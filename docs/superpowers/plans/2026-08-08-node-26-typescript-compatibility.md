@@ -147,6 +147,7 @@ Expected: one documentation-only commit.
 **Files:**
 
 - Modify: dependency or documentation files from Tasks 1–2 only if verification exposes a defect
+- Modify: `docs/superpowers/plans/2026-08-08-node-26-typescript-compatibility.md` only if a verification command is not portable to the project shell
 
 - [ ] **Step 1: Verify the installed direct dependency graph**
 
@@ -164,8 +165,8 @@ Run:
 
 ```powershell
 $outdatedJson = npm outdated --json
-$outdated = $outdatedJson | ConvertFrom-Json -AsHashtable
-$outdatedKeys = @($outdated.Keys)
+$outdated = $outdatedJson | ConvertFrom-Json
+$outdatedKeys = @($outdated.PSObject.Properties.Name)
 if ($outdatedKeys.Count -ne 1 -or $outdatedKeys[0] -ne 'typescript') {
   $outdatedJson
   throw 'Unexpected direct dependency lag remains'
@@ -218,7 +219,7 @@ Expected: only `.nvmrc`, `package.json`, `package-lock.json`, `README.md`, `docs
 If verification required a correction within the approved files, run:
 
 ```powershell
-git add .nvmrc package.json package-lock.json README.md docs/dependency-decisions.md
+git add .nvmrc package.json package-lock.json README.md docs/dependency-decisions.md docs/superpowers/plans/2026-08-08-node-26-typescript-compatibility.md
 git commit -m "build: finalize Node 26 compatibility"
 ```
 
