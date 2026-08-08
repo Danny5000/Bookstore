@@ -1,29 +1,35 @@
-<script>
+<script lang="ts">
   import { untrack } from 'svelte';
   import PageFace from './PageFace.svelte';
   import BookVolume from './BookVolume.svelte';
   import { pageBox, paginate, pageForAnchor, freeSheets, PAPERS, TYPEFACES } from '$lib/paginate';
   import { library } from '$lib/stores/library.svelte';
   import { money, coverBackground } from '$lib/data/catalog';
+  import { cubicBezier } from '$lib/reader/easing';
+  import type {
+    EasingFunction,
+    PaperId,
+    ReaderPhase,
+    ReaderProps,
+    ReadingAnchor,
+    SheetView,
+    TurnDirection,
+    TurnProgress,
+    TypefaceId
+  } from '$lib/types/reader';
 
-  /**
-   * The reader. Handles: two-page spread on desktop / single page on mobile,
-   * 3D page turns with drag + swipe + keys, contents drawer, bookmarks,
-   * type controls, comic page-vs-panel view, and the free-sample paywall.
-   *
-   * @type {{ title: any, sample?: boolean, onclose?: () => void, onbuy?: () => void }}
-   */
-  let { title, sample = false, onclose, onbuy } = $props();
+  let { title, sample = false, onclose, onbuy }: ReaderProps = $props();
 
   let vw = $state(1440);
   let vh = $state(900);
 
-  let sheet = $state(library.progress[title.id] || 0);
-  let phase = $state((library.progress[title.id] || 0) > 0 ? 'reading' : 'closed');
+  const initialSheet = untrack(() => library.progress[title.id] ?? 0);
+  let sheet = $state(initialSheet);
+  let phase = $state<ReaderPhase>(initialSheet > 0 ? 'reading' : 'closed');
   let flipped = $state(false);
   let flipping = $state(false);
-  let flipTimer;
-  let openTimer;
+  let flipTimer: ReturnType<typeof setTimeout> | undefined;
+  let openTimer: ReturnType<typeof setTimeout> | undefined;
 
   // Opening: settle the volume square, then swing the front board off the
   // spine onto the table, revealing page one underneath.
@@ -112,52 +118,38 @@
     clearTimeout(flipTimer);
     flipTimer = setTimeout(() => (flipping = false), 900);
   }
-  let drag = $state(null); // { dir: 1 | -1, t: 0..1 }
+  let drag = $state<TurnProgress | null>(null);
   // A turn in flight, advanced frame by frame from JS. A CSS transition moves
   // the rotation but leaves curl, lift and shading frozen at their resting
   // values, so a clicked turn arrived with none of the lighting a dragged one
   // has. One driver, one set of numbers, both paths.
-  let turning = $state(null); // { dir, t: 0..1 }
+  let turning = $state<TurnProgress | null>(null);
   let tocOpen = $state(false);
   let controlsOpen = $state(false);
 
   // comic guided view
-  let comicMode = $state('page'); // 'page' | 'panel'
-  let pageIdx = $state(null);
+  let comicMode = $state<'page' | 'panel'>('page');
+  let pageIdx = $state<number | null>(null);
   let panelIdx = $state(0);
 
   let startX = 0;
-  let fromSide = 1;
+  let fromSide: TurnDirection = 1;
   let halfWidth = 1;
   let raf = 0;
 
   const reduced =
     typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-  /** The CSS cubic-bezier curve, solved in JS (Newton, 5 passes is plenty). */
-  function bezier(x1, y1, x2, y2) {
-    const A = (a, b) => 1 - 3 * b + 3 * a;
-    const B = (a, b) => 3 * b - 6 * a;
-    const at = (t, a, b) => ((A(a, b) * t + B(a, b)) * t + 3 * a) * t;
-    const slope = (t, a, b) => (3 * A(a, b) * t + 2 * B(a, b)) * t + 3 * a;
-    return (x) => {
-      let t = x;
-      for (let i = 0; i < 5; i++) {
-        const d = slope(t, x1, x2);
-        if (!d) break;
-        t -= (at(t, x1, x2) - x) / d;
-      }
-      return at(t, y1, y2);
-    };
-  }
-
   // A page under a hand: slow to break off the stack, quick through the arc,
   // settles onto the other side.
-  const easeTurn = bezier(0.22, 0.61, 0.28, 1);
+  const easeTurn = cubicBezier(0.22, 0.61, 0.28, 1);
   // Let go mid-drag and the page already carries speed — it only decelerates.
-  const easeDrop = bezier(0.16, 0.78, 0.32, 1);
+  const easeDrop = cubicBezier(0.16, 0.78, 0.32, 1);
   // A page that did not make it falls back against the stack.
-  const easeBack = bezier(0.3, 0.86, 0.45, 1);
+  const easeBack = cubicBezier(0.3, 0.86, 0.45, 1);
+
+  const typefaceIds: readonly TypefaceId[] = ['serif', 'sans', 'georgia'];
+  const paperIds: readonly PaperId[] = ['white', 'sepia', 'dim'];
 
   const narrow = $derived(vw < 900);
   const per = $derived(narrow ? 1 : 2);
@@ -217,37 +209,41 @@
   const panelH = $derived(Math.max(260, Math.min(600, vh - 250)));
 
   /** Sheets, with their live rotation + shading. */
-  const sheets = $derived.by(() => {
-    const list = [];
-    const g = drag || turning;
-    for (let k = 0; k < totalSheets; k++) {
-      const flipped = k < sheet;
-      let angle = flipped ? -180 : 0;
-      if (g) {
-        if (g.dir === 1 && k === sheet) angle = -180 * g.t;
-        if (g.dir === -1 && k === sheet - 1) angle = -180 * (1 - g.t);
+  const sheets = $derived.by<SheetView[]>(() => {
+    const list: SheetView[] = [];
+    const turnProgress = drag ?? turning;
+    for (let index = 0; index < totalSheets; index += 1) {
+      const isFlipped = index < sheet;
+      let angle = isFlipped ? -180 : 0;
+      if (turnProgress?.dir === 1 && index === sheet) angle = -180 * turnProgress.t;
+      if (turnProgress?.dir === -1 && index === sheet - 1) {
+        angle = -180 * (1 - turnProgress.t);
       }
-      const active = !!g && (k === sheet || k === sheet - 1);
+      const active = turnProgress !== null && (index === sheet || index === sheet - 1);
       const curl = Math.sin((Math.abs(angle) / 180) * Math.PI);
-      const settled = !g;
+      const settled = turnProgress === null;
       list.push({
-        k,
+        k: index,
         angle,
         curl,
         active,
         // While it swings, the moving sheet clears both stacks: past halfway it
         // is over pages whose resting z is higher than its own.
-        z: active ? totalSheets + 3 : flipped ? k + 1 : totalSheets - k + 1,
+        z: active
+          ? totalSheets + 3
+          : isFlipped
+            ? index + 1
+            : totalSheets - index + 1,
         showFront: settled ? angle > -90 : true,
         showBack: settled ? angle <= -90 : true,
-        front: pages[k * per] || null,
-        back: per === 2 ? pages[k * per + 1] || null : null
+        front: pages[index * per] ?? null,
+        back: per === 2 ? (pages[index * per + 1] ?? null) : null
       });
     }
     return list;
   });
 
-  function commit(n) {
+  function commit(n: number): void {
     const next = Math.max(0, Math.min(Math.min(totalSheets, limit), n));
     sheet = next;
     recordAnchor();
@@ -257,16 +253,16 @@
   // Reflow renumbers the whole book: at a narrower size a 30-page novel becomes
   // 52 pages, and the stored sheet index then points somewhere else entirely.
   // The reader's position in the text is what gets kept.
-  let anchor = library.anchorFor(title.id);
+  let anchor: ReadingAnchor | null = untrack(() => library.anchorFor(title.id));
 
-  function recordAnchor() {
+  function recordAnchor(): void {
     const p = pages[Math.min(pages.length - 1, sheet * per)];
     if (p) anchor = { chapter: p.chapter, at: p.at || 0 };
   }
 
   $effect(() => {
-    pages;
-    per;
+    const currentPages = pages;
+    const currentPer = per;
     untrack(() => {
       if (!anchor) {
         recordAnchor();
@@ -274,7 +270,10 @@
       }
       const next = Math.max(
         0,
-        Math.min(Math.min(totalSheets, limit), Math.floor(pageForAnchor(pages, anchor) / per))
+        Math.min(
+          Math.min(totalSheets, limit),
+          Math.floor(pageForAnchor(currentPages, anchor) / currentPer)
+        )
       );
       if (next !== sheet) {
         sheet = next;
@@ -284,7 +283,7 @@
   });
 
   /** A jump (contents, bookmark) lands flat — it is not one page turning. */
-  function go(n) {
+  function go(n: number): void {
     cancelAnimationFrame(raf);
     turning = null;
     drag = null;
@@ -292,7 +291,7 @@
   }
 
   /** Land a turn already in flight so the next input is never dropped. */
-  function settleTurn() {
+  function settleTurn(): void {
     if (!turning) return;
     const d = turning.dir;
     cancelAnimationFrame(raf);
@@ -300,7 +299,14 @@
     commit(sheet + d);
   }
 
-  function runTurn(dir, from, to, ease, ms, land) {
+  function runTurn(
+    dir: TurnDirection,
+    from: number,
+    to: number,
+    ease: EasingFunction,
+    ms: number,
+    land: boolean
+  ): void {
     cancelAnimationFrame(raf);
     drag = null;
     if (reduced) {
@@ -317,7 +323,7 @@
     // Read the clock here rather than trusting the frame timestamp: a patched
     // requestAnimationFrame can hand back a different time base, which lands
     // the whole turn on the first frame.
-    const step = () => {
+    const step = (): void => {
       const p = Math.min(1, (performance.now() - t0) / dur);
       turning = { dir, t: from + span * ease(p) };
       if (p < 1) {
@@ -330,7 +336,7 @@
     raf = requestAnimationFrame(step);
   }
 
-  function turn(dir) {
+  function turn(dir: TurnDirection): void {
     if (phase === 'closed') {
       if (dir > 0) openBook();
       return;
@@ -353,10 +359,10 @@
     runTurn(dir, 0, 1, easeTurn, 720, true);
   }
 
-  function turnPanel(dir) {
+  function turnPanel(dir: TurnDirection): void {
     let p = currentPage;
     let i = panelIdx + dir;
-    const count = (n) => pages[n]?.layout?.length || 1;
+    const count = (pageNumber: number): number => pages[pageNumber]?.layout?.length || 1;
     if (i >= count(p)) {
       if (p + 1 >= pages.length) {
         if (limit >= totalSheets) {
@@ -390,28 +396,32 @@
     library.setProgress(title.id, nextSheet, anchor);
   }
 
-  function onPointerDown(e) {
+  function onPointerDown(event: PointerEvent): void {
     if (guided || phase !== 'reading' || turning) return;
-    const rect = e.currentTarget.getBoundingClientRect();
+    const target = event.currentTarget;
+    if (!(target instanceof HTMLDivElement)) return;
+    const rect = target.getBoundingClientRect();
     halfWidth = rect.width / per;
-    startX = e.clientX;
-    fromSide = e.clientX > rect.left + rect.width / 2 ? 1 : -1;
-    e.currentTarget.setPointerCapture?.(e.pointerId);
+    startX = event.clientX;
+    fromSide = event.clientX > rect.left + rect.width / 2 ? 1 : -1;
+    target.setPointerCapture?.(event.pointerId);
     drag = { dir: fromSide, t: 0 };
   }
 
-  function onPointerMove(e) {
+  function onPointerMove(event: PointerEvent): void {
     if (!drag) return;
-    const dx = e.clientX - startX;
+    const dx = event.clientX - startX;
     const t = Math.max(0, Math.min(1, (fromSide === 1 ? -dx : dx) / halfWidth));
     drag = { dir: fromSide, t };
   }
 
-  function onPointerUp() {
+  function onPointerUp(): void {
     if (!drag) return;
     const { dir, t } = drag;
     drag = null;
-    const fallBack = () => (t > 0.01 ? runTurn(dir, t, 0, easeBack, 420, false) : undefined);
+    const fallBack = (): void => {
+      if (t > 0.01) runTurn(dir, t, 0, easeBack, 420, false);
+    };
     if (t <= 0.28) return fallBack();
     // Dragging off either end of the book closes it rather than turning.
     if ((dir < 0 && sheet === 0) || (dir > 0 && !sampling && sheet >= totalSheets)) {
@@ -422,10 +432,10 @@
     runTurn(dir, t, 1, easeDrop, 620, true);
   }
 
-  function onKeydown(e) {
-    if (e.key === 'ArrowRight') turn(1);
-    if (e.key === 'ArrowLeft') turn(-1);
-    if (e.key === 'Escape') onclose?.();
+  function onKeydown(event: KeyboardEvent): void {
+    if (event.key === 'ArrowRight') turn(1);
+    if (event.key === 'ArrowLeft') turn(-1);
+    if (event.key === 'Escape') onclose?.();
   }
 
   $effect(() => () => {
@@ -434,7 +444,7 @@
     clearTimeout(openTimer);
   });
 
-  function jumpToChapter(ci) {
+  function jumpToChapter(ci: number): void {
     const idx = Math.max(0, pages.findIndex((p) => p.chapter === ci));
     go(Math.floor(idx / per));
     tocOpen = false;
@@ -482,14 +492,14 @@
     {#if tocOpen}
       <aside class="drawer">
         <div class="mono">Contents</div>
-        {#each title.chapters || [] as ch, ci}
+        {#each title.chapters || [] as ch, ci (ch.title)}
           <button class="toc-row" onclick={() => jumpToChapter(ci)}>
             <span>{ch.title}</span>
             <span class="mono plain">ch {ci + 1}</span>
           </button>
         {/each}
         <div class="mono" style="margin-top: 26px">Bookmarks</div>
-        {#each bookmarks as b}
+        {#each bookmarks as b (b)}
           <button class="toc-row" onclick={() => { go(b); tocOpen = false; }}>
             <span>Page {b * per + 1}</span>
             <span style="color: var(--accent)">&#9670;</span>
@@ -510,29 +520,29 @@
 
         <div class="mono">Typeface</div>
         <div class="stack">
-          {#each Object.entries(TYPEFACES) as [key, tf]}
+          {#each typefaceIds as key (key)}
             <button
               class="mini"
               class:on={prefs.typeface === key}
-              style:font-family={tf.css}
+              style:font-family={TYPEFACES[key].css}
               onclick={() => library.setPref('typeface', key)}
             >
-              {tf.label}
+              {TYPEFACES[key].label}
             </button>
           {/each}
         </div>
 
         <div class="mono">Paper</div>
         <div class="row">
-          {#each Object.entries(PAPERS) as [key, p]}
+          {#each paperIds as key (key)}
             <button
               class="mini paper"
               class:on={prefs.paper === key}
-              style:background={p.bg}
-              style:color={p.ink}
+              style:background={PAPERS[key].bg}
+              style:color={PAPERS[key].ink}
               onclick={() => library.setPref('paper', key)}
             >
-              {p.label}
+              {PAPERS[key].label}
             </button>
           {/each}
         </div>
@@ -663,6 +673,8 @@
     {:else}
       <div
         class="book"
+        role="application"
+        aria-label="Interactive pages for {title.title}; use arrow keys to turn pages"
         style:width="{bookW}px"
         style:height="{box.ph}px"
         style:padding-left={narrow ? '0' : `${box.pw}px`}
