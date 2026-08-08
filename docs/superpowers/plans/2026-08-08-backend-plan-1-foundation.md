@@ -1069,8 +1069,9 @@ docker run --detach --rm `
   pale-orbit:plan1
 
 try {
-  curl.exe --retry 20 --retry-connrefused --retry-delay 1 --fail `
+  curl.exe --retry 20 --retry-connrefused --retry-all-errors --retry-delay 1 --fail `
     http://127.0.0.1:13001/health/ready
+  if ($LASTEXITCODE -ne 0) { throw 'Application readiness did not become available' }
 
   $rootStatus = curl.exe --silent --output NUL --write-out "%{http_code}" `
     http://127.0.0.1:13001/
