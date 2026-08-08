@@ -2669,8 +2669,17 @@ describe('PostgreSQL jobs', () => {
   });
 
   it('uses skip locked so two workers claim different jobs', async () => {
-    await enqueueJob(databaseClient.db, { type: 'test.one', payload: { order: 1 } });
-    await enqueueJob(databaseClient.db, { type: 'test.two', payload: { order: 2 } });
+    const alreadyDue = new Date(0);
+    await enqueueJob(databaseClient.db, {
+      type: 'test.one',
+      payload: { order: 1 },
+      runAt: alreadyDue
+    });
+    await enqueueJob(databaseClient.db, {
+      type: 'test.two',
+      payload: { order: 2 },
+      runAt: alreadyDue
+    });
     const repository = createPostgresJobRepository(
       databaseClient.db,
       applicationConfig.jobs
