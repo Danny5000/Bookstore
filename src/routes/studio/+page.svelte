@@ -1,6 +1,7 @@
 <script>
   import CoverArt from '$lib/components/CoverArt.svelte';
-  import { titles, parseManuscript } from '$lib/stores/titles.svelte.js';
+  import { parseManuscript } from '$lib/data/manuscript';
+  import { titles } from '$lib/stores/titles.svelte';
   import { SWATCHES } from '$lib/data/catalog';
 
   let form = $state({

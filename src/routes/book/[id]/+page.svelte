@@ -2,8 +2,8 @@
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
   import BookVolume from '$lib/components/BookVolume.svelte';
-  import { titles } from '$lib/stores/titles.svelte.js';
-  import { library } from '$lib/stores/library.svelte.js';
+  import { titles } from '$lib/stores/titles.svelte';
+  import { library } from '$lib/stores/library.svelte';
   import { money } from '$lib/data/catalog';
 
   const title = $derived(titles.get($page.params.id));

@@ -1,7 +1,7 @@
 <script>
   import { page } from '$app/stores';
-  import { titles } from '$lib/stores/titles.svelte.js';
-  import { library } from '$lib/stores/library.svelte.js';
+  import { titles } from '$lib/stores/titles.svelte';
+  import { library } from '$lib/stores/library.svelte';
 
   const id = $derived($page.url.searchParams.get('title'));
   const title = $derived(id ? titles.get(id) : null);

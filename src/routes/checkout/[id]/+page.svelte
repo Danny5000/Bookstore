@@ -2,9 +2,9 @@
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
   import CoverArt from '$lib/components/CoverArt.svelte';
-  import { titles } from '$lib/stores/titles.svelte.js';
-  import { library } from '$lib/stores/library.svelte.js';
-  import { session } from '$lib/stores/session.svelte.js';
+  import { titles } from '$lib/stores/titles.svelte';
+  import { library } from '$lib/stores/library.svelte';
+  import { session } from '$lib/stores/session.svelte';
   import { money } from '$lib/data/catalog';
 
   const title = $derived(titles.get($page.params.id));

@@ -3,7 +3,7 @@
   import PageFace from './PageFace.svelte';
   import BookVolume from './BookVolume.svelte';
   import { pageBox, paginate, pageForAnchor, freeSheets, PAPERS, TYPEFACES } from '$lib/paginate';
-  import { library } from '$lib/stores/library.svelte.js';
+  import { library } from '$lib/stores/library.svelte';
   import { money, coverBackground } from '$lib/data/catalog';
 
   /**

@@ -2,7 +2,7 @@
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
   import BookReader from '$lib/components/BookReader.svelte';
-  import { titles } from '$lib/stores/titles.svelte.js';
+  import { titles } from '$lib/stores/titles.svelte';
 
   const title = $derived(titles.get($page.params.id));
   const sample = $derived($page.url.searchParams.get('sample') === '1');

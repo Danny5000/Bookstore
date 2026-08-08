@@ -1,7 +1,7 @@
 <script>
   import { page } from '$app/stores';
-  import { theme, THEMES } from '$lib/stores/theme.svelte.js';
-  import { session } from '$lib/stores/session.svelte.js';
+  import { theme, THEMES } from '$lib/stores/theme.svelte';
+  import { session } from '$lib/stores/session.svelte';
 
   let { onsignin } = $props();
 

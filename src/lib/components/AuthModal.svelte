@@ -1,5 +1,5 @@
 <script>
-  import { session } from '$lib/stores/session.svelte.js';
+  import { session } from '$lib/stores/session.svelte';
 
   let { open = false, onclose } = $props();
 
