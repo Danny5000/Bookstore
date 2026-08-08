@@ -10,7 +10,16 @@ const VALID_DEVELOPMENT_ENVIRONMENT: EnvironmentValues = {
   DATABASE_PORT: '5432',
   DATABASE_NAME: 'pale_orbit',
   DATABASE_USER: 'pale_orbit',
-  DATABASE_PASSWORD: 'development-only'
+  DATABASE_PASSWORD: 'development-only',
+  DATABASE_POOL_MAX: '5',
+  DATABASE_CONNECTION_TIMEOUT_MS: '5000',
+  DATABASE_STATEMENT_TIMEOUT_MS: '30000',
+  DATABASE_READINESS_TIMEOUT_MS: '2000',
+  JOB_POLL_INTERVAL_MS: '1000',
+  JOB_LEASE_MS: '30000',
+  JOB_RETRY_BASE_MS: '1000',
+  JOB_RETRY_MAX_MS: '300000',
+  WORKER_READY_FILE: '.worker-ready'
 };
 
 describe('loadApplicationConfig', () => {
@@ -24,9 +33,59 @@ describe('loadApplicationConfig', () => {
         port: 5432,
         name: 'pale_orbit',
         user: 'pale_orbit',
-        password: 'development-only'
+        password: 'development-only',
+        poolMax: 5,
+        connectionTimeoutMs: 5000,
+        statementTimeoutMs: 30000,
+        readinessTimeoutMs: 2000
+      },
+      jobs: {
+        pollIntervalMs: 1000,
+        leaseMs: 30000,
+        retryBaseMs: 1000,
+        retryMaxMs: 300000,
+        workerReadyFile: '.worker-ready'
       }
     });
+  });
+
+  it('returns bounded database and worker settings', () => {
+    const config = loadApplicationConfig(VALID_DEVELOPMENT_ENVIRONMENT);
+
+    expect(config.database).toMatchObject({
+      poolMax: 5,
+      connectionTimeoutMs: 5000,
+      statementTimeoutMs: 30000,
+      readinessTimeoutMs: 2000
+    });
+    expect(config.jobs).toEqual({
+      pollIntervalMs: 1000,
+      leaseMs: 30000,
+      retryBaseMs: 1000,
+      retryMaxMs: 300000,
+      workerReadyFile: '.worker-ready'
+    });
+  });
+
+  it.each([
+    ['DATABASE_POOL_MAX', '0'],
+    ['DATABASE_READINESS_TIMEOUT_MS', 'not-a-number'],
+    ['JOB_POLL_INTERVAL_MS', '0'],
+    ['JOB_LEASE_MS', '500']
+  ])('rejects invalid operational setting %s=%s', (key, value) => {
+    expect(() =>
+      loadApplicationConfig({ ...VALID_DEVELOPMENT_ENVIRONMENT, [key]: value })
+    ).toThrow(ConfigurationError);
+  });
+
+  it('rejects a retry base greater than the retry ceiling', () => {
+    expect(() =>
+      loadApplicationConfig({
+        ...VALID_DEVELOPMENT_ENVIRONMENT,
+        JOB_RETRY_BASE_MS: '6000',
+        JOB_RETRY_MAX_MS: '5000'
+      })
+    ).toThrow(/JOB_RETRY_BASE_MS: must not exceed JOB_RETRY_MAX_MS/);
   });
 
   it('loads the database password from a production secret file', () => {

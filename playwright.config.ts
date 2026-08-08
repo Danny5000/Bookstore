@@ -39,7 +39,16 @@ export default defineConfig({
       DATABASE_PORT: '5432',
       DATABASE_NAME: 'pale_orbit_test',
       DATABASE_USER: 'pale_orbit_test',
-      DATABASE_PASSWORD: 'playwright-only'
+      DATABASE_PASSWORD: 'playwright-only',
+      DATABASE_POOL_MAX: '5',
+      DATABASE_CONNECTION_TIMEOUT_MS: '5000',
+      DATABASE_STATEMENT_TIMEOUT_MS: '30000',
+      DATABASE_READINESS_TIMEOUT_MS: '2000',
+      JOB_POLL_INTERVAL_MS: '1000',
+      JOB_LEASE_MS: '30000',
+      JOB_RETRY_BASE_MS: '1000',
+      JOB_RETRY_MAX_MS: '300000',
+      WORKER_READY_FILE: '.worker-ready-test'
     }
   }
 });
