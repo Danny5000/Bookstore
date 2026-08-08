@@ -3,7 +3,7 @@
   import { resolve } from '$app/paths';
   import { titles } from '$lib/stores/titles.svelte';
   import { library } from '$lib/stores/library.svelte';
-  import { SWATCHES, coverBackground } from '$lib/data/catalog';
+  import { coverBackground, coverPalette } from '$lib/data/catalog';
   import { pageBox, paginate } from '$lib/paginate';
   import type { DeliveryChannel } from '$lib/types/api';
   import type { Title } from '$lib/types/catalog';
@@ -77,7 +77,7 @@
       <!-- Spine width is the thickness of the object: a bound volume stands
            square on the shelf, a stapled issue is barely more than card. -->
       {@const spineW = t.kind === 'comic' ? 18 : 52}
-      {@const pair = SWATCHES[t.cover % SWATCHES.length] ?? SWATCHES[0]}
+      {@const pair = coverPalette(t.cover)}
       <!-- A real box: spine facing out, front cover receding into the shelf,
            paper edge on top. A single plane just narrows as it rotates. -->
       <a

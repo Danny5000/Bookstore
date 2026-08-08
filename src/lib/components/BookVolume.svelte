@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { money, SWATCHES, coverBackground } from '$lib/data/catalog';
+  import { money, coverBackground, coverPalette } from '$lib/data/catalog';
   import { bookDepth } from '$lib/reader/geometry';
   import type { Title } from '$lib/types/catalog';
 
@@ -63,7 +63,7 @@
   );
   const d = $derived(depth ?? bookDepth(title.kind, leaves));
 
-  const pair = $derived(SWATCHES[title.cover % SWATCHES.length] ?? SWATCHES[0]);
+  const pair = $derived(coverPalette(title.cover));
   const art = $derived(coverBackground(title.cover, title.coverUrl));
   const frontRadius = $derived(stapled ? '1px 2px 2px 1px' : '3px 6px 6px 3px');
   const backRadius = $derived(stapled ? '2px 1px 1px 2px' : '6px 3px 3px 6px');

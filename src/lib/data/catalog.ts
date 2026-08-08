@@ -10,10 +10,13 @@ export const SWATCHES = [
   ['oklch(0.86 0.05 90)', 'oklch(0.24 0.02 260)']
 ] as const satisfies readonly (readonly [string, string])[];
 
+export function coverPalette(index = 0): (typeof SWATCHES)[number] {
+  return SWATCHES[index % SWATCHES.length] ?? SWATCHES[0];
+}
+
 export function coverBackground(index = 0, url: string | null | undefined = null): string {
   if (url) return `center / cover url(${url})`;
-  const pair = SWATCHES[index % SWATCHES.length] ?? SWATCHES[0];
-  const [accent, ground] = pair;
+  const [accent, ground] = coverPalette(index);
   return `linear-gradient(150deg, ${ground} 0%, ${ground} 46%, ${accent} 47%, ${accent} 53%, ${ground} 54%)`;
 }
 
