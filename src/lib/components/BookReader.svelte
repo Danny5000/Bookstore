@@ -6,6 +6,8 @@
   import { library } from '$lib/stores/library.svelte';
   import { money, coverBackground } from '$lib/data/catalog';
   import { cubicBezier } from '$lib/reader/easing';
+  import { bookDepth } from '$lib/reader/geometry';
+  import { clampSheet } from '$lib/reader/navigation';
   import type {
     EasingFunction,
     PaperId,
@@ -178,11 +180,7 @@
   // Closed book: thickness scales with the page count, capped so a long novel
   // still reads as a book rather than a brick. A comic is a stapled issue, not
   // a bound volume, so it stays thin however many pages it runs to.
-  const depth = $derived(
-    isComic
-      ? Math.max(5, Math.min(11, Math.round(pages.length * 0.5)))
-      : Math.max(16, Math.min(58, Math.round(pages.length * 0.9) + 10))
-  );
+  const depth = $derived(bookDepth(title.kind, pages.length));
   // The closed footer is taller than the reading one, so the volume is sized
   // down here rather than shrinking the page box (which would repaginate).
   const coverBase = $derived(box.ph - 42);
@@ -244,7 +242,7 @@
   });
 
   function commit(n: number): void {
-    const next = Math.max(0, Math.min(Math.min(totalSheets, limit), n));
+    const next = clampSheet(n, totalSheets, limit);
     sheet = next;
     recordAnchor();
     library.setProgress(title.id, next, anchor);
@@ -268,12 +266,10 @@
         recordAnchor();
         return;
       }
-      const next = Math.max(
-        0,
-        Math.min(
-          Math.min(totalSheets, limit),
-          Math.floor(pageForAnchor(currentPages, anchor) / currentPer)
-        )
+      const next = clampSheet(
+        Math.floor(pageForAnchor(currentPages, anchor) / currentPer),
+        totalSheets,
+        limit
       );
       if (next !== sheet) {
         sheet = next;
@@ -355,7 +351,7 @@
       startClosingEnd();
       return;
     }
-    if (Math.max(0, Math.min(Math.min(totalSheets, limit), sheet + dir)) === sheet) return;
+    if (clampSheet(sheet + dir, totalSheets, limit) === sheet) return;
     runTurn(dir, 0, 1, easeTurn, 720, true);
   }
 
@@ -428,7 +424,7 @@
       turn(dir);
       return;
     }
-    if (Math.max(0, Math.min(Math.min(totalSheets, limit), sheet + dir)) === sheet) return fallBack();
+    if (clampSheet(sheet + dir, totalSheets, limit) === sheet) return fallBack();
     runTurn(dir, t, 1, easeDrop, 620, true);
   }
 
