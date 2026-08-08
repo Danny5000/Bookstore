@@ -2,6 +2,10 @@
 	admin off
 }
 
+:2015 {
+	respond /health/caddy 200
+}
+
 {$SITE_ADDRESS} {
 	encode zstd gzip
 	reverse_proxy app:3000

@@ -80,6 +80,8 @@ docker compose --file compose.prod.yaml up --detach --wait
 
 `APP_IMAGE` must identify the already-built immutable application image. Caddy is the only service with published ports. PostgreSQL persists in `postgres_data` and is reachable only on the Compose network. The database password becomes `/run/secrets/database_password` in the app and PostgreSQL containers; it is not stored in a production `.env` file.
 
+Caddy's internal port 2015 health endpoint is container-only and avoids coupling container health to the configured public hostname or TLS redirect behavior.
+
 The application container runs as the unprivileged `node` user with `no-new-privileges`. Its root filesystem remains writable in Plan 1 because Docker Compose cannot materialize an environment-backed secret into a read-only container root filesystem; Plan 7 must revisit that control alongside the production secret provider.
 
 Check the baseline:

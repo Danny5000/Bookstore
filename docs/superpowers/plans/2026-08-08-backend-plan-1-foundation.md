@@ -1314,6 +1314,10 @@ Create `deploy/Caddyfile`:
 	admin off
 }
 
+:2015 {
+	respond /health/caddy 200
+}
+
 {$SITE_ADDRESS} {
 	encode zstd gzip
 	reverse_proxy app:3000
@@ -1416,7 +1420,7 @@ services:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: [CMD-SHELL, 'wget -q --spider http://127.0.0.1/health/live']
+      test: [CMD-SHELL, 'wget -q --spider http://127.0.0.1:2015/health/caddy']
       interval: 10s
       timeout: 3s
       retries: 10
@@ -1443,6 +1447,7 @@ Important properties to preserve:
 - There is no `env_file` key anywhere in this file.
 - The app image is supplied externally and is not built on the VPS.
 - Only Caddy publishes ports.
+- Caddy's container-only listener on port 2015 provides a hostname-independent process health check; it is not published to the host.
 - PostgreSQL receives its password through `/run/secrets/database_password` and has no host port.
 - The app receives the same secret file and never receives `DATABASE_PASSWORD` as an environment variable.
 - The app remains non-root with `no-new-privileges`; a read-only root filesystem is deferred because Docker Compose cannot materialize an environment-backed secret into a read-only container root filesystem. Plan 7 must revisit this hardening control alongside the deployment secret provider.

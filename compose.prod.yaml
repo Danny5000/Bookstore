@@ -87,7 +87,7 @@ services:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: [CMD-SHELL, 'wget -q --spider http://127.0.0.1/health/live']
+      test: [CMD-SHELL, 'wget -q --spider http://127.0.0.1:2015/health/caddy']
       interval: 10s
       timeout: 3s
       retries: 10
