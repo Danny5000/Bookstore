@@ -1,9 +1,11 @@
 import type { Handle, ServerInit } from '@sveltejs/kit';
 import { isRequestAvailable } from '$lib/server/application-mode';
 import { getApplicationConfig } from '$lib/server/config';
+import { getDatabaseClient } from '$lib/server/db/runtime';
 
 export const init: ServerInit = () => {
   getApplicationConfig();
+  getDatabaseClient();
 };
 
 export const handle: Handle = async ({ event, resolve }) => {

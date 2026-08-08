@@ -22,11 +22,14 @@
     "test:unit": "vitest run",
     "test:integration:raw": "vitest run --config vitest.integration.config.ts",
     "test:integration": "tsx scripts/with-test-database.ts npm run test:integration:raw",
-    "test:e2e": "playwright test",
+    "test:e2e:raw": "playwright test",
+    "test:e2e": "tsx scripts/with-test-database.ts npm run test:e2e:raw",
     "test:e2e:headed": "playwright test --headed",
     "test:e2e:install": "playwright install chromium",
     "test:watch": "vitest",
-    "verify": "npm run check && npm run lint && npm run test:unit && npm run test:e2e && npm run build"
+    "test:database:raw": "npm run test:integration:raw && npm run test:e2e:raw",
+    "test:database": "tsx scripts/with-test-database.ts npm run test:database:raw",
+    "verify": "npm run check && npm run lint && npm run test:unit && npm run test:database && npm run build"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
