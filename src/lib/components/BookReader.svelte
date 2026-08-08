@@ -8,13 +8,13 @@
   import { cubicBezier } from '$lib/reader/easing';
   import { bookDepth } from '$lib/reader/geometry';
   import { clampSheet } from '$lib/reader/navigation';
+  import { buildSheetWindow } from '$lib/reader/sheet-window';
   import type {
     EasingFunction,
     PaperId,
     ReaderPhase,
     ReaderProps,
     ReadingAnchor,
-    SheetView,
     TurnDirection,
     TurnProgress,
     TypefaceId
@@ -206,40 +206,20 @@
   const panelCell = $derived(pages[currentPage]?.layout?.[panelIdx % panelCount] || null);
   const panelH = $derived(Math.max(260, Math.min(600, vh - 250)));
 
-  /** Sheets, with their live rotation + shading. */
-  const sheets = $derived.by<SheetView[]>(() => {
-    const list: SheetView[] = [];
-    const turnProgress = drag ?? turning;
-    for (let index = 0; index < totalSheets; index += 1) {
-      const isFlipped = index < sheet;
-      let angle = isFlipped ? -180 : 0;
-      if (turnProgress?.dir === 1 && index === sheet) angle = -180 * turnProgress.t;
-      if (turnProgress?.dir === -1 && index === sheet - 1) {
-        angle = -180 * (1 - turnProgress.t);
-      }
-      const active = turnProgress !== null && (index === sheet || index === sheet - 1);
-      const curl = Math.sin((Math.abs(angle) / 180) * Math.PI);
-      const settled = turnProgress === null;
-      list.push({
-        k: index,
-        angle,
-        curl,
-        active,
-        // While it swings, the moving sheet clears both stacks: past halfway it
-        // is over pages whose resting z is higher than its own.
-        z: active
-          ? totalSheets + 3
-          : isFlipped
-            ? index + 1
-            : totalSheets - index + 1,
-        showFront: settled ? angle > -90 : true,
-        showBack: settled ? angle <= -90 : true,
-        front: pages[index * per] ?? null,
-        back: per === 2 ? (pages[index * per + 1] ?? null) : null
-      });
-    }
-    return list;
-  });
+  const maxRenderedSheet = $derived(
+    sampling ? Math.min(totalSheets - 1, readable) : totalSheets - 1
+  );
+
+  const sheets = $derived(
+    buildSheetWindow({
+      pages,
+      per,
+      currentSheet: sheet,
+      totalSheets,
+      maxReadableSheet: maxRenderedSheet,
+      turn: drag ?? turning
+    })
+  );
 
   function commit(n: number): void {
     const next = clampSheet(n, totalSheets, limit);
