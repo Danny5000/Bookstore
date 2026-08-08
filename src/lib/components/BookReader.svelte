@@ -2,6 +2,7 @@
   import { untrack } from 'svelte';
   import BookVolume from './BookVolume.svelte';
   import ReaderDrawers from './reader/ReaderDrawers.svelte';
+  import ReaderFooter from './reader/ReaderFooter.svelte';
   import ReaderGuidedPanel from './reader/ReaderGuidedPanel.svelte';
   import ReaderOpeningRig from './reader/ReaderOpeningRig.svelte';
   import ReaderPaywall from './reader/ReaderPaywall.svelte';
@@ -560,28 +561,22 @@
     {/if}
   </div>
 
-  {#if phase === 'closed'}
-    <div class="nav">
-      <button class="btn nowrap" onclick={openBook}>Open the {isComic ? 'comic' : 'book'}</button>
-      <button class="btn ghost nowrap" onclick={flipCover}>
-        {flipped ? 'Front cover' : 'Back cover'}
-      </button>
-    </div>
-  {:else}
-    <div class="nav">
-      <button class="round" aria-label="Previous" onclick={() => turn(-1)}>&lsaquo;</button>
-      <span class="folio mono plain">
-        {#if guided}
-          Page {currentPage + 1} &middot; panel {panelIdx + 1} of {panelCount}
-        {:else if leftFolio && rightFolio}
-          Pages {leftFolio}&ndash;{rightFolio} of {pages.length}
-        {:else}
-          Page {leftFolio || rightFolio || pages.length} of {pages.length}
-        {/if}
-      </span>
-      <button class="round" aria-label="Next" onclick={() => turn(1)}>&rsaquo;</button>
-    </div>
-  {/if}
+  <ReaderFooter
+    {phase}
+    {isComic}
+    {flipped}
+    {guided}
+    {currentPage}
+    panelIndex={panelIdx}
+    {panelCount}
+    {leftFolio}
+    {rightFolio}
+    pageCount={pages.length}
+    onopen={openBook}
+    onflip={flipCover}
+    onprevious={() => turn(-1)}
+    onnext={() => turn(1)}
+  />
 </div>
 
 <style>
@@ -643,40 +638,4 @@
     perspective-origin: 50% 45%;
   }
 
-  /* nav ---------------------------------------------------------------- */
-  .nav {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 22px;
-    padding: 12px 0 18px;
-  }
-
-  .round {
-    width: 42px;
-    height: 42px;
-    border-radius: 50%;
-    border: 1px solid var(--line);
-    background: none;
-    color: var(--ink);
-    cursor: pointer;
-  }
-
-  .round:hover {
-    border-color: var(--accent);
-  }
-
-  .nowrap {
-    white-space: nowrap;
-    padding: 12px 24px;
-  }
-
-  .folio {
-    font-size: 11px;
-  }
-
-  .plain {
-    letter-spacing: 0.1em;
-    text-transform: none;
-  }
 </style>
