@@ -1,7 +1,9 @@
 <script lang="ts">
   import { untrack } from 'svelte';
   import BookVolume from './BookVolume.svelte';
+  import ReaderGuidedPanel from './reader/ReaderGuidedPanel.svelte';
   import ReaderOpeningRig from './reader/ReaderOpeningRig.svelte';
+  import ReaderPaywall from './reader/ReaderPaywall.svelte';
   import ReaderSpread from './reader/ReaderSpread.svelte';
   import { pageBox, paginate, pageForAnchor, freeSheets, PAPERS, TYPEFACES } from '$lib/paginate';
   import { library } from '$lib/stores/library.svelte';
@@ -569,16 +571,7 @@
         oncomplete={settleTransition}
       />
     {:else if guided}
-      <!-- Guided view: one panel at a time, framed to the panel's own aspect -->
-      <button
-        class="single-panel"
-        style:height="{panelH}px"
-        style:width="min(80vw, {Math.round(panelH * (panelCell ? (panelCell.c / panelCell.r) * 1.15 : 1.4))}px)"
-        onclick={() => turn(1)}
-      >
-        <span class="art"></span>
-        <span class="cap">{panelCell?.cap}</span>
-      </button>
+      <ReaderGuidedPanel height={panelH} panel={panelCell} onnext={() => turn(1)} />
     {:else}
       <ReaderSpread
         title={title.title}
@@ -597,15 +590,13 @@
     {/if}
 
     {#if paywalled}
-      <div class="paywall">
-        <div class="card">
-          <div class="mono accent">End of the free {isComic ? 'preview' : 'chapter'}</div>
-          <h3 class="display">{title.title}</h3>
-          <p>Keep going for {money(title.price)}. Yours forever, in the browser or as a file.</p>
-          <button class="btn" onclick={() => onbuy?.()}>Buy the whole {isComic ? 'issue' : 'book'}</button>
-          <button class="link" onclick={() => onclose?.()}>Not now</button>
-        </div>
-      </div>
+      <ReaderPaywall
+        {isComic}
+        title={title.title}
+        price={money(title.price)}
+        onbuy={() => onbuy?.()}
+        onclose={() => onclose?.()}
+      />
     {/if}
   </div>
 
@@ -782,38 +773,6 @@
     perspective-origin: 50% 45%;
   }
 
-  /* guided comic view -------------------------------------------------- */
-  .single-panel {
-    position: relative;
-    padding: 0;
-    background: #fff;
-    border: 3px solid #16130f;
-    box-shadow: 0 40px 80px -40px rgba(0, 0, 0, 0.9);
-    cursor: pointer;
-    animation: fade-up 0.28s ease both;
-  }
-
-  .single-panel .art {
-    position: absolute;
-    inset: 0;
-    background: repeating-linear-gradient(
-      135deg,
-      rgba(20, 18, 15, 0.09) 0 12px,
-      rgba(20, 18, 15, 0.02) 12px 24px
-    );
-  }
-
-  .single-panel .cap {
-    position: absolute;
-    left: 18px;
-    right: 18px;
-    bottom: 18px;
-    text-align: left;
-    font-family: var(--font-mono);
-    font-size: 12px;
-    color: rgba(0, 0, 0, 0.62);
-  }
-
   /* drawers ------------------------------------------------------------ */
   .drawer {
     position: absolute;
@@ -900,57 +859,6 @@
   .mini.paper.on {
     outline: 2px solid var(--accent);
     outline-offset: 1px;
-  }
-
-  /* paywall ------------------------------------------------------------ */
-  .paywall {
-    position: absolute;
-    inset: 0;
-    z-index: 40;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: color-mix(in oklab, var(--bg) 78%, transparent);
-    backdrop-filter: blur(6px);
-  }
-
-  .card {
-    width: 420px;
-    max-width: 90vw;
-    padding: 34px;
-    text-align: center;
-    background: var(--surface);
-    border: 1px solid var(--line);
-    border-radius: 6px;
-  }
-
-  .card h3 {
-    font-size: 30px;
-    margin: 12px 0;
-  }
-
-  .card p {
-    font-size: 14.5px;
-    line-height: 1.6;
-    color: var(--muted);
-    margin: 0 0 24px;
-  }
-
-  .card .btn {
-    width: 100%;
-  }
-
-  .accent {
-    color: var(--accent);
-  }
-
-  .link {
-    margin-top: 12px;
-    border: 0;
-    background: none;
-    font-size: 13px;
-    color: var(--muted);
-    cursor: pointer;
   }
 
   /* nav ---------------------------------------------------------------- */
