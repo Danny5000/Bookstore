@@ -1,5 +1,5 @@
 <script>
-  import { coverBackground } from '$lib/data/catalog.js';
+  import { coverBackground } from '$lib/data/catalog';
 
   /**
    * A cover. Uses the uploaded artwork when there is one, otherwise falls back

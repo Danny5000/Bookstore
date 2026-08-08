@@ -1,6 +1,6 @@
 import { json, error } from '@sveltejs/kit';
 import { env } from '$env/dynamic/private';
-import { CATALOG } from '$lib/data/catalog.js';
+import { CATALOG } from '$lib/data/catalog';
 
 /**
  * Creates a Stripe Checkout Session for one title and returns its URL.

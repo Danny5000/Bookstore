@@ -2,7 +2,7 @@
   import { goto } from '$app/navigation';
   import { titles } from '$lib/stores/titles.svelte.js';
   import { library } from '$lib/stores/library.svelte.js';
-  import { SWATCHES, coverBackground } from '$lib/data/catalog.js';
+  import { SWATCHES, coverBackground } from '$lib/data/catalog';
   import { pageBox, paginate } from '$lib/paginate.js';
 
   let toast = $state('');

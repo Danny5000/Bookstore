@@ -1,4 +1,4 @@
-import { COMIC_LAYOUTS } from './data/catalog.js';
+import { COMIC_LAYOUTS } from './data/catalog';
 
 /**
  * Page box that fits the available stage, keeping a book-ish 0.73 aspect.
@@ -29,7 +29,7 @@ export function pageBox({ vw, vh, narrow, fontSize, chrome = 244 }) {
  * frame of a page turn. Repeat calls at the same size are free, and the stable
  * array identity also means repagination effects only fire on a real reflow.
  *
- * @param {import('./data/catalog.js').Title} title
+ * @param {import('./types/catalog').Title} title
  * @param {{pw:number, ph:number, pad:number, fs:number}} box
  */
 const cache = new WeakMap();

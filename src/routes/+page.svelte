@@ -2,7 +2,7 @@
   import CoverArt from '$lib/components/CoverArt.svelte';
   import BookVolume from '$lib/components/BookVolume.svelte';
   import { titles } from '$lib/stores/titles.svelte.js';
-  import { money } from '$lib/data/catalog.js';
+  import { money } from '$lib/data/catalog';
 
   const featured = $derived(titles.all[0]);
 </script>

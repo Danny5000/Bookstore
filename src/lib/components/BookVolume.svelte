@@ -1,5 +1,5 @@
 <script>
-  import { money, SWATCHES, coverBackground } from '$lib/data/catalog.js';
+  import { money, SWATCHES, coverBackground } from '$lib/data/catalog';
 
   /**
    * A closed book as an object: boards, spine, page block, cast shadow. The

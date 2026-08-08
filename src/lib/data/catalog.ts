@@ -1,44 +1,22 @@
-import { chapters } from './prose.js';
+import type { Title } from '$lib/types/catalog';
+import type { PanelCell } from '$lib/types/reader';
+import { chapters } from './prose';
 
-/**
- * Seed catalog. In production this comes from your DB (README -> Data model);
- * the shape below is what every component expects.
- *
- * @typedef {Object} Title
- * @property {string} id
- * @property {'novel'|'comic'} kind
- * @property {string} title
- * @property {string} author
- * @property {number} price
- * @property {string} released
- * @property {number} cover        index into SWATCHES (placeholder art)
- * @property {string|null} [coverUrl] uploaded cover image; falls back to SWATCHES
- * @property {string} summary
- * @property {{title: string, paras: string[]}[]} [chapters]
- * @property {number} [pages]      comics only
- */
-
-/** Placeholder cover palettes: [accent, ground] */
 export const SWATCHES = [
   ['oklch(0.72 0.14 200)', 'oklch(0.28 0.06 260)'],
   ['oklch(0.78 0.15 60)', 'oklch(0.30 0.05 30)'],
   ['oklch(0.70 0.16 340)', 'oklch(0.26 0.05 300)'],
   ['oklch(0.80 0.13 130)', 'oklch(0.27 0.05 160)'],
   ['oklch(0.86 0.05 90)', 'oklch(0.24 0.02 260)']
-];
+] as const satisfies readonly (readonly [string, string])[];
 
-/**
- * The `background` shorthand for a cover: uploaded artwork when there is one,
- * otherwise the placeholder palette. One definition, so the shelf, the reader's
- * boards and every catalogue card draw the same cover.
- */
-export function coverBackground(index = 0, url = null) {
+export function coverBackground(index = 0, url: string | null | undefined = null): string {
   if (url) return `center / cover url(${url})`;
-  const [accent, ground] = SWATCHES[index % SWATCHES.length];
+  const pair = SWATCHES[index % SWATCHES.length] ?? SWATCHES[0];
+  const [accent, ground] = pair;
   return `linear-gradient(150deg, ${ground} 0%, ${ground} 46%, ${accent} 47%, ${accent} 53%, ${ground} 54%)`;
 }
 
-/** Comic page layouts: c = column span, r = row span, cap = art-direction note */
 export const COMIC_LAYOUTS = [
   [
     { c: 2, r: 1, cap: 'PANEL - establishing shot, the salt flats at dawn' },
@@ -56,9 +34,8 @@ export const COMIC_LAYOUTS = [
     { c: 1, r: 1, cap: 'PANEL - the inquiry room' },
     { c: 2, r: 1, cap: 'PANEL - wide: everyone leaving at once' }
   ]
-];
+] as const satisfies readonly (readonly PanelCell[])[];
 
-/** @type {Title[]} */
 export const CATALOG = [
   {
     id: 'salt',
@@ -134,8 +111,12 @@ export const CATALOG = [
     pages: 8,
     summary: 'Issue #1. What the long-exposure survey found looking away from everything.'
   }
-];
+] satisfies Title[];
 
-export const money = (n) => '$' + Number(n).toFixed(2);
+export function money(value: number): string {
+  return '$' + Number(value).toFixed(2);
+}
 
-export const byId = (id) => CATALOG.find((t) => t.id === id);
+export function byId(id: string): Title | undefined {
+  return CATALOG.find((title) => title.id === id);
+}

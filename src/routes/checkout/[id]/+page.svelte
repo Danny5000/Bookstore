@@ -5,7 +5,7 @@
   import { titles } from '$lib/stores/titles.svelte.js';
   import { library } from '$lib/stores/library.svelte.js';
   import { session } from '$lib/stores/session.svelte.js';
-  import { money } from '$lib/data/catalog.js';
+  import { money } from '$lib/data/catalog';
 
   const title = $derived(titles.get($page.params.id));
 

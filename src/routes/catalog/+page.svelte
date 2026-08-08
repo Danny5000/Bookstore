@@ -1,7 +1,7 @@
 <script>
   import CoverArt from '$lib/components/CoverArt.svelte';
   import { titles } from '$lib/stores/titles.svelte.js';
-  import { money } from '$lib/data/catalog.js';
+  import { money } from '$lib/data/catalog';
 
   let filter = $state('all');
 

@@ -1,11 +1,11 @@
 import { browser } from '$app/environment';
-import { CATALOG } from '$lib/data/catalog.js';
+import { CATALOG } from '$lib/data/catalog';
 
 const KEY = 'paleorbit.titles';
 const HIDDEN_KEY = 'paleorbit.titles.hidden';
 
 /**
- * Catalog store. Seeded from src/lib/data/catalog.js and extended by anything
+ * Catalog store. Seeded from src/lib/data/catalog.ts and extended by anything
  * published in Studio. Replace with load() data from your DB when you wire one
  * up — every component reads `titles.all` and `titles.get(id)`.
  *

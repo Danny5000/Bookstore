@@ -4,7 +4,7 @@
   import BookVolume from './BookVolume.svelte';
   import { pageBox, paginate, pageForAnchor, freeSheets, PAPERS, TYPEFACES } from '$lib/paginate.js';
   import { library } from '$lib/stores/library.svelte.js';
-  import { money, coverBackground } from '$lib/data/catalog.js';
+  import { money, coverBackground } from '$lib/data/catalog';
 
   /**
    * The reader. Handles: two-page spread on desktop / single page on mobile,

@@ -1,5 +1,7 @@
+import type { Chapter } from '$lib/types/catalog';
+
 // Placeholder manuscript text. Replace with real content, or load from the DB.
-export const BANK = [
+export const BANK: readonly string[] = [
   'The tide came in grey that season, and with it the salt that would pay for everything we did next. We worked the flats at low water, three of us and a borrowed rake, while the station lights burned overhead like a town that had forgotten to come down.',
   'Ceren said the orbital was drifting again. She said it the way you mention weather, or a debt. I kept my eyes on the shallow water and counted the crystals forming along the rope, small and patient and entirely indifferent to whether we lived.',
   'There is a particular arithmetic to being poor on a company world. You learn the price of everything twice: once in credit, once in the hours it costs to earn the credit. By the second winter I could do the second sum faster than the first.',
@@ -16,12 +18,18 @@ export const BANK = [
   'What an engineer would say is: the tolerance had been exceeded, and the party responsible for the tolerance had been reassigned. That is the whole story, told properly. Everything else is just the part where people live in it.'
 ];
 
-export function prose(seed, n) {
-  const out = [];
-  for (let i = 0; i < n; i++) out.push(BANK[(seed + i) % BANK.length]);
-  return out;
+export function prose(seed: number, count: number): string[] {
+  const output: string[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const paragraph = BANK[(seed + index) % BANK.length];
+    if (paragraph !== undefined) output.push(paragraph);
+  }
+  return output;
 }
 
-export function chapters(seed, names) {
-  return names.map((title, i) => ({ title, paras: prose(seed + i * 5, 9 + (i % 3)) }));
+export function chapters(seed: number, names: readonly string[]): Chapter[] {
+  return names.map((title, index) => ({
+    title,
+    paras: prose(seed + index * 5, 9 + (index % 3))
+  }));
 }
