@@ -1,10 +1,12 @@
 <script lang="ts">
   import { untrack } from 'svelte';
   import BookVolume from './BookVolume.svelte';
+  import ReaderDrawers from './reader/ReaderDrawers.svelte';
   import ReaderGuidedPanel from './reader/ReaderGuidedPanel.svelte';
   import ReaderOpeningRig from './reader/ReaderOpeningRig.svelte';
   import ReaderPaywall from './reader/ReaderPaywall.svelte';
   import ReaderSpread from './reader/ReaderSpread.svelte';
+  import ReaderToolbar from './reader/ReaderToolbar.svelte';
   import { pageBox, paginate, pageForAnchor, freeSheets, PAPERS, TYPEFACES } from '$lib/paginate';
   import { library } from '$lib/stores/library.svelte';
   import { money, coverBackground } from '$lib/data/catalog';
@@ -167,6 +169,8 @@
 
   const typefaceIds: readonly TypefaceId[] = ['serif', 'sans', 'georgia'];
   const paperIds: readonly PaperId[] = ['white', 'sepia', 'dim'];
+  const typefaceOptions = typefaceIds.map((id) => ({ id, ...TYPEFACES[id] }));
+  const paperOptions = paperIds.map((id) => ({ id, ...PAPERS[id] }));
 
   const narrow = $derived(vw < 900);
   const per = $derived(narrow ? 1 : 2);
@@ -281,6 +285,11 @@
     commit(n);
   }
 
+  function goToBookmark(bookmark: number): void {
+    go(bookmark);
+    tocOpen = false;
+  }
+
   /** Land a turn already in flight so the next input is never dropped. */
   function settleTurn(): void {
     if (!turning) return;
@@ -387,6 +396,12 @@
     library.setProgress(title.id, nextSheet, anchor);
   }
 
+  function toggleGuided(): void {
+    comicMode = guided ? 'page' : 'panel';
+    panelIdx = 0;
+    pageIdx = sheet * per;
+  }
+
   function onPointerDown(event: PointerEvent): void {
     if (guided || phase !== 'reading' || turning) return;
     const target = event.currentTarget;
@@ -449,96 +464,41 @@
   class:dim={prefs.paper === 'dim'}
   style:background={prefs.paper === 'dim' ? 'oklch(0.16 0.01 262)' : 'var(--bg)'}
 >
-  <div class="toolbar">
-    <button class="tool" onclick={() => onclose?.()}>&larr; Close</button>
-    <button class="tool" onclick={() => (tocOpen = !tocOpen)}>Contents</button>
-    <button
-      class="tool"
-      class:on={bookmarks.includes(sheet)}
-      onclick={() => library.toggleBookmark(title.id, sheet)}
-    >
-      {bookmarks.includes(sheet) ? '\u25C6' : '\u25C7'}{narrow ? '' : bookmarks.includes(sheet) ? ' Bookmarked' : ' Bookmark'}
-    </button>
-
-    <div class="title">{title.title}</div>
-
-    {#if isComic}
-      <button class="pill" onclick={() => { comicMode = guided ? 'page' : 'panel'; panelIdx = 0; pageIdx = sheet * per; }}>
-        {guided ? 'Guided view' : 'Page view'}
-      </button>
-    {:else if !title.fixed}
-      <button class="tool" onclick={() => (controlsOpen = !controlsOpen)}>Aa</button>
-    {/if}
-
-    <span class="pct">{Math.round(progress * 100)}%</span>
-  </div>
-
-  <div class="rail"><div class="fill" style:width="{progress * 100}%"></div></div>
+  <ReaderToolbar
+    title={title.title}
+    {isComic}
+    isFixed={title.kind === 'novel' && !!title.fixed}
+    {narrow}
+    bookmarked={bookmarks.includes(sheet)}
+    {guided}
+    {progress}
+    onclose={() => onclose?.()}
+    oncontents={() => (tocOpen = !tocOpen)}
+    onbookmark={() => library.toggleBookmark(title.id, sheet)}
+    onguided={toggleGuided}
+    oncontrols={() => (controlsOpen = !controlsOpen)}
+  />
 
   <div class="stage">
     <!-- edge hit zones: tap left / right like a real page -->
     <button class="edge left" aria-label="Previous page" onclick={() => turn(-1)}></button>
     <button class="edge right" aria-label="Next page" onclick={() => turn(1)}></button>
 
-    {#if tocOpen}
-      <aside class="drawer">
-        <div class="mono">Contents</div>
-        {#each title.chapters || [] as ch, ci (ch.title)}
-          <button class="toc-row" onclick={() => jumpToChapter(ci)}>
-            <span>{ch.title}</span>
-            <span class="mono plain">ch {ci + 1}</span>
-          </button>
-        {/each}
-        <div class="mono" style="margin-top: 26px">Bookmarks</div>
-        {#each bookmarks as b (b)}
-          <button class="toc-row" onclick={() => { go(b); tocOpen = false; }}>
-            <span>Page {b * per + 1}</span>
-            <span style="color: var(--accent)">&#9670;</span>
-          </button>
-        {:else}
-          <p class="empty">No bookmarks yet.</p>
-        {/each}
-      </aside>
-    {/if}
-
-    {#if controlsOpen}
-      <aside class="panel-controls">
-        <div class="mono">Type size</div>
-        <div class="row">
-          <button class="mini" onclick={() => library.setPref('fontSize', Math.max(14, prefs.fontSize - 1))}>A&minus;</button>
-          <button class="mini big" onclick={() => library.setPref('fontSize', Math.min(24, prefs.fontSize + 1))}>A+</button>
-        </div>
-
-        <div class="mono">Typeface</div>
-        <div class="stack">
-          {#each typefaceIds as key (key)}
-            <button
-              class="mini"
-              class:on={prefs.typeface === key}
-              style:font-family={TYPEFACES[key].css}
-              onclick={() => library.setPref('typeface', key)}
-            >
-              {TYPEFACES[key].label}
-            </button>
-          {/each}
-        </div>
-
-        <div class="mono">Paper</div>
-        <div class="row">
-          {#each paperIds as key (key)}
-            <button
-              class="mini paper"
-              class:on={prefs.paper === key}
-              style:background={PAPERS[key].bg}
-              style:color={PAPERS[key].ink}
-              onclick={() => library.setPref('paper', key)}
-            >
-              {PAPERS[key].label}
-            </button>
-          {/each}
-        </div>
-      </aside>
-    {/if}
+    <ReaderDrawers
+      contentsOpen={tocOpen}
+      {controlsOpen}
+      chapters={title.kind === 'novel' ? (title.chapters ?? []) : []}
+      {bookmarks}
+      {per}
+      {prefs}
+      typefaces={typefaceOptions}
+      papers={paperOptions}
+      onchapter={jumpToChapter}
+      onbookmark={goToBookmark}
+      onfontsize={(fontSize) => library.setPref('fontSize', fontSize)}
+      ontypeface={(typeface) => library.setPref('typeface', typeface)}
+      onpaper={(nextPaper) => library.setPref('paper', nextPaper)}
+    />
 
     {#if phase === 'closed'}
       <!-- Closed book: front board, spine, page block, flip to the back cover -->
@@ -643,96 +603,6 @@
     color: var(--ink);
   }
 
-  .toolbar {
-    display: flex;
-    align-items: center;
-    gap: 18px;
-    padding: 14px 22px;
-    border-bottom: 1px solid var(--line);
-  }
-
-  .tool,
-  .pill {
-    background: none;
-    border: 0;
-    padding: 0;
-    font-family: var(--font-mono);
-    font-size: 11px;
-    letter-spacing: 0.16em;
-    text-transform: uppercase;
-    color: var(--muted);
-    cursor: pointer;
-    white-space: nowrap;
-  }
-
-  .tool:hover,
-  .pill:hover {
-    color: var(--ink);
-  }
-
-  .tool.on {
-    color: var(--accent);
-  }
-
-  .pill {
-    padding: 6px 12px;
-    border: 1px solid var(--line);
-    border-radius: 999px;
-    color: var(--ink);
-  }
-
-  .title {
-    flex: 1;
-    min-width: 0;
-    text-align: center;
-    font-family: var(--font-display);
-    font-size: 16px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  /* The toolbar is one row that must never be wider than the screen: when it
-     overflows it drags the whole stage off-centre and the page reads as cut
-     off at the edge. */
-  @media (max-width: 700px) {
-    .toolbar {
-      gap: 12px;
-      padding: 12px 14px;
-    }
-
-    .tool,
-    .pill {
-      font-size: 10px;
-      letter-spacing: 0.1em;
-    }
-
-    .pill {
-      padding: 5px 9px;
-    }
-
-    .title {
-      font-size: 14px;
-    }
-  }
-
-  .pct {
-    font-family: var(--font-mono);
-    font-size: 11px;
-    color: var(--muted);
-  }
-
-  .rail {
-    height: 2px;
-    background: var(--line);
-  }
-
-  .fill {
-    height: 2px;
-    background: var(--accent);
-    transition: width 0.4s ease;
-  }
-
   .stage {
     position: relative;
     flex: 1;
@@ -771,94 +641,6 @@
     justify-content: center;
     perspective: 2200px;
     perspective-origin: 50% 45%;
-  }
-
-  /* drawers ------------------------------------------------------------ */
-  .drawer {
-    position: absolute;
-    left: 0;
-    top: 0;
-    bottom: 0;
-    width: 300px;
-    z-index: 30;
-    padding: 24px;
-    overflow-y: auto;
-    background: var(--surface);
-    border-right: 1px solid var(--line);
-    animation: fade-up 0.25s ease both;
-  }
-
-  .toc-row {
-    display: flex;
-    justify-content: space-between;
-    gap: 12px;
-    width: 100%;
-    padding: 11px 0;
-    border: 0;
-    border-bottom: 1px solid var(--line);
-    background: none;
-    color: var(--ink);
-    font-size: 14px;
-    text-align: left;
-    cursor: pointer;
-  }
-
-  .toc-row:hover {
-    color: var(--accent);
-  }
-
-  .empty {
-    font-size: 13px;
-    color: var(--muted);
-  }
-
-  .panel-controls {
-    position: absolute;
-    right: 20px;
-    top: 16px;
-    width: 268px;
-    z-index: 30;
-    padding: 18px;
-    display: grid;
-    gap: 10px;
-    background: var(--surface);
-    border: 1px solid var(--line);
-    border-radius: 6px;
-    animation: fade-up 0.2s ease both;
-  }
-
-  .row {
-    display: flex;
-    gap: 8px;
-  }
-
-  .stack {
-    display: grid;
-    gap: 6px;
-  }
-
-  .mini {
-    flex: 1;
-    padding: 10px 12px;
-    border: 1px solid var(--line);
-    border-radius: 3px;
-    background: none;
-    color: var(--ink);
-    font-size: 14px;
-    cursor: pointer;
-  }
-
-  .mini.big {
-    font-size: 18px;
-  }
-
-  .mini.on {
-    border-color: var(--accent);
-  }
-
-  .mini.paper.on {
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
   }
 
   /* nav ---------------------------------------------------------------- */
