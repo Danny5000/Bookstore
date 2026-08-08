@@ -2439,7 +2439,7 @@ export async function enqueueJob(
   return existing;
 }
 
-interface ClaimedJobRow {
+interface ClaimedJobRow extends Record<string, unknown> {
   id: string;
   type: string;
   payload: JsonObject;
