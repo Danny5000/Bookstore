@@ -76,6 +76,8 @@ try {
     WORKER_READY_FILE: join(tmpdir(), `pale-orbit-worker-${process.pid}.ready`)
   };
 
+  runChecked('npm', ['run', 'db:migrate:raw'], testEnvironment);
+
   const childInvocation = invocation(childCommand, childArguments);
   const child = spawnSync(childInvocation.command, childInvocation.args, {
     env: testEnvironment,

@@ -173,7 +173,7 @@ npm ls --depth=0
 npm audit --audit-level=high
 ```
 
-Expected: all commands exit zero; 67 existing unit tests pass; only the documented low-severity `cookie` finding remains.
+Expected: all commands exit zero and 67 existing unit tests pass. Document the low-severity `cookie` path plus any current-stable, development-only Drizzle Kit advisory path; do not apply npm's incompatible forced downgrades.
 
 - [ ] **Step 6: Commit the dependency boundary**
 
@@ -539,7 +539,7 @@ Create `scripts/with-test-database.ts`:
 
 ```ts
 import { spawnSync } from 'node:child_process';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 const project = `pale-orbit-test-${process.pid}`;
@@ -551,15 +551,24 @@ if (!childCommand) {
   throw new Error('Expected a command to run after the test database starts');
 }
 
-function executable(command: string): string {
+interface CommandInvocation {
+  command: string;
+  args: string[];
+}
+
+function invocation(command: string, args: string[]): CommandInvocation {
   if (process.platform === 'win32' && (command === 'npm' || command === 'npx')) {
-    return `${command}.cmd`;
+    const npmCli = process.env.npm_execpath;
+    if (!npmCli) throw new Error('npm_execpath is required to launch npm commands on Windows');
+    const cli = command === 'npm' ? npmCli : join(dirname(npmCli), 'npx-cli.js');
+    return { command: process.execPath, args: [cli, ...args] };
   }
-  return command;
+  return { command, args };
 }
 
 function runChecked(command: string, args: string[], environment = process.env): void {
-  const result = spawnSync(executable(command), args, {
+  const resolved = invocation(command, args);
+  const result = spawnSync(resolved.command, resolved.args, {
     env: environment,
     stdio: 'inherit'
   });
@@ -569,7 +578,8 @@ function runChecked(command: string, args: string[], environment = process.env):
 }
 
 function capture(command: string, args: string[]): string {
-  const result = spawnSync(executable(command), args, {
+  const resolved = invocation(command, args);
+  const result = spawnSync(resolved.command, resolved.args, {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'inherit']
   });
@@ -578,8 +588,6 @@ function capture(command: string, args: string[]): string {
   }
   return result.stdout.trim();
 }
-
-let childExitCode = 1;
 
 try {
   runChecked('docker', [...composeArguments, 'up', '--detach', '--wait', '--wait-timeout', '90']);
@@ -608,16 +616,15 @@ try {
     WORKER_READY_FILE: join(tmpdir(), `pale-orbit-worker-${process.pid}.ready`)
   };
 
-  const child = spawnSync(executable(childCommand), childArguments, {
+  const childInvocation = invocation(childCommand, childArguments);
+  const child = spawnSync(childInvocation.command, childInvocation.args, {
     env: testEnvironment,
     stdio: 'inherit'
   });
-  childExitCode = child.status ?? 1;
+  process.exitCode = child.status ?? 1;
 } finally {
   runChecked('docker', [...composeArguments, 'down', '--volumes', '--remove-orphans']);
 }
-
-process.exitCode = childExitCode;
 ```
 
 - [ ] **Step 3: Write the failing pooled-client integration test**
@@ -861,6 +868,7 @@ import {
   pgTable,
   text,
   timestamp,
+  unique,
   uniqueIndex,
   uuid,
   varchar,
@@ -934,7 +942,7 @@ export const titleRevisions = pgTable(
   (table) => [
     index('title_revisions_title_created_idx').on(table.titleId, table.createdAt),
     index('title_revisions_state_created_idx').on(table.state, table.createdAt),
-    uniqueIndex('title_revisions_title_id_id_unique').on(table.titleId, table.id),
+    unique('title_revisions_title_id_id_unique').on(table.titleId, table.id),
     uniqueIndex('title_revisions_one_active_per_title')
       .on(table.titleId)
       .where(sql`${table.state} = 'active'`),
@@ -3622,7 +3630,7 @@ Expected:
 - Both Playwright files pass in Chromium against database-backed readiness.
 - Adapter-node, worker, and migration bundles build.
 - The dependency tree is valid.
-- The high-threshold audit exits zero with only the documented low-severity `cookie` finding.
+- The high-threshold audit exits zero; every remaining low/moderate path is explicitly documented, development-only where stated, and has a removal condition.
 
 - [ ] **Step 5: Re-run Compose and image gates**
 
