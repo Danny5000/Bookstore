@@ -17,6 +17,11 @@ Checked against the npm registry on 2026-08-08.
 | Mailpit image | 1.30.0 | Exact development-only SMTP capture service. |
 | Caddy image | 2.11.4 Alpine | Exact production reverse-proxy baseline. |
 | Stripe SDK | Current stable | Upgrade in isolation and verify checkout/webhook types and runtime behavior. |
+| Drizzle ORM | 0.45.2 | Current stable typed PostgreSQL ORM; schema files are the source of truth and runtime code uses the node-postgres adapter. |
+| Drizzle Kit | 0.31.10 | Current stable development-only migration generator/checker; generated SQL and snapshots are committed. |
+| node-postgres (`pg`) | 8.23.0 | Current stable pooled PostgreSQL driver supported by Drizzle; web, worker, and migration processes own separate bounded pools. |
+| `@types/pg` | 8.21.0 | Current node-postgres type declarations required by the strict TypeScript build. |
+| tsx | 4.23.11 | Current stable development-only TypeScript runner for worker, migration, and test orchestration entry points. |
 
 TypeScript 6.0.3 remains intentional: as checked on 2026-08-08,
 `typescript-eslint` 8.66.0 accepts TypeScript `>=4.8.4 <6.1.0` and
@@ -26,6 +31,8 @@ packages support TypeScript 7.
 Run `npm outdated`, `npm audit`, `npm ls`, and `npm run verify` before completing each implementation plan.
 Any remaining direct-package lag requires a dated compatibility reason and a removal condition in this file.
 
-## Accepted audit finding
+## Accepted audit findings
 
 `npm audit` currently reports one transitive advisory as three low-severity dependency-path findings: `cookie` below 0.7.0 through SvelteKit and adapter-node. The prototype only reads its fixed-name session cookie and does not construct cookie names, paths, or domains from untrusted input, so the affected validation behavior is not exposed by current application code. There is no compatible stable SvelteKit upgrade that removes the finding; npm's suggested forced resolution is an invalid downgrade. Remove this exception when a stable SvelteKit release depends on `cookie` 0.7.0 or newer.
+
+Drizzle Kit 0.31.10 also reports four moderate development-only dependency-path findings through its deprecated `@esbuild-kit/esm-loader` dependency and esbuild 0.18.20. The advisory concerns an exposed esbuild development server; this project uses Drizzle Kit only as a local/CI migration generator and checker, never as a production server or runtime dependency. Drizzle Kit 0.31.10 is the current stable release, while npm's suggested `0.18.1` resolution is an incompatible downgrade. Do not expose Drizzle Kit's development server to untrusted networks. Remove this exception when a stable Drizzle Kit release removes the deprecated loader path or upgrades its affected esbuild dependency.

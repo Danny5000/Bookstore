@@ -2,7 +2,7 @@ import type { RequestHandler } from './$types';
 import Stripe from 'stripe';
 import { env } from '$env/dynamic/private';
 import { error, json } from '@sveltejs/kit';
-import { grantPurchase } from '$lib/server/db';
+import { grantPurchase } from '$lib/server/prototype-db';
 import { sendBookEmail } from '$lib/server/mail';
 import { messageFromUnknown } from '$lib/utils/errors';
 

@@ -1,6 +1,6 @@
 import type { RequestHandler } from './$types';
 import { error, json } from '@sveltejs/kit';
-import { entitlementsFor } from '$lib/server/db';
+import { entitlementsFor } from '$lib/server/prototype-db';
 import { sendBookEmail } from '$lib/server/mail';
 import { parseDeliveryRequest } from '$lib/types/api';
 
