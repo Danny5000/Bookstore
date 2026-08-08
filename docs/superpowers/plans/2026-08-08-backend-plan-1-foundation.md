@@ -1353,7 +1353,6 @@ services:
     expose:
       - "3000"
     restart: unless-stopped
-    read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
     security_opt:
@@ -1446,6 +1445,7 @@ Important properties to preserve:
 - Only Caddy publishes ports.
 - PostgreSQL receives its password through `/run/secrets/database_password` and has no host port.
 - The app receives the same secret file and never receives `DATABASE_PASSWORD` as an environment variable.
+- The app remains non-root with `no-new-privileges`; a read-only root filesystem is deferred because Docker Compose cannot materialize an environment-backed secret into a read-only container root filesystem. Plan 7 must revisit this hardening control alongside the deployment secret provider.
 - `ADDRESS_HEADER` and `XFF_DEPTH=1` trust exactly the single Caddy hop for client-address handling.
 - Resource limits have conservative defaults and remain overridable for the final VPS sizing review in Plan 7.
 - `APPLICATION_MODE` is hard-coded to `maintenance`; a later reviewed plan must deliberately change the supported production mode after real authorization and persistence exist.
@@ -1519,13 +1519,32 @@ try {
     --project-name pale-orbit-plan1-prod `
     --file compose.prod.yaml `
     exec --no-TTY app `
-    sh -c 'test -s /run/secrets/database_password && test -z "$DATABASE_PASSWORD"'
+    test -s /run/secrets/database_password
 
-  $postgresPort = docker compose `
+  $databasePasswordEnvironment = docker compose `
     --project-name pale-orbit-plan1-prod `
     --file compose.prod.yaml `
-    port postgres 5432 2>$null
-  if ($postgresPort) { throw "PostgreSQL must not publish a host port: $postgresPort" }
+    exec --no-TTY app printenv DATABASE_PASSWORD 2>$null
+  if ($LASTEXITCODE -eq 0 -or $databasePasswordEnvironment) {
+    throw 'DATABASE_PASSWORD must not be present in the app environment'
+  }
+
+  $appUserId = docker compose `
+    --project-name pale-orbit-plan1-prod `
+    --file compose.prod.yaml `
+    exec --no-TTY app id -u
+  if ([int]$appUserId -eq 0) { throw 'The app must not run as root' }
+
+  $postgresContainerId = docker compose `
+    --project-name pale-orbit-plan1-prod `
+    --file compose.prod.yaml `
+    ps --quiet postgres
+  $postgresContainer = docker inspect $postgresContainerId | ConvertFrom-Json
+  $publishedPostgresPorts = $postgresContainer[0].NetworkSettings.Ports.PSObject.Properties |
+    Where-Object Value
+  if ($publishedPostgresPorts) {
+    throw "PostgreSQL must not publish a host port: $publishedPostgresPorts"
+  }
 
   docker compose `
     --project-name pale-orbit-plan1-prod `

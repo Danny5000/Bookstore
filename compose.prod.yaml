@@ -1,0 +1,109 @@
+services:
+  app:
+    image: ${APP_IMAGE:?APP_IMAGE must be an immutable versioned image}
+    init: true
+    environment:
+      NODE_ENV: production
+      APP_ENV: production
+      APPLICATION_MODE: maintenance
+      ORIGIN: ${ORIGIN:?ORIGIN must be set}
+      DATABASE_HOST: postgres
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: ${DATABASE_NAME:?DATABASE_NAME must be set}
+      DATABASE_USER: ${DATABASE_USER:?DATABASE_USER must be set}
+      DATABASE_PASSWORD_FILE: /run/secrets/database_password
+      HOST: 0.0.0.0
+      PORT: "3000"
+      ADDRESS_HEADER: X-Forwarded-For
+      XFF_DEPTH: "1"
+    secrets:
+      - database_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - "3000"
+    restart: unless-stopped
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3000/health/ready').then((response)=>{if(!response.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: ${WEB_CPU_LIMIT:-1.00}
+          memory: ${WEB_MEMORY_LIMIT:-768M}
+
+  postgres:
+    image: postgres:18.4-alpine3.24
+    environment:
+      POSTGRES_DB: ${DATABASE_NAME:?DATABASE_NAME must be set}
+      POSTGRES_USER: ${DATABASE_USER:?DATABASE_USER must be set}
+      POSTGRES_PASSWORD_FILE: /run/secrets/database_password
+    secrets:
+      - database_password
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    stop_grace_period: 60s
+    shm_size: 128mb
+    deploy:
+      resources:
+        limits:
+          cpus: ${POSTGRES_CPU_LIMIT:-1.50}
+          memory: ${POSTGRES_MEMORY_LIMIT:-1G}
+
+  caddy:
+    image: caddy:2.11.4-alpine
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:?SITE_ADDRESS must be set}
+    ports:
+      - ${HTTP_BIND_ADDRESS:-0.0.0.0}:${HTTP_PORT:-80}:80
+      - ${HTTPS_BIND_ADDRESS:-0.0.0.0}:${HTTPS_PORT:-443}:443
+      - ${HTTPS_BIND_ADDRESS:-0.0.0.0}:${HTTPS_PORT:-443}:443/udp
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD-SHELL, 'wget -q --spider http://127.0.0.1/health/live']
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: ${CADDY_CPU_LIMIT:-0.50}
+          memory: ${CADDY_MEMORY_LIMIT:-256M}
+
+secrets:
+  database_password:
+    environment: DATABASE_PASSWORD
+
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:
