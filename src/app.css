@@ -1,0 +1,160 @@
+/* Design tokens. :root is Nocturne; [data-theme="vellum"] overrides. */
+:root {
+  --bg: oklch(0.18 0.018 262);
+  --surface: oklch(0.225 0.018 262);
+  --raised: oklch(0.27 0.018 262);
+  --ink: oklch(0.95 0.008 262);
+  --muted: oklch(0.68 0.015 262);
+  --line: oklch(0.33 0.016 262);
+  --accent: oklch(0.8 0.125 192);
+  --accent-ink: oklch(0.22 0.03 192);
+
+  --font-display: 'Newsreader', Georgia, serif;
+  --font-ui: 'IBM Plex Sans', system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
+}
+
+:root[data-theme='vellum'] {
+  --bg: oklch(0.955 0.012 88);
+  --surface: oklch(0.982 0.008 88);
+  --raised: oklch(0.92 0.012 88);
+  --ink: oklch(0.24 0.012 60);
+  --muted: oklch(0.52 0.012 60);
+  --line: oklch(0.86 0.012 88);
+  --accent: oklch(0.55 0.13 32);
+  --accent-ink: oklch(0.97 0.01 88);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+a:hover {
+  color: var(--ink);
+}
+
+input,
+textarea,
+select,
+button {
+  font: inherit;
+  color: inherit;
+}
+
+::selection {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
+/* shared primitives -------------------------------------------------- */
+.mono {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.display {
+  font-family: var(--font-display);
+  font-weight: 300;
+  letter-spacing: -0.02em;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 14px 26px;
+  border: 0;
+  border-radius: 4px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.btn:hover {
+  filter: brightness(1.08);
+}
+
+.btn.ghost {
+  background: transparent;
+  color: var(--ink);
+  border: 1px solid var(--line);
+}
+
+.btn.ghost:hover {
+  border-color: var(--ink);
+  filter: none;
+}
+
+.field {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 13px 14px;
+  outline: none;
+}
+
+.field:focus {
+  border-color: var(--accent);
+}
+
+.wrap {
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: 0 48px;
+}
+
+@media (max-width: 700px) {
+  .wrap {
+    padding: 0 20px;
+  }
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Near-zero rather than none: animationend still fires, so the reader's
+   opening and closing sequences still settle instead of hanging half-open. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0s !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0s !important;
+    scroll-behavior: auto !important;
+  }
+}
