@@ -1,14 +1,21 @@
-<script>
+<script lang="ts">
   import { session } from '$lib/stores/session.svelte';
 
-  let { open = false, onclose } = $props();
+  type AuthMode = 'signin' | 'magic';
 
-  let mode = $state('signin'); // 'signin' | 'magic'
+  interface Props {
+    open?: boolean;
+    onclose?: () => void;
+  }
+
+  let { open = false, onclose }: Props = $props();
+
+  let mode = $state<AuthMode>('signin');
   let email = $state('');
   let password = $state('');
   let sent = $state(false);
 
-  function submit() {
+  function submit(): void {
     if (!email) return;
     if (mode === 'magic') {
       // POST /api/auth/magic-link in production
@@ -19,7 +26,7 @@
     onclose?.();
   }
 
-  function oauth(provider) {
+  function oauth(_provider: 'google' | 'apple'): void {
     // Redirect to /auth/{provider} in production (see README -> Auth)
     session.signIn('reader@paleorbit.co');
     onclose?.();

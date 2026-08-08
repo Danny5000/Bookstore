@@ -1,10 +1,19 @@
-<script>
+<script lang="ts">
   import { coverBackground } from '$lib/data/catalog';
 
   /**
    * A cover. Uses the uploaded artwork when there is one, otherwise falls back
    * to a placeholder palette so the layout never has a hole in it.
    */
+  interface Props {
+    index?: number;
+    src?: string | null | undefined;
+    alt?: string;
+    width?: string;
+    height?: string;
+    radius?: string;
+  }
+
   let {
     index = 0,
     src = null,
@@ -12,7 +21,7 @@
     width = '100%',
     height = '300px',
     radius = '2px 4px 4px 2px'
-  } = $props();
+  }: Props = $props();
 
 </script>
 

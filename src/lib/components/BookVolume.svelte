@@ -1,5 +1,6 @@
-<script>
+<script lang="ts">
   import { money, SWATCHES, coverBackground } from '$lib/data/catalog';
+  import type { Title } from '$lib/types/catalog';
 
   /**
    * A closed book as an object: boards, spine, page block, cast shadow. The
@@ -8,6 +9,20 @@
    * Comics are stapled issues, not bound volumes — thin, square-spined, and
    * with no stacked page block to show.
    */
+  interface Props {
+    title: Title;
+    width?: number;
+    height?: number;
+    depth?: number | null;
+    pageCount?: number | null;
+    flipped?: boolean;
+    flipping?: boolean;
+    tilt?: number;
+    interactive?: boolean;
+    onclick?: (() => void) | null;
+    label?: string | null;
+  }
+
   let {
     title,
     width = 260,
@@ -20,7 +35,7 @@
     interactive = false,
     onclick = null,
     label = null
-  } = $props();
+  }: Props = $props();
 
   let hover = $state(false);
 
@@ -33,7 +48,15 @@
       Math.max(
         24,
         Math.round(
-          (title.chapters || []).reduce((n, c) => n + c.paras.reduce((m, p) => m + p.length, 0), 0) / 1800
+          (title.chapters || []).reduce(
+            (total: number, chapter) =>
+              total +
+              chapter.paras.reduce(
+                (chapterTotal: number, paragraph) => chapterTotal + paragraph.length,
+                0
+              ),
+            0
+          ) / 1800
         )
       )
   );
@@ -44,7 +67,7 @@
         : Math.max(16, Math.min(58, Math.round(leaves * 0.9) + 10)))
   );
 
-  const pair = $derived(SWATCHES[title.cover % SWATCHES.length]);
+  const pair = $derived(SWATCHES[title.cover % SWATCHES.length] ?? SWATCHES[0]);
   const art = $derived(coverBackground(title.cover, title.coverUrl));
   const frontRadius = $derived(stapled ? '1px 2px 2px 1px' : '3px 6px 6px 3px');
   const backRadius = $derived(stapled ? '2px 1px 1px 2px' : '6px 3px 3px 6px');
@@ -63,7 +86,9 @@
   onclick={onclick}
   onpointerenter={() => (hover = true)}
   onpointerleave={() => (hover = false)}
-  aria-label={label}
+  role={onclick ? 'button' : 'img'}
+  type={onclick ? 'button' : undefined}
+  aria-label={label ?? title.title}
 >
   <!-- Solid core: without it the volume is a hollow shell and you see straight
        through it as it passes edge-on. -->

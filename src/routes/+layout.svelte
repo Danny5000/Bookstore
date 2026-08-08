@@ -1,10 +1,15 @@
-<script>
+<script lang="ts">
+  import type { Snippet } from 'svelte';
   import '../app.css';
   import Header from '$lib/components/Header.svelte';
   import AuthModal from '$lib/components/AuthModal.svelte';
   import { page } from '$app/stores';
 
-  let { children } = $props();
+  interface Props {
+    children: Snippet;
+  }
+
+  let { children }: Props = $props();
   let authOpen = $state(false);
 
   const isReader = $derived($page.url.pathname.startsWith('/read/'));

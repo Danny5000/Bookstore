@@ -1,8 +1,23 @@
-<script>
+<script lang="ts">
   import { PAPERS, TYPEFACES } from '$lib/paginate';
+  import type { PageBox, PaperId, ReaderPage, TypefaceId } from '$lib/types/reader';
 
   /** One printed side of a sheet: a text page or a comic page. */
-  let { page = null, box, paper = 'white', typeface = 'serif', side = 'front' } = $props();
+  interface Props {
+    page?: ReaderPage | null | undefined;
+    box: PageBox;
+    paper?: PaperId;
+    typeface?: TypefaceId;
+    side?: 'front' | 'back';
+  }
+
+  let {
+    page = null,
+    box,
+    paper = 'white',
+    typeface = 'serif',
+    side = 'front'
+  }: Props = $props();
 
   const ink = $derived(PAPERS[paper].ink);
   const font = $derived(TYPEFACES[typeface].css);
@@ -22,7 +37,7 @@
     </div>
   {:else if page && page.type === 'comic'}
     <div class="grid">
-      {#each page.layout as cell}
+      {#each page.layout as cell (cell.cap)}
         <div class="panel" style:grid-column="span {cell.c}" style:grid-row="span {cell.r}">
           <div class="art"></div>
           <div class="cap">{cell.cap}</div>
@@ -36,7 +51,7 @@
           {page.heading}
         </h2>
       {/if}
-      {#each page.paras as para, i}
+      {#each page.paras as para, i (i)}
         <p style:text-indent={i === 0 && page.heading ? '0' : '1.4em'}>{para}</p>
       {/each}
     </div>

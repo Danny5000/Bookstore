@@ -1,34 +1,39 @@
-<script>
+<script lang="ts">
   import { page } from '$app/stores';
+  import { resolve } from '$app/paths';
   import { theme, THEMES } from '$lib/stores/theme.svelte';
   import { session } from '$lib/stores/session.svelte';
 
-  let { onsignin } = $props();
+  interface Props {
+    onsignin: () => void;
+  }
+
+  let { onsignin }: Props = $props();
 
   const links = [
     { href: '/catalog', label: 'Catalog' },
     { href: '/library', label: 'My Shelf' },
     { href: '/studio', label: 'Studio' }
-  ];
+  ] as const;
 </script>
 
 <header>
-  <a class="brand" href="/">
+  <a class="brand" href={resolve('/')}>
     <span class="dot"></span>
     <span class="wordmark">Pale Orbit</span>
     <span class="mono">Press</span>
   </a>
 
   <nav>
-    {#each links as l}
-      <a href={l.href} class:active={$page.url.pathname.startsWith(l.href)}>{l.label}</a>
+    {#each links as l (l.href)}
+      <a href={resolve(l.href)} class:active={$page.url.pathname.startsWith(l.href)}>{l.label}</a>
     {/each}
   </nav>
 
   <div class="spacer"></div>
 
   <div class="themes">
-    {#each THEMES as t}
+    {#each THEMES as t (t.id)}
       <button
         class="chip"
         class:on={theme.current === t.id}
@@ -41,7 +46,7 @@
   </div>
 
   {#if session.user}
-    <a class="account" href="/library"><span class="dot small"></span><span class="who">{session.user.email}</span></a>
+    <a class="account" href={resolve('/library')}><span class="dot small"></span><span class="who">{session.user.email}</span></a>
   {:else}
     <button class="account" onclick={onsignin}><span class="dot small"></span><span class="who">Sign in</span></button>
   {/if}
