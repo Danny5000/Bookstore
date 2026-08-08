@@ -40,6 +40,24 @@ The repository is a SvelteKit frontend prototype with JavaScript source, large i
 
 The migration will retain SvelteKit as the full-stack framework instead of introducing a second API application. This reduces deployment and type-sharing complexity while the product is owned and operated as a single application.
 
+### 4.1 Dependency audit snapshot
+
+An npm registry audit on 2026-08-08 found that the lockfile installs current SvelteKit and Svelte releases, while several declared direct dependencies require major-version review:
+
+| Dependency | Installed | Registry latest | Required disposition |
+| --- | ---: | ---: | --- |
+| `@sveltejs/adapter-auto` | 3.3.1 | 7.0.1 | Remove and replace with the current compatible `@sveltejs/adapter-node` release for production. |
+| `@sveltejs/adapter-node` | Not installed | 5.5.7 | Add the current stable release after confirming its SvelteKit peer range. |
+| `@sveltejs/kit` | 2.70.2 | 2.70.2 | Retain the current stable release and align the stale manifest range. |
+| `@sveltejs/vite-plugin-svelte` | 4.0.4 | 7.3.0 | Upgrade together with Vite after reviewing official migration notes and peer requirements. |
+| `svelte` | 5.56.8 | 5.56.8 | Retain the current stable release and align the stale manifest range. |
+| `vite` | 5.4.21 | 8.2.1 | Upgrade together with the Svelte Vite plugin and verify development and production builds. |
+| `stripe` | 17.7.0 | 22.4.0 | Upgrade as an isolated major-version change and verify API-version, webhook, and type behavior. |
+
+This table is a dated baseline, not a permanent version pin. Plan 0 must repeat the registry and compatibility checks immediately before changing dependencies.
+
+The same audit reported eight known advisories in the current tree: two high, three moderate, and three low. The high and moderate findings are concentrated in Vite and related transitive tooling, with fixes requiring reviewed dependency updates. Plan 0 must resolve or explicitly risk-assess every finding. It must not use `npm audit fix --force` or accept a suggested downgrade without validating the resulting package versions and compatibility.
+
 ## 5. Chosen architecture
 
 ### 5.1 Modular SvelteKit monolith
@@ -106,10 +124,18 @@ The future CI/CD pipeline can provide the same process environment and run the d
 
 ## 7. TypeScript migration: Implementation Plan 0
 
-The first implementation plan is a behavior-preserving, strict TypeScript migration of the existing prototype.
+The first implementation plan modernizes the existing dependency baseline and then performs a behavior-preserving, strict TypeScript migration of the prototype. Dependency changes and source conversion use separate commits and verification checkpoints so failures can be attributed correctly.
 
 It will:
 
+- Record the existing build and runtime baseline before changing packages.
+- Run `npm outdated`, `npm audit`, and `npm ls`, then review direct and relevant transitive dependencies.
+- Select the latest stable, mutually compatible releases available at implementation time; prereleases and forced peer-dependency combinations are excluded.
+- Review official release notes and migration guides for every major upgrade.
+- Replace `adapter-auto` with the current compatible `adapter-node`, upgrade the Vite/Svelte toolchain as a coordinated set, and upgrade Stripe separately.
+- Align `package.json`, regenerate and commit `package-lock.json`, and document any justified compatibility pin.
+- Resolve advisories through deliberate package upgrades and lockfile regeneration rather than blind forced audit fixes.
+- Pin one supported Node.js release line consistently across local tooling, `package.json` engines, CI documentation, and production images.
 - Convert all JavaScript modules to TypeScript.
 - Convert every Svelte component script to `lang="ts"`.
 - Type component props, events, stores, route data, service boundaries, and reader state.
@@ -119,7 +145,9 @@ It will:
 - Avoid blanket `any`, broad type assertions, and unexplained suppression directives.
 - Preserve the prototype's current behavior and presentation.
 
-Plan 0 is complete only when TypeScript checking, Svelte checking, linting, tests, and the production build pass with no migration-related errors.
+Plan 0 is complete only when TypeScript checking, Svelte checking, linting, tests, and the production build pass with no migration-related errors; `npm ls` reports a valid dependency tree; and no unexplained direct dependency or known high/critical security issue remains.
+
+Every later implementation plan repeats a direct-dependency currency and compatibility check before introducing backend packages. New dependencies use current stable releases at the time of implementation, are added only for a concrete requirement, and are locked reproducibly. A newer major release is not adopted blindly when its supported peer matrix conflicts with the application; any temporary pin must include its reason, risk, and removal condition in the implementation plan.
 
 ## 8. Data model
 
@@ -438,11 +466,11 @@ This program is too large for one safe implementation plan. The approved deliver
 
 ### Plan 0: Strict TypeScript migration
 
-Convert and type the prototype without changing its product behavior. Establish type, check, lint, test, and build gates.
+Audit and modernize the existing dependency set in isolated, verified groups, then convert and type the prototype without changing its product behavior. Establish dependency, type, check, lint, test, and build gates.
 
 ### Plan 1: Test foundation, environments, and configuration
 
-Add the test harness, development and production Compose definitions, adapter-node build, validated environment/secret loading, PostgreSQL, Mailpit, Caddy baseline, and shared application configuration.
+Re-check current stable versions before adding the test and backend foundation. Add the test harness, development and production Compose definitions, adapter-node build, validated environment/secret loading, PostgreSQL, Mailpit, Caddy baseline, and shared application configuration.
 
 ### Plan 2: Database, domain foundation, jobs, and audit
 
@@ -475,6 +503,7 @@ Each plan must keep the application runnable, preserve completed behavior, and p
 The program is complete when:
 
 - The repository contains no production JavaScript source that escaped the strict TypeScript migration.
+- Existing and newly added direct dependencies have been reviewed against current stable releases; compatibility pins are explicit and justified, the lockfile is reproducible, and the dependency tree has no unexplained peer conflicts or known unaccepted high/critical security issues.
 - A customer can register, authenticate, reset a password, use a magic link, purchase as a guest or account holder, claim a guest purchase, and access entitled material.
 - EPUB and CBZ/ZIP originals can be safely uploaded, processed, reviewed privately, published explicitly, downloaded by entitled customers, replaced without accidental publication, and rolled back.
 - Public users can see only public catalog data and configured preview boundaries.
