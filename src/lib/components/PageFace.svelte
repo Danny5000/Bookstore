@@ -1,5 +1,5 @@
 <script>
-  import { PAPERS, TYPEFACES } from '$lib/paginate.js';
+  import { PAPERS, TYPEFACES } from '$lib/paginate';
 
   /** One printed side of a sheet: a text page or a comic page. */
   let { page = null, box, paper = 'white', typeface = 'serif', side = 'front' } = $props();

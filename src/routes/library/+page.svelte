@@ -3,7 +3,7 @@
   import { titles } from '$lib/stores/titles.svelte.js';
   import { library } from '$lib/stores/library.svelte.js';
   import { SWATCHES, coverBackground } from '$lib/data/catalog';
-  import { pageBox, paginate } from '$lib/paginate.js';
+  import { pageBox, paginate } from '$lib/paginate';
 
   let toast = $state('');
   let pullingId = $state(null);

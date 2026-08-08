@@ -2,7 +2,7 @@
   import { untrack } from 'svelte';
   import PageFace from './PageFace.svelte';
   import BookVolume from './BookVolume.svelte';
-  import { pageBox, paginate, pageForAnchor, freeSheets, PAPERS, TYPEFACES } from '$lib/paginate.js';
+  import { pageBox, paginate, pageForAnchor, freeSheets, PAPERS, TYPEFACES } from '$lib/paginate';
   import { library } from '$lib/stores/library.svelte.js';
   import { money, coverBackground } from '$lib/data/catalog';
 
