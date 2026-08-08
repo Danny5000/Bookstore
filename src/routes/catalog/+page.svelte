@@ -1,12 +1,21 @@
-<script>
+<script lang="ts">
+  import { resolve } from '$app/paths';
   import CoverArt from '$lib/components/CoverArt.svelte';
   import { titles } from '$lib/stores/titles.svelte';
   import { money } from '$lib/data/catalog';
+  import type { TitleKind } from '$lib/types/catalog';
 
-  let filter = $state('all');
+  type CatalogFilter = 'all' | TitleKind;
+
+  interface FilterOption {
+    id: CatalogFilter;
+    label: string;
+  }
+
+  let filter = $state<CatalogFilter>('all');
 
   const shown = $derived(titles.all.filter((t) => filter === 'all' || t.kind === filter));
-  const filters = [
+  const filters: FilterOption[] = [
     { id: 'all', label: 'Everything' },
     { id: 'novel', label: 'Novels' },
     { id: 'comic', label: 'Comics' }
@@ -19,14 +28,14 @@
   <h1 class="display">Catalog</h1>
 
   <div class="filters">
-    {#each filters as f}
+    {#each filters as f (f.id)}
       <button class="chip" class:on={filter === f.id} onclick={() => (filter = f.id)}>{f.label}</button>
     {/each}
   </div>
 
   <div class="grid">
-    {#each shown as t}
-      <a class="card" href="/book/{t.id}">
+    {#each shown as t (t.id)}
+      <a class="card" href={resolve('/book/[id]', { id: t.id })}>
         <CoverArt index={t.cover} src={t.coverUrl} alt={t.title} height="320px" />
         <div class="line">
           <span class="name">{t.title}</span>

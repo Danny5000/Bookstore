@@ -1,5 +1,6 @@
-<script>
+<script lang="ts">
   import { page } from '$app/stores';
+  import { resolve } from '$app/paths';
   import { titles } from '$lib/stores/titles.svelte';
   import { library } from '$lib/stores/library.svelte';
 
@@ -9,7 +10,7 @@
   // If the reader came back from Stripe, the webhook has already granted the
   // purchase server-side; mirror it locally so the shelf updates immediately.
   $effect(() => {
-    if (id) library.grant(id);
+    if (id !== null) library.grant(id);
   });
 </script>
 
@@ -21,9 +22,9 @@
   <p>Receipt and files are on their way. Your place is saved as you read.</p>
   <div class="acts">
     {#if title}
-      <a class="btn" href="/read/{title.id}">Start reading {title.title}</a>
+      <a class="btn" href={resolve('/read/[id]', { id: title.id })}>Start reading {title.title}</a>
     {/if}
-    <a class="btn ghost" href="/library">Go to my shelf</a>
+    <a class="btn ghost" href={resolve('/library')}>Go to my shelf</a>
   </div>
 </section>
 

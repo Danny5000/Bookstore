@@ -1,4 +1,5 @@
-<script>
+<script lang="ts">
+  import { resolve } from '$app/paths';
   import CoverArt from '$lib/components/CoverArt.svelte';
   import BookVolume from '$lib/components/BookVolume.svelte';
   import { titles } from '$lib/stores/titles.svelte';
@@ -9,6 +10,7 @@
 
 <svelte:head><title>Pale Orbit Press</title></svelte:head>
 
+{#if featured}
 <section class="hero wrap">
   <div class="copy">
     <div class="mono accent">Science fiction &amp; true stories</div>
@@ -19,27 +21,28 @@
       mailed to you.
     </p>
     <div class="actions">
-      <a class="btn" href="/read/{featured.id}?sample=1">
+      <a class="btn" href={resolve('/read/[id]?sample=1', { id: featured.id })}>
         {featured.kind === 'comic' ? 'Preview first pages' : 'Read chapter one free'}
       </a>
-      <a class="btn ghost" href="/catalog">Browse the catalog</a>
+      <a class="btn ghost" href={resolve('/catalog')}>Browse the catalog</a>
     </div>
   </div>
 
-  <a class="art" href="/book/{featured.id}">
+  <a class="art" href={resolve('/book/[id]', { id: featured.id })}>
     <BookVolume title={featured} width={296} height={430} interactive tilt={-16} />
   </a>
 </section>
+{/if}
 
 <section class="wrap">
   <div class="section-head">
     <h2 class="display">Recent releases</h2>
-    <a class="mono" href="/catalog">All titles &rarr;</a>
+    <a class="mono" href={resolve('/catalog')}>All titles &rarr;</a>
   </div>
 
   <div class="grid">
-    {#each titles.all as t}
-      <a class="card" href="/book/{t.id}">
+    {#each titles.all as t (t.id)}
+      <a class="card" href={resolve('/book/[id]', { id: t.id })}>
         <CoverArt index={t.cover} src={t.coverUrl} alt={t.title} height="300px" />
         <div class="line">
           <span class="name">{t.title}</span>

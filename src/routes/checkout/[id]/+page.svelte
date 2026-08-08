@@ -1,13 +1,16 @@
-<script>
+<script lang="ts">
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
+  import { resolve } from '$app/paths';
   import CoverArt from '$lib/components/CoverArt.svelte';
   import { titles } from '$lib/stores/titles.svelte';
   import { library } from '$lib/stores/library.svelte';
   import { session } from '$lib/stores/session.svelte';
   import { money } from '$lib/data/catalog';
+  import { isCheckoutResponse } from '$lib/types/api';
+  import { messageFromUnknown } from '$lib/utils/errors';
 
-  const title = $derived(titles.get($page.params.id));
+  const title = $derived($page.params.id ? titles.get($page.params.id) : undefined);
 
   let email = $state(session.user?.email ?? '');
   let emailCopy = $state(true);
@@ -18,7 +21,11 @@
   const total = $derived(title ? title.price + tax : 0);
 
   /** Real flow: create a Stripe Checkout Session and redirect to it. */
-  async function payWithStripe() {
+  async function payWithStripe(): Promise<void> {
+    if (!title) {
+      error = 'This title is unavailable.';
+      return;
+    }
     if (!email) {
       error = 'Add an email for the receipt and delivery.';
       return;
@@ -26,31 +33,34 @@
     busy = true;
     error = '';
     try {
-      const res = await fetch('/api/checkout', {
+      const response = await fetch('/api/checkout', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ titleId: title.id, email, emailCopy })
       });
-      const data = await res.json();
-      if (data.url) {
-        window.location.href = data.url; // Stripe Checkout
+      const data: unknown = await response.json();
+      if (isCheckoutResponse(data) && 'url' in data) {
+        window.location.assign(data.url);
         return;
       }
-      throw new Error(data.message || 'Checkout unavailable');
-    } catch (e) {
+      const message =
+        isCheckoutResponse(data) && 'message' in data ? data.message : 'Checkout unavailable';
+      throw new Error(message);
+    } catch (cause: unknown) {
       // No Stripe keys configured yet — fall back to the local demo grant so
       // the rest of the flow stays clickable in development.
-      error = e.message + ' — granting locally for development.';
+      error = messageFromUnknown(cause) + ' — granting locally for development.';
       grantLocally();
     } finally {
       busy = false;
     }
   }
 
-  function grantLocally() {
+  function grantLocally(): void {
+    if (!title) return;
     library.grant(title.id);
     if (!session.user) session.signIn(email);
-    goto(`/checkout/success?title=${title.id}`);
+    void goto(resolve(`/checkout/success?title=${encodeURIComponent(title.id)}`));
   }
 </script>
 
@@ -59,7 +69,7 @@
 {#if title}
   <section class="checkout">
     <aside class="summary">
-      <a class="back mono" href="/book/{title.id}">&larr; Back</a>
+      <a class="back mono" href={resolve('/book/[id]', { id: title.id })}>&larr; Back</a>
       <CoverArt index={title.cover} src={title.coverUrl} alt={title.title} width="150px" height="215px" />
       <h2 class="display">{title.title}</h2>
       <p class="kind">{title.kind === 'comic' ? 'Comic' : 'Novel'} · EPUB, PDF &amp; in-browser</p>

@@ -1,49 +1,59 @@
-<script>
+<script lang="ts">
   import { goto } from '$app/navigation';
+  import { resolve } from '$app/paths';
   import { titles } from '$lib/stores/titles.svelte';
   import { library } from '$lib/stores/library.svelte';
   import { SWATCHES, coverBackground } from '$lib/data/catalog';
   import { pageBox, paginate } from '$lib/paginate';
+  import type { DeliveryChannel } from '$lib/types/api';
+  import type { Title } from '$lib/types/catalog';
 
   let toast = $state('');
-  let pullingId = $state(null);
+  let pullingId = $state<string | null>(null);
   let pulled = false;
 
   // Pull the book off the shelf first, then hand over to the reader.
-  function pull(t) {
+  function pull(title: Title): void {
     if (pullingId) return;
-    pullingId = t.id;
+    pullingId = title.id;
     pulled = false;
     // animationend is the real trigger, so the hand-off tracks the animation
     // rather than a guessed duration. The timer is a backstop for a throttled
     // tab; under reduced motion the animation ends at once and so does this.
-    setTimeout(() => open(t), 940);
+    setTimeout(() => open(title), 940);
   }
 
-  function open(t) {
+  function open(title: Title): void {
     if (pulled) return;
     pulled = true;
-    goto(`/read/${t.id}`);
+    void goto(resolve('/read/[id]', { id: title.id }));
   }
 
   const shelf = $derived(titles.all.filter((t) => library.owns(t.id)));
   const box = pageBox({ vw: 1440, vh: 900, narrow: false, fontSize: 18 });
 
-  function pct(t) {
-    const pages = paginate(t, box);
+  function pct(title: Title): number {
+    const pages = paginate(title, box);
     const total = Math.max(1, Math.ceil(pages.length / 2));
-    return Math.min(100, Math.round(((library.progress[t.id] || 0) / total) * 100));
+    return Math.min(
+      100,
+      Math.round(((library.progress[title.id] ?? 0) / total) * 100)
+    );
   }
 
-  function flash(msg) {
-    toast = msg;
+  function flash(message: string): void {
+    toast = message;
     setTimeout(() => (toast = ''), 2600);
   }
 
-  async function deliver(t, channel) {
+  async function deliver(title: Title, channel: DeliveryChannel): Promise<void> {
     // POST to /api/deliver in production; the endpoint signs a download URL
     // or hands the file to your mail provider.
-    flash(channel === 'email' ? `Sent — check your inbox for ${t.title}` : `${t.title}.epub — download started`);
+    flash(
+      channel === 'email'
+        ? `Sent — check your inbox for ${title.title}`
+        : `${title.title}.epub — download started`
+    );
   }
 </script>
 
@@ -61,18 +71,19 @@
        needs headroom for the pulled book's lift and perspective scale. -->
   <div class="case-scroll">
     <div class="bookcase">
-    {#each shelf as t}
+    {#each shelf as t (t.id)}
       {@const shelfH = 200 + (t.title.length % 5) * 9}
       {@const shelfW = Math.round(shelfH * 0.66)}
       <!-- Spine width is the thickness of the object: a bound volume stands
            square on the shelf, a stapled issue is barely more than card. -->
       {@const spineW = t.kind === 'comic' ? 18 : 52}
+      {@const pair = SWATCHES[t.cover % SWATCHES.length] ?? SWATCHES[0]}
       <!-- A real box: spine facing out, front cover receding into the shelf,
            paper edge on top. A single plane just narrows as it rotates. -->
       <a
         class="book"
         class:pulling={pullingId === t.id}
-        href="/read/{t.id}"
+        href={resolve('/read/[id]', { id: t.id })}
         onclick={(e) => {
           e.preventDefault();
           pull(t);
@@ -92,7 +103,7 @@
 
         <span
           class="spine-plate"
-          style:background="linear-gradient(90deg, {SWATCHES[t.cover % SWATCHES.length][1]}, {SWATCHES[t.cover % SWATCHES.length][0]} 70%, {SWATCHES[t.cover % SWATCHES.length][1]})"
+          style:background="linear-gradient(90deg, {pair[1]}, {pair[0]} 70%, {pair[1]})"
         >
           <span class="shelf-title" style:font-size={t.kind === 'comic' ? '10px' : '15px'}>{t.title}</span>
         </span>
@@ -104,7 +115,7 @@
   </div>
 
   <div class="rows">
-    {#each shelf as t}
+    {#each shelf as t (t.id)}
       <div class="row">
         <div class="head">
           <span class="name">{t.title}</span>
@@ -112,7 +123,7 @@
         </div>
         <div class="bar"><div class="fill" style:width="{pct(t)}%"></div></div>
         <div class="acts">
-          <a class="btn small" href="/read/{t.id}">{pct(t) > 0 ? 'Resume' : 'Read'}</a>
+          <a class="btn small" href={resolve('/read/[id]', { id: t.id })}>{pct(t) > 0 ? 'Resume' : 'Read'}</a>
           <button class="btn ghost small" onclick={() => deliver(t, 'email')}>Email me the file</button>
           <button class="btn ghost small" onclick={() => deliver(t, 'download')}>Download EPUB</button>
         </div>

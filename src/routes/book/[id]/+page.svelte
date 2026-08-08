@@ -1,18 +1,23 @@
-<script>
+<script lang="ts">
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
+  import { resolve } from '$app/paths';
   import BookVolume from '$lib/components/BookVolume.svelte';
   import { titles } from '$lib/stores/titles.svelte';
   import { library } from '$lib/stores/library.svelte';
   import { money } from '$lib/data/catalog';
 
-  const title = $derived(titles.get($page.params.id));
+  const title = $derived($page.params.id ? titles.get($page.params.id) : undefined);
   const owned = $derived(title ? library.owns(title.id) : false);
   const excerpt = $derived(title?.chapters?.[0]?.paras.slice(0, 2) || []);
 
-  function buy() {
-    if (owned) return goto(`/read/${title.id}`);
-    goto(`/checkout/${title.id}`);
+  function buy(): void {
+    if (!title) return;
+    if (owned) {
+      void goto(resolve('/read/[id]', { id: title.id }));
+      return;
+    }
+    void goto(resolve('/checkout/[id]', { id: title.id }));
   }
 </script>
 
@@ -29,7 +34,7 @@
         <button class="btn" onclick={buy}>
           {owned ? 'In your shelf — read now' : `Buy · ${money(title.price)}`}
         </button>
-        <a class="btn ghost" href="/read/{title.id}?sample=1">
+        <a class="btn ghost" href={resolve('/read/[id]?sample=1', { id: title.id })}>
           {title.kind === 'comic' ? 'Preview first pages' : 'Read chapter one free'}
         </a>
       </div>
@@ -50,14 +55,14 @@
       <div class="author">{title.author}</div>
       <p class="summary">{title.summary}</p>
 
-      {#each excerpt as para}
+      {#each excerpt as para, index (index)}
         <p class="excerpt">{para}</p>
       {/each}
 
       {#if title.chapters}
         <div class="toc">
           <div class="mono">Contents</div>
-          {#each title.chapters as ch, i}
+          {#each title.chapters as ch, i (ch.title)}
             <div class="row">
               <span>{ch.title}</span>
               <span class="mono plain">{i === 0 ? 'free' : `chapter ${i + 1}`}</span>
@@ -68,7 +73,7 @@
     </div>
   </section>
 {:else}
-  <p class="missing">No such title. <a href="/catalog">Back to the catalog</a></p>
+  <p class="missing">No such title. <a href={resolve('/catalog')}>Back to the catalog</a></p>
 {/if}
 
 <style>
