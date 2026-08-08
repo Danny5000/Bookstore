@@ -344,12 +344,12 @@
     }
     if (phase !== 'reading') return;
     settleTurn();
+    if (guided) return turnPanel(dir);
     // Turning back past the first spread closes the book again.
     if (dir < 0 && sheet === 0) {
       startClosing();
       return;
     }
-    if (guided) return turnPanel(dir);
     // At sheet k the visible spread is [back of k-1 | front of k], so the last
     // page only shows once every sheet is turned: sheet === totalSheets.
     if (dir > 0 && !sampling && sheet >= totalSheets) {
