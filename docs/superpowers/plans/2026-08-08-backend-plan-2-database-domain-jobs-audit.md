@@ -1578,10 +1578,7 @@ describe('redactAuditDetails', () => {
       })
     ).toEqual({
       title: 'A Safe Title',
-      credentials: {
-        password: '[redacted]',
-        resetToken: '[redacted]'
-      },
+      credentials: '[redacted]',
       changes: [{ field: 'visibility', value: 'private' }]
     });
   });
@@ -1754,11 +1751,21 @@ describe('audit events', () => {
         .update(auditEvents)
         .set({ action: 'tampered' })
         .where(eq(auditEvents.id, event.id))
-    ).rejects.toThrow(/audit_events is append-only/);
+    ).rejects.toMatchObject({
+      cause: expect.objectContaining({
+        code: '55000',
+        message: 'audit_events is append-only'
+      })
+    });
 
     await expect(
       databaseClient.db.execute(sql`delete from audit_events where id = ${event.id}`)
-    ).rejects.toThrow(/audit_events is append-only/);
+    ).rejects.toMatchObject({
+      cause: expect.objectContaining({
+        code: '55000',
+        message: 'audit_events is append-only'
+      })
+    });
   });
 });
 ```
