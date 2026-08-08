@@ -1680,6 +1680,8 @@ docker compose --file compose.prod.yaml up --detach --wait
 
 `APP_IMAGE` must identify the already-built immutable application image. Caddy is the only service with published ports. PostgreSQL persists in `postgres_data` and is reachable only on the Compose network. The database password becomes `/run/secrets/database_password` in the app and PostgreSQL containers; it is not stored in a production `.env` file.
 
+The application container runs as the unprivileged `node` user with `no-new-privileges`. Its root filesystem remains writable in Plan 1 because Docker Compose cannot materialize an environment-backed secret into a read-only container root filesystem; Plan 7 must revisit that control alongside the production secret provider.
+
 Check the baseline:
 
 ```powershell
@@ -1694,7 +1696,7 @@ docker compose --file compose.prod.yaml logs --tail 100 app postgres caddy
 - Plan 2 adds the database adapter, migrations, worker, jobs, and database readiness.
 - Plan 3 adds the provider-neutral SMTP adapter and connects it to Mailpit in development.
 - Plan 4 adds the private uploads volume and storage adapters.
-- Plan 7 adds the Hetzner deployment runbook, backup/restore procedures, monitoring, and final capacity tuning.
+- Plan 7 adds the Hetzner deployment runbook, backup/restore procedures, monitoring, final capacity tuning, and the read-only-rootfs review.
 ~~~~
 
 - [ ] **Step 2: Update the README development entry point**

@@ -6,27 +6,29 @@ a SvelteKit app.
 
 ## Development
 
-Requirements: Node.js 26.7.x and npm 11.12.1 or newer within the npm 11 line.
+Requirements: Node.js 26.7.x, npm 11.19.x, Docker, and Docker Compose 2.30 or newer.
 
-```bash
-npm install
-npm run dev
+```powershell
+Copy-Item .env.example .env
+npm ci
+npm run test:e2e:install
+docker compose --env-file .env --file compose.dev.yaml up --build --wait
 ```
+
+The storefront runs at `http://localhost:5173`; Mailpit runs at `http://localhost:8025`. See [runtime environments](docs/runtime-environments.md) for host-run development, production process secrets, health checks, and cleanup commands.
 
 Quality gates:
 
-```bash
+```powershell
 npm run check
 npm run lint
-npm run test
+npm run test:unit
+npm run test:e2e
 npm run build
 npm run verify
 ```
 
-The current frontend still uses prototype local state and runs without service
-credentials; checkout falls back to a local grant so the full flow remains
-clickable. Backend architecture and delivery sequencing are defined in the
-[full-stack design specification](docs/superpowers/specs/2026-08-08-bookstore-full-stack-design.md).
+Development retains the clickable frontend prototype. The production Compose baseline is deliberately locked to maintenance mode until later backend plans replace the prototype's browser identity, local purchase grants, in-memory entitlements, and fake delivery seams.
 
 ## Routes
 
