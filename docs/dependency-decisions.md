@@ -10,6 +10,12 @@ Checked against the npm registry on 2026-08-08.
 | SvelteKit / Svelte | Current stable | Keep both on their mutually supported stable releases. |
 | Vite / Svelte Vite plugin | Current compatible stable pair | Upgrade together because their peer ranges are coupled. |
 | adapter-node | Current SvelteKit-compatible stable | Replaces adapter-auto for the Docker/Node deployment target. |
+| npm | 11.19.x | Matches the npm release bundled in the exact Node 26.7.0 development and production image; reconsider npm 12 when the selected Node image ships it. |
+| Playwright | 1.62.x | Current stable browser-test runner; Chromium is the initial cross-browser contract and more projects can be added when browser-specific defects justify them. |
+| Zod | 4.4.x | Current stable runtime schema validator; restricted to trusted configuration and later request-boundary schemas. |
+| PostgreSQL image | 18.4 Alpine | Exact production/development database tag; mount `/var/lib/postgresql` for the PostgreSQL 18 image layout. |
+| Mailpit image | 1.30.0 | Exact development-only SMTP capture service. |
+| Caddy image | 2.11.4 Alpine | Exact production reverse-proxy baseline. |
 | Stripe SDK | Current stable | Upgrade in isolation and verify checkout/webhook types and runtime behavior. |
 
 TypeScript 6.0.3 remains intentional: as checked on 2026-08-08,
@@ -17,7 +23,7 @@ TypeScript 6.0.3 remains intentional: as checked on 2026-08-08,
 `svelte-check` 4.7.5 accepts TypeScript 5 or 6. Remove this pin when both stable
 packages support TypeScript 7.
 
-Run `npm outdated`, `npm audit`, `npm ls`, and `npm run verify` before completing Plan 0.
+Run `npm outdated`, `npm audit`, `npm ls`, and `npm run verify` before completing each implementation plan.
 Any remaining direct-package lag requires a dated compatibility reason and a removal condition in this file.
 
 ## Accepted audit finding
