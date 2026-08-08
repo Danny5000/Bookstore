@@ -4,14 +4,29 @@ Bookstore + in-browser reader for novels and comics. Ported from the HTML design
 prototype: same layout, tokens, typography and page-turn engine, restructured as
 a SvelteKit app.
 
+## Development
+
+Requirements: Node.js 24.15.x and npm 11.12.x.
+
 ```bash
 npm install
-cp .env.example .env      # add Stripe + mail keys when you have them
 npm run dev
 ```
 
-Runs with no keys configured — checkout falls back to a local grant so the whole
-flow stays clickable.
+Quality gates:
+
+```bash
+npm run check
+npm run lint
+npm run test
+npm run build
+npm run verify
+```
+
+The current frontend still uses prototype local state and runs without service
+credentials; checkout falls back to a local grant so the full flow remains
+clickable. Backend architecture and delivery sequencing are defined in the
+[full-stack design specification](docs/superpowers/specs/2026-08-08-bookstore-full-stack-design.md).
 
 ## Routes
 
@@ -42,7 +57,7 @@ flow stays clickable.
 - **Drag** — pointer events on `.book`; the drag ratio is `dx / half-width`,
   released past 0.28 to commit the turn. Also arrow keys and the left/right
   edge hit zones.
-- **Pagination** — `src/lib/paginate.js` derives a character budget from the
+- **Pagination** — `src/lib/paginate.ts` derives a character budget from the
   *measured* page box (`pageBox()`), so text reflows on resize and type-size
   change instead of clipping.
 - **Comics** — page view uses the same sheets with a panel grid; guided view
@@ -52,7 +67,7 @@ flow stays clickable.
   the paywall covers the stage.
 
 Reader prefs (type size, typeface, paper), progress and bookmarks live in
-`src/lib/stores/library.svelte.js` (localStorage; move to the account when auth
+`src/lib/stores/library.svelte.ts` (localStorage; move to the account when auth
 is real).
 
 ## Styling
@@ -62,16 +77,17 @@ scoped component CSS. Themes are attribute-based: `:root[data-theme="vellum"]`
 overrides the token block, `theme.set()` writes `document.documentElement`.
 
 Two themes ship: **Nocturne** (default) and **Vellum**. Add a third by appending
-to `THEMES` in `src/lib/stores/theme.svelte.js` and a matching token block.
+to `THEMES` in `src/lib/stores/theme.svelte.ts` and a matching token block.
 
 ## Data
 
-`src/lib/data/catalog.js` holds the seed titles; `src/lib/stores/titles.svelte.js`
+`src/lib/data/catalog.ts` holds the seed titles; `src/lib/stores/titles.svelte.ts`
 merges them with anything published in Studio. Swap both for `load()` functions
 against your DB — components only use `titles.all` / `titles.get(id)`, and the
-`Title` shape is documented in `catalog.js`.
+`Title` union is defined in `src/lib/types/catalog.ts`.
 
-Suggested schema is in `src/lib/server/db.js`.
+The prototype schema sketch is in `src/lib/server/db.ts`; the approved PostgreSQL
+model is in the full-stack design specification.
 
 ## Payments
 
@@ -87,23 +103,20 @@ stripe listen --forward-to localhost:5173/api/stripe-webhook
 
 ## Auth
 
-`src/hooks.server.js` puts `locals.user` in place; `session.svelte.js` is a
-localStorage placeholder for the UI. Pick one real implementation:
-
-- **Lucia** — full control, own your tables.
-- **Auth.js (@auth/sveltekit)** — Google / Apple providers and magic links out
-  of the box.
-- **Supabase / Clerk** — hosted, fastest to ship.
-
-The UI already covers: password sign-in, magic link, Google, Apple, and guest
-checkout (account created from the receipt email).
+`src/hooks.server.ts` puts `locals.user` in place;
+`src/lib/stores/session.svelte.ts` is a localStorage placeholder for the current
+UI. The approved backend will use Better Auth for email/password accounts,
+password reset, magic links, sessions, and claiming guest purchases. Third-party
+OAuth is outside the first backend release, even though the prototype still
+contains non-functional Google and Apple controls.
 
 ## Delivery
 
-`src/lib/server/mail.js` is the seam. EPUB is a zip of XHTML + OPF + NCX
-(`epub-gen-memory` works server-side); PDF can be a Playwright print of the same
-chapter HTML. Store built files in object storage and email a link or an
-attachment; `/api/deliver` re-issues both for owners.
+`src/lib/server/mail.ts` is the current placeholder seam. The approved backend
+retains uploaded EPUB and CBZ/ZIP originals on local disk behind a storage
+adapter, with an S3-compatible implementation stubbed for later. A
+provider-neutral SMTP adapter sends expiring download links; `/api/deliver`
+re-issues delivery for owners.
 
 ## Not yet wired
 

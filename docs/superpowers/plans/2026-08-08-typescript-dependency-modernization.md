@@ -1152,7 +1152,7 @@ npx tsc --noEmit
 npm run build
 ~~~
 
-Expected: all four pagination tests pass and the build exits 0 with the same UI warnings still isolated to unconverted Svelte components.
+Expected: all five pagination tests pass and the build exits 0 with the same UI warnings still isolated to unconverted Svelte components.
 
 - [ ] **Step 6: Commit pagination independently**
 
@@ -2864,7 +2864,7 @@ if ($javascript.Count -gt 0) {
   throw 'JavaScript application source remains'
 }
 
-$untypedSvelte = @(rg -n '<script(?! lang="ts")' --pcre2 src -g '*.svelte')
+$untypedSvelte = @(rg -n '<script(?! lang=\x22ts\x22)' --pcre2 src -g '*.svelte')
 if ($untypedSvelte.Count -gt 0) {
   $untypedSvelte
   throw 'Untyped Svelte scripts remain'
@@ -2878,14 +2878,16 @@ Expected: both arrays are empty. `svelte.config.js` and `eslint.config.js` are o
 Run:
 
 ~~~powershell
-$escapes = @(rg -n '\bany\b|@ts-ignore|@ts-expect-error' src -g '*.ts' -g '*.svelte')
-if ($escapes.Count -gt 0) {
-  $escapes
-  throw 'TypeScript escape hatch found'
+$suppressions = @(rg -n '@ts-ignore|@ts-expect-error' src -g '*.ts' -g '*.svelte')
+if ($suppressions.Count -gt 0) {
+  $suppressions
+  throw 'TypeScript compiler suppression found'
 }
+
+npx eslint src
 ~~~
 
-Expected: no matches. Validated, narrow assertions in `persistence.ts` are allowed because the guards prove their shapes first; `any` and compiler suppressions are not.
+Expected: no suppression matches and ESLint exits 0. The configured `@typescript-eslint/no-explicit-any` rule performs the syntax-aware check for broad `any` types without misclassifying prose or test matchers. Validated, narrow assertions in `persistence.ts` are allowed because the guards prove their shapes first; explicit `any` and compiler suppressions are not.
 
 - [ ] **Step 4: Run the complete automated verification**
 
@@ -2899,7 +2901,7 @@ Expected:
 
 - `svelte-check`: 0 errors and 0 warnings.
 - ESLint: exit 0 with no errors.
-- Vitest: 7 test files and 18 tests pass.
+- Vitest: 7 test files and 19 tests pass.
 - adapter-node production build: exit 0 with no adapter-auto or configuration warning.
 
 - [ ] **Step 5: Recheck dependency health**
@@ -2931,7 +2933,7 @@ Using the in-app browser, verify:
 5. `/read/vector?sample=1` switches between page and guided comic modes.
 6. `/studio` accepts pasted prose and comic filenames and publishes a prototype title.
 7. `/checkout/salt` reaches the local development grant when Stripe is not configured.
-8. `/library` shows the granted title, progress, bookmarks, and delivery feedback.
+8. `/library` shows the granted title, progress, and delivery feedback; the reader retains bookmarks.
 9. Theme and prototype session state survive a reload.
 
 Expected: no browser console error and no intended visual or interaction regression from the pre-migration prototype.
