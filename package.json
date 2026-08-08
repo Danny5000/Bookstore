@@ -16,6 +16,8 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:unit": "vitest run",
+    "test:integration:raw": "vitest run --config vitest.integration.config.ts",
+    "test:integration": "tsx scripts/with-test-database.ts npm run test:integration:raw",
     "test:e2e": "playwright test",
     "test:e2e:headed": "playwright test --headed",
     "test:e2e:install": "playwright install chromium",
