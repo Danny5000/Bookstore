@@ -6,7 +6,7 @@ a SvelteKit app.
 
 ## Development
 
-Requirements: Node.js 24.15.x and npm 11.12.x.
+Requirements: Node.js 26.7.x and npm 11.12.1 or newer within the npm 11 line.
 
 ```bash
 npm install
