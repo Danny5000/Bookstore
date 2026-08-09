@@ -12,10 +12,11 @@ Requirements: Node.js 26.7.x, npm 11.19.x, Docker, and Docker Compose 2.30 or ne
 Copy-Item .env.example .env
 npm ci
 npm run test:e2e:install
+docker compose --env-file .env --file compose.dev.yaml --profile tools run --rm migrate
 docker compose --env-file .env --file compose.dev.yaml up --build --wait
 ```
 
-The storefront runs at `http://localhost:5173`; Mailpit runs at `http://localhost:8025`. See [runtime environments](docs/runtime-environments.md) for host-run development, production process secrets, health checks, and cleanup commands.
+The storefront runs at `http://localhost:5173`; Mailpit runs at `http://localhost:8025`; the PostgreSQL-backed worker is private to Compose. See [runtime environments](docs/runtime-environments.md) and [database and workers](docs/database-and-workers.md) for host-run development, migrations, process secrets, health checks, tests, and cleanup commands.
 
 Quality gates:
 
@@ -23,6 +24,7 @@ Quality gates:
 npm run check
 npm run lint
 npm run test:unit
+npm run test:integration
 npm run test:e2e
 npm run build
 npm run verify

@@ -3694,7 +3694,7 @@ Run:
 
 ```powershell
 npm outdated --json
-rg -n "better-auth|nodemailer|@aws-sdk|redis|bullmq" package.json package-lock.json src
+rg -n "better-auth|nodemailer|@aws-sdk|redis|bullmq" package.json src
 git diff --check
 git status --short
 git log --oneline --decorate -12
@@ -3703,7 +3703,7 @@ git log --oneline --decorate -12
 Expected:
 
 - Only the documented TypeScript 7 difference remains in `npm outdated`.
-- The scope scan returns no Better Auth, SMTP, S3 SDK, Redis, or BullMQ dependency/import.
+- The manifest/source scope scan returns no Better Auth, SMTP, S3 SDK, Redis, or BullMQ dependency/import. The lockfile may name optional Drizzle adapter peers that are not installed.
 - No generated reports, `.env`, worker-ready file, or database data is tracked.
 - Commits are separated by dependencies/configuration, test database, schema/migrations, readiness, audit/policy, catalog, jobs, outbox/worker, Compose, and documentation.
 
