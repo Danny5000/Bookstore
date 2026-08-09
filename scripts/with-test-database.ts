@@ -73,7 +73,24 @@ try {
     JOB_LEASE_MS: '5000',
     JOB_RETRY_BASE_MS: '10',
     JOB_RETRY_MAX_MS: '1000',
-    WORKER_READY_FILE: join(tmpdir(), `pale-orbit-worker-${process.pid}.ready`)
+    WORKER_READY_FILE: join(tmpdir(), `pale-orbit-worker-${process.pid}.ready`),
+    AUTH_SECRET: 'test-only-auth-secret-at-least-thirty-two-bytes',
+    AUTH_SESSION_EXPIRES_SECONDS: '3600',
+    AUTH_VERIFICATION_EXPIRES_SECONDS: '600',
+    AUTH_RESET_EXPIRES_SECONDS: '600',
+    AUTH_MAGIC_EXPIRES_SECONDS: '600',
+    AUTH_RATE_LIMIT_WINDOW_SECONDS: '60',
+    AUTH_RATE_LIMIT_MAX: '100',
+    AUTH_LOGIN_RATE_LIMIT_MAX: '5',
+    AUTH_EMAIL_RATE_LIMIT_MAX: '3',
+    SMTP_HOST: '127.0.0.1',
+    SMTP_PORT: '1025',
+    SMTP_SECURE: 'false',
+    SMTP_REQUIRE_TLS: 'false',
+    SMTP_FROM: 'Pale Orbit Test <books@paleorbit.test>',
+    SMTP_CONNECTION_TIMEOUT_MS: '5000',
+    SMTP_GREETING_TIMEOUT_MS: '5000',
+    SMTP_SOCKET_TIMEOUT_MS: '10000'
   };
 
   runChecked('npm', ['run', 'db:migrate:raw'], testEnvironment);

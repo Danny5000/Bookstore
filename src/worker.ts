@@ -4,6 +4,9 @@ import { hostname } from 'node:os';
 import { loadApplicationConfig } from '$lib/server/config/load';
 import { createDatabaseClient } from '$lib/server/db/client';
 import { probeDatabase } from '$lib/server/db/health';
+import { AUTH_EMAIL_TOPIC } from '$lib/server/email/enqueue';
+import { createAuthEmailHandler } from '$lib/server/email/handler';
+import { createNodemailerEmailTransport } from '$lib/server/email/nodemailer';
 import { createPostgresJobRepository } from '$lib/server/jobs/repository';
 import { runWorker } from '$lib/server/jobs/runner';
 import type { JobHandler } from '$lib/server/jobs/types';
@@ -17,7 +20,13 @@ const config = loadApplicationConfig(process.env);
 const databaseClient = createDatabaseClient(config.database);
 const controller = new AbortController();
 const workerId = `${hostname()}:${process.pid}:${randomUUID()}`;
-const topicHandlers = new Map<string, OutboxTopicHandler>();
+const emailTransport = createNodemailerEmailTransport(config.smtp);
+const topicHandlers = new Map<string, OutboxTopicHandler>([
+  [
+    AUTH_EMAIL_TOPIC,
+    createAuthEmailHandler(emailTransport, config.smtp.from, new URL(config.origin).hostname)
+  ]
+]);
 const handlers = new Map<string, JobHandler>([
   [OUTBOX_DISPATCH_JOB, createOutboxDispatchHandler(databaseClient.db, topicHandlers)]
 ]);
@@ -47,6 +56,7 @@ try {
   });
   process.exitCode = 1;
 } finally {
+  emailTransport.close();
   await rm(config.jobs.workerReadyFile, { force: true });
   await databaseClient.close();
 }
