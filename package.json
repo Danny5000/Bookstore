@@ -18,6 +18,10 @@
     "db:check": "drizzle-kit check",
     "db:migrate:raw": "tsx src/migrate.ts",
     "db:migrate": "node --env-file-if-exists=.env --import tsx src/migrate.ts",
+    "auth:schema": "npx --yes auth@1.6.26 generate --config ./src/lib/server/auth/schema-config.ts --output ./src/lib/server/db/schema/auth.ts --yes",
+    "auth:info": "npx --yes auth@1.6.26 info --config ./src/lib/server/auth/schema-config.ts",
+    "admin:bootstrap:raw": "tsx src/bootstrap-admin.ts",
+    "admin:bootstrap": "node --env-file-if-exists=.env --import tsx src/bootstrap-admin.ts",
     "worker:dev": "node --env-file-if-exists=.env --import tsx src/worker.ts",
     "worker:watch": "node --watch --env-file-if-exists=.env --import tsx src/worker.ts",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
@@ -42,6 +46,7 @@
     "@sveltejs/kit": "^2.70.2",
     "@sveltejs/vite-plugin-svelte": "^7.3.0",
     "@types/node": "^26.2.0",
+    "@types/nodemailer": "8.0.1",
     "@types/pg": "8.21.0",
     "drizzle-kit": "0.31.10",
     "eslint": "^10.8.1",
@@ -56,7 +61,9 @@
     "vitest": "^4.1.10"
   },
   "dependencies": {
+    "better-auth": "1.6.26",
     "drizzle-orm": "0.45.2",
+    "nodemailer": "9.0.5",
     "pg": "8.23.0",
     "stripe": "^22.4.0",
     "zod": "^4.4.3"

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   ConfigurationError,
+  readOptionalSetting,
   readRequiredSetting,
   type EnvironmentValues
 } from './read-setting';
@@ -78,5 +79,43 @@ describe('readRequiredSetting', () => {
     expect((thrown as Error).message).toBe(
       'Could not read the secret file configured for DATABASE_PASSWORD_FILE'
     );
+  });
+});
+
+describe('readOptionalSetting', () => {
+  it('returns undefined when neither direct nor file-backed value is present', () => {
+    expect(readOptionalSetting({}, 'SMTP_USER', () => '')).toBeUndefined();
+  });
+
+  it('returns a trimmed direct value', () => {
+    expect(readOptionalSetting({ SMTP_USER: ' mailer ' }, 'SMTP_USER', () => '')).toBe(
+      'mailer'
+    );
+  });
+
+  it('reads and trims a file-backed value', () => {
+    expect(
+      readOptionalSetting(
+        { SMTP_PASSWORD_FILE: '/run/secrets/smtp' },
+        'SMTP_PASSWORD',
+        () => ' secret\n'
+      )
+    ).toBe('secret');
+  });
+
+  it('rejects ambiguous direct and file-backed values', () => {
+    expect(() =>
+      readOptionalSetting(
+        { SMTP_PASSWORD: 'direct', SMTP_PASSWORD_FILE: '/run/secrets/smtp' },
+        'SMTP_PASSWORD'
+      )
+    ).toThrow(/SMTP_PASSWORD and SMTP_PASSWORD_FILE cannot both be set/);
+  });
+
+  it('normalizes empty direct and file-backed values to undefined', () => {
+    expect(readOptionalSetting({ SMTP_USER: '  ' }, 'SMTP_USER')).toBeUndefined();
+    expect(
+      readOptionalSetting({ SMTP_USER_FILE: '/run/secrets/user' }, 'SMTP_USER', () => '\n')
+    ).toBeUndefined();
   });
 });

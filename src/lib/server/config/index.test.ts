@@ -19,7 +19,24 @@ const VALID_DEVELOPMENT_ENVIRONMENT: EnvironmentValues = {
   JOB_LEASE_MS: '30000',
   JOB_RETRY_BASE_MS: '1000',
   JOB_RETRY_MAX_MS: '300000',
-  WORKER_READY_FILE: '.worker-ready'
+  WORKER_READY_FILE: '.worker-ready',
+  AUTH_SECRET: 'test-only-auth-secret-at-least-thirty-two-bytes',
+  AUTH_SESSION_EXPIRES_SECONDS: '604800',
+  AUTH_VERIFICATION_EXPIRES_SECONDS: '3600',
+  AUTH_RESET_EXPIRES_SECONDS: '3600',
+  AUTH_MAGIC_EXPIRES_SECONDS: '900',
+  AUTH_RATE_LIMIT_WINDOW_SECONDS: '60',
+  AUTH_RATE_LIMIT_MAX: '100',
+  AUTH_LOGIN_RATE_LIMIT_MAX: '5',
+  AUTH_EMAIL_RATE_LIMIT_MAX: '3',
+  SMTP_HOST: '127.0.0.1',
+  SMTP_PORT: '1025',
+  SMTP_SECURE: 'false',
+  SMTP_REQUIRE_TLS: 'false',
+  SMTP_FROM: 'Pale Orbit Press <books@paleorbit.local>',
+  SMTP_CONNECTION_TIMEOUT_MS: '5000',
+  SMTP_GREETING_TIMEOUT_MS: '5000',
+  SMTP_SOCKET_TIMEOUT_MS: '10000'
 };
 
 describe('loadApplicationConfig', () => {
@@ -45,6 +62,31 @@ describe('loadApplicationConfig', () => {
         retryBaseMs: 1000,
         retryMaxMs: 300000,
         workerReadyFile: '.worker-ready'
+      },
+      auth: {
+        secret: 'test-only-auth-secret-at-least-thirty-two-bytes',
+        sessionExpiresIn: 604800,
+        verificationExpiresIn: 3600,
+        resetExpiresIn: 3600,
+        magicExpiresIn: 900,
+        rateLimit: {
+          windowSeconds: 60,
+          max: 100,
+          loginMax: 5,
+          emailMax: 3
+        }
+      },
+      smtp: {
+        host: '127.0.0.1',
+        port: 1025,
+        secure: false,
+        requireTls: false,
+        user: undefined,
+        password: undefined,
+        from: 'Pale Orbit Press <books@paleorbit.local>',
+        connectionTimeoutMs: 5000,
+        greetingTimeoutMs: 5000,
+        socketTimeoutMs: 10000
       }
     });
   });
@@ -96,7 +138,9 @@ describe('loadApplicationConfig', () => {
       ORIGIN: 'https://books.example.com',
       DATABASE_HOST: 'postgres',
       DATABASE_PASSWORD: undefined,
-      DATABASE_PASSWORD_FILE: '/run/secrets/database_password'
+      DATABASE_PASSWORD_FILE: '/run/secrets/database_password',
+      SMTP_USER: 'mailer',
+      SMTP_PASSWORD: 'smtp-secret'
     };
 
     const config = loadApplicationConfig(source, (path) => {
@@ -120,6 +164,46 @@ describe('loadApplicationConfig', () => {
     expect(() => loadApplicationConfig(source)).toThrow(
       /APPLICATION_MODE: production must use maintenance mode/
     );
+  });
+
+  it('rejects an auth secret shorter than 32 characters', () => {
+    expect(() =>
+      loadApplicationConfig({ ...VALID_DEVELOPMENT_ENVIRONMENT, AUTH_SECRET: 'too-short' })
+    ).toThrow(/AUTH_SECRET/);
+  });
+
+  it('rejects invalid SMTP security combinations and credentials', () => {
+    expect(() =>
+      loadApplicationConfig({
+        ...VALID_DEVELOPMENT_ENVIRONMENT,
+        SMTP_SECURE: 'true',
+        SMTP_REQUIRE_TLS: 'true'
+      })
+    ).toThrow(/SMTP_REQUIRE_TLS/);
+
+    expect(() =>
+      loadApplicationConfig({ ...VALID_DEVELOPMENT_ENVIRONMENT, SMTP_USER: 'mailer' })
+    ).toThrow(/SMTP_PASSWORD/);
+  });
+
+  it('requires https and authenticated SMTP in production', () => {
+    expect(() =>
+      loadApplicationConfig({
+        ...VALID_DEVELOPMENT_ENVIRONMENT,
+        APP_ENV: 'production',
+        APPLICATION_MODE: 'maintenance',
+        ORIGIN: 'http://books.example.com'
+      })
+    ).toThrow(/ORIGIN: production must use https/);
+
+    expect(() =>
+      loadApplicationConfig({
+        ...VALID_DEVELOPMENT_ENVIRONMENT,
+        APP_ENV: 'production',
+        APPLICATION_MODE: 'maintenance',
+        ORIGIN: 'https://books.example.com'
+      })
+    ).toThrow(/SMTP_USER: production SMTP credentials are required/);
   });
 
   it.each([

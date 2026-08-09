@@ -61,3 +61,31 @@ export function readRequiredSetting(
 
   return value;
 }
+
+export function readOptionalSetting(
+  source: EnvironmentValues,
+  name: string,
+  readSecretFile: SecretFileReader = readUtf8File
+): string | undefined {
+  const directValue = source[name];
+  const fileName = `${name}_FILE`;
+  const secretPath = source[fileName];
+
+  if (directValue !== undefined && secretPath !== undefined) {
+    throw new ConfigurationError(`${name} and ${fileName} cannot both be set`);
+  }
+
+  if (directValue !== undefined) {
+    return directValue.trim() || undefined;
+  }
+
+  if (secretPath === undefined || secretPath.trim().length === 0) return undefined;
+
+  try {
+    return removeOneTrailingLineEnding(readSecretFile(secretPath.trim())).trim() || undefined;
+  } catch (cause: unknown) {
+    throw new ConfigurationError(`Could not read the secret file configured for ${fileName}`, {
+      cause
+    });
+  }
+}

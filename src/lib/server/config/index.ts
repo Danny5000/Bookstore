@@ -6,8 +6,10 @@ export { loadApplicationConfig } from './load';
 export type {
   ApplicationConfig,
   ApplicationMode,
+  AuthConfig,
   DatabaseConfig,
-  JobConfig
+  JobConfig,
+  SmtpConfig
 } from './schema';
 
 let cachedConfiguration: ApplicationConfig | undefined;

@@ -22,6 +22,9 @@ Checked against the npm registry on 2026-08-08.
 | node-postgres (`pg`) | 8.23.0 | Current stable pooled PostgreSQL driver supported by Drizzle; web, worker, and migration processes own separate bounded pools. |
 | `@types/pg` | 8.21.0 | Current node-postgres type declarations required by the strict TypeScript build. |
 | tsx | 4.23.11 | Current stable development-only TypeScript runner for worker, migration, and test orchestration entry points. |
+| Better Auth | 1.6.26 | Current stable authentication runtime; its peer ranges accept the selected SvelteKit, Svelte, Drizzle, PostgreSQL, and Vitest versions. |
+| Nodemailer | 9.0.5 | Current stable SMTP implementation behind the provider-neutral email adapter. |
+| `@types/nodemailer` | 8.0.1 | Current published declarations; remove when Nodemailer ships compatible declarations directly. |
 
 TypeScript 6.0.3 remains intentional: as checked on 2026-08-08,
 `typescript-eslint` 8.66.0 accepts TypeScript `>=4.8.4 <6.1.0` and
@@ -30,6 +33,15 @@ packages support TypeScript 7.
 
 Run `npm outdated`, `npm audit`, `npm ls`, and `npm run verify` before completing each implementation plan.
 Any remaining direct-package lag requires a dated compatibility reason and a removal condition in this file.
+
+The Better Auth schema generator is invoked as exact `auth@1.6.26` by the
+`auth:schema` and `auth:info` scripts instead of being committed to the application
+dependency tree. On 2026-08-08 that CLI's Prisma parser pulled Lodash 4.17.23,
+which npm reports with an unfixed high-severity advisory. Schema generation is a
+manual/CI tool run only against this trusted repository, never a production runtime
+or network service. Keep the version exact, do not run it against untrusted config,
+and restore it as a locked development dependency when its dependency graph no
+longer contains the advisory.
 
 ## Accepted audit findings
 
