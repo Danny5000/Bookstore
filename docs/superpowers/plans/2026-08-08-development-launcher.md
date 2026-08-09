@@ -14,6 +14,7 @@
 
 - Create `scripts/start-dev.ps1`: validate prerequisites, resolve the repository root, preserve or create `.env`, run install/migration/start commands, and print the handoff summary.
 - Create `scripts/start-dev.test.ts`: exercise the PowerShell launcher against isolated command shims and temporary repository fixtures.
+- Modify `vitest.config.ts`: include colocated tests under `scripts/` in the unit suite.
 - Modify `README.md`: make the launcher the primary development entry point while retaining links to the manual runbooks.
 
 ### Task 1: Implement the tested PowerShell launcher
@@ -21,6 +22,7 @@
 **Files:**
 - Create: `scripts/start-dev.test.ts`
 - Create: `scripts/start-dev.ps1`
+- Modify: `vitest.config.ts`
 
 - [ ] **Step 1: Write the failing orchestration tests**
 
@@ -170,6 +172,12 @@ describeOnWindows('start-dev.ps1', () => {
 
 - [ ] **Step 2: Run the focused test and verify the missing launcher fails**
 
+Add the script test location to `vitest.config.ts` before running RED:
+
+```typescript
+include: ['src/**/*.test.ts', 'scripts/**/*.test.ts'],
+```
+
 Run:
 
 ```powershell
@@ -240,7 +248,7 @@ try {
 
   Invoke-CheckedCommand -FilePath 'npm' -ArgumentList @('ci')
 
-  $composeArguments = @('--env-file', '.env', '--file', 'compose.dev.yaml')
+  $composeArguments = @('compose', '--env-file', '.env', '--file', 'compose.dev.yaml')
   Invoke-CheckedCommand -FilePath 'docker' -ArgumentList (
     $composeArguments + @('--profile', 'tools', 'run', '--rm', 'migrate')
   )
@@ -304,7 +312,7 @@ Expected: no output and exit zero.
 - [ ] **Step 6: Commit the launcher and tests**
 
 ```powershell
-git add scripts/start-dev.ps1 scripts/start-dev.test.ts
+git add scripts/start-dev.ps1 scripts/start-dev.test.ts vitest.config.ts docs/superpowers/plans/2026-08-08-development-launcher.md
 git commit -m "feat: add development launcher"
 ```
 
