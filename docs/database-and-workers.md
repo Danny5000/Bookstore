@@ -103,7 +103,7 @@ Workers claim one job at a time with `FOR UPDATE SKIP LOCKED`. A lease timestamp
 
 Handlers persist only deliberately safe error text. The outbox pairs a message and dispatch job in the caller's transaction and delivers at least once. A message already recorded as delivered is not sent again on ordinary job replay, while topic handlers remain responsible for the crash window between an external side effect and the `deliveredAt` update.
 
-Authentication email uses the versioned `email.auth.v1` topic and a stable Message-ID. Better Auth's verification row is committed in the adapter before its awaited callback creates the project outbox transaction; those two library boundaries are deliberately not represented as one atomic transaction. See the authentication runbook for delivery and safe-troubleshooting details.
+Authentication email uses the versioned `email.auth.v1` topic and a stable Message-ID. Better Auth creates a signed email-verification token before its awaited callback stores a one-use SHA-256 digest marker and then creates the project outbox transaction. Those callback writes are separate transaction boundaries; the endpoint succeeds only after the outbox write is durable. See the authentication runbook for delivery and safe-troubleshooting details.
 
 ## Scope of later plans
 

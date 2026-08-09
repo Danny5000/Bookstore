@@ -119,6 +119,7 @@ describe('Better Auth server', () => {
     expect(await databaseClient.db.select().from(outboxMessages)).toEqual([
       expect.objectContaining({ status: 'pending' })
     ]);
+    expect(await databaseClient.db.select().from(verification)).toHaveLength(1);
     expect(await databaseClient.db.select().from(jobs)).toEqual([
       expect.objectContaining({ status: 'pending', type: 'outbox.dispatch' })
     ]);
@@ -134,8 +135,11 @@ describe('Better Auth server', () => {
     expect(setCookie.toLowerCase()).not.toContain('secure');
     const cookie = cookiePair(verified);
     expect(await databaseClient.db.select().from(session)).toHaveLength(1);
+    expect(await databaseClient.db.select().from(verification)).toHaveLength(0);
 
     const reused = await authRequest(auth, message.actionUrl);
+    expect(reused.status).toBe(302);
+    expect(reused.headers.get('location')).toContain('error=INVALID_TOKEN');
     expect(reused.headers.get('set-cookie')).toBeNull();
     expect(await databaseClient.db.select().from(session)).toHaveLength(1);
 

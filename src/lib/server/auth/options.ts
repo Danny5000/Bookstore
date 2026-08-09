@@ -1,4 +1,5 @@
 import { betterAuth, type BetterAuthPlugin } from 'better-auth';
+import { APIError, createAuthMiddleware } from 'better-auth/api';
 import { drizzleAdapter } from 'better-auth/adapters/drizzle';
 import { magicLink } from 'better-auth/plugins';
 import type { ApplicationConfig } from '$lib/server/config/schema';
@@ -6,6 +7,10 @@ import type { Database } from '$lib/server/db/client';
 import * as schema from '$lib/server/db/schema';
 import type { QueueAuthEmailInput } from '$lib/server/email/enqueue';
 import { normalizeEmailAddress } from './identity';
+import {
+  consumeEmailVerificationToken,
+  registerEmailVerificationToken
+} from './email-verification';
 
 export interface AuthServerDependencies {
   database: Database;
@@ -20,6 +25,7 @@ export interface AuthServerDependencies {
 
 export function createAuthServer(dependencies: AuthServerDependencies) {
   const { auth, environment, origin } = dependencies.config;
+  const trustedOrigin = new URL(origin).origin;
   return betterAuth({
     appName: 'Pale Orbit Press',
     baseURL: origin,
@@ -60,7 +66,12 @@ export function createAuthServer(dependencies: AuthServerDependencies) {
       expiresIn: auth.verificationExpiresIn,
       sendOnSignUp: true,
       autoSignInAfterVerification: true,
-      sendVerificationEmail: async ({ user, url }) => {
+      sendVerificationEmail: async ({ user, url, token }) => {
+        await registerEmailVerificationToken(dependencies.database, {
+          token,
+          email: user.email,
+          expiresInSeconds: auth.verificationExpiresIn
+        });
         await dependencies.queueVerificationEmail({
           template: 'auth.email-verification',
           to: normalizeEmailAddress(user.email),
@@ -71,6 +82,29 @@ export function createAuthServer(dependencies: AuthServerDependencies) {
       }
     },
     session: { expiresIn: auth.sessionExpiresIn },
+    hooks: {
+      before: createAuthMiddleware(async (context) => {
+        if (context.path !== '/verify-email') return;
+        const token = context.query?.token;
+        const accepted =
+          typeof token === 'string' &&
+          (await consumeEmailVerificationToken(dependencies.database, token));
+        if (accepted) return;
+
+        const callbackURL = context.query?.callbackURL;
+        if (typeof callbackURL === 'string') {
+          const destination = new URL(callbackURL, trustedOrigin);
+          if (destination.origin === trustedOrigin) {
+            destination.searchParams.set('error', 'INVALID_TOKEN');
+            throw context.redirect(destination.toString());
+          }
+        }
+        throw new APIError('UNAUTHORIZED', {
+          code: 'INVALID_TOKEN',
+          message: 'Invalid or expired verification token'
+        });
+      })
+    },
     rateLimit: {
       enabled: true,
       storage: 'database',
@@ -100,7 +134,7 @@ export function createAuthServer(dependencies: AuthServerDependencies) {
       useSecureCookies: environment === 'production',
       database: { generateId: 'uuid' }
     },
-    trustedOrigins: [new URL(origin).origin],
+    trustedOrigins: [trustedOrigin],
     telemetry: { enabled: false },
     plugins: [
       magicLink({

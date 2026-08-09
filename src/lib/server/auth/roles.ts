@@ -52,6 +52,12 @@ export async function setAdminRole(
     await transaction.execute(
       sql`select pg_advisory_xact_lock(hashtext('pale-orbit:user-roles:admin'))`
     );
+    const authorizedActor = {
+      type: 'user' as const,
+      id: actor.id,
+      roles: await listRolesForUser(transaction, actor.id)
+    };
+    requireCapability(authorizedActor, 'roles.manage');
 
     const [target] = await transaction
       .select({ id: user.id })
@@ -66,7 +72,7 @@ export async function setAdminRole(
     if (input.enabled) {
       const inserted = await transaction
         .insert(userRoles)
-        .values({ userId: target.id, role: 'admin', grantedByUserId: actor.id })
+        .values({ userId: target.id, role: 'admin', grantedByUserId: authorizedActor.id })
         .onConflictDoNothing({ target: [userRoles.userId, userRoles.role] })
         .returning({ userId: userRoles.userId });
       changed = inserted.length === 1;
@@ -86,7 +92,7 @@ export async function setAdminRole(
     const after = await listRolesForUser(transaction, target.id);
     if (changed) {
       await appendAuditEvent(transaction, {
-        actor,
+        actor: authorizedActor,
         action: input.enabled ? 'auth.role.granted' : 'auth.role.revoked',
         outcome: 'succeeded',
         resourceType: 'user',

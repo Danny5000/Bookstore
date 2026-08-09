@@ -1,28 +1,13 @@
 import { randomUUID } from 'node:crypto';
-import { and, eq } from 'drizzle-orm';
+import { verifyPassword } from 'better-auth/crypto';
+import { eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import {
   UnverifiedBootstrapAccountError,
   bootstrapFirstAdministrator
 } from '$lib/server/auth/bootstrap-admin';
-import { createAuthServer } from '$lib/server/auth/options';
-import { loadApplicationConfig } from '$lib/server/config/load';
 import { account, auditEvents, outboxMessages, user, userRoles } from '$lib/server/db/schema';
 import { databaseClient } from './database';
-
-const config = loadApplicationConfig(process.env);
-
-function createBootstrapAuth() {
-  return createAuthServer({
-    database: databaseClient.db,
-    config,
-    queueVerificationEmail: async () => undefined,
-    queueResetEmail: async () => undefined,
-    queueMagicEmail: async () => undefined,
-    canSendMagicLink: async () => true,
-    onUserCreated: async () => undefined
-  });
-}
 
 async function createExistingUser(emailVerified: boolean) {
   const [created] = await databaseClient.db
@@ -41,9 +26,7 @@ async function createExistingUser(emailVerified: boolean) {
 
 describe('bootstrapFirstAdministrator', () => {
   it('creates one verified credential administrator without sending mail', async () => {
-    const auth = createBootstrapAuth();
     const result = await bootstrapFirstAdministrator({
-      auth,
       database: databaseClient.db,
       email: '  OWNER@Example.COM ',
       name: 'First Owner',
@@ -59,9 +42,16 @@ describe('bootstrapFirstAdministrator', () => {
     expect(await databaseClient.db.select().from(user)).toEqual([
       expect.objectContaining({ id: result.userId, email: 'owner@example.com', emailVerified: true })
     ]);
-    expect(await databaseClient.db.select().from(account)).toEqual([
+    const [credentialAccount] = await databaseClient.db.select().from(account);
+    expect(credentialAccount).toEqual(
       expect.objectContaining({ userId: result.userId, providerId: 'credential' })
-    ]);
+    );
+    expect(
+      await verifyPassword({
+        hash: credentialAccount?.password ?? '',
+        password: 'A-secure-bootstrap-password'
+      })
+    ).toBe(true);
     expect(
       await databaseClient.db.select().from(userRoles).where(eq(userRoles.userId, result.userId))
     ).toEqual([
@@ -93,7 +83,6 @@ describe('bootstrapFirstAdministrator', () => {
       .from(account)
       .where(eq(account.userId, existing.id));
     const result = await bootstrapFirstAdministrator({
-      auth: createBootstrapAuth(),
       database: databaseClient.db,
       email: existing.email,
       name: 'Ignored Name',
@@ -115,7 +104,6 @@ describe('bootstrapFirstAdministrator', () => {
     const existing = await createExistingUser(false);
     await expect(
       bootstrapFirstAdministrator({
-        auth: createBootstrapAuth(),
         database: databaseClient.db,
         email: existing.email,
         name: existing.name,
@@ -130,7 +118,6 @@ describe('bootstrapFirstAdministrator', () => {
 
   it('is idempotent and does not append a duplicate success event', async () => {
     const input = {
-      auth: createBootstrapAuth(),
       database: databaseClient.db,
       email: 'idempotent@example.com',
       name: 'Idempotent Owner',
@@ -148,34 +135,28 @@ describe('bootstrapFirstAdministrator', () => {
     ).toHaveLength(1);
   });
 
-  it('keeps a separately created user but rolls back role grants when audit fails', async () => {
+  it('rolls back account creation when audit fails and allows a clean retry', async () => {
+    const input = {
+      database: databaseClient.db,
+      email: 'rollback@example.com',
+      name: 'Rollback Owner',
+      password: 'A-secure-bootstrap-password'
+    };
     await expect(
       bootstrapFirstAdministrator({
-        auth: createBootstrapAuth(),
-        database: databaseClient.db,
-        email: 'rollback@example.com',
-        name: 'Rollback Owner',
-        password: 'A-secure-bootstrap-password',
+        ...input,
         correlationId: null as unknown as string
       })
     ).rejects.toThrow();
-    const [created] = await databaseClient.db
-      .select()
-      .from(user)
-      .where(eq(user.email, 'rollback@example.com'));
-    expect(created).toBeDefined();
-    expect(created?.emailVerified).toBe(false);
     expect(
-      await databaseClient.db
-        .select()
-        .from(userRoles)
-        .where(
-          and(
-            eq(userRoles.userId, created?.id ?? '00000000-0000-0000-0000-000000000000'),
-            eq(userRoles.role, 'admin')
-          )
-        )
+      await databaseClient.db.select().from(user).where(eq(user.email, 'rollback@example.com'))
     ).toHaveLength(0);
+    expect(await databaseClient.db.select().from(account)).toHaveLength(0);
+    expect(await databaseClient.db.select().from(userRoles)).toHaveLength(0);
     expect(await databaseClient.db.select().from(auditEvents)).toHaveLength(0);
+
+    await expect(
+      bootstrapFirstAdministrator({ ...input, correlationId: 'bootstrap-retry' })
+    ).resolves.toMatchObject({ createdUser: true, grantedAdmin: true });
   });
 });

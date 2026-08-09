@@ -4,7 +4,6 @@ import {
   bootstrapFirstAdministrator
 } from '$lib/server/auth/bootstrap-admin';
 import { loadBootstrapAdminConfig } from '$lib/server/auth/bootstrap-config';
-import { createAuthServer } from '$lib/server/auth/options';
 import { loadApplicationConfig } from '$lib/server/config/load';
 import { ConfigurationError } from '$lib/server/config/read-setting';
 import { createDatabaseClient, type DatabaseClient } from '$lib/server/db/client';
@@ -15,17 +14,7 @@ try {
   const config = loadApplicationConfig(process.env);
   const bootstrapConfig = loadBootstrapAdminConfig(process.env);
   databaseClient = createDatabaseClient(config.database);
-  const auth = createAuthServer({
-    database: databaseClient.db,
-    config,
-    queueVerificationEmail: async () => undefined,
-    queueResetEmail: async () => undefined,
-    queueMagicEmail: async () => undefined,
-    canSendMagicLink: async () => true,
-    onUserCreated: async () => undefined
-  });
   const result = await bootstrapFirstAdministrator({
-    auth,
     database: databaseClient.db,
     ...bootstrapConfig,
     correlationId: randomUUID()

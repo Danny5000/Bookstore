@@ -121,6 +121,36 @@ describe('administrator role service', () => {
     expect(await databaseClient.db.select().from(auditEvents)).toHaveLength(0);
   });
 
+  it('rejects a stale administrator actor after its durable role is revoked', async () => {
+    const formerAdministrator = await createUser('admin');
+    await createUser('admin');
+    const target = await createUser();
+    const staleActor = adminActor(formerAdministrator.id);
+    await databaseClient.db
+      .delete(userRoles)
+      .where(
+        and(
+          eq(userRoles.userId, formerAdministrator.id),
+          eq(userRoles.role, 'admin')
+        )
+      );
+
+    await expect(
+      setAdminRole(databaseClient.db, {
+        actor: staleActor,
+        targetUserId: target.id,
+        enabled: true,
+        correlationId: 'stale-actor'
+      })
+    ).rejects.toEqual(new AuthorizationError('forbidden', 403));
+    expect(
+      await databaseClient.db
+        .select()
+        .from(userRoles)
+        .where(and(eq(userRoles.userId, target.id), eq(userRoles.role, 'admin')))
+    ).toHaveLength(0);
+  });
+
   it('protects the final administrator under concurrent demotions', async () => {
     const first = await createUser('admin');
     await expect(

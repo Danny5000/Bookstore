@@ -66,6 +66,7 @@ test('customer can complete password, reset, and magic-link journeys', async ({ 
   });
   const cleanVerificationPage = await cleanVerificationContext.newPage();
   await cleanVerificationPage.goto(verificationLink);
+  await expect(cleanVerificationPage).toHaveURL(/error=INVALID_TOKEN/);
   await expect(
     cleanVerificationPage.locator('header').getByRole('button', { name: 'Sign in' })
   ).toBeVisible();

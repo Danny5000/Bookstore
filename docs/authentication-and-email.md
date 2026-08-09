@@ -2,7 +2,7 @@
 
 ## Architecture and ownership
 
-Better Auth owns credential hashing, email-verification/reset/magic-link tokens, database sessions, cookies, trusted-origin checks, and endpoint rate limits. Pale Orbit Press owns the `customer` and `admin` roles, guest identities, authorization policy, append-only audit events, versioned email payloads, and PostgreSQL outbox delivery. Every authenticated user has the durable `customer` role; an `admin` role adds access to the protected `/admin` routes. Guest identities remain separate until the later commerce plan adds order claiming.
+Better Auth owns credential hashing, signed email-verification/reset/magic-link tokens, database sessions, cookies, trusted-origin checks, and endpoint rate limits. Pale Orbit Press owns the one-use verification-token markers, `customer` and `admin` roles, guest identities, authorization policy, append-only audit events, versioned email payloads, and PostgreSQL outbox delivery. Every authenticated user has the durable `customer` role; an `admin` role adds access to the protected `/admin` routes. Guest identities remain separate until the later commerce plan adds order claiming.
 
 PostgreSQL is the only database, rate-limit store, job queue, and outbox store. Redis is not required. Nodemailer implements the provider-neutral SMTP boundary. Development routes mail to Mailpit; production supplies standard SMTP settings without changing application code.
 
@@ -49,7 +49,7 @@ docker compose --env-file .env --file compose.dev.yaml down
 
 `npm run admin:bootstrap` and the Compose `bootstrap-admin` service are explicit, one-shot tools. The command is idempotent: it creates and verifies the configured account when absent, grants `customer` and `admin`, and records the grant in the audit trail. If the email already belongs to a verified credential account, its existing password is not changed. An existing unverified account is rejected so the operator must resolve it deliberately.
 
-After signing in as an administrator, use `/admin/users` to grant or revoke `admin`. Every change is authorized on the server and audited. The `customer` role cannot be removed, administrators cannot revoke their own role through the UI, and the database transaction refuses to remove the last administrator even if a forged form request bypasses the UI.
+After signing in as an administrator, use `/admin/users` to grant or revoke `admin`. Every change is authorized on the server and audited. The `customer` role cannot be removed. An administrator may demote themself only when another administrator remains; the UI disables the action and the database transaction refuses it when it would remove the final administrator.
 
 ## Production secrets and deployment order
 
@@ -104,7 +104,7 @@ Production remains in maintenance mode until the remaining backend plans replace
 
 Each project email enqueue inserts its versioned outbox message and dispatch job in one application transaction. The worker validates the payload, renders it, and sends it with a stable RFC Message-ID. Delivery is at least once: SMTP cannot commit atomically with PostgreSQL, so a crash after SMTP accepts a message but before `deliveredAt` is recorded can produce a duplicate. Verification, reset, and magic-link templates must therefore remain safe to receive twice.
 
-Better Auth first persists its verification state in its own adapter transaction and then awaits the configured mail callback. Better Auth 1.6 does not expose that transaction to application code, so its token row and the project outbox row cannot share one transaction without replacing the supported adapter. The endpoint reports success only after durable outbox enqueue. If enqueue fails, an unused Better Auth verification row can remain, but the application does not claim that mail was sent.
+Better Auth creates a signed verification token and then awaits the configured mail callback. The callback first stores only a SHA-256 token digest as a one-use marker, then creates the project outbox transaction. Better Auth 1.6 does not expose a transaction that can include these application writes, so the marker and outbox row cannot share one transaction without replacing the supported email flow. The endpoint reports success only after durable outbox enqueue. If enqueue fails, an unused marker can remain until it expires, but the application does not claim that mail was sent. Verification atomically consumes the marker before Better Auth validates and applies the signed token, so a previously used link is rejected rather than silently succeeding.
 
 ## Safe troubleshooting
 

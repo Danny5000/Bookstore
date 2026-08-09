@@ -1,9 +1,9 @@
 import { eq, sql } from 'drizzle-orm';
+import { hashPassword } from 'better-auth/crypto';
 import { appendAuditEvent } from '$lib/server/audit/service';
 import type { Database } from '$lib/server/db/client';
-import { user, userRoles } from '$lib/server/db/schema';
+import { account, user, userRoles } from '$lib/server/db/schema';
 import { withTransaction } from '$lib/server/db/transaction';
-import type { createAuthServer } from './options';
 import { normalizeEmailAddress } from './identity';
 
 export class UnverifiedBootstrapAccountError extends Error {
@@ -16,7 +16,6 @@ export class UnverifiedBootstrapAccountError extends Error {
 }
 
 export interface BootstrapFirstAdministratorInput {
-  auth: ReturnType<typeof createAuthServer>;
   database: Database;
   email: string;
   name: string;
@@ -34,34 +33,37 @@ export async function bootstrapFirstAdministrator(
   input: BootstrapFirstAdministratorInput
 ): Promise<BootstrapFirstAdministratorResult> {
   const email = normalizeEmailAddress(input.email);
-  let [target] = await input.database
-    .select()
-    .from(user)
-    .where(eq(user.email, email))
-    .limit(1);
-  let createdUser = false;
+  const passwordHash = await hashPassword(input.password);
 
-  if (!target) {
-    const registration = await input.auth.api.signUpEmail({
-      body: { email, name: input.name.trim(), password: input.password }
-    });
-    [target] = await input.database
-      .select()
-      .from(user)
-      .where(eq(user.id, registration.user.id))
-      .limit(1);
-    if (!target) throw new Error('Bootstrap registration did not create a durable user');
-    createdUser = true;
-  } else if (!target.emailVerified) {
-    throw new UnverifiedBootstrapAccountError();
-  }
-
-  const userId = target.id;
-  const grantedAdmin = await withTransaction(input.database, async (transaction) => {
+  return withTransaction(input.database, async (transaction) => {
     await transaction.execute(
       sql`select pg_advisory_xact_lock(hashtext('pale-orbit:user-roles:admin'))`
     );
 
+    let [target] = await transaction
+      .select()
+      .from(user)
+      .where(eq(user.email, email))
+      .limit(1);
+    let createdUser = false;
+    if (!target) {
+      [target] = await transaction
+        .insert(user)
+        .values({ email, name: input.name.trim(), emailVerified: true })
+        .returning();
+      if (!target) throw new Error('Bootstrap registration did not create a durable user');
+      await transaction.insert(account).values({
+        accountId: target.id,
+        providerId: 'credential',
+        userId: target.id,
+        password: passwordHash
+      });
+      createdUser = true;
+    } else if (!target.emailVerified) {
+      throw new UnverifiedBootstrapAccountError();
+    }
+
+    const userId = target.id;
     const existingRoles = await transaction
       .select({ role: userRoles.role })
       .from(userRoles)
@@ -70,9 +72,6 @@ export async function bootstrapFirstAdministrator(
       .map((row) => row.role)
       .sort((left, right) => (left === 'customer' ? -1 : right === 'customer' ? 1 : 0));
 
-    if (createdUser) {
-      await transaction.update(user).set({ emailVerified: true }).where(eq(user.id, userId));
-    }
     await transaction
       .insert(userRoles)
       .values({ userId, role: 'customer' })
@@ -96,8 +95,6 @@ export async function bootstrapFirstAdministrator(
         after: ['customer', 'admin']
       });
     }
-    return changed;
+    return { userId, createdUser, grantedAdmin: changed };
   });
-
-  return { userId, createdUser, grantedAdmin };
 }
