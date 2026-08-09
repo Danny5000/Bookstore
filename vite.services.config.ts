@@ -20,6 +20,7 @@ export default defineConfig({
     sourcemap: true,
     rolldownOptions: {
       input: {
+        'bootstrap-admin': resolve(import.meta.dirname, 'src/bootstrap-admin.ts'),
         migrate: resolve(import.meta.dirname, 'src/migrate.ts'),
         worker: resolve(import.meta.dirname, 'src/worker.ts')
       },
