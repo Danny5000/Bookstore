@@ -15,6 +15,13 @@
       "when": 1786232478281,
       "tag": "0001_audit_events_append_only",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1786241921927,
+      "tag": "0002_authentication_identity",
+      "breakpoints": true
     }
   ]
 }
