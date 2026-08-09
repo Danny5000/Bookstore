@@ -43,7 +43,7 @@
   </div>
   <div class="pair">
     <label><span class="mono">Price · minor units</span><input class="field" name="priceMinor" type="number" min="0" step="1" value={value?.priceMinor ?? 0} required /></label>
-    <label><span class="mono">Currency</span><input class="field" name="currency" value={value?.currency ?? 'USD'} pattern="[A-Za-z]{3}" maxlength="3" required /></label>
+    <label><span class="mono">Currency</span><input class="field" name="currency" value={value?.currency ?? 'USD'} pattern="[A-Za-z][A-Za-z][A-Za-z]" maxlength="3" required /></label>
   </div>
   <button class="btn" type="submit">{submitLabel}</button>
 </form>

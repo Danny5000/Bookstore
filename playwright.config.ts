@@ -8,10 +8,11 @@ const inheritedEnvironment = Object.fromEntries(
 
 export default defineConfig({
   testDir: './tests/e2e',
-  fullyParallel: true,
+  timeout: 120_000,
+  fullyParallel: false,
   forbidOnly: Boolean(process.env.CI),
   retries: process.env.CI ? 2 : 0,
-  workers: process.env.CI ? 1 : undefined,
+  workers: 1,
   reporter: process.env.CI ? 'github' : 'list',
   use: {
     baseURL: 'http://127.0.0.1:4173',
@@ -49,6 +50,20 @@ export default defineConfig({
       JOB_RETRY_BASE_MS: process.env.JOB_RETRY_BASE_MS ?? '10',
       JOB_RETRY_MAX_MS: process.env.JOB_RETRY_MAX_MS ?? '1000',
       WORKER_READY_FILE: process.env.WORKER_READY_FILE ?? '.worker-ready-test',
+      WORKER_CONCURRENCY: process.env.WORKER_CONCURRENCY ?? '1',
+      STORAGE_PROVIDER: process.env.STORAGE_PROVIDER ?? 'local',
+      STORAGE_LOCAL_ROOT: process.env.STORAGE_LOCAL_ROOT ?? '.data/test-e2e-storage',
+      UPLOAD_MAX_BYTES: process.env.UPLOAD_MAX_BYTES ?? '1048576',
+      INGEST_MAX_EXPANDED_BYTES: process.env.INGEST_MAX_EXPANDED_BYTES ?? '4194304',
+      INGEST_MAX_ENTRIES: process.env.INGEST_MAX_ENTRIES ?? '1000',
+      INGEST_MAX_XML_BYTES: process.env.INGEST_MAX_XML_BYTES ?? '1048576',
+      INGEST_MAX_IMAGE_PIXELS: process.env.INGEST_MAX_IMAGE_PIXELS ?? '100000000',
+      INGEST_MAX_COMPRESSION_RATIO: process.env.INGEST_MAX_COMPRESSION_RATIO ?? '200',
+      INGEST_TIMEOUT_MS: process.env.INGEST_TIMEOUT_MS ?? '60000',
+      STORAGE_STAGING_RETENTION_HOURS:
+        process.env.STORAGE_STAGING_RETENTION_HOURS ?? '1',
+      STORAGE_ORPHAN_RETENTION_HOURS:
+        process.env.STORAGE_ORPHAN_RETENTION_HOURS ?? '2',
       AUTH_SECRET:
         process.env.AUTH_SECRET ?? 'test-only-auth-secret-at-least-thirty-two-bytes',
       AUTH_SESSION_EXPIRES_SECONDS: process.env.AUTH_SESSION_EXPIRES_SECONDS ?? '3600',

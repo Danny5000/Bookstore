@@ -100,7 +100,7 @@ export function parseAuditFilters(search: URLSearchParams): AuditFilters {
       throw new Error('Audit query parameters are invalid');
     }
     const value = search.get(key);
-    if (value !== null) raw[key] = value;
+    if (value !== null && value !== '') raw[key] = value;
   }
   const parsed = rawFiltersSchema.parse(raw);
   return {

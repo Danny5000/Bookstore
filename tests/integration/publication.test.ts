@@ -698,6 +698,9 @@ describe('reader presentation drafts and publication', () => {
       .from(auditEvents)
       .where(eq(auditEvents.action, 'catalog.reader_settings.publish'));
     expect(events).toHaveLength(2);
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ resourceType: 'title', resourceId: candidate.title.id })
+    ]));
   });
 });
 

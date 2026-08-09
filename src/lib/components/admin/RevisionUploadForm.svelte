@@ -1,6 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
+  import { onMount } from 'svelte';
 
   interface Props {
     titleId: string;
@@ -10,7 +11,12 @@
 
   let { titleId, format, parentRevisionId = null }: Props = $props();
   let busy = $state(false);
+  let ready = $state(false);
   let message = $state('');
+
+  onMount(() => {
+    ready = true;
+  });
 
   async function upload(event: SubmitEvent): Promise<void> {
     event.preventDefault();
@@ -51,7 +57,7 @@
   </label>
   <label><span class="mono">Change summary</span><textarea class="field" name="changeSummary" rows="3" required maxlength="2000"></textarea></label>
   <input type="hidden" name="parentRevisionId" value={parentRevisionId ?? ''} />
-  <button class="btn" type="submit" disabled={busy}>{busy ? 'Uploading…' : 'Upload immutable revision'}</button>
+  <button class="btn" type="submit" disabled={!ready || busy}>{busy ? 'Uploading…' : 'Upload immutable revision'}</button>
   {#if message}<p class="message" role="status">{message}</p>{/if}
 </form>
 

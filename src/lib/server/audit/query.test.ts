@@ -34,6 +34,19 @@ describe('audit query input', () => {
     expect(parseAuditFilters(new URLSearchParams())).toEqual({ pageSize: 25 });
   });
 
+  it('treats blank controls submitted by the audit filter form as absent', () => {
+    expect(parseAuditFilters(new URLSearchParams({
+      actorId: '',
+      action: 'audit.event.view',
+      resourceType: '',
+      resourceId: '',
+      outcome: '',
+      from: '',
+      to: '',
+      pageSize: '50'
+    }))).toEqual({ action: 'audit.event.view', pageSize: 50 });
+  });
+
   it.each([
     ['unknown key', new URLSearchParams({ surprise: 'value' })],
     ['duplicate key', new URLSearchParams('action=one&action=two')],

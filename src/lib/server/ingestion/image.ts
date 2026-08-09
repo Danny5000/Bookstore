@@ -144,6 +144,10 @@ export async function normalizeImage(input: NormalizeImageInput): Promise<Normal
       callback(null, bytes);
     }
   });
+  // `pipeline()` observes the primary error through storage.write, but removes
+  // its listeners after settling. Keep a terminal listener for a secondary,
+  // late Sharp error forwarded while the stream graph is being destroyed.
+  hasher.on('error', () => undefined);
   let sourceFailure: unknown;
   replay.once('error', (cause: unknown) => {
     sourceFailure = cause;

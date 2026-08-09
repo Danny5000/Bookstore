@@ -78,7 +78,7 @@ test('server authorization and audited role controls govern admin access', async
   await administratorPage.goto('/');
   await signIn(administratorPage, 'admin@paleorbit.test', 'test-admin-password-2026');
   await administratorPage.goto('/admin');
-  await expect(administratorPage.getByRole('heading', { name: 'Admin foundation' })).toBeVisible();
+  await expect(administratorPage.getByRole('heading', { name: 'Publication control room' })).toBeVisible();
   await administratorPage.getByRole('link', { name: 'Users', exact: true }).click();
 
   const customerRow = administratorPage.getByRole('row').filter({ hasText: customerEmail });
@@ -89,23 +89,31 @@ test('server authorization and audited role controls govern admin access', async
   const bootstrapRow = administratorPage
     .getByRole('row')
     .filter({ hasText: 'admin@paleorbit.test' });
+  const bootstrapId = await bootstrapRow.locator('input[name="userId"]').inputValue();
   await bootstrapRow.getByRole('button', { name: 'Revoke admin' }).click();
 
-  await customerPage.goto('/');
-  await signOut(customerPage);
-  await signIn(customerPage, customerEmail, customerPassword);
-  await customerPage.goto('/admin/users');
-  await expect(customerPage.getByRole('heading', { name: 'Users' })).toBeVisible();
-  const ownRow = customerPage.getByRole('row').filter({ hasText: customerEmail });
-  await expect(ownRow.getByRole('button', { name: 'Revoke admin' })).toBeDisabled();
-  const lastAdminAttempt = await customerContext.request.post('/admin/users?/setAdmin', {
-    form: { userId: customerId, enabled: 'false' },
-    maxRedirects: 0
-  });
-  expect((await lastAdminAttempt.json()) as object).toMatchObject({
-    type: 'failure',
-    status: 409
-  });
+  try {
+    await customerPage.goto('/');
+    await signOut(customerPage);
+    await signIn(customerPage, customerEmail, customerPassword);
+    await customerPage.goto('/admin/users');
+    await expect(customerPage.getByRole('heading', { name: 'Users' })).toBeVisible();
+    const ownRow = customerPage.getByRole('row').filter({ hasText: customerEmail });
+    await expect(ownRow.getByRole('button', { name: 'Revoke admin' })).toBeDisabled();
+    const lastAdminAttempt = await customerContext.request.post('/admin/users?/setAdmin', {
+      form: { userId: customerId, enabled: 'false' },
+      maxRedirects: 0
+    });
+    expect((await lastAdminAttempt.json()) as object).toMatchObject({
+      type: 'failure',
+      status: 409
+    });
+  } finally {
+    await customerContext.request.post('/admin/users?/setAdmin', {
+      form: { userId: bootstrapId, enabled: 'true' },
+      maxRedirects: 0
+    });
+  }
 
   await administratorContext.close();
   await customerContext.close();

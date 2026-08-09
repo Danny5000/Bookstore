@@ -34,7 +34,7 @@ Checked against the npm registry on 2026-08-09.
 | `fast-xml-parser` | 5.10.1 | Current stable bounded XML parser; ingestion rejects document types and entities before parsing untrusted EPUB or ComicInfo metadata. |
 | fflate | 0.8.3 | Current stable test-only archive writer used to generate deterministic valid and hostile fixtures; it is not part of production ingestion. |
 
-TypeScript 6.0.3 remains intentional while the registry latest is 7.0.2: as checked on 2026-08-08,
+TypeScript 6.0.3 remains intentional while the registry latest is 7.0.2: as checked on 2026-08-09,
 `typescript-eslint` 8.66.0 accepts TypeScript `>=4.8.4 <6.1.0` and
 `svelte-check` 4.7.5 accepts TypeScript 5 or 6. Remove this pin when both stable
 packages support TypeScript 7.

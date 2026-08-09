@@ -217,8 +217,8 @@ export async function saveDraftPresentation(
       actor,
       action: 'catalog.reader_settings.draft.save',
       outcome: 'succeeded',
-      resourceType: 'revision_presentation',
-      resourceId: updated.id,
+      resourceType: 'title',
+      resourceId: input.titleId,
       correlationId: command.correlationId,
       ...(command.requestMetadata ? { requestMetadata: command.requestMetadata } : {}),
       after: {
@@ -349,8 +349,8 @@ export async function publishReaderSettings(
         actor,
         action: 'catalog.reader_settings.publish',
         outcome: 'succeeded',
-        resourceType: 'revision_presentation',
-        resourceId: published.id,
+        resourceType: 'title',
+        resourceId: input.titleId,
         correlationId: command.correlationId,
         ...(command.requestMetadata ? { requestMetadata: command.requestMetadata } : {}),
         after: {
