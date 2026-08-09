@@ -1,7 +1,8 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import type { LayoutData } from './$types';
-  import { invalidateAll } from '$app/navigation';
+  import { invalidateAll, replaceState } from '$app/navigation';
+  import { resolve } from '$app/paths';
   import '../app.css';
   import Header from '$lib/components/Header.svelte';
   import AuthModal from '$lib/components/AuthModal.svelte';
@@ -13,9 +14,37 @@
   }
 
   let { children, data }: Props = $props();
-  let authOpen = $state($page.url.searchParams.get('auth') === 'signin');
+  let lastAuthRequest = $state<string | null>(null);
+  let authOpen = $state(false);
+
+  $effect(() => {
+    const authRequest = $page.url.searchParams.get('auth');
+    if (
+      authRequest !== lastAuthRequest &&
+      (authRequest === 'signin' || authRequest === 'required')
+    ) {
+      authOpen = true;
+    }
+    lastAuthRequest = authRequest;
+  });
 
   const isReader = $derived($page.url.pathname.startsWith('/read/'));
+
+  function clearAuthRequest(): void {
+    if (!$page.url.searchParams.has('auth')) return;
+    replaceState(resolve('/'), {});
+  }
+
+  function closeAuth(): void {
+    authOpen = false;
+    clearAuthRequest();
+  }
+
+  function authenticated(): void {
+    authOpen = false;
+    clearAuthRequest();
+    void invalidateAll();
+  }
 </script>
 
 <Header user={data.user} onsignin={() => (authOpen = true)} />
@@ -31,11 +60,8 @@
 
 <AuthModal
   open={authOpen}
-  onclose={() => (authOpen = false)}
-  onauthenticated={() => {
-    authOpen = false;
-    void invalidateAll();
-  }}
+  onclose={closeAuth}
+  onauthenticated={authenticated}
 />
 
 <style>

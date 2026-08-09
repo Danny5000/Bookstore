@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { page } from '$app/state';
   import { resolve } from '$app/paths';
   import { authClient } from '$lib/auth/client';
@@ -9,8 +10,13 @@
   let password = $state('');
   let confirmation = $state('');
   let pending = $state(false);
+  let hydrated = $state(false);
   let complete = $state(false);
   let errorMessage = $state('');
+
+  onMount(() => {
+    hydrated = true;
+  });
 
   async function submit(event: SubmitEvent): Promise<void> {
     event.preventDefault();
@@ -79,7 +85,7 @@
           />
         </label>
         {#if errorMessage}<p class="error" role="alert">{errorMessage}</p>{/if}
-        <button class="btn" type="submit" disabled={pending}>
+        <button class="btn" type="submit" disabled={!hydrated || pending}>
           {pending ? 'Updating…' : 'Update password'}
         </button>
       </form>

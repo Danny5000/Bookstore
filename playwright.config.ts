@@ -58,7 +58,9 @@ export default defineConfig({
       AUTH_MAGIC_EXPIRES_SECONDS: process.env.AUTH_MAGIC_EXPIRES_SECONDS ?? '600',
       AUTH_RATE_LIMIT_WINDOW_SECONDS: process.env.AUTH_RATE_LIMIT_WINDOW_SECONDS ?? '60',
       AUTH_RATE_LIMIT_MAX: process.env.AUTH_RATE_LIMIT_MAX ?? '100',
-      AUTH_LOGIN_RATE_LIMIT_MAX: process.env.AUTH_LOGIN_RATE_LIMIT_MAX ?? '5',
+      // Parallel browser journeys share the loopback IP. Keep the production default
+      // covered by integration tests without allowing unrelated E2E workers to collide.
+      AUTH_LOGIN_RATE_LIMIT_MAX: '20',
       AUTH_EMAIL_RATE_LIMIT_MAX: process.env.AUTH_EMAIL_RATE_LIMIT_MAX ?? '3',
       SMTP_HOST: process.env.SMTP_HOST ?? '127.0.0.1',
       SMTP_PORT: process.env.SMTP_PORT ?? '1025',

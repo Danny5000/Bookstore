@@ -1,11 +1,22 @@
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { setTimeout as delay } from 'node:timers/promises';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 const project = `pale-orbit-test-${process.pid}`;
 const composeArguments = ['compose', '--project-name', project, '--file', 'compose.test.yaml'];
-const childCommand = process.argv[2];
-const childArguments = process.argv.slice(3);
+const argumentsToParse = process.argv.slice(2);
+let withWorker = false;
+let withBootstrapAdmin = false;
+while (argumentsToParse[0]?.startsWith('--')) {
+  const flag = argumentsToParse.shift();
+  if (flag === '--worker') withWorker = true;
+  else if (flag === '--bootstrap-admin') withBootstrapAdmin = true;
+  else throw new Error(`Unknown test service flag ${flag}`);
+}
+const childCommand = argumentsToParse.shift();
+const childArguments = argumentsToParse;
 
 if (!childCommand) {
   throw new Error('Expected a command to run after the test database starts');
@@ -56,6 +67,42 @@ function publishedPort(service: string, containerPort: string): string {
   return match[1];
 }
 
+async function startWorker(environment: NodeJS.ProcessEnv): Promise<ChildProcess> {
+  const worker = spawn(process.execPath, ['--import', 'tsx', 'src/worker.ts'], {
+    env: environment,
+    stdio: 'inherit'
+  });
+  let exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+  worker.once('exit', (code, signal) => {
+    exit = { code, signal };
+  });
+  const readyFile = environment.WORKER_READY_FILE;
+  if (!readyFile) throw new Error('WORKER_READY_FILE is required');
+  const deadline = Date.now() + 15_000;
+  while (!existsSync(readyFile)) {
+    if (exit) {
+      throw new Error(`Worker exited before readiness with ${exit.code ?? exit.signal ?? 'unknown'}`);
+    }
+    if (Date.now() >= deadline) throw new Error('Timed out waiting for worker readiness');
+    await delay(50);
+  }
+  return worker;
+}
+
+async function stopWorker(worker: ChildProcess): Promise<void> {
+  if (worker.exitCode !== null || worker.signalCode !== null) return;
+  worker.kill('SIGTERM');
+  const exited = new Promise<boolean>((resolve) => {
+    worker.once('exit', () => resolve(true));
+    setTimeout(() => resolve(false), 2_000).unref();
+  });
+  if (!(await exited) && worker.exitCode === null && worker.signalCode === null) {
+    worker.kill('SIGKILL');
+    await new Promise<void>((resolve) => worker.once('exit', () => resolve()));
+  }
+}
+
+let worker: ChildProcess | undefined;
 try {
   runChecked('docker', [...composeArguments, 'up', '--detach', '--wait', '--wait-timeout', '90']);
   const postgresPort = publishedPort('postgres', '5432');
@@ -98,10 +145,21 @@ try {
     SMTP_CONNECTION_TIMEOUT_MS: '5000',
     SMTP_GREETING_TIMEOUT_MS: '5000',
     SMTP_SOCKET_TIMEOUT_MS: '10000',
-    MAILPIT_HTTP_URL: `http://127.0.0.1:${mailpitHttpPort}`
+    MAILPIT_HTTP_URL: `http://127.0.0.1:${mailpitHttpPort}`,
+    ...(withBootstrapAdmin
+      ? {
+          BOOTSTRAP_ADMIN_EMAIL: 'admin@paleorbit.test',
+          BOOTSTRAP_ADMIN_NAME: 'Test Administrator',
+          BOOTSTRAP_ADMIN_PASSWORD: 'test-admin-password-2026'
+        }
+      : {})
   };
 
   runChecked('npm', ['run', 'db:migrate:raw'], testEnvironment);
+  if (withBootstrapAdmin) {
+    runChecked('npm', ['run', 'admin:bootstrap:raw'], testEnvironment);
+  }
+  if (withWorker) worker = await startWorker(testEnvironment);
 
   const childInvocation = invocation(childCommand, childArguments);
   const child = spawnSync(childInvocation.command, childInvocation.args, {
@@ -110,5 +168,6 @@ try {
   });
   process.exitCode = child.status ?? 1;
 } finally {
+  if (worker) await stopWorker(worker);
   runChecked('docker', [...composeArguments, 'down', '--volumes', '--remove-orphans']);
 }
