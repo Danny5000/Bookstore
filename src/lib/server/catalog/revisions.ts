@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { extname } from 'node:path';
 import { and, eq } from 'drizzle-orm';
 import { z } from 'zod';
@@ -8,8 +9,14 @@ import type { Database } from '$lib/server/db/client';
 import { titleRevisions, titles, type TitleRevisionRow } from '$lib/server/db/schema';
 import { withTransaction } from '$lib/server/db/transaction';
 import { enqueueRevisionIngestion } from '$lib/server/ingestion/job';
-import { parseStorageKey } from '$lib/server/storage/keys';
+import { parseStorageKey, stagingUploadKey } from '$lib/server/storage/keys';
+import type { ObjectStorage } from '$lib/server/storage/types';
 import { CatalogDomainError } from './errors';
+import {
+  parseRevisionPublicationActionInput,
+  type RevisionPublicationActionInput
+} from './input';
+import { withLockedAdminTitle } from './lock';
 
 const acceptRevisionUploadInputSchema = z.strictObject({
   titleId: z.uuid(),
@@ -109,4 +116,91 @@ export async function acceptRevisionUpload(
 
     return revision;
   });
+}
+
+export async function retryFailedRevision(
+  database: Database,
+  storage: ObjectStorage,
+  command: {
+    actor: Actor;
+    correlationId: string;
+    input: RevisionPublicationActionInput;
+  }
+): Promise<TitleRevisionRow> {
+  requireCapability(command.actor, 'catalog.manage');
+  const input = parseRevisionPublicationActionInput(command.input);
+  const [sourceRevision] = await database
+    .select()
+    .from(titleRevisions)
+    .where(and(eq(titleRevisions.id, input.revisionId), eq(titleRevisions.titleId, input.titleId)))
+    .limit(1);
+  if (
+    !sourceRevision ||
+    sourceRevision.state !== 'failed' ||
+    !sourceRevision.stagingStorageKey ||
+    !sourceRevision.stagingChecksumSha256 ||
+    !sourceRevision.stagingByteSize
+  ) {
+    throw new CatalogDomainError('retry_source_unavailable');
+  }
+  const oldKey = parseStorageKey(sourceRevision.stagingStorageKey);
+  const sourceStat = await storage.stat(oldKey);
+  if (!sourceStat || sourceStat.byteSize !== sourceRevision.stagingByteSize) {
+    throw new CatalogDomainError('retry_source_unavailable');
+  }
+  const freshKey = stagingUploadKey(randomUUID());
+  const copied = await storage.copy(oldKey, freshKey);
+  if (copied.byteSize !== sourceRevision.stagingByteSize) {
+    throw new CatalogDomainError('retry_source_unavailable');
+  }
+
+  return withTransaction(database, (transaction) =>
+    withLockedAdminTitle(transaction, command.actor, input.titleId, async ({ actor }) => {
+      const [failed] = await transaction
+        .select()
+        .from(titleRevisions)
+        .where(and(eq(titleRevisions.id, input.revisionId), eq(titleRevisions.titleId, input.titleId)))
+        .for('update')
+        .limit(1);
+      if (
+        !failed ||
+        failed.state !== 'failed' ||
+        failed.stagingStorageKey !== sourceRevision.stagingStorageKey ||
+        failed.stagingChecksumSha256 !== sourceRevision.stagingChecksumSha256 ||
+        failed.stagingByteSize !== sourceRevision.stagingByteSize
+      ) {
+        throw new CatalogDomainError('revision_conflict');
+      }
+      const nextGeneration = failed.ingestionGeneration + 1;
+      const [retried] = await transaction
+        .update(titleRevisions)
+        .set({
+          state: 'uploaded',
+          stagingStorageKey: freshKey,
+          ingestionGeneration: nextGeneration,
+          processingStartedAt: null,
+          processedAt: null,
+          failureCode: null,
+          failureDetails: null
+        })
+        .where(eq(titleRevisions.id, failed.id))
+        .returning();
+      if (!retried) throw new Error('Revision retry update returned no row');
+      await enqueueRevisionIngestion(transaction, retried.id, nextGeneration);
+      await appendAuditEvent(transaction, {
+        actor,
+        action: 'catalog.revision.retry',
+        outcome: 'succeeded',
+        resourceType: 'title_revision',
+        resourceId: retried.id,
+        correlationId: command.correlationId,
+        after: {
+          titleId: input.titleId,
+          state: retried.state,
+          generation: nextGeneration
+        }
+      });
+      return retried;
+    })
+  );
 }

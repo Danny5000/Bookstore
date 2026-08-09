@@ -10,12 +10,13 @@ import type { IngestionLimits } from './limits';
 const signaturePrefixBytes = 4_100;
 const epubFormats = new Set(['jpeg', 'png', 'webp', 'gif']);
 const comicFormats = new Set([...epubFormats, 'tiff']);
+const coverFormats = new Set(['jpeg', 'png']);
 
 export interface NormalizeImageInput {
   storage: ObjectStorage;
   source: Readable;
   destination: StorageKey;
-  profile: 'epub' | 'comic';
+  profile: 'epub' | 'comic' | 'cover';
   limits: IngestionLimits;
   signal: AbortSignal;
 }
@@ -109,7 +110,8 @@ export async function normalizeImage(input: NormalizeImageInput): Promise<Normal
   }
   const { prefix, replay } = await prefixReplay(input.source, input.signal);
   const hint = await fileTypeFromBuffer(prefix);
-  const allowedFormats = input.profile === 'epub' ? epubFormats : comicFormats;
+  const allowedFormats =
+    input.profile === 'epub' ? epubFormats : input.profile === 'comic' ? comicFormats : coverFormats;
   if (
     /^\s*(?:<\?xml[^>]*>\s*)?(?:<!doctype\s+svg[^>]*>\s*)?<svg\b/iu.test(
       prefix.toString('utf8')

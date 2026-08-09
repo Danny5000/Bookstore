@@ -4,62 +4,36 @@ import { appendAuditEvent } from '$lib/server/audit/service';
 import {
   titleRevisions,
   titles,
-  type TitleRevisionRow,
-  type TitleRow
+  type TitleRevisionRow
 } from '$lib/server/db/schema';
 import type { Database } from '$lib/server/db/client';
 import { withTransaction } from '$lib/server/db/transaction';
-import {
-  parseCreateRevisionInput,
-  parseCreateTitleInput,
-  type CreateRevisionInput,
-  type CreateTitleInput
-} from './input';
+import { parseCreateRevisionInput, type CreateRevisionInput } from './input';
 import { CatalogDomainError } from './errors';
 
 export { CatalogDomainError } from './errors';
 export { acceptRevisionUpload } from './revisions';
+export { retryFailedRevision } from './revisions';
+export { confirmCoverSuggestion, replaceTitleCover } from './covers';
+export { publishReaderSettings, saveDraftPresentation } from './presentations';
+export {
+  activatePrivateRevision,
+  publishReplacementRevision,
+  publishTitleToStorefront,
+  rollbackRevision,
+  withdrawTitle
+} from './publication';
+export {
+  createPrivateTitle,
+  getAdminTitleDetail,
+  listAdminTitles,
+  updateTitleMetadata
+} from './titles';
 
 interface CatalogCommand<T> {
   actor: Actor;
   correlationId: string;
   input: T;
-}
-
-export async function createPrivateTitle(
-  database: Database,
-  command: CatalogCommand<CreateTitleInput>
-): Promise<TitleRow> {
-  const actor = command.actor;
-  requireCapability(actor, 'catalog.manage');
-  const input = parseCreateTitleInput(command.input);
-
-  return withTransaction(database, async (transaction) => {
-    const [title] = await transaction
-      .insert(titles)
-      .values({ ...input, visibility: 'private' })
-      .returning();
-    if (!title) throw new Error('Title insert returned no row');
-
-    await appendAuditEvent(transaction, {
-      actor,
-      action: 'catalog.title.create',
-      outcome: 'succeeded',
-      resourceType: 'title',
-      resourceId: title.id,
-      correlationId: command.correlationId,
-      after: {
-        slug: title.slug,
-        title: title.title,
-        format: title.format,
-        visibility: title.visibility,
-        priceMinor: title.priceMinor,
-        currency: title.currency
-      }
-    });
-
-    return title;
-  });
 }
 
 export async function createRevisionSkeleton(

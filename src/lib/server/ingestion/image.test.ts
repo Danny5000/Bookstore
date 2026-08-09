@@ -108,6 +108,33 @@ describe('image normalization', () => {
     ).resolves.toMatchObject({ mediaType: 'image/webp', width: 3, height: 2 });
   });
 
+  it('accepts only JPEG and PNG for standalone title covers', async () => {
+    for (const format of ['jpeg', 'png'] as const) {
+      await expect(
+        normalizeImage({
+          storage,
+          source: Readable.from([await fixture(format)]),
+          destination: destinationKey(),
+          profile: 'cover',
+          limits,
+          signal: AbortSignal.timeout(5_000)
+        })
+      ).resolves.toMatchObject({ mediaType: 'image/webp', width: 3, height: 2 });
+    }
+    for (const format of ['webp', 'gif'] as const) {
+      await expect(
+        normalizeImage({
+          storage,
+          source: Readable.from([await fixture(format)]),
+          destination: destinationKey(),
+          profile: 'cover',
+          limits,
+          signal: AbortSignal.timeout(5_000)
+        })
+      ).rejects.toMatchObject({ code: 'unsupported_media' });
+    }
+  });
+
   it('applies EXIF orientation and strips source metadata', async () => {
     const oriented = await sharp({
       create: { width: 2, height: 3, channels: 3, background: '#884422' }
