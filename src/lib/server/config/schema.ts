@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { z } from 'zod';
 import { ConfigurationError } from './read-setting';
 
@@ -37,6 +38,18 @@ const rawApplicationConfigSchema = z
     JOB_RETRY_BASE_MS: milliseconds,
     JOB_RETRY_MAX_MS: milliseconds,
     WORKER_READY_FILE: z.string().trim().min(1),
+    WORKER_CONCURRENCY: integerSetting(1, 16),
+    STORAGE_PROVIDER: z.enum(['local', 's3']),
+    STORAGE_LOCAL_ROOT: z.string().trim().min(1).optional(),
+    UPLOAD_MAX_BYTES: integerSetting(1, Number.MAX_SAFE_INTEGER),
+    INGEST_MAX_EXPANDED_BYTES: integerSetting(1, Number.MAX_SAFE_INTEGER),
+    INGEST_MAX_ENTRIES: integerSetting(1, 100_000),
+    INGEST_MAX_XML_BYTES: integerSetting(1, Number.MAX_SAFE_INTEGER),
+    INGEST_MAX_IMAGE_PIXELS: integerSetting(1, 1_000_000_000),
+    INGEST_MAX_COMPRESSION_RATIO: integerSetting(1, 100_000),
+    INGEST_TIMEOUT_MS: milliseconds,
+    STORAGE_STAGING_RETENTION_HOURS: integerSetting(1, 87_600),
+    STORAGE_ORPHAN_RETENTION_HOURS: integerSetting(1, 87_600),
     AUTH_SECRET: z.string().min(32),
     AUTH_SESSION_EXPIRES_SECONDS: seconds,
     AUTH_VERIFICATION_EXPIRES_SECONDS: seconds,
@@ -113,6 +126,51 @@ const rawApplicationConfigSchema = z
         message: 'must not exceed JOB_RETRY_MAX_MS'
       });
     }
+
+    if (value.INGEST_MAX_EXPANDED_BYTES < value.UPLOAD_MAX_BYTES) {
+      context.addIssue({
+        code: 'custom',
+        path: ['INGEST_MAX_EXPANDED_BYTES'],
+        message: 'must be greater than or equal to UPLOAD_MAX_BYTES'
+      });
+    }
+
+    if (value.INGEST_MAX_XML_BYTES > value.INGEST_MAX_EXPANDED_BYTES) {
+      context.addIssue({
+        code: 'custom',
+        path: ['INGEST_MAX_XML_BYTES'],
+        message: 'must not exceed INGEST_MAX_EXPANDED_BYTES'
+      });
+    }
+
+    if (value.STORAGE_STAGING_RETENTION_HOURS > value.STORAGE_ORPHAN_RETENTION_HOURS) {
+      context.addIssue({
+        code: 'custom',
+        path: ['STORAGE_ORPHAN_RETENTION_HOURS'],
+        message: 'must be at least STORAGE_STAGING_RETENTION_HOURS'
+      });
+    }
+
+    if (value.STORAGE_PROVIDER === 'local' && !value.STORAGE_LOCAL_ROOT) {
+      context.addIssue({
+        code: 'custom',
+        path: ['STORAGE_LOCAL_ROOT'],
+        message: 'is required for local storage'
+      });
+    }
+
+    if (
+      value.APP_ENV === 'production' &&
+      value.STORAGE_PROVIDER === 'local' &&
+      value.STORAGE_LOCAL_ROOT &&
+      !path.isAbsolute(value.STORAGE_LOCAL_ROOT)
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['STORAGE_LOCAL_ROOT'],
+        message: 'must be absolute in production'
+      });
+    }
   })
   .transform((value) => ({
     environment: value.APP_ENV,
@@ -134,7 +192,23 @@ const rawApplicationConfigSchema = z
       leaseMs: value.JOB_LEASE_MS,
       retryBaseMs: value.JOB_RETRY_BASE_MS,
       retryMaxMs: value.JOB_RETRY_MAX_MS,
-      workerReadyFile: value.WORKER_READY_FILE
+      workerReadyFile: value.WORKER_READY_FILE,
+      concurrency: value.WORKER_CONCURRENCY
+    },
+    storage: {
+      provider: value.STORAGE_PROVIDER,
+      localRoot: value.STORAGE_LOCAL_ROOT,
+      stagingRetentionHours: value.STORAGE_STAGING_RETENTION_HOURS,
+      orphanRetentionHours: value.STORAGE_ORPHAN_RETENTION_HOURS
+    },
+    ingestion: {
+      maxUploadBytes: value.UPLOAD_MAX_BYTES,
+      maxExpandedBytes: value.INGEST_MAX_EXPANDED_BYTES,
+      maxEntries: value.INGEST_MAX_ENTRIES,
+      maxXmlBytes: value.INGEST_MAX_XML_BYTES,
+      maxImagePixels: value.INGEST_MAX_IMAGE_PIXELS,
+      maxCompressionRatio: value.INGEST_MAX_COMPRESSION_RATIO,
+      timeoutMs: value.INGEST_TIMEOUT_MS
     },
     auth: {
       secret: value.AUTH_SECRET,
@@ -167,6 +241,8 @@ export type ApplicationConfig = z.output<typeof rawApplicationConfigSchema>;
 export type ApplicationMode = ApplicationConfig['applicationMode'];
 export type DatabaseConfig = ApplicationConfig['database'];
 export type JobConfig = ApplicationConfig['jobs'];
+export type StorageConfig = ApplicationConfig['storage'];
+export type IngestionConfig = ApplicationConfig['ingestion'];
 export type AuthConfig = ApplicationConfig['auth'];
 export type SmtpConfig = ApplicationConfig['smtp'];
 

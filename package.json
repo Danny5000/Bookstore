@@ -48,9 +48,11 @@
     "@types/node": "^26.2.0",
     "@types/nodemailer": "8.0.1",
     "@types/pg": "8.21.0",
+    "@types/yauzl": "3.4.0",
     "drizzle-kit": "0.31.10",
     "eslint": "^10.8.1",
     "eslint-plugin-svelte": "^3.22.0",
+    "fflate": "0.8.3",
     "globals": "^17.9.0",
     "svelte": "^5.56.8",
     "svelte-check": "^4.7.5",
@@ -61,11 +63,16 @@
     "vitest": "^4.1.10"
   },
   "dependencies": {
+    "@fastify/busboy": "3.2.0",
     "better-auth": "1.6.26",
     "drizzle-orm": "0.45.2",
+    "fast-xml-parser": "5.10.1",
+    "file-type": "22.0.1",
     "nodemailer": "9.0.5",
     "pg": "8.23.0",
+    "sharp": "0.35.3",
     "stripe": "^22.4.0",
+    "yauzl": "3.4.0",
     "zod": "^4.4.3"
   }
 }

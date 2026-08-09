@@ -8,8 +8,10 @@ export type {
   ApplicationMode,
   AuthConfig,
   DatabaseConfig,
+  IngestionConfig,
   JobConfig,
-  SmtpConfig
+  SmtpConfig,
+  StorageConfig
 } from './schema';
 
 let cachedConfiguration: ApplicationConfig | undefined;

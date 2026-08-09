@@ -1,6 +1,6 @@
 # Dependency decisions
 
-Checked against the npm registry on 2026-08-08.
+Checked against the npm registry on 2026-08-09.
 
 | Package | Selected line | Decision |
 | --- | --- | --- |
@@ -26,6 +26,13 @@ Checked against the npm registry on 2026-08-08.
 | Better Auth CLI | 1.6.26 exact, on demand | Schema generation must match the runtime exactly; keep it outside the installed tree until its unfixed tool-only advisory is removed. |
 | Nodemailer | 9.0.5 | Current stable SMTP implementation behind the provider-neutral email adapter. |
 | `@types/nodemailer` | 8.0.1 | Current published declarations; remove when Nodemailer ships compatible declarations directly. |
+| `@fastify/busboy` | 3.2.0 | Current stable streaming multipart parser; request handlers apply explicit part-count and byte limits without buffering publication uploads. |
+| yauzl | 3.4.0 | Current stable lazy, random-access ZIP reader; ingestion validates archive metadata and observed streams before accepting entries. |
+| `@types/yauzl` | 3.4.0 | Current published strict TypeScript declarations for yauzl. |
+| sharp | 0.35.3 | Current stable image decoder/normalizer; its platform-specific optional packages must survive production dependency pruning. |
+| `file-type` | 22.0.1 | Current stable signature detector used only as a format hint; successful decoding and domain validation remain authoritative. |
+| `fast-xml-parser` | 5.10.1 | Current stable bounded XML parser; ingestion rejects document types and entities before parsing untrusted EPUB or ComicInfo metadata. |
+| fflate | 0.8.3 | Current stable test-only archive writer used to generate deterministic valid and hostile fixtures; it is not part of production ingestion. |
 
 TypeScript 6.0.3 remains intentional while the registry latest is 7.0.2: as checked on 2026-08-08,
 `typescript-eslint` 8.66.0 accepts TypeScript `>=4.8.4 <6.1.0` and

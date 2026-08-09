@@ -20,6 +20,18 @@ const VALID_DEVELOPMENT_ENVIRONMENT: EnvironmentValues = {
   JOB_RETRY_BASE_MS: '1000',
   JOB_RETRY_MAX_MS: '300000',
   WORKER_READY_FILE: '.worker-ready',
+  WORKER_CONCURRENCY: '1',
+  STORAGE_PROVIDER: 'local',
+  STORAGE_LOCAL_ROOT: '.data/storage',
+  UPLOAD_MAX_BYTES: '536870912',
+  INGEST_MAX_EXPANDED_BYTES: '2147483648',
+  INGEST_MAX_ENTRIES: '10000',
+  INGEST_MAX_XML_BYTES: '8388608',
+  INGEST_MAX_IMAGE_PIXELS: '100000000',
+  INGEST_MAX_COMPRESSION_RATIO: '200',
+  INGEST_TIMEOUT_MS: '900000',
+  STORAGE_STAGING_RETENTION_HOURS: '24',
+  STORAGE_ORPHAN_RETENTION_HOURS: '168',
   AUTH_SECRET: 'test-only-auth-secret-at-least-thirty-two-bytes',
   AUTH_SESSION_EXPIRES_SECONDS: '604800',
   AUTH_VERIFICATION_EXPIRES_SECONDS: '3600',
@@ -61,7 +73,23 @@ describe('loadApplicationConfig', () => {
         leaseMs: 30000,
         retryBaseMs: 1000,
         retryMaxMs: 300000,
-        workerReadyFile: '.worker-ready'
+        workerReadyFile: '.worker-ready',
+        concurrency: 1
+      },
+      storage: {
+        provider: 'local',
+        localRoot: '.data/storage',
+        stagingRetentionHours: 24,
+        orphanRetentionHours: 168
+      },
+      ingestion: {
+        maxUploadBytes: 536870912,
+        maxExpandedBytes: 2147483648,
+        maxEntries: 10000,
+        maxXmlBytes: 8388608,
+        maxImagePixels: 100000000,
+        maxCompressionRatio: 200,
+        timeoutMs: 900000
       },
       auth: {
         secret: 'test-only-auth-secret-at-least-thirty-two-bytes',
@@ -105,7 +133,23 @@ describe('loadApplicationConfig', () => {
       leaseMs: 30000,
       retryBaseMs: 1000,
       retryMaxMs: 300000,
-      workerReadyFile: '.worker-ready'
+      workerReadyFile: '.worker-ready',
+      concurrency: 1
+    });
+    expect(config.storage).toEqual({
+      provider: 'local',
+      localRoot: '.data/storage',
+      stagingRetentionHours: 24,
+      orphanRetentionHours: 168
+    });
+    expect(config.ingestion).toEqual({
+      maxUploadBytes: 536870912,
+      maxExpandedBytes: 2147483648,
+      maxEntries: 10000,
+      maxXmlBytes: 8388608,
+      maxImagePixels: 100000000,
+      maxCompressionRatio: 200,
+      timeoutMs: 900000
     });
   });
 
@@ -113,7 +157,12 @@ describe('loadApplicationConfig', () => {
     ['DATABASE_POOL_MAX', '0'],
     ['DATABASE_READINESS_TIMEOUT_MS', 'not-a-number'],
     ['JOB_POLL_INTERVAL_MS', '0'],
-    ['JOB_LEASE_MS', '500']
+    ['JOB_LEASE_MS', '500'],
+    ['WORKER_CONCURRENCY', '0'],
+    ['WORKER_CONCURRENCY', '17'],
+    ['UPLOAD_MAX_BYTES', '0'],
+    ['INGEST_MAX_ENTRIES', '100001'],
+    ['INGEST_MAX_COMPRESSION_RATIO', '0']
   ])('rejects invalid operational setting %s=%s', (key, value) => {
     expect(() =>
       loadApplicationConfig({ ...VALID_DEVELOPMENT_ENVIRONMENT, [key]: value })
@@ -130,6 +179,68 @@ describe('loadApplicationConfig', () => {
     ).toThrow(/JOB_RETRY_BASE_MS: must not exceed JOB_RETRY_MAX_MS/);
   });
 
+  it('rejects inconsistent ingestion and retention bounds', () => {
+    expect(() =>
+      loadApplicationConfig({
+        ...VALID_DEVELOPMENT_ENVIRONMENT,
+        UPLOAD_MAX_BYTES: '1000',
+        INGEST_MAX_EXPANDED_BYTES: '999'
+      })
+    ).toThrow(/INGEST_MAX_EXPANDED_BYTES: must be greater than or equal to UPLOAD_MAX_BYTES/);
+
+    expect(() =>
+      loadApplicationConfig({
+        ...VALID_DEVELOPMENT_ENVIRONMENT,
+        INGEST_MAX_EXPANDED_BYTES: '1000',
+        INGEST_MAX_XML_BYTES: '1001'
+      })
+    ).toThrow(/INGEST_MAX_XML_BYTES: must not exceed INGEST_MAX_EXPANDED_BYTES/);
+
+    expect(() =>
+      loadApplicationConfig({
+        ...VALID_DEVELOPMENT_ENVIRONMENT,
+        STORAGE_STAGING_RETENTION_HOURS: '169'
+      })
+    ).toThrow(/STORAGE_ORPHAN_RETENTION_HOURS: must be at least STORAGE_STAGING_RETENTION_HOURS/);
+  });
+
+  it('requires a local root only for local storage', () => {
+    const withoutLocalRoot: EnvironmentValues = {
+      ...VALID_DEVELOPMENT_ENVIRONMENT,
+      STORAGE_LOCAL_ROOT: undefined
+    };
+
+    expect(() => loadApplicationConfig(withoutLocalRoot)).toThrow(
+      /STORAGE_LOCAL_ROOT: is required for local storage/
+    );
+
+    expect(
+      loadApplicationConfig({ ...withoutLocalRoot, STORAGE_PROVIDER: 's3' }).storage
+    ).toEqual({
+      provider: 's3',
+      localRoot: undefined,
+      stagingRetentionHours: 24,
+      orphanRetentionHours: 168
+    });
+  });
+
+  it('rejects unknown providers and relative production storage roots', () => {
+    expect(() =>
+      loadApplicationConfig({ ...VALID_DEVELOPMENT_ENVIRONMENT, STORAGE_PROVIDER: 'ftp' })
+    ).toThrow(/STORAGE_PROVIDER/);
+
+    expect(() =>
+      loadApplicationConfig({
+        ...VALID_DEVELOPMENT_ENVIRONMENT,
+        APP_ENV: 'production',
+        APPLICATION_MODE: 'maintenance',
+        ORIGIN: 'https://books.example.com',
+        SMTP_USER: 'mailer',
+        SMTP_PASSWORD: 'smtp-secret'
+      })
+    ).toThrow(/STORAGE_LOCAL_ROOT: must be absolute in production/);
+  });
+
   it('loads the database password from a production secret file', () => {
     const source: EnvironmentValues = {
       ...VALID_DEVELOPMENT_ENVIRONMENT,
@@ -139,6 +250,7 @@ describe('loadApplicationConfig', () => {
       DATABASE_HOST: 'postgres',
       DATABASE_PASSWORD: undefined,
       DATABASE_PASSWORD_FILE: '/run/secrets/database_password',
+      STORAGE_LOCAL_ROOT: 'C:\\pale-orbit-storage',
       SMTP_USER: 'mailer',
       SMTP_PASSWORD: 'smtp-secret'
     };
