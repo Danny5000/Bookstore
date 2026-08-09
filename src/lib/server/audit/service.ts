@@ -10,6 +10,7 @@ export interface AppendAuditEventInput {
   resourceType: string;
   resourceId?: string | null;
   correlationId: string;
+  requestMetadata?: JsonValue | null;
   before?: JsonValue | null;
   after?: JsonValue | null;
 }
@@ -28,6 +29,8 @@ export async function appendAuditEvent(
       resourceType: input.resourceType,
       resourceId: input.resourceId ?? null,
       correlationId: input.correlationId,
+      requestMetadata:
+        input.requestMetadata == null ? null : redactAuditDetails(input.requestMetadata),
       before: input.before == null ? null : redactAuditDetails(input.before),
       after: input.after == null ? null : redactAuditDetails(input.after)
     })

@@ -13,10 +13,20 @@ describe('audit events', () => {
       resourceType: 'title',
       resourceId: 'title-1',
       correlationId: 'request-1',
+      requestMetadata: {
+        method: 'POST',
+        routeId: '/admin/catalog',
+        authorization: 'unsafe'
+      },
       after: { title: 'Safe', password: 'unsafe' }
     });
 
     expect(event.after).toEqual({ title: 'Safe', password: '[redacted]' });
+    expect(event.requestMetadata).toEqual({
+      method: 'POST',
+      routeId: '/admin/catalog',
+      authorization: '[redacted]'
+    });
 
     await expect(
       databaseClient.db

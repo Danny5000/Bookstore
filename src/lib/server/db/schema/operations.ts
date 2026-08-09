@@ -95,6 +95,7 @@ export const auditEvents = pgTable(
     resourceType: text('resource_type').notNull(),
     resourceId: text('resource_id'),
     correlationId: text('correlation_id').notNull(),
+    requestMetadata: jsonb('request_metadata').$type<JsonValue>(),
     before: jsonb('before').$type<JsonValue>(),
     after: jsonb('after').$type<JsonValue>()
   },
@@ -103,6 +104,8 @@ export const auditEvents = pgTable(
     index('audit_events_resource_idx').on(table.resourceType, table.resourceId, table.occurredAt),
     index('audit_events_actor_idx').on(table.actorType, table.actorId, table.occurredAt),
     index('audit_events_correlation_idx').on(table.correlationId),
+    index('audit_events_action_occurred_idx').on(table.action, table.occurredAt),
+    index('audit_events_outcome_occurred_idx').on(table.outcome, table.occurredAt),
     check(
       'audit_events_actor_id_required',
       sql`${table.actorType} = 'anonymous' or ${table.actorId} is not null`
