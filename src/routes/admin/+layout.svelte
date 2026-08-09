@@ -21,7 +21,7 @@
       <a href={resolve('/admin')} class:active={$page.url.pathname === '/admin'}>Overview</a>
       <a href={resolve('/admin/users')} class:active={$page.url.pathname.startsWith('/admin/users')}>Users</a>
       <a href={resolve('/admin/catalog')} class:active={$page.url.pathname.startsWith('/admin/catalog')}>Catalog</a>
-      <span>Audit <small>Upcoming</small></span>
+      <a href={resolve('/admin/audit')} class:active={$page.url.pathname.startsWith('/admin/audit')}>Audit</a>
       <span>Sales <small>Upcoming</small></span>
     </nav>
   </aside>
