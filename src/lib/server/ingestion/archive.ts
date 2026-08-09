@@ -17,6 +17,7 @@ export interface ArchiveEntry {
   readonly compressedSize: number;
   readonly uncompressedSize: number;
   readonly compressionMethod: 0 | 8;
+  readonly generalPurposeBitFlag: number;
   readonly crc32: number;
   readonly localHeaderOffset: number;
 }
@@ -259,6 +260,7 @@ function validateEntry(
       compressedSize: rawEntry.compressedSize,
       uncompressedSize: rawEntry.uncompressedSize,
       compressionMethod: rawEntry.compressionMethod,
+      generalPurposeBitFlag: rawEntry.generalPurposeBitFlag,
       crc32: rawEntry.crc32,
       localHeaderOffset: rawEntry.relativeOffsetOfLocalHeader
     },

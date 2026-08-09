@@ -1,7 +1,7 @@
 import { strToU8, zipSync, type AsyncZippable, type Zippable } from 'fflate';
 
 export const onePixelPng = Buffer.from(
-  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nWQAAAAASUVORK5CYII=',
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
   'base64'
 );
 
@@ -24,22 +24,34 @@ export function validEpubFixture(overrides: Zippable = {}): Buffer {
       <manifest>
         <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
         <item id="chapter-1" href="chapter-1.xhtml" media-type="application/xhtml+xml"/>
+        <item id="chapter-2" href="chapter-2.xhtml" media-type="application/xhtml+xml"/>
+        <item id="station" href="images/station.png" media-type="image/png"/>
         <item id="cover" href="images/cover.png" media-type="image/png" properties="cover-image"/>
       </manifest>
-      <spine><itemref idref="chapter-1"/></spine>
+      <spine><itemref idref="chapter-1"/><itemref idref="chapter-2"/></spine>
     </package>`;
   const navXhtml = `<?xml version="1.0"?>
     <html xmlns="http://www.w3.org/1999/xhtml"><body><nav epub:type="toc"
-      xmlns:epub="http://www.idpf.org/2007/ops"><ol><li><a href="chapter-1.xhtml">Chapter One</a></li></ol>
+      xmlns:epub="http://www.idpf.org/2007/ops"><ol>
+        <li><a href="chapter-1.xhtml">Chapter One</a></li>
+        <li><a href="chapter-2.xhtml">Chapter Two</a></li>
+      </ol>
     </nav></body></html>`;
   const chapterXhtml = `<?xml version="1.0"?>
-    <html xmlns="http://www.w3.org/1999/xhtml"><body><h1>Chapter One</h1><p>Safe text.</p></body></html>`;
+    <html xmlns="http://www.w3.org/1999/xhtml"><body><h1>Chapter One</h1>
+      <p>The <em>signal</em> arrived.</p>
+      <img src="images/station.png" alt="A distant station"/>
+    </body></html>`;
+  const secondChapterXhtml = `<?xml version="1.0"?>
+    <html xmlns="http://www.w3.org/1999/xhtml"><body><h1>Chapter Two</h1><p>Second.</p></body></html>`;
   const entries = {
     mimetype: [strToU8('application/epub+zip'), { level: 0 }],
     'META-INF/container.xml': strToU8(containerXml),
     'EPUB/package.opf': strToU8(packageXml),
     'EPUB/nav.xhtml': strToU8(navXhtml),
+    'EPUB/chapter-2.xhtml': strToU8(secondChapterXhtml),
     'EPUB/chapter-1.xhtml': strToU8(chapterXhtml),
+    'EPUB/images/station.png': onePixelPng,
     'EPUB/images/cover.png': onePixelPng,
     ...overrides
   } satisfies Zippable;
