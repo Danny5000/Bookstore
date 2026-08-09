@@ -20,7 +20,7 @@
     <nav aria-label="Admin sections">
       <a href={resolve('/admin')} class:active={$page.url.pathname === '/admin'}>Overview</a>
       <a href={resolve('/admin/users')} class:active={$page.url.pathname.startsWith('/admin/users')}>Users</a>
-      <span>Catalog <small>Upcoming</small></span>
+      <a href={resolve('/admin/catalog')} class:active={$page.url.pathname.startsWith('/admin/catalog')}>Catalog</a>
       <span>Audit <small>Upcoming</small></span>
       <span>Sales <small>Upcoming</small></span>
     </nav>

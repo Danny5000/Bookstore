@@ -1,6 +1,7 @@
 import { and, eq } from 'drizzle-orm';
 import { requireCapability, type Actor } from '$lib/server/auth/admin-policy';
 import { appendAuditEvent } from '$lib/server/audit/service';
+import type { AuditRequestMetadata } from '$lib/server/audit/request-metadata';
 import type { Database } from '$lib/server/db/client';
 import {
   revisionPresentations,
@@ -23,6 +24,7 @@ import { withLockedAdminTitle, type LockedAdminTitle } from './lock';
 interface PublicationCommand<T> {
   actor: Actor;
   correlationId: string;
+  requestMetadata?: AuditRequestMetadata;
   input: T;
 }
 
@@ -90,7 +92,7 @@ async function setActiveRevision(
 async function auditLifecycle(
   transaction: DatabaseTransaction,
   context: LockedAdminTitle,
-  command: { correlationId: string },
+  command: { correlationId: string; requestMetadata?: AuditRequestMetadata },
   action: string,
   revisionId?: string
 ): Promise<void> {
@@ -101,6 +103,7 @@ async function auditLifecycle(
     resourceType: revisionId ? 'title_revision' : 'title',
     resourceId: revisionId ?? context.title.id,
     correlationId: command.correlationId,
+    ...(command.requestMetadata ? { requestMetadata: command.requestMetadata } : {}),
     after: {
       titleId: context.title.id,
       ...(revisionId ? { revisionId } : {})

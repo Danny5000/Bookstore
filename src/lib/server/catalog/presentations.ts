@@ -1,6 +1,7 @@
 import { and, asc, desc, eq, inArray } from 'drizzle-orm';
 import { requireCapability, type Actor } from '$lib/server/auth/admin-policy';
 import { appendAuditEvent } from '$lib/server/audit/service';
+import type { AuditRequestMetadata } from '$lib/server/audit/request-metadata';
 import type { Database } from '$lib/server/db/client';
 import {
   comicPages,
@@ -26,6 +27,7 @@ import { withLockedAdminTitle } from './lock';
 interface PresentationCommand<T> {
   actor: Actor;
   correlationId: string;
+  requestMetadata?: AuditRequestMetadata;
   input: T;
 }
 
@@ -218,6 +220,7 @@ export async function saveDraftPresentation(
       resourceType: 'revision_presentation',
       resourceId: updated.id,
       correlationId: command.correlationId,
+      ...(command.requestMetadata ? { requestMetadata: command.requestMetadata } : {}),
       after: {
         revisionId: input.revisionId,
         format: input.format,
@@ -349,6 +352,7 @@ export async function publishReaderSettings(
         resourceType: 'revision_presentation',
         resourceId: published.id,
         correlationId: command.correlationId,
+        ...(command.requestMetadata ? { requestMetadata: command.requestMetadata } : {}),
         after: {
           revisionId: input.revisionId,
           presentationId: published.id,

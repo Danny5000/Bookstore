@@ -12,8 +12,13 @@ import { parseCreateRevisionInput, type CreateRevisionInput } from './input';
 import { CatalogDomainError } from './errors';
 
 export { CatalogDomainError } from './errors';
-export { acceptRevisionUpload } from './revisions';
-export { retryFailedRevision } from './revisions';
+export {
+  acceptRevisionUpload,
+  getAdminRevisionReview,
+  getAdminRevisionStatus,
+  listAdminRevisions,
+  retryFailedRevision
+} from './revisions';
 export { confirmCoverSuggestion, replaceTitleCover } from './covers';
 export { publishReaderSettings, saveDraftPresentation } from './presentations';
 export {

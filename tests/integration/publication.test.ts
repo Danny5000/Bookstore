@@ -39,7 +39,12 @@ import {
   rollbackRevision,
   withdrawTitle
 } from '$lib/server/catalog/publication';
-import { retryFailedRevision } from '$lib/server/catalog/revisions';
+import {
+  getAdminRevisionReview,
+  getAdminRevisionStatus,
+  listAdminRevisions,
+  retryFailedRevision
+} from '$lib/server/catalog/revisions';
 import { resolveCoverAccess } from '$lib/server/catalog/media';
 import {
   getPublicPreview,
@@ -287,6 +292,7 @@ describe('title metadata and covers', () => {
     const updated = await updateTitleMetadata(databaseClient.db, {
       actor: admin,
       correlationId: 'update-metadata',
+      requestMetadata: { method: 'POST', routeId: '/admin/catalog/[titleId]' },
       input: {
         titleId: title.id,
         slug: 'metadata-title-revised',
@@ -315,7 +321,41 @@ describe('title metadata and covers', () => {
       .select()
       .from(auditEvents)
       .where(eq(auditEvents.action, 'catalog.title.update'));
-    expect(event).toMatchObject({ actorId: admin.id, resourceId: title.id, outcome: 'succeeded' });
+    expect(event).toMatchObject({
+      actorId: admin.id,
+      resourceId: title.id,
+      outcome: 'succeeded',
+      requestMetadata: { method: 'POST', routeId: '/admin/catalog/[titleId]' }
+    });
+  });
+
+  it('loads safe administrator revision summaries, review context, and status', async () => {
+    const candidate = await createProsePresentation(`admin-review-${randomUUID()}`);
+    const revisions = await listAdminRevisions(databaseClient.db, candidate.title.id);
+    const status = await getAdminRevisionStatus(
+      databaseClient.db,
+      candidate.title.id,
+      candidate.revision.id
+    );
+    const review = await getAdminRevisionReview(
+      databaseClient.db,
+      candidate.title.id,
+      candidate.revision.id
+    );
+
+    expect(revisions).toEqual([
+      expect.objectContaining({ id: candidate.revision.id, state: 'ready_for_review' })
+    ]);
+    expect(status).toMatchObject({ state: 'ready_for_review', warnings: [] });
+    expect(review).toMatchObject({
+      title: { id: candidate.title.id },
+      revision: { id: candidate.revision.id },
+      draft: { id: candidate.presentation.id },
+      published: null,
+      warnings: []
+    });
+    expect(JSON.stringify({ revisions, status, review }))
+      .not.toMatch(/storageKey|sourceReference|uploadFilename/iu);
   });
 
   it('rejects unauthorized or format-changing metadata without writing', async () => {

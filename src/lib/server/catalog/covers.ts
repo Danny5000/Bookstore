@@ -3,6 +3,7 @@ import { and, eq } from 'drizzle-orm';
 import { z } from 'zod';
 import { requireCapability, type Actor } from '$lib/server/auth/admin-policy';
 import { appendAuditEvent } from '$lib/server/audit/service';
+import type { AuditRequestMetadata } from '$lib/server/audit/request-metadata';
 import type { Database } from '$lib/server/db/client';
 import { revisionCoverSuggestions, titleRevisions, titles } from '$lib/server/db/schema';
 import { withTransaction } from '$lib/server/db/transaction';
@@ -19,6 +20,7 @@ import {
 interface CoverCommand<T> {
   actor: Actor;
   correlationId: string;
+  requestMetadata?: AuditRequestMetadata;
   input: T;
 }
 
@@ -113,6 +115,7 @@ export async function confirmCoverSuggestion(
       resourceType: 'title',
       resourceId: input.titleId,
       correlationId: command.correlationId,
+      ...(command.requestMetadata ? { requestMetadata: command.requestMetadata } : {}),
       before: { checksumSha256: title.coverChecksumSha256 },
       after: { checksumSha256: suggestion.suggestion.checksumSha256 }
     });
@@ -178,6 +181,7 @@ export async function replaceTitleCover(
       resourceType: 'title',
       resourceId: input.titleId,
       correlationId: command.correlationId,
+      ...(command.requestMetadata ? { requestMetadata: command.requestMetadata } : {}),
       before: { checksumSha256: title.coverChecksumSha256 },
       after: { checksumSha256: normalized.checksumSha256 }
     });

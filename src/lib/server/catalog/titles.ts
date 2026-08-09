@@ -1,6 +1,7 @@
 import { desc, eq } from 'drizzle-orm';
 import { requireCapability, type Actor } from '$lib/server/auth/admin-policy';
 import { appendAuditEvent } from '$lib/server/audit/service';
+import type { AuditRequestMetadata } from '$lib/server/audit/request-metadata';
 import type { Database } from '$lib/server/db/client';
 import { titles, type TitleRow } from '$lib/server/db/schema';
 import { withTransaction } from '$lib/server/db/transaction';
@@ -15,7 +16,60 @@ import {
 interface CatalogCommand<T> {
   actor: Actor;
   correlationId: string;
+  requestMetadata?: AuditRequestMetadata;
   input: T;
+}
+
+export interface AdminTitleDto {
+  id: string;
+  slug: string;
+  title: string;
+  subtitle: string | null;
+  description: string;
+  creatorName: string;
+  format: TitleRow['format'];
+  priceMinor: number;
+  currency: string;
+  visibility: TitleRow['visibility'];
+  activeRevisionId: string | null;
+  cover: {
+    url: string;
+    checksumSha256: string;
+    mediaType: string;
+    byteSize: number;
+    width: number;
+    height: number;
+  } | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export function toAdminTitleDto(title: TitleRow): AdminTitleDto {
+  return {
+    id: title.id,
+    slug: title.slug,
+    title: title.title,
+    subtitle: title.subtitle,
+    description: title.description,
+    creatorName: title.creatorName,
+    format: title.format,
+    priceMinor: title.priceMinor,
+    currency: title.currency,
+    visibility: title.visibility,
+    activeRevisionId: title.activeRevisionId,
+    cover: title.coverChecksumSha256 && title.coverMediaType && title.coverByteSize && title.coverWidth && title.coverHeight
+      ? {
+          url: `/media/covers/${title.id}/${title.coverChecksumSha256}`,
+          checksumSha256: title.coverChecksumSha256,
+          mediaType: title.coverMediaType,
+          byteSize: title.coverByteSize,
+          width: title.coverWidth,
+          height: title.coverHeight
+        }
+      : null,
+    createdAt: title.createdAt,
+    updatedAt: title.updatedAt
+  };
 }
 
 export async function createPrivateTitle(
@@ -39,6 +93,7 @@ export async function createPrivateTitle(
       resourceType: 'title',
       resourceId: title.id,
       correlationId: command.correlationId,
+      ...(command.requestMetadata ? { requestMetadata: command.requestMetadata } : {}),
       after: {
         slug: title.slug,
         title: title.title,
@@ -90,6 +145,7 @@ export async function updateTitleMetadata(
       resourceType: 'title',
       resourceId: updated.id,
       correlationId: command.correlationId,
+      ...(command.requestMetadata ? { requestMetadata: command.requestMetadata } : {}),
       before: {
         slug: before.slug,
         title: before.title,

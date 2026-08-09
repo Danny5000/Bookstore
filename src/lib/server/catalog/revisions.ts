@@ -1,12 +1,20 @@
 import { randomUUID } from 'node:crypto';
 import { extname } from 'node:path';
-import { and, eq } from 'drizzle-orm';
+import { and, asc, desc, eq } from 'drizzle-orm';
 import { z } from 'zod';
 import { requireCapability, type Actor } from '$lib/server/auth/admin-policy';
 import { appendAuditEvent } from '$lib/server/audit/service';
 import type { AuditRequestMetadata } from '$lib/server/audit/request-metadata';
 import type { Database } from '$lib/server/db/client';
-import { titleRevisions, titles, type TitleRevisionRow } from '$lib/server/db/schema';
+import {
+  revisionCoverSuggestions,
+  revisionIngestionWarnings,
+  revisionPresentations,
+  titleRevisions,
+  titles,
+  type RevisionPresentationRow,
+  type TitleRevisionRow
+} from '$lib/server/db/schema';
 import { withTransaction } from '$lib/server/db/transaction';
 import { enqueueRevisionIngestion } from '$lib/server/ingestion/job';
 import { parseStorageKey, stagingUploadKey } from '$lib/server/storage/keys';
@@ -17,6 +25,7 @@ import {
   type RevisionPublicationActionInput
 } from './input';
 import { withLockedAdminTitle } from './lock';
+import { toAdminTitleDto, type AdminTitleDto } from './titles';
 
 const acceptRevisionUploadInputSchema = z.strictObject({
   titleId: z.uuid(),
@@ -118,12 +127,181 @@ export async function acceptRevisionUpload(
   });
 }
 
+export interface AdminRevisionSummary {
+  id: string;
+  titleId: string;
+  parentRevisionId: string | null;
+  state: TitleRevisionRow['state'];
+  changeSummary: string;
+  ingestionGeneration: number;
+  original: {
+    filename: string;
+    mediaType: string;
+    byteSize: number;
+    checksumSha256: string;
+    downloadUrl: string;
+  } | null;
+  failure: { code: string; message: string } | null;
+  retryAvailable: boolean;
+  createdAt: Date;
+  processingStartedAt: Date | null;
+  processedAt: Date | null;
+  activatedAt: Date | null;
+  retiredAt: Date | null;
+}
+
+export interface AdminRevisionStatus {
+  state: TitleRevisionRow['state'];
+  processingStartedAt: Date | null;
+  processedAt: Date | null;
+  failure: { code: string; message: string } | null;
+  warnings: readonly { code: string; message: string }[];
+}
+
+export interface AdminRevisionReview {
+  title: AdminTitleDto;
+  revision: AdminRevisionSummary;
+  draft: RevisionPresentationRow | null;
+  published: RevisionPresentationRow | null;
+  warnings: readonly { code: string; message: string }[];
+  suggestion: {
+    id: string;
+    sourceDescription: string;
+    url: string;
+    checksumSha256: string;
+    mediaType: string;
+    byteSize: number;
+    width: number;
+    height: number;
+  } | null;
+}
+
+function safeRevision(revision: TitleRevisionRow): AdminRevisionSummary {
+  const original = revision.originalFilename && revision.originalMimeType &&
+    revision.originalByteSize && revision.originalChecksumSha256
+    ? {
+        filename: revision.originalFilename,
+        mediaType: revision.originalMimeType,
+        byteSize: revision.originalByteSize,
+        checksumSha256: revision.originalChecksumSha256,
+        downloadUrl: `/admin/catalog/${revision.titleId}/revisions/${revision.id}/original`
+      }
+    : null;
+  return {
+    id: revision.id,
+    titleId: revision.titleId,
+    parentRevisionId: revision.parentRevisionId,
+    state: revision.state,
+    changeSummary: revision.changeSummary,
+    ingestionGeneration: revision.ingestionGeneration,
+    original,
+    failure: revision.failureCode
+      ? { code: revision.failureCode, message: revision.failureDetails ?? 'Processing failed' }
+      : null,
+    retryAvailable: revision.state === 'failed' && Boolean(
+      revision.stagingStorageKey && revision.stagingChecksumSha256 && revision.stagingByteSize
+    ),
+    createdAt: revision.createdAt,
+    processingStartedAt: revision.processingStartedAt,
+    processedAt: revision.processedAt,
+    activatedAt: revision.activatedAt,
+    retiredAt: revision.retiredAt
+  };
+}
+
+export async function listAdminRevisions(
+  database: Database,
+  titleId: string
+): Promise<readonly AdminRevisionSummary[]> {
+  const rows = await database
+    .select()
+    .from(titleRevisions)
+    .where(eq(titleRevisions.titleId, titleId))
+    .orderBy(desc(titleRevisions.createdAt), desc(titleRevisions.id));
+  return rows.map(safeRevision);
+}
+
+async function warningDtos(database: Database, revisionId: string) {
+  const warnings = await database
+    .select({ code: revisionIngestionWarnings.code, message: revisionIngestionWarnings.safeMessage })
+    .from(revisionIngestionWarnings)
+    .where(eq(revisionIngestionWarnings.revisionId, revisionId))
+    .orderBy(asc(revisionIngestionWarnings.ordinal));
+  return warnings;
+}
+
+export async function getAdminRevisionStatus(
+  database: Database,
+  titleId: string,
+  revisionId: string
+): Promise<AdminRevisionStatus | null> {
+  const [revision] = await database
+    .select()
+    .from(titleRevisions)
+    .where(and(eq(titleRevisions.id, revisionId), eq(titleRevisions.titleId, titleId)))
+    .limit(1);
+  if (!revision) return null;
+  const safe = safeRevision(revision);
+  return {
+    state: safe.state,
+    processingStartedAt: safe.processingStartedAt,
+    processedAt: safe.processedAt,
+    failure: safe.failure,
+    warnings: await warningDtos(database, revisionId)
+  };
+}
+
+export async function getAdminRevisionReview(
+  database: Database,
+  titleId: string,
+  revisionId: string
+): Promise<AdminRevisionReview | null> {
+  const [title] = await database.select().from(titles).where(eq(titles.id, titleId)).limit(1);
+  if (!title) return null;
+  const [revision] = await database
+    .select()
+    .from(titleRevisions)
+    .where(and(eq(titleRevisions.id, revisionId), eq(titleRevisions.titleId, titleId)))
+    .limit(1);
+  if (!revision) return null;
+  const presentations = await database
+    .select()
+    .from(revisionPresentations)
+    .where(eq(revisionPresentations.revisionId, revisionId))
+    .orderBy(desc(revisionPresentations.updatedAt));
+  const [suggestion] = await database
+    .select()
+    .from(revisionCoverSuggestions)
+    .where(eq(revisionCoverSuggestions.revisionId, revisionId))
+    .limit(1);
+  return {
+    title: toAdminTitleDto(title),
+    revision: safeRevision(revision),
+    draft: presentations.find((presentation) => presentation.state === 'draft') ?? null,
+    published: presentations.find((presentation) => presentation.state === 'published') ?? null,
+    warnings: await warningDtos(database, revisionId),
+    suggestion: suggestion
+      ? {
+          id: suggestion.id,
+          sourceDescription: suggestion.sourceDescription,
+          url: `/media/revisions/${revisionId}/cover-suggestion/${suggestion.id}/${suggestion.checksumSha256}`,
+          checksumSha256: suggestion.checksumSha256,
+          mediaType: suggestion.mediaType,
+          byteSize: suggestion.byteSize,
+          width: suggestion.width,
+          height: suggestion.height
+        }
+      : null
+  };
+}
+
 export async function retryFailedRevision(
   database: Database,
   storage: ObjectStorage,
   command: {
     actor: Actor;
     correlationId: string;
+    requestMetadata?: AuditRequestMetadata;
     input: RevisionPublicationActionInput;
   }
 ): Promise<TitleRevisionRow> {
@@ -194,6 +372,7 @@ export async function retryFailedRevision(
         resourceType: 'title_revision',
         resourceId: retried.id,
         correlationId: command.correlationId,
+        ...(command.requestMetadata ? { requestMetadata: command.requestMetadata } : {}),
         after: {
           titleId: input.titleId,
           state: retried.state,
