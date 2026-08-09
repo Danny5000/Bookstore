@@ -1,11 +1,13 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { existsSync, rmSync } from 'node:fs';
+import { existsSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 
 const project = `pale-orbit-test-${process.pid}`;
-const testStorageRoot = join(tmpdir(), `pale-orbit-storage-${process.pid}`);
+const testStoragePrefix = join(resolve(tmpdir()), 'pale-orbit-test-storage-');
+const testStorageRoot = await mkdtemp(testStoragePrefix);
 const composeArguments = ['compose', '--project-name', project, '--file', 'compose.test.yaml'];
 const argumentsToParse = process.argv.slice(2);
 let withWorker = false;
@@ -182,6 +184,12 @@ try {
   process.exitCode = child.status ?? 1;
 } finally {
   if (worker) await stopWorker(worker);
-  rmSync(testStorageRoot, { recursive: true, force: true });
+  const resolvedStorageRoot = resolve(testStorageRoot);
+  if (!resolvedStorageRoot.startsWith(testStoragePrefix)) {
+    console.error('[test] refusing to remove an unexpected storage directory');
+    process.exitCode = 1;
+  } else {
+    await rm(resolvedStorageRoot, { recursive: true, force: true });
+  }
   runChecked('docker', [...composeArguments, 'down', '--volumes', '--remove-orphans']);
 }

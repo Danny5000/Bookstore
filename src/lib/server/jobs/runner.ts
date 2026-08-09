@@ -12,6 +12,7 @@ interface RunWorkerOptions {
   repository: JobRepository;
   handlers: ReadonlyMap<string, JobHandler>;
   workerId: string;
+  concurrency: number;
   pollIntervalMs: number;
   signal: AbortSignal;
   sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
@@ -25,7 +26,7 @@ async function abortableSleep(milliseconds: number, signal: AbortSignal): Promis
   }
 }
 
-export async function runWorker(options: RunWorkerOptions): Promise<void> {
+async function runWorkerLoop(options: Omit<RunWorkerOptions, 'concurrency'>): Promise<void> {
   const sleep = options.sleep ?? abortableSleep;
 
   while (!options.signal.aborted) {
@@ -59,4 +60,22 @@ export async function runWorker(options: RunWorkerOptions): Promise<void> {
       );
     }
   }
+}
+
+export async function runWorker(options: RunWorkerOptions): Promise<void> {
+  if (!Number.isSafeInteger(options.concurrency) || options.concurrency < 1) {
+    throw new RangeError('Worker concurrency must be a positive integer');
+  }
+  await Promise.all(
+    Array.from({ length: options.concurrency }, (_, slot) =>
+      runWorkerLoop({
+        repository: options.repository,
+        handlers: options.handlers,
+        workerId: options.concurrency === 1 ? options.workerId : `${options.workerId}:${slot}`,
+        pollIntervalMs: options.pollIntervalMs,
+        signal: options.signal,
+        ...(options.sleep ? { sleep: options.sleep } : {})
+      })
+    )
+  );
 }

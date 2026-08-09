@@ -15,13 +15,10 @@ import {
   type CreateRevisionInput,
   type CreateTitleInput
 } from './input';
+import { CatalogDomainError } from './errors';
 
-export class CatalogDomainError extends Error {
-  constructor(readonly code: 'title_not_found' | 'parent_revision_not_in_title') {
-    super(code);
-    this.name = 'CatalogDomainError';
-  }
-}
+export { CatalogDomainError } from './errors';
+export { acceptRevisionUpload } from './revisions';
 
 interface CatalogCommand<T> {
   actor: Actor;
