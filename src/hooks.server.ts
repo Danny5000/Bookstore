@@ -6,11 +6,13 @@ import { actorForUser } from '$lib/server/auth/identity';
 import { getAuthServer } from '$lib/server/auth/runtime';
 import { getApplicationConfig } from '$lib/server/config';
 import { getDatabaseClient } from '$lib/server/db/runtime';
+import { getObjectStorage } from '$lib/server/storage/runtime';
 
 export const init: ServerInit = () => {
   if (building) return;
   getApplicationConfig();
   getDatabaseClient();
+  getObjectStorage();
 };
 
 export const handle: Handle = async ({ event, resolve }) => {
