@@ -368,9 +368,14 @@ Expected:
 First ensure the default development Compose project is not already running:
 
 ```powershell
-$existingContainers = docker compose --env-file .env --file compose.dev.yaml ps --quiet
-if ($existingContainers) {
-  throw 'The development stack is already running; preserve it and perform this smoke test when it is stopped.'
+$env:DEV_ENV_FILE = '.env.example'
+try {
+  $existingContainers = docker compose --env-file .env.example --file compose.dev.yaml ps --quiet
+  if ($existingContainers) {
+    throw 'The development stack is already running; preserve it and perform this smoke test when it is stopped.'
+  }
+} finally {
+  Remove-Item Env:DEV_ENV_FILE -ErrorAction SilentlyContinue
 }
 ```
 
