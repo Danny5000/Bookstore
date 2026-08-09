@@ -12,7 +12,7 @@ Requirements: Node.js 26.7.x, npm 11.19.x, Docker, and Docker Compose 2.30 or ne
 .\scripts\start-dev.ps1
 ```
 
-The launcher creates `.env` from `.env.example` when needed, installs the locked dependencies, applies committed migrations, and starts the app, worker, PostgreSQL, and Mailpit. It waits for healthy services and then returns to PowerShell. The storefront runs at `http://localhost:5173`; Mailpit runs at `http://localhost:8025`; the PostgreSQL-backed worker is private to Compose.
+The launcher creates `.env` from `.env.example` when needed, installs the locked dependencies, applies committed migrations, and starts the app, worker, PostgreSQL, and Mailpit. It waits for healthy services and then returns to PowerShell. The storefront runs at `http://localhost:5173`; Mailpit runs at `http://localhost:8025`; the PostgreSQL-backed worker is private to Compose. Uploaded publications live under the ignored `.data/storage` directory.
 
 Manual host-run commands:
 
@@ -31,7 +31,7 @@ docker compose --env-file .env --file compose.dev.yaml --profile tools run --rm 
 docker compose --env-file .env --file compose.dev.yaml up --build --wait
 ```
 
-See [authentication and email operations](docs/authentication-and-email.md), [runtime environments](docs/runtime-environments.md), and [database and workers](docs/database-and-workers.md) for migrations, process secrets, health checks, tests, logs, shutdown, and cleanup commands.
+See [authentication and email operations](docs/authentication-and-email.md), [runtime environments](docs/runtime-environments.md), [database and workers](docs/database-and-workers.md), and [storage, ingestion, publication, and recovery](docs/storage-ingestion-and-publication.md) for migrations, process secrets, health checks, upload/retry/publication operations, cleanup, disk thresholds, coordinated backups, and isolated restores.
 
 Quality gates:
 
@@ -45,7 +45,7 @@ npm run build
 npm run verify
 ```
 
-Development retains the clickable frontend prototype around durable authentication and administration. The production Compose baseline is deliberately locked to maintenance mode until later backend plans replace the prototype catalog, local purchase grants, in-memory entitlements, and fake file-delivery seams.
+Development now uses the PostgreSQL catalog, private EPUB/CBZ storage, background ingestion, revision review/publication, public previews, and an audited admin dashboard. The production Compose baseline remains deliberately locked to maintenance mode until commerce and customer full-book access are implemented.
 
 ## Routes
 
@@ -56,7 +56,7 @@ Development retains the clickable frontend prototype around durable authenticati
 | `/book/[id]` | Detail: cover, summary, excerpt, contents, buy / free chapter |
 | `/read/[id]` | The reader. `?sample=1` opens the free-chapter mode |
 | `/library` | The shelf: spines, progress, resume, email / download |
-| `/studio` | Admin: publish a title by pasting a manuscript |
+| `/studio` | Redirect to the database-backed admin catalog |
 | `/checkout/[id]` | Order summary → Stripe Checkout |
 | `/checkout/success` | Post-payment landing |
 | `/api/checkout` | Creates the Stripe Checkout Session |
@@ -100,13 +100,7 @@ to `THEMES` in `src/lib/stores/theme.svelte.ts` and a matching token block.
 
 ## Data
 
-`src/lib/data/catalog.ts` holds the seed titles; `src/lib/stores/titles.svelte.ts`
-merges them with anything published in Studio. Swap both for `load()` functions
-against your DB — components only use `titles.all` / `titles.get(id)`, and the
-`Title` union is defined in `src/lib/types/catalog.ts`.
-
-The prototype schema sketch is in `src/lib/server/db.ts`; the approved PostgreSQL
-model is in the full-stack design specification.
+Public catalog, detail, and preview loaders read only active, public revisions with published reader settings from PostgreSQL. Administrators create titles, stream EPUB/CBZ uploads, review derived content, publish settings, and explicitly activate, replace, roll back, or withdraw revisions under `/admin/catalog`.
 
 ## Payments
 
@@ -131,15 +125,9 @@ the last administrator. Third-party OAuth is intentionally out of scope.
 
 ## Delivery
 
-Versioned authentication messages are queued through the PostgreSQL outbox and
-sent by the worker through a provider-neutral SMTP adapter. Development SMTP is
-captured by Mailpit; production credentials come from the deployment process as
-Compose secrets. The later storage plan retains EPUB and CBZ/ZIP originals on
-local disk behind an adapter, with an S3-compatible stub for future use.
+Versioned authentication messages are queued through the PostgreSQL outbox and sent by the worker through a provider-neutral SMTP adapter. Development SMTP is captured by Mailpit; production credentials come from the deployment process as Compose secrets. EPUB and CBZ/ZIP originals are retained immutably behind the object-storage interface. Local disk is implemented; the S3 provider value fails explicitly until a future adapter is built.
 
 ## Not yet wired
 
-- Real cover art and comic page images (placeholders are CSS gradients / hatch
-  patterns — see `CoverArt.svelte` and `PageFace.svelte`).
-- Server-side entitlement checks on `/read/[id]` (currently client-side).
+- Customer entitlement and purchased-original delivery; public reading is intentionally limited to configured free previews.
 - Search, series grouping, pre-orders, reviews.

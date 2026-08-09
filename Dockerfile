@@ -15,7 +15,8 @@ CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "5173"]
 FROM dependencies AS build
 COPY . .
 RUN npm run build
-RUN npm prune --omit=dev --omit=optional
+RUN npm prune --omit=dev
+RUN node -e "import('sharp').then(async ({default: sharp}) => sharp({create:{width:1,height:1,channels:4,background:'#fff'}}).webp().toBuffer())"
 
 FROM ${NODE_IMAGE} AS runtime
 ENV NODE_ENV=production \
@@ -26,6 +27,7 @@ COPY --from=build --chown=node:node /app/build ./build
 COPY --from=build --chown=node:node /app/drizzle ./drizzle
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/package.json ./package.json
+RUN mkdir -p /var/lib/pale-orbit/storage && chown node:node /var/lib/pale-orbit/storage
 USER node
 EXPOSE 3000
 CMD ["node", "build"]

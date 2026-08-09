@@ -24,6 +24,8 @@
     "admin:bootstrap": "node --env-file-if-exists=.env --import tsx src/bootstrap-admin.ts",
     "worker:dev": "node --env-file-if-exists=.env --import tsx src/worker.ts",
     "worker:watch": "node --watch --env-file-if-exists=.env --import tsx src/worker.ts",
+    "storage:cleanup:raw": "tsx src/cleanup-storage.ts",
+    "storage:cleanup": "node --env-file-if-exists=.env --import tsx src/cleanup-storage.ts",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "lint": "eslint .",
     "test": "vitest run",

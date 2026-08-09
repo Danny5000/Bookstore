@@ -4,7 +4,7 @@
 
 Drizzle schema files under `src/lib/server/db/schema/` are the database model source of truth. Generated SQL and snapshots under `drizzle/` are committed and reviewed. Never use `drizzle-kit push` against shared or production databases.
 
-The web process, migration command, and worker each own a bounded node-postgres pool. The web process uses PostgreSQL for readiness. The worker claims durable jobs from PostgreSQL and dispatches transactional outbox messages. Redis is not part of the current topology.
+The web process, migration command, worker, and storage-cleanup command each own a bounded node-postgres pool. The web process uses PostgreSQL for readiness. The worker claims durable jobs from PostgreSQL, dispatches transactional outbox messages, and ingests revision sources from private object storage. Redis is not part of the current topology.
 
 ## Local schema changes
 
@@ -74,7 +74,7 @@ npm run test:e2e
 npm run test:database
 ```
 
-`npm run verify` runs integration and browser suites in separate disposable Compose projects. Browser tests additionally start the real worker and bootstrap a test administrator so email delivery and role authorization use production-shaped paths.
+`npm run verify` runs integration and browser suites in separate disposable Compose projects. Browser tests additionally start the real worker and bootstrap a test administrator so email delivery and role authorization use production-shaped paths. The harness creates a unique temporary local-storage root and removes only that verified path.
 
 ## Production deployment order
 
@@ -95,7 +95,7 @@ docker compose --file compose.prod.yaml ps
 docker compose --file compose.prod.yaml logs --tail 100 app worker postgres caddy
 ```
 
-`/health/live` proves only the web process responds. `/health/ready` performs a bounded PostgreSQL query. Worker health proves the worker completed its initial database probe and entered the polling loop. Production storefront and API paths remain in maintenance mode until later plans replace prototype identity and commerce seams.
+`/health/live` proves only the web process responds. `/health/ready` performs bounded PostgreSQL and storage probes. Worker health proves the worker completed its initial dependency probes and entered the polling loop. Production storefront and API paths remain in maintenance mode until commerce and customer full-book access are implemented.
 
 ## Job behavior
 
@@ -103,11 +103,13 @@ Workers claim one job at a time with `FOR UPDATE SKIP LOCKED`. A lease timestamp
 
 Handlers persist only deliberately safe error text. The outbox pairs a message and dispatch job in the caller's transaction and delivers at least once. A message already recorded as delivered is not sent again on ordinary job replay, while topic handlers remain responsible for the crash window between an external side effect and the `deliveredAt` update.
 
+Revision-ingestion jobs copy accepted sources to immutable original keys, produce deterministic derived assets, and commit a generation only while it is still current. Transient storage/database/timeout failures retry automatically; permanent archive/content failures require an administrator retry only when the staged source is still intact, or a new immutable upload. See [storage, ingestion, publication, and recovery](storage-ingestion-and-publication.md) for cleanup, capacity, backup, and restore operations.
+
 Authentication email uses the versioned `email.auth.v1` topic and a stable Message-ID. Better Auth creates a signed email-verification token before its awaited callback stores a one-use SHA-256 digest marker and then creates the project outbox transaction. Those callback writes are separate transaction boundaries; the endpoint succeeds only after the outbox write is durable. See the authentication runbook for delivery and safe-troubleshooting details.
 
 ## Scope of later plans
 
 - Plan 3 registered authentication email outbox topics, integrated Better Auth, and mapped sessions/roles to the actor policy.
-- Plan 4 adds storage/ingestion jobs and revision lifecycle transitions.
+- Plan 4 added storage/ingestion jobs, revision lifecycle transitions, and bounded storage cleanup.
 - Plan 6 adds Stripe reconciliation job topics.
-- Plan 7 adds failed-job administration, structured logging, queue-age monitoring, backup/restore, and final pool/capacity tuning.
+- Plan 7 adds failed-job administration, structured logging, queue-age monitoring, scheduled off-host backups, and final pool/capacity tuning.

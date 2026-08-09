@@ -1,8 +1,23 @@
+x-publication-settings: &publication-settings
+  WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-1}
+  STORAGE_PROVIDER: ${STORAGE_PROVIDER:-local}
+  STORAGE_LOCAL_ROOT: /var/lib/pale-orbit/storage
+  UPLOAD_MAX_BYTES: ${UPLOAD_MAX_BYTES:-536870912}
+  INGEST_MAX_EXPANDED_BYTES: ${INGEST_MAX_EXPANDED_BYTES:-2147483648}
+  INGEST_MAX_ENTRIES: ${INGEST_MAX_ENTRIES:-10000}
+  INGEST_MAX_XML_BYTES: ${INGEST_MAX_XML_BYTES:-8388608}
+  INGEST_MAX_IMAGE_PIXELS: ${INGEST_MAX_IMAGE_PIXELS:-100000000}
+  INGEST_MAX_COMPRESSION_RATIO: ${INGEST_MAX_COMPRESSION_RATIO:-200}
+  INGEST_TIMEOUT_MS: ${INGEST_TIMEOUT_MS:-900000}
+  STORAGE_STAGING_RETENTION_HOURS: ${STORAGE_STAGING_RETENTION_HOURS:-24}
+  STORAGE_ORPHAN_RETENTION_HOURS: ${STORAGE_ORPHAN_RETENTION_HOURS:-168}
+
 services:
   app:
     image: ${APP_IMAGE:?APP_IMAGE must be an immutable versioned image}
     init: true
     environment:
+      <<: *publication-settings
       NODE_ENV: production
       APP_ENV: production
       APPLICATION_MODE: maintenance
@@ -48,6 +63,8 @@ services:
       - database_password
       - auth_secret
       - smtp_password
+    volumes:
+      - book_storage:/var/lib/pale-orbit/storage
     depends_on:
       postgres:
         condition: service_healthy
@@ -80,6 +97,7 @@ services:
     init: true
     command: [node, build/services/worker.js]
     environment:
+      <<: *publication-settings
       NODE_ENV: production
       APP_ENV: production
       APPLICATION_MODE: maintenance
@@ -121,6 +139,8 @@ services:
       - database_password
       - auth_secret
       - smtp_password
+    volumes:
+      - book_storage:/var/lib/pale-orbit/storage
     depends_on:
       postgres:
         condition: service_healthy
@@ -147,6 +167,7 @@ services:
     image: ${APP_IMAGE:?APP_IMAGE must be an immutable versioned image}
     command: [node, build/services/migrate.js]
     environment:
+      <<: *publication-settings
       NODE_ENV: production
       APP_ENV: production
       APPLICATION_MODE: maintenance
@@ -200,6 +221,7 @@ services:
     image: ${APP_IMAGE:?APP_IMAGE must be an immutable versioned image}
     command: [node, build/services/bootstrap-admin.js]
     environment:
+      <<: *publication-settings
       NODE_ENV: production
       APP_ENV: production
       APPLICATION_MODE: maintenance
@@ -245,6 +267,34 @@ services:
       - auth_secret
       - smtp_password
       - bootstrap_admin_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+  storage-cleanup:
+    profiles: [tools]
+    image: ${APP_IMAGE:?APP_IMAGE must be an immutable versioned image}
+    command: [node, build/services/cleanup-storage.js]
+    environment:
+      <<: *publication-settings
+      NODE_ENV: production
+      APP_ENV: production
+      DATABASE_HOST: postgres
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: ${DATABASE_NAME:?DATABASE_NAME must be set}
+      DATABASE_USER: ${DATABASE_USER:?DATABASE_USER must be set}
+      DATABASE_PASSWORD_FILE: /run/secrets/database_password
+      DATABASE_POOL_MAX: "1"
+      DATABASE_CONNECTION_TIMEOUT_MS: "5000"
+      DATABASE_STATEMENT_TIMEOUT_MS: "30000"
+      DATABASE_READINESS_TIMEOUT_MS: "2000"
+    secrets:
+      - database_password
+    volumes:
+      - book_storage:/var/lib/pale-orbit/storage
     depends_on:
       postgres:
         condition: service_healthy
@@ -318,5 +368,6 @@ secrets:
 
 volumes:
   postgres_data:
+  book_storage:
   caddy_data:
   caddy_config:

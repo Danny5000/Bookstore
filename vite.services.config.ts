@@ -21,6 +21,7 @@ export default defineConfig({
     rolldownOptions: {
       input: {
         'bootstrap-admin': resolve(import.meta.dirname, 'src/bootstrap-admin.ts'),
+        'cleanup-storage': resolve(import.meta.dirname, 'src/cleanup-storage.ts'),
         migrate: resolve(import.meta.dirname, 'src/migrate.ts'),
         worker: resolve(import.meta.dirname, 'src/worker.ts')
       },

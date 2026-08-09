@@ -4,6 +4,7 @@ node_modules
 /test-results/
 /playwright-report/
 /blob-report/
+/.data/
 .env
 .DS_Store
 /.worktrees/
