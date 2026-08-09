@@ -16,6 +16,15 @@ export class LastAdministratorError extends Error {
   }
 }
 
+export class RoleTargetNotFoundError extends Error {
+  readonly code = 'role_target_not_found';
+
+  constructor() {
+    super('User not found');
+    this.name = 'RoleTargetNotFoundError';
+  }
+}
+
 export interface SetAdminRoleInput {
   actor: Actor;
   targetUserId: string;
@@ -49,7 +58,7 @@ export async function setAdminRole(
       .from(user)
       .where(eq(user.id, input.targetUserId))
       .limit(1);
-    if (!target) throw new Error('User not found');
+    if (!target) throw new RoleTargetNotFoundError();
 
     const before = await listRolesForUser(transaction, target.id);
     let changed = false;

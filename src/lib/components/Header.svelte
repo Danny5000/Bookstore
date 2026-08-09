@@ -45,7 +45,7 @@
       <a href={resolve(l.href)} class:active={$page.url.pathname.startsWith(l.href)}>{l.label}</a>
     {/each}
     {#if user?.roles.includes('admin')}
-      <a href={resolve('/admin' as never)} class:active={$page.url.pathname.startsWith('/admin')}>Admin</a>
+      <a href={resolve('/admin')} class:active={$page.url.pathname.startsWith('/admin')}>Admin</a>
     {/if}
   </nav>
 
