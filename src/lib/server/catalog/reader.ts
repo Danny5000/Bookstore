@@ -1,4 +1,4 @@
-import { and, asc, eq } from 'drizzle-orm';
+import { and, asc, count, eq } from 'drizzle-orm';
 import { requireCapability, type Actor } from '$lib/server/auth/admin-policy';
 import type { Database } from '$lib/server/db/client';
 import {
@@ -62,11 +62,13 @@ function titleSummary(root: ReaderRoot): CatalogTitleSummary {
   };
 }
 
-function titleDetail(root: ReaderRoot): CatalogTitleDetail {
+function titleDetail(root: ReaderRoot, extentCount: number): CatalogTitleDetail {
   return {
     ...titleSummary(root),
     description: root.title.description,
-    previewUrl: `/api/catalog/${encodeURIComponent(root.title.slug)}/preview`
+    previewUrl: `/api/catalog/${encodeURIComponent(root.title.slug)}/preview`,
+    extentCount,
+    extentUnit: root.title.format === 'prose' ? 'sections' : 'pages'
   };
 }
 
@@ -118,7 +120,13 @@ export async function getPublicTitleDetail(
   slug: string
 ): Promise<CatalogTitleDetail | null> {
   const root = await getPublicRoot(database, slug);
-  return root ? titleDetail(root) : null;
+  if (!root) return null;
+  const source = root.title.format === 'prose' ? proseSections : comicPages;
+  const [extent] = await database
+    .select({ value: count() })
+    .from(source)
+    .where(eq(source.revisionId, root.revisionId));
+  return titleDetail(root, extent?.value ?? 0);
 }
 
 function imageDto(revisionId: string, image: typeof proseImages.$inferSelect): ProseImageDto {

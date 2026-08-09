@@ -54,6 +54,8 @@ export interface CatalogTitleSummary {
 export interface CatalogTitleDetail extends CatalogTitleSummary {
   description: string;
   previewUrl: string;
+  extentCount: number;
+  extentUnit: 'sections' | 'pages';
 }
 
 export interface ProseBlockDto {

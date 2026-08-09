@@ -2,19 +2,18 @@
   interface Props {
     isComic: boolean;
     title: string;
-    price: string;
     onbuy: () => void;
     onclose: () => void;
   }
 
-  let { isComic, title, price, onbuy, onclose }: Props = $props();
+  let { isComic, title, onbuy, onclose }: Props = $props();
 </script>
 
 <div class="paywall">
   <div class="card">
     <div class="mono accent">End of the free {isComic ? 'preview' : 'chapter'}</div>
     <h3 class="display">{title}</h3>
-    <p>Keep going for {price}. Yours forever, in the browser or as a file.</p>
+    <p>Purchase this title to keep reading and download the original file.</p>
     <button class="btn" type="button" onclick={onbuy}>Buy the whole {isComic ? 'issue' : 'book'}</button>
     <button class="link" type="button" onclick={onclose}>Not now</button>
   </div>

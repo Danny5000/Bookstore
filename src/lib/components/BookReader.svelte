@@ -8,13 +8,15 @@
   import ReaderPaywall from './reader/ReaderPaywall.svelte';
   import ReaderSpread from './reader/ReaderSpread.svelte';
   import ReaderToolbar from './reader/ReaderToolbar.svelte';
-  import { pageBox, paginate, pageForAnchor, freeSheets, PAPERS, TYPEFACES } from '$lib/paginate';
+  import { pageBox, pageForAnchor, PAPERS, TYPEFACES } from '$lib/paginate';
   import { library } from '$lib/stores/library.svelte';
-  import { money, coverBackground } from '$lib/data/catalog';
+  import { coverBackground } from '$lib/data/catalog';
   import { cubicBezier } from '$lib/reader/easing';
   import { bookDepth } from '$lib/reader/geometry';
   import { clampSheet } from '$lib/reader/navigation';
+  import { paginatePublication } from '$lib/reader/publication-pagination';
   import { buildSheetWindow } from '$lib/reader/sheet-window';
+  import type { Chapter, Title } from '$lib/types/catalog';
   import type {
     EasingFunction,
     PaperId,
@@ -26,12 +28,47 @@
     TypefaceId
   } from '$lib/types/reader';
 
-  let { title, sample = false, onclose, onbuy }: ReaderProps = $props();
+  let { document, access, onclose, onbuy }: ReaderProps = $props();
+
+  const progressKey = $derived(document.presentationId);
+  const displayTitle: Title = $derived(
+    document.format === 'comic'
+      ? {
+          id: document.titleId,
+          title: document.title,
+          author: '',
+          price: 0,
+          released: '',
+          cover: 0,
+          summary: '',
+          kind: 'comic',
+          pages: document.pages.length,
+          direction: document.readingDirection,
+          panelMode: document.guidedViewEnabled ? 'manual' : 'off'
+        }
+      : {
+          id: document.titleId,
+          title: document.title,
+          author: '',
+          price: 0,
+          released: '',
+          cover: 0,
+          summary: '',
+          kind: 'novel',
+          chapters: document.sections.map((section) => ({
+            title: section.label ?? `Section ${section.ordinal + 1}`,
+            paras: []
+          }))
+        }
+  );
+  const chapters: readonly Chapter[] = $derived(
+    document.format === 'prose' ? displayTitle.chapters ?? [] : []
+  );
 
   let vw = $state(1440);
   let vh = $state(900);
 
-  const initialSheet = untrack(() => library.progress[title.id] ?? 0);
+  const initialSheet = untrack(() => library.progress[progressKey] ?? 0);
   let sheet = $state(initialSheet);
   let phase = $state<ReaderPhase>(initialSheet > 0 ? 'reading' : 'closed');
   let flipped = $state(false);
@@ -179,34 +216,35 @@
   // Pagination is derived from this box, so it must NOT vary with reader phase
   // — a different box when the book closes would renumber the whole book.
   const box = $derived(pageBox({ vw, vh, narrow, fontSize: prefs.fontSize }));
-  const pages = $derived(paginate(title, box));
+  const pages = $derived(paginatePublication(document, box));
   const totalSheets = $derived(Math.ceil(pages.length / per));
-  const owned = $derived(library.owns(title.id));
-  const sampling = $derived(sample && !owned);
-  // freeSheets() returns the LAST readable sheet; one past it is the paywall.
-  const readable = $derived(sampling ? freeSheets(title, pages, per) : totalSheets);
-  const limit = $derived(sampling ? Math.min(totalSheets, readable + 1) : totalSheets);
-  const paywalled = $derived(sampling && sheet > readable && totalSheets > readable);
+  const sampling = $derived(access === 'preview');
+  // The server has already truncated the document to its reviewed preview
+  // boundary. One step beyond the final returned sheet opens the paywall.
+  const readable = $derived(sampling ? Math.max(0, totalSheets - 1) : totalSheets);
+  const limit = $derived(totalSheets);
+  const paywalled = $derived(sampling && totalSheets > 0 && sheet > readable);
   const paper = $derived(PAPERS[prefs.paper]);
-  const isComic = $derived(title.kind === 'comic');
-  const guided = $derived(isComic && comicMode === 'panel');
+  const isComic = $derived(document.format === 'comic');
+  const hasGuidedView = $derived(document.format === 'comic' && document.guidedViewEnabled);
+  const guided = $derived(hasGuidedView && comicMode === 'panel');
 
   const bookW = $derived(narrow ? box.pw : box.pw * 2);
   const progress = $derived(
     phase === 'closed' && flipped ? 1 : totalSheets ? Math.min(1, sheet / totalSheets) : 0
   );
-  const bookmarks = $derived(library.bookmarksFor(title.id));
+  const bookmarks = $derived(library.bookmarksFor(progressKey));
 
   // Closed book: thickness scales with the page count, capped so a long novel
   // still reads as a book rather than a brick. A comic is a stapled issue, not
   // a bound volume, so it stays thin however many pages it runs to.
-  const depth = $derived(bookDepth(title.kind, pages.length));
+  const depth = $derived(bookDepth(isComic ? 'comic' : 'novel', pages.length));
   // The closed footer is taller than the reading one, so the volume is sized
   // down here rather than shrinking the page box (which would repaginate).
   const coverBase = $derived(box.ph - 42);
   const coverW = $derived(Math.round(coverBase * 0.73 * 1.04));
   const coverH = $derived(Math.round(coverBase * 1.02));
-  const boardArt = $derived(coverBackground(title.cover, title.coverUrl));
+  const boardArt = $derived(coverBackground(0));
 
   // Visible folios: left is the back of the previous sheet, right the front of
   // this one. Sheet 0 shows page 1 alone on the right, like an opened book.
@@ -222,8 +260,11 @@
   const currentPage = $derived(
     Math.min(Math.max(0, pages.length - 1), pageIdx === null ? sheet * per : pageIdx)
   );
-  const panelCount = $derived(pages[currentPage]?.layout?.length || 1);
-  const panelCell = $derived(pages[currentPage]?.layout?.[panelIdx % panelCount] || null);
+  const comicPage = $derived(
+    pages[currentPage]?.type === 'comic' ? pages[currentPage] : null
+  );
+  const panelCount = $derived(comicPage?.panels?.length || 1);
+  const panelRegion = $derived(comicPage?.panels?.[panelIdx % panelCount] ?? null);
   const panelH = $derived(Math.max(260, Math.min(600, vh - 250)));
 
   const maxRenderedSheet = $derived(
@@ -245,13 +286,13 @@
     const next = clampSheet(n, totalSheets, limit);
     sheet = next;
     recordAnchor();
-    library.setProgress(title.id, next, anchor);
+    library.setProgress(progressKey, next, anchor);
   }
 
   // Reflow renumbers the whole book: at a narrower size a 30-page novel becomes
   // 52 pages, and the stored sheet index then points somewhere else entirely.
   // The reader's position in the text is what gets kept.
-  let anchor: ReadingAnchor | null = untrack(() => library.anchorFor(title.id));
+  let anchor: ReadingAnchor | null = untrack(() => library.anchorFor(progressKey));
 
   function recordAnchor(): void {
     const p = pages[Math.min(pages.length - 1, sheet * per)];
@@ -273,7 +314,7 @@
       );
       if (next !== sheet) {
         sheet = next;
-        library.setProgress(title.id, next, anchor);
+        library.setProgress(progressKey, next, anchor);
       }
     });
   });
@@ -363,10 +404,15 @@
   function turnPanel(dir: TurnDirection): void {
     let p = currentPage;
     let i = panelIdx + dir;
-    const count = (pageNumber: number): number => pages[pageNumber]?.layout?.length || 1;
+    const count = (pageNumber: number): number => {
+      const page = pages[pageNumber];
+      return page?.type === 'comic' ? page.panels?.length || 1 : 1;
+    };
     if (i >= count(p)) {
       if (p + 1 >= pages.length) {
-        if (limit >= totalSheets) {
+        if (sampling) {
+          sheet = totalSheets;
+        } else {
           phase = 'closed';
           flipped = true;
           flipping = false;
@@ -394,7 +440,7 @@
     panelIdx = i;
     sheet = nextSheet;
     recordAnchor();
-    library.setProgress(title.id, nextSheet, anchor);
+    library.setProgress(progressKey, nextSheet, anchor);
   }
 
   function toggleGuided(): void {
@@ -466,16 +512,16 @@
   style:background={prefs.paper === 'dim' ? 'oklch(0.16 0.01 262)' : 'var(--bg)'}
 >
   <ReaderToolbar
-    title={title.title}
-    {isComic}
-    isFixed={title.kind === 'novel' && !!title.fixed}
+    title={document.title}
+    isComic={hasGuidedView}
+    isFixed={false}
     {narrow}
     bookmarked={bookmarks.includes(sheet)}
     {guided}
     {progress}
     onclose={() => onclose?.()}
     oncontents={() => (tocOpen = !tocOpen)}
-    onbookmark={() => library.toggleBookmark(title.id, sheet)}
+    onbookmark={() => library.toggleBookmark(progressKey, sheet)}
     onguided={toggleGuided}
     oncontrols={() => (controlsOpen = !controlsOpen)}
   />
@@ -488,7 +534,7 @@
     <ReaderDrawers
       contentsOpen={tocOpen}
       {controlsOpen}
-      chapters={title.kind === 'novel' ? (title.chapters ?? []) : []}
+      {chapters}
       {bookmarks}
       {per}
       {prefs}
@@ -505,7 +551,7 @@
       <!-- Closed book: front board, spine, page block, flip to the back cover -->
       <div class="case">
         <BookVolume
-          {title}
+          title={displayTitle}
           width={coverW}
           height={coverH}
           {depth}
@@ -513,7 +559,7 @@
           {flipped}
           {flipping}
           onclick={openBook}
-          label="Open {title.title}"
+          label="Open {document.title}"
         />
       </div>
     {:else if phase !== 'reading'}
@@ -532,10 +578,17 @@
         oncomplete={settleTransition}
       />
     {:else if guided}
-      <ReaderGuidedPanel height={panelH} panel={panelCell} onnext={() => turn(1)} />
+      <ReaderGuidedPanel
+        height={panelH}
+        imageUrl={comicPage?.imageUrl ?? ''}
+        pageWidth={comicPage?.imageWidth ?? 1}
+        pageHeight={comicPage?.imageHeight ?? 1}
+        panel={panelRegion}
+        onnext={() => turn(1)}
+      />
     {:else}
       <ReaderSpread
-        title={title.title}
+        title={document.title}
         bookWidth={bookW}
         {box}
         {narrow}
@@ -553,8 +606,7 @@
     {#if paywalled}
       <ReaderPaywall
         {isComic}
-        title={title.title}
-        price={money(title.price)}
+        title={document.title}
         onbuy={() => onbuy?.()}
         onclose={() => onclose?.()}
       />

@@ -1,15 +1,23 @@
 <script lang="ts">
-  import type { PanelCell } from '$lib/types/reader';
+  import type { PanelRegionDto } from '$lib/types/publication';
 
   interface Props {
     height: number;
-    panel: PanelCell | null;
+    imageUrl: string;
+    pageWidth: number;
+    pageHeight: number;
+    panel: PanelRegionDto | null;
     onnext: () => void;
   }
 
-  let { height, panel, onnext }: Props = $props();
+  let { height, imageUrl, pageWidth, pageHeight, panel, onnext }: Props = $props();
+  const rawPanel = $derived(panel ?? { id: 'page', ordinal: 0, x: 0, y: 0, width: 1, height: 1 });
+  const safeWidth = $derived(Math.max(0.001, Math.min(1, rawPanel.width)));
+  const safeHeight = $derived(Math.max(0.001, Math.min(1, rawPanel.height)));
+  const safeX = $derived(Math.max(0, Math.min(1 - safeWidth, rawPanel.x)));
+  const safeY = $derived(Math.max(0, Math.min(1 - safeHeight, rawPanel.y)));
   const width = $derived(
-    Math.round(height * (panel ? (panel.c / panel.r) * 1.15 : 1.4))
+    Math.round(height * ((safeWidth * Math.max(1, pageWidth)) / (safeHeight * Math.max(1, pageHeight))))
   );
 </script>
 
@@ -20,13 +28,22 @@
   style:width="min(80vw, {width}px)"
   onclick={onnext}
 >
-  <span class="art"></span>
-  <span class="cap">{panel?.cap}</span>
+  {#if imageUrl}
+    <img
+      src={imageUrl}
+      alt=""
+      style:width="{100 / safeWidth}%"
+      style:height="{100 / safeHeight}%"
+      style:left="{-safeX / safeWidth * 100}%"
+      style:top="{-safeY / safeHeight * 100}%"
+    />
+  {/if}
 </button>
 
 <style>
   .single-panel {
     position: relative;
+    overflow: hidden;
     padding: 0;
     background: #fff;
     border: 3px solid #16130f;
@@ -35,24 +52,9 @@
     animation: fade-up 0.28s ease both;
   }
 
-  .single-panel .art {
+  .single-panel img {
     position: absolute;
-    inset: 0;
-    background: repeating-linear-gradient(
-      135deg,
-      rgba(20, 18, 15, 0.09) 0 12px,
-      rgba(20, 18, 15, 0.02) 12px 24px
-    );
-  }
-
-  .single-panel .cap {
-    position: absolute;
-    left: 18px;
-    right: 18px;
-    bottom: 18px;
-    text-align: left;
-    font-family: var(--font-mono);
-    font-size: 12px;
-    color: rgba(0, 0, 0, 0.62);
+    max-width: none;
+    object-fit: fill;
   }
 </style>

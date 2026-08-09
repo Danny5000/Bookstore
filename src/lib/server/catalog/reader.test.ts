@@ -81,7 +81,7 @@ const publicRoot = {
 describe('publication reader queries', () => {
   it('maps only qualified public roots into safe list and detail DTOs', async () => {
     const listDatabase = databaseReturning([publicRoot]);
-    const detailDatabase = databaseReturning([publicRoot]);
+    const detailDatabase = databaseReturning([publicRoot], [{ value: 7 }]);
 
     await expect(listPublicCatalog(listDatabase)).resolves.toEqual([
       {
@@ -106,7 +106,9 @@ describe('publication reader queries', () => {
     await expect(getPublicTitleDetail(detailDatabase, 'reader-title')).resolves.toMatchObject({
       id: titleId,
       description: 'A published title.',
-      previewUrl: '/api/catalog/reader-title/preview'
+      previewUrl: '/api/catalog/reader-title/preview',
+      extentCount: 7,
+      extentUnit: 'sections'
     });
     await expect(getPublicTitleDetail(databaseReturning([]), 'private-or-missing')).resolves.toBeNull();
   });

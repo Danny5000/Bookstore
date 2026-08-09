@@ -1,4 +1,10 @@
 import type { Title } from './catalog';
+import type {
+  PanelRegionDto,
+  ProseBlockData,
+  ReaderAccess,
+  ReaderDocument
+} from './publication';
 
 export interface PageBoxInput {
   vw: number;
@@ -36,6 +42,7 @@ export interface TextReaderPage extends ReaderPageBase {
   type: 'text';
   heading: string | null;
   paras: string[];
+  blocks?: readonly RenderedProseBlock[];
   layout?: never;
   label?: never;
 }
@@ -43,6 +50,10 @@ export interface TextReaderPage extends ReaderPageBase {
 export interface ComicReaderPage extends ReaderPageBase {
   type: 'comic';
   layout: PanelCell[];
+  imageUrl?: string;
+  imageWidth?: number;
+  imageHeight?: number;
+  panels?: readonly PanelRegionDto[];
   heading?: never;
   paras?: never;
   label?: never;
@@ -64,6 +75,13 @@ export interface ReaderPreferences {
   fontSize: number;
   typeface: TypefaceId;
   paper: PaperId;
+}
+
+export interface RenderedProseBlock {
+  sourceBlockId: string;
+  sourceOffset: number;
+  content: ProseBlockData;
+  imageUrl?: string;
 }
 
 export type ReaderPhase =
@@ -95,6 +113,14 @@ export interface SheetView {
 export type EasingFunction = (position: number) => number;
 
 export interface ReaderProps {
+  document: ReaderDocument;
+  access: ReaderAccess;
+  onclose?: () => void;
+  onbuy?: () => void;
+}
+
+// Retained for prototype-only callers that still use the legacy paginator.
+export interface PrototypeReaderProps {
   title: Title;
   sample?: boolean;
   onclose?: () => void;
