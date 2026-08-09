@@ -32,6 +32,7 @@ Start PostgreSQL and Mailpit, apply migrations, then run web and worker in separ
 ```powershell
 docker compose --env-file .env --file compose.dev.yaml up postgres mailpit --detach --wait
 npm run db:migrate
+npm run admin:bootstrap
 npm run dev
 ```
 
@@ -51,6 +52,7 @@ Run the explicit migration profile before long-running services:
 
 ```powershell
 docker compose --env-file .env --file compose.dev.yaml --profile tools run --rm migrate
+docker compose --env-file .env --file compose.dev.yaml --profile tools run --rm bootstrap-admin
 docker compose --env-file .env --file compose.dev.yaml up --build --wait
 ```
 
@@ -72,7 +74,7 @@ npm run test:e2e
 npm run test:database
 ```
 
-`npm run verify` uses one disposable database for the serialized integration and browser suites.
+`npm run verify` runs integration and browser suites in separate disposable Compose projects. Browser tests additionally start the real worker and bootstrap a test administrator so email delivery and role authorization use production-shaped paths.
 
 ## Production deployment order
 
@@ -80,10 +82,11 @@ Production configuration comes from the invoking process environment; no product
 
 ```powershell
 docker compose --file compose.prod.yaml --profile tools run --rm migrate
+docker compose --file compose.prod.yaml --profile tools run --rm bootstrap-admin
 docker compose --file compose.prod.yaml up --detach --wait
 ```
 
-Do not start the new web or worker containers if migration exits nonzero. Re-running the same committed migration set is safe because Drizzle records applied migrations in `drizzle.__drizzle_migrations`.
+Do not start the new web or worker containers if migration exits nonzero. Re-running the same committed migration set is safe because Drizzle records applied migrations in `drizzle.__drizzle_migrations`. The administrator bootstrap is also idempotent and must use the bootstrap-only process secret documented in [authentication and email operations](authentication-and-email.md).
 
 Check the deployment:
 
@@ -100,9 +103,11 @@ Workers claim one job at a time with `FOR UPDATE SKIP LOCKED`. A lease timestamp
 
 Handlers persist only deliberately safe error text. The outbox pairs a message and dispatch job in the caller's transaction and delivers at least once. A message already recorded as delivered is not sent again on ordinary job replay, while topic handlers remain responsible for the crash window between an external side effect and the `deliveredAt` update.
 
+Authentication email uses the versioned `email.auth.v1` topic and a stable Message-ID. Better Auth's verification row is committed in the adapter before its awaited callback creates the project outbox transaction; those two library boundaries are deliberately not represented as one atomic transaction. See the authentication runbook for delivery and safe-troubleshooting details.
+
 ## Scope of later plans
 
-- Plan 3 registers transactional email outbox topics, integrates Better Auth, and maps sessions/roles to the actor policy.
+- Plan 3 registered authentication email outbox topics, integrated Better Auth, and mapped sessions/roles to the actor policy.
 - Plan 4 adds storage/ingestion jobs and revision lifecycle transitions.
 - Plan 6 adds Stripe reconciliation job topics.
 - Plan 7 adds failed-job administration, structured logging, queue-age monitoring, backup/restore, and final pool/capacity tuning.

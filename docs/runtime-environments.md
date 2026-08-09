@@ -22,6 +22,7 @@ Copy-Item .env.example .env
 npm ci
 docker compose --env-file .env --file compose.dev.yaml up postgres mailpit --detach --wait
 npm run db:migrate
+npm run admin:bootstrap
 npm run dev
 ```
 
@@ -43,10 +44,13 @@ After creating `.env`, run the explicit migration profile, then start the source
 
 ```powershell
 docker compose --env-file .env --file compose.dev.yaml --profile tools run --rm migrate
+docker compose --env-file .env --file compose.dev.yaml --profile tools run --rm bootstrap-admin
 docker compose --env-file .env --file compose.dev.yaml up --build --wait
 ```
 
-The development topology contains the app, worker, PostgreSQL, and Mailpit. The Compose app and worker override `DATABASE_HOST` to the internal service name `postgres`. Source changes are served by Vite from the bind mount. Dependencies remain in the named `app_node_modules` volume. The worker is private to Compose and publishes no port.
+The development topology contains the app, worker, PostgreSQL, and Mailpit. The Compose application processes override `DATABASE_HOST` and `SMTP_HOST` to the internal service names `postgres` and `mailpit`. Source changes are served by Vite from the bind mount. Dependencies remain in the named `app_node_modules` volume. The worker is private to Compose and publishes no port. `bootstrap-admin` is an idempotent, one-shot tool and does not start with the ordinary stack.
+
+The loopback bindings default to app `5173`, PostgreSQL `5432`, SMTP `1025`, and Mailpit HTTP `8025`. A parallel worktree can set `DEV_APP_PORT`, `DEV_DATABASE_PORT`, `DEV_SMTP_PORT`, and `DEV_MAILPIT_HTTP_PORT` in its ignored `.env`; set `ORIGIN` to the matching app URL.
 
 Stop the stack while retaining PostgreSQL data:
 
@@ -72,20 +76,27 @@ docker compose --env-file .env --file compose.dev.yaml down --volumes
 | `DATABASE_NAME` | `.env` | Deployment-process environment | No |
 | `DATABASE_USER` | `.env` | Deployment-process environment | No |
 | `DATABASE_PASSWORD` | `.env` | Deployment-process environment converted to a Compose secret | Yes |
+| `AUTH_SECRET` | `.env` development value | Deployment-process environment converted to a Compose secret | Yes |
+| Auth lifetimes/rate limits | `.env` | Deployment-process environment or documented Compose defaults | No |
+| `SMTP_HOST`, port, TLS mode, user, from | Mailpit/local values in `.env` | Required deployment-process environment | User is not secret |
+| `SMTP_PASSWORD` | Omitted for Mailpit | Deployment-process environment converted to a Compose secret | Yes |
+| Bootstrap email/name | `.env`, explicit tool only | Deployment-process environment, explicit tool only | No |
+| `BOOTSTRAP_ADMIN_PASSWORD` | `.env`, explicit tool only | Deployment-process environment converted to a bootstrap-only secret | Yes |
 
-Every required application value also supports a mutually exclusive `<NAME>_FILE` form. Production uses `DATABASE_PASSWORD_FILE=/run/secrets/database_password`. Startup fails when a value is missing, empty, invalid, or supplied both directly and through `_FILE`.
+Every required application value also supports a mutually exclusive `<NAME>_FILE` form. Production uses `DATABASE_PASSWORD_FILE`, `AUTH_SECRET_FILE`, and `SMTP_PASSWORD_FILE` under `/run/secrets`; the bootstrap tool also uses `BOOTSTRAP_ADMIN_PASSWORD_FILE`. Startup fails when a value is missing, empty, invalid, or supplied both directly and through `_FILE`.
 
 ## Production baseline
 
-Production does not use an environment file. The deployment process exports `APP_IMAGE`, `ORIGIN`, `SITE_ADDRESS`, `DATABASE_NAME`, `DATABASE_USER`, and `DATABASE_PASSWORD`, then runs:
+Production does not use an environment file. The deployment process exports the image/origin/database values, a generated `AUTH_SECRET`, provider SMTP values, and the first-administrator values. See [authentication and email operations](authentication-and-email.md) for the complete contract. Then run:
 
 ```powershell
 docker compose --file compose.prod.yaml config --quiet
 docker compose --file compose.prod.yaml --profile tools run --rm migrate
+docker compose --file compose.prod.yaml --profile tools run --rm bootstrap-admin
 docker compose --file compose.prod.yaml up --detach --wait
 ```
 
-The production topology contains the app, worker, PostgreSQL, and Caddy. `APP_IMAGE` must identify the already-built immutable application image. The explicit migration command must succeed before the app and worker start. Caddy is the only service with published ports. PostgreSQL persists in `postgres_data` and is reachable only on the Compose network. The database password becomes `/run/secrets/database_password` in the app, worker, migration, and PostgreSQL containers; it is not stored in a production `.env` file.
+The production topology contains the app, worker, PostgreSQL, and Caddy. `APP_IMAGE` must identify the already-built immutable application image. The explicit migration command must succeed before the app and worker start. Caddy is the only service with published ports. PostgreSQL persists in `postgres_data` and is reachable only on the Compose network. Database, auth, and SMTP secrets are mounted only into the application processes that need them. The bootstrap password is mounted only into the one-shot bootstrap service. None is stored in a production `.env` file.
 
 Caddy's internal port 2015 health endpoint is container-only and avoids coupling container health to the configured public hostname or TLS redirect behavior.
 
@@ -103,6 +114,6 @@ docker compose --file compose.prod.yaml logs --tail 100 app worker postgres cadd
 ## Ownership of later work
 
 - Plan 2 supplies the database adapter, committed migrations, worker, durable jobs/outbox, append-only audit events, and database readiness.
-- Plan 3 adds the provider-neutral SMTP adapter and connects it to Mailpit in development.
+- Plan 3 supplies verified email/password and magic-link authentication, audited roles, the provider-neutral SMTP adapter, and Mailpit development delivery.
 - Plan 4 adds the private uploads volume and storage adapters.
 - Plan 7 adds the Hetzner deployment runbook, backup/restore procedures, monitoring, final capacity tuning, and the read-only-rootfs review.

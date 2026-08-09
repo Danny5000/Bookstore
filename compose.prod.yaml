@@ -16,6 +16,25 @@ services:
       DATABASE_CONNECTION_TIMEOUT_MS: "5000"
       DATABASE_STATEMENT_TIMEOUT_MS: "30000"
       DATABASE_READINESS_TIMEOUT_MS: "2000"
+      AUTH_SECRET_FILE: /run/secrets/auth_secret
+      AUTH_SESSION_EXPIRES_SECONDS: ${AUTH_SESSION_EXPIRES_SECONDS:-604800}
+      AUTH_VERIFICATION_EXPIRES_SECONDS: ${AUTH_VERIFICATION_EXPIRES_SECONDS:-3600}
+      AUTH_RESET_EXPIRES_SECONDS: ${AUTH_RESET_EXPIRES_SECONDS:-3600}
+      AUTH_MAGIC_EXPIRES_SECONDS: ${AUTH_MAGIC_EXPIRES_SECONDS:-900}
+      AUTH_RATE_LIMIT_WINDOW_SECONDS: ${AUTH_RATE_LIMIT_WINDOW_SECONDS:-60}
+      AUTH_RATE_LIMIT_MAX: ${AUTH_RATE_LIMIT_MAX:-100}
+      AUTH_LOGIN_RATE_LIMIT_MAX: ${AUTH_LOGIN_RATE_LIMIT_MAX:-5}
+      AUTH_EMAIL_RATE_LIMIT_MAX: ${AUTH_EMAIL_RATE_LIMIT_MAX:-3}
+      SMTP_HOST: ${SMTP_HOST:?SMTP_HOST must be set}
+      SMTP_PORT: ${SMTP_PORT:?SMTP_PORT must be set}
+      SMTP_SECURE: ${SMTP_SECURE:?SMTP_SECURE must be set}
+      SMTP_REQUIRE_TLS: ${SMTP_REQUIRE_TLS:?SMTP_REQUIRE_TLS must be set}
+      SMTP_USER: ${SMTP_USER:?SMTP_USER must be set}
+      SMTP_PASSWORD_FILE: /run/secrets/smtp_password
+      SMTP_FROM: ${SMTP_FROM:?SMTP_FROM must be set}
+      SMTP_CONNECTION_TIMEOUT_MS: ${SMTP_CONNECTION_TIMEOUT_MS:-5000}
+      SMTP_GREETING_TIMEOUT_MS: ${SMTP_GREETING_TIMEOUT_MS:-5000}
+      SMTP_SOCKET_TIMEOUT_MS: ${SMTP_SOCKET_TIMEOUT_MS:-10000}
       JOB_POLL_INTERVAL_MS: "1000"
       JOB_LEASE_MS: "30000"
       JOB_RETRY_BASE_MS: "1000"
@@ -27,6 +46,8 @@ services:
       XFF_DEPTH: "1"
     secrets:
       - database_password
+      - auth_secret
+      - smtp_password
     depends_on:
       postgres:
         condition: service_healthy
@@ -72,6 +93,25 @@ services:
       DATABASE_CONNECTION_TIMEOUT_MS: "5000"
       DATABASE_STATEMENT_TIMEOUT_MS: "30000"
       DATABASE_READINESS_TIMEOUT_MS: "2000"
+      AUTH_SECRET_FILE: /run/secrets/auth_secret
+      AUTH_SESSION_EXPIRES_SECONDS: ${AUTH_SESSION_EXPIRES_SECONDS:-604800}
+      AUTH_VERIFICATION_EXPIRES_SECONDS: ${AUTH_VERIFICATION_EXPIRES_SECONDS:-3600}
+      AUTH_RESET_EXPIRES_SECONDS: ${AUTH_RESET_EXPIRES_SECONDS:-3600}
+      AUTH_MAGIC_EXPIRES_SECONDS: ${AUTH_MAGIC_EXPIRES_SECONDS:-900}
+      AUTH_RATE_LIMIT_WINDOW_SECONDS: ${AUTH_RATE_LIMIT_WINDOW_SECONDS:-60}
+      AUTH_RATE_LIMIT_MAX: ${AUTH_RATE_LIMIT_MAX:-100}
+      AUTH_LOGIN_RATE_LIMIT_MAX: ${AUTH_LOGIN_RATE_LIMIT_MAX:-5}
+      AUTH_EMAIL_RATE_LIMIT_MAX: ${AUTH_EMAIL_RATE_LIMIT_MAX:-3}
+      SMTP_HOST: ${SMTP_HOST:?SMTP_HOST must be set}
+      SMTP_PORT: ${SMTP_PORT:?SMTP_PORT must be set}
+      SMTP_SECURE: ${SMTP_SECURE:?SMTP_SECURE must be set}
+      SMTP_REQUIRE_TLS: ${SMTP_REQUIRE_TLS:?SMTP_REQUIRE_TLS must be set}
+      SMTP_USER: ${SMTP_USER:?SMTP_USER must be set}
+      SMTP_PASSWORD_FILE: /run/secrets/smtp_password
+      SMTP_FROM: ${SMTP_FROM:?SMTP_FROM must be set}
+      SMTP_CONNECTION_TIMEOUT_MS: ${SMTP_CONNECTION_TIMEOUT_MS:-5000}
+      SMTP_GREETING_TIMEOUT_MS: ${SMTP_GREETING_TIMEOUT_MS:-5000}
+      SMTP_SOCKET_TIMEOUT_MS: ${SMTP_SOCKET_TIMEOUT_MS:-10000}
       JOB_POLL_INTERVAL_MS: "1000"
       JOB_LEASE_MS: "30000"
       JOB_RETRY_BASE_MS: "1000"
@@ -79,6 +119,8 @@ services:
       WORKER_READY_FILE: /tmp/worker-ready
     secrets:
       - database_password
+      - auth_secret
+      - smtp_password
     depends_on:
       postgres:
         condition: service_healthy
@@ -118,6 +160,25 @@ services:
       DATABASE_CONNECTION_TIMEOUT_MS: "5000"
       DATABASE_STATEMENT_TIMEOUT_MS: "30000"
       DATABASE_READINESS_TIMEOUT_MS: "2000"
+      AUTH_SECRET_FILE: /run/secrets/auth_secret
+      AUTH_SESSION_EXPIRES_SECONDS: ${AUTH_SESSION_EXPIRES_SECONDS:-604800}
+      AUTH_VERIFICATION_EXPIRES_SECONDS: ${AUTH_VERIFICATION_EXPIRES_SECONDS:-3600}
+      AUTH_RESET_EXPIRES_SECONDS: ${AUTH_RESET_EXPIRES_SECONDS:-3600}
+      AUTH_MAGIC_EXPIRES_SECONDS: ${AUTH_MAGIC_EXPIRES_SECONDS:-900}
+      AUTH_RATE_LIMIT_WINDOW_SECONDS: ${AUTH_RATE_LIMIT_WINDOW_SECONDS:-60}
+      AUTH_RATE_LIMIT_MAX: ${AUTH_RATE_LIMIT_MAX:-100}
+      AUTH_LOGIN_RATE_LIMIT_MAX: ${AUTH_LOGIN_RATE_LIMIT_MAX:-5}
+      AUTH_EMAIL_RATE_LIMIT_MAX: ${AUTH_EMAIL_RATE_LIMIT_MAX:-3}
+      SMTP_HOST: ${SMTP_HOST:?SMTP_HOST must be set}
+      SMTP_PORT: ${SMTP_PORT:?SMTP_PORT must be set}
+      SMTP_SECURE: ${SMTP_SECURE:?SMTP_SECURE must be set}
+      SMTP_REQUIRE_TLS: ${SMTP_REQUIRE_TLS:?SMTP_REQUIRE_TLS must be set}
+      SMTP_USER: ${SMTP_USER:?SMTP_USER must be set}
+      SMTP_PASSWORD_FILE: /run/secrets/smtp_password
+      SMTP_FROM: ${SMTP_FROM:?SMTP_FROM must be set}
+      SMTP_CONNECTION_TIMEOUT_MS: ${SMTP_CONNECTION_TIMEOUT_MS:-5000}
+      SMTP_GREETING_TIMEOUT_MS: ${SMTP_GREETING_TIMEOUT_MS:-5000}
+      SMTP_SOCKET_TIMEOUT_MS: ${SMTP_SOCKET_TIMEOUT_MS:-10000}
       JOB_POLL_INTERVAL_MS: "1000"
       JOB_LEASE_MS: "30000"
       JOB_RETRY_BASE_MS: "1000"
@@ -125,6 +186,65 @@ services:
       WORKER_READY_FILE: /tmp/worker-ready
     secrets:
       - database_password
+      - auth_secret
+      - smtp_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+  bootstrap-admin:
+    profiles: [tools]
+    image: ${APP_IMAGE:?APP_IMAGE must be an immutable versioned image}
+    command: [node, build/services/bootstrap-admin.js]
+    environment:
+      NODE_ENV: production
+      APP_ENV: production
+      APPLICATION_MODE: maintenance
+      ORIGIN: ${ORIGIN:?ORIGIN must be set}
+      DATABASE_HOST: postgres
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: ${DATABASE_NAME:?DATABASE_NAME must be set}
+      DATABASE_USER: ${DATABASE_USER:?DATABASE_USER must be set}
+      DATABASE_PASSWORD_FILE: /run/secrets/database_password
+      DATABASE_POOL_MAX: "1"
+      DATABASE_CONNECTION_TIMEOUT_MS: "5000"
+      DATABASE_STATEMENT_TIMEOUT_MS: "30000"
+      DATABASE_READINESS_TIMEOUT_MS: "2000"
+      AUTH_SECRET_FILE: /run/secrets/auth_secret
+      AUTH_SESSION_EXPIRES_SECONDS: ${AUTH_SESSION_EXPIRES_SECONDS:-604800}
+      AUTH_VERIFICATION_EXPIRES_SECONDS: ${AUTH_VERIFICATION_EXPIRES_SECONDS:-3600}
+      AUTH_RESET_EXPIRES_SECONDS: ${AUTH_RESET_EXPIRES_SECONDS:-3600}
+      AUTH_MAGIC_EXPIRES_SECONDS: ${AUTH_MAGIC_EXPIRES_SECONDS:-900}
+      AUTH_RATE_LIMIT_WINDOW_SECONDS: ${AUTH_RATE_LIMIT_WINDOW_SECONDS:-60}
+      AUTH_RATE_LIMIT_MAX: ${AUTH_RATE_LIMIT_MAX:-100}
+      AUTH_LOGIN_RATE_LIMIT_MAX: ${AUTH_LOGIN_RATE_LIMIT_MAX:-5}
+      AUTH_EMAIL_RATE_LIMIT_MAX: ${AUTH_EMAIL_RATE_LIMIT_MAX:-3}
+      SMTP_HOST: ${SMTP_HOST:?SMTP_HOST must be set}
+      SMTP_PORT: ${SMTP_PORT:?SMTP_PORT must be set}
+      SMTP_SECURE: ${SMTP_SECURE:?SMTP_SECURE must be set}
+      SMTP_REQUIRE_TLS: ${SMTP_REQUIRE_TLS:?SMTP_REQUIRE_TLS must be set}
+      SMTP_USER: ${SMTP_USER:?SMTP_USER must be set}
+      SMTP_PASSWORD_FILE: /run/secrets/smtp_password
+      SMTP_FROM: ${SMTP_FROM:?SMTP_FROM must be set}
+      SMTP_CONNECTION_TIMEOUT_MS: ${SMTP_CONNECTION_TIMEOUT_MS:-5000}
+      SMTP_GREETING_TIMEOUT_MS: ${SMTP_GREETING_TIMEOUT_MS:-5000}
+      SMTP_SOCKET_TIMEOUT_MS: ${SMTP_SOCKET_TIMEOUT_MS:-10000}
+      JOB_POLL_INTERVAL_MS: "1000"
+      JOB_LEASE_MS: "30000"
+      JOB_RETRY_BASE_MS: "1000"
+      JOB_RETRY_MAX_MS: "300000"
+      WORKER_READY_FILE: /tmp/worker-ready
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:?BOOTSTRAP_ADMIN_EMAIL must be set}
+      BOOTSTRAP_ADMIN_NAME: ${BOOTSTRAP_ADMIN_NAME:?BOOTSTRAP_ADMIN_NAME must be set}
+      BOOTSTRAP_ADMIN_PASSWORD_FILE: /run/secrets/bootstrap_admin_password
+    secrets:
+      - database_password
+      - auth_secret
+      - smtp_password
+      - bootstrap_admin_password
     depends_on:
       postgres:
         condition: service_healthy
@@ -189,6 +309,12 @@ services:
 secrets:
   database_password:
     environment: DATABASE_PASSWORD
+  auth_secret:
+    environment: AUTH_SECRET
+  smtp_password:
+    environment: SMTP_PASSWORD
+  bootstrap_admin_password:
+    environment: BOOTSTRAP_ADMIN_PASSWORD
 
 volumes:
   postgres_data:

@@ -15,7 +15,7 @@ CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "5173"]
 FROM dependencies AS build
 COPY . .
 RUN npm run build
-RUN npm prune --omit=dev
+RUN npm prune --omit=dev --omit=optional
 
 FROM ${NODE_IMAGE} AS runtime
 ENV NODE_ENV=production \

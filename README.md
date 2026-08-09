@@ -12,7 +12,26 @@ Requirements: Node.js 26.7.x, npm 11.19.x, Docker, and Docker Compose 2.30 or ne
 .\scripts\start-dev.ps1
 ```
 
-The launcher creates `.env` from `.env.example` when needed, installs the locked dependencies, applies committed migrations, and starts the app, worker, PostgreSQL, and Mailpit. It waits for healthy services and then returns to PowerShell. The storefront runs at `http://localhost:5173`; Mailpit runs at `http://localhost:8025`; the PostgreSQL-backed worker is private to Compose. See [runtime environments](docs/runtime-environments.md) and [database and workers](docs/database-and-workers.md) for manual startup, migrations, process secrets, health checks, tests, logs, shutdown, and cleanup commands.
+The launcher creates `.env` from `.env.example` when needed, installs the locked dependencies, applies committed migrations, and starts the app, worker, PostgreSQL, and Mailpit. It waits for healthy services and then returns to PowerShell. The storefront runs at `http://localhost:5173`; Mailpit runs at `http://localhost:8025`; the PostgreSQL-backed worker is private to Compose.
+
+Manual host-run commands:
+
+```powershell
+npm run db:migrate
+npm run admin:bootstrap
+npm run dev
+npm run worker:watch
+```
+
+Fully containerized development:
+
+```powershell
+docker compose --env-file .env --file compose.dev.yaml --profile tools run --rm migrate
+docker compose --env-file .env --file compose.dev.yaml --profile tools run --rm bootstrap-admin
+docker compose --env-file .env --file compose.dev.yaml up --build --wait
+```
+
+See [authentication and email operations](docs/authentication-and-email.md), [runtime environments](docs/runtime-environments.md), and [database and workers](docs/database-and-workers.md) for migrations, process secrets, health checks, tests, logs, shutdown, and cleanup commands.
 
 Quality gates:
 
@@ -26,7 +45,7 @@ npm run build
 npm run verify
 ```
 
-Development retains the clickable frontend prototype. The production Compose baseline is deliberately locked to maintenance mode until later backend plans replace the prototype's browser identity, local purchase grants, in-memory entitlements, and fake delivery seams.
+Development retains the clickable frontend prototype around durable authentication and administration. The production Compose baseline is deliberately locked to maintenance mode until later backend plans replace the prototype catalog, local purchase grants, in-memory entitlements, and fake file-delivery seams.
 
 ## Routes
 
@@ -103,20 +122,20 @@ stripe listen --forward-to localhost:5173/api/stripe-webhook
 
 ## Auth
 
-`src/hooks.server.ts` puts `locals.user` in place;
-`src/lib/stores/session.svelte.ts` is a localStorage placeholder for the current
-UI. The approved backend will use Better Auth for email/password accounts,
-password reset, magic links, sessions, and claiming guest purchases. Third-party
-OAuth is outside the first backend release, even though the prototype still
-contains non-functional Google and Apple controls.
+Better Auth provides verified email/password accounts, password reset, magic
+links, and PostgreSQL-backed sessions and rate limits. `src/hooks.server.ts`
+resolves the session and project roles into `locals`; every `/admin` route and
+action enforces authorization on the server. Administrators can manage audited
+admin grants at `/admin/users`, with transactional protection against removing
+the last administrator. Third-party OAuth is intentionally out of scope.
 
 ## Delivery
 
-`src/lib/server/mail.ts` is the current placeholder seam. The approved backend
-retains uploaded EPUB and CBZ/ZIP originals on local disk behind a storage
-adapter, with an S3-compatible implementation stubbed for later. A
-provider-neutral SMTP adapter sends expiring download links; `/api/deliver`
-re-issues delivery for owners.
+Versioned authentication messages are queued through the PostgreSQL outbox and
+sent by the worker through a provider-neutral SMTP adapter. Development SMTP is
+captured by Mailpit; production credentials come from the deployment process as
+Compose secrets. The later storage plan retains EPUB and CBZ/ZIP originals on
+local disk behind an adapter, with an S3-compatible stub for future use.
 
 ## Not yet wired
 
