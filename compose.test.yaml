@@ -18,3 +18,22 @@ services:
       timeout: 3s
       retries: 30
       start_period: 5s
+
+  mailpit:
+    image: axllent/mailpit:v1.30.0
+    command: [--max, "500", --max-age, 7d, --disable-version-check]
+    ports:
+      - target: 1025
+        published: "0"
+        host_ip: 127.0.0.1
+        protocol: tcp
+      - target: 8025
+        published: "0"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    healthcheck:
+      test: [CMD, /mailpit, readyz]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s

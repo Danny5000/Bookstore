@@ -49,11 +49,18 @@ function capture(command: string, args: string[]): string {
   return result.stdout.trim();
 }
 
+function publishedPort(service: string, containerPort: string): string {
+  const output = capture('docker', [...composeArguments, 'port', service, containerPort]);
+  const match = /:(\d+)$/.exec(output);
+  if (!match?.[1]) throw new Error(`Could not parse ${service} port from ${output}`);
+  return match[1];
+}
+
 try {
   runChecked('docker', [...composeArguments, 'up', '--detach', '--wait', '--wait-timeout', '90']);
-  const portOutput = capture('docker', [...composeArguments, 'port', 'postgres', '5432']);
-  const portMatch = /:(\d+)$/.exec(portOutput);
-  if (!portMatch?.[1]) throw new Error(`Could not parse PostgreSQL port from ${portOutput}`);
+  const postgresPort = publishedPort('postgres', '5432');
+  const smtpPort = publishedPort('mailpit', '1025');
+  const mailpitHttpPort = publishedPort('mailpit', '8025');
 
   const testEnvironment: NodeJS.ProcessEnv = {
     ...process.env,
@@ -61,7 +68,7 @@ try {
     APPLICATION_MODE: 'prototype',
     ORIGIN: 'http://127.0.0.1:4173',
     DATABASE_HOST: '127.0.0.1',
-    DATABASE_PORT: portMatch[1],
+    DATABASE_PORT: postgresPort,
     DATABASE_NAME: 'pale_orbit_test',
     DATABASE_USER: 'pale_orbit_test',
     DATABASE_PASSWORD: 'pale_orbit_test_only',
@@ -84,13 +91,14 @@ try {
     AUTH_LOGIN_RATE_LIMIT_MAX: '5',
     AUTH_EMAIL_RATE_LIMIT_MAX: '3',
     SMTP_HOST: '127.0.0.1',
-    SMTP_PORT: '1025',
+    SMTP_PORT: smtpPort,
     SMTP_SECURE: 'false',
     SMTP_REQUIRE_TLS: 'false',
     SMTP_FROM: 'Pale Orbit Test <books@paleorbit.test>',
     SMTP_CONNECTION_TIMEOUT_MS: '5000',
     SMTP_GREETING_TIMEOUT_MS: '5000',
-    SMTP_SOCKET_TIMEOUT_MS: '10000'
+    SMTP_SOCKET_TIMEOUT_MS: '10000',
+    MAILPIT_HTTP_URL: `http://127.0.0.1:${mailpitHttpPort}`
   };
 
   runChecked('npm', ['run', 'db:migrate:raw'], testEnvironment);
