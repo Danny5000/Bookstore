@@ -1,5 +1,7 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
+  import type { LayoutData } from './$types';
+  import { invalidateAll } from '$app/navigation';
   import '../app.css';
   import Header from '$lib/components/Header.svelte';
   import AuthModal from '$lib/components/AuthModal.svelte';
@@ -7,15 +9,16 @@
 
   interface Props {
     children: Snippet;
+    data: LayoutData;
   }
 
-  let { children }: Props = $props();
-  let authOpen = $state(false);
+  let { children, data }: Props = $props();
+  let authOpen = $state($page.url.searchParams.get('auth') === 'signin');
 
   const isReader = $derived($page.url.pathname.startsWith('/read/'));
 </script>
 
-<Header onsignin={() => (authOpen = true)} />
+<Header user={data.user} onsignin={() => (authOpen = true)} />
 
 {@render children()}
 
@@ -26,7 +29,14 @@
   </footer>
 {/if}
 
-<AuthModal open={authOpen} onclose={() => (authOpen = false)} />
+<AuthModal
+  open={authOpen}
+  onclose={() => (authOpen = false)}
+  onauthenticated={() => {
+    authOpen = false;
+    void invalidateAll();
+  }}
+/>
 
 <style>
   footer {

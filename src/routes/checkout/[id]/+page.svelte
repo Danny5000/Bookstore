@@ -5,14 +5,13 @@
   import CoverArt from '$lib/components/CoverArt.svelte';
   import { titles } from '$lib/stores/titles.svelte';
   import { library } from '$lib/stores/library.svelte';
-  import { session } from '$lib/stores/session.svelte';
   import { money } from '$lib/data/catalog';
   import { isCheckoutResponse } from '$lib/types/api';
   import { messageFromUnknown } from '$lib/utils/errors';
 
   const title = $derived($page.params.id ? titles.get($page.params.id) : undefined);
 
-  let email = $state(session.user?.email ?? '');
+  let email = $state($page.data.user?.email ?? '');
   let emailCopy = $state(true);
   let busy = $state(false);
   let error = $state('');
@@ -59,7 +58,6 @@
   function grantLocally(): void {
     if (!title) return;
     library.grant(title.id);
-    if (!session.user) session.signIn(email);
     void goto(resolve(`/checkout/success?title=${encodeURIComponent(title.id)}`));
   }
 </script>

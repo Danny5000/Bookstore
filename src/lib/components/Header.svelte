@@ -1,14 +1,30 @@
 <script lang="ts">
   import { page } from '$app/stores';
+  import { invalidateAll } from '$app/navigation';
   import { resolve } from '$app/paths';
+  import { authClient } from '$lib/auth/client';
   import { theme, THEMES } from '$lib/stores/theme.svelte';
-  import { session } from '$lib/stores/session.svelte';
+  import type { SessionUser } from '$lib/types/auth';
 
   interface Props {
+    user: SessionUser | null;
     onsignin: () => void;
   }
 
-  let { onsignin }: Props = $props();
+  let { user, onsignin }: Props = $props();
+  const liveSession = authClient.useSession();
+  let signingOut = $state(false);
+  const activeEmail = $derived($liveSession.data?.user.email ?? user?.email ?? null);
+
+  async function signOut(): Promise<void> {
+    signingOut = true;
+    try {
+      await authClient.signOut();
+      await invalidateAll();
+    } finally {
+      signingOut = false;
+    }
+  }
 
   const links = [
     { href: '/catalog', label: 'Catalog' },
@@ -28,6 +44,9 @@
     {#each links as l (l.href)}
       <a href={resolve(l.href)} class:active={$page.url.pathname.startsWith(l.href)}>{l.label}</a>
     {/each}
+    {#if user?.roles.includes('admin')}
+      <a href={resolve('/admin' as never)} class:active={$page.url.pathname.startsWith('/admin')}>Admin</a>
+    {/if}
   </nav>
 
   <div class="spacer"></div>
@@ -45,8 +64,11 @@
     {/each}
   </div>
 
-  {#if session.user}
-    <a class="account" href={resolve('/library')}><span class="dot small"></span><span class="who">{session.user.email}</span></a>
+  {#if activeEmail}
+    <a class="account" href={resolve('/library')}><span class="dot small"></span><span class="who">{activeEmail}</span></a>
+    <button class="signout" disabled={signingOut} onclick={signOut}>
+      {signingOut ? 'Signing out…' : 'Sign out'}
+    </button>
   {:else}
     <button class="account" onclick={onsignin}><span class="dot small"></span><span class="who">Sign in</span></button>
   {/if}
@@ -158,6 +180,24 @@
 
   .account:hover {
     border-color: var(--accent);
+  }
+
+  .signout {
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+
+  .signout:hover:not(:disabled) {
+    color: var(--ink);
+  }
+
+  .signout:disabled {
+    cursor: wait;
+    opacity: 0.65;
   }
 
   /* Everything here shrinks or drops rather than wrapping: a wrapped header
