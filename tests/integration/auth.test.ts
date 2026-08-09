@@ -107,15 +107,21 @@ describe('Better Auth server', () => {
       expiresInSeconds: -1
     });
     expect(await databaseClient.db.select().from(verification)).toHaveLength(1);
+    await databaseClient.db.insert(verification).values({
+      identifier: 'better-auth-owned-reset-token',
+      value: 'reset@example.com',
+      expiresAt: new Date(0)
+    });
 
     await registerEmailVerificationToken(databaseClient.db, {
       token: 'current-token',
       email: 'current@example.com',
       expiresInSeconds: 60
     });
-    expect(await databaseClient.db.select().from(verification)).toEqual([
-      expect.objectContaining({ value: 'current@example.com' })
-    ]);
+    const remainingValues = (await databaseClient.db.select().from(verification))
+      .map((row) => row.value)
+      .sort();
+    expect(remainingValues).toEqual(['current@example.com', 'reset@example.com']);
   });
 
   it('registers, verifies once, establishes a hardened cookie, and signs out', async () => {
