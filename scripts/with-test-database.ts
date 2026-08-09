@@ -1,10 +1,11 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, rmSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 const project = `pale-orbit-test-${process.pid}`;
+const testStorageRoot = join(tmpdir(), `pale-orbit-storage-${process.pid}`);
 const composeArguments = ['compose', '--project-name', project, '--file', 'compose.test.yaml'];
 const argumentsToParse = process.argv.slice(2);
 let withWorker = false;
@@ -128,6 +129,18 @@ try {
     JOB_RETRY_BASE_MS: '10',
     JOB_RETRY_MAX_MS: '1000',
     WORKER_READY_FILE: join(tmpdir(), `pale-orbit-worker-${process.pid}.ready`),
+    WORKER_CONCURRENCY: '1',
+    STORAGE_PROVIDER: 'local',
+    STORAGE_LOCAL_ROOT: testStorageRoot,
+    UPLOAD_MAX_BYTES: '1048576',
+    INGEST_MAX_EXPANDED_BYTES: '4194304',
+    INGEST_MAX_ENTRIES: '1000',
+    INGEST_MAX_XML_BYTES: '1048576',
+    INGEST_MAX_IMAGE_PIXELS: '100000000',
+    INGEST_MAX_COMPRESSION_RATIO: '200',
+    INGEST_TIMEOUT_MS: '60000',
+    STORAGE_STAGING_RETENTION_HOURS: '1',
+    STORAGE_ORPHAN_RETENTION_HOURS: '2',
     AUTH_SECRET: 'test-only-auth-secret-at-least-thirty-two-bytes',
     AUTH_SESSION_EXPIRES_SECONDS: '3600',
     AUTH_VERIFICATION_EXPIRES_SECONDS: '600',
@@ -169,5 +182,6 @@ try {
   process.exitCode = child.status ?? 1;
 } finally {
   if (worker) await stopWorker(worker);
+  rmSync(testStorageRoot, { recursive: true, force: true });
   runChecked('docker', [...composeArguments, 'down', '--volumes', '--remove-orphans']);
 }
