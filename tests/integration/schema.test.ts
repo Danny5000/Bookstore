@@ -110,7 +110,7 @@ async function createProseBlock(
   return result.rows[0]!.id;
 }
 
-async function createComicPage(revisionId: string, ordinal = 0): Promise<string> {
+async function createComicPage(revisionId: string, ordinal = 1): Promise<string> {
   const result = await databaseClient.pool.query<{ id: string }>(
     `
       insert into comic_pages

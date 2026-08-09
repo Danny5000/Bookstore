@@ -556,9 +556,9 @@
       },
       "policies": {},
       "checkConstraints": {
-        "comic_pages_ordinal_nonnegative": {
-          "name": "comic_pages_ordinal_nonnegative",
-          "value": "\"comic_pages\".\"ordinal\" >= 0"
+        "comic_pages_ordinal_positive": {
+          "name": "comic_pages_ordinal_positive",
+          "value": "\"comic_pages\".\"ordinal\" > 0"
         },
         "comic_pages_byte_size_positive": {
           "name": "comic_pages_byte_size_positive",

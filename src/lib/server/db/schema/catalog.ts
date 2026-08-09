@@ -281,7 +281,7 @@ export const comicPages = pgTable(
     unique('comic_pages_revision_ordinal_unique').on(table.revisionId, table.ordinal),
     uniqueIndex('comic_pages_storage_key_unique').on(table.storageKey),
     index('comic_pages_revision_idx').on(table.revisionId, table.ordinal),
-    check('comic_pages_ordinal_nonnegative', sql`${table.ordinal} >= 0`),
+    check('comic_pages_ordinal_positive', sql`${table.ordinal} > 0`),
     check('comic_pages_byte_size_positive', sql`${table.byteSize} > 0`),
     check('comic_pages_dimensions_positive', sql`${table.width} > 0 and ${table.height} > 0`),
     check('comic_pages_checksum_shape', sql`${table.checksumSha256} ~ '^[0-9a-f]{64}$'`)

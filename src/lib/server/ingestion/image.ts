@@ -130,6 +130,7 @@ export async function normalizeImage(input: NormalizeImageInput): Promise<Normal
   const outputInfo = new Promise<OutputInfo>((resolve, reject) => {
     output.once('info', resolve);
     output.on('error', reject);
+    output.once('close', () => reject(new Error('Image output closed before completion')));
   });
   const hash = createHash('sha256');
   let outputByteSize = 0;
@@ -158,13 +159,14 @@ export async function normalizeImage(input: NormalizeImageInput): Promise<Normal
     hasher.destroy(cause);
   };
   input.signal.addEventListener('abort', abort, { once: true });
+  const writePromise = input.storage.write(input.destination, hasher, {
+    maxBytes: input.limits.maxExpandedBytes
+  });
 
   try {
     const [metadata, stored, info] = await Promise.all([
       metadataPromise,
-      input.storage.write(input.destination, hasher, {
-        maxBytes: input.limits.maxExpandedBytes
-      }),
+      writePromise,
       outputInfo
     ]);
     const decodedFormat = metadata.format;
@@ -197,6 +199,7 @@ export async function normalizeImage(input: NormalizeImageInput): Promise<Normal
     decoder.destroy();
     output.destroy();
     hasher.destroy();
+    await Promise.allSettled([metadataPromise, writePromise, outputInfo]);
     if (sourceFailure instanceof IngestionError) throw sourceFailure;
     throw mapImageError(cause);
   } finally {

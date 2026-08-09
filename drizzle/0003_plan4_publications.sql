@@ -15,7 +15,7 @@ CREATE TABLE "comic_pages" (
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	CONSTRAINT "comic_pages_revision_id_id_unique" UNIQUE("revision_id","id"),
 	CONSTRAINT "comic_pages_revision_ordinal_unique" UNIQUE("revision_id","ordinal"),
-	CONSTRAINT "comic_pages_ordinal_nonnegative" CHECK ("comic_pages"."ordinal" >= 0),
+	CONSTRAINT "comic_pages_ordinal_positive" CHECK ("comic_pages"."ordinal" > 0),
 	CONSTRAINT "comic_pages_byte_size_positive" CHECK ("comic_pages"."byte_size" > 0),
 	CONSTRAINT "comic_pages_dimensions_positive" CHECK ("comic_pages"."width" > 0 and "comic_pages"."height" > 0),
 	CONSTRAINT "comic_pages_checksum_shape" CHECK ("comic_pages"."checksum_sha256" ~ '^[0-9a-f]{64}$')

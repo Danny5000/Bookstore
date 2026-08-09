@@ -63,7 +63,7 @@ export function validComicFixture(entries?: Zippable): Buffer {
     entries ??
       ({
         'page-10.png': onePixelPng,
-        'nested/page-2.png': onePixelPng,
+        'page-2.png': onePixelPng,
         'page-1.png': onePixelPng,
         '__MACOSX/._page-1.png': strToU8('metadata'),
         '.DS_Store': strToU8('metadata'),
