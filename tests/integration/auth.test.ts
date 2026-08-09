@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { and, eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
+import { registerEmailVerificationToken } from '$lib/server/auth/email-verification';
 import { createAuthServer } from '$lib/server/auth/options';
 import { canSendMagicLink, ensureCustomerRole } from '$lib/server/auth/identity';
 import { loadApplicationConfig } from '$lib/server/config/load';
@@ -99,6 +100,24 @@ async function registerAndVerify(auth: TestAuth) {
 }
 
 describe('Better Auth server', () => {
+  it('purges expired project email-verification markers during registration', async () => {
+    await registerEmailVerificationToken(databaseClient.db, {
+      token: 'expired-token',
+      email: 'expired@example.com',
+      expiresInSeconds: -1
+    });
+    expect(await databaseClient.db.select().from(verification)).toHaveLength(1);
+
+    await registerEmailVerificationToken(databaseClient.db, {
+      token: 'current-token',
+      email: 'current@example.com',
+      expiresInSeconds: 60
+    });
+    expect(await databaseClient.db.select().from(verification)).toEqual([
+      expect.objectContaining({ value: 'current@example.com' })
+    ]);
+  });
+
   it('registers, verifies once, establishes a hardened cookie, and signs out', async () => {
     const auth = createTestAuth();
     const { email, response } = await register(auth);

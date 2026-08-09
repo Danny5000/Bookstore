@@ -2,7 +2,7 @@
 
 ## Architecture and ownership
 
-Better Auth owns credential hashing, signed email-verification/reset/magic-link tokens, database sessions, cookies, trusted-origin checks, and endpoint rate limits. Pale Orbit Press owns the one-use verification-token markers, `customer` and `admin` roles, guest identities, authorization policy, append-only audit events, versioned email payloads, and PostgreSQL outbox delivery. Every authenticated user has the durable `customer` role; an `admin` role adds access to the protected `/admin` routes. Guest identities remain separate until the later commerce plan adds order claiming.
+Better Auth owns credential hashing; token creation and validation for email verification, password reset, and magic links; database sessions; cookies; trusted-origin checks; and endpoint rate limits. Pale Orbit Press owns the one-use email-verification markers, `customer` and `admin` roles, guest identities, authorization policy, append-only audit events, versioned email payloads, and PostgreSQL outbox delivery. Every authenticated user has the durable `customer` role; an `admin` role adds access to the protected `/admin` routes. Guest identities remain separate until the later commerce plan adds order claiming.
 
 PostgreSQL is the only database, rate-limit store, job queue, and outbox store. Redis is not required. Nodemailer implements the provider-neutral SMTP boundary. Development routes mail to Mailpit; production supplies standard SMTP settings without changing application code.
 
@@ -104,7 +104,7 @@ Production remains in maintenance mode until the remaining backend plans replace
 
 Each project email enqueue inserts its versioned outbox message and dispatch job in one application transaction. The worker validates the payload, renders it, and sends it with a stable RFC Message-ID. Delivery is at least once: SMTP cannot commit atomically with PostgreSQL, so a crash after SMTP accepts a message but before `deliveredAt` is recorded can produce a duplicate. Verification, reset, and magic-link templates must therefore remain safe to receive twice.
 
-Better Auth creates a signed verification token and then awaits the configured mail callback. The callback first stores only a SHA-256 token digest as a one-use marker, then creates the project outbox transaction. Better Auth 1.6 does not expose a transaction that can include these application writes, so the marker and outbox row cannot share one transaction without replacing the supported email flow. The endpoint reports success only after durable outbox enqueue. If enqueue fails, an unused marker can remain until it expires, but the application does not claim that mail was sent. Verification atomically consumes the marker before Better Auth validates and applies the signed token, so a previously used link is rejected rather than silently succeeding.
+Better Auth creates a signed email-verification token and then awaits the configured mail callback. The current callback first stores only a SHA-256 token digest as a one-use marker, then creates the project outbox transaction. Those application writes use separate transactions, and the endpoint reports success only after both complete and the outbox enqueue is durable. If enqueue fails, an unused marker can remain expired in the table, but the application does not claim that mail was sent. Verification atomically consumes the marker before Better Auth validates and applies the signed token, so a previously used link is rejected rather than silently succeeding.
 
 ## Safe troubleshooting
 

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { eq } from 'drizzle-orm';
+import { and, eq, like, lte } from 'drizzle-orm';
 import type { Database } from '$lib/server/db/client';
 import { user, verification } from '$lib/server/db/schema';
 import { withTransaction } from '$lib/server/db/transaction';
@@ -16,10 +16,21 @@ export async function registerEmailVerificationToken(
   database: Database,
   input: { token: string; email: string; expiresInSeconds: number }
 ): Promise<void> {
-  await database.insert(verification).values({
-    identifier: identifierForToken(input.token),
-    value: normalizeEmailAddress(input.email),
-    expiresAt: new Date(Date.now() + input.expiresInSeconds * 1000)
+  const now = new Date();
+  await withTransaction(database, async (transaction) => {
+    await transaction
+      .delete(verification)
+      .where(
+        and(
+          like(verification.identifier, `${IDENTIFIER_PREFIX}%`),
+          lte(verification.expiresAt, now)
+        )
+      );
+    await transaction.insert(verification).values({
+      identifier: identifierForToken(input.token),
+      value: normalizeEmailAddress(input.email),
+      expiresAt: new Date(now.getTime() + input.expiresInSeconds * 1000)
+    });
   });
 }
 
