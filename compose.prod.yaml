@@ -12,6 +12,15 @@ services:
       DATABASE_NAME: ${DATABASE_NAME:?DATABASE_NAME must be set}
       DATABASE_USER: ${DATABASE_USER:?DATABASE_USER must be set}
       DATABASE_PASSWORD_FILE: /run/secrets/database_password
+      DATABASE_POOL_MAX: "5"
+      DATABASE_CONNECTION_TIMEOUT_MS: "5000"
+      DATABASE_STATEMENT_TIMEOUT_MS: "30000"
+      DATABASE_READINESS_TIMEOUT_MS: "2000"
+      JOB_POLL_INTERVAL_MS: "1000"
+      JOB_LEASE_MS: "30000"
+      JOB_RETRY_BASE_MS: "1000"
+      JOB_RETRY_MAX_MS: "300000"
+      WORKER_READY_FILE: /tmp/worker-ready
       HOST: 0.0.0.0
       PORT: "3000"
       ADDRESS_HEADER: X-Forwarded-For
@@ -44,6 +53,84 @@ services:
         limits:
           cpus: ${WEB_CPU_LIMIT:-1.00}
           memory: ${WEB_MEMORY_LIMIT:-768M}
+
+  worker:
+    image: ${APP_IMAGE:?APP_IMAGE must be an immutable versioned image}
+    init: true
+    command: [node, build/services/worker.js]
+    environment:
+      NODE_ENV: production
+      APP_ENV: production
+      APPLICATION_MODE: maintenance
+      ORIGIN: ${ORIGIN:?ORIGIN must be set}
+      DATABASE_HOST: postgres
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: ${DATABASE_NAME:?DATABASE_NAME must be set}
+      DATABASE_USER: ${DATABASE_USER:?DATABASE_USER must be set}
+      DATABASE_PASSWORD_FILE: /run/secrets/database_password
+      DATABASE_POOL_MAX: "5"
+      DATABASE_CONNECTION_TIMEOUT_MS: "5000"
+      DATABASE_STATEMENT_TIMEOUT_MS: "30000"
+      DATABASE_READINESS_TIMEOUT_MS: "2000"
+      JOB_POLL_INTERVAL_MS: "1000"
+      JOB_LEASE_MS: "30000"
+      JOB_RETRY_BASE_MS: "1000"
+      JOB_RETRY_MAX_MS: "300000"
+      WORKER_READY_FILE: /tmp/worker-ready
+    secrets:
+      - database_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: [CMD, node, -e, "require('node:fs').statSync('/tmp/worker-ready').size > 0 || process.exit(1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: ${WORKER_CPU_LIMIT:-0.75}
+          memory: ${WORKER_MEMORY_LIMIT:-512M}
+
+  migrate:
+    profiles: [tools]
+    image: ${APP_IMAGE:?APP_IMAGE must be an immutable versioned image}
+    command: [node, build/services/migrate.js]
+    environment:
+      NODE_ENV: production
+      APP_ENV: production
+      APPLICATION_MODE: maintenance
+      ORIGIN: ${ORIGIN:?ORIGIN must be set}
+      DATABASE_HOST: postgres
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: ${DATABASE_NAME:?DATABASE_NAME must be set}
+      DATABASE_USER: ${DATABASE_USER:?DATABASE_USER must be set}
+      DATABASE_PASSWORD_FILE: /run/secrets/database_password
+      DATABASE_POOL_MAX: "1"
+      DATABASE_CONNECTION_TIMEOUT_MS: "5000"
+      DATABASE_STATEMENT_TIMEOUT_MS: "30000"
+      DATABASE_READINESS_TIMEOUT_MS: "2000"
+      JOB_POLL_INTERVAL_MS: "1000"
+      JOB_LEASE_MS: "30000"
+      JOB_RETRY_BASE_MS: "1000"
+      JOB_RETRY_MAX_MS: "300000"
+      WORKER_READY_FILE: /tmp/worker-ready
+    secrets:
+      - database_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
 
   postgres:
     image: postgres:18.4-alpine3.24
