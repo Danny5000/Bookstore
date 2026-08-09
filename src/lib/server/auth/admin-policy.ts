@@ -1,5 +1,12 @@
-export type ApplicationRole = 'customer' | 'admin';
-export type AdminCapability = 'catalog.manage' | 'audit.read' | 'jobs.retry';
+import type { ApplicationRole } from '$lib/types/auth';
+
+export type { ApplicationRole } from '$lib/types/auth';
+export type AdminCapability =
+  | 'admin.access'
+  | 'catalog.manage'
+  | 'roles.manage'
+  | 'audit.read'
+  | 'jobs.retry';
 
 export type Actor =
   | { type: 'anonymous' }

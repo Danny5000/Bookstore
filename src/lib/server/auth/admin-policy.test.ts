@@ -11,6 +11,14 @@ describe('requireCapability', () => {
     expect(() => requireCapability(actor, 'catalog.manage')).not.toThrow();
   });
 
+  it.each(['admin.access', 'roles.manage'] as const)(
+    'allows an administrator to use %s',
+    (capability) => {
+      const actor: Actor = { type: 'user', id: 'admin-1', roles: ['customer', 'admin'] };
+      expect(() => requireCapability(actor, capability)).not.toThrow();
+    }
+  );
+
   it('rejects an anonymous actor as unauthenticated', () => {
     expect(() => requireCapability({ type: 'anonymous' }, 'audit.read')).toThrow(
       new AuthorizationError('unauthenticated', 401)
@@ -28,5 +36,11 @@ describe('requireCapability', () => {
     expect(() =>
       requireCapability({ type: 'system', id: 'worker-1' }, 'catalog.manage')
     ).toThrow(AuthorizationError);
+  });
+
+  it('does not allow a guest to manage roles', () => {
+    expect(() => requireCapability({ type: 'guest', id: 'guest-1' }, 'roles.manage')).toThrow(
+      new AuthorizationError('forbidden', 403)
+    );
   });
 });
