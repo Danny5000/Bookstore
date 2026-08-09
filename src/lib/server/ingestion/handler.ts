@@ -275,7 +275,10 @@ async function commitIngestion(
         state: 'ready_for_review',
         originalStorageKey: originalKey,
         originalChecksumSha256: candidate.stagingChecksumSha256,
-        originalMimeType: candidate.uploadMimeType,
+        originalMimeType:
+          candidate.format === 'prose'
+            ? 'application/epub+zip'
+            : 'application/vnd.comicbook+zip',
         originalByteSize: candidate.stagingByteSize,
         originalFilename: candidate.uploadFilename,
         stagingStorageKey: null,

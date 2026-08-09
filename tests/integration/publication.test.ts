@@ -40,6 +40,12 @@ import {
   withdrawTitle
 } from '$lib/server/catalog/publication';
 import { retryFailedRevision } from '$lib/server/catalog/revisions';
+import { resolveCoverAccess } from '$lib/server/catalog/media';
+import {
+  getPublicPreview,
+  getPublicTitleDetail,
+  listPublicCatalog
+} from '$lib/server/catalog/reader';
 import type { IngestionLimits } from '$lib/server/ingestion/limits';
 import {
   parseStorageKey,
@@ -911,5 +917,50 @@ describe('failed revision retry', () => {
         input: { titleId: title.id, revisionId: failed.id }
       })
     ).rejects.toMatchObject({ code: 'retry_source_unavailable' });
+  });
+});
+
+describe('public reader query integration', () => {
+  it('joins only the active published presentation and enforces its semantic boundary', async () => {
+    const candidate = await publishProseSettings(undefined, 'public-reader-query');
+    await activatePrivateRevision(databaseClient.db, {
+      actor: admin,
+      correlationId: 'reader-activate',
+      input: { titleId: candidate.title.id, revisionId: candidate.revision.id }
+    });
+    await publishTitleToStorefront(databaseClient.db, {
+      actor: admin,
+      correlationId: 'reader-publish',
+      input: { titleId: candidate.title.id }
+    });
+    const { revision: coverRevision, suggestion } = await createCoverSuggestion(candidate.title.id);
+    await confirmCoverSuggestion(databaseClient.db, storage, {
+      actor: admin,
+      correlationId: 'reader-cover',
+      input: {
+        titleId: candidate.title.id,
+        revisionId: coverRevision.id,
+        suggestionId: suggestion.id
+      }
+    });
+
+    await expect(listPublicCatalog(databaseClient.db)).resolves.toEqual([
+      expect.objectContaining({ id: candidate.title.id, slug: 'public-reader-query' })
+    ]);
+    await expect(getPublicTitleDetail(databaseClient.db, 'public-reader-query')).resolves.toMatchObject({
+      id: candidate.title.id,
+      description: candidate.title.description
+    });
+    const preview = await getPublicPreview(databaseClient.db, 'public-reader-query');
+    expect(preview?.format).toBe('prose');
+    expect(preview?.format === 'prose' ? preview.sections : []).toHaveLength(1);
+    expect(preview?.format === 'prose' ? preview.sections[0]?.blocks : []).toHaveLength(2);
+    expect(JSON.stringify(preview)).not.toMatch(/storage|sourcePath|uploadFilename/iu);
+    await expect(
+      resolveCoverAccess(databaseClient.db, storage, { type: 'anonymous' }, {
+        titleId: candidate.title.id,
+        checksum: suggestion.checksumSha256
+      })
+    ).resolves.toMatchObject({ cacheControl: 'public, max-age=31536000, immutable' });
   });
 });
