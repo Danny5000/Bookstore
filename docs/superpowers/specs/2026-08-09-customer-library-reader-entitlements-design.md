@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-09
 
-**Status:** Approved conversational design; awaiting review of this written specification
+**Status:** Approved
 
 **Depends on:** Plans 1-4 and `2026-08-08-bookstore-full-stack-design.md`
 
@@ -160,6 +160,7 @@ Location uniqueness prevents duplicate current-revision bookmarks for one user. 
 `reader_revision_migrations` stores one result for a user, title, source revision, and target revision. It records:
 
 - progress result: `migrated`, `reset`, or `absent`;
+- whether a comic panel position was simplified to its exact matching whole page;
 - migrated and unmatched bookmark counts;
 - completion timestamp;
 - nullable notice-acknowledgement timestamp.
