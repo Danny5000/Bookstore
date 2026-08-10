@@ -33,7 +33,12 @@ import {
   ReaderStateNotFoundError,
   StaleReaderStateError
 } from './errors';
-import { lockReaderAccount, lockReaderTitle, requireUserActor } from './lock';
+import {
+  lockReaderAccount,
+  lockReaderTitle,
+  requireUserActor,
+  type LockedReaderTitle
+} from './lock';
 import { migrateLockedReaderState } from './migration';
 
 export interface AccountStateContext {
@@ -132,69 +137,76 @@ async function currentProgress(
   return row ?? null;
 }
 
+export async function getLockedReaderInitialState(
+  transaction: DatabaseTransaction,
+  locked: LockedReaderTitle
+): Promise<ReaderInitialStateDto> {
+  await migrateLockedReaderState(transaction, locked);
+  const progress = await currentProgress(
+    transaction,
+    locked.userId,
+    locked.title.id,
+    locked.revisionId
+  );
+  const bookmarks = await transaction
+    .select()
+    .from(readerBookmarks)
+    .where(
+      and(
+        eq(readerBookmarks.userId, locked.userId),
+        eq(readerBookmarks.titleId, locked.title.id),
+        eq(readerBookmarks.revisionId, locked.revisionId)
+      )
+    )
+    .orderBy(asc(readerBookmarks.createdAt), asc(readerBookmarks.id));
+  const preferencesRows = await transaction
+    .select()
+    .from(readerPreferences)
+    .where(eq(readerPreferences.userId, locked.userId))
+    .limit(1);
+  const titlePreferencesRows = await transaction
+    .select()
+    .from(readerTitlePreferences)
+    .where(
+      and(
+        eq(readerTitlePreferences.userId, locked.userId),
+        eq(readerTitlePreferences.titleId, locked.title.id)
+      )
+    )
+    .limit(1);
+  const migrationRows = await transaction
+    .select()
+    .from(readerRevisionMigrations)
+    .where(
+      and(
+        eq(readerRevisionMigrations.userId, locked.userId),
+        eq(readerRevisionMigrations.titleId, locked.title.id),
+        eq(readerRevisionMigrations.targetRevisionId, locked.revisionId),
+        isNull(readerRevisionMigrations.noticeAcknowledgedAt)
+      )
+    )
+    .orderBy(desc(readerRevisionMigrations.completedAt))
+    .limit(1);
+  return {
+    progress: progress ? progressDto(progress) : null,
+    bookmarks: bookmarks.map(bookmarkDto),
+    preferences: preferencesRows[0]
+      ? preferencesDto(preferencesRows[0])
+      : { fontSize: 18, typeface: 'serif', paper: 'white', version: 0 },
+    titlePreferences: titlePreferencesRows[0]
+      ? titlePreferencesDto(titlePreferencesRows[0])
+      : null,
+    migrationNotice: migrationRows[0] ? migrationNoticeDto(migrationRows[0]) : null
+  };
+}
+
 export async function getReaderInitialState(
   input: ReaderStateContext
 ): Promise<ReaderInitialStateDto> {
   requireUserActor(input.actor);
   return withTransaction(input.database, async (transaction) => {
     const locked = await lockReaderTitle(transaction, input.actor, input.titleId);
-    await migrateLockedReaderState(transaction, locked);
-    const progress = await currentProgress(
-      transaction,
-      locked.userId,
-      locked.title.id,
-      locked.revisionId
-    );
-    const bookmarks = await transaction
-      .select()
-      .from(readerBookmarks)
-      .where(
-        and(
-          eq(readerBookmarks.userId, locked.userId),
-          eq(readerBookmarks.titleId, locked.title.id),
-          eq(readerBookmarks.revisionId, locked.revisionId)
-        )
-      )
-      .orderBy(asc(readerBookmarks.createdAt), asc(readerBookmarks.id));
-    const preferencesRows = await transaction
-      .select()
-      .from(readerPreferences)
-      .where(eq(readerPreferences.userId, locked.userId))
-      .limit(1);
-    const titlePreferencesRows = await transaction
-      .select()
-      .from(readerTitlePreferences)
-      .where(
-        and(
-          eq(readerTitlePreferences.userId, locked.userId),
-          eq(readerTitlePreferences.titleId, locked.title.id)
-        )
-      )
-      .limit(1);
-    const migrationRows = await transaction
-      .select()
-      .from(readerRevisionMigrations)
-      .where(
-        and(
-              eq(readerRevisionMigrations.userId, locked.userId),
-              eq(readerRevisionMigrations.titleId, locked.title.id),
-              eq(readerRevisionMigrations.targetRevisionId, locked.revisionId),
-              isNull(readerRevisionMigrations.noticeAcknowledgedAt)
-        )
-      )
-      .orderBy(desc(readerRevisionMigrations.completedAt))
-      .limit(1);
-    return {
-      progress: progress ? progressDto(progress) : null,
-      bookmarks: bookmarks.map(bookmarkDto),
-      preferences: preferencesRows[0]
-        ? preferencesDto(preferencesRows[0])
-        : { fontSize: 18, typeface: 'serif', paper: 'white', version: 0 },
-      titlePreferences: titlePreferencesRows[0]
-        ? titlePreferencesDto(titlePreferencesRows[0])
-        : null,
-      migrationNotice: migrationRows[0] ? migrationNoticeDto(migrationRows[0]) : null
-    };
+    return getLockedReaderInitialState(transaction, locked);
   });
 }
 

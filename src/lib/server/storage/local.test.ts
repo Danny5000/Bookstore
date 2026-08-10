@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, rm, symlink } from 'node:fs/promises';
+import { writeFile, mkdtemp, readdir, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
@@ -67,6 +67,30 @@ describe('local object storage', () => {
     await expect(storage.readRange(key, -1, 2)).rejects.toThrow(StorageRangeError);
     await expect(storage.readRange(key, 3, 2)).rejects.toThrow(StorageRangeError);
     await expect(storage.readRange(key, 0, 6)).rejects.toThrow(StorageRangeError);
+  });
+
+  it('prepares a checksum-verified snapshot and rejects same-size corruption', async () => {
+    const storage = createLocalObjectStorage(root);
+    const key = parseStorageKey(
+      'titles/018f0000-0000-7000-8000-000000000010/revisions/018f0000-0000-7000-8000-000000000011/original'
+    );
+    await storage.write(key, Readable.from(['abcdef']), { maxBytes: 6 });
+
+    const verified = await storage.prepareVerifiedRead(key, {
+      byteSize: 6,
+      checksumSha256: 'bef57ec7f53a6d40beb640a780a639c83bc29ac8a9816f1fc6c5c6dcd93c4721'
+    });
+    expect(verified).not.toBeNull();
+    await expect(readText(await verified!.read({ start: 1, endInclusive: 3 }))).resolves.toBe('bcd');
+    await verified!.close();
+
+    await writeFile(join(root, ...key.split('/')), 'abcdeg');
+    await expect(
+      storage.prepareVerifiedRead(key, {
+        byteSize: 6,
+        checksumSha256: 'bef57ec7f53a6d40beb640a780a639c83bc29ac8a9816f1fc6c5c6dcd93c4721'
+      })
+    ).resolves.toBeNull();
   });
 
   it('copies atomically and leaves source and destination independent', async () => {

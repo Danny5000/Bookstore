@@ -2,20 +2,20 @@ import { randomUUID } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Actor } from '$lib/server/auth/admin-policy';
 
-const { resolvePublicationAccess, getReaderDocumentForAccess, getReaderInitialState } = vi.hoisted(
+const { resolvePublicationAccess, getReaderDocumentForAccess, getEntitledInitialReader } = vi.hoisted(
   () => ({
     resolvePublicationAccess: vi.fn(),
     getReaderDocumentForAccess: vi.fn(),
-    getReaderInitialState: vi.fn()
+    getEntitledInitialReader: vi.fn()
   })
 );
 vi.mock('$lib/server/db/runtime', () => ({ getDatabaseClient: () => ({ db: {} }) }));
 vi.mock('$lib/server/library/access', () => ({ resolvePublicationAccess }));
 vi.mock('$lib/server/catalog/reader', () => ({
   getPublicPreview: vi.fn(),
-  getReaderDocumentForAccess
+  getReaderDocumentForAccess,
+  getEntitledInitialReader
 }));
-vi.mock('$lib/server/reader-state/service', () => ({ getReaderInitialState }));
 
 import { load } from './+page.server';
 
@@ -54,7 +54,7 @@ function event(actor: Actor) {
 }
 
 describe('reader page access loader', () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => vi.resetAllMocks());
 
   it('returns full entitled state with server persistence and private caching', async () => {
     resolvePublicationAccess.mockResolvedValueOnce({
@@ -64,8 +64,7 @@ describe('reader page access loader', () => {
       presentationId,
       root
     });
-    getReaderDocumentForAccess.mockResolvedValueOnce(document);
-    getReaderInitialState.mockResolvedValueOnce(initialState);
+    getEntitledInitialReader.mockResolvedValueOnce({ document, initialState });
     const request = event(customer);
     await expect(load(request as never)).resolves.toMatchObject({
       document,
@@ -73,9 +72,12 @@ describe('reader page access loader', () => {
       persistenceKind: 'server',
       slug: 'reader-title'
     });
-    expect(getReaderInitialState).toHaveBeenCalledWith(
-      expect.objectContaining({ actor: customer, titleId })
+    expect(getEntitledInitialReader).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ level: 'entitled', titleId }),
+      expect.objectContaining({ actor: customer })
     );
+    expect(getReaderDocumentForAccess).not.toHaveBeenCalled();
     expect(request.setHeaders).toHaveBeenCalledWith({ 'cache-control': 'private, no-store' });
   });
 
@@ -94,7 +96,7 @@ describe('reader page access loader', () => {
       persistenceKind: 'preview-local',
       initialState
     });
-    expect(getReaderInitialState).not.toHaveBeenCalled();
+    expect(getEntitledInitialReader).not.toHaveBeenCalled();
   });
 
   it('uses memory persistence for an active admin edition and hides denied titles', async () => {

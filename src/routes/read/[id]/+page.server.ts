@@ -2,10 +2,14 @@ import { randomUUID } from 'node:crypto';
 import { error } from '@sveltejs/kit';
 import { z } from 'zod';
 import type { PageServerLoad } from './$types';
-import { getPublicPreview, getReaderDocumentForAccess } from '$lib/server/catalog/reader';
+import {
+  getEntitledInitialReader,
+  getPublicPreview,
+  getReaderDocumentForAccess
+} from '$lib/server/catalog/reader';
 import { getDatabaseClient } from '$lib/server/db/runtime';
 import { resolvePublicationAccess } from '$lib/server/library/access';
-import { getReaderInitialState } from '$lib/server/reader-state/service';
+import { ReaderStateNotFoundError } from '$lib/server/reader-state/errors';
 import type { ReaderInitialStateDto } from '$lib/types/library';
 
 const titleIdSchema = z.uuid();
@@ -41,7 +45,19 @@ export const load: PageServerLoad = async ({ params, locals, setHeaders }) => {
   if (decision.level === 'denied' || decision.level === 'unavailable') {
     error(404, 'Publication not found');
   }
-  const document = await getReaderDocumentForAccess(database, decision);
+  let entitled: Awaited<ReturnType<typeof getEntitledInitialReader>> | null = null;
+  if (decision.level === 'entitled') {
+    try {
+      entitled = await getEntitledInitialReader(database, decision, {
+        actor: locals.actor,
+        correlationId: randomUUID()
+      });
+    } catch (cause: unknown) {
+      if (cause instanceof ReaderStateNotFoundError) error(404, 'Publication not found');
+      throw cause;
+    }
+  }
+  const document = entitled?.document ?? await getReaderDocumentForAccess(database, decision);
   if (!document) error(404, 'Publication not found');
   const persistenceKind =
     decision.level === 'entitled'
@@ -49,14 +65,7 @@ export const load: PageServerLoad = async ({ params, locals, setHeaders }) => {
       : decision.level === 'admin'
         ? 'memory' as const
         : 'preview-local' as const;
-  const initialState = decision.level === 'entitled'
-    ? await getReaderInitialState({
-        database,
-        actor: locals.actor,
-        titleId: decision.titleId,
-        correlationId: randomUUID()
-      })
-    : emptyInitialState;
+  const initialState = entitled?.initialState ?? emptyInitialState;
   setHeaders?.({ 'cache-control': 'private, no-store' });
   return {
     document,

@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto';
+import { Readable } from 'node:stream';
 import { count, eq, sql } from 'drizzle-orm';
 import { describe, expect, it, vi } from 'vitest';
 import type { Actor } from '$lib/server/auth/admin-policy';
 import {
   MediaNotFoundError,
-  resolveCustomerOriginalDownload,
-  resolveReaderImageAccess
+  resolveReaderImageAccess,
+  streamCustomerOriginalDownload
 } from '$lib/server/catalog/media';
 import {
   auditEvents,
@@ -159,10 +160,37 @@ async function createPublication() {
   return { title, revision, previewImageId, fullImageId, candidateRevisionId, candidateImageId };
 }
 
-function storage(): ObjectStorage {
+function storage(options: { prepareFailure?: Error } = {}): ObjectStorage {
   return {
-    stat: vi.fn(async () => ({ byteSize: 100, modifiedAt: new Date(0) }))
+    stat: vi.fn(async () => ({ byteSize: 100, modifiedAt: new Date(0) })),
+    prepareVerifiedRead: vi.fn(async () => {
+      if (options.prepareFailure) throw options.prepareFailure;
+      return {
+        stat: { byteSize: 100, modifiedAt: new Date(0) },
+        read: vi.fn(async (range?: { start: number; endInclusive: number }) =>
+          Readable.from([Buffer.alloc(range ? range.endInclusive - range.start + 1 : 100)])),
+        close: vi.fn(async () => undefined)
+      };
+    })
   } as unknown as ObjectStorage;
+}
+
+async function waitForBlockedEntitlementQuery(): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const result = await databaseClient.pool.query<{ blocked: boolean }>(`
+      select exists (
+        select 1
+        from pg_stat_activity
+        where datname = current_database()
+          and pid <> pg_backend_pid()
+          and wait_event_type = 'Lock'
+          and query ilike '%entitlements%'
+      ) as blocked
+    `);
+    if (result.rows[0]?.blocked) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error('Expected the download authorization query to wait for entitlement revocation');
 }
 
 describe('entitled media and original download resolution', () => {
@@ -190,26 +218,20 @@ describe('entitled media and original download resolution', () => {
       })
     ).rejects.toBeInstanceOf(MediaNotFoundError);
 
-    const download = await resolveCustomerOriginalDownload(
+    const download = await streamCustomerOriginalDownload(
       databaseClient.db,
       objectStorage,
       customer,
       {
         titleId: publication.title.id,
         correlationId: 'customer-range-download',
-        rangeRequested: true,
-        requestMetadata: { method: 'GET', routeId: '/library/[titleId]/download' }
+        method: 'HEAD',
+        rangeHeader: 'bytes=0-9'
       }
     );
-    expect(download).toMatchObject({
-      titleId: publication.title.id,
-      revisionId: publication.revision.id,
-      access: {
-        filename: 'Archived Reader.epub',
-        mediaType: 'application/epub+zip',
-        cacheControl: 'private, no-store'
-      }
-    });
+    expect(download.status).toBe(206);
+    expect(download.headers.get('content-disposition')).toContain('Archived%20Reader.epub');
+    expect(download.headers.get('content-type')).toBe('application/epub+zip');
     const events = await databaseClient.db
       .select()
       .from(auditEvents)
@@ -222,6 +244,7 @@ describe('entitled media and original download resolution', () => {
       resourceType: 'title_revision',
       resourceId: publication.revision.id,
       correlationId: 'customer-range-download',
+      requestMetadata: null,
       after: {
         titleId: publication.title.id,
         activeRevisionId: publication.revision.id,
@@ -237,10 +260,11 @@ describe('entitled media and original download resolution', () => {
       .set({ revokedAt: sql`clock_timestamp()` })
       .where(eq(entitlements.userId, customer.id));
     await expect(
-      resolveCustomerOriginalDownload(databaseClient.db, objectStorage, customer, {
+      streamCustomerOriginalDownload(databaseClient.db, objectStorage, customer, {
         titleId: publication.title.id,
         correlationId: 'revoked-download',
-        rangeRequested: false
+        method: 'GET',
+        rangeHeader: null
       })
     ).rejects.toBeInstanceOf(MediaNotFoundError);
     const [auditCount] = await databaseClient.db
@@ -267,5 +291,156 @@ describe('entitled media and original download resolution', () => {
         checksum
       })
     ).rejects.toBeInstanceOf(MediaNotFoundError);
+  });
+
+  it('serializes stream-start authorization against concurrent entitlement revocation', async () => {
+    const customer = await createCustomer();
+    const publication = await createPublication();
+    await databaseClient.db.insert(entitlements).values({
+      userId: customer.id,
+      titleId: publication.title.id
+    });
+    const objectStorage = storage();
+    const revoker = await databaseClient.pool.connect();
+    try {
+      await revoker.query('begin');
+      await revoker.query(
+        `update entitlements
+         set revoked_at = clock_timestamp(), updated_at = clock_timestamp()
+         where user_id = $1 and title_id = $2`,
+        [customer.id, publication.title.id]
+      );
+      const download = streamCustomerOriginalDownload(
+        databaseClient.db,
+        objectStorage,
+        customer,
+        {
+          titleId: publication.title.id,
+          correlationId: 'concurrent-revocation',
+          method: 'GET',
+          rangeHeader: null
+        }
+      );
+      await waitForBlockedEntitlementQuery();
+      expect(objectStorage.prepareVerifiedRead).not.toHaveBeenCalled();
+
+      await revoker.query('commit');
+      await expect(download).rejects.toBeInstanceOf(MediaNotFoundError);
+      const events = await databaseClient.db
+        .select()
+        .from(auditEvents)
+        .where(eq(auditEvents.correlationId, 'concurrent-revocation'));
+      expect(events).toHaveLength(0);
+      expect(objectStorage.prepareVerifiedRead).not.toHaveBeenCalled();
+    } finally {
+      await revoker.query('rollback').catch(() => undefined);
+      revoker.release();
+    }
+  });
+
+  it('holds entitlement authorization until the verified response stream is ready', async () => {
+    const customer = await createCustomer();
+    const publication = await createPublication();
+    await databaseClient.db.insert(entitlements).values({
+      userId: customer.id,
+      titleId: publication.title.id
+    });
+    let markPrepareStarted!: () => void;
+    const prepareStarted = new Promise<void>((resolve) => { markPrepareStarted = resolve; });
+    let releasePrepare!: () => void;
+    const prepareGate = new Promise<void>((resolve) => { releasePrepare = resolve; });
+    const objectStorage = storage();
+    vi.mocked(objectStorage.prepareVerifiedRead).mockImplementationOnce(async () => {
+      markPrepareStarted();
+      await prepareGate;
+      return {
+        stat: { byteSize: 100, modifiedAt: new Date(0) },
+        read: vi.fn(async () => Readable.from([Buffer.alloc(100)])),
+        close: vi.fn(async () => undefined)
+      };
+    });
+    const download = streamCustomerOriginalDownload(
+      databaseClient.db,
+      objectStorage,
+      customer,
+      {
+        titleId: publication.title.id,
+        correlationId: 'download-wins-revocation-race',
+        method: 'GET',
+        rangeHeader: null
+      }
+    );
+    await prepareStarted;
+
+    const revoker = await databaseClient.pool.connect();
+    try {
+      let revocationSettled = false;
+      const revocation = revoker.query(
+        `update entitlements
+         set revoked_at = clock_timestamp(), updated_at = clock_timestamp()
+         where user_id = $1 and title_id = $2`,
+        [customer.id, publication.title.id]
+      ).finally(() => { revocationSettled = true; });
+      await waitForBlockedEntitlementQuery();
+      expect(revocationSettled).toBe(false);
+
+      releasePrepare();
+      const response = await download;
+      expect(response.status).toBe(200);
+      expect((await response.arrayBuffer()).byteLength).toBe(100);
+      await revocation;
+      expect(revocationSettled).toBe(true);
+      const events = await databaseClient.db
+        .select()
+        .from(auditEvents)
+        .where(eq(auditEvents.correlationId, 'download-wins-revocation-race'));
+      expect(events).toHaveLength(1);
+    } finally {
+      releasePrepare();
+      revoker.release();
+    }
+  });
+
+  it('does not commit success audit for invalid ranges or synchronous storage failures', async () => {
+    const customer = await createCustomer();
+    const publication = await createPublication();
+    await databaseClient.db.insert(entitlements).values({
+      userId: customer.id,
+      titleId: publication.title.id
+    });
+
+    const invalidRange = await streamCustomerOriginalDownload(
+      databaseClient.db,
+      storage(),
+      customer,
+      {
+        titleId: publication.title.id,
+        correlationId: 'invalid-range-no-audit',
+        method: 'GET',
+        rangeHeader: 'bytes=200-'
+      }
+    );
+    expect(invalidRange.status).toBe(416);
+
+    await expect(
+      streamCustomerOriginalDownload(
+        databaseClient.db,
+        storage({ prepareFailure: new Error('temporary provider failure') }),
+        customer,
+        {
+          titleId: publication.title.id,
+          correlationId: 'storage-failure-no-audit',
+          method: 'GET',
+          rangeHeader: null
+        }
+      )
+    ).rejects.toThrow('temporary provider failure');
+    const failedEvents = await databaseClient.db
+      .select()
+      .from(auditEvents)
+      .where(
+        sql`${auditEvents.correlationId} in ('invalid-range-no-audit', 'storage-failure-no-audit')`
+      );
+    expect(failedEvents).toHaveLength(0);
   });
 });

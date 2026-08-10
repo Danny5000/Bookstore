@@ -1,4 +1,4 @@
-import { Readable } from 'node:stream';
+import { PassThrough, Readable } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 import { parseStorageKey } from '$lib/server/storage/keys';
 import type { ObjectStorage } from '$lib/server/storage/types';
@@ -53,5 +53,84 @@ describe('method-aware media streaming', () => {
       expect(response.status).toBe(416);
       expect(response.headers.get('content-range')).toBe('bytes */6');
     }
+  });
+
+  it('fails closed when an original has same-size checksum corruption', async () => {
+    const objectStorage = storage();
+    objectStorage.prepareVerifiedRead = vi.fn(async () => null);
+
+    await expect(
+      streamMediaResponse(
+        objectStorage,
+        { ...access, verifyIntegrity: true },
+        'GET',
+        null
+      )
+    ).rejects.toThrow('Stored media failed integrity verification');
+    expect(objectStorage.read).not.toHaveBeenCalled();
+  });
+
+  it('does not open or checksum a verified original for HEAD metadata', async () => {
+    const objectStorage = storage();
+    objectStorage.prepareVerifiedRead = vi.fn(async () => null);
+
+    const response = await streamMediaResponse(
+      objectStorage,
+      { ...access, verifyIntegrity: true },
+      'HEAD',
+      null
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.body).toBeNull();
+    expect(objectStorage.prepareVerifiedRead).not.toHaveBeenCalled();
+    expect(objectStorage.read).not.toHaveBeenCalled();
+    expect(objectStorage.readRange).not.toHaveBeenCalled();
+  });
+
+  it('streams a verified original snapshot without reopening the storage object', async () => {
+    const objectStorage = storage();
+    const close = vi.fn(async () => undefined);
+    objectStorage.prepareVerifiedRead = vi.fn(async () => ({
+      stat: access.stat,
+      read: vi.fn(async () => Readable.from([Buffer.from('abcdef')])),
+      close
+    }));
+
+    const response = await streamMediaResponse(
+      objectStorage,
+      { ...access, verifyIntegrity: true },
+      'GET',
+      null
+    );
+    expect(await response.text()).toBe('abcdef');
+    expect(objectStorage.prepareVerifiedRead).toHaveBeenCalledWith(access.key, {
+      byteSize: 6,
+      checksumSha256: checksum
+    });
+    expect(objectStorage.read).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it('closes the verified snapshot when the response body is cancelled', async () => {
+    const objectStorage = storage();
+    const source = new PassThrough();
+    const close = vi.fn(async () => undefined);
+    objectStorage.prepareVerifiedRead = vi.fn(async () => ({
+      stat: access.stat,
+      read: vi.fn(async () => source),
+      close
+    }));
+
+    const response = await streamMediaResponse(
+      objectStorage,
+      { ...access, verifyIntegrity: true },
+      'GET',
+      null
+    );
+    await response.body?.cancel();
+
+    await vi.waitFor(() => expect(close).toHaveBeenCalledTimes(1));
+    expect(source.destroyed).toBe(true);
   });
 });

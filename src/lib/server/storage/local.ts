@@ -1,6 +1,6 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { constants, createReadStream, lstatSync, mkdirSync } from 'node:fs';
+import { constants, createReadStream, createWriteStream, lstatSync, mkdirSync } from 'node:fs';
 import {
   copyFile,
   lstat,
@@ -14,7 +14,12 @@ import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { Transform, type Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { parseStorageKey, type StorageKey } from './keys';
-import type { ObjectStorage, StorageListPage, StoredObjectStat } from './types';
+import type {
+  ObjectStorage,
+  PreparedVerifiedRead,
+  StorageListPage,
+  StoredObjectStat
+} from './types';
 
 const maximumListPageSize = 1_000;
 
@@ -181,6 +186,69 @@ class LocalObjectStorage implements ObjectStorage {
       throw new StorageRangeError();
     }
     return createReadStream(target, { start, end: endInclusive });
+  }
+
+  async prepareVerifiedRead(
+    key: StorageKey,
+    expected: { byteSize: number; checksumSha256: string }
+  ): Promise<PreparedVerifiedRead | null> {
+    const target = this.#targetFor(key);
+    const object = await this.#regularFileStat(target);
+    if (!object || object.byteSize !== expected.byteSize) return null;
+
+    const snapshotDirectory = join(this.#root, '.verified-downloads');
+    await this.#prepareDestination(snapshotDirectory);
+    await mkdir(snapshotDirectory, { recursive: true });
+    const snapshot = join(snapshotDirectory, randomUUID());
+    const digest = createHash('sha256');
+    let byteSize = 0;
+    const verifier = new Transform({
+      transform(chunk: unknown, _encoding, callback) {
+        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
+        byteSize += bytes.byteLength;
+        digest.update(bytes);
+        callback(null, bytes);
+      }
+    });
+
+    try {
+      await pipeline(
+        createReadStream(target),
+        verifier,
+        createWriteStream(snapshot, { flags: 'wx', mode: 0o600 })
+      );
+      if (byteSize !== expected.byteSize || digest.digest('hex') !== expected.checksumSha256) {
+        await unlink(snapshot);
+        return null;
+      }
+      let closed = false;
+      return {
+        stat: object,
+        read: async (range) => {
+          if (!range) return createReadStream(snapshot);
+          if (
+            !Number.isSafeInteger(range.start) ||
+            !Number.isSafeInteger(range.endInclusive) ||
+            range.start < 0 ||
+            range.endInclusive < range.start ||
+            range.endInclusive >= object.byteSize
+          ) throw new StorageRangeError();
+          return createReadStream(snapshot, { start: range.start, end: range.endInclusive });
+        },
+        close: async () => {
+          if (closed) return;
+          closed = true;
+          await unlink(snapshot).catch((cause: unknown) => {
+            if (!isMissingFileError(cause)) throw cause;
+          });
+        }
+      };
+    } catch (cause: unknown) {
+      await unlink(snapshot).catch((cleanupCause: unknown) => {
+        if (!isMissingFileError(cleanupCause)) throw cleanupCause;
+      });
+      throw cause;
+    }
   }
 
   async stat(key: StorageKey): Promise<StoredObjectStat | null> {

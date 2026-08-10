@@ -12,6 +12,12 @@ const safeMediaTypes = new Set([
   'application/vnd.comicbook+zip',
   'application/octet-stream'
 ]);
+const responseCleanup = new WeakMap<Response, () => Promise<void>>();
+
+export async function closeMediaResponse(response: Response): Promise<void> {
+  await response.body?.cancel().catch(() => undefined);
+  await responseCleanup.get(response)?.();
+}
 
 function safeContentType(value: string): string {
   const normalized = value.toLowerCase().split(';', 1)[0]?.trim() ?? '';
@@ -76,11 +82,43 @@ export async function streamMediaResponse(
   if (method === 'HEAD') {
     return new Response(null, { status: range ? 206 : 200, headers });
   }
-  const source = range
-    ? await storage.readRange(access.key, range.start, range.endInclusive)
-    : await storage.read(access.key);
-  return new Response(Readable.toWeb(source) as ReadableStream<Uint8Array>, {
+  const prepared = access.verifyIntegrity
+    ? await storage.prepareVerifiedRead(access.key, {
+        byteSize: access.stat.byteSize,
+        checksumSha256: access.checksumSha256
+      })
+    : null;
+  if (access.verifyIntegrity && !prepared) {
+    throw new Error('Stored media failed integrity verification');
+  }
+  let source;
+  try {
+    source = prepared
+      ? await prepared.read(range ?? undefined)
+      : range
+        ? await storage.readRange(access.key, range.start, range.endInclusive)
+        : await storage.read(access.key);
+  } catch (cause: unknown) {
+    await prepared?.close();
+    throw cause;
+  }
+  let cleanupPrepared: (() => Promise<void>) | undefined;
+  if (prepared) {
+    let cleanupStarted = false;
+    cleanupPrepared = async () => {
+      if (cleanupStarted) return;
+      cleanupStarted = true;
+      await prepared.close();
+    };
+    const cleanup = () => void cleanupPrepared?.().catch(() => undefined);
+    source.once('end', cleanup);
+    source.once('error', cleanup);
+    source.once('close', cleanup);
+  }
+  const response = new Response(Readable.toWeb(source) as ReadableStream<Uint8Array>, {
     status: range ? 206 : 200,
     headers
   });
+  if (cleanupPrepared) responseCleanup.set(response, cleanupPrepared);
+  return response;
 }

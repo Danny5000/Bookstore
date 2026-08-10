@@ -1,23 +1,26 @@
 import { randomUUID } from 'node:crypto';
+import { Readable } from 'node:stream';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Actor } from '$lib/server/auth/admin-policy';
 import type { Database } from '$lib/server/db/client';
 import type { ObjectStorage } from '$lib/server/storage/types';
 
-const { appendAuditEvent, resolvePublicationAccess } = vi.hoisted(() => ({
+const { appendAuditEvent, lockReaderTitle, resolvePublicationAccess } = vi.hoisted(() => ({
   appendAuditEvent: vi.fn(),
+  lockReaderTitle: vi.fn(),
   resolvePublicationAccess: vi.fn()
 }));
 vi.mock('$lib/server/audit/service', () => ({ appendAuditEvent }));
 vi.mock('$lib/server/library/access', () => ({ resolvePublicationAccess }));
+vi.mock('$lib/server/reader-state/lock', () => ({ lockReaderTitle }));
 
 import {
   MediaNotFoundError,
   resolveCoverAccess,
   resolveCoverSuggestionAccess,
-  resolveCustomerOriginalDownload,
   resolveOriginalDownload,
-  resolveReaderImageAccess
+  resolveReaderImageAccess,
+  streamCustomerOriginalDownload
 } from './media';
 
 function databaseReturning(...results: unknown[][]): Database {
@@ -40,7 +43,12 @@ function databaseReturning(...results: unknown[][]): Database {
 
 function storageWithSize(byteSize = 100): ObjectStorage {
   return {
-    stat: vi.fn(async () => ({ byteSize, modifiedAt: new Date(0) }))
+    stat: vi.fn(async () => ({ byteSize, modifiedAt: new Date(0) })),
+    prepareVerifiedRead: vi.fn(async () => ({
+      stat: { byteSize, modifiedAt: new Date(0) },
+      read: vi.fn(async () => Readable.from([Buffer.alloc(byteSize)])),
+      close: vi.fn(async () => undefined)
+    }))
   } as unknown as ObjectStorage;
 }
 
@@ -82,6 +90,12 @@ describe('publication media authorization', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resolvePublicationAccess.mockResolvedValue(accessDecision('preview'));
+    lockReaderTitle.mockResolvedValue({
+      userId: customer.id,
+      title: { ...publicTitle, title: 'A Curious Book', format: 'prose' as const },
+      revisionId,
+      presentation: { id: randomUUID(), revisionId, state: 'published' }
+    });
   });
 
   it('resolves a qualified public cover and keeps private covers admin-only', async () => {
@@ -358,87 +372,114 @@ describe('publication media authorization', () => {
     expect(auditJson).not.toContain('private-original');
   });
 
-  it('resolves the entitled active original with a title-based filename and redacted audit', async () => {
-    resolvePublicationAccess.mockResolvedValueOnce(accessDecision('entitled'));
+  it('records a minimal customer audit only after a valid stream response starts', async () => {
     appendAuditEvent.mockResolvedValueOnce({ id: randomUUID() });
-    const record = {
-      title: { ...publicTitle, title: 'A / Curious  Book', format: 'prose' as const },
-      revision: {
-        ...activeRevision,
-        originalStorageKey: 'titles/private-original-with-secret-name',
-        originalMimeType: 'application/epub+zip',
-        originalFilename: 'publisher-secret-name.epub',
-        originalChecksumSha256: checksum,
-        originalByteSize: 100
-      }
-    };
-    const result = await resolveCustomerOriginalDownload(
+    const record = { revision: {
+      ...activeRevision,
+      originalStorageKey: 'titles/private-original-with-secret-name',
+      originalMimeType: 'application/epub+zip',
+      originalFilename: 'publisher-secret-name.epub',
+      originalChecksumSha256: checksum,
+      originalByteSize: 100
+    } };
+    const response = await streamCustomerOriginalDownload(
       databaseReturning([record]),
       storageWithSize(),
       customer,
       {
         titleId,
-        correlationId: 'customer-download',
-        rangeRequested: true,
-        requestMetadata: { method: 'GET', routeId: '/library/[titleId]/download' }
+        correlationId: 'customer-stream',
+        method: 'HEAD',
+        rangeHeader: 'bytes=1-3'
       }
     );
-    expect(result).toMatchObject({
-      titleId,
-      revisionId,
-      access: {
-        mediaType: 'application/epub+zip',
-        filename: 'Curious  Book.epub',
-        disposition: 'attachment',
-        cacheControl: 'private, no-store'
-      }
+    expect(response.status).toBe(206);
+    expect(appendAuditEvent.mock.calls[0]?.[1]).toEqual({
+      actor: customer,
+      action: 'library.original.download',
+      outcome: 'succeeded',
+      resourceType: 'title_revision',
+      resourceId: revisionId,
+      correlationId: 'customer-stream',
+      after: { titleId, activeRevisionId: revisionId, range: true }
     });
-    expect(appendAuditEvent).toHaveBeenCalledTimes(1);
-    const auditJson = JSON.stringify(appendAuditEvent.mock.calls[0]);
-    expect(auditJson).toContain('library.original.download');
-    expect(auditJson).toContain(customer.id);
-    expect(auditJson).toContain(titleId);
-    expect(auditJson).toContain(revisionId);
-    expect(auditJson).toContain('"range":true');
-    expect(auditJson).not.toContain('publisher-secret-name.epub');
-    expect(auditJson).not.toContain('private-original-with-secret-name');
   });
 
-  it.each([
-    ['cbz', 'application/vnd.comicbook+zip'],
-    ['zip', 'application/zip']
-  ] as const)('preserves an entitled comic original as %s', async (extension, mediaType) => {
-    resolvePublicationAccess.mockResolvedValueOnce(accessDecision('entitled'));
-    appendAuditEvent.mockResolvedValueOnce({ id: randomUUID() });
-    const record = {
-      title: { ...publicTitle, title: 'Comic Title', format: 'comic' as const },
-      revision: {
-        ...activeRevision,
-        originalStorageKey: `titles/private-comic-${extension}`,
-        originalMimeType: 'application/octet-stream',
-        originalFilename: `source.${extension}`,
-        originalChecksumSha256: checksum,
-        originalByteSize: 100
-      }
-    };
+  it('does not audit an invalid range or a synchronous storage-open failure', async () => {
+    const record = { revision: {
+      ...activeRevision,
+      originalStorageKey: 'titles/private-original',
+      originalMimeType: 'application/epub+zip',
+      originalFilename: 'source.epub',
+      originalChecksumSha256: checksum,
+      originalByteSize: 100
+    } };
     await expect(
-      resolveCustomerOriginalDownload(
+      streamCustomerOriginalDownload(
         databaseReturning([record]),
         storageWithSize(),
         customer,
         {
           titleId,
-          correlationId: `comic-${extension}`,
-          rangeRequested: false
+          correlationId: 'invalid-range',
+          method: 'GET',
+          rangeHeader: 'bytes=200-'
         }
       )
-    ).resolves.toMatchObject({
-      access: {
-        filename: `Comic Title.${extension}`,
-        mediaType,
-        disposition: 'attachment',
-        cacheControl: 'private, no-store'
-      }
+    ).resolves.toMatchObject({ status: 416 });
+    expect(appendAuditEvent).not.toHaveBeenCalled();
+
+    const unavailableStorage = storageWithSize();
+    vi.mocked(unavailableStorage.prepareVerifiedRead).mockRejectedValueOnce(
+      new Error('provider unavailable')
+    );
+    await expect(
+      streamCustomerOriginalDownload(
+        databaseReturning([record]),
+        unavailableStorage,
+        customer,
+        {
+          titleId,
+          correlationId: 'storage-failure',
+          method: 'GET',
+          rangeHeader: null
+        }
+      )
+    ).rejects.toThrow('provider unavailable');
+    expect(appendAuditEvent).not.toHaveBeenCalled();
+  });
+
+  it('closes the verified snapshot when the success audit database write fails', async () => {
+    const close = vi.fn(async () => undefined);
+    const objectStorage = storageWithSize();
+    vi.mocked(objectStorage.prepareVerifiedRead).mockResolvedValueOnce({
+      stat: { byteSize: 100, modifiedAt: new Date(0) },
+      read: vi.fn(async () => Readable.from([Buffer.alloc(100)])),
+      close
     });
+    appendAuditEvent.mockRejectedValueOnce(new Error('temporary database failure'));
+    const record = { revision: {
+      ...activeRevision,
+      originalStorageKey: 'titles/private-original',
+      originalMimeType: 'application/epub+zip',
+      originalFilename: 'source.epub',
+      originalChecksumSha256: checksum,
+      originalByteSize: 100
+    } };
+
+    await expect(
+      streamCustomerOriginalDownload(
+        databaseReturning([record]),
+        objectStorage,
+        customer,
+        {
+          titleId,
+          correlationId: 'audit-database-failure',
+          method: 'GET',
+          rangeHeader: null
+        }
+      )
+    ).rejects.toThrow('temporary database failure');
+    expect(close).toHaveBeenCalledTimes(1);
   });
 });

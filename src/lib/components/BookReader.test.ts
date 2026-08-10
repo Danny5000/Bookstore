@@ -55,4 +55,26 @@ describe('BookReader persistence boundary', () => {
     expect(source).toContain('locationForPage');
     expect(source).toContain('pageIndexForLocation');
   });
+
+  it('routes non-progress mutations into the accessible reader status instead of swallowing errors', async () => {
+    const source = await readFile(new URL('./BookReader.svelte', import.meta.url), 'utf8');
+    expect(source).not.toContain('.catch(() => {})');
+    expect(source).toContain('runReaderMutation');
+    expect(source).toContain('readerMutationMessage');
+  });
+
+  it('records the new semantic location only after comic-mode persistence succeeds', async () => {
+    const source = await readFile(new URL('./BookReader.svelte', import.meta.url), 'utf8');
+    const comicMutation = source.slice(
+      source.indexOf("kind: 'comic-mode'"),
+      source.indexOf("kind: 'bookmark'")
+    );
+    const success = comicMutation.slice(
+      comicMutation.indexOf('onSuccess:'),
+      comicMutation.indexOf('onFailure:')
+    );
+    const failure = comicMutation.slice(comicMutation.indexOf('onFailure:'));
+    expect(success).toContain('recordLocation');
+    expect(failure).not.toContain('recordLocation');
+  });
 });

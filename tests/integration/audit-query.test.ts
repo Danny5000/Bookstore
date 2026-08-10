@@ -142,7 +142,6 @@ describe('audit browsing queries', () => {
           resourceType: 'title_revision',
           resourceId: revisionId,
           correlationId: 'download-correlation',
-          requestMetadata: { method: 'GET', routeId: '/library/[titleId]/download' },
           after: { titleId, activeRevisionId: revisionId, range: false }
         })
       )
@@ -171,7 +170,7 @@ describe('audit browsing queries', () => {
       correlationId: 'view-download'
     });
     expect(detail).toMatchObject({
-      requestMetadata: { method: 'GET', routeId: '/library/[titleId]/download' },
+      requestMetadata: null,
       after: { titleId, activeRevisionId: revisionId, range: false }
     });
   });

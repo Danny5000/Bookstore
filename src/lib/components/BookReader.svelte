@@ -13,6 +13,12 @@
   import { cubicBezier } from '$lib/reader/easing';
   import { bookDepth } from '$lib/reader/geometry';
   import { locationForPage, pageIndexForLocation } from '$lib/reader/locations';
+  import {
+    readerMutationMessage,
+    runReaderMutation,
+    type ReaderMutationStatus
+  } from '$lib/reader/mutation-status';
+  import { createPreferenceMutationQueue } from '$lib/reader/preference-mutation';
   import { clampSheet } from '$lib/reader/navigation';
   import {
     progressKeepaliveFor,
@@ -24,7 +30,11 @@
   } from '$lib/reader/progress-sync';
   import { paginatePublication } from '$lib/reader/publication-pagination';
   import { buildSheetWindow } from '$lib/reader/sheet-window';
-  import type { ReaderInitialStateDto, ReaderLocation } from '$lib/types/library';
+  import type {
+    ReaderBookmarkDto,
+    ReaderInitialStateDto,
+    ReaderLocation
+  } from '$lib/types/library';
   import type { ReaderDocument } from '$lib/types/publication';
   import type {
     EasingFunction,
@@ -51,6 +61,13 @@
     status: 'idle',
     progress: initialState.progress,
     error: null
+  });
+  let mutationStatus = $state<ReaderMutationStatus>({ status: 'idle' });
+  const preferenceMutations = createPreferenceMutationQueue({
+    current: () => readerState.preferences,
+    save: (input) => persistenceAdapter.savePreferences(input),
+    onAdopt: (value) => { readerState.preferences = value; },
+    onStatus: (status) => { mutationStatus = status; }
   });
   let currentLocation = $state<ReaderLocation | null>(initialState.progress?.location ?? null);
   const progressKeepalive = progressKeepaliveFor(persistenceAdapter);
@@ -481,60 +498,97 @@
     recordLocation(p);
   }
 
+  function mutationInProgress(): boolean {
+    return mutationStatus.status === 'pending';
+  }
+
   function toggleGuided(): void {
+    if (mutationInProgress()) return;
+    const previousMode = comicMode;
+    const previousPanelIndex = panelIdx;
+    const previousPageIndex = pageIdx;
     comicMode = guided ? 'page' : 'panel';
     panelIdx = 0;
-    pageIdx = sheet * per;
+    const nextPageIndex = sheet * per;
+    pageIdx = nextPageIndex;
     const nextMode = comicMode === 'panel' ? 'guided' : 'page';
-    void persistenceAdapter
-      .saveTitlePreferences({
+    void runReaderMutation({
+      kind: 'comic-mode',
+      work: () => persistenceAdapter.saveTitlePreferences({
         comicMode: nextMode,
         expectedVersion: readerState.titlePreferences?.version ?? 0
-      })
-      .then((value) => {
+      }),
+      onStatus: (status) => { mutationStatus = status; },
+      onSuccess: (value) => {
         readerState.titlePreferences = value;
-      })
-      .catch(() => {});
-    recordLocation(pageIdx);
-  }
-
-  async function toggleBookmark(): Promise<void> {
-    await progressSync.flush();
-    const location = currentLocation ?? locationAt(currentPage);
-    if (!location) return;
-    currentLocation = location;
-    if (currentBookmark) {
-      await persistenceAdapter.deleteBookmark(currentBookmark.id);
-      readerState.bookmarks = readerState.bookmarks.filter(
-        (bookmark) => bookmark.id !== currentBookmark.id
-      );
-      return;
-    }
-    const bookmark = await persistenceAdapter.createBookmark(location);
-    if (!readerState.bookmarks.some((candidate) => candidate.id === bookmark.id)) {
-      readerState.bookmarks = [...readerState.bookmarks, bookmark];
-    }
-  }
-
-  async function updatePreferences(
-    values: Partial<Pick<ReaderInitialStateDto['preferences'], 'fontSize' | 'typeface' | 'paper'>>
-  ): Promise<void> {
-    const value = await persistenceAdapter.savePreferences({
-      fontSize: values.fontSize ?? prefs.fontSize,
-      typeface: values.typeface ?? prefs.typeface,
-      paper: values.paper ?? prefs.paper,
-      expectedVersion: prefs.version
+        recordLocation(nextPageIndex);
+      },
+      onFailure: () => {
+        comicMode = previousMode;
+        panelIdx = previousPanelIndex;
+        pageIdx = previousPageIndex;
+      }
     });
-    readerState.preferences = value;
   }
 
-  async function acknowledgeMigration(): Promise<void> {
+  function toggleBookmark(): void {
+    if (mutationInProgress()) return;
+    void runReaderMutation({
+      kind: 'bookmark',
+      work: async (): Promise<
+        | { action: 'created'; bookmark: ReaderBookmarkDto }
+        | { action: 'deleted'; bookmarkId: string }
+        | null
+      > => {
+        await progressSync.flush();
+        const location = currentLocation ?? locationAt(currentPage);
+        if (!location) return null;
+        currentLocation = location;
+        if (currentBookmark) {
+          const bookmarkId = currentBookmark.id;
+          await persistenceAdapter.deleteBookmark(bookmarkId);
+          return { action: 'deleted', bookmarkId };
+        }
+        return {
+          action: 'created',
+          bookmark: await persistenceAdapter.createBookmark(location)
+        };
+      },
+      onStatus: (status) => { mutationStatus = status; },
+      onSuccess: (result) => {
+        if (result?.action === 'deleted') {
+          readerState.bookmarks = readerState.bookmarks.filter(
+            (bookmark) => bookmark.id !== result.bookmarkId
+          );
+        } else if (
+          result?.action === 'created' &&
+          !readerState.bookmarks.some((candidate) => candidate.id === result.bookmark.id)
+        ) {
+          readerState.bookmarks = [...readerState.bookmarks, result.bookmark];
+        }
+      }
+    });
+  }
+
+  function updatePreferences(
+    values: Partial<Pick<ReaderInitialStateDto['preferences'], 'fontSize' | 'typeface' | 'paper'>>
+  ): void {
+    preferenceMutations.update(values);
+  }
+
+  function acknowledgeMigration(): void {
+    if (mutationInProgress()) return;
     const notice = readerState.migrationNotice;
     if (!notice) return;
-    await persistenceAdapter.acknowledgeMigration(notice.targetRevisionId);
-    readerState.migrationNotice = { ...notice, acknowledged: true };
-    await tick();
-    readerStatusElement.focus();
+    void runReaderMutation({
+      kind: 'migration-notice',
+      work: () => persistenceAdapter.acknowledgeMigration(notice.targetRevisionId),
+      onStatus: (status) => { mutationStatus = status; },
+      onSuccess: () => {
+        readerState.migrationNotice = { ...notice, acknowledged: true };
+        void tick().then(() => readerStatusElement.focus());
+      }
+    });
   }
 
   function onPointerDown(event: PointerEvent): void {
@@ -591,6 +645,10 @@
             : syncState.status === 'synced'
               ? 'Reading position saved'
               : ''
+  );
+  const mutationMessage = $derived(readerMutationMessage(mutationStatus));
+  const statusMessage = $derived(
+    [syncMessage, mutationMessage].filter((message) => message.length > 0).join('. ')
   );
 
   $effect(() => () => {
@@ -747,7 +805,7 @@
     aria-live="polite"
     bind:this={readerStatusElement}
     tabindex="-1"
-  >{syncMessage}</p>
+  >{statusMessage}</p>
   {#if readerState.migrationNotice && !readerState.migrationNotice.acknowledged}
     <aside class="edition-notice" role="status" aria-live="polite">
       <span>

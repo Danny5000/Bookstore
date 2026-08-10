@@ -1,6 +1,7 @@
 import { and, asc, count, eq } from 'drizzle-orm';
 import type { Actor } from '$lib/server/auth/admin-policy';
 import type { Database } from '$lib/server/db/client';
+import { withTransaction, type DatabaseExecutor } from '$lib/server/db/transaction';
 import {
   comicPages,
   comicPanelRegions,
@@ -17,6 +18,8 @@ import {
   type PublicationAccessDecision,
   type PublicationAccessRoot
 } from '$lib/server/library/access';
+import { lockReaderTitle } from '$lib/server/reader-state/lock';
+import { getLockedReaderInitialState } from '$lib/server/reader-state/service';
 import type { ReaderInitialStateDto } from '$lib/types/library';
 import type {
   CatalogTitleDetail,
@@ -144,7 +147,7 @@ function imageDto(revisionId: string, image: typeof proseImages.$inferSelect): P
 }
 
 async function proseDocument(
-  database: Database,
+  database: DatabaseExecutor,
   root: ReaderRoot,
   access: ReaderAccess
 ): Promise<ReaderDocument | null> {
@@ -238,7 +241,7 @@ function comicPageDto(
 }
 
 async function comicDocument(
-  database: Database,
+  database: DatabaseExecutor,
   root: ReaderRoot,
   access: ReaderAccess
 ): Promise<ReaderDocument | null> {
@@ -278,7 +281,7 @@ async function comicDocument(
 }
 
 async function readerDocument(
-  database: Database,
+  database: DatabaseExecutor,
   root: ReaderRoot,
   access: ReaderAccess
 ): Promise<ReaderDocument | null> {
@@ -305,20 +308,20 @@ export async function getReaderDocumentForAccess(
 
 export async function getEntitledInitialReader(
   database: Database,
-  decision: Extract<PublicationAccessDecision, { level: 'entitled' }>
+  decision: Extract<PublicationAccessDecision, { level: 'entitled' }>,
+  input: { actor: Actor; correlationId: string }
 ): Promise<{ document: ReaderDocument; initialState: ReaderInitialStateDto }> {
-  const document = await readerDocument(database, decision.root, 'entitled');
-  if (!document) throw new CatalogDomainError('presentation_not_found');
-  return {
-    document,
-    initialState: {
-      progress: null,
-      bookmarks: [],
-      preferences: { fontSize: 18, typeface: 'serif', paper: 'white', version: 0 },
-      titlePreferences: null,
-      migrationNotice: null
-    }
-  };
+  return withTransaction(database, async (transaction) => {
+    const locked = await lockReaderTitle(transaction, input.actor, decision.titleId);
+    const document = await readerDocument(transaction, {
+      title: locked.title,
+      revisionId: locked.revisionId,
+      presentation: locked.presentation
+    }, 'entitled');
+    if (!document) throw new CatalogDomainError('presentation_not_found');
+    const initialState = await getLockedReaderInitialState(transaction, locked);
+    return { document, initialState };
+  });
 }
 
 export async function getAdminRevisionReader(

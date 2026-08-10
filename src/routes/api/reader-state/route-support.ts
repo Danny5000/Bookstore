@@ -128,9 +128,11 @@ export function readerStateErrorResponse(cause: unknown): Response {
   if (cause instanceof ReaderStateRouteError) {
     return privateJson({ code: cause.code }, cause.status);
   }
+  if (cause instanceof InvalidReaderLocationError) {
+    return privateJson({ code: 'INVALID_INPUT' }, 422);
+  }
   if (
     cause instanceof ReaderStateNotFoundError ||
-    cause instanceof InvalidReaderLocationError ||
     cause instanceof ActiveRevisionChangedError ||
     cause instanceof AuthorizationError
   ) return privateJson({ code: 'NOT_FOUND' }, 404);

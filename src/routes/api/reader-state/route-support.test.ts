@@ -79,7 +79,6 @@ describe('reader-state route support', () => {
   it('maps domain, stale, authorization, and transient failures to safe private responses', async () => {
     for (const cause of [
       new ReaderStateNotFoundError(),
-      new InvalidReaderLocationError(),
       new AuthorizationError('forbidden', 403)
     ]) {
       const response = readerStateErrorResponse(cause);
@@ -98,6 +97,13 @@ describe('reader-state route support', () => {
     const transient = readerStateErrorResponse(new Error('secret database detail'));
     expect(transient.status).toBe(503);
     expect(await transient.text()).not.toContain('secret');
+  });
+
+  it('maps a structurally valid but invalid reader location to the approved 422 response', async () => {
+    const response = readerStateErrorResponse(new InvalidReaderLocationError());
+    expect(response.status).toBe(422);
+    expect(await response.json()).toEqual({ code: 'INVALID_INPUT' });
+    expect(response.headers.get('cache-control')).toBe('no-store');
   });
 
   it('validates route UUIDs and correlation IDs without trusting arbitrary input', () => {

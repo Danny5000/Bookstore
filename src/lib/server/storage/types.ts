@@ -15,6 +15,12 @@ export interface StorageListPage {
   cursor: string | null;
 }
 
+export interface PreparedVerifiedRead {
+  stat: StoredObjectStat;
+  read(range?: { start: number; endInclusive: number }): Promise<Readable>;
+  close(): Promise<void>;
+}
+
 export interface ObjectStorage {
   write(
     key: StorageKey,
@@ -23,6 +29,10 @@ export interface ObjectStorage {
   ): Promise<StoredObjectStat>;
   read(key: StorageKey): Promise<Readable>;
   readRange(key: StorageKey, start: number, endInclusive: number): Promise<Readable>;
+  prepareVerifiedRead(
+    key: StorageKey,
+    expected: { byteSize: number; checksumSha256: string }
+  ): Promise<PreparedVerifiedRead | null>;
   stat(key: StorageKey): Promise<StoredObjectStat | null>;
   copy(source: StorageKey, destination: StorageKey): Promise<StoredObjectStat>;
   delete(key: StorageKey): Promise<void>;

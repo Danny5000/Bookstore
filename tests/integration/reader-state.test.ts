@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { and, eq, sql } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import type { Actor } from '$lib/server/auth/admin-policy';
+import { getEntitledInitialReader } from '$lib/server/catalog/reader';
 import {
   comicPages,
   comicPanelRegions,
@@ -446,6 +447,102 @@ describe('optimistic reader state', () => {
         eq(readerProgress.revisionId, replacementRevision.id)
       ));
     expect(replacementRows).toHaveLength(0);
+  });
+
+  it('loads entitled document and state from one current snapshot after a replacement', async () => {
+    const customer = await createCustomer('Reader Snapshot Customer');
+    const publication = await createProsePublication();
+    await grant(customer.id, publication.title.id);
+    await databaseClient.db.update(proseBlocks)
+      .set({ semanticFingerprintSha256: '8'.repeat(64), semanticFingerprintVersion: 1 })
+      .where(eq(proseBlocks.id, publication.blocks[0]!.id));
+    await saveProgress({
+      ...context(customer, publication.title.id),
+      location: { format: 'prose', blockId: publication.blocks[0]!.id, offset: 1 },
+      expectedVersion: 0
+    });
+
+    const [replacementRevision] = await databaseClient.db.insert(titleRevisions).values({
+      titleId: publication.title.id,
+      state: 'ready_for_review',
+      createdByActorId: 'fixture',
+      changeSummary: 'Reader snapshot replacement'
+    }).returning();
+    if (!replacementRevision) throw new Error('Expected reader snapshot replacement');
+    const [replacementSection] = await databaseClient.db.insert(proseSections).values({
+      revisionId: replacementRevision.id,
+      ordinal: 0,
+      label: 'Replacement',
+      sourceReference: 'EPUB/reader-snapshot-replacement.xhtml'
+    }).returning();
+    if (!replacementSection) throw new Error('Expected reader snapshot replacement section');
+    const [replacementBlock] = await databaseClient.db.insert(proseBlocks).values({
+      revisionId: replacementRevision.id,
+      sectionId: replacementSection.id,
+      ordinal: 0,
+      kind: 'paragraph',
+      content: { kind: 'paragraph', fragments: [{ text: 'replacement edition', marks: [] }] },
+      imageId: null,
+      semanticFingerprintSha256: '8'.repeat(64),
+      semanticFingerprintVersion: 1
+    }).returning();
+    if (!replacementBlock) throw new Error('Expected reader snapshot replacement block');
+    const [replacementPresentation] = await databaseClient.db.insert(revisionPresentations).values({
+      revisionId: replacementRevision.id,
+      state: 'published',
+      previewProseSectionId: replacementSection.id,
+      previewProseBlockId: replacementBlock.id,
+      previewComicPageId: null
+    }).returning();
+    if (!replacementPresentation) throw new Error('Expected reader snapshot replacement presentation');
+
+    const staleDecision = {
+      level: 'entitled' as const,
+      titleId: publication.title.id,
+      revisionId: publication.revision.id,
+      presentationId: publication.presentation.id,
+      root: {
+        title: publication.title,
+        revisionId: publication.revision.id,
+        presentation: publication.presentation
+      }
+    };
+    let releaseReplacement!: () => void;
+    const release = new Promise<void>((resolve) => { releaseReplacement = resolve; });
+    let signalLocked!: () => void;
+    const locked = new Promise<void>((resolve) => { signalLocked = resolve; });
+    const replacement = databaseClient.db.transaction(async (transaction) => {
+      await transaction.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${publication.title.id}, 0))`
+      );
+      signalLocked();
+      await release;
+      await transaction.update(titleRevisions)
+        .set({ state: 'retired', retiredAt: sql`clock_timestamp()` })
+        .where(eq(titleRevisions.id, publication.revision.id));
+      await transaction.update(titleRevisions)
+        .set({ state: 'active', activatedAt: sql`clock_timestamp()` })
+        .where(eq(titleRevisions.id, replacementRevision.id));
+      await transaction.update(titles)
+        .set({ activeRevisionId: replacementRevision.id, updatedAt: sql`clock_timestamp()` })
+        .where(eq(titles.id, publication.title.id));
+    });
+    await locked;
+    const loading = getEntitledInitialReader(databaseClient.db, staleDecision, {
+      actor: customer,
+      correlationId: randomUUID()
+    });
+    releaseReplacement();
+    await replacement;
+    const payload = await loading;
+
+    expect(payload.document.revisionId).toBe(replacementRevision.id);
+    expect(payload.initialState.progress).toMatchObject({
+      revisionId: replacementRevision.id,
+      location: { format: 'prose', blockId: replacementBlock.id, offset: 1 }
+    });
+    expect(payload.initialState.progress?.revisionId).toBe(payload.document.revisionId);
+    expect(JSON.stringify(payload.document)).not.toContain(publication.revision.id);
   });
 
   it('migrates exact prose state once across concurrent loads and acknowledges its notice', async () => {
