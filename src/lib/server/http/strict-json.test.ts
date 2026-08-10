@@ -11,6 +11,7 @@ import {
   correlationIdForRequest,
   privateEmpty,
   privateJson,
+  readBoundedBody,
   readStrictJson
 } from './strict-json';
 
@@ -114,5 +115,22 @@ describe('strict JSON HTTP helpers', () => {
     expect(empty.status).toBe(204);
     expect(empty.headers.get('cache-control')).toBe('no-store');
     expect(await empty.text()).toBe('');
+  });
+
+  it('buffers exact untouched bytes under an explicit raw-body limit', async () => {
+    const bytes = new TextEncoder().encode('  {"snowman":"☃"}\r\n');
+    const request = new Request('https://books.example.com/webhook', {
+      method: 'POST',
+      body: bytes
+    });
+    await expect(readBoundedBody(request, { maxBytes: 64 })).resolves.toEqual(bytes);
+    await expect(readBoundedBody(new Request('https://books.example.com/webhook', {
+      method: 'POST',
+      headers: { 'content-length': '65' },
+      body: new Uint8Array([1])
+    }), { maxBytes: 64 })).rejects.toMatchObject({
+      status: 413,
+      code: 'PAYLOAD_TOO_LARGE'
+    });
   });
 });

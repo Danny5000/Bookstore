@@ -34,7 +34,14 @@ export function assertSameOrigin(
   }
 }
 
-async function boundedBody(request: Request, maxBytes: number): Promise<Uint8Array> {
+export async function readBoundedBody(
+  request: Request,
+  options: { maxBytes: number }
+): Promise<Uint8Array> {
+  const { maxBytes } = options;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
+    throw new TypeError('maxBytes must be a positive safe integer');
+  }
   const declared = Number(request.headers.get('content-length'));
   if (Number.isFinite(declared) && declared > maxBytes) {
     throw new StrictHttpError(413, 'PAYLOAD_TOO_LARGE');
@@ -77,7 +84,7 @@ export async function readStrictJson<Schema extends ZodType>(
   }
   let parsed: unknown;
   try {
-    const bytes = await boundedBody(request, maxBytes);
+    const bytes = await readBoundedBody(request, { maxBytes });
     const body = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
     parsed = JSON.parse(body);
   } catch (error) {

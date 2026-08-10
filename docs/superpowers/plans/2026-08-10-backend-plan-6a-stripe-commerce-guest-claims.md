@@ -977,13 +977,13 @@ git commit -m "feat: create durable stripe checkout orders"
 - Create: `src/routes/api/webhooks/stripe/+server.ts`, `route.test.ts`
 - Modify: `src/lib/server/http/strict-json.ts` only to share a bounded raw-body reader
 
-- [ ] **Step 1: Write failing allowlist/minimization tests**
+- [x] **Step 1: Write failing allowlist/minimization tests**
 
 Define immutable supported event sets for Checkout completion/async success/async failure/expiry, current Refund create/update/failure lifecycle, and Dispute create/update/close/funds-withdrawn/funds-reinstated lifecycle. Each supported type maps to its expected object family and retrieval method. Unsupported valid types are acknowledged but not persisted.
 
 Assert the minimized value contains only event ID/type, object ID, live mode, API version, provider creation time, and raw-body digest. Run focused tests. Expected: FAIL.
 
-- [ ] **Step 2: Write failing raw webhook route tests**
+- [x] **Step 2: Write failing raw webhook route tests**
 
 Cover missing signature, invalid signature, oversized body before buffering (64 KiB maximum), disabled provider, live/test mismatch, unsupported valid event, supported event, and signature verification over exact untouched bytes containing whitespace/non-ASCII. Mock only the neutral gateway.
 
@@ -1000,25 +1000,25 @@ valid supported         -> 200 after durable insert/job
 
 Run route tests. Expected: FAIL.
 
-- [ ] **Step 3: Implement bounded verification and allowlist**
+- [x] **Step 3: Implement bounded verification and allowlist**
 
 Read bytes once; do not call `request.json()` or decode before `verifyWebhook`. Compare verified live mode with config. Validate allowlisted type/object pairing and bounded identifiers after verification. Never log signature/body/email/provider object.
 
 Run unit/route tests. Expected: the persistence cases remain RED.
 
-- [ ] **Step 4: Write failing transactional acceptance tests**
+- [x] **Step 4: Write failing transactional acceptance tests**
 
 With real PostgreSQL, prove one transaction inserts `stripe_events` and `commerce.stripe-event` job with dedup key `stripe:event:<providerEventId>`. Duplicate delivery creates one event/job. Force job insert failure and prove event rollback so Stripe retry can recover. Concurrent duplicates converge. A duplicate with conflicting minimized immutable fields does not overwrite the accepted event and emits no sensitive data.
 
 Run `npm run test:integration -- tests/integration/commerce-webhooks.test.ts`. Expected: FAIL.
 
-- [ ] **Step 5: Implement atomic event/job acceptance**
+- [x] **Step 5: Implement atomic event/job acceptance**
 
 Use `enqueueJob(transaction, { type: STRIPE_EVENT_JOB, payload: { stripeEventId }, deduplicationKey })`. On conflict, load and constant-compare immutable fields/digest; acknowledge exact duplicate. Treat conflict as a safe permanent invariant, leave original intact, and avoid infinite webhook retry. Receiver performs no canonical retrieval, order transition, email, grant, entitlement, or audit for routine duplicate delivery.
 
 Run integration and route tests. Expected: PASS.
 
-- [ ] **Step 6: Verify and commit Task 7**
+- [x] **Step 6: Verify and commit Task 7**
 
 Run:
 
