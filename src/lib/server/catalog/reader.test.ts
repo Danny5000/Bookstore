@@ -4,6 +4,7 @@ import type { Actor } from '$lib/server/auth/admin-policy';
 import type { Database } from '$lib/server/db/client';
 import {
   getAdminRevisionReader,
+  getReaderDocumentForAccess,
   getPublicPreview,
   getPublicTitleDetail,
   listPublicCatalog
@@ -253,5 +254,72 @@ describe('publication reader queries', () => {
       )
     ).rejects.toMatchObject({ code: 'forbidden' });
     expect(deniedDatabase.select).not.toHaveBeenCalled();
+  });
+
+  it('returns every prose block and image for an entitled decision', async () => {
+    const sections = [
+      { id: firstSectionId, revisionId, ordinal: 0, label: 'One', sourceReference: 'one.xhtml', createdAt: new Date() },
+      { id: secondSectionId, revisionId, ordinal: 1, label: 'Two', sourceReference: 'two.xhtml', createdAt: new Date() }
+    ];
+    const blocks = [
+      {
+        id: firstBlockId,
+        revisionId,
+        sectionId: firstSectionId,
+        ordinal: 0,
+        kind: 'paragraph' as const,
+        content: { kind: 'paragraph' as const, fragments: [{ text: 'First', marks: [] }] },
+        imageId: null,
+        createdAt: new Date()
+      },
+      {
+        id: boundaryBlockId,
+        revisionId,
+        sectionId: firstSectionId,
+        ordinal: 1,
+        kind: 'image' as const,
+        content: { kind: 'image' as const, imageId: includedImageId, alt: 'Included' },
+        imageId: includedImageId,
+        createdAt: new Date()
+      },
+      {
+        id: laterBlockId,
+        revisionId,
+        sectionId: secondSectionId,
+        ordinal: 0,
+        kind: 'image' as const,
+        content: { kind: 'image' as const, imageId: excludedImageId, alt: 'Later' },
+        imageId: excludedImageId,
+        createdAt: new Date()
+      }
+    ];
+    const images = [includedImageId, excludedImageId].map((id, index) => ({
+      id,
+      revisionId,
+      storageKey: `private/${id}`,
+      mediaType: 'image/webp',
+      checksumSha256: String(index + 1).repeat(64),
+      byteSize: 100,
+      width: 10,
+      height: 20,
+      altText: '',
+      createdAt: new Date()
+    }));
+
+    const document = await getReaderDocumentForAccess(
+      databaseReturning(sections, blocks, images),
+      {
+        level: 'entitled',
+        titleId,
+        revisionId,
+        presentationId,
+        root: publicRoot
+      }
+    );
+
+    expect(document?.access).toBe('entitled');
+    expect(document?.format === 'prose' ? document.sections : []).toHaveLength(2);
+    expect(document?.format === 'prose' ? document.images : []).toHaveLength(2);
+    expect(JSON.stringify(document)).not.toMatch(/storage|sourcePath|uploadFilename/iu);
   });
 });

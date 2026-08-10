@@ -530,7 +530,7 @@ git commit -m "feat: persist publication fingerprints"
 - Modify: `src/lib/server/catalog/reader.test.ts`
 - Create: `tests/integration/library-access.test.ts`
 
-- [ ] **Step 1: Write the access matrix as failing tests**
+- [x] **Step 1: Write the access matrix as failing tests**
 
 Cover each row explicitly:
 
@@ -547,7 +547,7 @@ Cover each row explicitly:
 
 Also assert an entitlement for title A never unlocks title B, the public resolver derives the user ID only from its `Actor`, and denied private/nonexistent resources expose the same public error.
 
-- [ ] **Step 2: Prove the focused tests fail**
+- [x] **Step 2: Prove the focused tests fail**
 
 Run:
 
@@ -558,7 +558,7 @@ npm run test:integration -- tests/integration/library-access.test.ts
 
 Expected: FAIL because the shared access service and `entitled` reader variant do not exist.
 
-- [ ] **Step 3: Implement one typed access decision**
+- [x] **Step 3: Implement one typed access decision**
 
 Expose narrow functions whose actor comes from the authenticated server context:
 
@@ -582,7 +582,7 @@ export async function resolvePublicationAccess(input: {
 
 The implementation may split internal queries, but routes and catalog modules consume this decision rather than reproducing visibility/entitlement joins. Resolve only current active customer content; preserve the existing explicit candidate selection only for an authorized admin-review purpose. Keep grant/revoke behavior absent.
 
-- [ ] **Step 4: Add entitled full reader construction**
+- [x] **Step 4: Add entitled full reader construction**
 
 Change `ReaderAccess` to `'preview' | 'entitled' | 'admin'`. Refactor `catalog/reader.ts` so:
 
@@ -593,7 +593,7 @@ Change `ReaderAccess` to `'preview' | 'entitled' | 'admin'`. Refactor `catalog/r
 
 Avoid a second entitlement query after resolving the access decision; pass the resolved root into the document builder.
 
-- [ ] **Step 5: Run access and publication regressions**
+- [x] **Step 5: Run access and publication regressions**
 
 Run:
 
@@ -605,7 +605,7 @@ npm run check
 
 Expected: full matrix and existing publication tests pass; check has zero errors/warnings.
 
-- [ ] **Step 6: Commit centralized access**
+- [x] **Step 6: Commit centralized access**
 
 ```powershell
 git add src/lib/server/library/access.ts src/lib/server/library/access.test.ts src/lib/types/publication.ts src/lib/server/catalog/reader.ts src/lib/server/catalog/reader.test.ts tests/integration/library-access.test.ts

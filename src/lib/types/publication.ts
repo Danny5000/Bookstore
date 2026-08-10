@@ -1,6 +1,6 @@
 export type PublicationFormat = 'prose' | 'comic';
 export type ReadingDirection = 'ltr' | 'rtl';
-export type ReaderAccess = 'preview' | 'admin';
+export type ReaderAccess = 'preview' | 'entitled' | 'admin';
 export type InlineMark = 'strong' | 'emphasis' | 'code' | 'subscript' | 'superscript';
 
 export interface InlineFragment {

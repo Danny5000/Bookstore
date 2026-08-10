@@ -1,5 +1,5 @@
 import { and, asc, count, eq } from 'drizzle-orm';
-import { requireCapability, type Actor } from '$lib/server/auth/admin-policy';
+import type { Actor } from '$lib/server/auth/admin-policy';
 import type { Database } from '$lib/server/db/client';
 import {
   comicPages,
@@ -10,9 +10,13 @@ import {
   revisionPresentations,
   titleRevisions,
   titles,
-  type RevisionPresentationRow,
   type TitleRow
 } from '$lib/server/db/schema';
+import {
+  resolveAdminReviewAccess,
+  type PublicationAccessDecision,
+  type PublicationAccessRoot
+} from '$lib/server/library/access';
 import type {
   CatalogTitleDetail,
   CatalogTitleSummary,
@@ -20,15 +24,12 @@ import type {
   ProseImageDto,
   ProseSectionDto,
   PublicationMediaDto,
+  ReaderAccess,
   ReaderDocument
 } from '$lib/types/publication';
 import { CatalogDomainError } from './errors';
 
-interface ReaderRoot {
-  title: TitleRow;
-  revisionId: string;
-  presentation: RevisionPresentationRow;
-}
+type ReaderRoot = PublicationAccessRoot;
 
 function coverDto(title: TitleRow): PublicationMediaDto | null {
   if (
@@ -144,7 +145,7 @@ function imageDto(revisionId: string, image: typeof proseImages.$inferSelect): P
 async function proseDocument(
   database: Database,
   root: ReaderRoot,
-  access: 'preview' | 'admin'
+  access: ReaderAccess
 ): Promise<ReaderDocument | null> {
   const sections = await database
     .select()
@@ -162,7 +163,7 @@ async function proseDocument(
     .where(eq(proseImages.revisionId, root.revisionId));
   const includedImageIds = new Set<string>();
   const mappedSections: ProseSectionDto[] = [];
-  let boundaryFound = access === 'admin';
+  let boundaryFound = access !== 'preview';
 
   for (const section of sections) {
     const mappedBlocks = [];
@@ -192,7 +193,7 @@ async function proseDocument(
   }
   if (!boundaryFound) return null;
   const mappedImages = images
-    .filter((image) => access === 'admin' || includedImageIds.has(image.id))
+    .filter((image) => access !== 'preview' || includedImageIds.has(image.id))
     .map((image) => imageDto(root.revisionId, image));
   return {
     titleId: root.title.id,
@@ -238,7 +239,7 @@ function comicPageDto(
 async function comicDocument(
   database: Database,
   root: ReaderRoot,
-  access: 'preview' | 'admin'
+  access: ReaderAccess
 ): Promise<ReaderDocument | null> {
   const allPages = await database
     .select()
@@ -278,7 +279,7 @@ async function comicDocument(
 async function readerDocument(
   database: Database,
   root: ReaderRoot,
-  access: 'preview' | 'admin'
+  access: ReaderAccess
 ): Promise<ReaderDocument | null> {
   return root.title.format === 'prose'
     ? proseDocument(database, root, access)
@@ -293,32 +294,27 @@ export async function getPublicPreview(
   return root ? readerDocument(database, root, 'preview') : null;
 }
 
+export async function getReaderDocumentForAccess(
+  database: Database,
+  decision: PublicationAccessDecision
+): Promise<ReaderDocument | null> {
+  if (decision.level === 'denied' || decision.level === 'unavailable') return null;
+  return readerDocument(database, decision.root, decision.level);
+}
+
 export async function getAdminRevisionReader(
   database: Database,
   actor: Actor,
   revisionId: string,
   presentationState: 'draft' | 'published'
 ): Promise<ReaderDocument> {
-  requireCapability(actor, 'catalog.manage');
-  const [root] = await database
-    .select({
-      title: titles,
-      revisionId: titleRevisions.id,
-      presentation: revisionPresentations
-    })
-    .from(titleRevisions)
-    .innerJoin(titles, eq(titles.id, titleRevisions.titleId))
-    .innerJoin(
-      revisionPresentations,
-      and(
-        eq(revisionPresentations.revisionId, titleRevisions.id),
-        eq(revisionPresentations.state, presentationState)
-      )
-    )
-    .where(eq(titleRevisions.id, revisionId))
-    .limit(1);
-  if (!root) throw new CatalogDomainError('presentation_not_found');
-  const document = await readerDocument(database, root, 'admin');
+  const decision = await resolveAdminReviewAccess({
+    db: database,
+    actor,
+    revisionId,
+    presentationState
+  });
+  const document = await getReaderDocumentForAccess(database, decision);
   if (!document) throw new CatalogDomainError('presentation_not_found');
   return document;
 }
