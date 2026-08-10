@@ -2,7 +2,7 @@
 
 ## Architecture and ownership
 
-Better Auth owns credential hashing; token creation and validation for email verification, password reset, and magic links; database sessions; cookies; trusted-origin checks; and endpoint rate limits. Pale Orbit Press owns the one-use email-verification markers, `customer` and `admin` roles, guest identities, authorization policy, append-only audit events, versioned email payloads, and PostgreSQL outbox delivery. Every authenticated user has the durable `customer` role; an `admin` role adds access to the protected `/admin` routes. Guest identities remain separate until the later commerce plan adds order claiming.
+Better Auth owns credential hashing; token creation and validation for email verification, password reset, and magic links; database sessions; cookies; trusted-origin checks; and endpoint rate limits. Pale Orbit Press owns the one-use email-verification markers, `customer` and `admin` roles, guest identities, authorization policy, append-only audit events, versioned email payloads, and PostgreSQL outbox delivery. Every authenticated user has the durable `customer` role; an `admin` role adds access to the protected `/admin` routes. A paid guest identity remains separate and has no account access until a verified same-email account completes the commerce claim flow.
 
 PostgreSQL is the only database, rate-limit store, job queue, and outbox store. Redis is not required. Nodemailer implements the provider-neutral SMTP boundary. Development routes mail to Mailpit; production supplies standard SMTP settings without changing application code.
 
@@ -98,9 +98,15 @@ Use `SMTP_SECURE=true` with `SMTP_REQUIRE_TLS=false` for implicit TLS, normally 
 
 The public `ORIGIN` must be the exact HTTPS origin served by Caddy. Better Auth accepts only trusted-origin requests, uses HTTP-only database-backed session cookies, and enables secure cookies in production. Session and verification lifetimes and PostgreSQL-backed endpoint rate limits are controlled by the `AUTH_*_SECONDS` and `AUTH_*_RATE_LIMIT_*` settings. Changing the auth secret invalidates signed state and should be treated as a coordinated credential rotation.
 
-Production remains in maintenance mode through Plan 5. Catalog, storage, customer libraries, full entitled reading, and original downloads are durable; Plan 6 must add commerce and the audited entitlement grant/revoke boundary before storefront activation is considered.
+Production remains in maintenance mode after Plan 6A. Catalog, storage, commerce, guest claims, customer libraries, full entitled reading, and original downloads are durable; Plan 6B financial reporting and the Plan 7 launch gate remain prerequisites before storefront activation is considered.
 
 Authentication email contains text/HTML only. EPUB and CBZ/ZIP originals are never attached to email; entitled delivery is re-authorized and streamed by the application as documented in [customer library, reader state, and original downloads](customer-library-and-reader.md).
+
+## Commerce receipts and guest claims
+
+Canonical paid fulfillment enqueues versioned `email.commerce.v1` messages through the same PostgreSQL outbox/SMTP adapter. An account order receives a receipt at the verified account email. A paid guest purchase receives a combined receipt and one-use claim action at the normalized email returned by canonical Stripe Checkout; a browser-submitted email is never ownership authority.
+
+A verified same-email account claims all eligible guest purchases in one locked transaction. The public request form returns the same success copy for present, absent, and already-claimed addresses. If a password account is still unverified, the receipt first uses the normal verification flow; after verification, the customer requests a fresh claim action. Claim replay is rejected without duplicating grants. Use Mailpit locally and follow [commerce and guest-claim operations](commerce-and-guest-claims.md); never print action URLs, outbox payloads, or recipient addresses during diagnosis.
 
 ## Delivery guarantees and transaction boundary
 

@@ -488,9 +488,11 @@ Implement local storage, the S3 stub, secure EPUB/CBZ ingestion, retained origin
 
 Connect the existing storefront and reader to server data, implement public previews, entitlement-protected reading and downloads, library state, progress, bookmarks, and safe revision transitions.
 
-### Plan 6A: Stripe commerce, claims, and entitlement lifecycle
+### Plan 6A: Stripe commerce, claims, and entitlement lifecycle — implemented 2026-08-10
 
 Implement the multi-title cart, hosted checkout, signed idempotent webhooks, orders, payment fulfillment, purchase grants, guest purchase claiming, and refund/dispute-driven entitlement changes.
+
+Plan 6A is implemented and verified with mocked Stripe adapter responses, signed webhook fixtures, PostgreSQL integration tests, browser journeys, production Compose validation, and an isolated production-image smoke test. Stripe stays disabled in the base production Compose definition; enabling the provider requires the explicit Stripe overlay and process-supplied secrets. Plan 6B financial reconciliation and the final production launch remain pending.
 
 ### Plan 6B: Stripe financial reconciliation and reporting
 

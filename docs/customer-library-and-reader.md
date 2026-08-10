@@ -2,7 +2,7 @@
 
 ## Ownership and release boundary
 
-PostgreSQL is authoritative for customer access and saved reader state. A user has an effective entitlement only when one `entitlements` row exists for the user/title pair and `revoked_at` is null. Plan 5 deliberately has no application grant or revoke route: the browser, library page, reader APIs, and admin catalog cannot create an entitlement. Plan 6 owns checkout, Stripe webhook reconciliation, guest-order claiming, and the audited grant/revoke service. Until that plan lands, test-only direct seeding lives only under `tests/e2e`.
+PostgreSQL is authoritative for customer access and saved reader state. A user has an effective entitlement only when one `entitlements` row exists for the user/title pair and `revoked_at` is null. Plan 6A makes `entitlement_grants` the auditable source set: paid order items create purchase grants, guest purchase grants stay unclaimed until verified same-email claim, refunds/disputes change only funded purchase grants, and preserved grants retain pre-commerce/administrative access. The projection is recomputed from all active grants; the browser, library page, reader APIs, and admin catalog cannot directly toggle it.
 
 Access is resolved on the server for every reader, media, and download request. The precedence is:
 
@@ -52,12 +52,14 @@ The coordinated PostgreSQL dump and private-volume archive in [storage, ingestio
 
 It must also include `semantic_fingerprint_sha256` and `semantic_fingerprint_version` on both `prose_blocks` and `comic_pages`. During an isolated restore, compare row counts for all six tables, verify the fingerprint pair is either both null or both populated, and sample reader state against restored active revisions before accepting the backup.
 
+Plan 6A adds the commerce/access chain that must be restored with that projection: `orders`, `order_items`, `payments`, `refunds`, `refund_allocations`, `disputes`, `stripe_events`, `entitlement_grants`, `guest_identities`, jobs, outbox messages, and audit events. After restore, verify every purchase grant references its order item, unclaimed grants have no user, effective entitlements agree with the complete active grant set, and no raw provider payload/card/address/secret column exists. Follow [commerce and guest-claim operations](commerce-and-guest-claims.md).
+
 ## Recovery diagnostics
 
 - **Shelf item unavailable:** verify the entitlement is active, `titles.active_revision_id` points to an active revision, and that revision has exactly one published presentation. Do not hand-edit the shelf DTO or grant a replacement entitlement.
 - **Migration failed or repeats:** check the active pointer, fingerprint pair constraints, the target migration row, and application logs by correlation ID. Preserve old state and upload/activate a corrected immutable revision if source content is wrong; do not fabricate approximate mappings.
 - **Persistent stale conflict:** close duplicate tabs, reload to obtain the authoritative version, and confirm the reader-state endpoint can reach PostgreSQL. Never increment versions manually to silence a conflict.
 - **Missing storage object:** compare the database checksum/size with the private volume and backup manifest. Restore the exact immutable object or activate a verified replacement revision; never expose the volume or substitute an unverified file.
-- **Unexpected loss of access:** inspect the entitlement timestamps and relevant audit events without selecting auth or outbox secrets. A non-null `revoked_at` is authoritative. Plan 5 has no production re-grant control; defer remediation to the audited Plan 6 boundary.
+- **Unexpected loss of access:** inspect the effective entitlement, every purchase/preserved grant for the user/title pair, canonical refund/dispute state, and relevant audit events without selecting email, auth, provider, or outbox secrets. Do not hand-edit `entitlements`; fix the authoritative reconciliation condition or use a separately authorized preserved-grant operation.
 
-Production remains fixed to `APPLICATION_MODE=maintenance` through Plan 5. Plan 6 must add commerce and grant/revoke reconciliation, complete its own release gates, and explicitly approve the storefront mode change; deploying this branch alone must not make production public.
+Production remains fixed to `APPLICATION_MODE=maintenance` after Plan 6A. Plan 6B must add financial reporting/reconciliation, and Plan 7 must complete the production launch gate; deploying this branch alone must not make production public.

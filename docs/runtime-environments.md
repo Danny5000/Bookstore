@@ -2,7 +2,7 @@
 
 ## Scope
 
-The repository supplies a development environment and a production infrastructure baseline. Authentication, administration, PostgreSQL catalog data, private publication storage, ingestion, customer libraries, reader state, and entitled original downloads are durable. Production intentionally remains in maintenance mode until Plan 6 implements commerce and reconciled entitlement mutation.
+The repository supplies a development environment and a production infrastructure baseline. Authentication, administration, PostgreSQL catalog data, private publication storage, ingestion, Stripe commerce, guest claims, entitlement grants, customer libraries, reader state, and entitled original downloads are durable. Stripe is disabled by default. Production intentionally remains in maintenance mode while Plan 6B financial reporting and the Plan 7 launch gate are incomplete.
 
 ## Required toolchain
 
@@ -85,6 +85,12 @@ docker compose --env-file .env --file compose.dev.yaml down --volumes
 | Upload/ingestion bounds | `.env` | Deployment-process environment or documented Compose defaults | No |
 | Storage retention hours | `.env` | Deployment-process environment or documented Compose defaults | No |
 | `WORKER_CONCURRENCY` | `.env` | Deployment-process environment or documented Compose default | No |
+| Stripe enabled/fixture/live flags | Disabled/false/false in `.env` | Base Compose fixes disabled/false/false | No |
+| Stripe API version | Application pin `2026-07-29.dahlia` | Same immutable application pin | No |
+| Checkout duration/webhook tolerance | `1800` / `300` seconds | Deployment-process environment or documented Compose defaults | No |
+| Automatic tax and format tax codes | Off; optional local values | Deployment-process environment; both codes required when enabled | No |
+| Checkout rate-limit window/max | `.env` | Deployment-process environment or documented Compose defaults | No |
+| `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` | Omitted/empty while disabled; ignored `.env` only for manual test mode | Deployment-process environment converted by the opt-in overlay to Compose secrets | Yes |
 | Bootstrap email/name | `.env`, explicit tool only | Deployment-process environment, explicit tool only | No |
 | `BOOTSTRAP_ADMIN_PASSWORD` | `.env`, explicit tool only | Deployment-process environment converted to a bootstrap-only secret | Yes |
 
@@ -92,7 +98,7 @@ Every required application value also supports a mutually exclusive `<NAME>_FILE
 
 ## Production baseline
 
-Production does not use an environment file. The deployment process exports the image/origin/database values, a generated `AUTH_SECRET`, provider SMTP values, and the first-administrator values. See [authentication and email operations](authentication-and-email.md) for the complete contract. Then run:
+Production does not use an environment file. The deployment process exports the image/origin/database values, a generated `AUTH_SECRET`, provider SMTP values, and the first-administrator values. See [authentication and email operations](authentication-and-email.md) for that contract and [commerce and guest-claim operations](commerce-and-guest-claims.md) for Stripe. Base production requires no Stripe credentials and keeps `STRIPE_ENABLED=false`. Then run:
 
 ```powershell
 docker compose --file compose.prod.yaml config --quiet
@@ -102,6 +108,15 @@ docker compose --file compose.prod.yaml up --detach --wait
 ```
 
 The production topology contains the app, worker, PostgreSQL, and Caddy. `APP_IMAGE` must identify the already-built immutable application image. The explicit migration command must succeed before the app and worker start. Caddy is the only service with published ports. PostgreSQL persists in `postgres_data`; private books persist in `book_storage`, mounted read/write only by app, worker, and the cleanup tool. Caddy, migration, and bootstrap containers do not receive publication storage. Database, auth, and SMTP secrets are mounted only into processes that need them. The bootstrap password is mounted only into the one-shot bootstrap service. None is stored in a production `.env` file.
+
+For a deliberate future test-mode checkpoint, supply both Stripe values from protected process memory and add the explicit overlay:
+
+```powershell
+docker compose --file compose.prod.yaml --file compose.stripe.yaml config --quiet
+docker compose --file compose.prod.yaml --file compose.stripe.yaml up --detach --wait
+```
+
+`compose.stripe.yaml` mounts the two environment-backed secrets only into app and worker. It does not alter `APPLICATION_MODE=maintenance`, live mode, or the existing database/auth/SMTP secret mounts, and it is not a storefront launch switch.
 
 Caddy's internal port 2015 health endpoint is container-only and avoids coupling container health to the configured public hostname or TLS redirect behavior.
 
@@ -129,5 +144,6 @@ docker compose --file compose.prod.yaml --profile tools run --rm storage-cleanup
 - Plan 3 supplies verified email/password and magic-link authentication, audited roles, the provider-neutral SMTP adapter, and Mailpit development delivery.
 - Plan 4 supplies private storage, bounded ingestion, revision publication, cleanup, and the current backup/restore procedure.
 - Plan 5 supplies server-owned customer libraries, full entitled reading, optimistic reader state, exact revision migration, and authenticated original downloads. See [customer library, reader state, and original downloads](customer-library-and-reader.md).
-- Plan 6 supplies Stripe reconciliation, guest claiming, and the only application grant/revoke boundary.
+- Plan 6A supplies Stripe Checkout/event reconciliation, guest claiming, purchase grants, and refund/dispute access changes.
+- Plan 6B supplies processing-fee, balance-transaction, payout, allocation, and administrator sales/estimated-payout reporting.
 - Plan 7 adds deployment automation, off-host backup scheduling, monitoring/alert delivery, final capacity tuning, and the read-only-rootfs review.

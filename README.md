@@ -1,6 +1,6 @@
 # Pale Orbit Press — SvelteKit
 
-Bookstore and in-browser reader for prose EPUBs and CBZ/ZIP comics. The original visual prototype has been migrated to a strict TypeScript SvelteKit application with PostgreSQL-backed authentication, catalog, publication workflows, customer libraries, and reader state.
+Bookstore and in-browser reader for prose EPUBs and CBZ/ZIP comics. The original visual prototype has been migrated to a strict TypeScript SvelteKit application with PostgreSQL-backed authentication, catalog, publication workflows, multi-title Stripe commerce, guest purchase claiming, customer libraries, and reader state.
 
 ## Development
 
@@ -31,6 +31,7 @@ docker compose --env-file .env --file compose.dev.yaml up --build --wait
 
 Operational references:
 
+- [Commerce and guest claims](docs/commerce-and-guest-claims.md)
 - [Authentication and email](docs/authentication-and-email.md)
 - [Customer library, reader state, and downloads](docs/customer-library-and-reader.md)
 - [Runtime environments](docs/runtime-environments.md)
@@ -49,7 +50,7 @@ npm run build
 npm run verify
 ```
 
-Development uses the PostgreSQL catalog, private EPUB/CBZ storage, background ingestion, revision review/publication, public previews, server-owned customer libraries and reader state, authenticated original downloads, and an audited admin dashboard. Production Compose remains fixed to maintenance mode until Plan 6 implements commerce and reconciled entitlement grants.
+Development uses the PostgreSQL catalog, private EPUB/CBZ storage, background ingestion, revision review/publication, public previews, server-owned commerce and entitlement grants, customer libraries and reader state, authenticated original downloads, and an audited admin dashboard. Stripe is disabled by default and production Compose remains fixed to maintenance mode while Plan 6B financial reporting and the later production launch gate remain incomplete.
 
 ## Routes
 
@@ -58,6 +59,9 @@ Development uses the PostgreSQL catalog, private EPUB/CBZ storage, background in
 | `/` | Storefront backed by public catalog data |
 | `/catalog` | Public active titles and format filter |
 | `/book/[id]` | Public detail and reviewed free-preview entry point |
+| `/cart` | Server-requoted multi-title cart and Stripe Checkout entry point |
+| `/checkout/success` | Private polling view for asynchronous order status |
+| `/claim` | Enumeration-resistant guest-purchase claim request |
 | `/read/[id]` | Public preview by slug or entitled full reader by title ID |
 | `/library` | Server-owned entitled shelf, resume state, and downloads |
 | `/library/[titleId]/download` | Re-authorized EPUB/CBZ/ZIP original stream |
@@ -87,15 +91,18 @@ Public catalog, detail, and preview loaders read only active public revisions wi
 
 ## Commerce boundary
 
-Checkout is not live in Plan 5. Retired commerce, webhook, success, and delivery routes return `404` and cannot change a shelf. The Stripe SDK remains installed for Plan 6, which owns payment reconciliation, guest claiming, sales reporting, and the audited entitlement grant/revoke service.
+Plan 6A provides a bounded quantity-one multi-title cart, server-owned quotes, immutable order snapshots, Stripe-hosted Checkout, signed idempotent webhook processing, account and guest fulfillment, one-use guest claims, and refund/dispute-driven purchase grants. A redirect never creates access: canonical asynchronous Stripe processing is the only purchase fulfillment authority. Prices are tax-exclusive, mixed currencies are rejected, and Stripe remains disabled unless explicit validated test-mode configuration enables it.
+
+Production is still `APPLICATION_MODE=maintenance`. Plan 6B must add fee, balance-transaction, payout, ambiguous-refund allocation, and administrator sales/estimated-payout reporting. See the [commerce operations runbook](docs/commerce-and-guest-claims.md).
 
 ## Authentication and delivery
 
 Better Auth provides verified email/password accounts, password reset, magic links, and PostgreSQL-backed sessions and rate limits. Every protected route enforces authorization on the server. Administrators manage audited roles at `/admin/users`, including transactional final-admin protection. Third-party OAuth remains out of scope.
 
-Versioned authentication messages use the PostgreSQL outbox and provider-neutral SMTP adapter; development mail is captured by Mailpit. Publication files are never email attachments. Entitled customers download retained originals through the authenticated application route, which supports HEAD and single byte ranges and records a redacted audit event. Local disk is implemented; the S3 provider remains a fail-at-startup interface stub with no AWS SDK installed.
+Versioned authentication and commerce messages use the PostgreSQL outbox and provider-neutral SMTP adapter; development mail is captured by Mailpit. Paid guests receive a receipt and one-use claim action, while unverified password accounts verify before claiming. Publication files are never email attachments. Entitled customers download retained originals through the authenticated application route, which supports HEAD and single byte ranges and records a redacted audit event. Local disk is implemented; the S3 provider remains a fail-at-startup interface stub with no AWS SDK installed.
 
-## Not yet wired
+## Deferred work
 
-- Stripe checkout, reconciled entitlement grants/revocations, guest checkout claiming, and sales reporting (Plan 6).
+- Stripe processing-fee, balance, payout, ambiguous-refund allocation, and sales/estimated-payout reporting (Plan 6B).
+- Production launch, deployment automation, monitoring, and off-host backup scheduling (Plan 7).
 - Search, series grouping, pre-orders, and reviews.

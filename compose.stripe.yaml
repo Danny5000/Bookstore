@@ -1,0 +1,24 @@
+services:
+  app:
+    environment:
+      STRIPE_ENABLED: "true"
+      STRIPE_SECRET_KEY_FILE: /run/secrets/stripe_secret_key
+      STRIPE_WEBHOOK_SECRET_FILE: /run/secrets/stripe_webhook_secret
+    secrets:
+      - stripe_secret_key
+      - stripe_webhook_secret
+
+  worker:
+    environment:
+      STRIPE_ENABLED: "true"
+      STRIPE_SECRET_KEY_FILE: /run/secrets/stripe_secret_key
+      STRIPE_WEBHOOK_SECRET_FILE: /run/secrets/stripe_webhook_secret
+    secrets:
+      - stripe_secret_key
+      - stripe_webhook_secret
+
+secrets:
+  stripe_secret_key:
+    environment: STRIPE_SECRET_KEY
+  stripe_webhook_secret:
+    environment: STRIPE_WEBHOOK_SECRET
