@@ -765,11 +765,11 @@ git commit -m "feat: map reader semantic locations"
 - Create: `src/lib/server/reader-state/service.test.ts`
 - Create: `tests/integration/reader-state.test.ts`
 
-- [ ] **Step 1: Write failing anchor-validation tests**
+- [x] **Step 1: Write failing anchor-validation tests**
 
 Assert prose offsets accept `0..visibleLength` for the exact active block and reject negative, past-end, wrong-revision, wrong-title, or comic-shaped locations. Assert comic anchors accept an existing page and null panel, accept a real published panel only when guided mode is available, and reject missing/draft-only panels. Assert every failure uses one non-disclosing domain error.
 
-- [ ] **Step 2: Write failing state/concurrency tests**
+- [x] **Step 2: Write failing state/concurrency tests**
 
 Cover:
 
@@ -782,7 +782,7 @@ Cover:
 - account preferences work only for an authenticated user and are independent of entitlement;
 - comic mode is per user/title while font/typeface/paper is account-wide.
 
-- [ ] **Step 3: Prove the tests fail**
+- [x] **Step 3: Prove the tests fail**
 
 Run:
 
@@ -793,7 +793,7 @@ npm run test:integration -- tests/integration/reader-state.test.ts
 
 Expected: FAIL because the reader-state modules do not exist.
 
-- [ ] **Step 4: Implement deterministic locking and post-lock authorization**
+- [x] **Step 4: Implement deterministic locking and post-lock authorization**
 
 Reuse Plan 4's title advisory lock first. Then acquire a transaction-scoped advisory lock keyed by an explicit domain prefix plus user/title IDs. After both locks, re-read:
 
@@ -803,7 +803,7 @@ Reuse Plan 4's title advisory lock first. Then acquire a transaction-scoped advi
 
 Do not accept a caller-provided user ID. Keep all checks and writes in the same transaction.
 
-- [ ] **Step 5: Implement semantic validation and compare-and-swap writes**
+- [x] **Step 5: Implement semantic validation and compare-and-swap writes**
 
 Expose focused service functions:
 
@@ -827,7 +827,7 @@ Use an `UPDATE ... WHERE version = expectedVersion RETURNING`/insert-on-version-
 
 Account preferences use a user-scoped advisory lock because no title or active revision participates. Title-scoped operations keep the title-then-user/title lock order above.
 
-- [ ] **Step 6: Run concurrency repeatedly and run regressions**
+- [x] **Step 6: Run concurrency repeatedly and run regressions**
 
 Run:
 
@@ -840,7 +840,7 @@ npm run check
 
 Expected: every repeated run has one winner/one stale result with no flake; access/publication regressions and check pass.
 
-- [ ] **Step 7: Commit reader-state services**
+- [x] **Step 7: Commit reader-state services**
 
 ```powershell
 git add src/lib/server/reader-state tests/integration/reader-state.test.ts
