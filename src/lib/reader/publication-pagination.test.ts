@@ -129,9 +129,32 @@ describe('publication pagination', () => {
     const restored = narrow[pageForAnchor(narrow, anchor)];
     expect(restored?.chapter).toBe(0);
     expect(restored?.at).toBeLessThanOrEqual(anchor.at);
-    expect(restored?.type === 'text' ? restored.blocks?.[0]?.sourceOffset : 0).toBeLessThanOrEqual(
+    expect(restored?.type === 'text' ? restored.blocks?.[0]?.sourceStartOffset : 0).toBeLessThanOrEqual(
       anchor.at
     );
+  });
+
+  it('partitions split block-relative source ranges without overlap or loss', () => {
+    const text = 'word '.repeat(500);
+    const document: ProseReaderDocument = {
+      ...proseDocument,
+      sections: [{
+        ...proseDocument.sections[0]!,
+        blocks: [{
+          id: paragraphId,
+          ordinal: 0,
+          content: { kind: 'paragraph', fragments: [{ text, marks: [] }] }
+        }]
+      }],
+      images: []
+    };
+    const pages = paginatePublication(document, { pw: 300, ph: 500, pad: 30, fs: 18 });
+    const blocks = pages.flatMap((page) => page.type === 'text' ? page.blocks ?? [] : []);
+    expect(blocks[0]).toMatchObject({ sourceBlockId: paragraphId, sourceStartOffset: 0 });
+    expect(blocks.at(-1)?.sourceEndOffset).toBe(text.length);
+    for (let index = 1; index < blocks.length; index += 1) {
+      expect(blocks[index]?.sourceStartOffset).toBe(blocks[index - 1]?.sourceEndOffset);
+    }
   });
 
   it('ends exactly with the server-delivered preview boundary', () => {
@@ -180,6 +203,7 @@ describe('publication pagination', () => {
       expect.objectContaining({
         type: 'comic',
         imageUrl: '/media/page-1.webp',
+        sourcePageId: imageId,
         panels: comic.pages[0]!.panels,
         chapter: 0,
         at: 0

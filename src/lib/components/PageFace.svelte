@@ -82,7 +82,7 @@
   {:else if page}
     <div class="body" style:font-family={font} style:font-size="{box.fs}px" style:color={ink}>
       {#if page.blocks}
-        {#each page.blocks as block (`${block.sourceBlockId}:${block.sourceOffset}`)}
+        {#each page.blocks as block (`${block.sourceBlockId}:${block.sourceStartOffset}:${block.sourceEndOffset}`)}
           {#if block.content.kind === 'heading'}
             <svelte:element this={`h${block.content.level}`} class="prose-heading">
               {@render inline(block.content.fragments)}

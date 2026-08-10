@@ -49,6 +49,7 @@ export interface TextReaderPage extends ReaderPageBase {
 
 export interface ComicReaderPage extends ReaderPageBase {
   type: 'comic';
+  sourcePageId: string;
   layout: PanelCell[];
   imageUrl?: string;
   imageWidth?: number;
@@ -79,7 +80,8 @@ export interface ReaderPreferences {
 
 export interface RenderedProseBlock {
   sourceBlockId: string;
-  sourceOffset: number;
+  sourceStartOffset: number;
+  sourceEndOffset: number;
   content: ProseBlockData;
   imageUrl?: string;
 }

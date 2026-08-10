@@ -688,7 +688,7 @@ git commit -m "feat: query customer library and full reader"
 - Modify: `src/lib/components/PageFace.svelte`
 - Create: `src/lib/components/PageFace.test.ts`
 
-- [ ] **Step 1: Write failing pure mapping tests**
+- [x] **Step 1: Write failing pure mapping tests**
 
 Test prose and comic directions independently:
 
@@ -699,7 +699,7 @@ Test prose and comic directions independently:
 - comic `(pageId, null)` maps to whole-page mode and `(pageId, panelOrdinal)` maps only to an existing ordered published panel;
 - a missing item returns a typed unresolved result, never a guessed ordinal/percentage location.
 
-- [ ] **Step 2: Prove the tests fail**
+- [x] **Step 2: Prove the tests fail**
 
 Run:
 
@@ -709,7 +709,7 @@ npx vitest run src/lib/reader/locations.test.ts src/lib/reader/publication-pagin
 
 Expected: FAIL because pagination currently exposes section-relative/source-sheet anchors rather than authoritative block-relative locations.
 
-- [ ] **Step 3: Preserve source provenance through pagination**
+- [x] **Step 3: Preserve source provenance through pagination**
 
 Change rendered prose fragments to carry `sourceBlockId`, `sourceStartOffset`, and `sourceEndOffset` relative to the canonical reader-visible text of that one block. Splitting a block must partition those ranges without overlap or loss. Decorative layout items do not generate persistable anchors.
 
@@ -732,11 +732,11 @@ export function locationForPage(
 
 Clamp only within a known matching block's valid endpoint. A missing block/page/panel returns null.
 
-- [ ] **Step 4: Adapt PageFace to the richer fragment metadata**
+- [x] **Step 4: Adapt PageFace to the richer fragment metadata**
 
 Keep the metadata internal; do not render IDs or offsets into visible text. Preserve HTML sanitization and current visual output.
 
-- [ ] **Step 5: Run mapping and component regressions**
+- [x] **Step 5: Run mapping and component regressions**
 
 Run:
 
@@ -747,7 +747,7 @@ npm run check
 
 Expected: pure round-trip tests pass across at least two pagination configurations, component tests pass, and check reports no errors/warnings.
 
-- [ ] **Step 6: Commit semantic viewport mapping**
+- [x] **Step 6: Commit semantic viewport mapping**
 
 ```powershell
 git add src/lib/reader/locations.ts src/lib/reader/locations.test.ts src/lib/reader/publication-pagination.ts src/lib/reader/publication-pagination.test.ts src/lib/components/PageFace.svelte src/lib/components/PageFace.test.ts

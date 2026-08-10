@@ -72,6 +72,7 @@ function build(title: Title, box: PageBox): ReaderPage[] {
       }
       return {
         type: 'comic',
+        sourcePageId: `prototype-page-${index}`,
         chapter: 0,
         at: index,
         layout,

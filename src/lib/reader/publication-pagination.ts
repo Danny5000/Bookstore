@@ -11,6 +11,7 @@ import type {
   RenderedProseBlock,
   TextReaderPage
 } from '$lib/types/reader';
+import { proseBlockVisibleLength } from './locations';
 
 function fragmentLength(fragments: readonly InlineFragment[]): number {
   return fragments.reduce((total, fragment) => total + fragment.text.length, 0);
@@ -125,7 +126,8 @@ function prosePages(document: ProseReaderDocument, box: PageBox): ReaderPage[] {
           pageOffset = sectionOffset + consumed;
           pageBlocks = [{
             sourceBlockId: block.id,
-            sourceOffset: sectionOffset + consumed,
+            sourceStartOffset: consumed,
+            sourceEndOffset: consumed + chunkLength,
             content: chunkContent
           }];
           pageCost = blockCost(chunkContent, columns, budget);
@@ -145,7 +147,8 @@ function prosePages(document: ProseReaderDocument, box: PageBox): ReaderPage[] {
         block.content.kind === 'image' ? imageUrls.get(block.content.imageId) : undefined;
       pageBlocks.push({
         sourceBlockId: block.id,
-        sourceOffset: sectionOffset,
+        sourceStartOffset: 0,
+        sourceEndOffset: proseBlockVisibleLength(block.content),
         content: block.content,
         ...(imageUrl ? { imageUrl } : {})
       });
@@ -160,6 +163,7 @@ function prosePages(document: ProseReaderDocument, box: PageBox): ReaderPage[] {
 function comicPages(document: Extract<ReaderDocument, { format: 'comic' }>): ReaderPage[] {
   return document.pages.map((page, index): ComicReaderPage => ({
     type: 'comic',
+    sourcePageId: page.id,
     chapter: 0,
     at: index,
     folio: String(index + 1),
