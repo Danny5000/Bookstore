@@ -856,7 +856,7 @@ git commit -m "feat: persist optimistic reader state"
 - Modify: `tests/integration/reader-state.test.ts`
 - Modify: `tests/integration/publication.test.ts`
 
-- [ ] **Step 1: Write the migration matrix as failing tests**
+- [x] **Step 1: Write the migration matrix as failing tests**
 
 Cover prose and comic cases:
 
@@ -873,7 +873,7 @@ Cover prose and comic cases:
 
 Include a transaction-failure injection and assert no partial target progress, bookmark, or migration record commits.
 
-- [ ] **Step 2: Prove migration tests fail**
+- [x] **Step 2: Prove migration tests fail**
 
 Run:
 
@@ -884,7 +884,7 @@ npm run test:integration -- tests/integration/reader-state.test.ts tests/integra
 
 Expected: FAIL because lazy migration is absent.
 
-- [ ] **Step 3: Implement the exact-only migration transaction**
+- [x] **Step 3: Implement the exact-only migration transaction**
 
 When entitled initial state has no current-revision migration result:
 
@@ -900,11 +900,11 @@ When entitled initial state has no current-revision migration result:
 
 Do not query or sort by approximate ordinal to choose a match. A prose offset may be preserved only because the versioned canonical block is identical; validate its endpoint before insert.
 
-- [ ] **Step 4: Integrate lazy migration and notice acknowledgement**
+- [x] **Step 4: Integrate lazy migration and notice acknowledgement**
 
 Call migration from entitled `getReaderInitialState` before reading target state. Expose a service acknowledgement requiring entitlement and the matching current target revision; set `notice_acknowledged_at` only when null. A later reload omits acknowledged notices without deleting migration history.
 
-- [ ] **Step 5: Run migration and publication race tests repeatedly**
+- [x] **Step 5: Run migration and publication race tests repeatedly**
 
 Run:
 
@@ -916,7 +916,7 @@ npm run check
 
 Expected: exact/ambiguous/null/idempotent/rollback cases pass on every run; publication remains gap-free and no migration race flakes.
 
-- [ ] **Step 6: Commit exact migration**
+- [x] **Step 6: Commit exact migration**
 
 ```powershell
 git add src/lib/server/reader-state/migration.ts src/lib/server/reader-state/migration.test.ts src/lib/server/reader-state/service.ts tests/integration/reader-state.test.ts tests/integration/publication.test.ts

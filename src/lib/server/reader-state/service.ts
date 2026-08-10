@@ -16,6 +16,7 @@ import {
 import { withTransaction, type DatabaseTransaction } from '$lib/server/db/transaction';
 import type {
   BookmarkMutationInput,
+  MigrationNoticeMutationInput,
   PreferencesMutationInput,
   ProgressMutationInput,
   ReaderBookmarkDto,
@@ -33,6 +34,7 @@ import {
   StaleReaderStateError
 } from './errors';
 import { lockReaderAccount, lockReaderTitle, requireUserActor } from './lock';
+import { migrateLockedReaderState } from './migration';
 
 export interface AccountStateContext {
   database: Database;
@@ -136,6 +138,7 @@ export async function getReaderInitialState(
   requireUserActor(input.actor);
   return withTransaction(input.database, async (transaction) => {
     const locked = await lockReaderTitle(transaction, input.actor, input.titleId);
+    await migrateLockedReaderState(transaction, locked);
     const progress = await currentProgress(
       transaction,
       locked.userId,
@@ -173,9 +176,10 @@ export async function getReaderInitialState(
       .from(readerRevisionMigrations)
       .where(
         and(
-          eq(readerRevisionMigrations.userId, locked.userId),
-          eq(readerRevisionMigrations.titleId, locked.title.id),
-          eq(readerRevisionMigrations.targetRevisionId, locked.revisionId)
+              eq(readerRevisionMigrations.userId, locked.userId),
+              eq(readerRevisionMigrations.titleId, locked.title.id),
+              eq(readerRevisionMigrations.targetRevisionId, locked.revisionId),
+              isNull(readerRevisionMigrations.noticeAcknowledgedAt)
         )
       )
       .orderBy(desc(readerRevisionMigrations.completedAt))
@@ -435,5 +439,41 @@ export async function saveReaderTitlePreferences(
     const current = await currentTitlePreferences(transaction, locked.userId, locked.title.id);
     if (!current) throw new ReaderStateNotFoundError();
     throw new StaleReaderStateError(titlePreferencesDto(current));
+  });
+}
+
+export async function acknowledgeMigrationNotice(
+  input: ReaderStateContext & MigrationNoticeMutationInput
+): Promise<ReaderMigrationNoticeDto> {
+  requireUserActor(input.actor);
+  return withTransaction(input.database, async (transaction) => {
+    const locked = await lockReaderTitle(transaction, input.actor, input.titleId);
+    if (input.targetRevisionId !== locked.revisionId) throw new ReaderStateNotFoundError();
+    const [updated] = await transaction
+      .update(readerRevisionMigrations)
+      .set({ noticeAcknowledgedAt: sql`clock_timestamp()` })
+      .where(
+        and(
+          eq(readerRevisionMigrations.userId, locked.userId),
+          eq(readerRevisionMigrations.titleId, locked.title.id),
+          eq(readerRevisionMigrations.targetRevisionId, locked.revisionId),
+          isNull(readerRevisionMigrations.noticeAcknowledgedAt)
+        )
+      )
+      .returning();
+    if (updated) return migrationNoticeDto(updated);
+    const [existing] = await transaction
+      .select()
+      .from(readerRevisionMigrations)
+      .where(
+        and(
+          eq(readerRevisionMigrations.userId, locked.userId),
+          eq(readerRevisionMigrations.titleId, locked.title.id),
+          eq(readerRevisionMigrations.targetRevisionId, locked.revisionId)
+        )
+      )
+      .limit(1);
+    if (!existing) throw new ReaderStateNotFoundError();
+    return migrationNoticeDto(existing);
   });
 }
