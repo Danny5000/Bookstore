@@ -79,9 +79,44 @@ describe('image normalization', () => {
         height: 2
       });
       expect(normalized.checksumSha256).toBe(createHash('sha256').update(stored).digest('hex'));
+      expect(normalized.semanticFingerprintSha256).toMatch(/^[0-9a-f]{64}$/u);
+      expect(normalized.semanticFingerprintVersion).toBe(1);
       expect(metadata.format).toBe('webp');
     }
   );
+
+  it('fingerprints normalized decoded pixels independently of source encoding', async () => {
+    const pixels = Buffer.from([
+      10, 20, 30, 255, 40, 50, 60, 255,
+      70, 80, 90, 255, 100, 110, 120, 255
+    ]);
+    const raw = { width: 2, height: 2, channels: 4 as const };
+    const png = await sharp(pixels, { raw }).png().toBuffer();
+    const webp = await sharp(pixels, { raw }).webp({ lossless: true }).toBuffer();
+    const changedPixels = Buffer.from(pixels);
+    changedPixels[0] = 11;
+    const changed = await sharp(changedPixels, { raw }).png().toBuffer();
+
+    const normalize = async (bytes: Buffer) =>
+      normalizeImage({
+        storage,
+        source: Readable.from([bytes]),
+        destination: destinationKey(),
+        profile: 'epub',
+        limits,
+        signal: AbortSignal.timeout(5_000)
+      });
+    const [fromPng, fromWebp, fromChangedPixels] = await Promise.all([
+      normalize(png),
+      normalize(webp),
+      normalize(changed)
+    ]);
+
+    expect(fromPng.semanticFingerprintSha256).toBe(fromWebp.semanticFingerprintSha256);
+    expect(fromChangedPixels.semanticFingerprintSha256).not.toBe(
+      fromPng.semanticFingerprintSha256
+    );
+  });
 
   it('accepts TIFF only for comic ingestion', async () => {
     const bytes = await fixture('tiff');

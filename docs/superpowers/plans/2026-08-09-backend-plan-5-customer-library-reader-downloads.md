@@ -314,7 +314,7 @@ Expected: one narrow commit; `docs/dependency-decisions.md` is staged only if St
 - Modify: `src/lib/server/ingestion/epub.test.ts`
 - Modify: `src/lib/server/ingestion/comic.test.ts`
 
-- [ ] **Step 1: Write failing semantic-fingerprint tests**
+- [x] **Step 1: Write failing semantic-fingerprint tests**
 
 Test these behaviors before changing implementation:
 
@@ -327,7 +327,7 @@ Test these behaviors before changing implementation:
 
 Use small generated buffers already supported by Sharp; do not add binary fixtures or a hashing package.
 
-- [ ] **Step 2: Prove the tests fail**
+- [x] **Step 2: Prove the tests fail**
 
 Run:
 
@@ -337,7 +337,7 @@ npx vitest run src/lib/server/reader-state/fingerprint.test.ts src/lib/server/in
 
 Expected: FAIL because the fingerprint module and result fields do not exist.
 
-- [ ] **Step 3: Implement deterministic fingerprint primitives**
+- [x] **Step 3: Implement deterministic fingerprint primitives**
 
 In `fingerprint.ts`, expose explicit versioned functions:
 
@@ -358,7 +358,7 @@ export function fingerprintProseBlock(input: {
 
 Use a domain-separated UTF-8 prefix such as `pale-orbit:image:v1\0` or `pale-orbit:prose-block:v1\0`, fixed-width dimension encoding, and canonical JSON with recursively sorted object keys. Arrays retain order. Include only sanitized reader-visible semantic content. Reject missing image fingerprints for image blocks and unexpected image fingerprints for non-image blocks.
 
-- [ ] **Step 4: Hash decoded pixels without buffering the complete image twice**
+- [x] **Step 4: Hash decoded pixels without buffering the complete image twice**
 
 Extend `NormalizedImage` with:
 
@@ -374,11 +374,11 @@ From the validated Sharp input, use separate clones:
 
 Read dimensions from the normalized raw pipeline metadata, then call `fingerprintDecodedImage`. Preserve existing decoder limits, single-image worker concurrency, abort/time budgets, and output checksum behavior. The semantic fingerprint must not hash WebP output bytes.
 
-- [ ] **Step 5: Attach prose and comic fingerprints to ingestion results**
+- [x] **Step 5: Attach prose and comic fingerprints to ingestion results**
 
 Extend `EpubBlockRow` and `ComicPageRow` so every newly accepted block/page carries the paired digest/version. For EPUB image blocks, resolve the normalized image fingerprint before hashing the block. Throw the existing controlled ingestion failure type if an internal image reference has no normalized fingerprint; never write a partial manifest.
 
-- [ ] **Step 6: Run focused ingestion tests**
+- [x] **Step 6: Run focused ingestion tests**
 
 Run:
 
@@ -389,7 +389,7 @@ npm run check
 
 Expected: all focused tests pass and check reports zero errors/warnings. Inspect tests to confirm at least one visually identical PNG/JPEG or PNG/WebP pair proves encoding independence.
 
-- [ ] **Step 7: Commit fingerprint calculation**
+- [x] **Step 7: Commit fingerprint calculation**
 
 ```powershell
 git add src/lib/server/reader-state/fingerprint.ts src/lib/server/reader-state/fingerprint.test.ts src/lib/server/ingestion/image.ts src/lib/server/ingestion/image.test.ts src/lib/server/ingestion/epub.ts src/lib/server/ingestion/comic.ts src/lib/server/ingestion/epub.test.ts src/lib/server/ingestion/comic.test.ts

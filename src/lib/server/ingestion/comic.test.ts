@@ -74,9 +74,18 @@ describe('comic archive ingestion', () => {
     ]);
     expect(result.pages.every((page) => page.mediaType === 'image/webp')).toBe(true);
     expect(result.pages.every((page) => page.width === 1 && page.height === 1)).toBe(true);
+    expect(
+      result.pages.every(
+        (page) =>
+          page.semanticFingerprintVersion === 1 &&
+          /^[0-9a-f]{64}$/u.test(page.semanticFingerprintSha256)
+      )
+    ).toBe(true);
     expect(result.coverSuggestion).toMatchObject({
       sourceDescription: 'First normalized comic page',
       checksumSha256: result.pages[0]!.checksumSha256,
+      semanticFingerprintSha256: result.pages[0]!.semanticFingerprintSha256,
+      semanticFingerprintVersion: 1,
       byteSize: result.pages[0]!.byteSize,
       width: 1,
       height: 1

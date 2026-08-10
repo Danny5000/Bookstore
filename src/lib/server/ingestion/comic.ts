@@ -131,6 +131,8 @@ export async function ingestComic(input: IngestComicInput): Promise<ComicIngesti
       storageKey: suggestionKey,
       mediaType: 'image/webp',
       checksumSha256: firstPage.checksumSha256,
+      semanticFingerprintSha256: firstPage.semanticFingerprintSha256,
+      semanticFingerprintVersion: firstPage.semanticFingerprintVersion,
       byteSize: copied.byteSize,
       width: firstPage.width,
       height: firstPage.height,

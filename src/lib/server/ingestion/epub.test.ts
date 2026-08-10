@@ -111,12 +111,22 @@ describe('EPUB ingestion', () => {
     expect(result.images[0]).toMatchObject({
       sourcePath: 'EPUB/images/station.png',
       mediaType: 'image/webp',
+      semanticFingerprintVersion: 1,
       width: 1,
       height: 1
     });
+    expect(result.images[0]?.semanticFingerprintSha256).toMatch(/^[0-9a-f]{64}$/u);
+    expect(
+      result.sections.flatMap((section) => section.blocks).every(
+        (block) =>
+          block.semanticFingerprintVersion === 1 &&
+          /^[0-9a-f]{64}$/u.test(block.semanticFingerprintSha256)
+      )
+    ).toBe(true);
     expect(result.coverSuggestion).toMatchObject({
       sourceDescription: 'EPUB package cover image',
       mediaType: 'image/webp',
+      semanticFingerprintVersion: 1,
       width: 1,
       height: 1
     });

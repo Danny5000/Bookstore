@@ -11,6 +11,10 @@ import { openArchive, type ArchiveEntry, type ArchiveSession } from './archive';
 import { IngestionError, type IngestionWarning } from './errors';
 import { normalizeImage, type NormalizedImage } from './image';
 import type { IngestionLimits } from './limits';
+import {
+  SEMANTIC_FINGERPRINT_VERSION,
+  fingerprintProseBlock
+} from '../reader-state/fingerprint';
 import { convertXhtmlToBlocks, stableIngestionId } from './prose';
 import {
   readOrderedXml,
@@ -51,6 +55,8 @@ export interface EpubBlockRow {
   kind: ProseBlockData['kind'];
   content: ProseBlockData;
   imageId: string | null;
+  semanticFingerprintSha256: string;
+  semanticFingerprintVersion: typeof SEMANTIC_FINGERPRINT_VERSION;
 }
 
 export interface EpubSectionRow {
@@ -451,6 +457,9 @@ export async function ingestEpub(input: IngestEpubInput): Promise<EpubIngestionR
       images.push({ id: imageId, sourcePath: path, altText, ...normalized });
     }
 
+    const imageFingerprintsById = new Map(
+      images.map((image) => [image.id, image.semanticFingerprintSha256] as const)
+    );
     const sections: EpubSectionRow[] = sectionDocuments.map(({ item, document }, ordinal) => {
       const sectionId = stableIngestionId(input.revisionId, item.path, 'section', ordinal);
       const content = convertXhtmlToBlocks(document, {
@@ -458,13 +467,26 @@ export async function ingestEpub(input: IngestEpubInput): Promise<EpubIngestionR
         resourcePath: item.path,
         imageIdsByPath
       });
-      const blocks = content.map((block, blockOrdinal): EpubBlockRow => ({
-        id: stableIngestionId(input.revisionId, item.path, block.kind, blockOrdinal),
-        ordinal: blockOrdinal,
-        kind: block.kind,
-        content: block,
-        imageId: block.kind === 'image' ? block.imageId : null
-      }));
+      const blocks = content.map((block, blockOrdinal): EpubBlockRow => {
+        const imageFingerprint = block.kind === 'image'
+          ? imageFingerprintsById.get(block.imageId)
+          : undefined;
+        if (block.kind === 'image' && !imageFingerprint) {
+          throw epubError('epub_content', 'Referenced EPUB image fingerprint is missing');
+        }
+        return {
+          id: stableIngestionId(input.revisionId, item.path, block.kind, blockOrdinal),
+          ordinal: blockOrdinal,
+          kind: block.kind,
+          content: block,
+          imageId: block.kind === 'image' ? block.imageId : null,
+          semanticFingerprintSha256: fingerprintProseBlock({
+            block,
+            ...(imageFingerprint ? { imageFingerprintSha256: imageFingerprint } : {})
+          }),
+          semanticFingerprintVersion: SEMANTIC_FINGERPRINT_VERSION
+        };
+      });
       return {
         id: sectionId,
         ordinal,

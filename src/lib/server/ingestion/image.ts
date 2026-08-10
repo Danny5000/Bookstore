@@ -1,11 +1,16 @@
 import { createHash } from 'node:crypto';
-import { Readable, Transform } from 'node:stream';
+import { Readable, Transform, Writable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { fileTypeFromBuffer } from 'file-type';
 import sharp, { type OutputInfo } from 'sharp';
 import type { StorageKey } from '../storage/keys';
 import type { ObjectStorage } from '../storage/types';
 import { IngestionError, type IngestionWarning } from './errors';
 import type { IngestionLimits } from './limits';
+import {
+  SEMANTIC_FINGERPRINT_VERSION,
+  fingerprintDecodedImage
+} from '../reader-state/fingerprint';
 
 const signaturePrefixBytes = 4_100;
 const epubFormats = new Set(['jpeg', 'png', 'webp', 'gif']);
@@ -25,6 +30,8 @@ export interface NormalizedImage {
   storageKey: StorageKey;
   mediaType: 'image/webp';
   checksumSha256: string;
+  semanticFingerprintSha256: string;
+  semanticFingerprintVersion: typeof SEMANTIC_FINGERPRINT_VERSION;
   byteSize: number;
   width: number;
   height: number;
@@ -129,12 +136,14 @@ export async function normalizeImage(input: NormalizeImageInput): Promise<Normal
   });
   const metadataPromise = decoder.metadata();
   const output = decoder.clone().rotate().webp({ quality: 90, effort: 4 });
+  const rawOutput = decoder.clone().rotate().toColourspace('srgb').ensureAlpha().raw();
   const outputInfo = new Promise<OutputInfo>((resolve, reject) => {
     output.once('info', resolve);
     output.on('error', reject);
     output.once('close', () => reject(new Error('Image output closed before completion')));
   });
   const hash = createHash('sha256');
+  const rawHash = createHash('sha256');
   let outputByteSize = 0;
   const hasher = new Transform({
     transform(chunk: unknown, _encoding, callback) {
@@ -143,6 +152,17 @@ export async function normalizeImage(input: NormalizeImageInput): Promise<Normal
       hash.update(bytes);
       callback(null, bytes);
     }
+  });
+  const rawHasher = new Writable({
+    write(chunk: unknown, _encoding, callback) {
+      rawHash.update(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array));
+      callback();
+    }
+  });
+  const rawOutputInfo = new Promise<OutputInfo>((resolve, reject) => {
+    rawOutput.once('info', resolve);
+    rawOutput.on('error', reject);
+    rawOutput.once('close', () => reject(new Error('Raw image output closed before completion')));
   });
   // `pipeline()` observes the primary error through storage.write, but removes
   // its listeners after settling. Keep a terminal listener for a secondary,
@@ -155,14 +175,18 @@ export async function normalizeImage(input: NormalizeImageInput): Promise<Normal
   });
   decoder.on('error', () => undefined);
   output.on('error', (cause: unknown) => hasher.destroy(cause as Error));
+  rawOutput.on('error', (cause: unknown) => rawHasher.destroy(cause as Error));
   replay.pipe(decoder);
   output.pipe(hasher);
+  const rawWritePromise = pipeline(rawOutput, rawHasher);
   const abort = () => {
     const cause = new IngestionError('ingestion_aborted', 'Ingestion was aborted', false);
     replay.destroy(cause);
     decoder.destroy(cause);
     output.destroy(cause);
+    rawOutput.destroy(cause);
     hasher.destroy(cause);
+    rawHasher.destroy(cause);
   };
   input.signal.addEventListener('abort', abort, { once: true });
   const writePromise = input.storage.write(input.destination, hasher, {
@@ -170,10 +194,12 @@ export async function normalizeImage(input: NormalizeImageInput): Promise<Normal
   });
 
   try {
-    const [metadata, stored, info] = await Promise.all([
+    const [metadata, stored, info, rawInfo] = await Promise.all([
       metadataPromise,
       writePromise,
-      outputInfo
+      outputInfo,
+      rawOutputInfo,
+      rawWritePromise
     ]);
     const decodedFormat = metadata.format;
     if (!decodedFormat || !allowedFormats.has(decodedFormat)) {
@@ -183,6 +209,15 @@ export async function normalizeImage(input: NormalizeImageInput): Promise<Normal
     if (!info.width || !info.height || info.width * info.height > input.limits.maxImagePixels) {
       await input.storage.delete(input.destination);
       throw new IngestionError('image_pixels', 'Image exceeds the decoded pixel limit', false);
+    }
+    if (
+      !rawInfo.width ||
+      !rawInfo.height ||
+      rawInfo.width !== info.width ||
+      rawInfo.height !== info.height
+    ) {
+      await input.storage.delete(input.destination);
+      throw new IngestionError('image_decode', 'Image dimensions were inconsistent', false);
     }
     const warnings: IngestionWarning[] = [];
     if ((metadata.pages ?? 1) > 1) {
@@ -195,6 +230,12 @@ export async function normalizeImage(input: NormalizeImageInput): Promise<Normal
       storageKey: input.destination,
       mediaType: 'image/webp',
       checksumSha256: hash.digest('hex'),
+      semanticFingerprintSha256: fingerprintDecodedImage({
+        width: rawInfo.width,
+        height: rawInfo.height,
+        pixelDigestSha256: rawHash.digest('hex')
+      }),
+      semanticFingerprintVersion: SEMANTIC_FINGERPRINT_VERSION,
       byteSize: stored.byteSize || outputByteSize,
       width: info.width,
       height: info.height,
@@ -204,8 +245,16 @@ export async function normalizeImage(input: NormalizeImageInput): Promise<Normal
     replay.destroy();
     decoder.destroy();
     output.destroy();
+    rawOutput.destroy();
     hasher.destroy();
-    await Promise.allSettled([metadataPromise, writePromise, outputInfo]);
+    rawHasher.destroy();
+    await Promise.allSettled([
+      metadataPromise,
+      writePromise,
+      outputInfo,
+      rawOutputInfo,
+      rawWritePromise
+    ]);
     if (sourceFailure instanceof IngestionError) throw sourceFailure;
     throw mapImageError(cause);
   } finally {
