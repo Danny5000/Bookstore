@@ -110,6 +110,27 @@ describe('transactional commerce email enqueue', () => {
     expect(test.enqueueOutboxMessage).not.toHaveBeenCalled();
   });
 
+  it('deduplicates a replacement claim message by a digest of its one-use action', async () => {
+    const initial = snapshot({ ownerType: 'guest' });
+    const test = harness(initial);
+    const claimUrl = `${origin}/api/auth/magic-link/verify?token=replacement-safe&callbackURL=%2Fclaim%2Fcomplete`;
+    await test.enqueuer.enqueueGuestClaimReissue(transaction, initial.orderId, claimUrl);
+    await test.enqueuer.enqueueGuestClaimReissue(transaction, initial.orderId, claimUrl);
+
+    const calls = test.enqueueOutboxMessage.mock.calls;
+    expect(calls).toHaveLength(2);
+    const key = calls[0]?.[1].deduplicationKey;
+    expect(key).toMatch(
+      new RegExp(`^commerce:claim-reissue:order:${initial.orderId}:action:[a-f0-9]{64}:v1$`, 'u')
+    );
+    expect(key).not.toContain('replacement-safe');
+    expect(calls[0]?.[1].payload).toMatchObject({
+      template: 'commerce.guest-receipt-claim',
+      messageId: initial.orderId,
+      claimUrl
+    });
+  });
+
   it('uses the internal event UUID for idempotent access-change mail', async () => {
     const test = harness();
     const eventId = randomUUID();

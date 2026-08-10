@@ -47,6 +47,17 @@ describe('commerce claim-email job', () => {
     expect(ops.requestMagicLink).not.toHaveBeenCalled();
   });
 
+  it('allows an explicit re-request job to mint a replacement after the receipt exists', async () => {
+    const record = job();
+    const ops = operations({ receiptExists: vi.fn(async () => true) });
+    await createClaimEmailHandler(ops, { allowExistingReceipt: true })(
+      record,
+      new AbortController().signal
+    );
+    expect(ops.loadEligibility).toHaveBeenCalledWith(record.payload.orderId);
+    expect(ops.requestMagicLink).toHaveBeenCalledOnce();
+  });
+
   it('requests one metadata-bound magic link for no account or a verified account', async () => {
     const record = job();
     const ops = operations();

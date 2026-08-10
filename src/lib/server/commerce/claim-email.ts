@@ -17,6 +17,7 @@ import {
 import type { CommerceMessageEnqueuer } from './email/enqueue';
 
 export const COMMERCE_CLAIM_EMAIL_JOB = 'commerce.claim-email' as const;
+export const COMMERCE_CLAIM_REQUEST_JOB = 'commerce.claim-email-request' as const;
 
 export const claimEmailJobPayloadSchema = z.strictObject({
   orderId: z.uuid()
@@ -69,7 +70,15 @@ export async function queueCommerceClaimEmail(
       .limit(1)
       .for('update');
     if (!identity || identity.email !== parsed.email) return;
-    await messages.enqueueGuestReceiptClaim(transaction, order.id, parsed.claimUrl);
+    const receiptExists = (await findOutboxMessageByDeduplicationKey(
+      transaction,
+      commerceReceiptDeduplicationKey(order.id)
+    )) !== null;
+    if (receiptExists) {
+      await messages.enqueueGuestClaimReissue(transaction, order.id, parsed.claimUrl);
+    } else {
+      await messages.enqueueGuestReceiptClaim(transaction, order.id, parsed.claimUrl);
+    }
   });
 }
 
@@ -141,13 +150,16 @@ function throwIfAborted(signal: AbortSignal): void {
   if (signal.aborted) throw new DOMException('Claim email handling was aborted.', 'AbortError');
 }
 
-export function createClaimEmailHandler(operations: ClaimEmailOperations): JobHandler {
+export function createClaimEmailHandler(
+  operations: ClaimEmailOperations,
+  options: { allowExistingReceipt?: boolean } = {}
+): JobHandler {
   return async (job, signal) => {
     const parsed = claimEmailJobPayloadSchema.safeParse(job.payload);
     if (!parsed.success) throw new PermanentJobError('Invalid commerce claim-email payload');
     const { orderId } = parsed.data;
     throwIfAborted(signal);
-    if (await operations.receiptExists(orderId)) return;
+    if ((await operations.receiptExists(orderId)) && !options.allowExistingReceipt) return;
     const eligibility = await operations.loadEligibility(orderId);
     if (!eligibility || eligibility.orderId !== orderId) {
       throw new PermanentJobError('Commerce claim-email order is not eligible');

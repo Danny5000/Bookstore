@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { asc, eq } from 'drizzle-orm';
 import { z } from 'zod';
 import {
@@ -65,6 +66,11 @@ export interface CommerceMessageEnqueuer extends PurchaseMessageEnqueuer {
   enqueueGuestReceiptWithoutClaim(
     transaction: DatabaseTransaction,
     orderId: string
+  ): Promise<void>;
+  enqueueGuestClaimReissue(
+    transaction: DatabaseTransaction,
+    orderId: string,
+    claimUrl: string
   ): Promise<void>;
   enqueueAccessChange(
     transaction: DatabaseTransaction,
@@ -167,7 +173,8 @@ export function createCommerceMessageEnqueuer(
     orderId: string,
     template: 'commerce.account-receipt' | 'commerce.guest-receipt-claim',
     expectedOwner: 'account' | 'guest',
-    claimUrl?: string
+    claimUrl?: string,
+    deduplicationKey?: string
   ): Promise<void> {
     const canonicalOrderId = idSchema.parse(orderId);
     const snapshot = await dependencies.loadReceiptSnapshot(transaction, canonicalOrderId);
@@ -176,7 +183,8 @@ export function createCommerceMessageEnqueuer(
     await dependencies.enqueueOutboxMessage(transaction, {
       topic: COMMERCE_EMAIL_TOPIC,
       payload: asJson(payload),
-      deduplicationKey: `commerce:receipt:order:${canonicalOrderId}:v1`,
+      deduplicationKey:
+        deduplicationKey ?? `commerce:receipt:order:${canonicalOrderId}:v1`,
       maxAttempts: 8
     });
   }
@@ -206,6 +214,19 @@ export function createCommerceMessageEnqueuer(
 
     enqueueGuestReceiptWithoutClaim: (transaction, orderId) =>
       enqueueReceipt(transaction, orderId, 'commerce.account-receipt', 'guest'),
+
+    enqueueGuestClaimReissue(transaction, orderId, claimUrl) {
+      const canonicalOrderId = idSchema.parse(orderId);
+      const actionDigest = createHash('sha256').update(claimUrl, 'utf8').digest('hex');
+      return enqueueReceipt(
+        transaction,
+        canonicalOrderId,
+        'commerce.guest-receipt-claim',
+        'guest',
+        claimUrl,
+        `commerce:claim-reissue:order:${canonicalOrderId}:action:${actionDigest}:v1`
+      );
+    },
 
     async enqueueAccessChange(transaction, input) {
       const eventId = idSchema.parse(input.eventId);

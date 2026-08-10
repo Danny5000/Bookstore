@@ -3,6 +3,7 @@ import { eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import {
   COMMERCE_CLAIM_EMAIL_JOB,
+  COMMERCE_CLAIM_REQUEST_JOB,
   claimEmailJobPayloadSchema,
   createClaimEmailHandler,
   createClaimEmailOperations,
@@ -125,10 +126,10 @@ function createCommerceAuth() {
   return { auth, messages };
 }
 
-function claimJob(orderId: string): JobRecord {
+function claimJob(orderId: string, type: string = COMMERCE_CLAIM_EMAIL_JOB): JobRecord {
   return {
     id: randomUUID(),
-    type: COMMERCE_CLAIM_EMAIL_JOB,
+    type,
     payload: { orderId },
     attempts: 1,
     maxAttempts: 8,
@@ -349,6 +350,31 @@ describe('commerce email persistence', () => {
 
     await handler(claimJob(fixture.orderId), new AbortController().signal);
     expect(await databaseClient.db.select().from(verification)).toHaveLength(1);
+
+    await createClaimEmailHandler(createClaimEmailOperations(
+      databaseClient.db,
+      auth,
+      messages,
+      applicationConfig.origin
+    ), { allowExistingReceipt: true })(
+      claimJob(fixture.orderId, COMMERCE_CLAIM_REQUEST_JOB),
+      new AbortController().signal
+    );
+    const replacements = (await databaseClient.db.select().from(outboxMessages))
+      .filter((row) => row.topic === 'email.commerce.v1');
+    expect(replacements).toHaveLength(2);
+    expect(replacements[1]?.deduplicationKey).toMatch(
+      new RegExp(`^commerce:claim-reissue:order:${fixture.orderId}:action:[a-f0-9]{64}:v1$`, 'u')
+    );
+    const replacementPayload = parseCommerceEmailPayload(
+      replacements[1]?.payload,
+      applicationConfig.origin
+    );
+    if (replacementPayload.template !== 'commerce.guest-receipt-claim') {
+      throw new Error('Expected replacement guest claim payload');
+    }
+    expect(replacementPayload.claimUrl).not.toBe(payload.claimUrl);
+    expect(await databaseClient.db.select().from(verification)).toHaveLength(2);
 
     const request = () => auth.handler(new Request(payload.claimUrl, {
       headers: { origin: applicationConfig.origin },

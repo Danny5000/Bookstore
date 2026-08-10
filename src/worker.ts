@@ -6,6 +6,7 @@ import { createAuthServer } from '$lib/server/auth/options';
 import { canSendMagicLink, ensureCustomerRole } from '$lib/server/auth/identity';
 import {
   COMMERCE_CLAIM_EMAIL_JOB,
+  COMMERCE_CLAIM_REQUEST_JOB,
   createClaimEmailHandler,
   createClaimEmailOperations,
   queueCommerceClaimEmail
@@ -100,6 +101,15 @@ const handlers = new Map<string, JobHandler>([
       commerceMessages,
       config.origin
     ))
+  ],
+  [
+    COMMERCE_CLAIM_REQUEST_JOB,
+    createClaimEmailHandler(createClaimEmailOperations(
+      databaseClient.db,
+      workerAuth,
+      commerceMessages,
+      config.origin
+    ), { allowExistingReceipt: true })
   ],
   [STRIPE_EVENT_JOB, stripeEventHandler],
   [
