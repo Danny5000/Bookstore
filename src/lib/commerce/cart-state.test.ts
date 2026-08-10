@@ -6,7 +6,8 @@ import {
   loadCartState,
   MAX_SERIALIZED_CART_STATE_BYTES,
   removeCartTitle,
-  resetCart
+  resetCart,
+  rotateCheckoutAttempt
 } from './cart-state';
 
 const uuid = (value: number): string =>
@@ -128,6 +129,13 @@ describe('cart state edits', () => {
       version: 1,
       titleIds: [],
       checkoutAttemptId: uuid(102)
+    });
+  });
+
+  it('rotates a terminal failed attempt without removing cart titles', () => {
+    expect(rotateCheckoutAttempt(initial, () => uuid(103))).toEqual({
+      ...initial,
+      checkoutAttemptId: uuid(103)
     });
   });
 });

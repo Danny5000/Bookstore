@@ -75,6 +75,21 @@ describe('cart store', () => {
     expect(cart.titleIds).toEqual([uuid(1)]);
   });
 
+  it('rotates a failed attempt while preserving every title', () => {
+    const storage = new MemoryStorage();
+    const attempts = [uuid(100), uuid(101)];
+    const cart = createCartStore({ storage, generateAttemptId: () => attempts.shift()! });
+    cart.add(uuid(1));
+    cart.add(uuid(2));
+
+    cart.rotateAttempt();
+    expect(cart.state).toEqual({
+      version: 1,
+      titleIds: [uuid(1), uuid(2)],
+      checkoutAttemptId: uuid(101)
+    });
+  });
+
   it('rejects a duplicate and a twenty-sixth title without mutating storage', () => {
     const storage = new MemoryStorage();
     const cart = createCartStore({ storage, generateAttemptId: () => uuid(100) });

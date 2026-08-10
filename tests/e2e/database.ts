@@ -2,8 +2,10 @@ import { Client } from 'pg';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import * as schema from '$lib/server/db/schema';
 import { setPreservedGrantState } from '$lib/server/commerce/grants';
+import type { Database } from '$lib/server/db/client';
 
-interface E2EDatabase {
+export interface E2EDatabase {
+  readonly db: Database;
   grantEntitlement(email: string, titleId: string): Promise<void>;
   revokeEntitlement(email: string, titleId: string): Promise<void>;
   close(): Promise<void>;
@@ -44,6 +46,7 @@ export async function openE2EDatabase(): Promise<E2EDatabase> {
   }
 
   return {
+    db: database,
     async grantEntitlement(email, titleId) {
       const id = await userId(email);
       await database.transaction((transaction) =>

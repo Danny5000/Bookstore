@@ -20,6 +20,8 @@
     if (terminal.status === 'paid' || terminal.status === 'paid_guest') {
       const pending = loadPendingCheckout(globalThis.sessionStorage);
       cart.completePaid(pending?.acceptedTitleIds ?? []);
+    } else {
+      cart.rotateAttempt();
     }
     clearPendingCheckout(globalThis.sessionStorage);
   }

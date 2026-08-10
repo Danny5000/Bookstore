@@ -7,6 +7,7 @@ import {
   loadCartState,
   removeCartTitle,
   resetCart,
+  rotateCheckoutAttempt,
   serializeCartState,
   type AttemptIdGenerator
 } from './cart-state';
@@ -87,6 +88,11 @@ class CartStore {
 
   completePaid(completedTitleIds: readonly string[]): void {
     this.state = completePaidCart(this.state, completedTitleIds, this.generateAttemptId);
+    this.persist();
+  }
+
+  rotateAttempt(): void {
+    this.state = rotateCheckoutAttempt(this.state, this.generateAttemptId);
     this.persist();
   }
 

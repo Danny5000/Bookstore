@@ -97,3 +97,13 @@ export function completePaidCart(
     checkoutAttemptId: generateAttemptId()
   });
 }
+
+export function rotateCheckoutAttempt(
+  state: CartStateV1,
+  generateAttemptId: AttemptIdGenerator = defaultAttemptId
+): CartStateV1 {
+  return cartStateV1Schema.parse({
+    ...state,
+    checkoutAttemptId: generateAttemptId()
+  });
+}

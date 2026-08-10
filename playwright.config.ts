@@ -1,7 +1,8 @@
 import { defineConfig, devices } from '@playwright/test';
+import { withoutStripeProviderSecrets } from './scripts/test-environment';
 
 const inheritedEnvironment = Object.fromEntries(
-  Object.entries(process.env).filter(
+  Object.entries(withoutStripeProviderSecrets(process.env)).filter(
     (entry): entry is [string, string] => entry[1] !== undefined
   )
 );
@@ -77,9 +78,9 @@ export default defineConfig({
       // covered by integration tests without allowing unrelated E2E workers to collide.
       AUTH_LOGIN_RATE_LIMIT_MAX: '20',
       AUTH_EMAIL_RATE_LIMIT_MAX: process.env.AUTH_EMAIL_RATE_LIMIT_MAX ?? '3',
-      STRIPE_ENABLED: process.env.STRIPE_ENABLED ?? 'false',
-      STRIPE_TEST_FIXTURE_MODE: process.env.STRIPE_TEST_FIXTURE_MODE ?? 'false',
-      STRIPE_LIVE_MODE: process.env.STRIPE_LIVE_MODE ?? 'false',
+      STRIPE_ENABLED: 'false',
+      STRIPE_TEST_FIXTURE_MODE: 'true',
+      STRIPE_LIVE_MODE: 'false',
       STRIPE_AUTOMATIC_TAX_ENABLED:
         process.env.STRIPE_AUTOMATIC_TAX_ENABLED ?? 'false',
       STRIPE_CHECKOUT_DURATION_SECONDS:

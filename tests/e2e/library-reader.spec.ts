@@ -243,9 +243,11 @@ test('customer library, reader state, downloads, revisions, and revocation stay 
     await customerPage.goto(`/read/${prose.titleId}`);
     await expect(customerPage.getByText(/saved position was checked against this edition/u)).toBeVisible();
     await expect(customerPage.getByText('Second.', { exact: true })).toBeAttached();
-    await customerPage.getByRole('button', { name: 'Contents' }).click();
+    const replacementContents = customerPage.getByRole('button', { name: 'Contents' });
+    await waitForHydratedHandler(replacementContents);
+    await replacementContents.click();
     await expect(customerPage.getByText('No bookmarks yet.')).toBeVisible();
-    await customerPage.getByRole('button', { name: 'Contents' }).click();
+    await replacementContents.click();
     const dismissNotice = customerPage.getByRole('button', { name: 'Dismiss' });
     await waitForHydratedHandler(dismissNotice);
     await dismissNotice.click();
@@ -262,7 +264,7 @@ test('customer library, reader state, downloads, revisions, and revocation stay 
     expect((await anonymousContext.request.get(`/read/${proseSlug}`)).status()).toBe(404);
 
     const shelfCount = await customerPage.getByRole('article').count();
-    for (const removedUrl of ['/api/checkout', '/api/stripe-webhook', '/api/deliver', '/checkout/success']) {
+    for (const removedUrl of ['/api/checkout', '/api/stripe-webhook', '/api/deliver']) {
       expect((await customerContext.request.get(removedUrl)).status()).toBe(404);
     }
     await customerPage.reload();

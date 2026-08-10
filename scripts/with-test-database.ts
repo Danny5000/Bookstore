@@ -4,6 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import { withoutStripeProviderSecrets } from './test-environment';
 
 const project = `pale-orbit-test-${process.pid}`;
 const testStoragePrefix = join(resolve(tmpdir()), 'pale-orbit-test-storage-');
@@ -113,7 +114,7 @@ try {
   const mailpitHttpPort = publishedPort('mailpit', '8025');
 
   const testEnvironment: NodeJS.ProcessEnv = {
-    ...process.env,
+    ...withoutStripeProviderSecrets(process.env),
     APP_ENV: 'test',
     APPLICATION_MODE: 'prototype',
     ORIGIN: 'http://127.0.0.1:4173',
@@ -153,7 +154,7 @@ try {
     AUTH_LOGIN_RATE_LIMIT_MAX: '5',
     AUTH_EMAIL_RATE_LIMIT_MAX: '3',
     STRIPE_ENABLED: 'false',
-    STRIPE_TEST_FIXTURE_MODE: 'false',
+    STRIPE_TEST_FIXTURE_MODE: withWorker ? 'true' : 'false',
     STRIPE_LIVE_MODE: 'false',
     STRIPE_AUTOMATIC_TAX_ENABLED: 'false',
     STRIPE_CHECKOUT_DURATION_SECONDS: '1800',
