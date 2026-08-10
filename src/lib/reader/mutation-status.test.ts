@@ -111,6 +111,53 @@ describe('reader non-progress mutation status', () => {
     expect(statuses).toEqual([{ kind: 'comic-mode', status: 'pending' }]);
   });
 
+  it('suppresses late success callbacks after the reader becomes inactive', async () => {
+    const controller = new AbortController();
+    let resolveWork!: (value: number) => void;
+    const work = new Promise<number>((resolve) => { resolveWork = resolve; });
+    const onSuccess = vi.fn();
+    const statuses: ReaderMutationStatus[] = [];
+    const running = runReaderMutation({
+      kind: 'preferences',
+      work: () => work,
+      signal: controller.signal,
+      onStatus: (status) => statuses.push(status),
+      onSuccess
+    });
+
+    controller.abort();
+    resolveWork(7);
+    await running;
+
+    expect(onSuccess).not.toHaveBeenCalled();
+    expect(statuses).toEqual([{ kind: 'preferences', status: 'pending' }]);
+  });
+
+  it('suppresses late conflict and failure callbacks after the reader becomes inactive', async () => {
+    const controller = new AbortController();
+    let rejectWork!: (cause: unknown) => void;
+    const work = new Promise<never>((_resolve, reject) => { rejectWork = reject; });
+    const onConflict = vi.fn();
+    const onFailure = vi.fn();
+    const statuses: ReaderMutationStatus[] = [];
+    const running = runReaderMutation({
+      kind: 'comic-mode',
+      work: () => work,
+      signal: controller.signal,
+      onStatus: (status) => statuses.push(status),
+      onConflict,
+      onFailure
+    });
+
+    controller.abort();
+    rejectWork(new ReaderConflictError({ comicMode: 'page', version: 2 }));
+    await running;
+
+    expect(onConflict).not.toHaveBeenCalled();
+    expect(onFailure).not.toHaveBeenCalled();
+    expect(statuses).toEqual([{ kind: 'comic-mode', status: 'pending' }]);
+  });
+
   it.each([
     ['bookmark', 'Saving bookmark', 'Bookmark saved', 'Bookmark was not saved', 'Bookmarks changed on another device'],
     ['preferences', 'Saving reader preferences', 'Reader preferences saved', 'Reader preferences were not saved', 'Reader preferences changed on another device'],

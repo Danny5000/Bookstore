@@ -1464,11 +1464,11 @@ git commit -m "test: verify customer library journeys"
 
 If Step 4 required small route/component fixes, stage those exact files in this commit and state them in the commit body; do not sweep unrelated worktree changes into it.
 
-- [ ] **Step 11: Request code review and resolve findings rigorously**
+- [x] **Step 11: Request code review and resolve findings rigorously**
 
 Use `superpowers:requesting-code-review` against the complete Plan 5 branch. Give the reviewer the approved design, this implementation plan, base commit, head commit, and verification evidence. For each finding, use `superpowers:receiving-code-review`: reproduce the issue, add or tighten a failing regression test, implement the narrow fix, rerun the affected and full gates, and request a final re-review. Do not integrate with unresolved Critical or Important findings.
 
-- [ ] **Step 12: Create the corrective commit only if review changed code**
+- [x] **Step 12: Create the corrective commit only if review changed code**
 
 Stage only the regression test and implementation/documentation files actually changed to resolve accepted findings. Inspect `git diff --cached --stat` and `git diff --cached --check`, then run:
 
@@ -1478,7 +1478,7 @@ git commit -m "fix: address plan 5 review findings"
 
 Expected: omit this commit when review required no changes; the cached diff contains no unrelated workspace file.
 
-- [ ] **Step 13: Re-run final verification from a clean worktree**
+- [x] **Step 13: Re-run final verification from a clean worktree**
 
 Use `superpowers:verification-before-completion`, then run:
 

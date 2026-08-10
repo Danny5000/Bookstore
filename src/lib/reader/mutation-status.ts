@@ -53,10 +53,12 @@ export async function runReaderMutation<Value>(
     if (options.signal?.aborted) return;
     try {
       const value = await options.work();
+      if (options.signal?.aborted) return;
       options.onSuccess?.(value);
       options.onStatus({ kind: options.kind, status: 'succeeded' });
       return;
     } catch (cause: unknown) {
+      if (options.signal?.aborted) return;
       if (cause instanceof ReaderConflictError) {
         options.onConflict?.(cause.current as Value);
         options.onStatus({ kind: options.kind, status: 'conflict' });
