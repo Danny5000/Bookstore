@@ -56,8 +56,13 @@ describe('cart store', () => {
     const cart = createCartStore({ storage, generateAttemptId: () => attempts.shift()! });
     cart.add(uuid(1));
 
-    cart.completePaid();
-    expect(cart.state).toEqual({ version: 1, titleIds: [], checkoutAttemptId: uuid(101) });
+    cart.add(uuid(2));
+    cart.completePaid([uuid(1)]);
+    expect(cart.state).toEqual({
+      version: 1,
+      titleIds: [uuid(2)],
+      checkoutAttemptId: uuid(101)
+    });
     cart.add(uuid(2));
     cart.reset();
     expect(cart.state).toEqual({ version: 1, titleIds: [], checkoutAttemptId: uuid(102) });
@@ -68,5 +73,19 @@ describe('cart store', () => {
 
     expect(cart.add(uuid(1))).toBe(true);
     expect(cart.titleIds).toEqual([uuid(1)]);
+  });
+
+  it('rejects a duplicate and a twenty-sixth title without mutating storage', () => {
+    const storage = new MemoryStorage();
+    const cart = createCartStore({ storage, generateAttemptId: () => uuid(100) });
+    for (let index = 1; index <= 25; index += 1) {
+      expect(cart.add(uuid(index))).toBe(true);
+    }
+    const atLimit = storage.values.get(CART_STORAGE_KEY);
+
+    expect(cart.add(uuid(25))).toBe(false);
+    expect(cart.add(uuid(26))).toBe(false);
+    expect(cart.size).toBe(25);
+    expect(storage.values.get(CART_STORAGE_KEY)).toBe(atLimit);
   });
 });

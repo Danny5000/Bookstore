@@ -30,7 +30,8 @@ describe('public publication loaders', () => {
     expect(listPublicCatalog).toHaveBeenCalledWith(database);
     const source = await readFile(new URL('./+page.svelte', import.meta.url), 'utf8');
     expect(source).not.toMatch(/stores\/titles|data\/catalog|prototype/iu);
-    expect(source).toContain('checkout is not yet available');
+    expect(source).not.toMatch(/checkout is not yet|not connected/iu);
+    expect(source).toContain('CartToggle');
   });
 
   it('loads the public catalog from the database query', async () => {

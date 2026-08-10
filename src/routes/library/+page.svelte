@@ -30,7 +30,7 @@
   {:else if data.entries.length === 0}
     <div class="state-card">
       <h2 class="display">Your library is empty</h2>
-      <p>Free previews remain available in the catalog; checkout is not yet available.</p>
+      <p>Add a title to your cart, or read any public preview for free.</p>
       <a class="btn ghost" href={resolve('/catalog')}>Browse public titles</a>
     </div>
   {:else}

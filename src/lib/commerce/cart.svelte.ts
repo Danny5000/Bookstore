@@ -85,8 +85,8 @@ class CartStore {
     return true;
   }
 
-  completePaid(): void {
-    this.state = completePaidCart(this.state, this.generateAttemptId);
+  completePaid(completedTitleIds: readonly string[]): void {
+    this.state = completePaidCart(this.state, completedTitleIds, this.generateAttemptId);
     this.persist();
   }
 

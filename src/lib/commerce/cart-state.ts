@@ -81,8 +81,19 @@ export function clearCart(state: CartStateV1): CartStateV1 {
 }
 
 export function completePaidCart(
-  _state: CartStateV1,
+  state: CartStateV1,
+  completedTitleIds: readonly string[],
   generateAttemptId: AttemptIdGenerator = defaultAttemptId
 ): CartStateV1 {
-  return resetCart(generateAttemptId);
+  const completed = new Set<string>();
+  for (const titleId of completedTitleIds) {
+    const parsed = cartTitleIdSchema.safeParse(titleId);
+    if (!parsed.success || completed.has(parsed.data)) throw new CartStateError();
+    completed.add(parsed.data);
+  }
+  return cartStateV1Schema.parse({
+    version: 1,
+    titleIds: state.titleIds.filter((titleId) => !completed.has(titleId)),
+    checkoutAttemptId: generateAttemptId()
+  });
 }

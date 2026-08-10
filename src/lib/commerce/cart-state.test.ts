@@ -119,9 +119,9 @@ describe('cart state edits', () => {
   });
 
   it('rotates the attempt only for paid cleanup or explicit reset', () => {
-    expect(completePaidCart(initial, () => uuid(101))).toEqual({
+    expect(completePaidCart(initial, [uuid(1)], () => uuid(101))).toEqual({
       version: 1,
-      titleIds: [],
+      titleIds: [uuid(2)],
       checkoutAttemptId: uuid(101)
     });
     expect(resetCart(() => uuid(102))).toEqual({

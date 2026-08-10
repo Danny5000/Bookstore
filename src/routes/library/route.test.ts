@@ -100,14 +100,13 @@ describe('customer library route', () => {
       props: { data: { user: null, signedIn: true, entries: [] } }
     });
     expect(body).toContain('Your library is empty');
-    expect(body).toContain('checkout is not yet available');
+    expect(body).toContain('Add a title to your cart');
   });
 
-  it('has no fake checkout, webhook, delivery, or success route on disk', async () => {
+  it('has no retired fake checkout, webhook, or delivery API on disk', async () => {
     const paths = ['checkout', 'stripe-webhook', 'deliver'].map(
       (route) => `../api/${route}/+server.ts`
     );
-    paths.push(`../${'checkout'}/success/+page.svelte`);
     for (const path of paths) {
       await expect(access(new URL(path, import.meta.url))).rejects.toMatchObject({ code: 'ENOENT' });
     }

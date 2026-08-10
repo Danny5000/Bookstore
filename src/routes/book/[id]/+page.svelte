@@ -1,5 +1,6 @@
 <script lang="ts">
   import { resolve } from '$app/paths';
+  import CartToggle from '$lib/components/CartToggle.svelte';
   import CoverArt from '$lib/components/CoverArt.svelte';
   import type { PageData } from './$types';
 
@@ -25,11 +26,11 @@
     </div>
 
     <div class="buttons" id="purchase">
-      <button class="btn" type="button" disabled title="Checkout is not connected yet">
-        Buy · {price}
-      </button>
+      <div class="purchase-row">
+        <span class="price">{price}</span>
+        <CartToggle titleId={title.id} titleLabel={title.title} />
+      </div>
       <a class="btn ghost" href={resolve('/read/[id]', { id: title.slug })}>Read the free preview</a>
-      <p class="purchase-note">Purchasing opens after checkout is connected.</p>
     </div>
 
     <dl>
@@ -64,8 +65,8 @@
   .detail { display: grid; grid-template-columns: 0.9fr 1.1fr; gap: 64px; max-width: 1240px; margin: 0 auto; padding: 60px 48px 110px; }
   .buttons { display: grid; gap: 10px; margin-top: 26px; }
   .buttons .btn { text-align: center; }
-  .buttons .btn:disabled { cursor: not-allowed; opacity: 0.58; }
-  .purchase-note { margin: 0; color: var(--muted); font-size: 12px; text-align: center; }
+  .purchase-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 10px 0; }
+  .price { font-family: var(--font-mono); color: var(--ink); }
   .art { display: flex; align-items: center; justify-content: center; min-height: 430px; }
   dl { display: grid; gap: 8px; margin: 22px 0 0; font-family: var(--font-mono); font-size: 11px; color: var(--muted); }
   dl > div { display: flex; justify-content: space-between; }

@@ -3,6 +3,7 @@
   import { invalidateAll } from '$app/navigation';
   import { resolve } from '$app/paths';
   import { authClient } from '$lib/auth/client';
+  import { cart } from '$lib/commerce/cart.svelte';
   import { theme, THEMES } from '$lib/stores/theme.svelte';
   import type { SessionUser } from '$lib/types/auth';
 
@@ -50,6 +51,17 @@
   </nav>
 
   <div class="spacer"></div>
+
+  <a
+    class="cart-link"
+    href={resolve('/cart')}
+    aria-label={`Cart, ${cart.size} items`}
+    class:active={$page.url.pathname.startsWith('/cart')}
+  >
+    <span>Cart</span>
+    <span class="cart-count" aria-hidden="true">{cart.size}</span>
+  </a>
+  <span class="sr-only" aria-live="polite" aria-atomic="true">Cart contains {cart.size} items</span>
 
   <div class="themes">
     {#each THEMES as t (t.id)}
@@ -141,6 +153,51 @@
     padding: 4px;
     border: 1px solid var(--line);
     border-radius: 999px;
+  }
+
+  .cart-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--muted);
+    font-size: 13px;
+    white-space: nowrap;
+  }
+
+  .cart-link:hover,
+  .cart-link.active {
+    color: var(--ink);
+  }
+
+  .cart-link:focus-visible {
+    outline: 3px solid color-mix(in oklab, var(--accent) 65%, white);
+    outline-offset: 4px;
+    border-radius: 4px;
+  }
+
+  .cart-count {
+    display: inline-grid;
+    place-items: center;
+    min-width: 24px;
+    height: 24px;
+    padding: 0 6px;
+    border-radius: 999px;
+    background: var(--accent);
+    color: var(--bg);
+    font-family: var(--font-mono);
+    font-size: 11px;
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
   }
 
   .chip {
