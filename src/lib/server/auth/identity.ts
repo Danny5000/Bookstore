@@ -55,7 +55,7 @@ export async function actorForUser(
 }
 
 export async function findOrCreateGuestIdentity(
-  database: Database,
+  database: DatabaseExecutor,
   email: string
 ): Promise<GuestIdentityRow> {
   const normalizedEmail = normalizeEmailAddress(email);
