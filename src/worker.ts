@@ -24,6 +24,7 @@ import {
 } from '$lib/server/commerce/handler';
 import { STRIPE_EVENT_JOB } from '$lib/server/commerce/job';
 import { RetryableProviderError } from '$lib/server/commerce/errors';
+import { fulfillRefundEvent } from '$lib/server/commerce/refunds';
 import { createStripeCommerceRuntime } from '$lib/server/commerce/stripe/runtime-core';
 import { createDatabaseClient } from '$lib/server/db/client';
 import { probeDatabase } from '$lib/server/db/health';
@@ -86,7 +87,9 @@ const stripeEventHandler: JobHandler = createStripeEventHandler(
     fulfillCheckout: (database, input) => fulfillCheckoutEvent(database, input, {
       purchaseMessages: commerceMessages
     }),
-    fulfillRefund: async () => { throw new RetryableProviderError(); },
+    fulfillRefund: (database, input) => fulfillRefundEvent(database, input, {
+      messages: commerceMessages
+    }),
     fulfillDispute: async () => { throw new RetryableProviderError(); },
     recordException: (database, input) => recordFulfillmentException(database, input)
   }

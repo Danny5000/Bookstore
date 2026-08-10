@@ -61,12 +61,13 @@ function harness(row = event()) {
   const load = deferred<StripeEventRow | null>();
   const checkout = deferred<ReturnType<typeof checkoutSnapshotFixture>>();
   const payment = deferred<ReturnType<typeof paymentSnapshotFixture>>();
+  const refund = deferred<ReturnType<typeof refundSnapshotFixture>>();
   const mutation = deferred<void>();
   const gateway = {
     createCheckoutSession: vi.fn(),
     retrieveCheckoutSession: vi.fn(() => checkout.promise),
     retrievePayment: vi.fn(() => payment.promise),
-    retrieveRefund: vi.fn(),
+    retrieveRefund: vi.fn(() => refund.promise),
     retrieveDispute: vi.fn(),
     verifyWebhook: vi.fn()
   };
@@ -78,7 +79,7 @@ function harness(row = event()) {
     recordException: vi.fn()
   };
   const handler = createStripeEventHandler({} as never, gateway, dependencies);
-  return { row, load, checkout, payment, mutation, gateway, dependencies, handler };
+  return { row, load, checkout, payment, refund, mutation, gateway, dependencies, handler };
 }
 
 describe('Stripe event handler provider ordering', () => {
@@ -155,13 +156,15 @@ describe('Stripe event handler provider ordering', () => {
     const refund = harness(refundRow);
     const refundSnapshot = refundSnapshotFixture();
     refund.gateway.retrieveRefund.mockResolvedValueOnce(refundSnapshot);
+    const refundPayment = paymentSnapshotFixture();
+    refund.gateway.retrievePayment.mockResolvedValueOnce(refundPayment);
     refund.dependencies.fulfillRefund.mockResolvedValueOnce(undefined);
     const refundRun = refund.handler(job(refundRow.id), new AbortController().signal);
     refund.load.resolve(refundRow);
     await expect(refundRun).resolves.toBeUndefined();
     expect(refund.dependencies.fulfillRefund).toHaveBeenCalledWith(
       expect.anything(),
-      { stripeEventId: refundRow.id, refund: refundSnapshot }
+      { stripeEventId: refundRow.id, refund: refundSnapshot, payment: refundPayment }
     );
 
     const disputeRow = event({
@@ -179,6 +182,38 @@ describe('Stripe event handler provider ordering', () => {
       expect.anything(),
       { stripeEventId: disputeRow.id, dispute: disputeSnapshot }
     );
+  });
+
+  it('retrieves a refund and its linked payment before starting local mutation', async () => {
+    const row = event({
+      eventType: 'refund.updated',
+      objectId: 're_test_fixture_101'
+    });
+    const test = harness(row);
+    test.dependencies.fulfillRefund.mockResolvedValueOnce(undefined);
+    const running = test.handler(job(row.id), new AbortController().signal);
+    test.load.resolve(row);
+    await settle();
+    expect(test.gateway.retrieveRefund).toHaveBeenCalledWith(row.objectId);
+    expect(test.gateway.retrievePayment).not.toHaveBeenCalled();
+    expect(test.dependencies.fulfillRefund).not.toHaveBeenCalled();
+
+    const canonicalRefund = refundSnapshotFixture();
+    test.refund.resolve(canonicalRefund);
+    await settle();
+    expect(test.gateway.retrievePayment).toHaveBeenCalledWith(
+      canonicalRefund.paymentIntentId
+    );
+    expect(test.dependencies.fulfillRefund).not.toHaveBeenCalled();
+
+    const canonicalPayment = paymentSnapshotFixture();
+    test.payment.resolve(canonicalPayment);
+    await expect(running).resolves.toBeUndefined();
+    expect(test.dependencies.fulfillRefund).toHaveBeenCalledWith(expect.anything(), {
+      stripeEventId: row.id,
+      refund: canonicalRefund,
+      payment: canonicalPayment
+    });
   });
 
   it('rejects malformed or missing job state permanently without provider work', async () => {

@@ -24,6 +24,7 @@ export interface CheckoutFulfillmentInput {
 export interface RefundFulfillmentInput {
   stripeEventId: string;
   refund: RefundSnapshot;
+  payment: PaymentSnapshot;
 }
 
 export interface DisputeFulfillmentInput {
@@ -112,7 +113,9 @@ export function createStripeEventHandler(
       if (descriptor.objectFamily === 'refund') {
         const refund = await gateway.retrieveRefund(row.objectId);
         throwIfAborted(signal);
-        await dependencies.fulfillRefund(database, { stripeEventId, refund });
+        const payment = await gateway.retrievePayment(refund.paymentIntentId);
+        throwIfAborted(signal);
+        await dependencies.fulfillRefund(database, { stripeEventId, refund, payment });
         return;
       }
       const dispute = await gateway.retrieveDispute(row.objectId);
