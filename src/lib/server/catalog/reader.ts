@@ -17,6 +17,7 @@ import {
   type PublicationAccessDecision,
   type PublicationAccessRoot
 } from '$lib/server/library/access';
+import type { ReaderInitialStateDto } from '$lib/types/library';
 import type {
   CatalogTitleDetail,
   CatalogTitleSummary,
@@ -300,6 +301,24 @@ export async function getReaderDocumentForAccess(
 ): Promise<ReaderDocument | null> {
   if (decision.level === 'denied' || decision.level === 'unavailable') return null;
   return readerDocument(database, decision.root, decision.level);
+}
+
+export async function getEntitledInitialReader(
+  database: Database,
+  decision: Extract<PublicationAccessDecision, { level: 'entitled' }>
+): Promise<{ document: ReaderDocument; initialState: ReaderInitialStateDto }> {
+  const document = await readerDocument(database, decision.root, 'entitled');
+  if (!document) throw new CatalogDomainError('presentation_not_found');
+  return {
+    document,
+    initialState: {
+      progress: null,
+      bookmarks: [],
+      preferences: { fontSize: 18, typeface: 'serif', paper: 'white', version: 0 },
+      titlePreferences: null,
+      migrationNotice: null
+    }
+  };
 }
 
 export async function getAdminRevisionReader(

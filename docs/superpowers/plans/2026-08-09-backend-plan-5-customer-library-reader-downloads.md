@@ -620,7 +620,7 @@ git commit -m "feat: resolve effective publication access"
 - Modify: `src/lib/server/catalog/reader.ts`
 - Modify: `tests/integration/library-access.test.ts`
 
-- [ ] **Step 1: Write failing library-query tests**
+- [x] **Step 1: Write failing library-query tests**
 
 Test deterministic title ordering and safe DTOs for:
 
@@ -632,7 +632,7 @@ Test deterministic title ordering and safe DTOs for:
 
 Use explicit directly seeded entitlement rows only inside test setup. Do not create an application grant helper.
 
-- [ ] **Step 2: Prove the tests fail**
+- [x] **Step 2: Prove the tests fail**
 
 Run:
 
@@ -643,7 +643,7 @@ npm run test:integration -- tests/integration/library-access.test.ts
 
 Expected: FAIL because `listCustomerLibrary` is absent.
 
-- [ ] **Step 3: Implement the shelf query and progress summary**
+- [x] **Step 3: Implement the shelf query and progress summary**
 
 Expose:
 
@@ -656,11 +656,11 @@ export async function listCustomerLibrary(
 
 Use one bounded relational query (or a constant number of queries), not one query per title. Build application-owned URLs from stable title IDs. Compute prose completion from semantic block order and offset, and comic completion from page/panel position; this percentage is display-only and is never used for migration or authorization. Treat a missing/unpublished active presentation as unavailable.
 
-- [ ] **Step 4: Add an entitled initial-reader query contract**
+- [x] **Step 4: Add an entitled initial-reader query contract**
 
 Add a server function that receives the already-resolved entitled root and returns the complete `ReaderDocument` plus a placeholder-free initial-state envelope whose reader-state fields are populated in Tasks 8–9. Keep the public preview function unchanged so callers cannot accidentally request `access: 'entitled'` without an entitlement decision.
 
-- [ ] **Step 5: Run focused tests and query-count assertions**
+- [x] **Step 5: Run focused tests and query-count assertions**
 
 Run:
 
@@ -671,7 +671,7 @@ npm run test:integration -- tests/integration/library-access.test.ts
 
 Expected: all cases pass; the test with multiple titles confirms query count does not grow per shelf entry.
 
-- [ ] **Step 6: Commit library queries**
+- [x] **Step 6: Commit library queries**
 
 ```powershell
 git add src/lib/server/library/query.ts src/lib/server/library/query.test.ts src/lib/server/catalog/reader.ts src/lib/server/catalog/reader.test.ts tests/integration/library-access.test.ts

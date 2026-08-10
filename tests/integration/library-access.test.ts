@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { asc, eq } from 'drizzle-orm';
+import { and, asc, eq, sql } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import type { Actor } from '$lib/server/auth/admin-policy';
 import { getReaderDocumentForAccess } from '$lib/server/catalog/reader';
@@ -7,12 +7,14 @@ import {
   entitlements,
   proseBlocks,
   proseSections,
+  readerProgress,
   revisionPresentations,
   titleRevisions,
   titles,
   user
 } from '$lib/server/db/schema';
 import { resolvePublicationAccess } from '$lib/server/library/access';
+import { listCustomerLibrary } from '$lib/server/library/query';
 import { databaseClient } from './database';
 
 const anonymous = { type: 'anonymous' } satisfies Actor;
@@ -29,12 +31,15 @@ async function createCustomer(): Promise<Extract<Actor, { type: 'user' }>> {
   return { type: 'user', id, roles: ['customer'] };
 }
 
-async function createPublishedProse(visibility: 'public' | 'private' | 'archived') {
+async function createPublishedProse(
+  visibility: 'public' | 'private' | 'archived',
+  titleLabel = 'Access Title'
+) {
   const [title] = await databaseClient.db
     .insert(titles)
     .values({
       slug: `access-${randomUUID()}`,
-      title: 'Access Title',
+      title: titleLabel,
       description: 'Access policy fixture',
       creatorName: 'Pale Orbit',
       format: 'prose',
@@ -50,7 +55,12 @@ async function createPublishedProse(visibility: 'public' | 'private' | 'archived
       titleId: title.id,
       state: 'active',
       createdByActorId: admin.id,
-      changeSummary: 'Access fixture'
+      changeSummary: 'Access fixture',
+      originalStorageKey: `originals/${randomUUID()}`,
+      originalChecksumSha256: 'a'.repeat(64),
+      originalMimeType: 'application/epub+zip',
+      originalByteSize: 1_024,
+      originalFilename: `${titleLabel.toLowerCase().replaceAll(' ', '-')}.epub`
     })
     .returning();
   if (!revision) throw new Error('Expected revision');
@@ -154,7 +164,7 @@ describe('effective publication access', () => {
 
     await databaseClient.db
       .update(entitlements)
-      .set({ revokedAt: new Date(), updatedAt: new Date() })
+      .set({ revokedAt: sql`clock_timestamp()`, updatedAt: sql`clock_timestamp()` })
       .where(eq(entitlements.userId, customer.id));
     await expect(
       resolvePublicationAccess({
@@ -228,5 +238,125 @@ describe('effective publication access', () => {
       .where(eq(proseBlocks.revisionId, entitledPublication.revision.id))
       .orderBy(asc(proseBlocks.ordinal));
     expect(persistedBlocks).toHaveLength(3);
+  });
+
+  it('returns a safe deterministic shelf with current progress and unavailable titles', async () => {
+    const customer = await createCustomer();
+    const alpha = await createPublishedProse('public', 'Alpha Public');
+    const beta = await createPublishedProse('private', 'Beta Private');
+    const gamma = await createPublishedProse('archived', 'Gamma Archived');
+    const revoked = await createPublishedProse('public', 'Revoked Title');
+    const [unavailable] = await databaseClient.db
+      .insert(titles)
+      .values({
+        slug: `unavailable-shelf-${randomUUID()}`,
+        title: 'Zeta Unavailable',
+        description: 'No current edition',
+        creatorName: 'Pale Orbit',
+        format: 'prose',
+        priceMinor: 0,
+        currency: 'USD',
+        visibility: 'archived'
+      })
+      .returning();
+    if (!unavailable) throw new Error('Expected unavailable title');
+
+    for (const titleId of [
+      alpha.title.id,
+      beta.title.id,
+      gamma.title.id,
+      revoked.title.id,
+      unavailable.id
+    ]) await grant(customer.id, titleId);
+    await databaseClient.db
+      .update(entitlements)
+      .set({ revokedAt: sql`clock_timestamp()`, updatedAt: sql`clock_timestamp()` })
+      .where(
+        and(
+          eq(entitlements.userId, customer.id),
+          eq(entitlements.titleId, revoked.title.id)
+        )
+      );
+    await databaseClient.db.insert(readerProgress).values({
+      userId: customer.id,
+      titleId: alpha.title.id,
+      revisionId: alpha.revision.id,
+      format: 'prose',
+      blockId: alpha.blocks[1]!.id,
+      proseOffset: 3
+    });
+    const [historicalRevision] = await databaseClient.db
+      .insert(titleRevisions)
+      .values({
+        titleId: beta.title.id,
+        state: 'retired',
+        createdByActorId: admin.id,
+        changeSummary: 'Historical progress fixture'
+      })
+      .returning();
+    if (!historicalRevision) throw new Error('Expected historical revision');
+    const [historicalSection] = await databaseClient.db
+      .insert(proseSections)
+      .values({
+        revisionId: historicalRevision.id,
+        ordinal: 0,
+        label: 'Historical chapter',
+        sourceReference: 'EPUB/historical.xhtml'
+      })
+      .returning();
+    if (!historicalSection) throw new Error('Expected historical section');
+    const [historicalBlock] = await databaseClient.db
+      .insert(proseBlocks)
+      .values({
+        revisionId: historicalRevision.id,
+        sectionId: historicalSection.id,
+        ordinal: 0,
+        kind: 'paragraph',
+        content: {
+          kind: 'paragraph',
+          fragments: [{ text: 'Old position', marks: [] }]
+        },
+        imageId: null
+      })
+      .returning();
+    if (!historicalBlock) throw new Error('Expected historical block');
+    await databaseClient.db.insert(readerProgress).values({
+      userId: customer.id,
+      titleId: beta.title.id,
+      revisionId: historicalRevision.id,
+      format: 'prose',
+      blockId: historicalBlock.id,
+      proseOffset: 4
+    });
+
+    const shelf = await listCustomerLibrary(databaseClient.db, customer.id);
+    expect(shelf.map((entry) => entry.title)).toEqual([
+      'Alpha Public',
+      'Beta Private',
+      'Gamma Archived',
+      'Zeta Unavailable'
+    ]);
+    expect(shelf[0]).toMatchObject({
+      availability: 'available',
+      activeRevisionId: alpha.revision.id,
+      downloadFormat: 'epub',
+      progressPercent: 47.62,
+      readUrl: `/read/${alpha.title.id}`,
+      downloadUrl: `/library/${alpha.title.id}/download`
+    });
+    expect(shelf[1]?.progressPercent).toBeNull();
+    expect(shelf[2]?.availability).toBe('available');
+    expect(shelf[3]).toMatchObject({
+      availability: 'temporarily_unavailable',
+      activeRevisionId: null,
+      downloadFormat: null,
+      progressPercent: null,
+      readUrl: null,
+      resumeUrl: null,
+      downloadUrl: null
+    });
+    expect(JSON.stringify(shelf)).not.toMatch(
+      /userId|entitlementId|storageKey|originalFilename|presentationId|candidate|retired/iu
+    );
   });
 });

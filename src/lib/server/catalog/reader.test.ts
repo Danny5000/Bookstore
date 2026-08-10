@@ -4,6 +4,7 @@ import type { Actor } from '$lib/server/auth/admin-policy';
 import type { Database } from '$lib/server/db/client';
 import {
   getAdminRevisionReader,
+  getEntitledInitialReader,
   getReaderDocumentForAccess,
   getPublicPreview,
   getPublicTitleDetail,
@@ -321,5 +322,24 @@ describe('publication reader queries', () => {
     expect(document?.format === 'prose' ? document.sections : []).toHaveLength(2);
     expect(document?.format === 'prose' ? document.images : []).toHaveLength(2);
     expect(JSON.stringify(document)).not.toMatch(/storage|sourcePath|uploadFilename/iu);
+
+    const payload = await getEntitledInitialReader(
+      databaseReturning(sections, blocks, images),
+      {
+        level: 'entitled',
+        titleId,
+        revisionId,
+        presentationId,
+        root: publicRoot
+      }
+    );
+    expect(payload.document.access).toBe('entitled');
+    expect(payload.initialState).toEqual({
+      progress: null,
+      bookmarks: [],
+      preferences: { fontSize: 18, typeface: 'serif', paper: 'white', version: 0 },
+      titlePreferences: null,
+      migrationNotice: null
+    });
   });
 });
