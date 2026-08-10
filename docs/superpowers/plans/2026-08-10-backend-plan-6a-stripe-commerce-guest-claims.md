@@ -818,17 +818,17 @@ git commit -m "feat: add authoritative commerce quotes"
 - Create: `src/lib/server/commerce/stripe/runtime.ts`, `runtime.test.ts`
 - Create: `tests/fixtures/stripe/checkout.ts`, `payment.ts`, `refund.ts`, `dispute.ts`, `events.ts`
 
-- [ ] **Step 1: Write failing provider-contract validation tests**
+- [x] **Step 1: Write failing provider-contract validation tests**
 
 Use the exact neutral interfaces above. Test complete paginated line-item mapping and rejection of more than 25 lines, duplicate/missing order-item metadata, quantity other than one, floats/unsafe money, unknown currency/status, missing IDs, mismatched page cursors, unsupported API version, and prohibited detail leakage.
 
 Run `npx vitest run src/lib/server/commerce/stripe`. Expected: FAIL.
 
-- [ ] **Step 2: Implement pure canonical schemas and mapping**
+- [x] **Step 2: Implement pure canonical schemas and mapping**
 
 Zod-validate every normalized result. Normalize PaymentIntent processing/requires-action states to pending and canceled/terminal payment failure to failed. Normalize Stripe Refund `requires_action` to pending (never allocatable), and only exact succeeded to succeeded. Normalize every nonfinal Dispute status to open and only exact won/lost to terminal values. Safe payment-method category is an allowlisted bounded category such as `card`, `link`, `cashapp`, `amazon_pay`, or `other`; do not map brand, last four, wallet details, or fingerprints. Refund/dispute reasons map to a safe allowlist or `other`/null. Run pure tests. Expected: PASS.
 
-- [ ] **Step 3: Write failing SDK gateway tests against a mocked Stripe client**
+- [x] **Step 3: Write failing SDK gateway tests against a mocked Stripe client**
 
 Assert the SDK is constructed with:
 
@@ -846,13 +846,13 @@ Also test pagination/retrieval and error mapping: network/rate limit/`5xx` are r
 
 Run focused SDK tests. Expected: FAIL.
 
-- [ ] **Step 4: Implement the sole Stripe SDK adapter**
+- [x] **Step 4: Implement the sole Stripe SDK adapter**
 
 Only `sdk-gateway.ts` imports `stripe`. Inject the SDK client or factory in tests. Do not use `any`, unchecked casts, or provider objects outside this file. Compare webhook event API version to `STRIPE_API_VERSION` when supplied. Hash raw body bytes before allowing event minimization.
 
 Run focused tests. Expected: PASS.
 
-- [ ] **Step 5: Implement fail-closed runtime selection**
+- [x] **Step 5: Implement fail-closed runtime selection**
 
 Runtime rules are exact:
 
@@ -865,7 +865,7 @@ The fixture adapter is a dependency injection seam, not an HTTP “mark paid” 
 
 Run `npx vitest run src/lib/server/commerce/stripe`. Expected: PASS.
 
-- [ ] **Step 6: Verify and commit Task 5**
+- [x] **Step 6: Verify and commit Task 5**
 
 Run:
 
