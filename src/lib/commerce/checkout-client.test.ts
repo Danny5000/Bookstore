@@ -128,6 +128,13 @@ describe('commerce browser client', () => {
     await expect(createCheckout(unavailable, {
       titleIds: [uuid(1)], quoteFingerprint: quote.fingerprint, checkoutAttemptId: uuid(100)
     })).rejects.toEqual(expect.objectContaining({ kind: 'checkout_unavailable' }));
+
+    const usedAttempt = vi.fn(async () => jsonResponse({
+      code: 'CHECKOUT_ATTEMPT_CONFLICT'
+    }, 409));
+    await expect(createCheckout(usedAttempt, {
+      titleIds: [uuid(1)], quoteFingerprint: quote.fingerprint, checkoutAttemptId: uuid(100)
+    })).rejects.toEqual(expect.objectContaining({ kind: 'attempt_conflict' }));
   });
 
   it.each([

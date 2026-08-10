@@ -5,6 +5,7 @@ import { auditEvents, orders, payments, stripeEvents, titles } from '$lib/server
 import { validEpubFixture } from '../fixtures/publications';
 import { registerAndVerifyCustomer } from './customer-session';
 import { createCommerceHarness } from './commerce-harness';
+import { assertCommercePrivacy } from './commerce-privacy';
 import { openE2EDatabase } from './database';
 import { publishCommerceProse } from './commerce-publication';
 import {
@@ -15,14 +16,6 @@ import {
 } from './publication-admin';
 
 test.describe.configure({ mode: 'serial' });
-
-function expectNoForbiddenCommerceFields(value: unknown): void {
-  const serialized = JSON.stringify(value);
-  expect(serialized).not.toMatch(
-    /"(?:secret|signature|stripeSignature|rawBody|rawEvent|billingAddress|shippingAddress|cardNumber|cardLast4|cardBrand)"\s*:/iu
-  );
-  expect(serialized).not.toMatch(/sk_(?:test|live)_|whsec_|4242/iu);
-}
 
 test('signed-in multi-title checkout keeps quotes, fulfillment, and access server-owned', async ({
   browser
@@ -163,14 +156,14 @@ test('signed-in multi-title checkout keeps quotes, fulfillment, and access serve
       `/api/commerce/orders/${orderId}/status`
     );
     expect(unauthorizedStatus.status()).toBe(404);
-    expectNoForbiddenCommerceFields(await unauthorizedStatus.json());
+    assertCommercePrivacy('account response', await unauthorizedStatus.json());
 
     const invalidWebhook = await customerContext.request.post('/api/webhooks/stripe', {
       headers: { 'stripe-signature': 'invalid-fixture-signature' },
       data: { id: `evt_test_${randomUUID().replaceAll('-', '')}` }
     });
     expect(invalidWebhook.status()).toBe(400);
-    expectNoForbiddenCommerceFields(await invalidWebhook.json());
+    assertCommercePrivacy('account response', await invalidWebhook.json());
 
     const oversizedCart = await customerContext.request.post('/api/commerce/quote', {
       headers: { origin: baseURL },
@@ -241,9 +234,18 @@ test('signed-in multi-title checkout keeps quotes, fulfillment, and access serve
       .from(auditEvents)
       .where(eq(auditEvents.resourceId, orderId));
     expect(orderAudits.length).toBeGreaterThan(0);
-    expectNoForbiddenCommerceFields({ persistedEvents, persistedPayment, orderAudits });
-    expect(browserLogs.join('\n')).not.toContain(customerEmail);
-    expectNoForbiddenCommerceFields(browserLogs);
+    assertCommercePrivacy(
+      'account database',
+      { persistedEvents, persistedPayment, orderAudits }
+    );
+    assertCommercePrivacy(
+      'account browser',
+      [
+        await customerPage.locator('body').innerText(),
+        await anonymousPage.locator('body').innerText()
+      ]
+    );
+    assertCommercePrivacy('account console', browserLogs, [customerEmail]);
   } finally {
     await database.close();
     await anonymousContext.close();

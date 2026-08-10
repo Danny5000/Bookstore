@@ -116,6 +116,8 @@ docker compose --file compose.prod.yaml --file compose.stripe.yaml config --quie
 docker compose --file compose.prod.yaml --file compose.stripe.yaml up --detach --wait
 ```
 
+`docker compose config` verifies the merged structure, but it does not verify that environment-backed secret values are present. Check that both Stripe variables are non-empty without printing them before any container-creation command.
+
 `compose.stripe.yaml` mounts the two environment-backed secrets only into app and worker. It does not alter `APPLICATION_MODE=maintenance`, live mode, or the existing database/auth/SMTP secret mounts, and it is not a storefront launch switch.
 
 Caddy's internal port 2015 health endpoint is container-only and avoids coupling container health to the configured public hostname or TLS redirect behavior.

@@ -1,4 +1,4 @@
-import { createHash, randomBytes as nodeRandomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes as nodeRandomBytes, timingSafeEqual } from 'node:crypto';
 import type { Cookies } from '@sveltejs/kit';
 import type { ApplicationConfig } from '$lib/server/config/schema';
 
@@ -46,6 +46,25 @@ export function createOrderStatusCredential(
   const random = randomSource(32);
   if (random.byteLength !== 32) throw new TypeError('Status token source must return 32 bytes');
   const bytes = Buffer.from(random);
+  return {
+    token: bytes.toString('base64url'),
+    digestSha256: digestBytes(bytes).toString('hex')
+  };
+}
+
+export function deriveOrderStatusCredential(
+  applicationSecret: string,
+  checkoutAttemptId: string
+): OrderStatusCredential {
+  requireOrderId(checkoutAttemptId);
+  if (Buffer.byteLength(applicationSecret, 'utf8') < 32) {
+    throw new TypeError('Application secret must contain at least 32 bytes');
+  }
+  // Stable per attempt: concurrent retry responses can arrive in either order
+  // without one response overwriting the browser with an obsolete credential.
+  const bytes = createHmac('sha256', applicationSecret)
+    .update(`pale-orbit:commerce:order-status:v1:${checkoutAttemptId}`, 'utf8')
+    .digest();
   return {
     token: bytes.toString('base64url'),
     digestSha256: digestBytes(bytes).toString('hex')

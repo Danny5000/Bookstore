@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { isSupportedCommerceCurrency } from '$lib/commerce/money';
 import { parsePanelRegion, parsePresentationInput } from './content';
 
 const optionalTrimmedText = z
@@ -16,7 +17,12 @@ const titleMetadataShape = {
   description: z.string().trim().min(1).max(20_000),
   creatorName: z.string().trim().min(1).max(300),
   priceMinor: z.number().int().nonnegative().max(2_147_483_647),
-  currency: z.string().trim().toUpperCase().regex(/^[A-Z]{3}$/)
+  currency: z
+    .string()
+    .trim()
+    .toUpperCase()
+    .regex(/^[A-Z]{3}$/)
+    .refine(isSupportedCommerceCurrency, 'Unsupported commerce currency')
 } as const;
 
 const createTitleInputSchema = z.strictObject({

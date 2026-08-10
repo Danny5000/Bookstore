@@ -139,14 +139,18 @@ async function createPurchase(
   return { orderId, paymentId: payment.id, paymentIntentId, userId, email, items };
 }
 
-async function createDisputeEvent(providerDisputeId: string, sequence: number) {
+async function createDisputeEvent(
+  providerDisputeId: string,
+  sequence: number,
+  providerCreatedAt = new Date(`2026-08-10T14:0${sequence}:00.000Z`)
+) {
   const [event] = await databaseClient.db.insert(stripeEvents).values({
     providerEventId: `evt_dispute_${sequence}_${randomUUID()}`,
     eventType: 'charge.dispute.updated',
     objectId: providerDisputeId,
     liveMode: false,
     apiVersion: '2026-07-29.dahlia',
-    providerCreatedAt: new Date(`2026-08-10T14:0${sequence}:00.000Z`),
+    providerCreatedAt,
     rawBodySha256: (sequence + 10).toString(16).padStart(64, '0')
   }).returning();
   if (!event) throw new Error('Expected event');
@@ -157,7 +161,7 @@ function command(
   fixture: Fixture,
   event: { id: string; objectId: string },
   state: 'open' | 'won' | 'lost',
-  sequence: number
+  _sequence: number
 ) {
   return {
     stripeEventId: event.id,
@@ -170,8 +174,7 @@ function command(
       amountMinor: fixture.items.reduce((sum, item) => sum + item.totalMinor, 0),
       currency: 'usd',
       reason: 'fraudulent',
-      providerCreatedAt: new Date('2026-08-10T14:00:00.000Z'),
-      providerUpdatedAt: new Date(`2026-08-10T14:${sequence.toString().padStart(2, '0')}:00.000Z`)
+      providerCreatedAt: new Date('2026-08-10T14:00:00.000Z')
     },
     payment: {
       paymentIntentId: fixture.paymentIntentId,
@@ -238,7 +241,11 @@ describe('canonical dispute fulfillment', () => {
       'reasonCategory' in message ? message.reasonCategory : null
     )).toEqual(['dispute_opened', 'dispute_resolved']);
 
-    const stale = await createDisputeEvent(disputeId, 3);
+    const stale = await createDisputeEvent(
+      disputeId,
+      3,
+      new Date('2026-08-10T14:01:30.000Z')
+    );
     await fulfillDisputeEvent(databaseClient.db, command(fixture, stale, 'open', 1), dependencies());
     expect((await databaseClient.db.select().from(disputes))[0]?.status).toBe('won');
     expect((await databaseClient.db.select().from(entitlementGrants))[0]?.state).toBe('active');

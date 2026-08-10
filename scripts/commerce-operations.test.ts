@@ -1,35 +1,150 @@
 import { readFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { describe, expect, it } from 'vitest';
 
 const root = new URL('../', import.meta.url);
+const executeFile = promisify(execFile);
+
+interface ComposeService {
+  environment?: Record<string, string>;
+  secrets?: Array<{ source: string; target: string }>;
+}
+
+interface ComposeConfiguration {
+  services: Record<string, ComposeService>;
+  secrets: Record<string, { environment: string }>;
+}
 
 async function source(path: string): Promise<string> {
   return readFile(new URL(path, root), 'utf8');
 }
 
+async function composeConfiguration(...files: string[]): Promise<ComposeConfiguration> {
+  const arguments_ = [
+    ...files.flatMap((file) => ['--file', file]),
+    '--profile',
+    'tools'
+  ];
+  const { stdout } = await executeFile(
+    'docker',
+    ['compose', ...arguments_, 'config', '--format', 'json'],
+    {
+      cwd: new URL('.', root),
+      env: {
+        ...process.env,
+        APP_IMAGE: 'registry.invalid/pale-orbit@sha256:validation-only',
+        ORIGIN: 'https://bookstore.invalid',
+        DATABASE_NAME: 'validation_database',
+        DATABASE_USER: 'validation_user',
+        SMTP_HOST: 'smtp.invalid',
+        SMTP_PORT: '587',
+        SMTP_SECURE: 'false',
+        SMTP_REQUIRE_TLS: 'true',
+        SMTP_USER: 'validation_user',
+        SMTP_FROM: 'Validation <noreply@bookstore.invalid>',
+        BOOTSTRAP_ADMIN_EMAIL: 'admin@bookstore.invalid',
+        BOOTSTRAP_ADMIN_NAME: 'Validation Administrator',
+        SITE_ADDRESS: 'bookstore.invalid',
+        STRIPE_SECRET_KEY: undefined,
+        STRIPE_WEBHOOK_SECRET: undefined
+      }
+    }
+  );
+  return JSON.parse(stdout) as ComposeConfiguration;
+}
+
+function mountedSecretSources(service: ComposeService): string[] {
+  return (service.secrets ?? []).map((secret) => secret.source).sort();
+}
+
 describe('commerce operations contract', () => {
-  it('keeps the production baseline disabled and maintenance-only', async () => {
-    const compose = await source('compose.prod.yaml');
-    expect(compose).toMatch(/APPLICATION_MODE:\s*maintenance/u);
-    expect(compose).toMatch(/STRIPE_ENABLED:\s*"false"/u);
-    expect(compose).toMatch(/STRIPE_TEST_FIXTURE_MODE:\s*"false"/u);
-    expect(compose).toMatch(/STRIPE_LIVE_MODE:\s*"false"/u);
-    expect(compose).toMatch(/STRIPE_CHECKOUT_DURATION_SECONDS:\s*\$\{STRIPE_CHECKOUT_DURATION_SECONDS:-1800\}/u);
-    expect(compose).toMatch(/STRIPE_WEBHOOK_TOLERANCE_SECONDS:\s*\$\{STRIPE_WEBHOOK_TOLERANCE_SECONDS:-300\}/u);
-    expect(compose).toMatch(/COMMERCE_CHECKOUT_RATE_LIMIT_WINDOW_SECONDS:\s*\$\{COMMERCE_CHECKOUT_RATE_LIMIT_WINDOW_SECONDS:-60\}/u);
-    expect(compose).toMatch(/COMMERCE_CHECKOUT_RATE_LIMIT_MAX:\s*\$\{COMMERCE_CHECKOUT_RATE_LIMIT_MAX:-5\}/u);
-    expect(compose).not.toMatch(/STRIPE_(?:SECRET_KEY|WEBHOOK_SECRET)(?!_FILE)\s*:/u);
+  it('keeps every production application process disabled and maintenance-only', async () => {
+    const compose = await composeConfiguration('compose.prod.yaml');
+    for (const name of ['app', 'worker', 'migrate', 'bootstrap-admin']) {
+      expect(compose.services[name]?.environment, name).toMatchObject({
+        APPLICATION_MODE: 'maintenance',
+        STRIPE_ENABLED: 'false',
+        STRIPE_TEST_FIXTURE_MODE: 'false',
+        STRIPE_LIVE_MODE: 'false',
+        STRIPE_CHECKOUT_DURATION_SECONDS: '1800',
+        STRIPE_WEBHOOK_TOLERANCE_SECONDS: '300',
+        COMMERCE_CHECKOUT_RATE_LIMIT_WINDOW_SECONDS: '60',
+        COMMERCE_CHECKOUT_RATE_LIMIT_MAX: '5'
+      });
+    }
+    for (const [name, service] of Object.entries(compose.services)) {
+      if (service.environment?.STRIPE_ENABLED !== undefined) {
+        expect(service.environment, name).toMatchObject({
+          STRIPE_ENABLED: 'false',
+          STRIPE_TEST_FIXTURE_MODE: 'false',
+          STRIPE_LIVE_MODE: 'false'
+        });
+      }
+      expect(service.environment, name).not.toHaveProperty('STRIPE_SECRET_KEY');
+      expect(service.environment, name).not.toHaveProperty('STRIPE_WEBHOOK_SECRET');
+      expect(service.environment, name).not.toHaveProperty('STRIPE_SECRET_KEY_FILE');
+      expect(service.environment, name).not.toHaveProperty('STRIPE_WEBHOOK_SECRET_FILE');
+    }
   });
 
-  it('enables only app and worker through environment-backed Stripe secrets', async () => {
-    const overlay = await source('compose.stripe.yaml');
-    expect(overlay).toMatch(/services:\s*[\s\S]*?app:\s*[\s\S]*?STRIPE_ENABLED:\s*"true"/u);
-    expect(overlay).toMatch(/worker:\s*[\s\S]*?STRIPE_ENABLED:\s*"true"/u);
-    expect(overlay).toMatch(/STRIPE_SECRET_KEY_FILE:\s*\/run\/secrets\/stripe_secret_key/u);
-    expect(overlay).toMatch(/STRIPE_WEBHOOK_SECRET_FILE:\s*\/run\/secrets\/stripe_webhook_secret/u);
-    expect(overlay).toMatch(/stripe_secret_key:\s*\n\s*environment:\s*STRIPE_SECRET_KEY/u);
-    expect(overlay).toMatch(/stripe_webhook_secret:\s*\n\s*environment:\s*STRIPE_WEBHOOK_SECRET/u);
-    expect(overlay).not.toMatch(/APPLICATION_MODE/u);
+  it('enables and mounts Stripe secrets only in app and worker after merging the overlay', async () => {
+    const baseline = await composeConfiguration('compose.prod.yaml');
+    const merged = await composeConfiguration('compose.prod.yaml', 'compose.stripe.yaml');
+    const stripeServices = ['app', 'worker'];
+    expect(Object.entries(merged.services)
+      .filter(([, service]) => service.environment?.STRIPE_ENABLED === 'true')
+      .map(([name]) => name)
+      .sort()).toEqual(stripeServices);
+    for (const fileSetting of ['STRIPE_SECRET_KEY_FILE', 'STRIPE_WEBHOOK_SECRET_FILE']) {
+      expect(Object.entries(merged.services)
+        .filter(([, service]) => service.environment?.[fileSetting] !== undefined)
+        .map(([name]) => name)
+        .sort()).toEqual(stripeServices);
+    }
+    for (const stripeSecret of ['stripe_secret_key', 'stripe_webhook_secret']) {
+      expect(Object.entries(merged.services)
+        .filter(([, service]) => mountedSecretSources(service).includes(stripeSecret))
+        .map(([name]) => name)
+        .sort()).toEqual(stripeServices);
+    }
+    for (const name of stripeServices) {
+      expect(merged.services[name]?.environment, name).toMatchObject({
+        APPLICATION_MODE: 'maintenance',
+        STRIPE_ENABLED: 'true',
+        STRIPE_TEST_FIXTURE_MODE: 'false',
+        STRIPE_LIVE_MODE: 'false',
+        STRIPE_SECRET_KEY_FILE: '/run/secrets/stripe_secret_key',
+        STRIPE_WEBHOOK_SECRET_FILE: '/run/secrets/stripe_webhook_secret'
+      });
+      expect(mountedSecretSources(merged.services[name]!)).toEqual([
+        'auth_secret',
+        'database_password',
+        'smtp_password',
+        'stripe_secret_key',
+        'stripe_webhook_secret'
+      ]);
+    }
+    for (const name of ['migrate', 'bootstrap-admin', 'storage-cleanup', 'caddy', 'postgres']) {
+      expect(merged.services[name]?.environment, name).not.toHaveProperty('STRIPE_ENABLED', 'true');
+      expect(merged.services[name]?.environment, name).not.toHaveProperty('STRIPE_SECRET_KEY_FILE');
+      expect(merged.services[name]?.environment, name).not.toHaveProperty('STRIPE_WEBHOOK_SECRET_FILE');
+      expect(mountedSecretSources(merged.services[name]!)).not.toContain('stripe_secret_key');
+      expect(mountedSecretSources(merged.services[name]!)).not.toContain('stripe_webhook_secret');
+    }
+    for (const [name, service] of Object.entries(baseline.services)) {
+      expect(
+        mountedSecretSources(merged.services[name]!).filter((secret) => !secret.startsWith('stripe_')),
+        name
+      ).toEqual(mountedSecretSources(service));
+    }
+    expect(merged.secrets).toMatchObject({
+      database_password: { environment: 'DATABASE_PASSWORD' },
+      auth_secret: { environment: 'AUTH_SECRET' },
+      smtp_password: { environment: 'SMTP_PASSWORD' },
+      stripe_secret_key: { environment: 'STRIPE_SECRET_KEY' },
+      stripe_webhook_secret: { environment: 'STRIPE_WEBHOOK_SECRET' }
+    });
   });
 
   it('documents safe commerce, claim, reconciliation, and manual-checkpoint operations', async () => {
@@ -57,6 +172,8 @@ describe('commerce operations contract', () => {
     expect(readme).toContain('docs/commerce-and-guest-claims.md');
     expect(readme).not.toContain('Checkout is not live in Plan 5');
     expect(runtime).toContain('compose.stripe.yaml');
+    expect(runtime).toContain('does not verify that environment-backed secret values are present');
+    expect(runbook).toContain('does not verify that environment-backed secret values are present');
     expect(database).toContain('stripe_events');
     expect(authentication).toContain('guest purchase');
     expect(library).toContain('entitlement_grants');

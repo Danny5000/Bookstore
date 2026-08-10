@@ -81,23 +81,33 @@ export async function lockCanonicalPaymentOrder(
   providerPayment: PaymentSnapshot,
   event: StripeEventRow
 ) {
-  const [payment] = await transaction
+  const [candidate] = await transaction
     .select()
     .from(payments)
     .where(eq(payments.stripePaymentIntentId, providerPayment.paymentIntentId))
+    .limit(1);
+  if (!candidate) permanentReconciliationFailure();
+  await lockOrder(transaction, candidate.orderId);
+  const [order] = await transaction
+    .select()
+    .from(orders)
+    .where(eq(orders.id, candidate.orderId))
+    .limit(1)
+    .for('update');
+  const [payment] = await transaction
+    .select()
+    .from(payments)
+    .where(and(
+      eq(payments.id, candidate.id),
+      eq(payments.stripePaymentIntentId, providerPayment.paymentIntentId)
+    ))
     .limit(1)
     .for('update');
   if (!payment) permanentReconciliationFailure();
   assertCanonicalPayment(payment, providerPayment, event);
-  await lockOrder(transaction, payment.orderId);
-  const [order] = await transaction
-    .select()
-    .from(orders)
-    .where(eq(orders.id, payment.orderId))
-    .limit(1)
-    .for('update');
   if (
     !order ||
+    payment.orderId !== order.id ||
     order.status !== 'paid' ||
     order.currency !== payment.currency ||
     order.totalMinor !== payment.amountMinor
@@ -105,6 +115,11 @@ export async function lockCanonicalPaymentOrder(
   return { payment, order };
 }
 
+/**
+ * Once operation-local event or identity rows are locked, every commerce mutation follows the
+ * same purchase-graph order: order, payment, refunds, allocations, disputes, items, entitlement
+ * scopes, then grants. Keeping this sequence shared prevents cross-flow deadlocks.
+ */
 export async function lockPaymentAccessFacts(
   transaction: DatabaseTransaction,
   payment: typeof payments.$inferSelect,
@@ -144,26 +159,46 @@ export async function lockPaymentAccessFacts(
   if (aggregate === null || aggregate !== payment.amountMinor) {
     permanentReconciliationFailure();
   }
+  const candidateGrants = await transaction
+    .select()
+    .from(entitlementGrants)
+    .where(inArray(entitlementGrants.orderItemId, items.map((item) => item.id)))
+    .orderBy(asc(entitlementGrants.id));
+  if (
+    candidateGrants.length !== items.length ||
+    candidateGrants.some((grant) => grant.source !== 'purchase')
+  ) {
+    permanentReconciliationFailure();
+  }
+  const itemById = new Map(items.map((item) => [item.id, item]));
+  if (candidateGrants.some((grant) => {
+    const item = grant.orderItemId ? itemById.get(grant.orderItemId) : undefined;
+    return !item || grant.titleId !== item.titleId;
+  })) permanentReconciliationFailure();
+  await lockEntitlementScopes(
+    transaction,
+    candidateGrants.flatMap((grant) => grant.userId
+      ? [{ userId: grant.userId, titleId: grant.titleId }]
+      : [])
+  );
   const grants = await transaction
     .select()
     .from(entitlementGrants)
     .where(inArray(entitlementGrants.orderItemId, items.map((item) => item.id)))
     .orderBy(asc(entitlementGrants.id))
     .for('update');
-  if (grants.length !== items.length || grants.some((grant) => grant.source !== 'purchase')) {
-    permanentReconciliationFailure();
-  }
-  const itemById = new Map(items.map((item) => [item.id, item]));
-  if (grants.some((grant) => {
-    const item = grant.orderItemId ? itemById.get(grant.orderItemId) : undefined;
-    return !item || grant.titleId !== item.titleId;
-  })) permanentReconciliationFailure();
-  await lockEntitlementScopes(
-    transaction,
-    grants.flatMap((grant) => grant.userId
-      ? [{ userId: grant.userId, titleId: grant.titleId }]
-      : [])
-  );
+  if (
+    grants.length !== candidateGrants.length ||
+    grants.some((grant, index) => {
+      const candidate = candidateGrants[index];
+      return !candidate ||
+        grant.id !== candidate.id ||
+        grant.orderItemId !== candidate.orderItemId ||
+        grant.titleId !== candidate.titleId ||
+        grant.userId !== candidate.userId ||
+        grant.source !== candidate.source;
+    })
+  ) permanentReconciliationFailure();
   return {
     refunds: lockedRefunds,
     allocations: lockedAllocations,

@@ -62,7 +62,6 @@ export interface DisputeSnapshot {
   currency: string;
   reason: string | null;
   providerCreatedAt: Date;
-  providerUpdatedAt: Date;
 }
 
 export interface VerifiedStripeEvent {

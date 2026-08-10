@@ -56,13 +56,14 @@ The user must obtain `STRIPE_WEBHOOK_SECRET` from the local `stripe listen --for
 - A cart contains version `1`, at most 25 distinct title UUIDs, and one client checkout-attempt UUID. Quantity is structurally one.
 - A quote is authoritative only for the exact ordered title set, current public/active/published availability, immutable current price/currency snapshots, and current account ownership used to compute its SHA-256 fingerprint.
 - A checkout accepts one currency. Mixed-currency input is rejected; currencies are never converted or summed.
+- Browser display and provider validation share the ISO currency exponent from `Intl`; unsupported codes and Stripe's exceptional ISK/UGX charge-unit semantics are rejected before publication/Checkout.
 - Signed-in checkout identity is permanently the authenticated verified user and that user's normalized account email. A payer-edited Checkout contact email cannot redirect ownership or application email.
 - Guest purchase identity is created only from a canonically paid Checkout Session email. Browser-submitted email is never purchase authority.
 - A local order and its item snapshots commit before Checkout Session creation. Stripe uses the order UUID as its idempotency key.
 - Because Plan 6A enables neither discounts nor adjustable quantities, finalized item/order tax and total are paired and satisfy `totalMinor = subtotalMinor + taxMinor`; a succeeded payment amount equals the finalized order total.
-- The 30-minute open Checkout Session honors its accepted stored price even if catalog price or visibility changes before a valid payment completes.
+- The configured 30-minute Checkout hold, plus no more than one minute reserved for safe provider creation, honors its accepted stored price even if catalog price or visibility changes before a valid payment completes.
 - Local state transitions are monotonic: `paid` never regresses, a permanently revoked purchase grant never becomes active, and an older event cannot override newer canonical provider state.
-- Every Stripe event row contains only allowlisted identifiers and metadata plus a raw-body SHA-256 digest. Duplicate event IDs create neither a second event nor a second job.
+- Every Stripe event row contains only allowlisted identifiers and metadata plus a raw-body SHA-256 digest. Duplicate event IDs create neither a second event nor a second job; an exact redelivery may re-arm only the same exhausted failed job while its event remains pending.
 - Payment fulfillment verifies the entire canonical order boundary: mode/live flag, metadata schema, order/session/payment linkage, complete paginated line items, quantities, membership, currency, subtotal, tax, total, and guest email when required.
 - One durable grant explains each independent access source. `preserved` grants explain pre-commerce access; `purchase` grants point to exactly one order item.
 - The effective entitlement for `(user, title)` is active if and only if at least one grant in that scope is active. Projection always locks the user/title scope before re-reading every grant.
@@ -840,7 +841,7 @@ new Stripe(secretKey, {
 });
 ```
 
-Assert Checkout creation sends `mode: 'payment'`, dashboard-managed payment methods by omitting a hard-coded list, inline exclusive `price_data`, quantity one, format tax codes, optional `automatic_tax`, order UUID metadata/client reference, 30-minute expiry, safe same-origin success/cancel URLs, and the order UUID as Stripe's idempotency key. Each inline product uses the immutable safe title snapshot for Checkout display and only `pale_orbit_order_item_id` in product metadata so paginated retrieval can prove membership. Signed-in checkout sets only the verified stored account email as `customer_email`; guest checkout omits it so Checkout collects canonical contact email. On retrieval, `customer_details.email` is authoritative and any nonnull legacy/session email must normalize identically. Assert no other email/name/token/storage metadata is supplied.
+Assert Checkout creation sends `mode: 'payment'`, dashboard-managed payment methods by omitting a hard-coded list, explicitly disables adaptive pricing, uses inline exclusive `price_data`, quantity one, format tax codes, optional `automatic_tax`, order UUID metadata/client reference, a deterministic whole-second 30-minute hold with bounded provider-creation allowance, safe same-origin success/cancel URLs, and the order UUID as Stripe's idempotency key. Each inline product uses the immutable safe title snapshot for Checkout display and only `pale_orbit_order_item_id` in product metadata so paginated retrieval can prove membership. Signed-in checkout sets only the verified stored account email as `customer_email`; guest checkout omits it so Checkout collects canonical contact email. On retrieval, `customer_details.email` is authoritative and any nonnull legacy/session email must normalize identically. Assert no other email/name/token/storage metadata is supplied.
 
 Also test pagination/retrieval and error mapping: network/rate limit/`5xx` are retryable; invalid requests and canonical mismatches are permanent; no raw Stripe message reaches a domain error.
 
@@ -897,7 +898,7 @@ git commit -m "feat: add stripe commerce gateway"
 
 - [x] **Step 1: Write failing status-token/cookie tests**
 
-Generate 32 random bytes, base64url-encode plaintext, persist only SHA-256, and compare with timing-safe equality. Cookie is HttpOnly, SameSite Lax, Secure only in production, bounded to order lifetime plus processing grace, and narrowly path-scoped where browser polling still works. Prove token never appears in DTO, URL, logs, or database plaintext.
+Derive a 32-byte, domain-separated HMAC credential from the application secret and random checkout-attempt UUID, base64url-encode it, persist only SHA-256, and compare with timing-safe equality. The value must remain stable for exact concurrent retries so reversed response order cannot install an obsolete cookie. Cookie is HttpOnly, SameSite Lax, Secure only in production, bounded to order lifetime plus processing grace, and narrowly path-scoped where browser polling still works. Prove token never appears in DTO, URL, logs, or database plaintext.
 
 Run focused tests. Expected: FAIL then PASS after implementation.
 
@@ -913,7 +914,7 @@ Run `npm run test:integration -- tests/integration/commerce-orders.test.ts`. Exp
 
 Inside one transaction: apply checkout throttle, call `lockAndQuoteCart`, constant-time compare the submitted fingerprint, create `checkout_pending` order/items/status digest, and append `commerce.checkout_created`. Return the plaintext status token only to the route call stack.
 
-For a retry with the same attempt UUID, lock/load the existing order and verify exact actor, quote membership/fingerprint, and nonterminal state. Reuse the order. If a guest lost the status cookie before receiving the first response, rotate the status digest only while the same attempt and exact quote remain `checkout_pending`/`checkout_open`; rotation invalidates the older cookie and is audit-free. Never rotate paid/failed/expired/exception status credentials.
+For a retry with the same attempt UUID, lock/load the existing order and verify exact actor, quote membership/fingerprint, and nonterminal state. Reuse the order and re-derive the same guest status credential without changing its stored digest. A terminal order, changed exact cart, secret mismatch, or attempt too old to preserve Stripe's minimum expiration returns `CHECKOUT_ATTEMPT_CONFLICT`; the browser rotates the attempt before retrying. Never reuse paid/failed/expired/exception attempts.
 
 Run integration tests. Expected: PASS.
 
@@ -940,7 +941,7 @@ Run focused/unit/integration tests. Expected: PASS.
 
 `POST /api/commerce/checkout` requires same-origin strict JSON and the checkout throttle. It returns private JSON with either redirect URL or `cart_changed` quote; it also sets/rotates the status cookie. Do not issue an HTTP 3xx from the mutation endpoint—client code navigates only after parsing a successful result.
 
-Map `CART_CHANGED` to 409 with the safe quote, invalid cart 422, throttle 429, disabled/transient provider 503, and permanent local exception 500-safe `CHECKOUT_UNAVAILABLE`. Never expose provider request IDs or messages.
+Map `CART_CHANGED` to 409 with the safe quote, `CHECKOUT_ATTEMPT_CONFLICT` to a safe 409 code, invalid cart 422, throttle 429, disabled/transient provider 503, and permanent local exception 500-safe `CHECKOUT_UNAVAILABLE`. Never expose provider request IDs or messages.
 
 - [x] **Step 7: Implement minimal authorized status**
 
@@ -1008,7 +1009,7 @@ Run unit/route tests. Expected: the persistence cases remain RED.
 
 - [x] **Step 4: Write failing transactional acceptance tests**
 
-With real PostgreSQL, prove one transaction inserts `stripe_events` and `commerce.stripe-event` job with dedup key `stripe:event:<providerEventId>`. Duplicate delivery creates one event/job. Force job insert failure and prove event rollback so Stripe retry can recover. Concurrent duplicates converge. A duplicate with conflicting minimized immutable fields does not overwrite the accepted event and emits no sensitive data.
+With real PostgreSQL, prove one transaction inserts `stripe_events` and a 12-attempt `commerce.stripe-event` job with dedup key `stripe:event:<providerEventId>`. Duplicate delivery creates one event/job. An exact duplicate atomically re-arms that same job only after it has exhausted attempts and failed while the event remains pending; processed, exception, conflicting, non-exhausted, or mismatched records remain untouched. Force job insert failure and prove event rollback so Stripe retry can recover. Concurrent duplicates converge. A duplicate with conflicting minimized immutable fields does not overwrite the accepted event and emits no sensitive data.
 
 Run `npm run test:integration -- tests/integration/commerce-webhooks.test.ts`. Expected: FAIL.
 
@@ -1046,13 +1047,13 @@ git commit -m "feat: accept signed stripe events"
 - Create: `tests/integration/commerce-fulfillment.test.ts`
 - Modify: `src/worker.ts` after all handler dependencies are injectable
 
-- [ ] **Step 1: Write failing canonical comparison tests**
+- [x] **Step 1: Write failing canonical comparison tests**
 
 Given stored order/items and neutral snapshots, require exact match for live flag, order/client reference, metadata version, session identity, mode/payment status, PaymentIntent link, currency, item membership, item IDs, quantity one, subtotal/tax/total, aggregate totals, and guest email. Reject duplicate/extra/missing lines, float/overflow amounts, `no_payment_required`, mismatched charge/payment, and changed account email identity.
 
 Run `npx vitest run src/lib/server/commerce/fulfillment.test.ts`. Expected: FAIL.
 
-- [ ] **Step 2: Implement the pure canonical validator**
+- [x] **Step 2: Implement the pure canonical validator**
 
 Return a normalized fulfillment command only after every comparison succeeds:
 
@@ -1065,13 +1066,13 @@ type FulfillmentCommand =
 
 Account purchase email always comes from the stored verified snapshot. Guest email comes from canonical Checkout and is normalized with the existing identity helper. Run focused tests. Expected: PASS.
 
-- [ ] **Step 3: Write failing provider-call ordering tests**
+- [x] **Step 3: Write failing provider-call ordering tests**
 
 Use deferred mocks to prove handler loads only the event descriptor, releases the query, retrieves Session and Payment outside a transaction, then starts the mutation transaction. Stripe latency must not occupy a transaction, row lock, or pooled connection. Abort signals stop before new provider calls but do not interrupt an already-committing local transaction.
 
 Expected: FAIL until handler exists.
 
-- [ ] **Step 4: Write failing atomic fulfillment integration tests**
+- [x] **Step 4: Write failing atomic fulfillment integration tests**
 
 Cover:
 
@@ -1090,7 +1091,7 @@ Inject a transactional `enqueuePurchaseMessage` dependency for now; Task 9 suppl
 
 Run `npm run test:integration -- tests/integration/commerce-fulfillment.test.ts`. Expected: FAIL.
 
-- [ ] **Step 5: Implement monotonic fulfillment transaction**
+- [x] **Step 5: Implement monotonic fulfillment transaction**
 
 Lock event, order, payment, then sorted grant projection scopes. Re-read every local state after locks. For paid:
 
@@ -1108,11 +1109,11 @@ For permanent mismatch, atomically store safe exception state/audit/event comple
 
 Run integration tests. Expected: PASS.
 
-- [ ] **Step 6: Register the event handler without premature email wiring**
+- [x] **Step 6: Register the event handler without premature email wiring**
 
 `createStripeEventHandler` parses only `{ stripeEventId }`, loads the minimized event, dispatches by object family, and maps permanent domain exception to job completion while retryable failures throw for job retry. Unknown job payload is permanent. Register in `src/worker.ts` only after constructing an explicit purchase-message dependency; if Task 9 immediately follows in the same execution batch, defer the final worker edit to Task 9 rather than adding a nonfunctional stub.
 
-- [ ] **Step 7: Verify and commit Task 8**
+- [x] **Step 7: Verify and commit Task 8**
 
 Run:
 
@@ -1147,7 +1148,7 @@ Omit `src/worker.ts` from this commit if registration is correctly deferred to T
 - Modify: `src/worker.ts`
 - Create: `tests/integration/commerce-email.test.ts`
 
-- [ ] **Step 1: Write failing strict payload/render tests**
+- [x] **Step 1: Write failing strict payload/render tests**
 
 Define `COMMERCE_EMAIL_TOPIC = 'email.commerce.v1'` and strict version-1 payloads:
 
@@ -1165,7 +1166,7 @@ Reject unknown fields, raw provider object, signature/secret, billing/address/ca
 
 Run focused tests. Expected: FAIL then PASS after payload/render implementation.
 
-- [ ] **Step 2: Write failing transactional enqueue tests**
+- [x] **Step 2: Write failing transactional enqueue tests**
 
 Prove account receipt and access-change messages use stable keys and that retries return one outbox/job. Reconstructing the same key with changed payload is an invariant failure. Use internal UUIDs for deterministic message IDs (order/event UUID), never email-derived keys.
 
@@ -1173,7 +1174,7 @@ Guest paid transition enqueues a deduplicated `commerce.claim-email` job rather 
 
 Run unit/integration email tests. Expected: FAIL.
 
-- [ ] **Step 3: Implement transactional purchase-message dependencies**
+- [x] **Step 3: Implement transactional purchase-message dependencies**
 
 Implement the interface injected into Task 8:
 
@@ -1186,7 +1187,7 @@ export interface PurchaseMessageEnqueuer {
 
 Load safe immutable snapshots inside the transition transaction, validate the payload, and call stable outbox/job enqueue. Run fulfillment rollback tests again and expect PASS.
 
-- [ ] **Step 4: Write failing Better Auth metadata-routing tests**
+- [x] **Step 4: Write failing Better Auth metadata-routing tests**
 
 Set magic-link token storage to `hashed`. Extend `sendMagicLink` to receive strict optional metadata. Only this exact shape selects commerce mail:
 
@@ -1201,7 +1202,7 @@ Prove absent metadata sends generic auth magic email; valid metadata plus matchi
 
 Run auth/claim-email tests. Expected: FAIL.
 
-- [ ] **Step 5: Implement safe claim-email preparation and fallback**
+- [x] **Step 5: Implement safe claim-email preparation and fallback**
 
 The claim-email job first checks the stable outbox key. If already present, complete without minting another token. Otherwise load the paid guest order and current identity eligibility.
 
@@ -1213,11 +1214,11 @@ The claim-email job first checks the stable outbox key. If already present, comp
 
 If Better Auth token creation succeeds but the process fails before mail enqueue, retry may mint a new token; the stable outbox key ensures only one logical commerce message is accepted. An already-enqueued message causes retry to finish before another token is minted.
 
-- [ ] **Step 6: Register production handlers**
+- [x] **Step 6: Register production handlers**
 
 Register `email.commerce.v1`, `commerce.claim-email`, and `commerce.stripe-event` in `src/worker.ts`. Disabled Stripe mode must still dispatch already-enqueued email but must not construct a real SDK client. Stripe event jobs fail safely as unavailable while disabled. Close only transports/resources actually constructed.
 
-- [ ] **Step 7: Verify and commit Task 9**
+- [x] **Step 7: Verify and commit Task 9**
 
 Run:
 
@@ -1247,7 +1248,7 @@ git commit -m "feat: send purchase and claim email"
 - Create: `src/routes/claim/complete/+page.server.ts`, `+page.svelte`, `page.server.test.ts`
 - Modify: auth email callback tests as needed
 
-- [ ] **Step 1: Write failing purchase-grant derivation tests**
+- [x] **Step 1: Write failing purchase-grant derivation tests**
 
 Purely derive a claimed purchase grant from complete local facts with precedence:
 
@@ -1261,7 +1262,7 @@ otherwise                                               -> unclaimed/error
 
 Won disputes do not override a full refund or permanent revocation. Multiple dispute rows reduce by precedence, not event timestamp. Run focused tests. Expected: FAIL then PASS after pure reducer.
 
-- [ ] **Step 2: Write failing claim integration tests**
+- [x] **Step 2: Write failing claim integration tests**
 
 Cover a verified session claiming every paid unclaimed purchase for normalized email; several orders/titles; same-user replay; a matching verified preexisting account; unverified-session denial; different email; identity already claimed by another user; concurrent claim attempts; current refund/dispute-derived active/suspended/revoked states; one projection per affected scope; and aggregate audit with no order contents/email.
 
@@ -1269,7 +1270,7 @@ Force a mid-claim failure and prove guest identity, grants, entitlements, and au
 
 Run `npm run test:integration -- tests/integration/commerce-claims.test.ts`. Expected: FAIL.
 
-- [ ] **Step 3: Implement the atomic claim transaction**
+- [x] **Step 3: Implement the atomic claim transaction**
 
 Require a current user whose `emailVerified` is true and normalize its email. Lock matching guest identity, then all paid guest orders/items/grants, then sorted user/title scopes. If `claimedByUserId` is null set it once; if it is the same user continue idempotently; if different, throw a generic permanent conflict.
 
@@ -1277,7 +1278,7 @@ Attach every eligible no-user purchase grant, derive its current state from lock
 
 Run integration tests. Expected: PASS.
 
-- [ ] **Step 4: Write failing claim-page tests**
+- [x] **Step 4: Write failing claim-page tests**
 
 `/claim` accepts a same-origin form email and always returns the same status text whether no identity, already claimed, unverified credential, or eligible purchases exist. A server service normalizes the email, applies the application-owned `commerce.claim-request` fixed-window limit using an HMAC scope over normalized email plus request IP and the existing auth email-limit settings, queries eligible guest orders without returning the result to the page, and enqueues deduplicated `{ orderId }` claim-email jobs. No job payload or key contains the submitted email. No match is a successful no-op.
 
@@ -1285,13 +1286,13 @@ Run integration tests. Expected: PASS.
 
 Expected: FAIL until routes exist.
 
-- [ ] **Step 5: Implement accessible enumeration-resistant pages**
+- [x] **Step 5: Implement accessible enumeration-resistant pages**
 
 Use native labeled email input/button, focusable error summary only for invalid local input, `role=status` for the generic sent message, and no partial email mask. Re-request calls the same safe claim-email job path and inherits Better Auth/application rate limiting. Do not put email or tokens in query strings.
 
 Run route tests and claim integration. Expected: PASS.
 
-- [ ] **Step 6: Verify and commit Task 10**
+- [x] **Step 6: Verify and commit Task 10**
 
 Run:
 
@@ -1319,7 +1320,7 @@ git commit -m "feat: claim guest purchases"
 - Create: `tests/integration/commerce-refunds.test.ts`
 - Modify: commerce access-change email tests
 
-- [ ] **Step 1: Write failing pure allocation tests**
+- [x] **Step 1: Write failing pure allocation tests**
 
 Cover a single-item partial/full/cumulative refund; one full multi-item refund; several refunds whose succeeded cumulative total exactly reaches the order total; partial multi-item refund; over-refund; failed/canceled/pending refund; duplicate event; and amounts in wrong currency.
 
@@ -1332,13 +1333,13 @@ The allocator may produce rows only when attribution is unambiguous:
 
 Assert per-refund allocation sum never exceeds its amount and per-item succeeded allocation never exceeds item total. Run focused tests. Expected: FAIL then PASS after pure algorithm.
 
-- [ ] **Step 2: Write failing refund retrieval/ordering tests**
+- [x] **Step 2: Write failing refund retrieval/ordering tests**
 
 Handler loads event descriptor, calls `retrieveRefund(objectId)` and `retrievePayment(refund.paymentIntentId)` outside transactions, then begins local mutation. It never trusts event amount/state and never holds payment/order/grant locks during provider calls. Transient provider errors retry; invalid currency/link/state is permanent exception.
 
 Run handler tests. Expected: FAIL.
 
-- [ ] **Step 3: Write failing refund integration tests**
+- [x] **Step 3: Write failing refund integration tests**
 
 Prove canonical upsert by Refund ID, succeeded-only allocation, cumulative single-title behavior, complete multi-title behavior, ambiguous partial exception/no access change, row-lock sum enforcement under concurrent refund jobs, fully allocated item revocation, another active grant preserving entitlement, unclaimed guest grant revocation without an entitlement, event processing atomicity, and monotonic succeeded state.
 
@@ -1346,7 +1347,7 @@ Force allocation/projection/email/audit/event failure and prove rollback. Prove 
 
 Run `npm run test:integration -- tests/integration/commerce-refunds.test.ts`. Expected: FAIL.
 
-- [ ] **Step 4: Implement locked refund import/allocation**
+- [x] **Step 4: Implement locked refund import/allocation**
 
 Lock event, payment, order, all order refunds/allocations/items, affected purchase grants, then sorted user/title scopes. Recompute allocation from complete canonical local refund state; never increment from event deltas. Persist refund state and Plan 6B reconciliation `pending`/`exception`. Once a grant is fully refund-revoked, never reactivate it.
 
@@ -1354,7 +1355,7 @@ Project only claimed-user scopes. Enqueue one versioned refund access-change mes
 
 Run integration tests. Expected: PASS.
 
-- [ ] **Step 5: Extend event dispatch and verify**
+- [x] **Step 5: Extend event dispatch and verify**
 
 Route Refund-family event jobs to refund handler; unknown/mismatched object family is permanent. Run:
 
@@ -1382,17 +1383,17 @@ git commit -m "feat: reconcile refund access changes"
 - Create: `tests/integration/commerce-disputes.test.ts`
 - Modify: commerce access-change email tests
 
-- [ ] **Step 1: Write failing dispute reduction tests**
+- [x] **Step 1: Write failing dispute reduction tests**
 
 Reduce all canonical dispute rows for one payment with precedence `lost -> revoked`, else any `open -> suspended`, else all `won -> otherwise-valid grant state`. Won restoration must re-evaluate full succeeded refund allocations and permanent grant revocation; it cannot blindly activate. Preserved grants are outside dispute mutation.
 
 Cover event-order permutations, duplicate rows, open->won, open->lost, won followed by out-of-order open event with canonical won retrieval, multiple disputes, and safe reason normalization. Run focused tests. Expected: FAIL then PASS after pure reducer.
 
-- [ ] **Step 2: Write failing provider-call ordering tests**
+- [x] **Step 2: Write failing provider-call ordering tests**
 
 Retrieve canonical Dispute then linked Payment outside a transaction. Canonical state—not triggering event name—drives the reduction. Provider mismatch/live/currency/payment errors become inspectable permanent exceptions; transient calls retry. Expected: FAIL until dispatch is implemented.
 
-- [ ] **Step 3: Write failing dispute integration tests**
+- [x] **Step 3: Write failing dispute integration tests**
 
 Cover:
 
@@ -1408,15 +1409,15 @@ Cover:
 
 Run `npm run test:integration -- tests/integration/commerce-disputes.test.ts`. Expected: FAIL.
 
-- [ ] **Step 4: Implement locked dispute lifecycle**
+- [x] **Step 4: Implement locked dispute lifecycle**
 
-Lock event, payment, order, all payment disputes/refunds/allocations/grants, then sorted user/title scopes. Upsert canonical dispute by provider ID and recompute every affected purchase grant from complete payment facts. Store Plan 6B reconciliation state, project claimed grants, enqueue deduplicated access-change mail, append minimized aggregate audit, and mark event processed atomically.
+After locking the event, follow the shared purchase-graph order: order, payment, refunds, allocations, disputes, items, sorted user/title scopes, then grants. Upsert canonical dispute by provider ID and recompute every affected purchase grant from complete payment facts. Derive dispute chronology from the immutable Dispute creation time plus the signed Stripe event creation time; do not invent an object update timestamp. Store Plan 6B reconciliation state, project claimed grants, enqueue deduplicated access-change mail, append minimized aggregate audit, and mark event processed atomically.
 
 Never store evidence, narratives, card/billing details, provider response, or full reason text. Clamp/map safe reason values.
 
 Run integration tests. Expected: PASS.
 
-- [ ] **Step 5: Extend dispatch, verify, and commit**
+- [x] **Step 5: Extend dispatch, verify, and commit**
 
 Run:
 
@@ -1448,19 +1449,19 @@ git commit -m "feat: reconcile dispute access changes"
 - Modify: `src/routes/library/+page.svelte` copy only where purchase guidance changes
 - Create: `src/lib/commerce/checkout-client.ts`, `checkout-client.test.ts`
 
-- [ ] **Step 1: Write failing component/store interaction tests**
+- [x] **Step 1: Write failing component/store interaction tests**
 
 Cover accessible Add/Remove button names, disabled states for owned/unavailable titles, cart count announcement without focus theft, header link/count, duplicate add, 25-title cap, and keyboard operation. Existing catalog/title loaders remain server-authoritative; components receive safe title IDs and state only.
 
 Run focused component tests. Expected: FAIL.
 
-- [ ] **Step 2: Implement catalog/title/header cart controls**
+- [x] **Step 2: Implement catalog/title/header cart controls**
 
 Use native buttons/links and visible focus. Keep card navigation separate from cart button activation. Header renders “Cart, N items” accessibly and an `aria-live=polite` count message. Remove every “checkout not connected/unavailable” prototype statement from development storefront pages, but do not claim production is live.
 
 Run component tests. Expected: PASS.
 
-- [ ] **Step 3: Write failing cart-page behavior tests**
+- [x] **Step 3: Write failing cart-page behavior tests**
 
 Cover empty, loading, current quote, owned, unavailable, mixed-currency, price-changed, disabled-provider, transient failure, canceled-return, and retry states. Currency uses `Intl.NumberFormat` only for display. Show “Tax calculated at checkout” beside tax-exclusive prices. Never parse formatted currency.
 
@@ -1468,7 +1469,7 @@ Checkout behavior must require explicit re-confirmation after `CART_CHANGED`: fi
 
 Expected: FAIL.
 
-- [ ] **Step 4: Implement quote-backed cart review**
+- [x] **Step 4: Implement quote-backed cart review**
 
 On mount and cart change, POST only IDs to quote. Abort stale requests and ignore out-of-order responses. Render rejected requested IDs generically without private metadata. Offer remove-owned/unavailable controls. Checkout POST sends IDs/fingerprint/attempt UUID and navigates with `window.location.assign` only for a gateway-validated `https://checkout.stripe.com` URL (or the injected test adapter's exact test URL). Reject arbitrary external schemes/hosts.
 
@@ -1476,7 +1477,7 @@ Before navigation, put only the accepted title IDs and attempt UUID in bounded `
 
 Run cart page/client tests. Expected: PASS.
 
-- [ ] **Step 5: Write failing success/cancel polling tests**
+- [x] **Step 5: Write failing success/cancel polling tests**
 
 Success loader accepts only an order UUID query value and exposes no status itself. Browser polls private status every two seconds with immediate first request, stops on terminal state/navigation/abort or after 60 seconds, and never calls Stripe/fulfillment. It renders delayed-payment pending guidance, account library action, guest check-email guidance without displaying email, safe failed/expired/exception recovery, and a timeout refresh action.
 
@@ -1484,13 +1485,13 @@ On paid/paid_guest, remove only pending accepted title IDs from the current cart
 
 Expected: FAIL.
 
-- [ ] **Step 6: Implement accessible success/cancel experience**
+- [x] **Step 6: Implement accessible success/cancel experience**
 
 Use `role=status` for pending/paid and `role=alert` only for actionable failure. Do not automatically navigate to library or claim. Clean intervals/abort controllers on destroy. Status URL contains only order UUID; status credential stays in HttpOnly cookie.
 
 Run page/route/polling tests. Expected: PASS.
 
-- [ ] **Step 7: Verify and commit Task 13**
+- [x] **Step 7: Verify and commit Task 13**
 
 Run:
 
@@ -1521,7 +1522,7 @@ git commit -m "feat: connect storefront checkout experience"
 - Modify: `scripts/with-test-database.ts` if worker fixture injection needs explicit test settings
 - Modify: removed-prototype-route assertions
 
-- [ ] **Step 1: Build a non-production provider test harness**
+- [x] **Step 1: Build a non-production provider test harness**
 
 Configure `STRIPE_TEST_FIXTURE_MODE=true`, `STRIPE_ENABLED=false`, and no real keys only in Playwright's `APP_ENV=test` processes. The fixture gateway returns deterministic provider-neutral snapshots and a nonsecret mock hosted URL but exposes no HTTP route that marks an order paid.
 
@@ -1529,27 +1530,27 @@ Playwright-side helpers may import server test utilities to submit locally signe
 
 Run a security test that every non-test configuration rejects fixture mode.
 
-- [ ] **Step 2: Add the signed-in multi-title journey**
+- [x] **Step 2: Add the signed-in multi-title journey**
 
 Publish at least two positive-price same-currency fixtures. Test add/remove/persist across navigation, server quote, changed price requiring explicit confirmation, fixture Checkout creation, signed event/canonical fulfillment, success polling, paid cart cleanup, library/reader/download access, and immutable paid snapshots after later catalog edit.
 
-- [ ] **Step 3: Add the guest claim journey**
+- [x] **Step 3: Add the guest claim journey**
 
 Test guest Checkout, unclaimed no-access boundary, signed fulfillment, Mailpit combined receipt/claim, one-use magic link, account creation/sign-in, claim of all same-email purchases, replay idempotency, and library access. Add the matching unverified password-account path: receipt plus verification callback, then claim after verification.
 
 Never assert/render raw email outside Mailpit test inspection or log an action URL.
 
-- [ ] **Step 4: Add delayed/refund/dispute journeys**
+- [x] **Step 4: Add delayed/refund/dispute journeys**
 
 Test completed-unpaid pending UI, later async success, async failure without access, full item refund revocation, partial multi-title exception/no guessed revocation, another preserved/purchase grant preserving access, open-dispute suspension, won restoration, and lost revocation. Use fixture canonical state, not event-name shortcuts.
 
-- [ ] **Step 5: Add abuse/error/privacy journeys**
+- [x] **Step 5: Add abuse/error/privacy journeys**
 
 Cover mixed currency, already-owned item, unavailable title, 26 items, duplicate checkout submit, invalid signature, duplicate webhook, live-mode mismatch, unauthorized/expired/rotated order status, generic claim request enumeration resistance, disabled Stripe 503, and removed prototype commerce paths remaining 404.
 
 Search captured page content, response DTOs, logs, audits, and database fixtures for forbidden secret/card/address/raw-event fields.
 
-- [ ] **Step 6: Run focused and full browser/database tests**
+- [x] **Step 6: Run focused and full browser/database tests**
 
 Run:
 
@@ -1561,7 +1562,7 @@ npm run test:e2e
 
 Expected: all integration suites and all browser journeys pass without a real network request to Stripe.
 
-- [ ] **Step 7: Verify and commit Task 14**
+- [x] **Step 7: Verify and commit Task 14**
 
 Run:
 
@@ -1599,19 +1600,19 @@ Stage `scripts/with-test-database.ts` only if changed.
 - Modify: `compose.dev.yaml` only if explicit disabled defaults are needed beyond `.env`
 - Modify: deployment/runbook validation tests
 
-- [ ] **Step 1: Write the commerce/claim runbook**
+- [x] **Step 1: Write the commerce/claim runbook**
 
 Document:
 
 - Disabled-by-default development and production behavior.
-- Exact nonsecret settings, API version `2026-07-29.dahlia`, 30-minute sessions, webhook tolerance, tax-exclusive prices, format tax codes, Dashboard-managed payment methods, and delayed-payment behavior.
+- Exact nonsecret settings, API version `2026-07-29.dahlia`, the 30-minute configured hold plus bounded provider-creation allowance, webhook tolerance, tax-exclusive prices, format tax codes, Dashboard-managed payment methods with adaptive pricing disabled, and delayed-payment behavior.
 - Local Mailpit receipt, guest claim, unverified-password fallback, refund, dispute, job retry, event/order/payment/grant/audit diagnosis.
 - Stripe Dashboard remains the refund/dispute-response UI.
 - Partial multi-title refund exceptions await Plan 6B allocation.
 - Plan 6B fee/balance/payout/reconciliation/dashboard work and production launch gate remain incomplete.
 - Secrets are never pasted into chat, committed, logged, included in diagnostics, or stored in `.env.example` as real values.
 
-- [ ] **Step 2: Add disabled production baseline and opt-in secret overlay**
+- [x] **Step 2: Add disabled production baseline and opt-in secret overlay**
 
 Put nonsecret Stripe/commerce defaults in the shared production environment with `STRIPE_ENABLED=false`, fixture false, and maintenance unchanged. Base `compose.prod.yaml` must validate/start without Stripe credentials.
 
@@ -1640,13 +1641,13 @@ secrets:
 
 Review Compose merge output to ensure existing database/auth/SMTP secrets remain mounted. Do not use this overlay to leave maintenance mode in Plan 6A.
 
-- [ ] **Step 3: Validate documentation and Compose with dummy process values**
+- [x] **Step 3: Validate documentation and Compose with dummy process values**
 
-Use only clearly fake validation values in the shell environment. Run base dev, base prod, and prod-plus-Stripe overlay `docker compose ... config --quiet`; verify rendered config does not print actual local secrets because none are supplied. Then clear the dummy shell variables.
+Run base dev, base prod, and prod-plus-Stripe overlay `docker compose ... config --quiet`; verify the merged structure without printing any secret values. Compose `config` does not verify that environment-backed secret variables are present, so use a separate non-printing deployment preflight to require both Stripe variables before any container-creation command.
 
-Expected: base production validates without Stripe secrets; overlay requires both environment-backed secrets; all services retain intended settings; production remains maintenance.
+Expected: base production validates without Stripe secrets; overlay structure references both environment-backed secrets; the separate preflight requires both values; all services retain intended settings; production remains maintenance.
 
-- [ ] **Step 4: Run the complete automated release gate**
+- [x] **Step 4: Run the complete automated release gate**
 
 Run from a clean service/test state:
 
@@ -1665,13 +1666,15 @@ git status --short
 
 Expected: every command exits zero; no unexplained high/critical production advisory; all commerce tests use fixtures; working tree contains only intended Task 15 docs/Compose edits.
 
-- [ ] **Step 5: Build and smoke the production image with Stripe disabled**
+- [x] **Step 5: Build and smoke the production image with Stripe disabled**
 
 Build the production image, apply migration in an isolated disposable Compose project, and start the maintenance baseline. Assert `/health/live` and `/health/ready` succeed; storefront/commerce/webhook paths remain maintenance/disabled as designed; worker becomes ready; migration backfill is idempotent; and no Stripe credential is required.
 
 Tear down only the explicitly named disposable project and its disposable volumes after resolving and checking its exact project name. Do not remove the user's ordinary development volumes.
 
-- [ ] **Step 6: Pause for the optional manual Stripe test-mode checkpoint**
+- [x] **Step 6: Pause for the optional manual Stripe test-mode checkpoint**
+
+Completion note: skipped as permitted because local Stripe test credentials were not supplied; the automated implementation and release gate remain valid.
 
 At this point—and not earlier—tell the user automated implementation is green and ask them to place their own test credentials in the ignored local `.env`:
 
@@ -1693,11 +1696,11 @@ After they update `.env`, restart app and worker. Perform one hosted test Checko
 
 If the user declines or has not supplied local credentials, skip only this optional manual step; automated completion remains valid. Never fabricate credentials or ask them to paste values into chat.
 
-- [ ] **Step 7: Update roadmap completion only after gates pass**
+- [x] **Step 7: Update roadmap completion only after gates pass**
 
 Mark Plan 6A implemented in the full-stack roadmap, leave Plan 6B pending, and retain the production maintenance warning. Record actual final dependency/test counts and any accepted advisory disposition in docs.
 
-- [ ] **Step 8: Commit Task 15**
+- [x] **Step 8: Commit Task 15**
 
 Run `git diff --check` and inspect `git status --short`, then commit:
 
@@ -1724,7 +1727,7 @@ After the final reviewed branch is clean and green, use `superpowers:finishing-a
 | --- | --- |
 | Bounded multi-title, quantity-one browser cart | 1, 4, 13, 14 |
 | Server refuses silent price/availability/ownership changes | 4, 6, 14 |
-| Immutable accepted order/item snapshots and 30-minute price hold | 2, 6, 8, 14 |
+| Immutable accepted order/item snapshots and bounded 30-minute configured price hold | 2, 6, 8, 14 |
 | Stripe-hosted Checkout with eligible Dashboard methods | 5, 6, 14, 15 |
 | Tax-exclusive prices and optional Stripe Tax | 1, 5, 8, 13, 15 |
 | Only signed asynchronous processing can fulfill | 5, 7, 8, 14 |

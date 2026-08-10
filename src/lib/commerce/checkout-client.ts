@@ -12,6 +12,7 @@ const MAX_PENDING_CHECKOUT_BYTES = 8 * 1024;
 
 export type CheckoutClientErrorKind =
   | 'invalid_cart'
+  | 'attempt_conflict'
   | 'rate_limited'
   | 'temporarily_unavailable'
   | 'checkout_unavailable'
@@ -202,8 +203,12 @@ export async function createCheckout(
   const body = await responseJson(response);
   if (response.status === 409) {
     const changed = z.strictObject({ status: z.literal('cart_changed'), quote: quoteSchema }).safeParse(body);
-    if (!changed.success) throw new CheckoutClientError('invalid_response');
-    return changed.data;
+    if (changed.success) return changed.data;
+    const conflict = z.strictObject({
+      code: z.literal('CHECKOUT_ATTEMPT_CONFLICT')
+    }).safeParse(body);
+    if (conflict.success) throw new CheckoutClientError('attempt_conflict');
+    throw new CheckoutClientError('invalid_response');
   }
   if (!response.ok) throw new CheckoutClientError(errorKindForStatus(response, body, true));
   const redirect = z.strictObject({

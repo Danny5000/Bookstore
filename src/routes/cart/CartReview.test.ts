@@ -43,6 +43,25 @@ describe('CartReview states', () => {
     expect(body).toMatch(/<button[^>]*>Continue to checkout<\/button>/u);
   });
 
+  it('renders three-decimal item prices and totals from minor units', () => {
+    const bhdQuote: CommerceQuoteDto = {
+      ...quote,
+      currency: 'BHD',
+      subtotalMinor: 1234,
+      items: quote.items.map((item) => ({
+        ...item,
+        currency: 'BHD',
+        unitSubtotalMinor: 1234
+      }))
+    };
+
+    const { body } = render(CartReview, {
+      props: { ...props, phase: 'ready', quote: bhdQuote }
+    });
+    expect(body.match(/BHD\u00a01\.234/gu)).toHaveLength(2);
+    expect(body).not.toContain('BHD 12.34');
+  });
+
   it('renders owned and unavailable rejections generically with remove controls', () => {
     const { body } = render(CartReview, { props: { ...props, phase: 'ready', quote } });
     expect(body).toContain('already in your library');

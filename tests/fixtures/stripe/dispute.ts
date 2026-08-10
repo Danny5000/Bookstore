@@ -13,7 +13,6 @@ export function disputeSnapshotFixture(
     currency: 'usd',
     reason: 'fraudulent',
     providerCreatedAt: new Date('2026-08-10T14:00:00.000Z'),
-    providerUpdatedAt: new Date('2026-08-10T14:00:00.000Z'),
     ...overrides
   };
 }

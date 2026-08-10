@@ -1,9 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { asc, eq } from 'drizzle-orm';
+import { asc, eq, inArray } from 'drizzle-orm';
 import {
+  auditEvents,
+  disputes,
   orderItems,
   orders,
   payments,
+  refunds,
+  stripeEvents,
   type OrderItemRow,
   type OrderRow,
   type PaymentRow
@@ -44,7 +48,6 @@ interface DisputeOptions {
   state: 'open' | 'won' | 'lost';
   providerDisputeId?: string;
   providerCreatedAt?: Date;
-  providerUpdatedAt?: Date;
   reason?: string | null;
 }
 
@@ -285,8 +288,7 @@ export function createCommerceHarness(database: E2EDatabase, applicationOrigin: 
       amountMinor: payment.amountMinor,
       currency: payment.currency.toLowerCase(),
       reason: options.reason ?? 'fraudulent',
-      providerCreatedAt,
-      providerUpdatedAt: options.providerUpdatedAt ?? new Date()
+      providerCreatedAt
     };
     fixture.harness.setPayment(canonical);
     fixture.harness.setDispute(dispute);
@@ -314,6 +316,49 @@ export function createCommerceHarness(database: E2EDatabase, applicationOrigin: 
           currency: item.currency,
           unitSubtotalMinor: item.unitSubtotalMinor
         }))
+      };
+    },
+    async privacySnapshot(orderIds: readonly string[]) {
+      if (orderIds.length === 0) throw new Error('E2E privacy snapshot requires an order');
+      const selectedOrders = await database.db
+        .select({
+          id: orders.id,
+          stripeCheckoutSessionId: orders.stripeCheckoutSessionId
+        })
+        .from(orders)
+        .where(inArray(orders.id, [...orderIds]));
+      const selectedPayments = await database.db
+        .select()
+        .from(payments)
+        .where(inArray(payments.orderId, [...orderIds]));
+      const paymentIds = selectedPayments.map((payment) => payment.id);
+      const selectedRefunds = paymentIds.length === 0
+        ? []
+        : await database.db.select().from(refunds).where(inArray(refunds.paymentId, paymentIds));
+      const selectedDisputes = paymentIds.length === 0
+        ? []
+        : await database.db.select().from(disputes).where(inArray(disputes.paymentId, paymentIds));
+      const providerObjectIds = [
+        ...selectedOrders.flatMap((order) => order.stripeCheckoutSessionId ?? []),
+        ...selectedRefunds.map((refund) => refund.stripeRefundId),
+        ...selectedDisputes.map((dispute) => dispute.stripeDisputeId)
+      ];
+      const selectedEvents = providerObjectIds.length === 0
+        ? []
+        : await database.db
+            .select()
+            .from(stripeEvents)
+            .where(inArray(stripeEvents.objectId, providerObjectIds));
+      const selectedAudits = await database.db
+        .select()
+        .from(auditEvents)
+        .where(inArray(auditEvents.resourceId, [...orderIds]));
+      return {
+        payments: selectedPayments,
+        refunds: selectedRefunds,
+        disputes: selectedDisputes,
+        stripeEvents: selectedEvents,
+        auditEvents: selectedAudits
       };
     }
   };

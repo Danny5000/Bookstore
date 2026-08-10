@@ -4,6 +4,10 @@ import configuration from '../playwright.config';
 import { withoutStripeProviderSecrets } from './test-environment';
 
 describe('Playwright commerce fixture isolation', () => {
+  it('does not retain browser traces containing one-use action URLs', () => {
+    expect(configuration.use?.trace).toBe('off');
+  });
+
   it('uses the fixture gateway with Stripe disabled and no provider secrets', () => {
     const webServer = configuration.webServer;
     if (!webServer || Array.isArray(webServer)) throw new Error('Expected one Playwright web server');

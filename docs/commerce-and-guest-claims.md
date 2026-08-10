@@ -6,11 +6,13 @@ Plan 6A implements the multi-title cart, Stripe-hosted Checkout, signed asynchro
 
 PostgreSQL is authoritative. Browser cart data contains title IDs and a client attempt UUID only. The server re-quotes current public titles, ownership, currency, and prices before creating immutable `orders` and `order_items`. A successful browser redirect never grants access. Only a signature-verified Stripe event followed by canonical Checkout Session and Payment retrieval can make an order paid and create an `entitlement_grants` row. The `entitlements` table is the effective user/title projection used by the library, reader, and download routes.
 
-Stripe Checkout is the only payment UI. Eligible payment methods are managed in the Stripe Dashboard; the application does not collect or persist card or billing fields. Stripe Dashboard also remains the refund and dispute-response UI.
+Guest order status uses a domain-separated HMAC credential scoped to the random checkout-attempt UUID; PostgreSQL stores only its SHA-256 digest. Exact concurrent retries return the same credential, so reversed HTTP response order cannot install an obsolete cookie. A terminal, changed, or provider-stale attempt returns a safe conflict and the cart rotates its attempt before retrying.
+
+Stripe Checkout is the only payment UI. Eligible payment methods are managed in the Stripe Dashboard; adaptive pricing is explicitly disabled so Stripe cannot change the accepted order currency or amount. The application does not collect or persist card or billing fields. Stripe Dashboard also remains the refund and dispute-response UI.
 
 ## Configuration contract
 
-The application pins Stripe API version `2026-07-29.dahlia`. Prices are tax-exclusive and the storefront says **Tax calculated at checkout**. Checkout Sessions last exactly 30 minutes. Delayed payment methods can leave a completed Checkout pending until a later signed asynchronous success or failure event.
+The application pins Stripe API version `2026-07-29.dahlia`. Prices are tax-exclusive and the storefront says **Tax calculated at checkout**. The configured Checkout hold is 30 minutes; the deterministic whole-second provider deadline reserves no more than one additional minute for safe Session creation and a 30-second outbound-call margin. Delayed payment methods can leave a completed Checkout pending until a later signed asynchronous success or failure event.
 
 The nonsecret baseline is:
 
@@ -27,7 +29,7 @@ STRIPE_TAX_CODE_PROSE=
 STRIPE_TAX_CODE_COMIC=
 ```
 
-`STRIPE_CHECKOUT_DURATION_SECONDS` is deliberately fixed at `1800`. Webhook signatures accept the configured tolerance, up to the validated 900-second bound; the default is 300 seconds. Currency is snapshotted per item and order, never converted, and mixed-currency carts are rejected.
+`STRIPE_CHECKOUT_DURATION_SECONDS` is deliberately fixed at `1800`. Webhook signatures accept the configured tolerance, up to the validated 900-second bound; the default is 300 seconds. Currency is snapshotted per item and order, never converted, and mixed-currency carts are rejected. Display uses the ISO exponent from `Intl.NumberFormat`; unsupported codes and Stripe's exceptional ISK/UGX charge-unit semantics are rejected at catalog and provider boundaries.
 
 When `STRIPE_AUTOMATIC_TAX_ENABLED=true`, both `STRIPE_TAX_CODE_PROSE` and `STRIPE_TAX_CODE_COMIC` are required Stripe `txcd_...` codes selected for the operator's products and jurisdictions. Automatic tax remains off until those codes and the Stripe account's tax configuration have been reviewed. The application still stores canonical Stripe-calculated subtotal, tax, and total values after payment.
 
@@ -88,7 +90,7 @@ Use Mailpit to inspect local receipt, claim, and verification messages. Do not p
 
 `POST /api/webhooks/stripe` reads bounded untouched bytes, verifies the `Stripe-Signature`, rejects live/test-mode mismatch, minimizes the supported event, and transactionally inserts one `stripe_events` row plus one deduplicated `commerce.stripe-event` job. Duplicate deliveries converge on the same row/job; a conflicting reuse of a provider event ID cannot overwrite accepted evidence.
 
-The worker retrieves canonical provider state outside a database transaction. It then enters short ordered transactions to reduce payment, refund, or dispute state; update purchase grants and the effective entitlement projection; enqueue deduplicated `email.commerce.v1` messages; append a minimized audit event; and mark the event processed. Provider/SMTP calls are never held inside database transactions.
+The worker retrieves canonical provider state outside a database transaction. It then enters short ordered transactions to reduce payment, refund, or dispute state; update purchase grants and the effective entitlement projection; enqueue deduplicated `email.commerce.v1` messages; append a minimized audit event; and mark the event processed. After an operation-local event or identity lock, purchase facts are always locked as order, payment, refunds, allocations, disputes, items, sorted entitlement scopes, then grants. Provider/SMTP calls are never held inside database transactions.
 
 Relevant audit actions are:
 
@@ -144,7 +146,7 @@ where resource_id = '<order-or-event-uuid>'
 order by occurred_at;
 ```
 
-A pending Stripe event with a pending/retryable job should be allowed to retry. A failed or exception event must be preserved for investigation; Plan 7 owns an authorized job-retry UI, so do not hand-edit attempts or status. Verify network/configuration, canonical Stripe object state, live mode, currency, order amount, and worker health. Stripe will retry non-2xx webhook delivery; application job retries use the configured bounded backoff.
+A Stripe event job gets 12 attempts, covering about 18.5 minutes with the production 1-second base and 5-minute backoff cap. If Stripe redelivers an exact event after those attempts are exhausted, acceptance atomically re-arms the same deduplicated job only while the event remains pending; processed, exception, and conflicting events are never re-armed. Otherwise preserve failed jobs and exception events for investigation. Plan 7 owns the authorized job-retry UI, so do not hand-edit attempts or status. Verify network/configuration, canonical Stripe object state, live mode, currency, order amount, and worker health. Stripe retries non-2xx webhook delivery; application job retries use the configured bounded backoff. Ordinary quote, checkout, and claim-request throttle consumption also removes a bounded batch of expired rows from its own namespace, so no separate rate-limit cleanup command is required.
 
 For receipt/claim delivery, inspect only outbox topic/status/deduplication key and job status—not the payload. Confirm Mailpit/SMTP reachability and worker health. A delivered outbox row suppresses ordinary replay, though an SMTP crash window can still produce a harmless duplicate message.
 
@@ -170,6 +172,8 @@ docker compose --file compose.prod.yaml config --quiet
 docker compose --file compose.prod.yaml --file compose.stripe.yaml config --quiet
 docker compose --file compose.prod.yaml --file compose.stripe.yaml up --detach --wait
 ```
+
+`docker compose config` verifies the merged structure, but it does not verify that environment-backed secret values are present. The deployment preflight must check that both Stripe variables are non-empty without printing them; container creation is the first Compose operation that consumes those values.
 
 The overlay does not alter `APPLICATION_MODE=maintenance`, `STRIPE_LIVE_MODE=false`, database/auth/SMTP secrets, or the migration/bootstrap tools. Do not use it as a production-launch switch. Plan 7 owns the deployment launch gate and Hetzner hardening.
 

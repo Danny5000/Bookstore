@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
-import { CartChangedError, RetryableProviderError } from './errors';
+import { CartChangedError, CommerceConflictError, RetryableProviderError } from './errors';
 import {
   orchestrateCheckout,
   type AcceptedOrder,
@@ -90,9 +90,10 @@ function dependencies(): CheckoutOrchestrationDependencies {
     createCheckoutSession: vi.fn().mockResolvedValue({
       providerSessionId: 'cs_test_order_101',
       checkoutUrl: 'https://checkout.stripe.com/c/pay/cs_test_order_101',
-      expiresAt: new Date('2026-08-10T12:30:00.000Z')
+      expiresAt: new Date('2026-08-10T12:31:00.000Z')
     }),
-    attachCheckoutSession: vi.fn().mockResolvedValue(undefined)
+    attachCheckoutSession: vi.fn().mockResolvedValue(undefined),
+    currentTime: vi.fn().mockReturnValue(new Date('2026-08-10T12:00:10.000Z'))
   };
 }
 
@@ -132,13 +133,13 @@ describe('Checkout orchestration', () => {
     providerResponse.resolve({
       providerSessionId: 'cs_test_order_101',
       checkoutUrl: 'https://checkout.stripe.com/c/pay/cs_test_order_101',
-      expiresAt: new Date('2026-08-10T12:30:00.000Z')
+      expiresAt: new Date('2026-08-10T12:31:00.000Z')
     });
 
     await expect(work).resolves.toEqual({
       orderId,
       checkoutUrl: 'https://checkout.stripe.com/c/pay/cs_test_order_101',
-      checkoutExpiresAt: new Date('2026-08-10T12:30:00.000Z'),
+      checkoutExpiresAt: new Date('2026-08-10T12:31:00.000Z'),
       statusToken: 'guest-status-token-must-stay-local'
     });
     expect(calls).toEqual([
@@ -155,7 +156,7 @@ describe('Checkout orchestration', () => {
       accountEmail: 'reader@example.com',
       currency: 'usd',
       automaticTaxEnabled: true,
-      expiresAt: new Date('2026-08-10T12:30:00.000Z'),
+      expiresAt: new Date('2026-08-10T12:31:00.000Z'),
       successUrl: `https://books.example.com/checkout/success?order=${orderId}`,
       cancelUrl: 'https://books.example.com/checkout/cancel',
       items: [{
@@ -216,8 +217,48 @@ describe('Checkout orchestration', () => {
     });
     for (const deps of [retry, recovered]) {
       expect(deps.createCheckoutSession).toHaveBeenCalledWith(
-        expect.objectContaining({ orderId, expiresAt: new Date('2026-08-10T12:30:00.000Z') })
+        expect.objectContaining({ orderId, expiresAt: new Date('2026-08-10T12:31:00.000Z') })
       );
+    }
+  });
+
+  it('uses a stable whole-second deadline with a provider-creation allowance', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-10T12:00:10.000Z'));
+    try {
+      const deps = dependencies();
+      const acceptedAt = new Date('2026-08-10T12:00:00.987Z');
+      vi.mocked(deps.createAcceptedOrder).mockResolvedValueOnce(accepted({
+        order: { ...accepted().order, createdAt: acceptedAt, updatedAt: acceptedAt }
+      }));
+      vi.mocked(deps.createCheckoutSession).mockImplementationOnce(async (request) => ({
+        providerSessionId: 'cs_test_order_101',
+        checkoutUrl: 'https://checkout.stripe.com/c/pay/cs_test_order_101',
+        expiresAt: request.expiresAt
+      }));
+
+      await orchestrateCheckout({} as never, input, options, deps);
+
+      expect(deps.createCheckoutSession).toHaveBeenCalledWith(expect.objectContaining({
+        expiresAt: new Date('2026-08-10T12:31:00.000Z')
+      }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects a stale unattached attempt before sending an invalid provider expiry', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-10T12:00:31.001Z'));
+    try {
+      const deps = dependencies();
+      vi.mocked(deps.currentTime).mockReturnValueOnce(new Date());
+      await expect(
+        orchestrateCheckout({} as never, input, options, deps)
+      ).rejects.toBeInstanceOf(CommerceConflictError);
+      expect(deps.createCheckoutSession).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
     }
   });
 });

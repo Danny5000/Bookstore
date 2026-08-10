@@ -1,4 +1,4 @@
-import { and, eq } from 'drizzle-orm';
+import { eq } from 'drizzle-orm';
 import { normalizeEmailAddress } from '$lib/server/auth/identity';
 import { appendAuditEvent as defaultAppendAuditEvent } from '$lib/server/audit/service';
 import type { Database } from '$lib/server/db/client';
@@ -238,23 +238,17 @@ export async function fulfillDisputeEvent(
       canonicalPayment,
       event
     );
+    const facts = await lockPaymentAccessFacts(transaction, payment, order);
     const [collision] = await transaction
-      .select()
+      .select({ paymentId: disputes.paymentId })
       .from(disputes)
       .where(eq(disputes.stripeDisputeId, canonicalDispute.providerDisputeId))
-      .limit(1)
-      .for('update');
+      .limit(1);
     if (collision && collision.paymentId !== payment.id) permanentReconciliationFailure();
-    const [existing] = await transaction
-      .select()
-      .from(disputes)
-      .where(and(
-        eq(disputes.paymentId, payment.id),
-        eq(disputes.stripeDisputeId, canonicalDispute.providerDisputeId)
-      ))
-      .limit(1)
-      .for('update');
-    await dependencies.storeDispute(transaction, existing, {
+    const existing = facts.disputes.find(
+      (dispute) => dispute.stripeDisputeId === canonicalDispute.providerDisputeId
+    );
+    const canonicalDisputeRow = await dependencies.storeDispute(transaction, existing, {
       paymentId: payment.id,
       stripeDisputeId: canonicalDispute.providerDisputeId,
       status: canonicalDispute.state,
@@ -262,13 +256,15 @@ export async function fulfillDisputeEvent(
       currency: canonicalDispute.currency.toUpperCase(),
       reason: normalizeDisputeReasonCategory(canonicalDispute.reason),
       providerCreatedAt: canonicalDispute.providerCreatedAt,
-      providerUpdatedAt: canonicalDispute.providerUpdatedAt,
+      providerUpdatedAt: new Date(Math.max(
+        canonicalDispute.providerCreatedAt.getTime(),
+        event.providerCreatedAt.getTime()
+      )),
       reconciliationStatus: 'pending',
       createdAt: now,
       updatedAt: now
     }, now);
 
-    const facts = await lockPaymentAccessFacts(transaction, payment, order);
     const refundById = new Map(facts.refunds.map((refund) => [refund.id, refund]));
     const allocationsByItem = new Map<string, number>();
     for (const allocation of facts.allocations) {
@@ -278,7 +274,12 @@ export async function fulfillDisputeEvent(
       if (!Number.isSafeInteger(total)) permanentReconciliationFailure();
       allocationsByItem.set(allocation.orderItemId, total);
     }
-    const disputeStates = facts.disputes.map((dispute) => dispute.status);
+    const allDisputes = existing
+      ? facts.disputes.map((dispute) =>
+          dispute.id === canonicalDisputeRow.id ? canonicalDisputeRow : dispute
+        )
+      : [...facts.disputes, canonicalDisputeRow];
+    const disputeStates = allDisputes.map((dispute) => dispute.status);
     const itemById = new Map(facts.items.map((item) => [item.id, item]));
     const changedScopes: Array<{ userId: string; titleId: string }> = [];
     const nextStates: DisputedPurchaseGrantState[] = [];

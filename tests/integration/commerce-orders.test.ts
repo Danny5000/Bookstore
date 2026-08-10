@@ -217,7 +217,7 @@ describe('durable accepted commerce orders', () => {
     ))).rejects.toBeInstanceOf(CommerceRateLimitError);
   });
 
-  it('serializes concurrent retries to one order and rotates only the guest credential', async () => {
+  it('serializes concurrent retries to one order and returns the same valid guest credential', async () => {
     const title = await createOrderTitle('Concurrent Order Title');
     const actor: Actor = { type: 'anonymous' };
     const quote = await quoteCart(databaseClient.db, actor, [title.id]);
@@ -229,20 +229,33 @@ describe('durable accepted commerce orders', () => {
     ]);
     expect(first.order.id).toBe(second.order.id);
     expect([first.reused, second.reused].sort()).toEqual([false, true]);
-    expect(first.statusToken).not.toBe(second.statusToken);
+    expect(first.statusToken).toBe(second.statusToken);
     const stored = await databaseClient.db.select().from(orders)
       .where(eq(orders.clientCheckoutAttemptId, input.checkoutAttemptId));
     expect(stored).toHaveLength(1);
-    const currentToken = first.reused ? first.statusToken : second.statusToken;
-    const supersededToken = first.reused ? second.statusToken : first.statusToken;
-    expect(matchesOrderStatusToken(currentToken!, stored[0]!.statusTokenSha256)).toBe(true);
-    expect(matchesOrderStatusToken(supersededToken!, stored[0]!.statusTokenSha256)).toBe(false);
+    expect(matchesOrderStatusToken(first.statusToken!, stored[0]!.statusTokenSha256)).toBe(true);
+    expect(matchesOrderStatusToken(second.statusToken!, stored[0]!.statusTokenSha256)).toBe(true);
     const items = await databaseClient.db.select().from(orderItems)
       .where(eq(orderItems.orderId, stored[0]!.id));
     expect(items).toHaveLength(1);
     const audit = await databaseClient.db.select().from(auditEvents)
       .where(eq(auditEvents.resourceId, stored[0]!.id));
     expect(audit).toHaveLength(1);
+  });
+
+  it('rejects exact reuse after the checkout attempt reaches a terminal state', async () => {
+    const title = await createOrderTitle('Terminal Checkout Attempt Title');
+    const actor: Actor = { type: 'anonymous' };
+    const quote = await quoteCart(databaseClient.db, actor, [title.id]);
+    const input = orderInput(actor, [title.id], quote.fingerprint);
+    const accepted = await createAcceptedOrder(databaseClient.db, input);
+    await databaseClient.db
+      .update(orders)
+      .set({ status: 'expired', updatedAt: new Date() })
+      .where(eq(orders.id, accepted.order.id));
+
+    await expect(createAcceptedOrder(databaseClient.db, input))
+      .rejects.toMatchObject({ code: 'CHECKOUT_ATTEMPT_CONFLICT' });
   });
 
   it('rejects attempt reuse by another actor or a different exact cart', async () => {

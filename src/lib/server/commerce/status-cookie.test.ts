@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   ORDER_STATUS_PROCESSING_GRACE_SECONDS,
   createOrderStatusCredential,
+  deriveOrderStatusCredential,
   isOrderStatusCredentialExpired,
   matchesOrderStatusToken,
   orderStatusCookieName,
@@ -24,6 +25,21 @@ describe('order status credentials', () => {
     expect(matchesOrderStatusToken(`${credential.token.slice(0, -1)}A`, credential.digestSha256)).toBe(false);
     expect(matchesOrderStatusToken('not-canonical', credential.digestSha256)).toBe(false);
     expect(matchesOrderStatusToken(credential.token, 'bad-digest')).toBe(false);
+  });
+
+  it('derives one stable, domain-separated credential for concurrent attempt retries', () => {
+    const secret = 'status-credential-secret-that-is-at-least-thirty-two-bytes';
+    const first = deriveOrderStatusCredential(secret, orderId);
+    const retry = deriveOrderStatusCredential(secret, orderId);
+    const differentAttempt = deriveOrderStatusCredential(
+      secret,
+      '00000000-0000-4000-8000-000000000202'
+    );
+
+    expect(retry).toEqual(first);
+    expect(differentAttempt.token).not.toBe(first.token);
+    expect(first.token).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+    expect(matchesOrderStatusToken(first.token, first.digestSha256)).toBe(true);
   });
 
   it('uses an order-specific name and narrowly scoped private cookie', () => {

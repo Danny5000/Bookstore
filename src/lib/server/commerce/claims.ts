@@ -146,7 +146,8 @@ function groupBy<T>(
 
 async function lockClaimFacts(
   transaction: DatabaseTransaction,
-  paidOrders: readonly (typeof orders.$inferSelect)[]
+  paidOrders: readonly (typeof orders.$inferSelect)[],
+  claimant: { userId: string; verifiedEmail: string }
 ): Promise<LockedClaimFacts> {
   const orderIds = paidOrders.map((order) => order.id);
   const lockedPayments = await transaction
@@ -159,30 +160,6 @@ async function lockClaimFacts(
   if (
     paymentsByOrderId.size !== paidOrders.length ||
     lockedPayments.some((payment) => payment.status !== 'succeeded')
-  ) permanent();
-
-  const items = await transaction
-    .select()
-    .from(orderItems)
-    .where(inArray(orderItems.orderId, orderIds))
-    .orderBy(asc(orderItems.id))
-    .for('update');
-  if (items.length === 0 || items.some((item) => item.totalMinor === null)) permanent();
-
-  const itemIds = items.map((item) => item.id);
-  const lockedGrants = await transaction
-    .select()
-    .from(entitlementGrants)
-    .where(inArray(entitlementGrants.orderItemId, itemIds))
-    .orderBy(asc(entitlementGrants.id))
-    .for('update');
-  const grantsByItemId = new Map(
-    lockedGrants.map((grant) => [grant.orderItemId ?? permanent(), grant])
-  );
-  if (
-    grantsByItemId.size !== items.length ||
-    lockedGrants.length !== items.length ||
-    lockedGrants.some((grant) => grant.source !== 'purchase')
   ) permanent();
 
   const paymentIds = lockedPayments.map((payment) => payment.id);
@@ -208,6 +185,48 @@ async function lockClaimFacts(
     .where(inArray(disputes.paymentId, paymentIds))
     .orderBy(asc(disputes.id))
     .for('update');
+
+  const items = await transaction
+    .select()
+    .from(orderItems)
+    .where(inArray(orderItems.orderId, orderIds))
+    .orderBy(asc(orderItems.id))
+    .for('update');
+  if (items.length === 0 || items.some((item) => item.totalMinor === null)) permanent();
+
+  await lockEntitlementScopes(
+    transaction,
+    items.map((item) => ({ userId: claimant.userId, titleId: item.titleId }))
+  );
+
+  // Preserved-grant creation takes this scope before its user FK lock. Re-locking the claimant
+  // only here keeps that order consistent; the discovery read is revalidated before grant writes.
+  const [lockedClaimant] = await transaction
+    .select()
+    .from(user)
+    .where(eq(user.id, claimant.userId))
+    .limit(1)
+    .for('update');
+  if (
+    !lockedClaimant ||
+    normalizedVerifiedEmail(lockedClaimant) !== claimant.verifiedEmail
+  ) permanent();
+
+  const itemIds = items.map((item) => item.id);
+  const lockedGrants = await transaction
+    .select()
+    .from(entitlementGrants)
+    .where(inArray(entitlementGrants.orderItemId, itemIds))
+    .orderBy(asc(entitlementGrants.id))
+    .for('update');
+  const grantsByItemId = new Map(
+    lockedGrants.map((grant) => [grant.orderItemId ?? permanent(), grant])
+  );
+  if (
+    grantsByItemId.size !== items.length ||
+    lockedGrants.length !== items.length ||
+    lockedGrants.some((grant) => grant.source !== 'purchase')
+  ) permanent();
 
   return {
     items,
@@ -270,8 +289,7 @@ export async function claimGuestPurchases(
       .select()
       .from(user)
       .where(eq(user.id, input.userId))
-      .limit(1)
-      .for('update');
+      .limit(1);
     if (!account) permanent();
     const email = normalizedVerifiedEmail(account);
 
@@ -298,14 +316,13 @@ export async function claimGuestPurchases(
       .for('update');
     if (paidOrders.length === 0) return EMPTY_RESULT;
 
-    const facts = await lockClaimFacts(transaction, paidOrders);
+    const facts = await lockClaimFacts(transaction, paidOrders, {
+      userId: account.id,
+      verifiedEmail: email
+    });
     const orderById = new Map(paidOrders.map((order) => [order.id, order]));
     const uniqueTitleIds = [...new Set(facts.items.map((item) => item.titleId))]
       .sort((left, right) => left.localeCompare(right));
-    await lockEntitlementScopes(
-      transaction,
-      uniqueTitleIds.map((titleId) => ({ userId: account.id, titleId }))
-    );
 
     const changedTitleIds = new Set<string>();
     for (const item of facts.items) {

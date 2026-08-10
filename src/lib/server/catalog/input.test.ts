@@ -59,6 +59,40 @@ describe('catalog inputs', () => {
     ).toThrow();
   });
 
+  it.each(['JPY', 'BHD', 'EUR'])(
+    'accepts supported %s create and metadata inputs',
+    (currency) => {
+      const metadata = {
+        slug: 'supported-currency',
+        title: 'Supported Currency',
+        subtitle: null,
+        description: 'Description',
+        creatorName: 'Creator',
+        priceMinor: 1234,
+        currency: currency.toLowerCase()
+      };
+      expect(parseCreateTitleInput({ ...metadata, format: 'prose' }).currency).toBe(currency);
+      expect(parseUpdateTitleMetadataInput({ ...metadata, titleId }).currency).toBe(currency);
+    }
+  );
+
+  it.each(['ABC', 'ISK', 'UGX'])(
+    'rejects unsupported %s create and metadata inputs',
+    (currency) => {
+      const metadata = {
+        slug: 'unsupported-currency',
+        title: 'Unsupported Currency',
+        subtitle: null,
+        description: 'Description',
+        creatorName: 'Creator',
+        priceMinor: 1234,
+        currency
+      };
+      expect(() => parseCreateTitleInput({ ...metadata, format: 'prose' })).toThrow();
+      expect(() => parseUpdateTitleMetadataInput({ ...metadata, titleId })).toThrow();
+    }
+  );
+
   it('validates revision identifiers and trims the change summary', () => {
     expect(
       parseCreateRevisionInput({

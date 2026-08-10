@@ -5,6 +5,8 @@ import { applicationRateLimits } from '$lib/server/db/schema';
 import type { DatabaseExecutor } from '$lib/server/db/transaction';
 import { PermanentCommerceError } from './errors';
 
+const AUTOMATIC_CLEANUP_LIMIT = 100;
+
 export interface RateLimitScopeInput {
   actor: Actor;
   requestIp: string;
@@ -56,6 +58,11 @@ export async function consumeRateLimit(
 ): Promise<RateLimitDecision> {
   validateLimitInput(input);
   const now = input.now ?? new Date();
+  await cleanupExpiredRateLimits(database, {
+    namespace: input.namespace,
+    now,
+    limit: AUTOMATIC_CLEANUP_LIMIT
+  });
   const windowMilliseconds = input.windowSeconds * 1000;
   const windowStart = new Date(
     Math.floor(now.getTime() / windowMilliseconds) * windowMilliseconds

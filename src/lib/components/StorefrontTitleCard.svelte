@@ -1,5 +1,6 @@
 <script lang="ts">
   import { resolve } from '$app/paths';
+  import { formatMinorCurrency } from '$lib/commerce/money';
   import CartToggle from './CartToggle.svelte';
   import CoverArt from './CoverArt.svelte';
 
@@ -29,9 +30,7 @@
     coverHeight = '300px'
   }: Props = $props();
 
-  const price = $derived(
-    new Intl.NumberFormat('en-US', { style: 'currency', currency }).format(priceMinor / 100)
-  );
+  const price = $derived(formatMinorCurrency(priceMinor, currency));
 </script>
 
 <article class="card">

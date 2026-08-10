@@ -1,4 +1,5 @@
 import { z, type ZodType } from 'zod';
+import { isSupportedCommerceCurrency } from '$lib/commerce/money';
 import { permanentStripeFailure } from './errors';
 import type {
   CheckoutSnapshot,
@@ -16,9 +17,8 @@ const moneySchema = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
 const positiveMoneySchema = moneySchema.refine((value) => value > 0);
 const dateSchema = z.date().refine((value) => Number.isFinite(value.getTime()));
 const normalizedEmailSchema = z.string().trim().toLowerCase().max(320).pipe(z.email());
-const supportedCurrencies = new Set(Intl.supportedValuesOf('currency').map((value) => value.toLowerCase()));
 const currencySchema = z.string().regex(/^[a-z]{3}$/u).refine(
-  (value) => supportedCurrencies.has(value),
+  isSupportedCommerceCurrency,
   'unsupported currency'
 );
 
@@ -153,12 +153,8 @@ const disputeSnapshotSchema = z.strictObject({
   amountMinor: positiveMoneySchema,
   currency: currencySchema,
   reason: disputeReasonSchema.nullable(),
-  providerCreatedAt: dateSchema,
-  providerUpdatedAt: dateSchema
-}).refine(
-  (value) => value.providerUpdatedAt >= value.providerCreatedAt,
-  'provider update precedes creation'
-);
+  providerCreatedAt: dateSchema
+});
 
 const verifiedStripeEventSchema = z.strictObject({
   providerEventId: providerIdSchema,
@@ -175,7 +171,10 @@ export const createCheckoutSessionInputSchema = z.strictObject({
   accountEmail: normalizedEmailSchema.nullable(),
   currency: currencySchema,
   automaticTaxEnabled: z.boolean(),
-  expiresAt: dateSchema,
+  expiresAt: dateSchema.refine(
+    (value) => value.getTime() % 1000 === 0,
+    'checkout expiry must use whole seconds'
+  ),
   successUrl: z.url(),
   cancelUrl: z.url(),
   items: z.array(z.strictObject({
@@ -219,8 +218,8 @@ export const parseVerifiedStripeEvent = (value: unknown): VerifiedStripeEvent =>
 
 export function normalizePaymentState(value: string): PaymentSnapshot['state'] {
   if (value === 'succeeded') return 'succeeded';
-  if (value === 'canceled') return 'failed';
-  if (['processing', 'requires_action', 'requires_confirmation', 'requires_capture', 'requires_payment_method'].includes(value)) return 'pending';
+  if (value === 'canceled' || value === 'requires_payment_method') return 'failed';
+  if (['processing', 'requires_action', 'requires_confirmation', 'requires_capture'].includes(value)) return 'pending';
   throw permanentStripeFailure();
 }
 
@@ -232,7 +231,8 @@ export function normalizeRefundState(value: string): RefundSnapshot['state'] {
 
 export function normalizeDisputeState(value: string): DisputeSnapshot['state'] {
   if (value === 'won' || value === 'lost') return value;
-  if (['warning_needs_response', 'warning_under_review', 'warning_closed', 'needs_response', 'under_review', 'prevented'].includes(value)) return 'open';
+  if (value === 'warning_closed' || value === 'prevented') return 'won';
+  if (['warning_needs_response', 'warning_under_review', 'needs_response', 'under_review'].includes(value)) return 'open';
   throw permanentStripeFailure();
 }
 

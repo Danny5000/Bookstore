@@ -146,7 +146,7 @@ All money uses integer minor units and uppercase ISO currency codes. Different c
 - Nullable tax and total until canonical Checkout values are available.
 - Unique client checkout-attempt ID.
 - Unique nullable Stripe Checkout Session ID.
-- A hashed random order-status credential.
+- A one-way digest of a pseudorandom, attempt-scoped order-status credential.
 - Checkout expiration, payment, creation, and update timestamps.
 
 A paid account order must retain its initiating user and original verified account email. A paid guest order must retain a normalized canonical Checkout email and guest identity. An order can never be both purchase types.
@@ -205,6 +205,8 @@ An unclaimed paid guest purchase has no user and cannot authorize reader or down
 
 The projection rule is exact: an effective `entitlements` row is active when at least one active grant exists for the user and title. If no active grant exists, the row is revoked. Re-activation clears `revokedAt`. Projection locks the user/title scope so concurrent payment, claim, refund, or dispute jobs cannot overwrite one another.
 
+After an operation-local Stripe-event or identity row is locked, every purchase-graph mutation uses the same order: order, payment, refunds, refund allocations, disputes, order items, sorted user/title entitlement scopes, then purchase grants. Canonical provider lookup happens before the transaction; an unlocked payment lookup may identify the order, but the service re-reads and validates payment evidence only after locking the order. This order also matches preserved-grant projection and prevents claim, refund, dispute, and preserved-access transactions from deadlocking one another.
+
 The migration creates `preserved` grants for every active Plan 5 entitlement. This prevents the commerce migration from revoking development, test, or legitimate pre-commerce access. Revoked entitlement rows remain revoked and receive no active preserved grant.
 
 ### 6.7 Stripe events
@@ -225,7 +227,7 @@ The existing outbox gains an optional stable deduplication key. Commerce uses it
 
 ### 6.9 Application rate limits
 
-An application-owned rate-limit table stores a hashed scope key, fixed-window boundary, count, and expiration. Commerce uses namespaced keys for quote and Checkout creation without reading or mutating Better Auth's vendor-owned rate-limit rows. Atomic upserts prevent concurrent requests from bypassing a limit, and expired windows can be removed by idempotent maintenance.
+An application-owned rate-limit table stores a hashed scope key, fixed-window boundary, count, and expiration. Commerce uses namespaced keys for quote and Checkout creation without reading or mutating Better Auth's vendor-owned rate-limit rows. Atomic upserts prevent concurrent requests from bypassing a limit, and each ordinary namespaced consumption performs a bounded, idempotent cleanup of expired rows.
 
 ## 7. Checkout Session creation
 
@@ -242,10 +244,11 @@ Stripe Session creation uses:
 - Format-specific configured Stripe tax codes.
 - Tax behavior `exclusive`.
 - `automatic_tax.enabled` from explicit configuration.
+- Adaptive pricing explicitly disabled so the accepted order currency and amount remain authoritative.
 - Dashboard-managed eligible payment methods rather than a hard-coded method list.
 - Internal order UUID and schema version in metadata and `client_reference_id`.
 - The order UUID as the Stripe API idempotency key.
-- A 30-minute expiration.
+- A deterministic whole-second expiration based on the accepted order time: the configured 30-minute window plus at most one minute of provider-creation allowance.
 - The application's success and cancel URLs.
 
 Metadata never contains email, names, tokens, roles, storage identifiers, or complete title metadata.
@@ -260,21 +263,21 @@ Plan 6A does not maintain reusable Stripe Customer records. Stripe may represent
 
 ### 7.3 Retry and recovery
 
-On successful Session creation, the app stores the unique Session ID, URL, expiration, and `checkout_open` state. The browser receives a redirect, not secret provider data.
+On successful Session creation, the app stores the unique Session ID, expiration, and `checkout_open` state. The URL remains only in the immediate server response used for browser navigation and is never persisted. The browser receives a redirect, not secret provider data.
 
-If the network response is lost, the same local checkout attempt retries the same order and Stripe idempotency key. If Stripe created the Session but the local update failed, metadata and the later verified webhook can still attach the Session to the existing order. A conflicting Session ID places the order in `exception`.
+If the network response is lost, the same local checkout attempt retries the same order, deterministic expiration, and Stripe idempotency key. A 30-second outbound-call safety margin prevents a first provider request after Stripe's minimum-expiration boundary; an attempt that has become too old is explicitly rotated by the cart before retry. If Stripe created the Session but the local update failed, metadata and the later verified webhook can still attach the Session to the existing order. A conflicting Session ID places the order in `exception`.
 
 An unchanged open order may return its existing unexpired Checkout URL. A changed cart creates a new order after explicit quote confirmation. Abandoned or canceled browser navigation does not grant access.
 
 ### 7.4 Price-hold policy
 
-The 30-minute Session is a short-lived accepted quote. If an administrator changes a title's price or visibility after Session creation, a valid payment completed before Session expiration is honored at the stored order price. Entitlements point to stable titles and therefore follow the existing active-edition behavior.
+The Session is a short-lived accepted quote with a 30-minute configured hold and no more than one additional minute reserved for safe provider creation. If an administrator changes a title's price or visibility after Session creation, a valid payment completed before Session expiration is honored at the stored order price. Entitlements point to stable titles and therefore follow the existing active-edition behavior.
 
 This rule avoids charging a customer and then withholding the purchased title because of a concurrent catalog edit. Administrators can expire an exceptional open Session in Stripe Dashboard if a legal or operational emergency requires it.
 
 ## 8. Success, cancellation, and order status
 
-Before redirect, the app stores a random order-status credential only as a database hash and sends the plaintext value in an HTTP-only cookie. The cookie is Secure in production, SameSite Lax, path-scoped where practical, bounded in lifetime, and unrelated to authentication sessions.
+Before redirect, the app derives a domain-separated HMAC credential from the application secret and the random checkout-attempt UUID, stores only its one-way digest, and sends the plaintext value in an HTTP-only cookie. The credential is stable for exact concurrent retries, so reversed response order cannot overwrite a valid cookie with an obsolete one. The cookie is Secure in production, SameSite Lax, path-scoped where practical, bounded in lifetime, and unrelated to authentication sessions.
 
 The success URL identifies the order but does not include a claim token, email, or payment credential. Status access requires either:
 
@@ -471,7 +474,7 @@ The application pins and documents the Stripe SDK API version used to create and
 
 - Checkout mutations require same-origin requests and bounded strict schemas.
 - Checkout creation uses a PostgreSQL-backed fixed-window throttle keyed by authenticated user or a privacy-preserving anonymous client key. The design does not couple application throttling to Better Auth's vendor-owned rate-limit table.
-- Order-status tokens use cryptographically random values and one-way database digests.
+- Order-status tokens are pseudorandom, domain-separated HMAC values scoped to random attempt UUIDs; only one-way digests are stored.
 - Stripe webhook signature verification receives the untouched body and occurs before JSON trust.
 - Verified event live/test mode must match application configuration.
 - Stripe metadata contains internal UUIDs and schema versions only.

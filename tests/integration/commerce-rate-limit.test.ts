@@ -53,12 +53,15 @@ describe('application commerce rate limits', () => {
       maxAttempts: 2,
       now: new Date('2026-08-10T12:00:00.000Z')
     });
-    await consumeRateLimit(databaseClient.db, {
+    const currentWindow = new Date('2026-08-10T12:02:00.000Z');
+    await databaseClient.db.insert(applicationRateLimits).values({
       namespace,
       scopeSha256: scope('c'),
-      windowSeconds: 60,
-      maxAttempts: 2,
-      now: new Date('2026-08-10T12:02:00.000Z')
+      windowStart: currentWindow,
+      count: 1,
+      expiresAt: new Date('2026-08-10T12:03:00.000Z'),
+      createdAt: currentWindow,
+      updatedAt: currentWindow
     });
 
     await expect(
@@ -80,6 +83,37 @@ describe('application commerce rate limits', () => {
       .from(applicationRateLimits)
       .where(eq(applicationRateLimits.namespace, namespace));
     expect(remaining?.value).toBe(1);
+  });
+
+  it('removes expired rows from an active namespace during ordinary consumption', async () => {
+    const namespace = 'commerce.automatic-cleanup';
+    const expiredWindow = new Date('2026-08-10T12:00:00.000Z');
+    const expiredAt = new Date('2026-08-10T12:01:00.000Z');
+    await databaseClient.db.insert(applicationRateLimits).values(
+      ['e', 'f', '0'].map((value) => ({
+        namespace,
+        scopeSha256: scope(value),
+        windowStart: expiredWindow,
+        count: 1,
+        expiresAt: expiredAt,
+        createdAt: expiredWindow,
+        updatedAt: expiredWindow
+      }))
+    );
+
+    await consumeRateLimit(databaseClient.db, {
+      namespace,
+      scopeSha256: scope('1'),
+      windowSeconds: 60,
+      maxAttempts: 2,
+      now: new Date('2026-08-10T12:02:00.000Z')
+    });
+
+    const rows = await databaseClient.db
+      .select({ scopeSha256: applicationRateLimits.scopeSha256 })
+      .from(applicationRateLimits)
+      .where(eq(applicationRateLimits.namespace, namespace));
+    expect(rows).toEqual([{ scopeSha256: scope('1') }]);
   });
 
   it('never allows more than N of 20 concurrent attempts', async () => {

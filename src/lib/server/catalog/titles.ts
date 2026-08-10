@@ -5,13 +5,13 @@ import type { AuditRequestMetadata } from '$lib/server/audit/request-metadata';
 import type { Database } from '$lib/server/db/client';
 import { titles, type TitleRow } from '$lib/server/db/schema';
 import { withTransaction } from '$lib/server/db/transaction';
-import { CatalogDomainError } from './errors';
 import {
   parseCreateTitleInput,
   parseUpdateTitleMetadataInput,
   type CreateTitleInput,
   type UpdateTitleMetadataInput
 } from './input';
+import { withLockedAdminTitle } from './lock';
 
 interface CatalogCommand<T> {
   actor: Actor;
@@ -112,61 +112,60 @@ export async function updateTitleMetadata(
   command: CatalogCommand<UpdateTitleMetadataInput>
 ): Promise<TitleRow> {
   requireCapability(command.actor, 'catalog.manage');
-  const actor = command.actor;
   const input = parseUpdateTitleMetadataInput(command.input);
 
-  return withTransaction(database, async (transaction) => {
-    const [before] = await transaction
-      .select()
-      .from(titles)
-      .where(eq(titles.id, input.titleId))
-      .for('update')
-      .limit(1);
-    if (!before) throw new CatalogDomainError('title_not_found');
-    const [updated] = await transaction
-      .update(titles)
-      .set({
-        slug: input.slug,
-        title: input.title,
-        subtitle: input.subtitle,
-        description: input.description,
-        creatorName: input.creatorName,
-        priceMinor: input.priceMinor,
-        currency: input.currency,
-        updatedAt: new Date()
-      })
-      .where(eq(titles.id, input.titleId))
-      .returning();
-    if (!updated) throw new Error('Title update returned no row');
-    await appendAuditEvent(transaction, {
-      actor,
-      action: 'catalog.title.update',
-      outcome: 'succeeded',
-      resourceType: 'title',
-      resourceId: updated.id,
-      correlationId: command.correlationId,
-      ...(command.requestMetadata ? { requestMetadata: command.requestMetadata } : {}),
-      before: {
-        slug: before.slug,
-        title: before.title,
-        subtitle: before.subtitle,
-        description: before.description,
-        creatorName: before.creatorName,
-        priceMinor: before.priceMinor,
-        currency: before.currency
-      },
-      after: {
-        slug: updated.slug,
-        title: updated.title,
-        subtitle: updated.subtitle,
-        description: updated.description,
-        creatorName: updated.creatorName,
-        priceMinor: updated.priceMinor,
-        currency: updated.currency
+  return withTransaction(database, (transaction) =>
+    withLockedAdminTitle(
+      transaction,
+      command.actor,
+      input.titleId,
+      async ({ actor, title: before }) => {
+        const [updated] = await transaction
+          .update(titles)
+          .set({
+            slug: input.slug,
+            title: input.title,
+            subtitle: input.subtitle,
+            description: input.description,
+            creatorName: input.creatorName,
+            priceMinor: input.priceMinor,
+            currency: input.currency,
+            updatedAt: new Date()
+          })
+          .where(eq(titles.id, input.titleId))
+          .returning();
+        if (!updated) throw new Error('Title update returned no row');
+        await appendAuditEvent(transaction, {
+          actor,
+          action: 'catalog.title.update',
+          outcome: 'succeeded',
+          resourceType: 'title',
+          resourceId: updated.id,
+          correlationId: command.correlationId,
+          ...(command.requestMetadata ? { requestMetadata: command.requestMetadata } : {}),
+          before: {
+            slug: before.slug,
+            title: before.title,
+            subtitle: before.subtitle,
+            description: before.description,
+            creatorName: before.creatorName,
+            priceMinor: before.priceMinor,
+            currency: before.currency
+          },
+          after: {
+            slug: updated.slug,
+            title: updated.title,
+            subtitle: updated.subtitle,
+            description: updated.description,
+            creatorName: updated.creatorName,
+            priceMinor: updated.priceMinor,
+            currency: updated.currency
+          }
+        });
+        return updated;
       }
-    });
-    return updated;
-  });
+    )
+  );
 }
 
 export async function listAdminTitles(database: Database): Promise<TitleRow[]> {

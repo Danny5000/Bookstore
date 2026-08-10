@@ -1,4 +1,4 @@
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq, gte, sql } from 'drizzle-orm';
 import type { JobConfig } from '$lib/server/config/schema';
 import type { Database } from '$lib/server/db/client';
 import { jobs, type JsonObject, type JobRow } from '$lib/server/db/schema';
@@ -41,6 +41,41 @@ export async function enqueueJob(
     .limit(1);
   if (!existing) throw new Error('Deduplicated job could not be loaded');
   return existing;
+}
+
+export interface RearmExhaustedJobInput {
+  type: string;
+  payload: JsonObject;
+  deduplicationKey: string;
+  maxAttempts: number;
+}
+
+export async function rearmExhaustedJob(
+  database: DatabaseExecutor,
+  input: RearmExhaustedJobInput
+): Promise<JobRow | null> {
+  const [rearmed] = await database
+    .update(jobs)
+    .set({
+      status: 'pending',
+      attempts: 0,
+      maxAttempts: input.maxAttempts,
+      lockedAt: null,
+      lockedBy: null,
+      completedAt: null,
+      updatedAt: new Date()
+    })
+    .where(
+      and(
+        eq(jobs.type, input.type),
+        eq(jobs.payload, input.payload),
+        eq(jobs.deduplicationKey, input.deduplicationKey),
+        eq(jobs.status, 'failed'),
+        gte(jobs.attempts, jobs.maxAttempts)
+      )
+    )
+    .returning();
+  return rearmed ?? null;
 }
 
 interface ClaimedJobRow extends Record<string, unknown> {

@@ -85,7 +85,10 @@
         // Checkout remains authoritative when private browsing blocks session storage.
       }
       globalThis.location.assign(result.checkoutUrl);
-    } catch {
+    } catch (error) {
+      if (error instanceof CheckoutClientError && error.kind === 'attempt_conflict') {
+        cart.rotateAttempt();
+      }
       issue = 'checkout_unavailable';
       phase = 'error';
     } finally {

@@ -239,6 +239,7 @@ export function createStripeSdkGateway(options: StripeSdkGatewayOptions): Stripe
         success_url: input.successUrl,
         cancel_url: input.cancelUrl,
         automatic_tax: { enabled: input.automaticTaxEnabled },
+        adaptive_pricing: { enabled: false },
         line_items: input.items.map((item) => ({
           quantity: 1,
           price_data: {
@@ -395,7 +396,6 @@ export function createStripeSdkGateway(options: StripeSdkGatewayOptions): Stripe
       const raw = await providerCall(() => client.disputes.retrieve(id));
       const dispute = parseProvider(rawDisputeSchema, raw);
       assertLiveMode(dispute.livemode, options.expectedLiveMode);
-      const createdAt = unixDate(dispute.created);
       return parseDisputeSnapshot({
         providerDisputeId: dispute.id,
         paymentIntentId: requireReferencedId(dispute.payment_intent),
@@ -405,8 +405,7 @@ export function createStripeSdkGateway(options: StripeSdkGatewayOptions): Stripe
         amountMinor: dispute.amount,
         currency: dispute.currency,
         reason: normalizeDisputeReason(dispute.reason),
-        providerCreatedAt: createdAt,
-        providerUpdatedAt: createdAt
+        providerCreatedAt: unixDate(dispute.created)
       });
     },
 

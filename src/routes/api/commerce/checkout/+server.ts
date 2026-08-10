@@ -2,6 +2,7 @@ import type { RequestHandler } from './$types';
 import {
   CartChangedError,
   CheckoutUnavailableError,
+  CommerceConflictError,
   CommerceRateLimitError,
   InvalidCartError,
   RetryableProviderError
@@ -71,6 +72,12 @@ export const POST: RequestHandler = async (event) => {
     }
     if (error instanceof InvalidCartError) {
       return privateJson({ code: error.code }, 422);
+    }
+    if (
+      error instanceof CommerceConflictError &&
+      error.code === 'CHECKOUT_ATTEMPT_CONFLICT'
+    ) {
+      return privateJson({ code: error.code }, 409);
     }
     if (error instanceof CommerceRateLimitError) {
       const config = getApplicationConfig();

@@ -288,6 +288,7 @@ function comicDraftInput(
 describe('title metadata and covers', () => {
   it('updates strict metadata with authorization, audit, and immediate admin queries', async () => {
     const title = await createTitle('metadata-title');
+    await persistAdminRole();
 
     const updated = await updateTitleMetadata(databaseClient.db, {
       actor: admin,
@@ -326,6 +327,30 @@ describe('title metadata and covers', () => {
       resourceId: title.id,
       outcome: 'succeeded',
       requestMetadata: { method: 'POST', routeId: '/admin/catalog/[titleId]' }
+    });
+  });
+
+  it('revalidates the administrator role at the metadata write serialization point', async () => {
+    const title = await createTitle('stale-admin-metadata');
+
+    await expect(updateTitleMetadata(databaseClient.db, {
+      actor: admin,
+      correlationId: 'stale-admin-metadata',
+      input: {
+        titleId: title.id,
+        slug: title.slug,
+        title: 'Unauthorized metadata update',
+        subtitle: title.subtitle,
+        description: title.description,
+        creatorName: title.creatorName,
+        priceMinor: 2599,
+        currency: title.currency
+      }
+    })).rejects.toMatchObject({ code: 'forbidden' });
+
+    await expect(getAdminTitleDetail(databaseClient.db, title.id)).resolves.toMatchObject({
+      title: 'Original Title',
+      priceMinor: 1299
     });
   });
 

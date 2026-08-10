@@ -1,5 +1,6 @@
 <script lang="ts">
   import { resolve } from '$app/paths';
+  import { formatMinorCurrency } from '$lib/commerce/money';
   import CoverArt from '$lib/components/CoverArt.svelte';
   import type { CommerceQuoteDto } from '$lib/types/commerce';
 
@@ -29,12 +30,6 @@
     oncheckout = () => undefined,
     onretry = () => undefined
   }: Props = $props();
-
-  function money(amountMinor: number, currency: string): string {
-    return new Intl.NumberFormat('en-US', { style: 'currency', currency }).format(
-      amountMinor / 100
-    );
-  }
 
   function issueText(value: Issue | null): string {
     if (value === 'mixed_currency') {
@@ -89,7 +84,7 @@
                 <span class="mono">{item.format === 'comic' ? 'Comic' : 'Book'}</span>
               </span>
             </a>
-            <span class="item-price">{money(item.unitSubtotalMinor, item.currency)}</span>
+            <span class="item-price">{formatMinorCurrency(item.unitSubtotalMinor, item.currency)}</span>
             <button
               class="remove"
               type="button"
@@ -135,7 +130,7 @@
 
     {#if quote.currency}
       <aside class="summary" aria-label="Cart total">
-        <div><span>Subtotal</span><strong>{money(quote.subtotalMinor, quote.currency)}</strong></div>
+        <div><span>Subtotal</span><strong>{formatMinorCurrency(quote.subtotalMinor, quote.currency)}</strong></div>
         <p>Tax calculated at checkout</p>
         <button
           class="btn"

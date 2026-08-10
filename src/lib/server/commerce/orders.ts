@@ -25,7 +25,7 @@ import { lockCheckoutAttempt } from './lock';
 import { lockOrder } from './lock';
 import { lockAndQuoteCart } from './quote';
 import { consumeRateLimit, rateLimitScopeDigest } from './rate-limit';
-import { createOrderStatusCredential } from './status-cookie';
+import { deriveOrderStatusCredential } from './status-cookie';
 import type {
   CreateCheckoutSessionInput,
   CreatedCheckoutSession
@@ -126,8 +126,7 @@ async function reuseAcceptedOrder(
   database: Parameters<Parameters<Database['transaction']>[0]>[0],
   existing: OrderRow,
   input: CreateAcceptedOrderInput,
-  validated: ReturnType<typeof validateInput>,
-  now: Date
+  validated: ReturnType<typeof validateInput>
 ): Promise<AcceptedOrder> {
   const items = await database
     .select()
@@ -145,14 +144,14 @@ async function reuseAcceptedOrder(
     input.actor.type === 'anonymous' &&
     (existing.status === 'checkout_pending' || existing.status === 'checkout_open')
   ) {
-    const credential = createOrderStatusCredential();
-    const [updated] = await database
-      .update(orders)
-      .set({ statusTokenSha256: credential.digestSha256, updatedAt: now })
-      .where(eq(orders.id, existing.id))
-      .returning();
-    if (!updated) throw new PermanentCommerceError();
-    return { order: updated, items, statusToken: credential.token, reused: true };
+    const credential = deriveOrderStatusCredential(
+      input.applicationSecret,
+      validated.checkoutAttemptId
+    );
+    if (!equalSha256(existing.statusTokenSha256, credential.digestSha256)) {
+      throw new CommerceConflictError('CHECKOUT_ATTEMPT_CONFLICT');
+    }
+    return { order: existing, items, statusToken: credential.token, reused: true };
   }
   return { order: existing, items, statusToken: null, reused: true };
 }
@@ -192,8 +191,7 @@ export async function createAcceptedOrder(
           transaction,
           existing,
           input,
-          validated,
-          now
+          validated
         ) } as const;
       }
 
@@ -206,7 +204,10 @@ export async function createAcceptedOrder(
       const purchaseEmail = input.actor.type === 'user'
         ? await accountEmail(transaction, input.actor)
         : null;
-      const credential = createOrderStatusCredential();
+      const credential = deriveOrderStatusCredential(
+        input.applicationSecret,
+        validated.checkoutAttemptId
+      );
       const [order] = await transaction
         .insert(orders)
         .values({
@@ -316,6 +317,7 @@ export interface CheckoutOrchestrationDependencies {
     database: Database,
     input: AttachCheckoutSessionInput
   ): Promise<void>;
+  currentTime(): Date;
 }
 
 export interface AttachCheckoutSessionDependencies {
@@ -401,14 +403,35 @@ const defaultCheckoutDependencies: CheckoutOrchestrationDependencies = {
     const { getStripeCommerceGateway } = await import('./stripe/runtime');
     return getStripeCommerceGateway().createCheckoutSession(input);
   },
-  attachCheckoutSession
+  attachCheckoutSession,
+  currentTime: () => new Date()
 };
+
+const CHECKOUT_PROVIDER_CREATION_ALLOWANCE_SECONDS = 60;
+const CHECKOUT_PROVIDER_CALL_SAFETY_SECONDS = 30;
 
 function checkoutExpiry(order: OrderRow, durationSeconds: number): Date {
   if (!Number.isInteger(durationSeconds) || durationSeconds !== 1800) {
     throw new PermanentCommerceError();
   }
-  return new Date(order.createdAt.getTime() + durationSeconds * 1000);
+  const createdAtMilliseconds = order.createdAt.getTime();
+  if (!Number.isFinite(createdAtMilliseconds)) throw new PermanentCommerceError();
+  const createdAtEpochSeconds = Math.floor(createdAtMilliseconds / 1000);
+  return new Date(
+    (createdAtEpochSeconds + durationSeconds + CHECKOUT_PROVIDER_CREATION_ALLOWANCE_SECONDS) * 1000
+  );
+}
+
+function assertCheckoutCanReachProvider(
+  expiresAt: Date,
+  durationSeconds: number,
+  providerRequestTime: Date
+): void {
+  const minimumRemainingMilliseconds =
+    (durationSeconds + CHECKOUT_PROVIDER_CALL_SAFETY_SECONDS) * 1000;
+  if (expiresAt.getTime() - providerRequestTime.getTime() < minimumRemainingMilliseconds) {
+    throw new CommerceConflictError('CHECKOUT_ATTEMPT_CONFLICT');
+  }
 }
 
 function checkoutUrls(origin: string, orderId: string): { successUrl: string; cancelUrl: string } {
@@ -429,6 +452,11 @@ export async function orchestrateCheckout(
 ): Promise<CheckoutOrchestrationResult> {
   const accepted = await dependencies.createAcceptedOrder(database, input);
   const expiresAt = checkoutExpiry(accepted.order, options.checkoutDurationSeconds);
+  assertCheckoutCanReachProvider(
+    expiresAt,
+    options.checkoutDurationSeconds,
+    dependencies.currentTime()
+  );
   const urls = checkoutUrls(options.origin, accepted.order.id);
   const created = await dependencies.createCheckoutSession({
     orderId: accepted.order.id,

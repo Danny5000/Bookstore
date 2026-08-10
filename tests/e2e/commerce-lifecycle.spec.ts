@@ -5,6 +5,7 @@ import { refunds } from '$lib/server/db/schema';
 import { validEpubFixture } from '../fixtures/publications';
 import { registerAndVerifyCustomer } from './customer-session';
 import { createCommerceHarness } from './commerce-harness';
+import { assertCommercePrivacy } from './commerce-privacy';
 import { publishCommerceProse } from './commerce-publication';
 import { openE2EDatabase } from './database';
 import {
@@ -61,6 +62,9 @@ test('delayed payments, refunds, preserved grants, and disputes converge on effe
     password: 'plan-six-lifecycle-password-2026',
     displayName: 'Lifecycle Customer'
   });
+  const browserLogs: string[] = [];
+  const orderIds: string[] = [];
+  customerPage.on('console', (message) => browserLogs.push(message.text()));
 
   try {
     const first = await publishCommerceProse(adminPage, {
@@ -75,6 +79,7 @@ test('delayed payments, refunds, preserved grants, and disputes converge on effe
     });
 
     const delayedOrder = await startAccountCheckout(customerPage, customerContext, [first.slug]);
+    orderIds.push(delayedOrder);
     await commerce.fulfillCheckout(delayedOrder, { state: 'pending', email });
     await expect(customerPage.getByRole('status')).toContainText('Confirming your purchase');
     expect((await customerContext.request.get(`/library/${first.titleId}/download`)).status())
@@ -90,6 +95,7 @@ test('delayed payments, refunds, preserved grants, and disputes converge on effe
       .toBe(404);
 
     const failedOrder = await startAccountCheckout(customerPage, customerContext, [second.slug]);
+    orderIds.push(failedOrder);
     const failedAttempt = await cartAttempt(customerPage);
     await commerce.fulfillCheckout(failedOrder, { state: 'pending', email });
     await commerce.fulfillCheckout(failedOrder, { state: 'failed', email });
@@ -101,6 +107,7 @@ test('delayed payments, refunds, preserved grants, and disputes converge on effe
       .toBe(404);
 
     const multiOrder = await startAccountCheckout(customerPage, customerContext, [first.slug]);
+    orderIds.push(multiOrder);
     await commerce.fulfillCheckout(multiOrder, { state: 'paid', email });
     await expect(customerPage.getByRole('status')).toContainText('Purchase complete', {
       timeout: 10_000
@@ -130,6 +137,7 @@ test('delayed payments, refunds, preserved grants, and disputes converge on effe
       .toBe(404);
 
     const disputedOrder = await startAccountCheckout(customerPage, customerContext, [second.slug]);
+    orderIds.push(disputedOrder);
     await commerce.fulfillCheckout(disputedOrder, { state: 'paid', email });
     await expect(customerPage.getByRole('status')).toContainText('Purchase complete', {
       timeout: 10_000
@@ -140,8 +148,7 @@ test('delayed payments, refunds, preserved grants, and disputes converge on effe
     await commerce.fulfillDispute(disputedOrder, {
       state: 'won',
       providerDisputeId: opened.providerDisputeId,
-      providerCreatedAt: opened.providerCreatedAt,
-      providerUpdatedAt: new Date(Date.now() + 1_000)
+      providerCreatedAt: opened.providerCreatedAt
     });
     expect((await customerContext.request.get(`/library/${second.titleId}/download`)).status())
       .toBe(200);
@@ -150,13 +157,15 @@ test('delayed payments, refunds, preserved grants, and disputes converge on effe
     await commerce.fulfillDispute(disputedOrder, {
       state: 'lost',
       providerDisputeId: lost.providerDisputeId,
-      providerCreatedAt: lost.providerCreatedAt,
-      providerUpdatedAt: new Date(Date.now() + 2_000)
+      providerCreatedAt: lost.providerCreatedAt
     });
     expect((await customerContext.request.get(`/library/${second.titleId}/download`)).status())
       .toBe(404);
     expect((await customerContext.request.get(`/library/${first.titleId}/download`)).status())
       .toBe(200);
+    assertCommercePrivacy('lifecycle browser', await customerPage.locator('body').innerText());
+    assertCommercePrivacy('lifecycle console', browserLogs, [email]);
+    assertCommercePrivacy('lifecycle database', await commerce.privacySnapshot(orderIds));
   } finally {
     await database.close();
     await customerContext.close();

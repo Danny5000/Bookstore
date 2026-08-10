@@ -6,8 +6,15 @@ import { parseVerifiedStripeEvent } from './stripe/schemas';
 import type { Database } from '$lib/server/db/client';
 import { stripeEvents, type StripeEventRow } from '$lib/server/db/schema';
 import type { DatabaseExecutor } from '$lib/server/db/transaction';
-import { enqueueJob as defaultEnqueueJob } from '$lib/server/jobs/repository';
-import { STRIPE_EVENT_JOB, createStripeEventJobPayload } from './job';
+import {
+  enqueueJob as defaultEnqueueJob,
+  rearmExhaustedJob
+} from '$lib/server/jobs/repository';
+import {
+  STRIPE_EVENT_JOB,
+  STRIPE_EVENT_JOB_MAX_ATTEMPTS,
+  createStripeEventJobPayload
+} from './job';
 
 export const SUPPORTED_STRIPE_EVENT_TYPES = Object.freeze([
   'checkout.session.completed',
@@ -136,7 +143,21 @@ async function enqueueStripeEventJob(
   await dependencies.enqueueJob(database, {
     type: STRIPE_EVENT_JOB,
     payload: createStripeEventJobPayload(stripeEventId),
-    deduplicationKey: `stripe:event:${providerEventId}`
+    deduplicationKey: `stripe:event:${providerEventId}`,
+    maxAttempts: STRIPE_EVENT_JOB_MAX_ATTEMPTS
+  });
+}
+
+async function rearmStripeEventJob(
+  database: DatabaseExecutor,
+  stripeEventId: string,
+  providerEventId: string
+): Promise<void> {
+  await rearmExhaustedJob(database, {
+    type: STRIPE_EVENT_JOB,
+    payload: createStripeEventJobPayload(stripeEventId),
+    deduplicationKey: `stripe:event:${providerEventId}`,
+    maxAttempts: STRIPE_EVENT_JOB_MAX_ATTEMPTS
   });
 }
 
@@ -183,6 +204,9 @@ export async function acceptStripeEvent(
     if (!existing) throw permanentStripeFailure();
     const exact = timingSafeEqual(rowDigest(existing), immutableDigest(event));
     if (!exact) return { status: 'conflict', stripeEventId: existing.id };
+    if (existing.status === 'pending') {
+      await rearmStripeEventJob(transaction, existing.id, existing.providerEventId);
+    }
     return { status: 'duplicate', stripeEventId: existing.id };
   });
 }

@@ -28,4 +28,22 @@ describe('StorefrontTitleCard', () => {
     expect(body).toMatch(/aria-label="Add The Glass Moon to cart"/u);
     expect(body).not.toMatch(/<a[^>]*>[\s\S]*<button[^>]*>[\s\S]*<\/a>/u);
   });
+
+  it('renders zero-decimal catalog prices from minor units', () => {
+    const { body } = render(StorefrontTitleCard, {
+      props: {
+        titleId,
+        slug: 'tokyo-stories',
+        title: 'Tokyo Stories',
+        creatorName: 'A. Writer',
+        format: 'prose',
+        coverUrl: null,
+        priceMinor: 1234,
+        currency: 'JPY'
+      }
+    });
+
+    expect(body).toContain('¥1,234');
+    expect(body).not.toContain('¥12.34');
+  });
 });

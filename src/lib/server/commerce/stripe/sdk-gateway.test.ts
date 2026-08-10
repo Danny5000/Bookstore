@@ -129,6 +129,7 @@ describe('Stripe SDK gateway', () => {
       success_url: input.successUrl,
       cancel_url: input.cancelUrl,
       automatic_tax: { enabled: true },
+      adaptive_pricing: { enabled: false },
       line_items: [{
         quantity: 1,
         price_data: {
@@ -162,7 +163,10 @@ describe('Stripe SDK gateway', () => {
     }));
     const [request] = sdk.client.checkout.sessions.create.mock.calls[0]!;
     expect(request).not.toHaveProperty('customer_email');
-    expect(request).toMatchObject({ automatic_tax: { enabled: false } });
+    expect(request).toMatchObject({
+      automatic_tax: { enabled: false },
+      adaptive_pricing: { enabled: false }
+    });
 
     await expect(gateway.createCheckoutSession(checkoutInputFixture({
       successUrl: 'https://evil.example/steal'
@@ -179,6 +183,13 @@ describe('Stripe SDK gateway', () => {
     await expect(
       createStripeSdkGateway(options).createCheckoutSession(checkoutInputFixture())
     ).rejects.toBeInstanceOf(PermanentCommerceError);
+  });
+
+  it('rejects a fractional-second expiry before the SDK can truncate it', async () => {
+    await expect(createStripeSdkGateway(options).createCheckoutSession(checkoutInputFixture({
+      expiresAt: new Date('2026-08-10T12:30:00.987Z')
+    }))).rejects.toBeInstanceOf(PermanentCommerceError);
+    expect(sdk.client.checkout.sessions.create).not.toHaveBeenCalled();
   });
 
   it('retrieves and validates every paginated line item', async () => {

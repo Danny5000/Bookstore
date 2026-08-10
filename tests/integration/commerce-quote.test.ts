@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { eq, sql } from 'drizzle-orm';
+import { eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import type { Actor } from '$lib/server/auth/admin-policy';
+import { updateTitleMetadata } from '$lib/server/catalog/titles';
 import { InvalidCartError } from '$lib/server/commerce/errors';
 import { lockAndQuoteCart, quoteCart } from '$lib/server/commerce/quote';
 import { setPreservedGrantState } from '$lib/server/commerce/grants';
@@ -11,7 +12,8 @@ import {
   revisionPresentations,
   titleRevisions,
   titles,
-  user
+  user,
+  userRoles
 } from '$lib/server/db/schema';
 import { databaseClient } from './database';
 
@@ -27,6 +29,18 @@ async function createCustomer(): Promise<Extract<Actor, { type: 'user' }>> {
     emailVerified: true
   });
   return { type: 'user', id, roles: ['customer'] };
+}
+
+async function createAdministrator(): Promise<Extract<Actor, { type: 'user' }>> {
+  const id = randomUUID();
+  await databaseClient.db.insert(user).values({
+    id,
+    name: 'Quote Administrator',
+    email: `${id}@example.com`,
+    emailVerified: true
+  });
+  await databaseClient.db.insert(userRoles).values({ userId: id, role: 'admin' });
+  return { type: 'user', id, roles: ['admin'] };
 }
 
 interface QuoteTitleOptions {
@@ -118,6 +132,25 @@ async function createQuoteTitle(options: QuoteTitleOptions) {
       .where(eq(titles.id, title.id));
   }
   return { title, revision, presentationId };
+}
+
+async function waitForBlockedTitleAdvisoryLock(): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const result = await databaseClient.pool.query<{ blocked: boolean }>(`
+      select exists (
+        select 1
+        from pg_stat_activity
+        where datname = current_database()
+          and pid <> pg_backend_pid()
+          and wait_event_type = 'Lock'
+          and wait_event = 'advisory'
+          and query ilike '%pg_advisory_xact_lock%'
+      ) as blocked
+    `);
+    if (result.rows[0]?.blocked) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error('Expected the metadata write to wait for the checkout title lock');
 }
 
 describe('authoritative commerce quotes', () => {
@@ -251,35 +284,69 @@ describe('authoritative commerce quotes', () => {
     });
   });
 
-  it('locked re-quote observes a catalog change committed while waiting for the title lock', async () => {
+  it('serializes a real metadata price write after the locked checkout quote commits', async () => {
     const fixture = await createQuoteTitle({ label: 'Concurrent Price Quote Title' });
-    let releaseChange!: () => void;
-    const release = new Promise<void>((resolve) => {
-      releaseChange = resolve;
+    const admin = await createAdministrator();
+    const completionOrder: string[] = [];
+    let releaseCheckout!: () => void;
+    const checkoutMayCommit = new Promise<void>((resolve) => {
+      releaseCheckout = resolve;
     });
-    let signalLocked!: () => void;
-    const locked = new Promise<void>((resolve) => {
-      signalLocked = resolve;
+    let signalQuoted!: () => void;
+    const checkoutQuoted = new Promise<void>((resolve) => {
+      signalQuoted = resolve;
     });
-    const catalogChange = databaseClient.db.transaction(async (transaction) => {
-      await transaction.execute(
-        sql`select pg_advisory_xact_lock(hashtextextended(${fixture.title.id}, 0))`
+    const checkout = databaseClient.db.transaction(async (transaction) => {
+      const quote = await lockAndQuoteCart(
+        transaction,
+        { type: 'anonymous' },
+        [fixture.title.id]
       );
-      signalLocked();
-      await release;
-      await transaction
-        .update(titles)
-        .set({ priceMinor: 1500, updatedAt: new Date() })
-        .where(eq(titles.id, fixture.title.id));
+      signalQuoted();
+      await checkoutMayCommit;
+      return quote;
+    }).then((quote) => {
+      completionOrder.push('checkout');
+      return quote;
     });
-    await locked;
-    const waitingQuote = databaseClient.db.transaction((transaction) =>
-      lockAndQuoteCart(transaction, { type: 'anonymous' }, [fixture.title.id])
-    );
-    releaseChange();
-    await catalogChange;
+    await checkoutQuoted;
 
-    await expect(waitingQuote).resolves.toMatchObject({
+    const metadataWrite = updateTitleMetadata(databaseClient.db, {
+      actor: admin,
+      correlationId: 'concurrent-price-update',
+      input: {
+        titleId: fixture.title.id,
+        slug: fixture.title.slug,
+        title: fixture.title.title,
+        subtitle: fixture.title.subtitle,
+        description: fixture.title.description,
+        creatorName: fixture.title.creatorName,
+        priceMinor: 1500,
+        currency: fixture.title.currency
+      }
+    }).then((title) => {
+      completionOrder.push('metadata');
+      return title;
+    });
+
+    try {
+      await waitForBlockedTitleAdvisoryLock();
+    } finally {
+      releaseCheckout();
+    }
+    const [quote, updated] = await Promise.all([checkout, metadataWrite]);
+
+    expect(quote).toMatchObject({
+      subtotalMinor: 1000,
+      items: [{ titleId: fixture.title.id, unitSubtotalMinor: 1000 }]
+    });
+    expect(updated).toMatchObject({
+      id: fixture.title.id,
+      priceMinor: 1500
+    });
+    expect(completionOrder).toEqual(['checkout', 'metadata']);
+    await expect(quoteCart(databaseClient.db, { type: 'anonymous' }, [fixture.title.id]))
+      .resolves.toMatchObject({
       subtotalMinor: 1500,
       items: [{ titleId: fixture.title.id, unitSubtotalMinor: 1500 }]
     });

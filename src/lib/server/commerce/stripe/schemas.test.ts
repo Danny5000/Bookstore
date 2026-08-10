@@ -33,10 +33,33 @@ describe('canonical Stripe boundary schemas', () => {
     expect(() => parseRefundSnapshot({ ...refundSnapshotFixture(), billingEmail: 'private@example.com' })).toThrow();
   });
 
+  it('uses the Stripe event time, not an invented Dispute update timestamp', () => {
+    const snapshot = {
+      providerDisputeId: 'dp_test_fixture_101',
+      paymentIntentId: 'pi_test_fixture_101',
+      chargeId: 'ch_test_fixture_101',
+      liveMode: false,
+      state: 'open' as const,
+      amountMinor: 1403,
+      currency: 'usd',
+      reason: 'fraudulent',
+      providerCreatedAt: new Date('2026-08-10T14:00:00.000Z')
+    };
+    expect(parseDisputeSnapshot(snapshot)).toEqual(snapshot);
+    expect(() => parseDisputeSnapshot({
+      ...snapshot,
+      providerUpdatedAt: new Date('2026-08-10T14:01:00.000Z')
+    })).toThrow();
+  });
+
   it.each([
     ['float money', checkoutSnapshotFixture({ subtotalMinor: 12.5 })],
     ['unsafe money', checkoutSnapshotFixture({ subtotalMinor: Number.MAX_SAFE_INTEGER + 1 })],
     ['unknown currency', checkoutSnapshotFixture({ currency: 'zzz' })],
+    ['unsupported Stripe charge-unit exception', checkoutSnapshotFixture({
+      currency: 'isk',
+      lineItems: checkoutSnapshotFixture().lineItems.map((line) => ({ ...line, currency: 'isk' }))
+    })],
     ['unknown status', { ...checkoutSnapshotFixture(), status: 'refunded' }],
     ['missing ID', { ...checkoutSnapshotFixture(), providerSessionId: '' }],
     ['too many lines', checkoutSnapshotFixture({ lineItems: Array.from({ length: 26 }, (_, index) => ({
@@ -53,11 +76,12 @@ describe('canonical Stripe boundary schemas', () => {
   });
 
   it('normalizes provider lifecycle states exhaustively', () => {
-    for (const state of ['processing', 'requires_action', 'requires_confirmation', 'requires_capture', 'requires_payment_method']) {
+    for (const state of ['processing', 'requires_action', 'requires_confirmation', 'requires_capture']) {
       expect(normalizePaymentState(state)).toBe('pending');
     }
     expect(normalizePaymentState('succeeded')).toBe('succeeded');
     expect(normalizePaymentState('canceled')).toBe('failed');
+    expect(normalizePaymentState('requires_payment_method')).toBe('failed');
     expect(() => normalizePaymentState('mystery')).toThrow();
 
     expect(normalizeRefundState('requires_action')).toBe('pending');
@@ -67,10 +91,12 @@ describe('canonical Stripe boundary schemas', () => {
     expect(normalizeRefundState('canceled')).toBe('canceled');
     expect(() => normalizeRefundState('mystery')).toThrow();
 
-    for (const state of ['warning_needs_response', 'warning_under_review', 'warning_closed', 'needs_response', 'under_review', 'prevented']) {
+    for (const state of ['warning_needs_response', 'warning_under_review', 'needs_response', 'under_review']) {
       expect(normalizeDisputeState(state)).toBe('open');
     }
     expect(normalizeDisputeState('won')).toBe('won');
+    expect(normalizeDisputeState('warning_closed')).toBe('won');
+    expect(normalizeDisputeState('prevented')).toBe('won');
     expect(normalizeDisputeState('lost')).toBe('lost');
     expect(() => normalizeDisputeState('mystery')).toThrow();
   });

@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   CartChangedError,
   CheckoutUnavailableError,
+  CommerceConflictError,
   CommerceRateLimitError,
   InvalidCartError,
   PermanentCommerceError,
@@ -142,6 +143,9 @@ describe('POST /api/commerce/checkout', () => {
   it.each([
     [new CartChangedError(quote), 409, { status: 'cart_changed', quote }],
     [new InvalidCartError(), 422, { code: 'INVALID_CART' }],
+    [new CommerceConflictError('CHECKOUT_ATTEMPT_CONFLICT'), 409, {
+      code: 'CHECKOUT_ATTEMPT_CONFLICT'
+    }],
     [new CheckoutUnavailableError(), 503, { code: 'CHECKOUT_UNAVAILABLE' }],
     [new RetryableProviderError(), 503, { code: 'CHECKOUT_UNAVAILABLE' }],
     [new PermanentCommerceError(), 500, { code: 'CHECKOUT_UNAVAILABLE' }]
