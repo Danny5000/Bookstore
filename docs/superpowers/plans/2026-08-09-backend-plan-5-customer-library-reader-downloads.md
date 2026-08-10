@@ -185,7 +185,7 @@ Generate `drizzle/0004_plan5_reader_library.sql` and matching `drizzle/meta` sta
 - Create: `src/lib/types/library.test.ts`
 - Modify: `docs/dependency-decisions.md`
 
-- [ ] **Step 1: Reconfirm current, wanted, and supported dependency versions**
+- [x] **Step 1: Reconfirm current, wanted, and supported dependency versions**
 
 Run:
 
@@ -199,7 +199,7 @@ npm audit --omit=dev --json
 
 Expected: TypeScript is the only outdated direct dependency; the installed/wanted version is `6.0.3`, registry latest is `7.0.2`, `typescript-eslint` rejects 7.x, `svelte-check` accepts only 5.x/6.x, and the runtime audit has zero high/critical advisories. If those facts changed, use official package metadata/release notes to update this plan and `docs/dependency-decisions.md` before installing anything. Do not run `npm audit fix --force`.
 
-- [ ] **Step 2: Write failing runtime-contract tests**
+- [x] **Step 2: Write failing runtime-contract tests**
 
 Create `src/lib/types/library.test.ts`. Exercise strict Zod schemas exported beside the TypeScript DTOs so route code and tests share one definition:
 
@@ -232,7 +232,7 @@ describe('reader location contracts', () => {
 
 Also assert font size bounds `14..24`, the existing `serif | sans | georgia` typeface IDs, the existing `white | sepia | dim` paper IDs, the exact comic-mode enum, nonnegative expected versions, UUID IDs, and rejection of unknown keys.
 
-- [ ] **Step 3: Prove the contract tests fail**
+- [x] **Step 3: Prove the contract tests fail**
 
 Run:
 
@@ -242,7 +242,7 @@ npx vitest run src/lib/types/library.test.ts
 
 Expected: FAIL because `src/lib/types/library.ts` does not exist.
 
-- [ ] **Step 4: Implement the browser-safe DTOs and strict schemas**
+- [x] **Step 4: Implement the browser-safe DTOs and strict schemas**
 
 Create `src/lib/types/library.ts` with the target location/state shapes above plus:
 
@@ -281,7 +281,7 @@ Export strict request schemas for progress PUT, bookmark POST, preferences PUT, 
 
 Also export strict response schemas for progress, bookmarks, preferences, title preferences, migration notice, initial state, and stale-state envelopes. The browser persistence adapter parses server responses with these schemas instead of casting JSON.
 
-- [ ] **Step 5: Run focused and static tests**
+- [x] **Step 5: Run focused and static tests**
 
 Run:
 
@@ -293,7 +293,7 @@ npm run lint
 
 Expected: contract tests pass; Svelte/TypeScript check reports zero errors and warnings; lint exits zero.
 
-- [ ] **Step 6: Commit the contracts**
+- [x] **Step 6: Commit the contracts**
 
 ```powershell
 git add src/lib/types/library.ts src/lib/types/library.test.ts docs/dependency-decisions.md
