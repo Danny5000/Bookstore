@@ -26,6 +26,7 @@ export const auth = createAuthServer({
   queueVerificationEmail: async () => undefined,
   queueResetEmail: async () => undefined,
   queueMagicEmail: async () => undefined,
+  queueCommerceClaimEmail: async () => undefined,
   canSendMagicLink: async () => true,
   onUserCreated: async () => undefined
 });

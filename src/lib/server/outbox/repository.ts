@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { and, eq, sql } from 'drizzle-orm';
 import { outboxMessages, type JsonObject, type OutboxMessageRow } from '$lib/server/db/schema';
-import type { DatabaseTransaction } from '$lib/server/db/transaction';
+import type { DatabaseExecutor, DatabaseTransaction } from '$lib/server/db/transaction';
 import { enqueueJob } from '$lib/server/jobs/repository';
 
 export const OUTBOX_DISPATCH_JOB = 'outbox.dispatch';
@@ -18,6 +18,18 @@ export class OutboxDeduplicationInvariantError extends Error {
     super('Outbox deduplication key was reused with different message contents');
     this.name = 'OutboxDeduplicationInvariantError';
   }
+}
+
+export async function findOutboxMessageByDeduplicationKey(
+  database: DatabaseExecutor,
+  deduplicationKey: string
+): Promise<OutboxMessageRow | null> {
+  const [message] = await database
+    .select()
+    .from(outboxMessages)
+    .where(eq(outboxMessages.deduplicationKey, deduplicationKey))
+    .limit(1);
+  return message ?? null;
 }
 
 export async function enqueueOutboxMessage(

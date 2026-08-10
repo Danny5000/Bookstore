@@ -28,6 +28,7 @@ function createTestAuth() {
     queueVerificationEmail: (input) => queueAuthEmail(databaseClient.db, input),
     queueResetEmail: (input) => queueAuthEmail(databaseClient.db, input),
     queueMagicEmail: (input) => queueAuthEmail(databaseClient.db, input),
+    queueCommerceClaimEmail: async () => undefined,
     canSendMagicLink: (email) => canSendMagicLink(databaseClient.db, email),
     onUserCreated: (userId) => ensureCustomerRole(databaseClient.db, userId)
   });
@@ -283,6 +284,10 @@ describe('Better Auth server', () => {
     expect(magicRequested.status).toBe(200);
     const magicMessage = await latestMessage('auth.magic-link', email);
     expect(magicMessage.actionUrl).toContain(`${config.origin}/api/auth/magic-link/verify`);
+    const magicToken = new URL(magicMessage.actionUrl).searchParams.get('token');
+    if (!magicToken) throw new Error('Expected magic-link token');
+    expect(JSON.stringify(await databaseClient.db.select().from(verification)))
+      .not.toContain(magicToken);
     const magicSession = await authRequest(auth, magicMessage.actionUrl);
     expect(magicSession.headers.get('set-cookie')).not.toBeNull();
     const reused = await authRequest(auth, magicMessage.actionUrl);

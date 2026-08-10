@@ -2,7 +2,9 @@ import { betterAuth, type BetterAuthPlugin } from 'better-auth';
 import { APIError, createAuthMiddleware } from 'better-auth/api';
 import { drizzleAdapter } from 'better-auth/adapters/drizzle';
 import { magicLink } from 'better-auth/plugins';
+import { z } from 'zod';
 import type { ApplicationConfig } from '$lib/server/config/schema';
+import type { QueueCommerceClaimEmailInput } from '$lib/server/commerce/claim-email';
 import type { Database } from '$lib/server/db/client';
 import * as schema from '$lib/server/db/schema';
 import type { QueueAuthEmailInput } from '$lib/server/email/enqueue';
@@ -18,9 +20,54 @@ export interface AuthServerDependencies {
   queueVerificationEmail(input: QueueAuthEmailInput): Promise<void>;
   queueResetEmail(input: QueueAuthEmailInput): Promise<void>;
   queueMagicEmail(input: QueueAuthEmailInput): Promise<void>;
+  queueCommerceClaimEmail(input: QueueCommerceClaimEmailInput): Promise<void>;
   canSendMagicLink(email: string): Promise<boolean>;
   onUserCreated(userId: string): Promise<void>;
   additionalPlugins?: readonly BetterAuthPlugin[];
+}
+
+export const commerceClaimMetadataSchema = z.strictObject({
+  purpose: z.literal('commerce-claim'),
+  orderId: z.uuid()
+});
+
+interface MagicLinkRoutingDependencies {
+  queueMagicEmail(input: QueueAuthEmailInput): Promise<void>;
+  queueCommerceClaimEmail(input: QueueCommerceClaimEmailInput): Promise<void>;
+  canSendMagicLink(email: string): Promise<boolean>;
+}
+
+interface RoutedMagicLinkInput {
+  email: string;
+  url: string;
+  metadata?: unknown;
+}
+
+export async function sendRoutedMagicLink(
+  dependencies: MagicLinkRoutingDependencies,
+  input: RoutedMagicLinkInput,
+  expiresInSeconds: number
+): Promise<void> {
+  const email = normalizeEmailAddress(input.email);
+  if (input.metadata === undefined) {
+    if (!(await dependencies.canSendMagicLink(email))) return;
+    await dependencies.queueMagicEmail({
+      template: 'auth.magic-link',
+      to: email,
+      recipientName: email,
+      actionUrl: input.url,
+      expiresInSeconds
+    });
+    return;
+  }
+  const metadata = commerceClaimMetadataSchema.safeParse(input.metadata);
+  if (!metadata.success) return;
+  if (!(await dependencies.canSendMagicLink(email))) return;
+  await dependencies.queueCommerceClaimEmail({
+    orderId: metadata.data.orderId,
+    email,
+    claimUrl: input.url
+  });
 }
 
 export function createAuthServer(dependencies: AuthServerDependencies) {
@@ -139,17 +186,10 @@ export function createAuthServer(dependencies: AuthServerDependencies) {
     plugins: [
       magicLink({
         expiresIn: auth.magicExpiresIn,
+        storeToken: 'hashed',
         disableSignUp: false,
-        sendMagicLink: async ({ email, url }) => {
-          if (!(await dependencies.canSendMagicLink(email))) return;
-          await dependencies.queueMagicEmail({
-            template: 'auth.magic-link',
-            to: normalizeEmailAddress(email),
-            recipientName: email,
-            actionUrl: url,
-            expiresInSeconds: auth.magicExpiresIn
-          });
-        }
+        sendMagicLink: ({ email, url, metadata }) =>
+          sendRoutedMagicLink(dependencies, { email, url, metadata }, auth.magicExpiresIn)
       }),
       ...(dependencies.additionalPlugins ?? [])
     ]
