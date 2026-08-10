@@ -30,6 +30,7 @@ export interface RefundFulfillmentInput {
 export interface DisputeFulfillmentInput {
   stripeEventId: string;
   dispute: DisputeSnapshot;
+  payment: PaymentSnapshot;
 }
 
 export interface FulfillmentExceptionInput {
@@ -120,7 +121,9 @@ export function createStripeEventHandler(
       }
       const dispute = await gateway.retrieveDispute(row.objectId);
       throwIfAborted(signal);
-      await dependencies.fulfillDispute(database, { stripeEventId, dispute });
+      const payment = await gateway.retrievePayment(dispute.paymentIntentId);
+      throwIfAborted(signal);
+      await dependencies.fulfillDispute(database, { stripeEventId, dispute, payment });
     } catch (error) {
       if (!(error instanceof PermanentCommerceError)) throw error;
       await dependencies.recordException(database, { stripeEventId, orderId });

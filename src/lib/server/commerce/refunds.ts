@@ -1,12 +1,9 @@
-import { and, asc, eq, inArray } from 'drizzle-orm';
+import { asc, eq, inArray } from 'drizzle-orm';
 import { normalizeEmailAddress } from '$lib/server/auth/identity';
 import { appendAuditEvent as defaultAppendAuditEvent } from '$lib/server/audit/service';
 import type { Database } from '$lib/server/db/client';
 import {
   entitlementGrants,
-  orderItems,
-  orders,
-  payments,
   refundAllocations,
   refunds,
   stripeEvents,
@@ -16,13 +13,20 @@ import {
   type StripeEventRow
 } from '$lib/server/db/schema';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
-import { PermanentCommerceError } from './errors';
 import type { RefundFulfillmentInput } from './handler';
 import {
   assertGrantTransitionAllowed,
   projectEffectiveEntitlement as defaultProjectEffectiveEntitlement
 } from './grants';
-import { lockEntitlementScopes, lockOrder } from './lock';
+import {
+  completeCommerceEvent,
+  lockCanonicalPaymentOrder,
+  lockPaymentAccessFacts,
+  permanentReconciliationFailure,
+  reconciliationTransitionTime,
+  safeMoneyTotal,
+  stripeEventValue
+} from './reconciliation';
 import { parsePaymentSnapshot, parseRefundSnapshot } from './stripe/schemas';
 import { describeSupportedStripeEvent } from './webhooks';
 
@@ -65,15 +69,6 @@ export type RefundAllocationResult =
 
 const exception = (): RefundAllocationResult => ({ state: 'exception', allocations: [] });
 const noop = (): RefundAllocationResult => ({ state: 'noop', allocations: [] });
-
-function safeTotal(values: readonly number[]): number | null {
-  let total = 0;
-  for (const value of values) {
-    total += value;
-    if (!Number.isSafeInteger(total)) return null;
-  }
-  return total;
-}
 
 function compareRefunds(
   left: RefundAllocationRefundFact,
@@ -158,8 +153,8 @@ export function allocateDeterministicRefunds(
   const succeeded = facts.refunds
     .filter((refund) => refund.status === 'succeeded')
     .sort(compareRefunds);
-  const itemTotal = safeTotal(items.map((item) => item.totalMinor));
-  const refundedTotal = safeTotal(succeeded.map((refund) => refund.amountMinor));
+  const itemTotal = safeMoneyTotal(items.map((item) => item.totalMinor));
+  const refundedTotal = safeMoneyTotal(succeeded.map((refund) => refund.amountMinor));
   if (itemTotal === null || refundedTotal === null || refundedTotal > itemTotal) {
     return exception();
   }
@@ -197,8 +192,8 @@ export function allocateDeterministicRefunds(
     (refund) => (remainingByRefund.get(refund.refundId) ?? 0) > 0
   );
   if (remainingRefunds.length === 0) return noop();
-  const remainingItemTotal = safeTotal([...remainingByItem.values()]);
-  const remainingRefundTotal = safeTotal([...remainingByRefund.values()]);
+  const remainingItemTotal = safeMoneyTotal([...remainingByItem.values()]);
+  const remainingRefundTotal = safeMoneyTotal([...remainingByRefund.values()]);
   if (
     remainingItemTotal === null ||
     remainingRefundTotal === null ||
@@ -264,60 +259,16 @@ async function createAllocation(
   await transaction.insert(refundAllocations).values(allocation);
 }
 
-async function completeEvent(
-  transaction: DatabaseTransaction,
-  stripeEventId: string,
-  status: 'processed' | 'exception',
-  now: Date
-): Promise<void> {
-  const [completed] = await transaction
-    .update(stripeEvents)
-    .set({ status, processedAt: now, updatedAt: now })
-    .where(and(eq(stripeEvents.id, stripeEventId), eq(stripeEvents.status, 'pending')))
-    .returning({ id: stripeEvents.id });
-  if (!completed) throw new Error('Pending refund event could not be completed');
-}
-
 function permanent(): never {
-  throw new PermanentCommerceError();
-}
-
-function eventValue(row: StripeEventRow) {
-  return {
-    providerEventId: row.providerEventId,
-    type: row.eventType,
-    objectId: row.objectId,
-    liveMode: row.liveMode,
-    apiVersion: row.apiVersion,
-    providerCreatedAt: row.providerCreatedAt,
-    rawBodySha256: row.rawBodySha256
-  };
+  return permanentReconciliationFailure();
 }
 
 function assertRefundEvent(event: StripeEventRow, providerRefundId: string): void {
-  const descriptor = describeSupportedStripeEvent(eventValue(event));
+  const descriptor = describeSupportedStripeEvent(stripeEventValue(event));
   if (
     !descriptor ||
     descriptor.objectFamily !== 'refund' ||
     event.objectId !== providerRefundId
-  ) permanent();
-}
-
-function assertCanonicalPayment(
-  local: typeof payments.$inferSelect,
-  provider: ReturnType<typeof parsePaymentSnapshot>,
-  event: StripeEventRow
-): void {
-  if (
-    provider.liveMode !== event.liveMode ||
-    provider.paymentIntentId !== local.stripePaymentIntentId ||
-    provider.state !== 'succeeded' ||
-    local.status !== 'succeeded' ||
-    provider.amountMinor !== local.amountMinor ||
-    provider.currency.toUpperCase() !== local.currency ||
-    provider.latestChargeId !== local.stripeLatestChargeId ||
-    provider.paidAt?.getTime() !== local.paidAt?.getTime() ||
-    provider.paymentMethodCategory !== local.paymentMethodCategory
   ) permanent();
 }
 
@@ -374,10 +325,6 @@ async function storeCanonicalRefund(
   return updated;
 }
 
-function transitionTime(now: Date, grantedAt: Date): Date {
-  return now.getTime() < grantedAt.getTime() ? grantedAt : now;
-}
-
 export async function fulfillRefundEvent(
   database: Database,
   input: RefundFulfillmentInput,
@@ -391,7 +338,7 @@ export async function fulfillRefundEvent(
     projectEntitlement:
       dependencyOverrides.projectEntitlement ?? defaultProjectEffectiveEntitlement,
     appendAuditEvent: dependencyOverrides.appendAuditEvent ?? defaultAppendAuditEvent,
-    completeEvent: dependencyOverrides.completeEvent ?? completeEvent,
+    completeEvent: dependencyOverrides.completeEvent ?? completeCommerceEvent,
     now: dependencyOverrides.now ?? (() => new Date())
   };
 
@@ -413,28 +360,11 @@ export async function fulfillRefundEvent(
       canonicalRefund.currency !== canonicalPayment.currency
     ) permanent();
 
-    const [payment] = await transaction
-      .select()
-      .from(payments)
-      .where(eq(payments.stripePaymentIntentId, canonicalPayment.paymentIntentId))
-      .limit(1)
-      .for('update');
-    if (!payment) permanent();
-    assertCanonicalPayment(payment, canonicalPayment, event);
-
-    await lockOrder(transaction, payment.orderId);
-    const [order] = await transaction
-      .select()
-      .from(orders)
-      .where(eq(orders.id, payment.orderId))
-      .limit(1)
-      .for('update');
-    if (
-      !order ||
-      order.status !== 'paid' ||
-      order.currency !== payment.currency ||
-      order.totalMinor !== payment.amountMinor
-    ) permanent();
+    const { payment, order } = await lockCanonicalPaymentOrder(
+      transaction,
+      canonicalPayment,
+      event
+    );
 
     const lockedRefunds = await transaction
       .select()
@@ -453,54 +383,18 @@ export async function fulfillRefundEvent(
     const existing = lockedRefunds.find(
       (refund) => refund.stripeRefundId === canonicalRefund.providerRefundId
     );
-    const storedRefund = await storeCanonicalRefund(
+    await storeCanonicalRefund(
       transaction,
       existing,
       payment.id,
       canonicalRefund,
       now
     );
-    const allRefunds = existing
-      ? lockedRefunds.map((refund) => refund.id === storedRefund.id ? storedRefund : refund)
-      : [...lockedRefunds, storedRefund].sort((left, right) => left.id.localeCompare(right.id));
-
-    const lockedAllocations = await transaction
-      .select()
-      .from(refundAllocations)
-      .where(inArray(refundAllocations.refundId, allRefunds.map((refund) => refund.id)))
-      .orderBy(asc(refundAllocations.id))
-      .for('update');
-    const items = await transaction
-      .select()
-      .from(orderItems)
-      .where(eq(orderItems.orderId, order.id))
-      .orderBy(asc(orderItems.id))
-      .for('update');
-    if (
-      items.length === 0 ||
-      items.some((item) => item.totalMinor === null || item.currency !== order.currency)
-    ) permanent();
-    const itemAggregate = safeTotal(items.map((item) => item.totalMinor!));
-    if (itemAggregate === null || itemAggregate !== payment.amountMinor) permanent();
-    const grants = await transaction
-      .select()
-      .from(entitlementGrants)
-      .where(inArray(entitlementGrants.orderItemId, items.map((item) => item.id)))
-      .orderBy(asc(entitlementGrants.id))
-      .for('update');
-    if (
-      grants.length !== items.length ||
-      grants.some((grant) => grant.source !== 'purchase')
-    ) permanent();
-    const itemById = new Map(items.map((item) => [item.id, item]));
-    if (grants.some((grant) => {
-      const item = grant.orderItemId ? itemById.get(grant.orderItemId) : undefined;
-      return !item || grant.titleId !== item.titleId;
-    })) permanent();
-    const scopes = grants.flatMap((grant) => grant.userId
-      ? [{ userId: grant.userId, titleId: grant.titleId }]
-      : []);
-    await lockEntitlementScopes(transaction, scopes);
+    const facts = await lockPaymentAccessFacts(transaction, payment, order);
+    const allRefunds = facts.refunds;
+    const lockedAllocations = facts.allocations;
+    const items = facts.items;
+    const grants = facts.grants;
 
     const allocation = allocateDeterministicRefunds({
       items: items.map((item) => ({
@@ -558,7 +452,7 @@ export async function fulfillRefundEvent(
             state: 'revoked',
             stateReason: 'refund_fully_allocated',
             suspendedAt: null,
-            revokedAt: transitionTime(now, grant.grantedAt),
+            revokedAt: reconciliationTransitionTime(now, grant.grantedAt),
             updatedAt: now
           })
           .where(eq(entitlementGrants.id, grant.id));

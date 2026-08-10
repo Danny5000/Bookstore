@@ -23,7 +23,7 @@ import {
   defaultLoadStripeEvent
 } from '$lib/server/commerce/handler';
 import { STRIPE_EVENT_JOB } from '$lib/server/commerce/job';
-import { RetryableProviderError } from '$lib/server/commerce/errors';
+import { fulfillDisputeEvent } from '$lib/server/commerce/disputes';
 import { fulfillRefundEvent } from '$lib/server/commerce/refunds';
 import { createStripeCommerceRuntime } from '$lib/server/commerce/stripe/runtime-core';
 import { createDatabaseClient } from '$lib/server/db/client';
@@ -90,7 +90,9 @@ const stripeEventHandler: JobHandler = createStripeEventHandler(
     fulfillRefund: (database, input) => fulfillRefundEvent(database, input, {
       messages: commerceMessages
     }),
-    fulfillDispute: async () => { throw new RetryableProviderError(); },
+    fulfillDispute: (database, input) => fulfillDisputeEvent(database, input, {
+      messages: commerceMessages
+    }),
     recordException: (database, input) => recordFulfillmentException(database, input)
   }
 );

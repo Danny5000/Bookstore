@@ -62,13 +62,14 @@ function harness(row = event()) {
   const checkout = deferred<ReturnType<typeof checkoutSnapshotFixture>>();
   const payment = deferred<ReturnType<typeof paymentSnapshotFixture>>();
   const refund = deferred<ReturnType<typeof refundSnapshotFixture>>();
+  const dispute = deferred<ReturnType<typeof disputeSnapshotFixture>>();
   const mutation = deferred<void>();
   const gateway = {
     createCheckoutSession: vi.fn(),
     retrieveCheckoutSession: vi.fn(() => checkout.promise),
     retrievePayment: vi.fn(() => payment.promise),
     retrieveRefund: vi.fn(() => refund.promise),
-    retrieveDispute: vi.fn(),
+    retrieveDispute: vi.fn(() => dispute.promise),
     verifyWebhook: vi.fn()
   };
   const dependencies = {
@@ -79,7 +80,18 @@ function harness(row = event()) {
     recordException: vi.fn()
   };
   const handler = createStripeEventHandler({} as never, gateway, dependencies);
-  return { row, load, checkout, payment, refund, mutation, gateway, dependencies, handler };
+  return {
+    row,
+    load,
+    checkout,
+    payment,
+    refund,
+    dispute,
+    mutation,
+    gateway,
+    dependencies,
+    handler
+  };
 }
 
 describe('Stripe event handler provider ordering', () => {
@@ -174,14 +186,48 @@ describe('Stripe event handler provider ordering', () => {
     const dispute = harness(disputeRow);
     const disputeSnapshot = disputeSnapshotFixture();
     dispute.gateway.retrieveDispute.mockResolvedValueOnce(disputeSnapshot);
+    const disputePayment = paymentSnapshotFixture();
+    dispute.gateway.retrievePayment.mockResolvedValueOnce(disputePayment);
     dispute.dependencies.fulfillDispute.mockResolvedValueOnce(undefined);
     const disputeRun = dispute.handler(job(disputeRow.id), new AbortController().signal);
     dispute.load.resolve(disputeRow);
     await expect(disputeRun).resolves.toBeUndefined();
     expect(dispute.dependencies.fulfillDispute).toHaveBeenCalledWith(
       expect.anything(),
-      { stripeEventId: disputeRow.id, dispute: disputeSnapshot }
+      { stripeEventId: disputeRow.id, dispute: disputeSnapshot, payment: disputePayment }
     );
+  });
+
+  it('retrieves a dispute and its linked payment before starting local mutation', async () => {
+    const row = event({
+      eventType: 'charge.dispute.updated',
+      objectId: 'dp_test_fixture_101'
+    });
+    const test = harness(row);
+    test.dependencies.fulfillDispute.mockResolvedValueOnce(undefined);
+    const running = test.handler(job(row.id), new AbortController().signal);
+    test.load.resolve(row);
+    await settle();
+    expect(test.gateway.retrieveDispute).toHaveBeenCalledWith(row.objectId);
+    expect(test.gateway.retrievePayment).not.toHaveBeenCalled();
+    expect(test.dependencies.fulfillDispute).not.toHaveBeenCalled();
+
+    const canonicalDispute = disputeSnapshotFixture();
+    test.dispute.resolve(canonicalDispute);
+    await settle();
+    expect(test.gateway.retrievePayment).toHaveBeenCalledWith(
+      canonicalDispute.paymentIntentId
+    );
+    expect(test.dependencies.fulfillDispute).not.toHaveBeenCalled();
+
+    const canonicalPayment = paymentSnapshotFixture();
+    test.payment.resolve(canonicalPayment);
+    await expect(running).resolves.toBeUndefined();
+    expect(test.dependencies.fulfillDispute).toHaveBeenCalledWith(expect.anything(), {
+      stripeEventId: row.id,
+      dispute: canonicalDispute,
+      payment: canonicalPayment
+    });
   });
 
   it('retrieves a refund and its linked payment before starting local mutation', async () => {
