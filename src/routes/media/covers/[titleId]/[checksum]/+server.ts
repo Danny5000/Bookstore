@@ -11,7 +11,7 @@ const parametersSchema = z.strictObject({
   checksum: z.string().regex(/^[0-9a-f]{64}$/)
 });
 
-export const GET: RequestHandler = async ({ locals, params, request }) => {
+const respond: RequestHandler = async ({ locals, params, request }) => {
   const parsed = parametersSchema.safeParse(params);
   if (!parsed.success) return new Response('Not found', { status: 404 });
   const storage = getObjectStorage();
@@ -22,7 +22,12 @@ export const GET: RequestHandler = async ({ locals, params, request }) => {
       locals.actor,
       parsed.data
     );
-    return streamMediaResponse(storage, access, request.headers.get('range'));
+    return streamMediaResponse(
+      storage,
+      access,
+      request.method === 'HEAD' ? 'HEAD' : 'GET',
+      request.headers.get('range')
+    );
   } catch (cause: unknown) {
     if (cause instanceof MediaNotFoundError || cause instanceof AuthorizationError) {
       return new Response('Not found', { status: 404, headers: { 'cache-control': 'no-store' } });
@@ -30,3 +35,6 @@ export const GET: RequestHandler = async ({ locals, params, request }) => {
     throw cause;
   }
 };
+
+export const GET = respond;
+export const HEAD = respond;

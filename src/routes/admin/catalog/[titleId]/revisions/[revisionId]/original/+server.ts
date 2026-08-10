@@ -11,7 +11,7 @@ import type { RequestHandler } from './$types';
 const parametersSchema = z.strictObject({ titleId: z.uuid(), revisionId: z.uuid() });
 const requestIdSchema = z.string().trim().min(1).max(200);
 
-export const GET: RequestHandler = async ({ locals, params, request, route }) => {
+const respond: RequestHandler = async ({ locals, params, request, route }) => {
   const parsed = parametersSchema.safeParse(params);
   if (!parsed.success) return new Response('Not found', { status: 404 });
   const storage = getObjectStorage();
@@ -22,7 +22,12 @@ export const GET: RequestHandler = async ({ locals, params, request, route }) =>
       correlationId: incomingRequestId.success ? incomingRequestId.data : randomUUID(),
       requestMetadata: safeAuditRequestMetadata(request, route.id)
     });
-    return streamMediaResponse(storage, access, request.headers.get('range'));
+    return streamMediaResponse(
+      storage,
+      access,
+      request.method === 'HEAD' ? 'HEAD' : 'GET',
+      request.headers.get('range')
+    );
   } catch (cause: unknown) {
     if (cause instanceof AuthorizationError) {
       return new Response(cause.status === 401 ? 'Sign in required' : 'Forbidden', {
@@ -36,6 +41,9 @@ export const GET: RequestHandler = async ({ locals, params, request, route }) =>
     throw cause;
   }
 };
+
+export const GET = respond;
+export const HEAD = respond;
 
 function databaseClient() {
   return getDatabaseClient();

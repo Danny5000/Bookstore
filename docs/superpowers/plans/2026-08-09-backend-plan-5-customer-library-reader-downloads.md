@@ -1034,7 +1034,7 @@ git commit -m "feat: expose reader state mutations"
 - Create: `tests/integration/media-routes.test.ts`
 - Modify: `tests/integration/audit-query.test.ts`
 
-- [ ] **Step 1: Write failing media access tests**
+- [x] **Step 1: Write failing media access tests**
 
 Extend the access matrix to prove:
 
@@ -1045,7 +1045,7 @@ Extend the access matrix to prove:
 - administrators retain Plan 4 review access;
 - inaccessible private and nonexistent objects are indistinguishable.
 
-- [ ] **Step 2: Write failing HEAD/download/range tests**
+- [x] **Step 2: Write failing HEAD/download/range tests**
 
 At unit and integration levels assert:
 
@@ -1058,7 +1058,7 @@ At unit and integration levels assert:
 - every new full/range request rechecks entitlement;
 - accepted customer download appends exactly one `library.original.download` event containing actor ID, title ID, active revision ID, outcome, correlation ID, and range boolean—never email, filename, key, content, cookies, token, or headers.
 
-- [ ] **Step 3: Prove focused tests fail**
+- [x] **Step 3: Prove focused tests fail**
 
 Run:
 
@@ -1069,19 +1069,19 @@ npm run test:integration -- tests/integration/media-routes.test.ts tests/integra
 
 Expected: FAIL because entitled access, customer download, and body-free HEAD support are absent. Quote the bracketed path if the active shell expands it.
 
-- [ ] **Step 4: Extend media resolution through the shared decision**
+- [x] **Step 4: Extend media resolution through the shared decision**
 
 Refactor `resolveCoverAccess` and `resolveReaderImageAccess` to consume `resolvePublicationAccess`. Return an internal resolved object containing the authorized storage reference and response policy, not a public DTO. For entitled images, prove the image/page belongs to the current active revision; for previews, retain the Plan 4 semantic-boundary query. Emit `private, no-store` for entitled/admin assets and existing immutable public caching only for public preview assets.
 
-- [ ] **Step 5: Make the streaming helper method-aware**
+- [x] **Step 5: Make the streaming helper method-aware**
 
 Add `method: 'GET' | 'HEAD'` to `streamMediaResponse`. Parse/validate Range for both methods so metadata/status is consistent. For `HEAD`, obtain authorized stored metadata already resolved by the caller and construct a response with `body: null`; do not call `storage.read`, create a stream, or record streamed bytes. Preserve current abort/error handling for GET.
 
-- [ ] **Step 6: Implement the customer original route and redacted audit event**
+- [x] **Step 6: Implement the customer original route and redacted audit event**
 
 The route accepts only GET/HEAD, requires `locals.actor`, resolves an effective entitlement and current active retained original, builds a format-appropriate sanitized attachment filename, and passes the method/range into the streaming helper. Append the accepted audit event through the existing audit service with the minimal detail contract. Do not accept a revision ID, original filename, storage key, or user ID from the request.
 
-- [ ] **Step 7: Run media/download regressions**
+- [x] **Step 7: Run media/download regressions**
 
 Run:
 
@@ -1093,7 +1093,7 @@ npm run check
 
 Expected: access matrix, HEAD no-read assertion, ranges, redacted audit details, and Plan 4 public/admin media cases all pass.
 
-- [ ] **Step 8: Commit entitled media and downloads**
+- [x] **Step 8: Commit entitled media and downloads**
 
 ```powershell
 git add src/lib/server/catalog/media.ts src/lib/server/catalog/media.test.ts src/lib/server/http/media-response.ts src/lib/server/http/media-response.test.ts src/routes/media src/routes/library/[titleId]/download tests/integration/media-routes.test.ts tests/integration/audit-query.test.ts

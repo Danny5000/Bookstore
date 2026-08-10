@@ -34,6 +34,7 @@ function contentDisposition(access: ResolvedMediaAccess): string {
 export async function streamMediaResponse(
   storage: ObjectStorage,
   access: ResolvedMediaAccess,
+  method: 'GET' | 'HEAD',
   rangeHeader: string | null
 ): Promise<Response> {
   let range;
@@ -54,9 +55,6 @@ export async function streamMediaResponse(
     throw cause;
   }
 
-  const source = range
-    ? await storage.readRange(access.key, range.start, range.endInclusive)
-    : await storage.read(access.key);
   const byteSize = range
     ? range.endInclusive - range.start + 1
     : access.stat.byteSize;
@@ -75,6 +73,12 @@ export async function streamMediaResponse(
       `bytes ${range.start}-${range.endInclusive}/${access.stat.byteSize}`
     );
   }
+  if (method === 'HEAD') {
+    return new Response(null, { status: range ? 206 : 200, headers });
+  }
+  const source = range
+    ? await storage.readRange(access.key, range.start, range.endInclusive)
+    : await storage.read(access.key);
   return new Response(Readable.toWeb(source) as ReadableStream<Uint8Array>, {
     status: range ? 206 : 200,
     headers

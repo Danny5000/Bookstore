@@ -128,4 +128,51 @@ describe('audit browsing queries', () => {
     const [total] = await databaseClient.db.select({ value: count() }).from(auditEvents);
     expect(total?.value).toBe(3);
   });
+
+  it('exposes customer download audits through the existing admin filters and detail view', async () => {
+    const titleId = randomUUID();
+    const revisionId = randomUUID();
+    const customerId = randomUUID();
+    const [download] = await databaseClient.db
+      .insert(auditEvents)
+      .values(
+        row({
+          actorId: customerId,
+          action: 'library.original.download',
+          resourceType: 'title_revision',
+          resourceId: revisionId,
+          correlationId: 'download-correlation',
+          requestMetadata: { method: 'GET', routeId: '/library/[titleId]/download' },
+          after: { titleId, activeRevisionId: revisionId, range: false }
+        })
+      )
+      .returning();
+    if (!download) throw new Error('Expected download event');
+
+    const page = await listAuditEvents(
+      databaseClient.db,
+      admin,
+      parseAuditFilters(
+        new URLSearchParams({
+          actorId: customerId,
+          action: 'library.original.download',
+          resourceType: 'title_revision',
+          resourceId: revisionId
+        })
+      )
+    );
+    expect(page.events).toHaveLength(1);
+    expect(page.events[0]).toMatchObject({ id: download.id, correlationId: 'download-correlation' });
+    expect(page.events[0]).not.toHaveProperty('after');
+
+    const detail = await getAuditEventDetail(databaseClient.db, {
+      actor: admin,
+      eventId: download.id,
+      correlationId: 'view-download'
+    });
+    expect(detail).toMatchObject({
+      requestMetadata: { method: 'GET', routeId: '/library/[titleId]/download' },
+      after: { titleId, activeRevisionId: revisionId, range: false }
+    });
+  });
 });

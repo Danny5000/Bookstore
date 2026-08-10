@@ -1,16 +1,21 @@
 import { randomUUID } from 'node:crypto';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Actor } from '$lib/server/auth/admin-policy';
 import type { Database } from '$lib/server/db/client';
 import type { ObjectStorage } from '$lib/server/storage/types';
 
-const { appendAuditEvent } = vi.hoisted(() => ({ appendAuditEvent: vi.fn() }));
+const { appendAuditEvent, resolvePublicationAccess } = vi.hoisted(() => ({
+  appendAuditEvent: vi.fn(),
+  resolvePublicationAccess: vi.fn()
+}));
 vi.mock('$lib/server/audit/service', () => ({ appendAuditEvent }));
+vi.mock('$lib/server/library/access', () => ({ resolvePublicationAccess }));
 
 import {
   MediaNotFoundError,
   resolveCoverAccess,
   resolveCoverSuggestionAccess,
+  resolveCustomerOriginalDownload,
   resolveOriginalDownload,
   resolveReaderImageAccess
 } from './media';
@@ -61,11 +66,28 @@ const publicTitle = {
 
 const activeRevision = { id: revisionId, titleId, state: 'active' as const };
 
+function accessDecision(
+  level: 'admin' | 'entitled' | 'preview',
+  overrides: { titleId?: string; revisionId?: string } = {}
+) {
+  return {
+    level,
+    titleId: overrides.titleId ?? titleId,
+    revisionId: overrides.revisionId ?? revisionId,
+    presentationId: randomUUID()
+  };
+}
+
 describe('publication media authorization', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resolvePublicationAccess.mockResolvedValue(accessDecision('preview'));
+  });
+
   it('resolves a qualified public cover and keeps private covers admin-only', async () => {
     await expect(
       resolveCoverAccess(
-        databaseReturning([publicTitle], [{ id: revisionId }]),
+        databaseReturning([publicTitle]),
         storageWithSize(),
         anonymous,
         { titleId, checksum }
@@ -77,18 +99,74 @@ describe('publication media authorization', () => {
     });
 
     const privateTitle = { ...publicTitle, visibility: 'private', activeRevisionId: null };
+    resolvePublicationAccess.mockResolvedValueOnce({ level: 'denied' });
     await expect(
       resolveCoverAccess(databaseReturning([privateTitle]), storageWithSize(), customer, {
         titleId,
         checksum
       })
     ).rejects.toBeInstanceOf(MediaNotFoundError);
+    resolvePublicationAccess.mockResolvedValueOnce({ level: 'unavailable', titleId });
     await expect(
       resolveCoverAccess(databaseReturning([privateTitle]), storageWithSize(), admin, {
         titleId,
         checksum
       })
     ).resolves.toMatchObject({ cacheControl: 'private, no-store' });
+  });
+
+  it('serves entitled covers and full current-revision images privately', async () => {
+    const archivedTitle = { ...publicTitle, visibility: 'archived' as const };
+    resolvePublicationAccess.mockResolvedValueOnce(accessDecision('entitled'));
+    await expect(
+      resolveCoverAccess(databaseReturning([archivedTitle]), storageWithSize(), customer, {
+        titleId,
+        checksum
+      })
+    ).resolves.toMatchObject({ cacheControl: 'private, no-store' });
+
+    const asset = {
+      title: archivedTitle,
+      revision: activeRevision,
+      media: {
+        id: imageId,
+        storageKey: 'private/full-reader-image',
+        mediaType: 'image/webp',
+        checksumSha256: checksum,
+        byteSize: 100
+      }
+    };
+    resolvePublicationAccess.mockResolvedValueOnce(accessDecision('entitled'));
+    await expect(
+      resolveReaderImageAccess(databaseReturning([asset]), storageWithSize(), customer, {
+        revisionId,
+        imageId,
+        checksum
+      })
+    ).resolves.toMatchObject({ cacheControl: 'private, no-store' });
+  });
+
+  it('does not let an entitlement select a candidate or another revision', async () => {
+    const candidateRevisionId = randomUUID();
+    const asset = {
+      title: publicTitle,
+      revision: { ...activeRevision, id: candidateRevisionId, state: 'ready_for_review' as const },
+      media: {
+        id: imageId,
+        storageKey: 'private/candidate-image',
+        mediaType: 'image/webp',
+        checksumSha256: checksum,
+        byteSize: 100
+      }
+    };
+    resolvePublicationAccess.mockResolvedValueOnce(accessDecision('entitled'));
+    await expect(
+      resolveReaderImageAccess(databaseReturning([asset]), storageWithSize(), customer, {
+        revisionId: candidateRevisionId,
+        imageId,
+        checksum
+      })
+    ).rejects.toBeInstanceOf(MediaNotFoundError);
   });
 
   it('allows a public prose image only when referenced at or before the published boundary', async () => {
@@ -278,5 +356,89 @@ describe('publication media authorization', () => {
     const auditJson = JSON.stringify(appendAuditEvent.mock.calls[0]);
     expect(auditJson).not.toContain('My Book.epub');
     expect(auditJson).not.toContain('private-original');
+  });
+
+  it('resolves the entitled active original with a title-based filename and redacted audit', async () => {
+    resolvePublicationAccess.mockResolvedValueOnce(accessDecision('entitled'));
+    appendAuditEvent.mockResolvedValueOnce({ id: randomUUID() });
+    const record = {
+      title: { ...publicTitle, title: 'A / Curious  Book', format: 'prose' as const },
+      revision: {
+        ...activeRevision,
+        originalStorageKey: 'titles/private-original-with-secret-name',
+        originalMimeType: 'application/epub+zip',
+        originalFilename: 'publisher-secret-name.epub',
+        originalChecksumSha256: checksum,
+        originalByteSize: 100
+      }
+    };
+    const result = await resolveCustomerOriginalDownload(
+      databaseReturning([record]),
+      storageWithSize(),
+      customer,
+      {
+        titleId,
+        correlationId: 'customer-download',
+        rangeRequested: true,
+        requestMetadata: { method: 'GET', routeId: '/library/[titleId]/download' }
+      }
+    );
+    expect(result).toMatchObject({
+      titleId,
+      revisionId,
+      access: {
+        mediaType: 'application/epub+zip',
+        filename: 'Curious  Book.epub',
+        disposition: 'attachment',
+        cacheControl: 'private, no-store'
+      }
+    });
+    expect(appendAuditEvent).toHaveBeenCalledTimes(1);
+    const auditJson = JSON.stringify(appendAuditEvent.mock.calls[0]);
+    expect(auditJson).toContain('library.original.download');
+    expect(auditJson).toContain(customer.id);
+    expect(auditJson).toContain(titleId);
+    expect(auditJson).toContain(revisionId);
+    expect(auditJson).toContain('"range":true');
+    expect(auditJson).not.toContain('publisher-secret-name.epub');
+    expect(auditJson).not.toContain('private-original-with-secret-name');
+  });
+
+  it.each([
+    ['cbz', 'application/vnd.comicbook+zip'],
+    ['zip', 'application/zip']
+  ] as const)('preserves an entitled comic original as %s', async (extension, mediaType) => {
+    resolvePublicationAccess.mockResolvedValueOnce(accessDecision('entitled'));
+    appendAuditEvent.mockResolvedValueOnce({ id: randomUUID() });
+    const record = {
+      title: { ...publicTitle, title: 'Comic Title', format: 'comic' as const },
+      revision: {
+        ...activeRevision,
+        originalStorageKey: `titles/private-comic-${extension}`,
+        originalMimeType: 'application/octet-stream',
+        originalFilename: `source.${extension}`,
+        originalChecksumSha256: checksum,
+        originalByteSize: 100
+      }
+    };
+    await expect(
+      resolveCustomerOriginalDownload(
+        databaseReturning([record]),
+        storageWithSize(),
+        customer,
+        {
+          titleId,
+          correlationId: `comic-${extension}`,
+          rangeRequested: false
+        }
+      )
+    ).resolves.toMatchObject({
+      access: {
+        filename: `Comic Title.${extension}`,
+        mediaType,
+        disposition: 'attachment',
+        cacheControl: 'private, no-store'
+      }
+    });
   });
 });

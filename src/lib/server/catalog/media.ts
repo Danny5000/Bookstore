@@ -15,6 +15,7 @@ import {
   titles
 } from '$lib/server/db/schema';
 import { withTransaction } from '$lib/server/db/transaction';
+import { resolvePublicationAccess } from '$lib/server/library/access';
 import { parseStorageKey, type StorageKey } from '$lib/server/storage/keys';
 import type { ObjectStorage, StoredObjectStat } from '$lib/server/storage/types';
 
@@ -96,29 +97,18 @@ export async function resolveCoverAccess(
     !title.coverByteSize
   ) throw new MediaNotFoundError();
 
-  let publicAccess = false;
-  if (title.visibility === 'public' && title.activeRevisionId) {
-    const [qualified] = await database
-      .select({ id: titleRevisions.id })
-      .from(titleRevisions)
-      .innerJoin(
-        revisionPresentations,
-        and(
-          eq(revisionPresentations.revisionId, titleRevisions.id),
-          eq(revisionPresentations.state, 'published')
-        )
-      )
-      .where(
-        and(
-          eq(titleRevisions.id, title.activeRevisionId),
-          eq(titleRevisions.titleId, title.id),
-          eq(titleRevisions.state, 'active')
-        )
-      )
-      .limit(1);
-    publicAccess = Boolean(qualified);
-  }
-  if (!publicAccess && !isAdmin(actor)) throw new MediaNotFoundError();
+  const decision = await resolvePublicationAccess({
+    db: database,
+    actor,
+    titleId: title.id,
+    purpose: 'cover'
+  });
+  const administratorUnavailable = decision.level === 'unavailable' && isAdmin(actor);
+  if (
+    decision.level === 'denied' ||
+    (decision.level === 'unavailable' && !administratorUnavailable)
+  ) throw new MediaNotFoundError();
+  const publicAccess = decision.level === 'preview';
   return resolvedAccess(
     storage,
     {
@@ -271,11 +261,17 @@ export async function resolveReaderImageAccess(
 
   const accepted = ['ready_for_review', 'active', 'retired'].includes(asset.revision.state);
   if (isAdmin(actor) && accepted) return resolvedAccess(storage, asset.media, false);
-  const qualifiedPublicRoot =
-    asset.title.visibility === 'public' &&
-    asset.title.activeRevisionId === asset.revision.id &&
-    asset.revision.state === 'active';
-  if (!qualifiedPublicRoot) throw new MediaNotFoundError();
+  const decision = await resolvePublicationAccess({
+    db: database,
+    actor,
+    titleId: asset.title.id,
+    purpose: 'derived-media'
+  });
+  if (
+    (decision.level !== 'preview' && decision.level !== 'entitled') ||
+    decision.revisionId !== asset.revision.id
+  ) throw new MediaNotFoundError();
+  if (decision.level === 'entitled') return resolvedAccess(storage, asset.media, false);
   const allowed = format === 'prose'
     ? await publicProseAssetAllowed(database, asset)
     : await publicComicAssetAllowed(database, asset);
@@ -377,5 +373,109 @@ export async function resolveOriginalDownload(
       after: { titleId: input.titleId, revisionId: input.revisionId }
     });
     return access;
+  });
+}
+
+export interface ResolvedCustomerOriginalDownload {
+  access: ResolvedMediaAccess;
+  titleId: string;
+  revisionId: string;
+}
+
+function customerDownloadExtension(
+  format: 'prose' | 'comic',
+  originalFilename: string
+): 'epub' | 'cbz' | 'zip' | null {
+  const extension = originalFilename.toLowerCase().match(/\.([^.]+)$/u)?.[1];
+  if (format === 'prose') return extension === 'epub' ? 'epub' : null;
+  return extension === 'cbz' || extension === 'zip' ? extension : null;
+}
+
+export async function resolveCustomerOriginalDownload(
+  database: Database,
+  storage: ObjectStorage,
+  actor: Actor,
+  input: {
+    titleId: string;
+    correlationId: string;
+    rangeRequested: boolean;
+    requestMetadata?: AuditRequestMetadata;
+  }
+): Promise<ResolvedCustomerOriginalDownload> {
+  const decision = await resolvePublicationAccess({
+    db: database,
+    actor,
+    titleId: input.titleId,
+    purpose: 'original-download'
+  });
+  if (decision.level !== 'entitled') throw new MediaNotFoundError();
+  return withTransaction(database, async (transaction) => {
+    const [record] = await transaction
+      .select({ revision: titleRevisions, title: titles })
+      .from(titleRevisions)
+      .innerJoin(titles, eq(titles.id, titleRevisions.titleId))
+      .innerJoin(
+        revisionPresentations,
+        and(
+          eq(revisionPresentations.revisionId, titleRevisions.id),
+          eq(revisionPresentations.state, 'published')
+        )
+      )
+      .where(
+        and(
+          eq(titles.id, decision.titleId),
+          eq(titles.activeRevisionId, decision.revisionId),
+          eq(titleRevisions.id, decision.revisionId),
+          eq(titleRevisions.state, 'active')
+        )
+      )
+      .limit(1);
+    const revision = record?.revision;
+    if (
+      !record ||
+      !revision?.originalStorageKey ||
+      !revision.originalChecksumSha256 ||
+      !revision.originalMimeType ||
+      !revision.originalByteSize ||
+      !revision.originalFilename
+    ) throw new MediaNotFoundError();
+    const extension = customerDownloadExtension(record.title.format, revision.originalFilename);
+    if (!extension) throw new MediaNotFoundError();
+    const mediaType = record.title.format === 'prose'
+      ? 'application/epub+zip'
+      : extension === 'cbz'
+        ? 'application/vnd.comicbook+zip'
+        : 'application/zip';
+    const access = await resolvedAccess(
+      storage,
+      {
+        storageKey: revision.originalStorageKey,
+        mediaType,
+        checksumSha256: revision.originalChecksumSha256,
+        byteSize: revision.originalByteSize
+      },
+      false,
+      safeDownloadFilename(`${record.title.title}.${extension}`),
+      'attachment'
+    );
+    await appendAuditEvent(transaction, {
+      actor,
+      action: 'library.original.download',
+      outcome: 'succeeded',
+      resourceType: 'title_revision',
+      resourceId: revision.id,
+      correlationId: input.correlationId,
+      ...(input.requestMetadata ? { requestMetadata: input.requestMetadata } : {}),
+      after: {
+        titleId: record.title.id,
+        activeRevisionId: revision.id,
+        range: input.rangeRequested
+      }
+    });
+    return {
+      access,
+      titleId: record.title.id,
+      revisionId: revision.id
+    };
   });
 }

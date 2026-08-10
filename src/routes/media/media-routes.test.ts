@@ -36,7 +36,7 @@ vi.mock('$lib/server/catalog/media', async (importOriginal) => ({
   resolveOriginalDownload
 }));
 
-import { GET as getCover } from './covers/[titleId]/[checksum]/+server';
+import { GET as getCover, HEAD as headCover } from './covers/[titleId]/[checksum]/+server';
 import { GET as getImage } from './revisions/[revisionId]/images/[imageId]/[checksum]/+server';
 import { GET as getSuggestion } from './revisions/[revisionId]/cover-suggestion/[suggestionId]/[checksum]/+server';
 import { GET as getOriginal } from '../admin/catalog/[titleId]/revisions/[revisionId]/original/+server';
@@ -67,13 +67,14 @@ function event(
   params: Record<string, string>,
   path: string,
   headers: Record<string, string> = {},
-  routeId = path
+  routeId = path,
+  method: 'GET' | 'HEAD' = 'GET'
 ) {
   return {
     locals: { actor, user: null, session: null },
     params,
     route: { id: routeId },
-    request: new Request(`http://localhost${path}`, { headers })
+    request: new Request(`http://localhost${path}`, { headers, method })
   };
 }
 
@@ -104,6 +105,29 @@ describe('publication media routes', () => {
     expect(response.headers.get('etag')).toBe(`"${checksum}"`);
     expect(response.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
     expect(response.headers.get('x-content-type-options')).toBe('nosniff');
+  });
+
+  it('returns the same authorized cover metadata for HEAD without opening storage', async () => {
+    const response = await headCover(
+      event(
+        anonymous,
+        { titleId, checksum },
+        `/media/covers/${titleId}/${checksum}`,
+        {},
+        '/media/covers/[titleId]/[checksum]',
+        'HEAD'
+      ) as never
+    );
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('');
+    expect(response.headers.get('content-length')).toBe('6');
+    expect(response.headers.get('content-type')).toBe('image/webp');
+    expect(response.headers.get('etag')).toBe(`"${checksum}"`);
+    expect(response.headers.get('accept-ranges')).toBe('bytes');
+    expect(response.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
+    expect(response.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(storage.read).not.toHaveBeenCalled();
+    expect(storage.readRange).not.toHaveBeenCalled();
   });
 
   it('streams one byte range with correct response metadata', async () => {
