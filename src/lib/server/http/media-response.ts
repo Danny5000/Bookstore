@@ -1,6 +1,6 @@
 import { Readable } from 'node:stream';
 import type { ResolvedMediaAccess } from '$lib/server/catalog/media';
-import type { ObjectStorage } from '$lib/server/storage/types';
+import type { ObjectStorage, PreparedVerifiedRead } from '$lib/server/storage/types';
 import { parseSingleRange, RangeNotSatisfiableError } from './range';
 
 const safeMediaTypes = new Set([
@@ -41,13 +41,15 @@ export async function streamMediaResponse(
   storage: ObjectStorage,
   access: ResolvedMediaAccess,
   method: 'GET' | 'HEAD',
-  rangeHeader: string | null
+  rangeHeader: string | null,
+  verifiedRead?: PreparedVerifiedRead
 ): Promise<Response> {
   let range;
   try {
     range = parseSingleRange(rangeHeader, access.stat.byteSize);
   } catch (cause: unknown) {
     if (cause instanceof RangeNotSatisfiableError) {
+      await verifiedRead?.close();
       return new Response(null, {
         status: 416,
         headers: {
@@ -58,6 +60,7 @@ export async function streamMediaResponse(
         }
       });
     }
+    await verifiedRead?.close();
     throw cause;
   }
 
@@ -80,16 +83,21 @@ export async function streamMediaResponse(
     );
   }
   if (method === 'HEAD') {
+    await verifiedRead?.close();
     return new Response(null, { status: range ? 206 : 200, headers });
   }
-  const prepared = access.verifyIntegrity
+  const prepared = verifiedRead ?? (access.verifyIntegrity
     ? await storage.prepareVerifiedRead(access.key, {
         byteSize: access.stat.byteSize,
         checksumSha256: access.checksumSha256
       })
-    : null;
+    : null);
   if (access.verifyIntegrity && !prepared) {
     throw new Error('Stored media failed integrity verification');
+  }
+  if (prepared && prepared.stat.byteSize !== access.stat.byteSize) {
+    await prepared.close();
+    throw new Error('Prepared media did not match the authorized object');
   }
   let source;
   try {

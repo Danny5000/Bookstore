@@ -14,13 +14,21 @@ import {
   titleRevisions,
   titles
 } from '$lib/server/db/schema';
-import { withTransaction } from '$lib/server/db/transaction';
+import {
+  withTransaction,
+  type DatabaseTransaction
+} from '$lib/server/db/transaction';
 import { closeMediaResponse, streamMediaResponse } from '$lib/server/http/media-response';
+import { parseSingleRange, RangeNotSatisfiableError } from '$lib/server/http/range';
 import { resolvePublicationAccess } from '$lib/server/library/access';
 import { ReaderStateNotFoundError } from '$lib/server/reader-state/errors';
 import { lockReaderTitle } from '$lib/server/reader-state/lock';
 import { parseStorageKey, type StorageKey } from '$lib/server/storage/keys';
-import type { ObjectStorage, StoredObjectStat } from '$lib/server/storage/types';
+import type {
+  ObjectStorage,
+  PreparedVerifiedRead,
+  StoredObjectStat
+} from '$lib/server/storage/types';
 
 export class MediaNotFoundError extends Error {
   readonly status = 404;
@@ -392,6 +400,72 @@ function customerDownloadExtension(
   return extension === 'cbz' || extension === 'zip' ? extension : null;
 }
 
+interface LockedCustomerOriginalDownload {
+  access: ResolvedMediaAccess;
+  titleId: string;
+  revisionId: string;
+}
+
+async function resolveLockedCustomerOriginalDownload(
+  transaction: DatabaseTransaction,
+  storage: ObjectStorage,
+  actor: Actor,
+  titleId: string
+): Promise<LockedCustomerOriginalDownload> {
+  const locked = await lockReaderTitle(transaction, actor, titleId);
+  const [record] = await transaction
+    .select({ revision: titleRevisions })
+    .from(titleRevisions)
+    .where(
+      and(
+        eq(titleRevisions.id, locked.revisionId),
+        eq(titleRevisions.titleId, locked.title.id),
+        eq(titleRevisions.state, 'active')
+      )
+    )
+    .limit(1);
+  const revision = record?.revision;
+  if (
+    !revision?.originalStorageKey ||
+    !revision.originalChecksumSha256 ||
+    !revision.originalMimeType ||
+    !revision.originalByteSize ||
+    !revision.originalFilename
+  ) throw new MediaNotFoundError();
+  const extension = customerDownloadExtension(locked.title.format, revision.originalFilename);
+  if (!extension) throw new MediaNotFoundError();
+  const mediaType = locked.title.format === 'prose'
+    ? 'application/epub+zip'
+    : extension === 'cbz'
+      ? 'application/vnd.comicbook+zip'
+      : 'application/zip';
+  const access = await resolvedAccess(
+    storage,
+    {
+      storageKey: revision.originalStorageKey,
+      mediaType,
+      checksumSha256: revision.originalChecksumSha256,
+      byteSize: revision.originalByteSize
+    },
+    false,
+    safeDownloadFilename(`${locked.title.title}.${extension}`),
+    'attachment',
+    true
+  );
+  return { access, titleId: locked.title.id, revisionId: revision.id };
+}
+
+function sameCustomerOriginal(
+  candidate: LockedCustomerOriginalDownload,
+  current: LockedCustomerOriginalDownload
+): boolean {
+  return candidate.titleId === current.titleId &&
+    candidate.revisionId === current.revisionId &&
+    candidate.access.key === current.access.key &&
+    candidate.access.checksumSha256 === current.access.checksumSha256 &&
+    candidate.access.stat.byteSize === current.access.stat.byteSize;
+}
+
 export async function streamCustomerOriginalDownload(
   database: Database,
   storage: ObjectStorage,
@@ -404,56 +478,58 @@ export async function streamCustomerOriginalDownload(
   }
 ): Promise<Response> {
   let startedResponse: Response | undefined;
+  let verifiedRead: PreparedVerifiedRead | undefined;
   try {
+    let candidate: LockedCustomerOriginalDownload | undefined;
+    if (input.method === 'GET') {
+      candidate = await withTransaction(database, (transaction) =>
+        resolveLockedCustomerOriginalDownload(
+          transaction,
+          storage,
+          actor,
+          input.titleId
+        ));
+      try {
+        parseSingleRange(input.rangeHeader, candidate.access.stat.byteSize);
+      } catch (cause: unknown) {
+        if (cause instanceof RangeNotSatisfiableError) {
+          return streamMediaResponse(
+            storage,
+            candidate.access,
+            input.method,
+            input.rangeHeader
+          );
+        }
+        throw cause;
+      }
+      verifiedRead = await storage.prepareVerifiedRead(candidate.access.key, {
+        byteSize: candidate.access.stat.byteSize,
+        checksumSha256: candidate.access.checksumSha256
+      }) ?? undefined;
+      if (!verifiedRead) throw new Error('Stored media failed integrity verification');
+    }
+
     return await withTransaction(database, async (transaction) => {
-      const locked = await lockReaderTitle(transaction, actor, input.titleId);
-      const [record] = await transaction
-        .select({ revision: titleRevisions })
-        .from(titleRevisions)
-        .where(
-          and(
-            eq(titleRevisions.id, locked.revisionId),
-            eq(titleRevisions.titleId, locked.title.id),
-            eq(titleRevisions.state, 'active')
-          )
-        )
-        .limit(1);
-      const revision = record?.revision;
-      if (
-        !revision?.originalStorageKey ||
-        !revision.originalChecksumSha256 ||
-        !revision.originalMimeType ||
-        !revision.originalByteSize ||
-        !revision.originalFilename
-      ) throw new MediaNotFoundError();
-      const extension = customerDownloadExtension(
-        locked.title.format,
-        revision.originalFilename
-      );
-      if (!extension) throw new MediaNotFoundError();
-      const mediaType = locked.title.format === 'prose'
-        ? 'application/epub+zip'
-        : extension === 'cbz'
-          ? 'application/vnd.comicbook+zip'
-          : 'application/zip';
-      const access = await resolvedAccess(
+      const current = await resolveLockedCustomerOriginalDownload(
+        transaction,
         storage,
-        {
-          storageKey: revision.originalStorageKey,
-          mediaType,
-          checksumSha256: revision.originalChecksumSha256,
-          byteSize: revision.originalByteSize
-        },
-        false,
-        safeDownloadFilename(`${locked.title.title}.${extension}`),
-        'attachment',
-        true
+        actor,
+        input.titleId
       );
+      if (candidate && !sameCustomerOriginal(candidate, current)) {
+        throw new MediaNotFoundError();
+      }
+      if (input.method === 'GET' && !verifiedRead) {
+        throw new Error('Verified download snapshot was not prepared');
+      }
+      const preparedForResponse = verifiedRead;
+      verifiedRead = undefined;
       const response = await streamMediaResponse(
         storage,
-        access,
+        current.access,
         input.method,
-        input.rangeHeader
+        input.rangeHeader,
+        preparedForResponse
       );
       startedResponse = response;
       if (response.status !== 200 && response.status !== 206) return response;
@@ -462,11 +538,11 @@ export async function streamCustomerOriginalDownload(
         action: 'library.original.download',
         outcome: 'succeeded',
         resourceType: 'title_revision',
-        resourceId: revision.id,
+        resourceId: current.revisionId,
         correlationId: input.correlationId,
         after: {
-          titleId: locked.title.id,
-          activeRevisionId: revision.id,
+          titleId: current.titleId,
+          activeRevisionId: current.revisionId,
           range: input.rangeHeader !== null
         }
       });
@@ -474,6 +550,7 @@ export async function streamCustomerOriginalDownload(
     });
   } catch (cause: unknown) {
     if (startedResponse) await closeMediaResponse(startedResponse);
+    else await verifiedRead?.close();
     if (cause instanceof ReaderStateNotFoundError) throw new MediaNotFoundError();
     throw cause;
   }

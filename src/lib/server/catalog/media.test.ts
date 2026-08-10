@@ -469,7 +469,7 @@ describe('publication media authorization', () => {
 
     await expect(
       streamCustomerOriginalDownload(
-        databaseReturning([record]),
+        databaseReturning([record], [record]),
         objectStorage,
         customer,
         {

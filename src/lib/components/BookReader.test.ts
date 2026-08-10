@@ -61,6 +61,7 @@ describe('BookReader persistence boundary', () => {
     expect(source).not.toContain('.catch(() => {})');
     expect(source).toContain('runReaderMutation');
     expect(source).toContain('readerMutationMessage');
+    expect(source).toContain('onConflict:');
   });
 
   it('records the new semantic location only after comic-mode persistence succeeds', async () => {

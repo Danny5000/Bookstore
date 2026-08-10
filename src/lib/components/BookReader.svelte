@@ -14,6 +14,7 @@
   import { bookDepth } from '$lib/reader/geometry';
   import { locationForPage, pageIndexForLocation } from '$lib/reader/locations';
   import {
+    readerMutationRetryDelaysMs,
     readerMutationMessage,
     runReaderMutation,
     type ReaderMutationStatus
@@ -63,11 +64,13 @@
     error: null
   });
   let mutationStatus = $state<ReaderMutationStatus>({ status: 'idle' });
+  const mutationAbortController = new AbortController();
   const preferenceMutations = createPreferenceMutationQueue({
     current: () => readerState.preferences,
     save: (input) => persistenceAdapter.savePreferences(input),
     onAdopt: (value) => { readerState.preferences = value; },
-    onStatus: (status) => { mutationStatus = status; }
+    onStatus: (status) => { mutationStatus = status; },
+    signal: mutationAbortController.signal
   });
   let currentLocation = $state<ReaderLocation | null>(initialState.progress?.location ?? null);
   const progressKeepalive = progressKeepaliveFor(persistenceAdapter);
@@ -518,10 +521,24 @@
         comicMode: nextMode,
         expectedVersion: readerState.titlePreferences?.version ?? 0
       }),
+      retryDelaysMs: readerMutationRetryDelaysMs,
+      signal: mutationAbortController.signal,
       onStatus: (status) => { mutationStatus = status; },
       onSuccess: (value) => {
         readerState.titlePreferences = value;
         recordLocation(nextPageIndex);
+      },
+      onConflict: (value) => {
+        readerState.titlePreferences = value;
+        const authoritativeMode = value.comicMode === 'guided' ? 'panel' : 'page';
+        comicMode = authoritativeMode;
+        if (authoritativeMode === previousMode) {
+          panelIdx = previousPanelIndex;
+          pageIdx = previousPageIndex;
+        } else {
+          panelIdx = 0;
+          pageIdx = nextPageIndex;
+        }
       },
       onFailure: () => {
         comicMode = previousMode;
@@ -655,6 +672,7 @@
     cancelAnimationFrame(raf);
     clearTimeout(flipTimer);
     clearTimeout(openTimer);
+    mutationAbortController.abort();
     progressSync.dispose();
   });
 

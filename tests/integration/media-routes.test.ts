@@ -338,7 +338,7 @@ describe('entitled media and original download resolution', () => {
     }
   });
 
-  it('holds entitlement authorization until the verified response stream is ready', async () => {
+  it('prepares the verified snapshot without holding entitlement locks, then rechecks access', async () => {
     const customer = await createCustomer();
     const publication = await createPublication();
     await databaseClient.db.insert(entitlements).values({
@@ -350,13 +350,14 @@ describe('entitled media and original download resolution', () => {
     let releasePrepare!: () => void;
     const prepareGate = new Promise<void>((resolve) => { releasePrepare = resolve; });
     const objectStorage = storage();
+    const close = vi.fn(async () => undefined);
     vi.mocked(objectStorage.prepareVerifiedRead).mockImplementationOnce(async () => {
       markPrepareStarted();
       await prepareGate;
       return {
         stat: { byteSize: 100, modifiedAt: new Date(0) },
         read: vi.fn(async () => Readable.from([Buffer.alloc(100)])),
-        close: vi.fn(async () => undefined)
+        close
       };
     });
     const download = streamCustomerOriginalDownload(
@@ -373,30 +374,32 @@ describe('entitled media and original download resolution', () => {
     await prepareStarted;
 
     const revoker = await databaseClient.pool.connect();
+    let revocation: Promise<unknown> | undefined;
     try {
-      let revocationSettled = false;
-      const revocation = revoker.query(
+      revocation = revoker.query(
         `update entitlements
          set revoked_at = clock_timestamp(), updated_at = clock_timestamp()
          where user_id = $1 and title_id = $2`,
         [customer.id, publication.title.id]
-      ).finally(() => { revocationSettled = true; });
-      await waitForBlockedEntitlementQuery();
-      expect(revocationSettled).toBe(false);
+      );
+      const revocationSettled = await Promise.race([
+        revocation.then(() => true),
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), 250))
+      ]);
+      expect(revocationSettled).toBe(true);
+      expect(objectStorage.prepareVerifiedRead).toHaveBeenCalledOnce();
 
       releasePrepare();
-      const response = await download;
-      expect(response.status).toBe(200);
-      expect((await response.arrayBuffer()).byteLength).toBe(100);
-      await revocation;
-      expect(revocationSettled).toBe(true);
+      await expect(download).rejects.toBeInstanceOf(MediaNotFoundError);
       const events = await databaseClient.db
         .select()
         .from(auditEvents)
         .where(eq(auditEvents.correlationId, 'download-wins-revocation-race'));
-      expect(events).toHaveLength(1);
+      expect(events).toHaveLength(0);
+      expect(close).toHaveBeenCalledOnce();
     } finally {
       releasePrepare();
+      await Promise.allSettled([download, ...(revocation ? [revocation] : [])]);
       revoker.release();
     }
   });

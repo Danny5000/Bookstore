@@ -2,7 +2,11 @@ import type {
   PreferencesMutationInput,
   ReaderPreferencesDto
 } from '$lib/types/library';
-import { runReaderMutation, type ReaderMutationStatus } from './mutation-status';
+import {
+  readerMutationRetryDelaysMs,
+  runReaderMutation,
+  type ReaderMutationStatus
+} from './mutation-status';
 
 type PreferenceValues = Omit<PreferencesMutationInput, 'expectedVersion'>;
 
@@ -11,6 +15,7 @@ interface PreferenceMutationQueueOptions {
   save: (input: PreferencesMutationInput) => Promise<ReaderPreferencesDto>;
   onAdopt: (value: ReaderPreferencesDto) => void;
   onStatus: (status: ReaderMutationStatus) => void;
+  signal?: AbortSignal;
 }
 
 export function createPreferenceMutationQueue(options: PreferenceMutationQueueOptions): {
@@ -42,6 +47,12 @@ export function createPreferenceMutationQueue(options: PreferenceMutationQueueOp
         return saved;
       },
       onStatus: options.onStatus,
+      ...(options.signal ? { signal: options.signal } : {}),
+      retryDelaysMs: readerMutationRetryDelaysMs,
+      onConflict: (current) => {
+        desired = null;
+        options.onAdopt(current);
+      },
       onFailure: () => { desired = null; }
     }).finally(() => { running = false; });
   };

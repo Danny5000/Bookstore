@@ -133,4 +133,50 @@ describe('method-aware media streaming', () => {
     await vi.waitFor(() => expect(close).toHaveBeenCalledTimes(1));
     expect(source.destroyed).toBe(true);
   });
+
+  it('streams a caller-prepared verified snapshot without preparing under a database lock', async () => {
+    const objectStorage = storage();
+    objectStorage.prepareVerifiedRead = vi.fn();
+    const close = vi.fn(async () => undefined);
+    const verified = {
+      stat: access.stat,
+      read: vi.fn(async () => Readable.from([Buffer.from('abcdef')])),
+      close
+    };
+
+    const response = await streamMediaResponse(
+      objectStorage,
+      { ...access, verifyIntegrity: true },
+      'GET',
+      null,
+      verified
+    );
+
+    expect(await response.text()).toBe('abcdef');
+    expect(objectStorage.prepareVerifiedRead).not.toHaveBeenCalled();
+    expect(verified.read).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it('closes a caller-prepared snapshot when a range is rejected before streaming', async () => {
+    const objectStorage = storage();
+    const close = vi.fn(async () => undefined);
+    const verified = {
+      stat: access.stat,
+      read: vi.fn(async () => Readable.from([])),
+      close
+    };
+
+    const response = await streamMediaResponse(
+      objectStorage,
+      { ...access, verifyIntegrity: true },
+      'GET',
+      'bytes=99-',
+      verified
+    );
+
+    expect(response.status).toBe(416);
+    expect(verified.read).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledOnce();
+  });
 });
