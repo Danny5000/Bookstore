@@ -6,7 +6,6 @@ import { getEntitledInitialReader } from '$lib/server/catalog/reader';
 import {
   comicPages,
   comicPanelRegions,
-  entitlements,
   proseBlocks,
   proseSections,
   readerBookmarks,
@@ -17,6 +16,7 @@ import {
   titles,
   user
 } from '$lib/server/db/schema';
+import { setPreservedGrantState } from '$lib/server/commerce/grants';
 import { StaleReaderStateError } from '$lib/server/reader-state/errors';
 import { lockReaderTitle } from '$lib/server/reader-state/lock';
 import { migrateLockedReaderState } from '$lib/server/reader-state/migration';
@@ -43,7 +43,14 @@ async function createCustomer(label: string): Promise<Extract<Actor, { type: 'us
 }
 
 async function grant(userId: string, titleId: string): Promise<void> {
-  await databaseClient.db.insert(entitlements).values({ userId, titleId });
+  await databaseClient.db.transaction((transaction) =>
+    setPreservedGrantState(transaction, {
+      userId,
+      titleId,
+      active: true,
+      stateReason: 'test_preserved_access'
+    })
+  );
 }
 
 async function createProsePublication() {
@@ -350,12 +357,14 @@ describe('optimistic reader state', () => {
     expect(state.bookmarks).toHaveLength(1);
     expect(state.preferences).toEqual({ fontSize: 18, typeface: 'serif', paper: 'white', version: 0 });
 
-    await databaseClient.db.update(entitlements)
-      .set({ revokedAt: sql`clock_timestamp()`, updatedAt: sql`clock_timestamp()` })
-      .where(and(
-        eq(entitlements.userId, customer.id),
-        eq(entitlements.titleId, publication.title.id)
-      ));
+    await databaseClient.db.transaction((transaction) =>
+      setPreservedGrantState(transaction, {
+        userId: customer.id,
+        titleId: publication.title.id,
+        active: false,
+        stateReason: 'test_preserved_revoked'
+      })
+    );
     await expect(saveProgress({
       ...base,
       location: { format: 'prose', blockId: publication.blocks[0]!.id, offset: 2 },

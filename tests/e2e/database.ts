@@ -1,4 +1,7 @@
 import { Client } from 'pg';
+import { drizzle } from 'drizzle-orm/node-postgres';
+import * as schema from '$lib/server/db/schema';
+import { setPreservedGrantState } from '$lib/server/commerce/grants';
 
 interface E2EDatabase {
   grantEntitlement(email: string, titleId: string): Promise<void>;
@@ -28,6 +31,7 @@ function configuredClient(): Client {
 export async function openE2EDatabase(): Promise<E2EDatabase> {
   const client = configuredClient();
   await client.connect();
+  const database = drizzle({ client, schema });
 
   async function userId(email: string): Promise<string> {
     const result = await client.query<{ id: string }>(
@@ -42,21 +46,24 @@ export async function openE2EDatabase(): Promise<E2EDatabase> {
   return {
     async grantEntitlement(email, titleId) {
       const id = await userId(email);
-      await client.query(
-        `insert into entitlements (user_id, title_id)
-         values ($1, $2)
-         on conflict (user_id, title_id) do update
-         set revoked_at = null, granted_at = clock_timestamp(), updated_at = clock_timestamp()`,
-        [id, titleId]
+      await database.transaction((transaction) =>
+        setPreservedGrantState(transaction, {
+          userId: id,
+          titleId,
+          active: true,
+          stateReason: 'e2e_preserved_access'
+        })
       );
     },
     async revokeEntitlement(email, titleId) {
       const id = await userId(email);
-      await client.query(
-        `update entitlements
-         set revoked_at = clock_timestamp(), updated_at = clock_timestamp()
-         where user_id = $1 and title_id = $2 and revoked_at is null`,
-        [id, titleId]
+      await database.transaction((transaction) =>
+        setPreservedGrantState(transaction, {
+          userId: id,
+          titleId,
+          active: false,
+          stateReason: 'e2e_preserved_revoked'
+        })
       );
     },
     async close() {

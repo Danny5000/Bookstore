@@ -630,7 +630,7 @@ git commit -m "feat: add commerce persistence model"
 - Create: `tests/integration/commerce-grants.test.ts`
 - Modify: existing library/E2E entitlement fixture helpers
 
-- [ ] **Step 1: Write failing pure projection tests**
+- [x] **Step 1: Write failing pure projection tests**
 
 Specify and cover no grants, one active, active plus suspended/revoked, only suspended, only unclaimed, and only revoked:
 
@@ -644,17 +644,17 @@ export function effectiveEntitlementState(
 
 Run `npx vitest run src/lib/server/commerce/grants.test.ts`. Expected: FAIL.
 
-- [ ] **Step 2: Implement the pure reducer and error taxonomy**
+- [x] **Step 2: Implement the pure reducer and error taxonomy**
 
 Add `PermanentCommerceError`, `RetryableProviderError`, `CommerceConflictError`, and customer-safe cart/order errors without provider messages or email. Permanently revoked purchase grants reject reactivation; refund/dispute code cannot mutate preserved grants. Run the focused test. Expected: PASS.
 
-- [ ] **Step 3: Write failing concurrent projection integration tests**
+- [x] **Step 3: Write failing concurrent projection integration tests**
 
 Prove first activation creates/reactivates an entitlement; losing the last active grant revokes it; another purchase/preserved grant preserves it; won-dispute restoration reactivates only an otherwise-valid grant; unclaimed grants never project; concurrent same-scope operations cannot commit stale access; and different scopes proceed independently.
 
 Run `npm run test:integration -- tests/integration/commerce-grants.test.ts`. Expected: FAIL.
 
-- [ ] **Step 4: Implement deterministic locking and projection**
+- [x] **Step 4: Implement deterministic locking and projection**
 
 Lock in this order: relevant order/payment row; guest identity when claiming; sorted `(userId,titleId)` advisory locks; scope grants; effective entitlement. After locking, re-read all grants.
 
@@ -669,7 +669,7 @@ export async function projectEffectiveEntitlement(
 
 Upsert one entitlement, retain its first `grantedAt`, clear `revokedAt` on reactivation, and set it only when no active grant remains. Never authorize from a pre-lock snapshot. Run integration tests. Expected: PASS without deadlock.
 
-- [ ] **Step 5: Replace direct test entitlements with preserved grants**
+- [x] **Step 5: Replace direct test entitlements with preserved grants**
 
 Update test helpers so “grant/revoke existing access” creates or changes a preserved grant and invokes production projection. Keep direct malformed inserts only in constraint tests.
 
@@ -682,7 +682,7 @@ npm run test:integration -- tests/integration/library-access.test.ts tests/integ
 
 Expected: Plan 5 access behavior remains green.
 
-- [ ] **Step 6: Verify and commit Task 3**
+- [x] **Step 6: Verify and commit Task 3**
 
 Run:
 

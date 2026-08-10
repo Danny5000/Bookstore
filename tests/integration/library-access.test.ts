@@ -1,10 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { and, asc, eq, sql } from 'drizzle-orm';
+import { asc, eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import type { Actor } from '$lib/server/auth/admin-policy';
 import { getReaderDocumentForAccess } from '$lib/server/catalog/reader';
 import {
-  entitlements,
   proseBlocks,
   proseSections,
   readerProgress,
@@ -13,6 +12,7 @@ import {
   titles,
   user
 } from '$lib/server/db/schema';
+import { setPreservedGrantState } from '$lib/server/commerce/grants';
 import { resolvePublicationAccess } from '$lib/server/library/access';
 import { listCustomerLibrary } from '$lib/server/library/query';
 import { databaseClient } from './database';
@@ -106,7 +106,25 @@ async function createPublishedProse(
 }
 
 async function grant(userId: string, titleId: string): Promise<void> {
-  await databaseClient.db.insert(entitlements).values({ userId, titleId });
+  await databaseClient.db.transaction((transaction) =>
+    setPreservedGrantState(transaction, {
+      userId,
+      titleId,
+      active: true,
+      stateReason: 'test_preserved_access'
+    })
+  );
+}
+
+async function revoke(userId: string, titleId: string): Promise<void> {
+  await databaseClient.db.transaction((transaction) =>
+    setPreservedGrantState(transaction, {
+      userId,
+      titleId,
+      active: false,
+      stateReason: 'test_preserved_revoked'
+    })
+  );
 }
 
 describe('effective publication access', () => {
@@ -162,10 +180,7 @@ describe('effective publication access', () => {
       })
     ).resolves.toMatchObject({ level: 'entitled' });
 
-    await databaseClient.db
-      .update(entitlements)
-      .set({ revokedAt: sql`clock_timestamp()`, updatedAt: sql`clock_timestamp()` })
-      .where(eq(entitlements.userId, customer.id));
+    await revoke(customer.id, publication.title.id);
     await expect(
       resolvePublicationAccess({
         db: databaseClient.db,
@@ -268,15 +283,7 @@ describe('effective publication access', () => {
       revoked.title.id,
       unavailable.id
     ]) await grant(customer.id, titleId);
-    await databaseClient.db
-      .update(entitlements)
-      .set({ revokedAt: sql`clock_timestamp()`, updatedAt: sql`clock_timestamp()` })
-      .where(
-        and(
-          eq(entitlements.userId, customer.id),
-          eq(entitlements.titleId, revoked.title.id)
-        )
-      );
+    await revoke(customer.id, revoked.title.id);
     await databaseClient.db.insert(readerProgress).values({
       userId: customer.id,
       titleId: alpha.title.id,

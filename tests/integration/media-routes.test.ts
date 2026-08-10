@@ -10,7 +10,6 @@ import {
 } from '$lib/server/catalog/media';
 import {
   auditEvents,
-  entitlements,
   proseBlocks,
   proseImages,
   proseSections,
@@ -19,6 +18,7 @@ import {
   titles,
   user
 } from '$lib/server/db/schema';
+import { setPreservedGrantState } from '$lib/server/commerce/grants';
 import { revisionOriginalKey, revisionProseImageKey } from '$lib/server/storage/keys';
 import type { ObjectStorage } from '$lib/server/storage/types';
 import { databaseClient } from './database';
@@ -35,6 +35,28 @@ async function createCustomer(): Promise<Extract<Actor, { type: 'user' }>> {
     emailVerified: true
   });
   return { type: 'user', id, roles: ['customer'] };
+}
+
+async function grant(userId: string, titleId: string): Promise<void> {
+  await databaseClient.db.transaction((transaction) =>
+    setPreservedGrantState(transaction, {
+      userId,
+      titleId,
+      active: true,
+      stateReason: 'test_preserved_access'
+    })
+  );
+}
+
+async function revoke(userId: string, titleId: string): Promise<void> {
+  await databaseClient.db.transaction((transaction) =>
+    setPreservedGrantState(transaction, {
+      userId,
+      titleId,
+      active: false,
+      stateReason: 'test_preserved_revoked'
+    })
+  );
 }
 
 async function createPublication() {
@@ -197,10 +219,7 @@ describe('entitled media and original download resolution', () => {
   it('rechecks current access, keeps full assets private, and writes one redacted audit event', async () => {
     const customer = await createCustomer();
     const publication = await createPublication();
-    await databaseClient.db.insert(entitlements).values({
-      userId: customer.id,
-      titleId: publication.title.id
-    });
+    await grant(customer.id, publication.title.id);
     const objectStorage = storage();
 
     await expect(
@@ -255,10 +274,7 @@ describe('entitled media and original download resolution', () => {
       /private-source-name|originalStorageKey|filename|cookie|token|authorization/iu
     );
 
-    await databaseClient.db
-      .update(entitlements)
-      .set({ revokedAt: sql`clock_timestamp()` })
-      .where(eq(entitlements.userId, customer.id));
+    await revoke(customer.id, publication.title.id);
     await expect(
       streamCustomerOriginalDownload(databaseClient.db, objectStorage, customer, {
         titleId: publication.title.id,
@@ -296,20 +312,28 @@ describe('entitled media and original download resolution', () => {
   it('serializes stream-start authorization against concurrent entitlement revocation', async () => {
     const customer = await createCustomer();
     const publication = await createPublication();
-    await databaseClient.db.insert(entitlements).values({
-      userId: customer.id,
-      titleId: publication.title.id
-    });
+    await grant(customer.id, publication.title.id);
     const objectStorage = storage();
-    const revoker = await databaseClient.pool.connect();
+    let releaseRevocation!: () => void;
+    const release = new Promise<void>((resolve) => {
+      releaseRevocation = resolve;
+    });
+    let signalRevocationPrepared!: () => void;
+    const revocationPrepared = new Promise<void>((resolve) => {
+      signalRevocationPrepared = resolve;
+    });
+    const revocation = databaseClient.db.transaction(async (transaction) => {
+      await setPreservedGrantState(transaction, {
+        userId: customer.id,
+        titleId: publication.title.id,
+        active: false,
+        stateReason: 'test_concurrent_revocation'
+      });
+      signalRevocationPrepared();
+      await release;
+    });
     try {
-      await revoker.query('begin');
-      await revoker.query(
-        `update entitlements
-         set revoked_at = clock_timestamp(), updated_at = clock_timestamp()
-         where user_id = $1 and title_id = $2`,
-        [customer.id, publication.title.id]
-      );
+      await revocationPrepared;
       const download = streamCustomerOriginalDownload(
         databaseClient.db,
         objectStorage,
@@ -324,7 +348,8 @@ describe('entitled media and original download resolution', () => {
       await waitForBlockedEntitlementQuery();
       expect(objectStorage.prepareVerifiedRead).not.toHaveBeenCalled();
 
-      await revoker.query('commit');
+      releaseRevocation();
+      await revocation;
       await expect(download).rejects.toBeInstanceOf(MediaNotFoundError);
       const events = await databaseClient.db
         .select()
@@ -333,18 +358,15 @@ describe('entitled media and original download resolution', () => {
       expect(events).toHaveLength(0);
       expect(objectStorage.prepareVerifiedRead).not.toHaveBeenCalled();
     } finally {
-      await revoker.query('rollback').catch(() => undefined);
-      revoker.release();
+      releaseRevocation();
+      await Promise.allSettled([revocation]);
     }
   });
 
   it('prepares the verified snapshot without holding entitlement locks, then rechecks access', async () => {
     const customer = await createCustomer();
     const publication = await createPublication();
-    await databaseClient.db.insert(entitlements).values({
-      userId: customer.id,
-      titleId: publication.title.id
-    });
+    await grant(customer.id, publication.title.id);
     let markPrepareStarted!: () => void;
     const prepareStarted = new Promise<void>((resolve) => { markPrepareStarted = resolve; });
     let releasePrepare!: () => void;
@@ -373,15 +395,9 @@ describe('entitled media and original download resolution', () => {
     );
     await prepareStarted;
 
-    const revoker = await databaseClient.pool.connect();
     let revocation: Promise<unknown> | undefined;
     try {
-      revocation = revoker.query(
-        `update entitlements
-         set revoked_at = clock_timestamp(), updated_at = clock_timestamp()
-         where user_id = $1 and title_id = $2`,
-        [customer.id, publication.title.id]
-      );
+      revocation = revoke(customer.id, publication.title.id);
       const revocationSettled = await Promise.race([
         revocation.then(() => true),
         new Promise<false>((resolve) => setTimeout(() => resolve(false), 250))
@@ -400,17 +416,13 @@ describe('entitled media and original download resolution', () => {
     } finally {
       releasePrepare();
       await Promise.allSettled([download, ...(revocation ? [revocation] : [])]);
-      revoker.release();
     }
   });
 
   it('does not commit success audit for invalid ranges or synchronous storage failures', async () => {
     const customer = await createCustomer();
     const publication = await createPublication();
-    await databaseClient.db.insert(entitlements).values({
-      userId: customer.id,
-      titleId: publication.title.id
-    });
+    await grant(customer.id, publication.title.id);
 
     const invalidRange = await streamCustomerOriginalDownload(
       databaseClient.db,
