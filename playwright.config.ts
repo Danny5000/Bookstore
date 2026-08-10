@@ -77,6 +77,19 @@ export default defineConfig({
       // covered by integration tests without allowing unrelated E2E workers to collide.
       AUTH_LOGIN_RATE_LIMIT_MAX: '20',
       AUTH_EMAIL_RATE_LIMIT_MAX: process.env.AUTH_EMAIL_RATE_LIMIT_MAX ?? '3',
+      STRIPE_ENABLED: process.env.STRIPE_ENABLED ?? 'false',
+      STRIPE_TEST_FIXTURE_MODE: process.env.STRIPE_TEST_FIXTURE_MODE ?? 'false',
+      STRIPE_LIVE_MODE: process.env.STRIPE_LIVE_MODE ?? 'false',
+      STRIPE_AUTOMATIC_TAX_ENABLED:
+        process.env.STRIPE_AUTOMATIC_TAX_ENABLED ?? 'false',
+      STRIPE_CHECKOUT_DURATION_SECONDS:
+        process.env.STRIPE_CHECKOUT_DURATION_SECONDS ?? '1800',
+      STRIPE_WEBHOOK_TOLERANCE_SECONDS:
+        process.env.STRIPE_WEBHOOK_TOLERANCE_SECONDS ?? '300',
+      COMMERCE_CHECKOUT_RATE_LIMIT_WINDOW_SECONDS:
+        process.env.COMMERCE_CHECKOUT_RATE_LIMIT_WINDOW_SECONDS ?? '60',
+      COMMERCE_CHECKOUT_RATE_LIMIT_MAX:
+        process.env.COMMERCE_CHECKOUT_RATE_LIMIT_MAX ?? '5',
       SMTP_HOST: process.env.SMTP_HOST ?? '127.0.0.1',
       SMTP_PORT: process.env.SMTP_PORT ?? '1025',
       SMTP_SECURE: process.env.SMTP_SECURE ?? 'false',

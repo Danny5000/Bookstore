@@ -7,11 +7,13 @@ export type {
   ApplicationConfig,
   ApplicationMode,
   AuthConfig,
+  CommerceConfig,
   DatabaseConfig,
   IngestionConfig,
   JobConfig,
   SmtpConfig,
-  StorageConfig
+  StorageConfig,
+  StripeConfig
 } from './schema';
 
 let cachedConfiguration: ApplicationConfig | undefined;

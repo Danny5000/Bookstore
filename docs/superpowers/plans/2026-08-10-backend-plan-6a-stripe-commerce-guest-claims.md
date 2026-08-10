@@ -348,10 +348,10 @@ Migration SQL must backfill one active `preserved` grant for every `entitlements
 
 - Modify: `package.json`, `package-lock.json`, `docs/dependency-decisions.md`, `.env.example`, `playwright.config.ts`
 - Create: `src/lib/types/commerce.ts`, `src/lib/types/commerce.test.ts`
-- Modify: `src/lib/server/config/schema.ts`, `load.ts`, `schema.test.ts`, `load.test.ts`
+- Modify: `src/lib/server/config/schema.ts`, `load.ts`, `index.ts`, `index.test.ts`
 - Modify: `scripts/with-test-database.ts` only if its explicit environment fixture requires the new settings
 
-- [ ] **Step 1: Capture dependency and security evidence before editing**
+- [x] **Step 1: Capture dependency and security evidence before editing**
 
 Run:
 
@@ -369,7 +369,7 @@ npm ls --depth=0
 
 Expected: Node `v26.7.0`, npm `11.19.0`; Stripe remains `22.4.0`; `tsx` reports the `4.23.12` patch; TypeScript 7 remains outside the linter peer range; no unexplained high/critical production advisory; dependency tree exits cleanly. If registry evidence differs, review official migration notes before changing the disposition.
 
-- [ ] **Step 2: Write failing shared-contract tests**
+- [x] **Step 2: Write failing shared-contract tests**
 
 In `src/lib/types/commerce.test.ts`, cover a valid version-1 cart, invalid versions, malformed title/attempt UUIDs, more than 25 IDs, strict rejection of unknown keys, and checkout fingerprints requiring 64 lowercase hexadecimal characters.
 
@@ -391,13 +391,13 @@ npx vitest run src/lib/types/commerce.test.ts
 
 Expected: FAIL because the commerce contract does not exist.
 
-- [ ] **Step 3: Implement browser-safe contracts**
+- [x] **Step 3: Implement browser-safe contracts**
 
 Create the exact `CartStateV1`, request schemas, quote DTO, checkout result, and order-status discriminated union from this plan's “Shared browser-safe contracts” section. Keep duplicate detection in the cart-state migration added in Task 4 so stored-state repair has one owner.
 
 Run the focused test again. Expected: PASS.
 
-- [ ] **Step 4: Write failing configuration tests**
+- [x] **Step 4: Write failing configuration tests**
 
 Add explicit test values for:
 
@@ -417,12 +417,12 @@ Test that disabled development/test starts without secrets; enabled mode require
 Run:
 
 ```powershell
-npx vitest run src/lib/server/config/schema.test.ts src/lib/server/config/load.test.ts
+npx vitest run src/lib/server/config/index.test.ts
 ```
 
 Expected: FAIL because the settings are absent.
 
-- [ ] **Step 5: Implement fail-closed commerce configuration**
+- [x] **Step 5: Implement fail-closed commerce configuration**
 
 Add this output shape:
 
@@ -450,13 +450,13 @@ Put nonsecret settings in `REQUIRED_SETTINGS`; put keys, webhook secret, and tax
 Run:
 
 ```powershell
-npx vitest run src/lib/server/config/schema.test.ts src/lib/server/config/load.test.ts src/lib/types/commerce.test.ts
+npx vitest run src/lib/server/config/index.test.ts src/lib/types/commerce.test.ts
 npm run check
 ```
 
 Expected: PASS with zero check warnings/errors.
 
-- [ ] **Step 6: Apply only the approved safe dependency patch**
+- [x] **Step 6: Apply only the approved safe dependency patch**
 
 Run:
 
@@ -467,14 +467,14 @@ npm ls --depth=0
 
 Expected: a clean dependency tree. Keep Stripe `22.4.0` and TypeScript `6.0.3` unchanged. Update `docs/dependency-decisions.md` with the date, commands, explicit Stripe API version, `tsx` patch, TypeScript peer-range hold, and audit disposition without pasting full audit output.
 
-- [ ] **Step 7: Verify and commit Task 1**
+- [x] **Step 7: Verify and commit Task 1**
 
 Run:
 
 ```powershell
 npm run check
 npm run lint
-npx vitest run src/lib/types/commerce.test.ts src/lib/server/config/schema.test.ts src/lib/server/config/load.test.ts
+npx vitest run src/lib/types/commerce.test.ts src/lib/server/config/index.test.ts
 git diff --check
 git status --short
 ```
@@ -484,7 +484,7 @@ Expected: all commands exit zero and the diff contains only Task 1 files.
 Commit:
 
 ```powershell
-git add package.json package-lock.json docs/dependency-decisions.md .env.example playwright.config.ts src/lib/types/commerce.ts src/lib/types/commerce.test.ts src/lib/server/config/schema.ts src/lib/server/config/load.ts src/lib/server/config/schema.test.ts src/lib/server/config/load.test.ts
+git add package.json package-lock.json docs/dependency-decisions.md .env.example playwright.config.ts src/lib/types/commerce.ts src/lib/types/commerce.test.ts src/lib/server/config/schema.ts src/lib/server/config/load.ts src/lib/server/config/index.ts src/lib/server/config/index.test.ts
 git add scripts/with-test-database.ts # only if changed
 git commit -m "feat: add commerce contracts and configuration"
 ```

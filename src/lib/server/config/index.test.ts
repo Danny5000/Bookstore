@@ -41,6 +41,14 @@ const VALID_DEVELOPMENT_ENVIRONMENT: EnvironmentValues = {
   AUTH_RATE_LIMIT_MAX: '100',
   AUTH_LOGIN_RATE_LIMIT_MAX: '5',
   AUTH_EMAIL_RATE_LIMIT_MAX: '3',
+  STRIPE_ENABLED: 'false',
+  STRIPE_TEST_FIXTURE_MODE: 'false',
+  STRIPE_LIVE_MODE: 'false',
+  STRIPE_AUTOMATIC_TAX_ENABLED: 'false',
+  STRIPE_CHECKOUT_DURATION_SECONDS: '1800',
+  STRIPE_WEBHOOK_TOLERANCE_SECONDS: '300',
+  COMMERCE_CHECKOUT_RATE_LIMIT_WINDOW_SECONDS: '60',
+  COMMERCE_CHECKOUT_RATE_LIMIT_MAX: '5',
   SMTP_HOST: '127.0.0.1',
   SMTP_PORT: '1025',
   SMTP_SECURE: 'false',
@@ -104,6 +112,22 @@ describe('loadApplicationConfig', () => {
           emailMax: 3
         }
       },
+      stripe: {
+        enabled: false,
+        testFixtureMode: false,
+        liveMode: false,
+        secretKey: undefined,
+        webhookSecret: undefined,
+        automaticTaxEnabled: false,
+        proseTaxCode: undefined,
+        comicTaxCode: undefined,
+        checkoutDurationSeconds: 1800,
+        webhookToleranceSeconds: 300
+      },
+      commerce: {
+        checkoutRateLimitWindowSeconds: 60,
+        checkoutRateLimitMax: 5
+      },
       smtp: {
         host: '127.0.0.1',
         port: 1025,
@@ -151,6 +175,156 @@ describe('loadApplicationConfig', () => {
       maxCompressionRatio: 200,
       timeoutMs: 900000
     });
+  });
+
+  it('requires mode-matching Stripe secrets only when Stripe is enabled', () => {
+    expect(() =>
+      loadApplicationConfig({
+        ...VALID_DEVELOPMENT_ENVIRONMENT,
+        STRIPE_ENABLED: 'true'
+      })
+    ).toThrow(/STRIPE_SECRET_KEY/);
+
+    expect(() =>
+      loadApplicationConfig({
+        ...VALID_DEVELOPMENT_ENVIRONMENT,
+        STRIPE_ENABLED: 'true',
+        STRIPE_SECRET_KEY: 'sk_test_unit_test_only',
+        STRIPE_WEBHOOK_SECRET: 'whsec_unit_test_only',
+        STRIPE_LIVE_MODE: 'true'
+      })
+    ).toThrow(/STRIPE_SECRET_KEY: must match STRIPE_LIVE_MODE/);
+
+    expect(() =>
+      loadApplicationConfig({
+        ...VALID_DEVELOPMENT_ENVIRONMENT,
+        STRIPE_ENABLED: 'true',
+        STRIPE_SECRET_KEY: 'sk_live_unit_test_only',
+        STRIPE_WEBHOOK_SECRET: 'whsec_unit_test_only',
+        STRIPE_LIVE_MODE: 'false'
+      })
+    ).toThrow(/STRIPE_SECRET_KEY: must match STRIPE_LIVE_MODE/);
+
+    expect(
+      loadApplicationConfig({
+        ...VALID_DEVELOPMENT_ENVIRONMENT,
+        STRIPE_ENABLED: 'true',
+        STRIPE_SECRET_KEY: 'sk_test_unit_test_only',
+        STRIPE_WEBHOOK_SECRET: 'whsec_unit_test_only'
+      }).stripe
+    ).toMatchObject({
+      enabled: true,
+      liveMode: false,
+      secretKey: 'sk_test_unit_test_only',
+      webhookSecret: 'whsec_unit_test_only'
+    });
+  });
+
+  it('permits the credential-free fixture provider only in test', () => {
+    expect(
+      loadApplicationConfig({
+        ...VALID_DEVELOPMENT_ENVIRONMENT,
+        APP_ENV: 'test',
+        STRIPE_TEST_FIXTURE_MODE: 'true',
+        STRIPE_SECRET_KEY: 'sk_live_must_be_ignored',
+        STRIPE_WEBHOOK_SECRET: 'whsec_must_be_ignored'
+      }).stripe
+    ).toMatchObject({
+      enabled: false,
+      testFixtureMode: true,
+      secretKey: undefined,
+      webhookSecret: undefined
+    });
+
+    expect(() =>
+      loadApplicationConfig({
+        ...VALID_DEVELOPMENT_ENVIRONMENT,
+        STRIPE_TEST_FIXTURE_MODE: 'true'
+      })
+    ).toThrow(/STRIPE_TEST_FIXTURE_MODE: is allowed only in test/);
+
+    expect(() =>
+      loadApplicationConfig({
+        ...VALID_DEVELOPMENT_ENVIRONMENT,
+        APP_ENV: 'test',
+        STRIPE_ENABLED: 'true',
+        STRIPE_TEST_FIXTURE_MODE: 'true',
+        STRIPE_SECRET_KEY: 'sk_test_unit_test_only',
+        STRIPE_WEBHOOK_SECRET: 'whsec_unit_test_only'
+      })
+    ).toThrow(/STRIPE_TEST_FIXTURE_MODE: requires STRIPE_ENABLED=false/);
+  });
+
+  it('requires both format tax codes only when automatic tax is enabled', () => {
+    expect(() =>
+      loadApplicationConfig({
+        ...VALID_DEVELOPMENT_ENVIRONMENT,
+        STRIPE_AUTOMATIC_TAX_ENABLED: 'true'
+      })
+    ).toThrow(/STRIPE_TAX_CODE_PROSE/);
+
+    expect(
+      loadApplicationConfig({
+        ...VALID_DEVELOPMENT_ENVIRONMENT,
+        STRIPE_AUTOMATIC_TAX_ENABLED: 'true',
+        STRIPE_TAX_CODE_PROSE: 'txcd_10000000',
+        STRIPE_TAX_CODE_COMIC: 'txcd_10000000'
+      }).stripe
+    ).toMatchObject({
+      automaticTaxEnabled: true,
+      proseTaxCode: 'txcd_10000000',
+      comicTaxCode: 'txcd_10000000'
+    });
+  });
+
+  it.each([
+    ['STRIPE_CHECKOUT_DURATION_SECONDS', '1799'],
+    ['STRIPE_CHECKOUT_DURATION_SECONDS', '1801'],
+    ['STRIPE_WEBHOOK_TOLERANCE_SECONDS', '0'],
+    ['STRIPE_WEBHOOK_TOLERANCE_SECONDS', '901'],
+    ['COMMERCE_CHECKOUT_RATE_LIMIT_WINDOW_SECONDS', '0'],
+    ['COMMERCE_CHECKOUT_RATE_LIMIT_MAX', '0']
+  ])('rejects invalid commerce setting %s=%s', (key, value) => {
+    expect(() =>
+      loadApplicationConfig({ ...VALID_DEVELOPMENT_ENVIRONMENT, [key]: value })
+    ).toThrow(ConfigurationError);
+  });
+
+  it('loads both Stripe secrets from files without exposing them in errors', () => {
+    const source: EnvironmentValues = {
+      ...VALID_DEVELOPMENT_ENVIRONMENT,
+      STRIPE_ENABLED: 'true',
+      STRIPE_SECRET_KEY_FILE: '/run/secrets/stripe_secret_key',
+      STRIPE_WEBHOOK_SECRET_FILE: '/run/secrets/stripe_webhook_secret'
+    };
+    const values: Record<string, string> = {
+      '/run/secrets/stripe_secret_key': 'sk_test_file_only_secret\n',
+      '/run/secrets/stripe_webhook_secret': 'whsec_file_only_secret\n'
+    };
+
+    expect(loadApplicationConfig(source, (path) => values[path] ?? '').stripe).toMatchObject({
+      secretKey: 'sk_test_file_only_secret',
+      webhookSecret: 'whsec_file_only_secret'
+    });
+
+    expect(() =>
+      loadApplicationConfig({
+        ...source,
+        STRIPE_SECRET_KEY: 'sk_test_direct_must_not_leak'
+      })
+    ).toThrow(/STRIPE_SECRET_KEY and STRIPE_SECRET_KEY_FILE cannot both be set/);
+
+    let thrown: unknown;
+    try {
+      loadApplicationConfig({
+        ...VALID_DEVELOPMENT_ENVIRONMENT,
+        STRIPE_SECRET_KEY: 'sk_test_must_never_appear',
+        STRIPE_WEBHOOK_TOLERANCE_SECONDS: 'invalid'
+      });
+    } catch (cause: unknown) {
+      thrown = cause;
+    }
+    expect((thrown as Error).message).not.toContain('sk_test_must_never_appear');
   });
 
   it.each([

@@ -59,6 +59,28 @@ const rawApplicationConfigSchema = z
     AUTH_RATE_LIMIT_MAX: integerSetting(1, 100_000),
     AUTH_LOGIN_RATE_LIMIT_MAX: integerSetting(1, 10_000),
     AUTH_EMAIL_RATE_LIMIT_MAX: integerSetting(1, 10_000),
+    STRIPE_ENABLED: booleanSetting,
+    STRIPE_TEST_FIXTURE_MODE: booleanSetting,
+    STRIPE_LIVE_MODE: booleanSetting,
+    STRIPE_SECRET_KEY: z.string().trim().min(9).max(500).optional(),
+    STRIPE_WEBHOOK_SECRET: z.string().trim().min(7).max(500).optional(),
+    STRIPE_AUTOMATIC_TAX_ENABLED: booleanSetting,
+    STRIPE_TAX_CODE_PROSE: z
+      .string()
+      .trim()
+      .regex(/^txcd_[A-Za-z0-9]+$/u, 'must be a Stripe tax code')
+      .max(200)
+      .optional(),
+    STRIPE_TAX_CODE_COMIC: z
+      .string()
+      .trim()
+      .regex(/^txcd_[A-Za-z0-9]+$/u, 'must be a Stripe tax code')
+      .max(200)
+      .optional(),
+    STRIPE_CHECKOUT_DURATION_SECONDS: integerSetting(1_800, 1_800),
+    STRIPE_WEBHOOK_TOLERANCE_SECONDS: integerSetting(1, 900),
+    COMMERCE_CHECKOUT_RATE_LIMIT_WINDOW_SECONDS: integerSetting(1, 86_400),
+    COMMERCE_CHECKOUT_RATE_LIMIT_MAX: integerSetting(1, 10_000),
     SMTP_HOST: z.string().trim().min(1),
     SMTP_PORT: port,
     SMTP_SECURE: booleanSetting,
@@ -108,6 +130,77 @@ const rawApplicationConfigSchema = z
         code: 'custom',
         path: ['SMTP_USER'],
         message: 'production SMTP credentials are required'
+      });
+    }
+
+    if (value.STRIPE_TEST_FIXTURE_MODE && value.APP_ENV !== 'test') {
+      context.addIssue({
+        code: 'custom',
+        path: ['STRIPE_TEST_FIXTURE_MODE'],
+        message: 'is allowed only in test'
+      });
+    }
+
+    if (value.STRIPE_TEST_FIXTURE_MODE && value.STRIPE_ENABLED) {
+      context.addIssue({
+        code: 'custom',
+        path: ['STRIPE_TEST_FIXTURE_MODE'],
+        message: 'requires STRIPE_ENABLED=false'
+      });
+    }
+
+    if (value.STRIPE_ENABLED && !value.STRIPE_SECRET_KEY) {
+      context.addIssue({
+        code: 'custom',
+        path: ['STRIPE_SECRET_KEY'],
+        message: 'is required when STRIPE_ENABLED=true'
+      });
+    }
+
+    if (value.STRIPE_ENABLED && !value.STRIPE_WEBHOOK_SECRET) {
+      context.addIssue({
+        code: 'custom',
+        path: ['STRIPE_WEBHOOK_SECRET'],
+        message: 'is required when STRIPE_ENABLED=true'
+      });
+    }
+
+    if (value.STRIPE_ENABLED && value.STRIPE_SECRET_KEY) {
+      const requiredPrefix = value.STRIPE_LIVE_MODE ? 'sk_live_' : 'sk_test_';
+      if (!value.STRIPE_SECRET_KEY.startsWith(requiredPrefix)) {
+        context.addIssue({
+          code: 'custom',
+          path: ['STRIPE_SECRET_KEY'],
+          message: 'must match STRIPE_LIVE_MODE'
+        });
+      }
+    }
+
+    if (
+      value.STRIPE_ENABLED &&
+      value.STRIPE_WEBHOOK_SECRET &&
+      !value.STRIPE_WEBHOOK_SECRET.startsWith('whsec_')
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['STRIPE_WEBHOOK_SECRET'],
+        message: 'must begin with whsec_'
+      });
+    }
+
+    if (value.STRIPE_AUTOMATIC_TAX_ENABLED && !value.STRIPE_TAX_CODE_PROSE) {
+      context.addIssue({
+        code: 'custom',
+        path: ['STRIPE_TAX_CODE_PROSE'],
+        message: 'is required when STRIPE_AUTOMATIC_TAX_ENABLED=true'
+      });
+    }
+
+    if (value.STRIPE_AUTOMATIC_TAX_ENABLED && !value.STRIPE_TAX_CODE_COMIC) {
+      context.addIssue({
+        code: 'custom',
+        path: ['STRIPE_TAX_CODE_COMIC'],
+        message: 'is required when STRIPE_AUTOMATIC_TAX_ENABLED=true'
       });
     }
 
@@ -223,6 +316,26 @@ const rawApplicationConfigSchema = z
         emailMax: value.AUTH_EMAIL_RATE_LIMIT_MAX
       }
     },
+    stripe: {
+      enabled: value.STRIPE_ENABLED,
+      testFixtureMode: value.STRIPE_TEST_FIXTURE_MODE,
+      liveMode: value.STRIPE_LIVE_MODE,
+      secretKey: value.STRIPE_ENABLED ? value.STRIPE_SECRET_KEY : undefined,
+      webhookSecret: value.STRIPE_ENABLED ? value.STRIPE_WEBHOOK_SECRET : undefined,
+      automaticTaxEnabled: value.STRIPE_AUTOMATIC_TAX_ENABLED,
+      proseTaxCode: value.STRIPE_AUTOMATIC_TAX_ENABLED
+        ? value.STRIPE_TAX_CODE_PROSE
+        : undefined,
+      comicTaxCode: value.STRIPE_AUTOMATIC_TAX_ENABLED
+        ? value.STRIPE_TAX_CODE_COMIC
+        : undefined,
+      checkoutDurationSeconds: value.STRIPE_CHECKOUT_DURATION_SECONDS,
+      webhookToleranceSeconds: value.STRIPE_WEBHOOK_TOLERANCE_SECONDS
+    },
+    commerce: {
+      checkoutRateLimitWindowSeconds: value.COMMERCE_CHECKOUT_RATE_LIMIT_WINDOW_SECONDS,
+      checkoutRateLimitMax: value.COMMERCE_CHECKOUT_RATE_LIMIT_MAX
+    },
     smtp: {
       host: value.SMTP_HOST,
       port: value.SMTP_PORT,
@@ -244,6 +357,8 @@ export type JobConfig = ApplicationConfig['jobs'];
 export type StorageConfig = ApplicationConfig['storage'];
 export type IngestionConfig = ApplicationConfig['ingestion'];
 export type AuthConfig = ApplicationConfig['auth'];
+export type StripeConfig = ApplicationConfig['stripe'];
+export type CommerceConfig = ApplicationConfig['commerce'];
 export type SmtpConfig = ApplicationConfig['smtp'];
 
 export function parseApplicationConfig(value: unknown): ApplicationConfig {
