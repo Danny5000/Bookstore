@@ -488,9 +488,13 @@ Implement local storage, the S3 stub, secure EPUB/CBZ ingestion, retained origin
 
 Connect the existing storefront and reader to server data, implement public previews, entitlement-protected reading and downloads, library state, progress, bookmarks, and safe revision transitions.
 
-### Plan 6: Stripe commerce, claims, and financial reporting
+### Plan 6A: Stripe commerce, claims, and entitlement lifecycle
 
-Implement checkout, signed idempotent webhooks, orders, payment fulfillment, entitlements, guest purchase claiming, refunds/dispute synchronization, balance-transaction and payout reconciliation, fee allocation, and the sales dashboard.
+Implement the multi-title cart, hosted checkout, signed idempotent webhooks, orders, payment fulfillment, purchase grants, guest purchase claiming, and refund/dispute-driven entitlement changes.
+
+### Plan 6B: Stripe financial reconciliation and reporting
+
+Import balance transactions and payouts, allocate processing and dispute fees, resolve ambiguous refund allocations, reconcile settlement state, and provide the administrator sales and estimated-payout dashboard.
 
 ### Plan 7: Production hardening and Hetzner operations
 
