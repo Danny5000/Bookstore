@@ -230,6 +230,8 @@ export const proseBlocks = pgTable(
     kind: proseBlockKind('kind').notNull(),
     content: jsonb('content').$type<ProseBlockData>().notNull(),
     imageId: uuid('image_id'),
+    semanticFingerprintSha256: varchar('semantic_fingerprint_sha256', { length: 64 }),
+    semanticFingerprintVersion: integer('semantic_fingerprint_version'),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull()
   },
   (table) => [
@@ -244,6 +246,11 @@ export const proseBlocks = pgTable(
       table.sectionId,
       table.ordinal
     ),
+    index('prose_blocks_semantic_fingerprint_idx').on(
+      table.revisionId,
+      table.semanticFingerprintVersion,
+      table.semanticFingerprintSha256
+    ),
     foreignKey({
       name: 'prose_blocks_section_same_revision_fk',
       columns: [table.revisionId, table.sectionId],
@@ -255,7 +262,19 @@ export const proseBlocks = pgTable(
       foreignColumns: [proseImages.revisionId, proseImages.id]
     }).onDelete('cascade'),
     check('prose_blocks_ordinal_nonnegative', sql`${table.ordinal} >= 0`),
-    check('prose_blocks_image_kind_shape', sql`(${table.kind} = 'image') = (${table.imageId} is not null)`)
+    check('prose_blocks_image_kind_shape', sql`(${table.kind} = 'image') = (${table.imageId} is not null)`),
+    check(
+      'prose_blocks_semantic_fingerprint_pair',
+      sql`(${table.semanticFingerprintSha256} is null) = (${table.semanticFingerprintVersion} is null)`
+    ),
+    check(
+      'prose_blocks_semantic_fingerprint_shape',
+      sql`${table.semanticFingerprintSha256} is null or ${table.semanticFingerprintSha256} ~ '^[0-9a-f]{64}$'`
+    ),
+    check(
+      'prose_blocks_semantic_fingerprint_version_positive',
+      sql`${table.semanticFingerprintVersion} is null or ${table.semanticFingerprintVersion} > 0`
+    )
   ]
 );
 
@@ -271,6 +290,8 @@ export const comicPages = pgTable(
     storageKey: text('storage_key').notNull(),
     mediaType: text('media_type').notNull(),
     checksumSha256: varchar('checksum_sha256', { length: 64 }).notNull(),
+    semanticFingerprintSha256: varchar('semantic_fingerprint_sha256', { length: 64 }),
+    semanticFingerprintVersion: integer('semantic_fingerprint_version'),
     byteSize: bigint('byte_size', { mode: 'number' }).notNull(),
     width: integer('width').notNull(),
     height: integer('height').notNull(),
@@ -281,10 +302,27 @@ export const comicPages = pgTable(
     unique('comic_pages_revision_ordinal_unique').on(table.revisionId, table.ordinal),
     uniqueIndex('comic_pages_storage_key_unique').on(table.storageKey),
     index('comic_pages_revision_idx').on(table.revisionId, table.ordinal),
+    index('comic_pages_semantic_fingerprint_idx').on(
+      table.revisionId,
+      table.semanticFingerprintVersion,
+      table.semanticFingerprintSha256
+    ),
     check('comic_pages_ordinal_positive', sql`${table.ordinal} > 0`),
     check('comic_pages_byte_size_positive', sql`${table.byteSize} > 0`),
     check('comic_pages_dimensions_positive', sql`${table.width} > 0 and ${table.height} > 0`),
-    check('comic_pages_checksum_shape', sql`${table.checksumSha256} ~ '^[0-9a-f]{64}$'`)
+    check('comic_pages_checksum_shape', sql`${table.checksumSha256} ~ '^[0-9a-f]{64}$'`),
+    check(
+      'comic_pages_semantic_fingerprint_pair',
+      sql`(${table.semanticFingerprintSha256} is null) = (${table.semanticFingerprintVersion} is null)`
+    ),
+    check(
+      'comic_pages_semantic_fingerprint_shape',
+      sql`${table.semanticFingerprintSha256} is null or ${table.semanticFingerprintSha256} ~ '^[0-9a-f]{64}$'`
+    ),
+    check(
+      'comic_pages_semantic_fingerprint_version_positive',
+      sql`${table.semanticFingerprintVersion} is null or ${table.semanticFingerprintVersion} > 0`
+    )
   ]
 );
 

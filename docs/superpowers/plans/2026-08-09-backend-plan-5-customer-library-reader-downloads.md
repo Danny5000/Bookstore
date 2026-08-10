@@ -407,7 +407,7 @@ git commit -m "feat: fingerprint semantic publication content"
 - Create: `drizzle/0004_plan5_reader_library.sql`
 - Modify/Create: `drizzle/meta/**`
 
-- [ ] **Step 1: Add failing schema assertions first**
+- [x] **Step 1: Add failing schema assertions first**
 
 Extend `tests/integration/schema.test.ts` to assert:
 
@@ -420,7 +420,7 @@ Extend `tests/integration/schema.test.ts` to assert:
 
 Add the six tables to integration truncation in child-to-parent order, before catalog/auth tables.
 
-- [ ] **Step 2: Prove the schema suite fails**
+- [x] **Step 2: Prove the schema suite fails**
 
 Run:
 
@@ -430,7 +430,7 @@ npm run test:integration -- tests/integration/schema.test.ts
 
 Expected: FAIL because the Plan 5 schema and migration do not exist.
 
-- [ ] **Step 3: Define the Drizzle schema with database-enforced location integrity**
+- [x] **Step 3: Define the Drizzle schema with database-enforced location integrity**
 
 Create `library.ts` using the existing UUID/timestamp conventions. Use explicit enums/checks consistent with the repository's schema style. Add composite keys on catalog rows needed to prove title/revision ownership. For bookmark uniqueness use separate partial unique indexes:
 
@@ -439,7 +439,7 @@ Create `library.ts` using the existing UUID/timestamp conventions. Use explicit 
 
 Ensure `migrated_from_bookmark_id` is nullable, references the same table without cascade deletion of historical lineage, and is not client-settable through route schemas.
 
-- [ ] **Step 4: Generate and review the migration**
+- [x] **Step 4: Generate and review the migration**
 
 Run:
 
@@ -450,7 +450,7 @@ git diff -- drizzle src/lib/server/db/schema
 
 Expected: Drizzle creates `drizzle/0004_plan5_reader_library.sql` and metadata. Review that it only adds Plan 5 tables, keys, indexes, and nullable catalog columns. It must not drop/recreate Plan 4 content tables, backfill decoded-pixel fingerprints in SQL, or make historical fingerprint columns non-null.
 
-- [ ] **Step 5: Apply the migration through the isolated integration harness and run schema tests**
+- [x] **Step 5: Apply the migration through the isolated integration harness and run schema tests**
 
 Run:
 
@@ -460,7 +460,7 @@ npm run test:integration -- tests/integration/schema.test.ts
 
 Expected: `scripts/with-test-database.ts` starts a disposable project database, applies every migration through `src/migrate.ts`, and all schema assertions pass. Never apply this migration to or reset the development database merely to satisfy the test.
 
-- [ ] **Step 6: Run static and schema-regression gates**
+- [x] **Step 6: Run static and schema-regression gates**
 
 ```powershell
 npm run check
@@ -470,7 +470,7 @@ npm run test:integration -- tests/integration/schema.test.ts tests/integration/s
 
 Expected: zero check/lint errors and both old/new schema suites pass.
 
-- [ ] **Step 7: Commit schema and migration**
+- [x] **Step 7: Commit schema and migration**
 
 ```powershell
 git add src/lib/server/db/schema/catalog.ts src/lib/server/db/schema/library.ts src/lib/server/db/schema/index.ts tests/integration/schema.test.ts tests/integration/setup.ts drizzle

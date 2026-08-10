@@ -20,6 +20,15 @@ const PLAN_4_TABLES = [
   'revision_presentations'
 ];
 
+const PLAN_5_TABLES = [
+  'entitlements',
+  'reader_bookmarks',
+  'reader_preferences',
+  'reader_progress',
+  'reader_revision_migrations',
+  'reader_title_preferences'
+];
+
 let entitySequence = 0;
 
 beforeEach(() => {
@@ -36,6 +45,19 @@ async function createTitle(format: 'prose' | 'comic' = 'prose'): Promise<string>
       returning id
     `,
     [`schema-title-${entitySequence}`, `Schema Title ${entitySequence}`, format]
+  );
+  return result.rows[0]!.id;
+}
+
+async function createUser(): Promise<string> {
+  entitySequence += 1;
+  const result = await databaseClient.pool.query<{ id: string }>(
+    `
+      insert into "user" (name, email, email_verified)
+      values ($1, $2, true)
+      returning id
+    `,
+    [`Schema User ${entitySequence}`, `schema-${entitySequence}@example.com`]
   );
   return result.rows[0]!.id;
 }
@@ -399,5 +421,230 @@ describe('Plan 4 publication schema', () => {
         request_metadata: { method: 'POST', routeId: '/admin/catalog/[id]' }
       }
     ]);
+  });
+});
+
+describe('Plan 5 reader library schema', () => {
+  it('creates every entitlement and reader-state table', async () => {
+    const result = await databaseClient.pool.query<{ table_name: string }>(
+      `
+        select table_name
+        from information_schema.tables
+        where table_schema = 'public'
+          and table_name = any($1::text[])
+        order by table_name
+      `,
+      [PLAN_5_TABLES]
+    );
+
+    expect(result.rows.map((row) => row.table_name)).toEqual(PLAN_5_TABLES);
+  });
+
+  it('keeps semantic fingerprint digest and version paired while allowing legacy nulls', async () => {
+    const proseRevisionId = await createRevision(await createTitle('prose'));
+    const sectionId = await createProseSection(proseRevisionId);
+    const blockId = await createProseBlock(proseRevisionId, sectionId);
+    const comicRevisionId = await createRevision(await createTitle('comic'));
+    const pageId = await createComicPage(comicRevisionId);
+
+    await expect(
+      databaseClient.pool.query(
+        `update prose_blocks
+         set semantic_fingerprint_sha256 = repeat('a', 64), semantic_fingerprint_version = 1
+         where id = $1`,
+        [blockId]
+      )
+    ).resolves.toBeDefined();
+    await expect(
+      databaseClient.pool.query(
+        `update prose_blocks set semantic_fingerprint_version = null where id = $1`,
+        [blockId]
+      )
+    ).rejects.toMatchObject({ code: '23514' });
+    await expect(
+      databaseClient.pool.query(
+        `update comic_pages
+         set semantic_fingerprint_sha256 = 'NOT-A-DIGEST', semantic_fingerprint_version = 1
+         where id = $1`,
+        [pageId]
+      )
+    ).rejects.toMatchObject({ code: '23514' });
+    await expect(
+      databaseClient.pool.query(
+        `update comic_pages
+         set semantic_fingerprint_sha256 = repeat('b', 64), semantic_fingerprint_version = 1
+         where id = $1`,
+        [pageId]
+      )
+    ).resolves.toBeDefined();
+  });
+
+  it('stores one effective entitlement row per user and title', async () => {
+    const userId = await createUser();
+    const titleId = await createTitle();
+
+    await databaseClient.pool.query(
+      `insert into entitlements (user_id, title_id) values ($1, $2)`,
+      [userId, titleId]
+    );
+    await expect(
+      databaseClient.pool.query(
+        `insert into entitlements (user_id, title_id) values ($1, $2)`,
+        [userId, titleId]
+      )
+    ).rejects.toMatchObject({ code: '23505' });
+    await expect(
+      databaseClient.pool.query(
+        `update entitlements set revoked_at = clock_timestamp(), updated_at = clock_timestamp()
+         where user_id = $1 and title_id = $2`,
+        [userId, titleId]
+      )
+    ).resolves.toBeDefined();
+  });
+
+  it('enforces semantic progress shape and same-title same-revision anchors', async () => {
+    const userId = await createUser();
+    const firstTitleId = await createTitle('prose');
+    const firstRevisionId = await createRevision(firstTitleId);
+    const firstSectionId = await createProseSection(firstRevisionId);
+    const firstBlockId = await createProseBlock(firstRevisionId, firstSectionId);
+    const secondTitleId = await createTitle('prose');
+    const secondRevisionId = await createRevision(secondTitleId);
+    const secondSectionId = await createProseSection(secondRevisionId);
+    const secondBlockId = await createProseBlock(secondRevisionId, secondSectionId);
+
+    await expect(
+      databaseClient.pool.query(
+        `insert into reader_progress
+           (user_id, title_id, revision_id, format, block_id, prose_offset, version)
+         values ($1, $2, $3, 'prose', $4, 0, 1)`,
+        [userId, firstTitleId, firstRevisionId, firstBlockId]
+      )
+    ).resolves.toBeDefined();
+    await expect(
+      databaseClient.pool.query(
+        `insert into reader_progress
+           (user_id, title_id, revision_id, format, block_id, prose_offset,
+            page_id, panel_ordinal, version)
+         values ($1, $2, $3, 'prose', $4, 0, $5, 0, 1)`,
+        [userId, secondTitleId, secondRevisionId, secondBlockId, await createComicPage(secondRevisionId)]
+      )
+    ).rejects.toMatchObject({ code: '23514' });
+    await expect(
+      databaseClient.pool.query(
+        `insert into reader_progress
+           (user_id, title_id, revision_id, format, block_id, prose_offset, version)
+         values ($1, $2, $3, 'prose', $4, 0, 1)`,
+        [userId, secondTitleId, secondRevisionId, firstBlockId]
+      )
+    ).rejects.toMatchObject({ code: '23503' });
+    await expect(
+      databaseClient.pool.query(
+        `insert into reader_progress
+           (user_id, title_id, revision_id, format, block_id, prose_offset, version)
+         values ($1, $2, $3, 'prose', $4, 0, 1)`,
+        [userId, firstTitleId, secondRevisionId, secondBlockId]
+      )
+    ).rejects.toMatchObject({ code: '23503' });
+  });
+
+  it('deduplicates prose and comic bookmark locations independently', async () => {
+    const userId = await createUser();
+    const proseTitleId = await createTitle('prose');
+    const proseRevisionId = await createRevision(proseTitleId);
+    const sectionId = await createProseSection(proseRevisionId);
+    const blockId = await createProseBlock(proseRevisionId, sectionId);
+    const comicTitleId = await createTitle('comic');
+    const comicRevisionId = await createRevision(comicTitleId);
+    const pageId = await createComicPage(comicRevisionId);
+
+    const insertProse = (offset: number) => databaseClient.pool.query(
+      `insert into reader_bookmarks
+         (user_id, title_id, revision_id, format, block_id, prose_offset)
+       values ($1, $2, $3, 'prose', $4, $5)`,
+      [userId, proseTitleId, proseRevisionId, blockId, offset]
+    );
+    await insertProse(0);
+    await insertProse(1);
+    await expect(insertProse(0)).rejects.toMatchObject({ code: '23505' });
+
+    const insertComic = () => databaseClient.pool.query(
+      `insert into reader_bookmarks
+         (user_id, title_id, revision_id, format, page_id, panel_ordinal)
+       values ($1, $2, $3, 'comic', $4, null)`,
+      [userId, comicTitleId, comicRevisionId, pageId]
+    );
+    await insertComic();
+    await expect(insertComic()).rejects.toMatchObject({ code: '23505' });
+  });
+
+  it('bounds preference values and versions', async () => {
+    const firstUserId = await createUser();
+    const secondUserId = await createUser();
+    const titleId = await createTitle('comic');
+
+    await expect(
+      databaseClient.pool.query(
+        `insert into reader_preferences (user_id, font_size, typeface, paper, version)
+         values ($1, 18, 'serif', 'white', 1)`,
+        [firstUserId]
+      )
+    ).resolves.toBeDefined();
+    await expect(
+      databaseClient.pool.query(
+        `insert into reader_preferences (user_id, font_size, typeface, paper, version)
+         values ($1, 13, 'serif', 'white', 1)`,
+        [secondUserId]
+      )
+    ).rejects.toMatchObject({ code: '23514' });
+    await expect(
+      databaseClient.pool.query(
+        `insert into reader_title_preferences (user_id, title_id, comic_mode, version)
+         values ($1, $2, 'guided', 0)`,
+        [firstUserId, titleId]
+      )
+    ).rejects.toMatchObject({ code: '23514' });
+  });
+
+  it('records one nonnegative migration outcome per user title and target revision', async () => {
+    const userId = await createUser();
+    const titleId = await createTitle();
+    const sourceRevisionId = await createRevision(titleId);
+    const otherSourceRevisionId = await createRevision(titleId);
+    const targetRevisionId = await createRevision(titleId);
+
+    await databaseClient.pool.query(
+      `insert into reader_revision_migrations
+         (user_id, title_id, source_revision_id, target_revision_id, progress_result,
+          panel_position_simplified, migrated_bookmark_count, unmatched_bookmark_count)
+       values ($1, $2, $3, $4, 'migrated', true, 1, 2)`,
+      [userId, titleId, sourceRevisionId, targetRevisionId]
+    );
+    await expect(
+      databaseClient.pool.query(
+        `insert into reader_revision_migrations
+           (user_id, title_id, source_revision_id, target_revision_id, progress_result)
+         values ($1, $2, $3, $4, 'absent')`,
+        [userId, titleId, otherSourceRevisionId, targetRevisionId]
+      )
+    ).rejects.toMatchObject({ code: '23505' });
+    await expect(
+      databaseClient.pool.query(
+        `insert into reader_revision_migrations
+           (user_id, title_id, source_revision_id, target_revision_id, progress_result,
+            unmatched_bookmark_count)
+         values ($1, $2, $3, $4, 'reset', -1)`,
+        [userId, titleId, sourceRevisionId, otherSourceRevisionId]
+      )
+    ).rejects.toMatchObject({ code: '23514' });
+    await expect(
+      databaseClient.pool.query(
+        `insert into reader_revision_migrations
+           (user_id, title_id, source_revision_id, target_revision_id, progress_result,
+            panel_position_simplified)
+         values ($1, $2, $3, $4, 'reset', true)`,
+        [userId, titleId, sourceRevisionId, otherSourceRevisionId]
+      )
+    ).rejects.toMatchObject({ code: '23514' });
   });
 });
