@@ -1312,7 +1312,7 @@ Review `git show --stat --oneline HEAD` and confirm the deletion set contains on
 - Modify: `docs/authentication-and-email.md`
 - Modify: `docs/dependency-decisions.md`
 
-- [ ] **Step 1: Add a test-only direct database seeding helper**
+- [x] **Step 1: Add a test-only direct database seeding helper**
 
 Create a Playwright-side helper that opens the configured E2E PostgreSQL database, looks up the normalized verified test user, and inserts/updates the effective entitlement row directly. It must:
 
@@ -1323,7 +1323,7 @@ Create a Playwright-side helper that opens the configured E2E PostgreSQL databas
 
 Extract reusable admin upload/review/activate helpers from `catalog-publication.spec.ts` without weakening its assertions.
 
-- [ ] **Step 2: Write the failing customer browser journey**
+- [x] **Step 2: Write the failing customer browser journey**
 
 Add one serial spec with isolated users/contexts that proves:
 
@@ -1338,7 +1338,7 @@ Add one serial spec with isolated users/contexts that proves:
 9. test revokes the entitlement directly; private full reader/media/download access disappears while an independent public preview still obeys publication visibility;
 10. removed prototype checkout/delivery URLs return `404` and never change the shelf.
 
-- [ ] **Step 3: Prove the new browser spec fails before final wiring/docs**
+- [x] **Step 3: Prove the new browser spec fails before final wiring/docs**
 
 Run:
 
@@ -1348,11 +1348,11 @@ npm run test:e2e -- tests/e2e/library-reader.spec.ts
 
 Expected: at least one Plan 5 assertion fails until all route/UI wiring and fixture extraction are complete. Do not weaken timeouts or assertions to make the test green.
 
-- [ ] **Step 4: Complete browser wiring and accessibility details**
+- [x] **Step 4: Complete browser wiring and accessibility details**
 
 Fix only observed Plan 5 gaps. Ensure status/edition notices use an appropriate live region, controls have accessible names, keyboard focus is retained after conflict/acknowledgement, unavailable items do not render dead links, and format-specific download labels are visible. Keep screenshots/traces free of secrets through existing Playwright configuration.
 
-- [ ] **Step 5: Write the operator/customer-reader runbook**
+- [x] **Step 5: Write the operator/customer-reader runbook**
 
 Create `docs/customer-library-and-reader.md` covering:
 
@@ -1368,7 +1368,7 @@ Create `docs/customer-library-and-reader.md` covering:
 
 Update the existing docs so none still claim browser-owned purchases, fake email delivery, or a live checkout. Record the unchanged TypeScript 7 peer blocker and current audit disposition without duplicating credentials or environment values.
 
-- [ ] **Step 6: Run documentation and placeholder audits**
+- [x] **Step 6: Run documentation and placeholder audits**
 
 Run:
 
@@ -1380,7 +1380,7 @@ git diff --check
 
 Expected: no stale prototype-authority copy; no placeholder instructions in new code/runbook; diff check is clean. Legitimate historical design statements must be clearly marked as superseded rather than silently contradicted.
 
-- [ ] **Step 7: Run focused browser and full automated gates**
+- [x] **Step 7: Run focused browser and full automated gates**
 
 Run in this order:
 
@@ -1430,7 +1430,7 @@ Expected:
 - both development and production Compose variants validate, and production still sets `APPLICATION_MODE=maintenance`;
 - diff check: no whitespace errors.
 
-- [ ] **Step 8: Validate the production image and runtime boundary**
+- [x] **Step 8: Validate the production image and runtime boundary**
 
 Run:
 
@@ -1442,7 +1442,7 @@ docker run --rm --entrypoint npm pale-orbit:plan5 ls --omit=dev --all
 
 Expected: image builds, Node reports `v26.7.0`, required production dependencies (including Sharp optional native packages and Stripe for Plan 6) are present, and no development-only test server is started. Do not publish or deploy the image in this task.
 
-- [ ] **Step 9: Inspect privacy, authority, and scope one final time**
+- [x] **Step 9: Inspect privacy, authority, and scope one final time**
 
 Run:
 
@@ -1455,7 +1455,7 @@ git status --short
 
 Expected: sensitive identifiers occur only in private internal resolution where required and never in response/audit payload builders; no application entitlement mutation or fake checkout path exists; every entitled reader construction is downstream of the centralized server decision; status shows only intended Plan 5/doc changes.
 
-- [ ] **Step 10: Commit browser coverage and documentation**
+- [x] **Step 10: Commit browser coverage and documentation**
 
 ```powershell
 git add tests/e2e tests/fixtures docs README.md

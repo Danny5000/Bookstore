@@ -98,7 +98,9 @@ Use `SMTP_SECURE=true` with `SMTP_REQUIRE_TLS=false` for implicit TLS, normally 
 
 The public `ORIGIN` must be the exact HTTPS origin served by Caddy. Better Auth accepts only trusted-origin requests, uses HTTP-only database-backed session cookies, and enables secure cookies in production. Session and verification lifetimes and PostgreSQL-backed endpoint rate limits are controlled by the `AUTH_*_SECONDS` and `AUTH_*_RATE_LIMIT_*` settings. Changing the auth secret invalidates signed state and should be treated as a coordinated credential rotation.
 
-Production remains in maintenance mode until the remaining backend plans replace the prototype catalog, storage, and commerce paths.
+Production remains in maintenance mode through Plan 5. Catalog, storage, customer libraries, full entitled reading, and original downloads are durable; Plan 6 must add commerce and the audited entitlement grant/revoke boundary before storefront activation is considered.
+
+Authentication email contains text/HTML only. EPUB and CBZ/ZIP originals are never attached to email; entitled delivery is re-authorized and streamed by the application as documented in [customer library, reader state, and original downloads](customer-library-and-reader.md).
 
 ## Delivery guarantees and transaction boundary
 

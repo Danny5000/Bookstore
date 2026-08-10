@@ -31,9 +31,15 @@
 </script>
 
 <div class="toolbar">
-  <button class="tool" type="button" onclick={onclose}>&larr; Close</button>
+  <button class="tool" type="button" aria-label="Close" onclick={onclose}>&larr; Close</button>
   <button class="tool" type="button" onclick={oncontents}>Contents</button>
-  <button class="tool" class:on={bookmarked} type="button" onclick={onbookmark}>
+  <button
+    class="tool"
+    class:on={bookmarked}
+    type="button"
+    aria-label={bookmarked ? 'Bookmarked' : 'Bookmark'}
+    onclick={onbookmark}
+  >
     {bookmarked ? '\u25C6' : '\u25C7'}{narrow ? '' : bookmarked ? ' Bookmarked' : ' Bookmark'}
   </button>
 
@@ -44,7 +50,7 @@
       {guided ? 'Guided view' : 'Page view'}
     </button>
   {:else if !isFixed}
-    <button class="tool" type="button" onclick={oncontrols}>Aa</button>
+    <button class="tool" type="button" aria-label="Reading settings" onclick={oncontrols}>Aa</button>
   {/if}
 
   <span class="pct">{Math.round(progress * 100)}%</span>

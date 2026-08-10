@@ -2,7 +2,7 @@
 
 ## Scope
 
-The repository supplies a development environment and a production infrastructure baseline. Authentication, administration, PostgreSQL catalog data, private publication storage, and ingestion are durable. Production intentionally remains in maintenance mode until commerce and customer full-book access are implemented.
+The repository supplies a development environment and a production infrastructure baseline. Authentication, administration, PostgreSQL catalog data, private publication storage, ingestion, customer libraries, reader state, and entitled original downloads are durable. Production intentionally remains in maintenance mode until Plan 6 implements commerce and reconciled entitlement mutation.
 
 ## Required toolchain
 
@@ -128,4 +128,6 @@ docker compose --file compose.prod.yaml --profile tools run --rm storage-cleanup
 - Plan 2 supplies the database adapter, committed migrations, worker, durable jobs/outbox, append-only audit events, and database readiness.
 - Plan 3 supplies verified email/password and magic-link authentication, audited roles, the provider-neutral SMTP adapter, and Mailpit development delivery.
 - Plan 4 supplies private storage, bounded ingestion, revision publication, cleanup, and the current backup/restore procedure.
+- Plan 5 supplies server-owned customer libraries, full entitled reading, optimistic reader state, exact revision migration, and authenticated original downloads. See [customer library, reader state, and original downloads](customer-library-and-reader.md).
+- Plan 6 supplies Stripe reconciliation, guest claiming, and the only application grant/revoke boundary.
 - Plan 7 adds deployment automation, off-host backup scheduling, monitoring/alert delivery, final capacity tuning, and the read-only-rootfs review.

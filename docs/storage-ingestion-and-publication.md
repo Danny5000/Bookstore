@@ -46,7 +46,7 @@ Database, storage, timeout, and worker-abort failures are transient. PostgreSQL 
 4. Use **Publish reader settings** to promote one complete presentation atomically.
 5. Use **Activate privately** for a first revision that should remain unavailable publicly.
 6. Use **Publish to storefront** for first publication. A public replacement remains invisible until **Publish replacement** atomically switches the active revision.
-7. **Roll back** switches to a prior ready/retired revision and its published settings. **Withdraw** makes catalog, detail, and preview routes unavailable without deleting admin review or retained originals.
+7. **Roll back** switches to a prior ready/retired revision and its published settings. **Withdraw** makes catalog, detail, and preview routes unavailable without deleting admin review, active customer entitlements, or retained originals. Entitled customers continue to use the current active publication; see [customer library, reader state, and original downloads](customer-library-and-reader.md).
 
 Metadata saves on a public title are explicit and become public after the successful transaction. Candidate processing, draft settings, and failed revisions never alter the current public reader.
 
@@ -115,7 +115,7 @@ docker compose --file compose.prod.yaml exec -T postgres psql -U $env:DATABASE_U
 docker compose --file compose.prod.yaml exec -T postgres psql -U $env:DATABASE_USER -d $env:DATABASE_NAME -c 'select original_storage_key, original_checksum_sha256 from title_revisions where original_storage_key is not null order by created_at desc limit 5;'
 ```
 
-Hash those exact paths from a read-only volume helper with `sha256sum`. Also verify that each active title points to an active revision, that active revisions have one published presentation, and that sampled prose-image/comic-page/cover rows have corresponding objects. A backup is not considered valid until this sampling and an isolated restore succeed.
+Hash those exact paths from a read-only volume helper with `sha256sum`. Also verify that each active title points to an active revision, that active revisions have one published presentation, that sampled prose-image/comic-page/cover rows have corresponding objects, and that the six Plan 5 reader tables plus prose/comic semantic fingerprint columns are present in the logical dump. A backup is not considered valid until this sampling and an isolated restore succeed.
 
 ## Isolated restore rehearsal
 

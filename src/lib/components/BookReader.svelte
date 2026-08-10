@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { untrack } from 'svelte';
+  import { tick, untrack } from 'svelte';
   import BookVolume from './BookVolume.svelte';
   import ReaderDrawers from './reader/ReaderDrawers.svelte';
   import ReaderFooter from './reader/ReaderFooter.svelte';
@@ -190,6 +190,7 @@
   let turning = $state<TurnProgress | null>(null);
   let tocOpen = $state(false);
   let controlsOpen = $state(false);
+  let readerStatusElement: HTMLParagraphElement;
 
   // comic guided view
   let comicMode = $state<'page' | 'panel'>(
@@ -245,7 +246,9 @@
   const bookmarkViews = $derived(
     readerState.bookmarks.flatMap((bookmark) => {
       const pageIndex = pageIndexForLocation(document, pages, bookmark.location);
-      return pageIndex === null ? [] : [{ id: bookmark.id, sheet: Math.floor(pageIndex / per) }];
+      return pageIndex === null
+        ? []
+        : [{ id: bookmark.id, sheet: Math.floor(pageIndex / per), location: bookmark.location }];
     })
   );
   const currentBookmark = $derived(
@@ -350,16 +353,21 @@
   });
 
   /** A jump (contents, bookmark) lands flat — it is not one page turning. */
-  function go(n: number): void {
+  function goToLocation(location: ReaderLocation): void {
+    const pageIndex = pageIndexForLocation(document, pages, location);
+    if (pageIndex === null) return;
     cancelAnimationFrame(raf);
     turning = null;
     drag = null;
-    commit(n);
+    sheet = clampSheet(Math.floor(pageIndex / per), totalSheets, limit);
+    pageIdx = document.format === 'comic' ? pageIndex : null;
+    currentLocation = location;
+    progressSync.navigate(location);
     void progressSync.flush();
   }
 
-  function goToBookmark(bookmark: { id: string; sheet: number }): void {
-    go(bookmark.sheet);
+  function goToBookmark(bookmark: { id: string; sheet: number; location: ReaderLocation }): void {
+    goToLocation(bookmark.location);
     tocOpen = false;
   }
 
@@ -494,6 +502,7 @@
     await progressSync.flush();
     const location = currentLocation ?? locationAt(currentPage);
     if (!location) return;
+    currentLocation = location;
     if (currentBookmark) {
       await persistenceAdapter.deleteBookmark(currentBookmark.id);
       readerState.bookmarks = readerState.bookmarks.filter(
@@ -524,6 +533,8 @@
     if (!notice) return;
     await persistenceAdapter.acknowledgeMigration(notice.targetRevisionId);
     readerState.migrationNotice = { ...notice, acknowledged: true };
+    await tick();
+    readerStatusElement.focus();
   }
 
   function onPointerDown(event: PointerEvent): void {
@@ -591,7 +602,8 @@
 
   function jumpToChapter(ci: number): void {
     const idx = Math.max(0, pages.findIndex((p) => p.chapter === ci));
-    go(Math.floor(idx / per));
+    const location = locationAt(idx);
+    if (location) goToLocation(location);
     tocOpen = false;
   }
 </script>
@@ -729,9 +741,15 @@
     onnext={() => turn(1)}
   />
 
-  <p class="reader-status" aria-live="polite">{syncMessage}</p>
+  <p
+    class="reader-status"
+    aria-label="Reader status"
+    aria-live="polite"
+    bind:this={readerStatusElement}
+    tabindex="-1"
+  >{syncMessage}</p>
   {#if readerState.migrationNotice && !readerState.migrationNotice.acknowledged}
-    <aside class="edition-notice" aria-live="polite">
+    <aside class="edition-notice" role="status" aria-live="polite">
       <span>
         Your saved position was checked against this edition
         {readerState.migrationNotice.progress === 'reset' ? ' and reset to the beginning' : ''}.

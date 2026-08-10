@@ -31,3 +31,5 @@ RUN mkdir -p /var/lib/pale-orbit/storage && chown node:node /var/lib/pale-orbit/
 USER node
 EXPOSE 3000
 CMD ["node", "build"]
+
+FROM runtime AS production

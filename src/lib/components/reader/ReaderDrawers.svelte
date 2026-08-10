@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { ReaderLocation } from '$lib/types/library';
   import type { PaperId, ReaderPreferences, TypefaceId } from '$lib/types/reader';
 
   interface ChapterView {
@@ -21,6 +22,7 @@
   interface BookmarkView {
     id: string;
     sheet: number;
+    location: ReaderLocation;
   }
 
   interface Props {
@@ -84,11 +86,13 @@
       <button
         class="mini"
         type="button"
+        aria-label="Decrease type size"
         onclick={() => onfontsize(Math.max(14, prefs.fontSize - 1))}
       >A&minus;</button>
       <button
         class="mini big"
         type="button"
+        aria-label="Increase type size"
         onclick={() => onfontsize(Math.min(24, prefs.fontSize + 1))}
       >A+</button>
     </div>

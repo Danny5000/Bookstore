@@ -74,7 +74,7 @@ npm run test:e2e
 npm run test:database
 ```
 
-`npm run verify` runs integration and browser suites in separate disposable Compose projects. Browser tests additionally start the real worker and bootstrap a test administrator so email delivery and role authorization use production-shaped paths. The harness creates a unique temporary local-storage root and removes only that verified path.
+`npm run verify` runs integration and browser suites in separate disposable Compose projects. Browser tests additionally start the real worker and bootstrap a test administrator so email delivery, ingestion, role authorization, customer downloads, and revision migration use production-shaped paths. The harness creates a unique temporary local-storage root and removes only that verified path. Its Plan 5 entitlement fixture rejects non-loopback or non-test databases and exists only under `tests/e2e`; it is not an application grant service.
 
 ## Production deployment order
 
@@ -95,7 +95,7 @@ docker compose --file compose.prod.yaml ps
 docker compose --file compose.prod.yaml logs --tail 100 app worker postgres caddy
 ```
 
-`/health/live` proves only the web process responds. `/health/ready` performs bounded PostgreSQL and storage probes. Worker health proves the worker completed its initial dependency probes and entered the polling loop. Production storefront and API paths remain in maintenance mode until commerce and customer full-book access are implemented.
+`/health/live` proves only the web process responds. `/health/ready` performs bounded PostgreSQL and storage probes. Worker health proves the worker completed its initial dependency probes and entered the polling loop. Production storefront and API paths remain in maintenance mode until Plan 6 commerce and entitlement reconciliation are complete.
 
 ## Job behavior
 
@@ -111,5 +111,6 @@ Authentication email uses the versioned `email.auth.v1` topic and a stable Messa
 
 - Plan 3 registered authentication email outbox topics, integrated Better Auth, and mapped sessions/roles to the actor policy.
 - Plan 4 added storage/ingestion jobs, revision lifecycle transitions, and bounded storage cleanup.
+- Plan 5 added the six entitlement/reader-state tables and semantic fingerprint columns. Reader migration is synchronous under ordered transaction locks; it is not a worker job.
 - Plan 6 adds Stripe reconciliation job topics.
 - Plan 7 adds failed-job administration, structured logging, queue-age monitoring, scheduled off-host backups, and final pool/capacity tuning.

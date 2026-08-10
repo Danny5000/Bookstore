@@ -16,7 +16,7 @@ Checked against the npm registry on 2026-08-09.
 | PostgreSQL image | 18.4 Alpine | Exact production/development database tag; mount `/var/lib/postgresql` for the PostgreSQL 18 image layout. |
 | Mailpit image | 1.30.0 | Exact development-only SMTP capture service. |
 | Caddy image | 2.11.4 Alpine | Exact production reverse-proxy baseline. |
-| Stripe SDK | Current stable | Upgrade in isolation and verify checkout/webhook types and runtime behavior. |
+| Stripe SDK | Current stable | Retained but unused by Plan 5; Plan 6 must verify checkout/webhook reconciliation types and runtime behavior before activation. |
 | Drizzle ORM | 0.45.2 | Current stable typed PostgreSQL ORM; schema files are the source of truth and runtime code uses the node-postgres adapter. |
 | Drizzle Kit | 0.31.10 | Current stable development-only migration generator/checker; generated SQL and snapshots are committed. |
 | node-postgres (`pg`) | 8.23.0 | Current stable pooled PostgreSQL driver supported by Drizzle; web, worker, and migration processes own separate bounded pools. |
@@ -41,6 +41,8 @@ packages support TypeScript 7.
 
 Run `npm outdated`, `npm audit`, `npm ls`, and `npm run verify` before completing each implementation plan.
 Any remaining direct-package lag requires a dated compatibility reason and a removal condition in this file.
+
+Plan 5 adds no S3 client or Redis dependency. Customer files stream through the existing object-storage interface, and PostgreSQL remains authoritative for entitlements, reader state, locks, jobs, and audit data.
 
 The Better Auth schema generator is invoked as exact `auth@1.6.26` by the
 `auth:schema` and `auth:info` scripts instead of being committed to the application
