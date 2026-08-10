@@ -712,17 +712,17 @@ git commit -m "feat: project durable entitlement grants"
 - Modify: `src/routes/api/reader-state/route-support.ts`
 - Create: `src/routes/api/commerce/quote/+server.ts`, `route.test.ts`
 
-- [ ] **Step 1: Write failing cart migration/store tests**
+- [x] **Step 1: Write failing cart migration/store tests**
 
 Cover invalid/oversized JSON, unsupported version, unknown fields, duplicates, malformed or 26 title IDs, add/remove/clear, uniqueness, stable attempt ID while editing, and new attempt ID only after a successful paid cleanup or explicit reset. Every invalid stored value becomes a fresh empty state.
 
 Run `npx vitest run src/lib/commerce/cart-state.test.ts src/lib/commerce/cart.svelte.test.ts`. Expected: FAIL.
 
-- [ ] **Step 2: Implement browser-only cart state**
+- [x] **Step 2: Implement browser-only cart state**
 
 Follow the Svelte 5 theme-store local-storage pattern and guard browser APIs. Persist only version, title IDs, and attempt UUID—never presentation, price, ownership, email, order/provider IDs, URLs, or paid state. Cap serialized input at 8 KiB. Run focused tests. Expected: PASS.
 
-- [ ] **Step 3: Write failing quote/fingerprint unit tests**
+- [x] **Step 3: Write failing quote/fingerprint unit tests**
 
 Canonical fingerprint input is versioned and sorted by raw UUID:
 
@@ -744,13 +744,13 @@ type QuoteFingerprintInputV1 = {
 
 Prove membership, price, currency, revision, publication, and ownership changes alter SHA-256 while input ordering does not. Never locale-sort. Run focused test. Expected: FAIL then PASS after pure implementation.
 
-- [ ] **Step 4: Write failing PostgreSQL quote tests**
+- [x] **Step 4: Write failing PostgreSQL quote tests**
 
 Cover public/published/active/positive-price titles; private, draft, inactive, zero-price, and missing-presentation titles; mixed currencies; active/revoked ownership; duplicates; unknown IDs; and 25/26 boundaries. Unknown/private IDs return only requested IDs in the unavailable list. Promise-barrier tests must prove locked re-quote observes concurrent catalog and entitlement changes.
 
 Run `npm run test:integration -- tests/integration/commerce-quote.test.ts`. Expected: FAIL.
 
-- [ ] **Step 5: Implement quote and locked re-quote**
+- [x] **Step 5: Implement quote and locked re-quote**
 
 Return only safe published DTOs. For checkout, acquire sorted Plan 4 title locks, then authenticated user/title locks, and re-read. Do not hold these locks across Stripe calls.
 
@@ -764,13 +764,13 @@ export async function lockAndQuoteCart(
 
 Reject duplicate/oversized/mixed-currency input as `INVALID_CART`; `canCheckout=false` when nothing remains. Run quote tests. Expected: PASS.
 
-- [ ] **Step 6: Write failing atomic rate-limit tests**
+- [x] **Step 6: Write failing atomic rate-limit tests**
 
 Prove first N attempts pass, N+1 gets bounded retry-after, a new window resets, cleanup is idempotent, and 20 concurrent calls cannot exceed N. Store only namespaced SHA-256/HMAC scope digests—not IP, token, email, or user agent. Auth scope starts from `user:<uuid>`; anonymous scope is an application-secret HMAC over the request IP.
 
 Run `npm run test:integration -- tests/integration/commerce-rate-limit.test.ts`. Expected: FAIL.
 
-- [ ] **Step 7: Implement rate limiting and shared strict HTTP helpers**
+- [x] **Step 7: Implement rate limiting and shared strict HTTP helpers**
 
 Use one atomic upsert for count and a bounded namespace/expiry cleanup. Extract current bounded strict JSON, same-origin, correlation, private JSON, and private empty helpers from reader route support with characterization tests. Preserve reader response codes and allow an explicit commerce body limit.
 
@@ -783,13 +783,13 @@ npm run test:integration -- tests/integration/commerce-rate-limit.test.ts
 
 Expected: PASS.
 
-- [ ] **Step 8: Add the thin quote endpoint**
+- [x] **Step 8: Add the thin quote endpoint**
 
 `POST /api/commerce/quote` requires same origin, quote throttle, strict schema, `locals.actor`, and private JSON. It never creates orders, calls Stripe, or audits routine cart activity. Map invalid JSON 400, forbidden 403, too large 413, media type 415, invalid cart 422, throttled 429 with bounded `Retry-After`, and unexpected dependency failure 503.
 
 Run the route, quote, and rate-limit suites. Expected: PASS.
 
-- [ ] **Step 9: Verify and commit Task 4**
+- [x] **Step 9: Verify and commit Task 4**
 
 Run:
 
