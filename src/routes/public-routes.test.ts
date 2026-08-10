@@ -11,6 +11,7 @@ vi.mock('$lib/server/catalog/reader', () => ({
   getPublicPreview: vi.fn()
 }));
 
+import { load as loadHome } from './+page.server';
 import { load as loadCatalog } from './catalog/+page.server';
 import { load as loadBook } from './book/[id]/+page.server';
 import { load as loadReader } from './read/[id]/+page.server';
@@ -22,6 +23,16 @@ import {
 } from '$lib/server/catalog/reader';
 
 describe('public publication loaders', () => {
+  it('loads the home surface from the public catalog query without a prototype fallback', async () => {
+    const titles = [{ id: 'title-id', slug: 'the-book', title: 'The Book' }];
+    vi.mocked(listPublicCatalog).mockResolvedValueOnce(titles as never);
+    await expect(loadHome({} as never)).resolves.toEqual({ titles });
+    expect(listPublicCatalog).toHaveBeenCalledWith(database);
+    const source = await readFile(new URL('./+page.svelte', import.meta.url), 'utf8');
+    expect(source).not.toMatch(/stores\/titles|data\/catalog|prototype/iu);
+    expect(source).toContain('checkout is not yet available');
+  });
+
   it('loads the public catalog from the database query', async () => {
     vi.mocked(listPublicCatalog).mockResolvedValueOnce([]);
 

@@ -1,7 +1,6 @@
 <script lang="ts">
-  import { money, coverBackground, coverPalette } from '$lib/data/catalog';
+  import { coverBackground, coverPalette } from '$lib/cover-art';
   import { bookDepth } from '$lib/reader/geometry';
-  import type { Title } from '$lib/types/catalog';
 
   /**
    * A closed book as an object: boards, spine, page block, cast shadow. The
@@ -9,9 +8,15 @@
    *
    * Comics are stapled issues, not bound volumes — thin, square-spined, and
    * with no stacked page block to show.
-   */
+  */
   interface Props {
-    title: Title;
+    title: string;
+    format: 'prose' | 'comic';
+    creatorName?: string;
+    description?: string;
+    priceLabel?: string | null;
+    coverSeed?: string | number;
+    coverUrl?: string | null;
     width?: number;
     height?: number;
     depth?: number | null;
@@ -26,6 +31,12 @@
 
   let {
     title,
+    format,
+    creatorName = '',
+    description = '',
+    priceLabel = null,
+    coverSeed = title,
+    coverUrl = null,
     width = 260,
     height = 360,
     depth = null,
@@ -40,31 +51,12 @@
 
   let hover = $state(false);
 
-  const stapled = $derived(title.kind === 'comic');
-  // Character count is a good enough stand-in for a page count here, and it
-  // avoids paginating a book just to decide how thick to draw it.
-  const leaves = $derived(
-    pageCount ??
-      title.pages ??
-      Math.max(
-        24,
-        Math.round(
-          (title.chapters || []).reduce(
-            (total: number, chapter) =>
-              total +
-              chapter.paras.reduce(
-                (chapterTotal: number, paragraph) => chapterTotal + paragraph.length,
-                0
-              ),
-            0
-          ) / 1800
-        )
-      )
-  );
-  const d = $derived(depth ?? bookDepth(title.kind, leaves));
+  const stapled = $derived(format === 'comic');
+  const leaves = $derived(pageCount ?? (stapled ? 24 : 80));
+  const d = $derived(depth ?? bookDepth(stapled ? 'comic' : 'novel', leaves));
 
-  const pair = $derived(coverPalette(title.cover));
-  const art = $derived(coverBackground(title.cover, title.coverUrl));
+  const pair = $derived(coverPalette(coverSeed));
+  const art = $derived(coverBackground(coverSeed, coverUrl));
   const frontRadius = $derived(stapled ? '1px 2px 2px 1px' : '3px 6px 6px 3px');
   const backRadius = $derived(stapled ? '2px 1px 1px 2px' : '6px 3px 3px 6px');
   const lean = $derived(interactive && hover ? tilt * 0.4 : tilt);
@@ -84,7 +76,7 @@
   onpointerleave={() => (hover = false)}
   role={onclick ? 'button' : 'img'}
   type={onclick ? 'button' : undefined}
-  aria-label={label ?? title.title}
+  aria-label={label ?? title}
 >
   <!-- Solid core: without it the volume is a hollow shell and you see straight
        through it as it passes edge-on. -->
@@ -112,11 +104,11 @@
          defeats backface-visibility, bleeding this text through the front -->
     <span class="tint"></span>
     <span class="blurb">
-      <span class="mono light">{title.author}</span>
-      <span class="blurb-text">{title.summary}</span>
+      <span class="mono light">{creatorName}</span>
+      <span class="blurb-text">{description}</span>
       <span class="blurb-foot mono light">
         <span>{leaves} pages</span>
-        <span>{money(title.price)}</span>
+        {#if priceLabel}<span>{priceLabel}</span>{/if}
       </span>
     </span>
   </span>
@@ -130,7 +122,7 @@
   >
     {#if d > 9}
       <span class="spine-text" style:font-size="{Math.min(15, d - 6)}px" style:max-height="{height - 40}px">
-        {title.title}
+        {title}
       </span>
     {/if}
   </span>

@@ -1,6 +1,6 @@
-import type { TitleKind } from '$lib/types/catalog';
+export type BookKind = 'novel' | 'comic';
 
-export function bookDepth(kind: TitleKind, pageCount: number): number {
+export function bookDepth(kind: BookKind, pageCount: number): number {
   const pages = Math.max(0, pageCount);
   return kind === 'comic'
     ? Math.max(5, Math.min(11, Math.round(pages * 0.5)))

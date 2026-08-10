@@ -1224,7 +1224,7 @@ git commit -m "feat: connect reader persistence adapters"
 - Remove: `src/routes/checkout/**`
 - Remove if `rg` proves unused: `src/lib/data/catalog.ts`, `src/lib/data/prose.ts`, `src/lib/data/manuscript/**`, `src/lib/types/catalog.ts`, legacy-only pagination helpers/tests
 
-- [ ] **Step 1: Write failing storefront and shelf route tests**
+- [x] **Step 1: Write failing storefront and shelf route tests**
 
 Assert:
 
@@ -1236,7 +1236,7 @@ Assert:
 - checkout controls state that checkout is not yet available and cannot grant access;
 - direct requests to removed checkout/webhook/delivery routes return route-level `404` and cannot mutate any entitlement.
 
-- [ ] **Step 2: Prove tests fail against the prototype**
+- [x] **Step 2: Prove tests fail against the prototype**
 
 Run:
 
@@ -1246,15 +1246,15 @@ npx vitest run src/routes/public-routes.test.ts src/routes/library/route.test.ts
 
 Expected: FAIL because home/library still consume prototype stores and fake commerce routes exist.
 
-- [ ] **Step 3: Make home and library server-backed**
+- [x] **Step 3: Make home and library server-backed**
 
 Load the home catalog through the Plan 4 public query and the library through `listCustomerLibrary`. Preserve current visual language and responsive behavior. Render direct application read/download links from the safe DTO. Replace “Email me the file” and fake checkout language with honest availability copy; do not display a successful purchase path before Plan 6.
 
-- [ ] **Step 4: Narrow reusable component inputs**
+- [x] **Step 4: Narrow reusable component inputs**
 
 Refactor `BookVolume` and any shared cover helpers to accept publication primitives rather than legacy prototype `Title`. Move genuinely shared visual-only cover derivation to `src/lib/cover-art.ts` with a focused unit test. Keep monetary display helpers presentation-only; price never implies entitlement.
 
-- [ ] **Step 5: Remove every browser/local fake-ownership path**
+- [x] **Step 5: Remove every browser/local fake-ownership path**
 
 Before deleting, run:
 
@@ -1264,7 +1264,7 @@ rg -n "library\.grant|prototype-db|stores/library|stores/titles|api/checkout|api
 
 Expected before removal: matches identify only the listed prototype consumers/tests. Migrate visual consumers, then delete the modules/routes/tests listed above. Keep `stripe` in `package.json` for Plan 6. Do not replace removed endpoints with no-op success handlers; filesystem route absence supplies `404`.
 
-- [ ] **Step 6: Prove no prototype authority remains**
+- [x] **Step 6: Prove no prototype authority remains**
 
 Run:
 
@@ -1278,7 +1278,7 @@ npm run lint
 
 Expected: first command has no matches; storage matches are limited to the explicitly presentation-scoped preview adapter and unrelated documented UI preferences; route/component/static tests pass.
 
-- [ ] **Step 7: Run all unit tests before committing deletion**
+- [x] **Step 7: Run all unit tests before committing deletion**
 
 Run:
 
@@ -1288,7 +1288,7 @@ npm run test:unit
 
 Expected: all unit tests pass with no imports of removed modules.
 
-- [ ] **Step 8: Commit server-backed surfaces and retirement**
+- [x] **Step 8: Commit server-backed surfaces and retirement**
 
 ```powershell
 git add -A src

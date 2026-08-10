@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { isRequestAvailable } from './application-mode';
 
 describe('isRequestAvailable', () => {
-  it.each(['/', '/catalog', '/api/checkout', '/read/vector'])(
+  it.each(['/', '/catalog', '/book/vector', '/read/vector'])(
     'allows %s in prototype mode',
     (path) => {
       expect(isRequestAvailable('prototype', path)).toBe(true);
@@ -16,7 +16,7 @@ describe('isRequestAvailable', () => {
     }
   );
 
-  it.each(['/', '/catalog', '/api/checkout', '/health/private'])(
+  it.each(['/', '/catalog', '/book/vector', '/health/private'])(
     'blocks %s in maintenance mode',
     (path) => {
       expect(isRequestAvailable('maintenance', path)).toBe(false);

@@ -1,6 +1,9 @@
 <script lang="ts">
-  import type { Chapter } from '$lib/types/catalog';
   import type { PaperId, ReaderPreferences, TypefaceId } from '$lib/types/reader';
+
+  interface ChapterView {
+    title: string;
+  }
 
   interface TypefaceOption {
     id: TypefaceId;
@@ -23,7 +26,7 @@
   interface Props {
     contentsOpen: boolean;
     controlsOpen: boolean;
-    chapters: readonly Chapter[];
+    chapters: readonly ChapterView[];
     bookmarks: readonly BookmarkView[];
     per: number;
     prefs: ReaderPreferences;

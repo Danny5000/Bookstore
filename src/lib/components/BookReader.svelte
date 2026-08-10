@@ -9,7 +9,7 @@
   import ReaderSpread from './reader/ReaderSpread.svelte';
   import ReaderToolbar from './reader/ReaderToolbar.svelte';
   import { pageBox, PAPERS, TYPEFACES } from '$lib/paginate';
-  import { coverBackground } from '$lib/data/catalog';
+  import { coverBackground } from '$lib/cover-art';
   import { cubicBezier } from '$lib/reader/easing';
   import { bookDepth } from '$lib/reader/geometry';
   import { locationForPage, pageIndexForLocation } from '$lib/reader/locations';
@@ -24,7 +24,6 @@
   } from '$lib/reader/progress-sync';
   import { paginatePublication } from '$lib/reader/publication-pagination';
   import { buildSheetWindow } from '$lib/reader/sheet-window';
-  import type { Chapter, Title } from '$lib/types/catalog';
   import type { ReaderInitialStateDto, ReaderLocation } from '$lib/types/library';
   import type { ReaderDocument } from '$lib/types/publication';
   import type {
@@ -66,38 +65,12 @@
     },
     ...(progressKeepalive ? { keepalive: progressKeepalive } : {})
   });
-  const displayTitle: Title = $derived(
-    document.format === 'comic'
-      ? {
-          id: document.titleId,
-          title: document.title,
-          author: '',
-          price: 0,
-          released: '',
-          cover: 0,
-          summary: '',
-          kind: 'comic',
-          pages: document.pages.length,
-          direction: document.readingDirection,
-          panelMode: document.guidedViewEnabled ? 'manual' : 'off'
-        }
-      : {
-          id: document.titleId,
-          title: document.title,
-          author: '',
-          price: 0,
-          released: '',
-          cover: 0,
-          summary: '',
-          kind: 'novel',
-          chapters: document.sections.map((section) => ({
-            title: section.label ?? `Section ${section.ordinal + 1}`,
-            paras: []
-          }))
-        }
-  );
-  const chapters: readonly Chapter[] = $derived(
-    document.format === 'prose' ? displayTitle.chapters ?? [] : []
+  const chapters = $derived(
+    document.format === 'prose'
+      ? document.sections.map((section) => ({
+          title: section.label ?? `Section ${section.ordinal + 1}`
+        }))
+      : []
   );
 
   let vw = $state(1440);
@@ -292,7 +265,7 @@
   const coverBase = $derived(box.ph - 42);
   const coverW = $derived(Math.round(coverBase * 0.73 * 1.04));
   const coverH = $derived(Math.round(coverBase * 1.02));
-  const boardArt = $derived(coverBackground(0));
+  const boardArt = $derived(coverBackground(document.titleId));
 
   // Visible folios: left is the back of the previous sheet, right the front of
   // this one. Sheet 0 shows page 1 alone on the right, like an opened book.
@@ -675,7 +648,9 @@
       <!-- Closed book: front board, spine, page block, flip to the back cover -->
       <div class="case">
         <BookVolume
-          title={displayTitle}
+          title={document.title}
+          format={document.format}
+          coverSeed={document.titleId}
           width={coverW}
           height={coverH}
           {depth}

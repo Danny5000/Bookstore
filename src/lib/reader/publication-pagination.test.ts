@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ComicReaderDocument, ProseReaderDocument } from '$lib/types/publication';
-import { pageForAnchor } from '$lib/paginate';
+import { pageIndexForLocation } from './locations';
 import { paginatePublication } from './publication-pagination';
 
 const sectionId = '018f0000-0000-7000-8000-000000000001';
@@ -125,12 +125,14 @@ describe('publication pagination', () => {
     const wide = paginatePublication(longDocument, { pw: 800, ph: 1000, pad: 40, fs: 16 });
     const narrow = paginatePublication(longDocument, { pw: 300, ph: 500, pad: 30, fs: 18 });
     expect(narrow.length).toBeGreaterThan(wide.length);
-    const anchor = { chapter: 0, at: 700 };
-    const restored = narrow[pageForAnchor(narrow, anchor)];
+    const anchor = { format: 'prose' as const, blockId: paragraphId, offset: 700 };
+    const restoredIndex = pageIndexForLocation(longDocument, narrow, anchor);
+    expect(restoredIndex).not.toBeNull();
+    const restored = narrow[restoredIndex!];
     expect(restored?.chapter).toBe(0);
-    expect(restored?.at).toBeLessThanOrEqual(anchor.at);
+    expect(restored?.at).toBeLessThanOrEqual(anchor.offset);
     expect(restored?.type === 'text' ? restored.blocks?.[0]?.sourceStartOffset : 0).toBeLessThanOrEqual(
-      anchor.at
+      anchor.offset
     );
   });
 

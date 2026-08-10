@@ -1,9 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import type { TitleKind } from '$lib/types/catalog';
-import { bookDepth } from './geometry';
+import { bookDepth, type BookKind } from './geometry';
 
 describe('bookDepth', () => {
-  it.each<[TitleKind, number, number]>([
+  it.each<[BookKind, number, number]>([
     ['comic', 0, 5],
     ['comic', 12, 6],
     ['comic', 100, 11],

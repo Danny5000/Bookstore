@@ -1,4 +1,3 @@
-import type { Title } from './catalog';
 import type {
   PanelRegionDto,
   ProseBlockData
@@ -111,11 +110,3 @@ export interface SheetView {
 }
 
 export type EasingFunction = (position: number) => number;
-
-// Retained for prototype-only callers that still use the legacy paginator.
-export interface PrototypeReaderProps {
-  title: Title;
-  sample?: boolean;
-  onclose?: () => void;
-  onbuy?: () => void;
-}
