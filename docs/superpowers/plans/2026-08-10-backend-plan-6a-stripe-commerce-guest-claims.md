@@ -895,13 +895,13 @@ git commit -m "feat: add stripe commerce gateway"
 - Create: `src/routes/api/commerce/orders/[orderId]/status/+server.ts`, `route.test.ts`
 - Create: `src/lib/server/commerce/status-cookie.ts`, `status-cookie.test.ts`
 
-- [ ] **Step 1: Write failing status-token/cookie tests**
+- [x] **Step 1: Write failing status-token/cookie tests**
 
 Generate 32 random bytes, base64url-encode plaintext, persist only SHA-256, and compare with timing-safe equality. Cookie is HttpOnly, SameSite Lax, Secure only in production, bounded to order lifetime plus processing grace, and narrowly path-scoped where browser polling still works. Prove token never appears in DTO, URL, logs, or database plaintext.
 
 Run focused tests. Expected: FAIL then PASS after implementation.
 
-- [ ] **Step 2: Write failing durable-order integration tests**
+- [x] **Step 2: Write failing durable-order integration tests**
 
 Cover account and guest order creation, immutable item snapshots, one currency, status hash only, unique attempt idempotency, no order for `CART_CHANGED`, no order for zero accepted items, concurrent same attempt yielding one order, and rollback of order/items/audit together.
 
@@ -909,7 +909,7 @@ For signed-in orders, snapshot only the verified account email and user. Guest o
 
 Run `npm run test:integration -- tests/integration/commerce-orders.test.ts`. Expected: FAIL.
 
-- [ ] **Step 3: Implement locked accepted-order creation**
+- [x] **Step 3: Implement locked accepted-order creation**
 
 Inside one transaction: apply checkout throttle, call `lockAndQuoteCart`, constant-time compare the submitted fingerprint, create `checkout_pending` order/items/status digest, and append `commerce.checkout_created`. Return the plaintext status token only to the route call stack.
 
@@ -917,7 +917,7 @@ For a retry with the same attempt UUID, lock/load the existing order and verify 
 
 Run integration tests. Expected: PASS.
 
-- [ ] **Step 4: Write failing Checkout orchestration tests**
+- [x] **Step 4: Write failing Checkout orchestration tests**
 
 Assert ordering with deferred promises:
 
@@ -930,25 +930,25 @@ Test successful attach, same-ID retry, conflicting Session ID to `exception`, re
 
 Expected RED until orchestration exists.
 
-- [ ] **Step 5: Implement Checkout orchestration and attachment**
+- [x] **Step 5: Implement Checkout orchestration and attachment**
 
 Map stored items—not browser DTOs—to `CreateCheckoutSessionInput`. Use order UUID for metadata and idempotency. Attach only Session ID, expiry, and state; do not persist the Checkout URL. Return the URL to the route. Reissuing the same idempotent create request recovers a lost URL/response. A conflicting provider ID becomes a permanent exception with a minimized audit event and no grants.
 
 Run focused/unit/integration tests. Expected: PASS.
 
-- [ ] **Step 6: Add checkout route**
+- [x] **Step 6: Add checkout route**
 
 `POST /api/commerce/checkout` requires same-origin strict JSON and the checkout throttle. It returns private JSON with either redirect URL or `cart_changed` quote; it also sets/rotates the status cookie. Do not issue an HTTP 3xx from the mutation endpoint—client code navigates only after parsing a successful result.
 
 Map `CART_CHANGED` to 409 with the safe quote, invalid cart 422, throttle 429, disabled/transient provider 503, and permanent local exception 500-safe `CHECKOUT_UNAVAILABLE`. Never expose provider request IDs or messages.
 
-- [ ] **Step 7: Implement minimal authorized status**
+- [x] **Step 7: Implement minimal authorized status**
 
 Authorize by exact initiating user or status-cookie digest. Admin role alone does not authorize customer order status. Return only the `OrderStatusDto` mapping; never email, amounts, title list, guest identity, provider IDs, or tokens. Missing, mismatched, expired credential and other user's order all return the same 404.
 
 Route tests cover account, guest cookie, bad/expired/rotated cookie, other user, anonymous account order, and cache-control no-store.
 
-- [ ] **Step 8: Verify and commit Task 6**
+- [x] **Step 8: Verify and commit Task 6**
 
 Run:
 

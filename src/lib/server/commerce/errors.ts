@@ -16,6 +16,15 @@ export class RetryableProviderError extends Error {
   }
 }
 
+export class CommerceRateLimitError extends Error {
+  readonly code = 'RATE_LIMITED' as const;
+
+  constructor(readonly retryAfterSeconds: number) {
+    super('The commerce request rate limit was exceeded.');
+    this.name = 'CommerceRateLimitError';
+  }
+}
+
 export type CommerceConflictCode =
   | 'GRANT_PERMANENTLY_REVOKED'
   | 'PRESERVED_GRANT_IMMUTABLE'
@@ -64,7 +73,7 @@ export class InvalidCartError extends CustomerSafeCommerceError {
 }
 
 export class CartChangedError extends CustomerSafeCommerceError {
-  constructor() {
+  constructor(readonly quote?: import('$lib/types/commerce').CommerceQuoteDto) {
     super('CART_CHANGED', 'The cart changed. Review it before checking out.');
   }
 }
