@@ -313,6 +313,13 @@ describe('revision ingestion handler', () => {
         .where(eq(proseImages.revisionId, candidate.revision.id));
       expect(sections).toHaveLength(2);
       expect(blocks.length).toBeGreaterThan(0);
+      expect(
+        blocks.every(
+          (block) =>
+            block.semanticFingerprintVersion === 1 &&
+            /^[0-9a-f]{64}$/u.test(block.semanticFingerprintSha256 ?? '')
+        )
+      ).toBe(true);
       expect(images).toHaveLength(1);
       expect(presentation?.previewProseSectionId).toBe(sections[0]?.id);
       const firstSectionBlocks = blocks.filter((block) => block.sectionId === sections[0]?.id);
@@ -326,6 +333,13 @@ describe('revision ingestion handler', () => {
         .where(eq(comicPages.revisionId, candidate.revision.id))
         .orderBy(asc(comicPages.ordinal));
       expect(pages).toHaveLength(3);
+      expect(
+        pages.every(
+          (page) =>
+            page.semanticFingerprintVersion === 1 &&
+            /^[0-9a-f]{64}$/u.test(page.semanticFingerprintSha256 ?? '')
+        )
+      ).toBe(true);
       expect(presentation?.previewComicPageId).toBe(pages[1]?.id);
     }
     const covers = await databaseClient.db
@@ -358,6 +372,19 @@ describe('revision ingestion handler', () => {
       await databaseClient.pool.query('drop function reject_plan4_ready_revision()');
     }
 
+    expect(
+      await databaseClient.db
+        .select()
+        .from(comicPages)
+        .where(eq(comicPages.revisionId, candidate.revision.id))
+    ).toHaveLength(0);
+    expect(
+      await databaseClient.db
+        .select()
+        .from(revisionPresentations)
+        .where(eq(revisionPresentations.revisionId, candidate.revision.id))
+    ).toHaveLength(0);
+
     await handler({ ...candidate.job, attempts: 2 }, new AbortController().signal);
     const pages = await databaseClient.db
       .select()
@@ -372,6 +399,7 @@ describe('revision ingestion handler', () => {
       .from(revisionPresentations)
       .where(eq(revisionPresentations.revisionId, candidate.revision.id));
     expect(pages).toHaveLength(3);
+    expect(pages.every((page) => page.semanticFingerprintVersion === 1)).toBe(true);
     expect(covers).toHaveLength(1);
     expect(presentations).toHaveLength(1);
   });

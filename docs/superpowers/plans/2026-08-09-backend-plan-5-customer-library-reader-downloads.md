@@ -484,11 +484,11 @@ git commit -m "feat: add reader library persistence schema"
 - Create: `src/lib/server/ingestion/handler.test.ts`
 - Modify: `tests/integration/storage-ingestion.test.ts`
 
-- [ ] **Step 1: Write failing persistence and rollback tests**
+- [x] **Step 1: Write failing persistence and rollback tests**
 
 Add integration cases that ingest one EPUB and one CBZ, then query PostgreSQL and assert every newly inserted block/page has version `1` and a 64-character digest matching the ingestion result. Add a failure fixture in which prose image fingerprint resolution fails and assert the transaction leaves no manifest rows or presentation behind while preserving the existing candidate failure semantics.
 
-- [ ] **Step 2: Prove the tests fail**
+- [x] **Step 2: Prove the tests fail**
 
 Run:
 
@@ -498,11 +498,11 @@ npm run test:integration -- tests/integration/storage-ingestion.test.ts
 
 Expected: FAIL because `handler.ts` does not insert fingerprint fields.
 
-- [ ] **Step 3: Insert the paired fields transactionally**
+- [x] **Step 3: Insert the paired fields transactionally**
 
 Map `semanticFingerprintSha256` and `semanticFingerprintVersion` into every `prose_blocks` and `comic_pages` insert. Keep the existing single manifest-promotion transaction, idempotent retry behavior, ingestion-generation check, and candidate-only publication rule. Do not derive or re-hash fingerprints in the handler.
 
-- [ ] **Step 4: Run ingestion and publication regressions**
+- [x] **Step 4: Run ingestion and publication regressions**
 
 Run:
 
@@ -513,7 +513,7 @@ npm run test:integration -- tests/integration/storage-ingestion.test.ts tests/in
 
 Expected: focused unit/integration tests pass; Plan 4 activation, replacement, rollback, and preview behavior is unchanged.
 
-- [ ] **Step 5: Commit manifest persistence**
+- [x] **Step 5: Commit manifest persistence**
 
 ```powershell
 git add src/lib/server/ingestion/handler.ts src/lib/server/ingestion/handler.test.ts tests/integration/storage-ingestion.test.ts

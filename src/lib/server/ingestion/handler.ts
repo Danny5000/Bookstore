@@ -19,8 +19,8 @@ import { revisionOriginalKey, parseStorageKey, type StorageKey } from '$lib/serv
 import type { ObjectStorage } from '$lib/server/storage/types';
 import { UploadError } from '$lib/server/uploads/multipart';
 import { hashStoredObject } from '$lib/server/uploads/stream-object';
-import { ingestComic, type ComicIngestionResult } from './comic';
-import { ingestEpub, type EpubIngestionResult } from './epub';
+import { ingestComic, type ComicIngestionResult, type ComicPageRow } from './comic';
+import { ingestEpub, type EpubIngestionResult, type EpubSectionRow } from './epub';
 import { IngestionError } from './errors';
 import { parseRevisionIngestionPayload } from './job';
 import type { IngestionLimits } from './limits';
@@ -44,6 +44,58 @@ interface ProcessingCandidate {
 type IngestionResult =
   | { format: 'prose'; value: EpubIngestionResult }
   | { format: 'comic'; value: ComicIngestionResult };
+
+function requireSemanticFingerprint(
+  value: { semanticFingerprintSha256?: string; semanticFingerprintVersion?: number },
+  code: 'epub_content' | 'image_decode'
+) {
+  if (
+    !value.semanticFingerprintSha256 ||
+    !/^[0-9a-f]{64}$/u.test(value.semanticFingerprintSha256) ||
+    !Number.isInteger(value.semanticFingerprintVersion) ||
+    (value.semanticFingerprintVersion ?? 0) <= 0
+  ) {
+    throw new IngestionError(code, 'Generated semantic fingerprint is incomplete', false);
+  }
+  return {
+    semanticFingerprintSha256: value.semanticFingerprintSha256,
+    semanticFingerprintVersion: value.semanticFingerprintVersion!
+  };
+}
+
+export function mapProseBlocksForInsert(
+  revisionId: string,
+  sections: readonly EpubSectionRow[]
+) {
+  return sections.flatMap((section) =>
+    section.blocks.map((block) => ({
+      id: block.id,
+      revisionId,
+      sectionId: section.id,
+      ordinal: block.ordinal,
+      kind: block.kind,
+      content: block.content,
+      imageId: block.imageId,
+      ...requireSemanticFingerprint(block, 'epub_content')
+    }))
+  );
+}
+
+export function mapComicPagesForInsert(revisionId: string, pages: readonly ComicPageRow[]) {
+  return pages.map((page) => ({
+    id: page.id,
+    revisionId,
+    ordinal: page.ordinal,
+    sourcePath: page.sourcePath,
+    storageKey: page.storageKey,
+    mediaType: page.mediaType,
+    checksumSha256: page.checksumSha256,
+    ...requireSemanticFingerprint(page, 'image_decode'),
+    byteSize: page.byteSize,
+    width: page.width,
+    height: page.height
+  }));
+}
 
 function failureFrom(cause: unknown, phase: FailurePhase, signal: AbortSignal, timeout: AbortSignal): IngestionError {
   if (cause instanceof IngestionError) return cause;
@@ -189,17 +241,7 @@ async function commitIngestion(
           }))
         );
       }
-      const blocks = value.sections.flatMap((section) =>
-        section.blocks.map((block) => ({
-          id: block.id,
-          revisionId: candidate.id,
-          sectionId: section.id,
-          ordinal: block.ordinal,
-          kind: block.kind,
-          content: block.content,
-          imageId: block.imageId
-        }))
-      );
+      const blocks = mapProseBlocksForInsert(candidate.id, value.sections);
       if (blocks.length > 0) await transaction.insert(proseBlocks).values(blocks);
       if (value.sections.length > 1) {
         const first = value.sections[0];
@@ -215,18 +257,7 @@ async function commitIngestion(
       const value = result.value;
       if (value.pages.length > 0) {
         await transaction.insert(comicPages).values(
-          value.pages.map((page) => ({
-            id: page.id,
-            revisionId: candidate.id,
-            ordinal: page.ordinal,
-            sourcePath: page.sourcePath,
-            storageKey: page.storageKey,
-            mediaType: page.mediaType,
-            checksumSha256: page.checksumSha256,
-            byteSize: page.byteSize,
-            width: page.width,
-            height: page.height
-          }))
+          mapComicPagesForInsert(candidate.id, value.pages)
         );
       }
       if (value.pages.length >= 2) {
