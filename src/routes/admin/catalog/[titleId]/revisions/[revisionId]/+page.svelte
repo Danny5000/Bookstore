@@ -5,6 +5,7 @@
   import PreviewBoundaryEditor from '$lib/components/admin/PreviewBoundaryEditor.svelte';
   import PublicationActions from '$lib/components/admin/PublicationActions.svelte';
   import RevisionStatus from '$lib/components/admin/RevisionStatus.svelte';
+  import { createMemoryReaderPersistence } from '$lib/reader/persistence';
   import type { ActionData, PageData } from './$types';
   interface Props { data: PageData; form: ActionData; }
   let { data, form }: Props = $props();
@@ -13,6 +14,20 @@
     revisionId: data.review.revision.id
   }));
   const processing = $derived(['uploaded', 'processing'].includes(data.review.revision.state));
+  const reviewPersistence = $derived(
+    data.document
+      ? createMemoryReaderPersistence({
+          document: data.document,
+          initialState: {
+            progress: null,
+            bookmarks: [],
+            preferences: { fontSize: 18, typeface: 'serif', paper: 'white', version: 0 },
+            titlePreferences: null,
+            migrationNotice: null
+          }
+        })
+      : null
+  );
 </script>
 
 <svelte:head><title>Review {data.review.title.title} · Pale Orbit Admin</title></svelte:head>
@@ -48,7 +63,7 @@
   </section>
 {/if}
 
-{#if data.document && data.review.draft}
+{#if data.document && data.review.draft && reviewPersistence}
   <section class="settings">
     <h3 class="display">Draft reader settings</h3>
     <form method="POST" action="?/saveSettings">
@@ -65,7 +80,7 @@
       <button class="publish" type="submit">Publish reader settings</button>
     </form>
   </section>
-  <section class="reader"><h3 class="display">Full private review</h3><BookReader document={data.document} access="admin" /></section>
+  <section class="reader"><h3 class="display">Full private review</h3><BookReader document={data.document} persistence={reviewPersistence} /></section>
 {/if}
 
 <PublicationActions

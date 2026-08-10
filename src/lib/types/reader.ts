@@ -1,9 +1,7 @@
 import type { Title } from './catalog';
 import type {
   PanelRegionDto,
-  ProseBlockData,
-  ReaderAccess,
-  ReaderDocument
+  ProseBlockData
 } from './publication';
 
 export interface PageBoxInput {
@@ -113,13 +111,6 @@ export interface SheetView {
 }
 
 export type EasingFunction = (position: number) => number;
-
-export interface ReaderProps {
-  document: ReaderDocument;
-  access: ReaderAccess;
-  onclose?: () => void;
-  onbuy?: () => void;
-}
 
 // Retained for prototype-only callers that still use the legacy paginator.
 export interface PrototypeReaderProps {

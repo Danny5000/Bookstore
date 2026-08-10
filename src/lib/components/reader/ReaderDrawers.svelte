@@ -15,17 +15,22 @@
     ink: string;
   }
 
+  interface BookmarkView {
+    id: string;
+    sheet: number;
+  }
+
   interface Props {
     contentsOpen: boolean;
     controlsOpen: boolean;
     chapters: readonly Chapter[];
-    bookmarks: readonly number[];
+    bookmarks: readonly BookmarkView[];
     per: number;
     prefs: ReaderPreferences;
     typefaces: readonly TypefaceOption[];
     papers: readonly PaperOption[];
     onchapter: (index: number) => void;
-    onbookmark: (sheet: number) => void;
+    onbookmark: (bookmark: BookmarkView) => void;
     onfontsize: (size: number) => void;
     ontypeface: (typeface: TypefaceId) => void;
     onpaper: (paper: PaperId) => void;
@@ -58,9 +63,9 @@
       </button>
     {/each}
     <div class="mono bookmarks-heading">Bookmarks</div>
-    {#each bookmarks as bookmark (bookmark)}
+    {#each bookmarks as bookmark (bookmark.id)}
       <button class="toc-row" type="button" onclick={() => onbookmark(bookmark)}>
-        <span>Page {bookmark * per + 1}</span>
+        <span>Page {bookmark.sheet * per + 1}</span>
         <span class="bookmark-mark">&#9670;</span>
       </button>
     {:else}

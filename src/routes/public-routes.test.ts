@@ -51,7 +51,16 @@ describe('public publication loaders', () => {
         params: { id: 'the-book' },
         url: new URL('http://localhost/read/the-book?revision=forged&presentation=draft')
       } as never)
-    ).resolves.toEqual({ document, slug: 'the-book' });
+    ).resolves.toMatchObject({
+      document,
+      slug: 'the-book',
+      persistenceKind: 'preview-local',
+      initialState: {
+        progress: null,
+        bookmarks: [],
+        preferences: { fontSize: 18, typeface: 'serif', paper: 'white', version: 0 }
+      }
+    });
     expect(getPublicPreview).toHaveBeenCalledWith(database, 'the-book');
   });
 

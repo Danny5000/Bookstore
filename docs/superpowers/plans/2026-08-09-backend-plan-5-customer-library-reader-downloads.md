@@ -1114,7 +1114,7 @@ git commit -m "feat: stream entitled media and downloads"
 - Modify: `src/routes/read/[id]/+page.svelte`
 - Create: `src/routes/read/[id]/route.test.ts`
 
-- [ ] **Step 1: Write failing adapter contract tests**
+- [x] **Step 1: Write failing adapter contract tests**
 
 Define one interface used by `BookReader`:
 
@@ -1138,7 +1138,7 @@ Test:
 - memory adapter mutates only its instance and performs no I/O, suitable for admin review;
 - no adapter has a grant/ownership method or accepts a user/access-level field.
 
-- [ ] **Step 2: Write failing synchronization-state tests**
+- [x] **Step 2: Write failing synchronization-state tests**
 
 Use fake timers and a fake adapter to prove:
 
@@ -1149,7 +1149,7 @@ Use fake timers and a fake adapter to prove:
 - a `409` adopts the server's authoritative state/version, enters visible conflict state, and does not automatically re-send the stale location;
 - dispose/pagehide performs only a best-effort keepalive flush and does not claim success without a response.
 
-- [ ] **Step 3: Prove the tests fail**
+- [x] **Step 3: Prove the tests fail**
 
 Run:
 
@@ -1159,17 +1159,17 @@ npx vitest run src/lib/reader/persistence.test.ts src/lib/reader/progress-sync.t
 
 Expected: FAIL because adapters/state machine are absent and `BookReader` imports the global library store.
 
-- [ ] **Step 4: Implement adapters and the pure synchronization state machine**
+- [x] **Step 4: Implement adapters and the pure synchronization state machine**
 
 Keep fetch, localStorage, and lifecycle operations behind injectable functions so unit tests do not need a browser. Parse every server response with shared Zod response schemas before adopting it. Treat `400/401/403/404/422` as non-retryable; retry only network errors and `503`. Expose status through callbacks/state rather than global stores.
 
 The preview adapter may retain device-local progress/bookmarks/display preferences, but account state from an entitled load always replaces preview defaults and preview state is never posted to the server automatically.
 
-- [ ] **Step 5: Refactor BookReader and drawers**
+- [x] **Step 5: Refactor BookReader and drawers**
 
 Replace the `$lib/stores/library.svelte` import with props containing the authorized document, initial state, and persistence adapter/factory. Use Task 7's semantic mapping for restore/save. Keep preview boundary/paywall visuals for `access: 'preview'`; remove the paywall for `entitled` and `admin`. Render accessible live-region notices for pending/failure/conflict/edition-change states. Keep current-revision bookmark navigation only.
 
-- [ ] **Step 6: Resolve route access and cache policy server-side**
+- [x] **Step 6: Resolve route access and cache policy server-side**
 
 In `/read/[id]/+page.server.ts`:
 
@@ -1181,7 +1181,7 @@ In `/read/[id]/+page.server.ts`:
 
 The Svelte page constructs only the adapter named by the safe loader response. It cannot upgrade preview to entitled in the browser.
 
-- [ ] **Step 7: Run reader unit and route tests**
+- [x] **Step 7: Run reader unit and route tests**
 
 Run:
 
@@ -1193,7 +1193,7 @@ npm run check
 
 Expected: adapter, debounce/retry/conflict, semantic restore, loader access, and integration tests pass; no component imports the prototype library store.
 
-- [ ] **Step 8: Commit the reader refactor**
+- [x] **Step 8: Commit the reader refactor**
 
 ```powershell
 git add src/lib/reader src/lib/components/BookReader.svelte src/lib/components/BookReader.test.ts src/lib/components/reader/ReaderDrawers.svelte src/routes/read/[id]

@@ -8,29 +8,64 @@
   import ReaderPaywall from './reader/ReaderPaywall.svelte';
   import ReaderSpread from './reader/ReaderSpread.svelte';
   import ReaderToolbar from './reader/ReaderToolbar.svelte';
-  import { pageBox, pageForAnchor, PAPERS, TYPEFACES } from '$lib/paginate';
-  import { library } from '$lib/stores/library.svelte';
+  import { pageBox, PAPERS, TYPEFACES } from '$lib/paginate';
   import { coverBackground } from '$lib/data/catalog';
   import { cubicBezier } from '$lib/reader/easing';
   import { bookDepth } from '$lib/reader/geometry';
+  import { locationForPage, pageIndexForLocation } from '$lib/reader/locations';
   import { clampSheet } from '$lib/reader/navigation';
+  import {
+    progressKeepaliveFor,
+    type ReaderPersistence
+  } from '$lib/reader/persistence';
+  import {
+    createProgressSynchronizer,
+    type ProgressSyncState
+  } from '$lib/reader/progress-sync';
   import { paginatePublication } from '$lib/reader/publication-pagination';
   import { buildSheetWindow } from '$lib/reader/sheet-window';
   import type { Chapter, Title } from '$lib/types/catalog';
+  import type { ReaderInitialStateDto, ReaderLocation } from '$lib/types/library';
+  import type { ReaderDocument } from '$lib/types/publication';
   import type {
     EasingFunction,
     PaperId,
     ReaderPhase,
-    ReaderProps,
-    ReadingAnchor,
     TurnDirection,
     TurnProgress,
     TypefaceId
   } from '$lib/types/reader';
 
-  let { document, access, onclose, onbuy }: ReaderProps = $props();
+  interface Props {
+    document: ReaderDocument;
+    persistence: ReaderPersistence;
+    onclose?: () => void;
+    onbuy?: () => void;
+  }
 
-  const progressKey = $derived(document.presentationId);
+  let { document, persistence, onclose, onbuy }: Props = $props();
+  const persistenceAdapter = untrack(() => persistence);
+
+  const initialState: ReaderInitialStateDto = persistenceAdapter.getInitialState();
+  let readerState = $state(initialState);
+  let syncState = $state<ProgressSyncState>({
+    status: 'idle',
+    progress: initialState.progress,
+    error: null
+  });
+  let currentLocation = $state<ReaderLocation | null>(initialState.progress?.location ?? null);
+  const progressKeepalive = progressKeepaliveFor(persistenceAdapter);
+  const progressSync = createProgressSynchronizer({
+    persistence: persistenceAdapter,
+    initialProgress: initialState.progress,
+    onState: (next) => {
+      syncState = next;
+      if (next.status === 'conflict' && next.progress) {
+        currentLocation = next.progress.location;
+      }
+    },
+    ...(progressKeepalive ? { keepalive: progressKeepalive } : {})
+  });
   const displayTitle: Title = $derived(
     document.format === 'comic'
       ? {
@@ -68,9 +103,8 @@
   let vw = $state(1440);
   let vh = $state(900);
 
-  const initialSheet = untrack(() => library.progress[progressKey] ?? 0);
-  let sheet = $state(initialSheet);
-  let phase = $state<ReaderPhase>(initialSheet > 0 ? 'reading' : 'closed');
+  let sheet = $state(0);
+  let phase = $state<ReaderPhase>(initialState.progress ? 'reading' : 'closed');
   let flipped = $state(false);
   let flipping = $state(false);
   let flipTimer: ReturnType<typeof setTimeout> | undefined;
@@ -185,7 +219,9 @@
   let controlsOpen = $state(false);
 
   // comic guided view
-  let comicMode = $state<'page' | 'panel'>('page');
+  let comicMode = $state<'page' | 'panel'>(
+    initialState.titlePreferences?.comicMode === 'guided' ? 'panel' : 'page'
+  );
   let pageIdx = $state<number | null>(null);
   let panelIdx = $state(0);
 
@@ -212,13 +248,13 @@
 
   const narrow = $derived(vw < 900);
   const per = $derived(narrow ? 1 : 2);
-  const prefs = $derived(library.prefs);
+  const prefs = $derived(readerState.preferences);
   // Pagination is derived from this box, so it must NOT vary with reader phase
   // — a different box when the book closes would renumber the whole book.
   const box = $derived(pageBox({ vw, vh, narrow, fontSize: prefs.fontSize }));
   const pages = $derived(paginatePublication(document, box));
   const totalSheets = $derived(Math.ceil(pages.length / per));
-  const sampling = $derived(access === 'preview');
+  const sampling = $derived(document.access === 'preview');
   // The server has already truncated the document to its reviewed preview
   // boundary. One step beyond the final returned sheet opens the paywall.
   const readable = $derived(sampling ? Math.max(0, totalSheets - 1) : totalSheets);
@@ -233,7 +269,19 @@
   const progress = $derived(
     phase === 'closed' && flipped ? 1 : totalSheets ? Math.min(1, sheet / totalSheets) : 0
   );
-  const bookmarks = $derived(library.bookmarksFor(progressKey));
+  const bookmarkViews = $derived(
+    readerState.bookmarks.flatMap((bookmark) => {
+      const pageIndex = pageIndexForLocation(document, pages, bookmark.location);
+      return pageIndex === null ? [] : [{ id: bookmark.id, sheet: Math.floor(pageIndex / per) }];
+    })
+  );
+  const currentBookmark = $derived(
+    currentLocation
+      ? readerState.bookmarks.find(
+          (bookmark) => JSON.stringify(bookmark.location) === JSON.stringify(currentLocation)
+        )
+      : undefined
+  );
 
   // Closed book: thickness scales with the page count, capped so a long novel
   // still reads as a book rather than a brick. A comic is a stapled issue, not
@@ -282,39 +330,48 @@
     })
   );
 
+  function locationAt(pageIndex: number): ReaderLocation | null {
+    if (document.format === 'comic' && guided) {
+      const source = document.pages[pageIndex];
+      const panel = source?.panels[panelIdx % Math.max(1, source.panels.length)];
+      if (source && panel) {
+        return { format: 'comic', pageId: source.id, panelOrdinal: panel.ordinal };
+      }
+    }
+    return locationForPage(document, pages, pageIndex, guided ? 'guided' : 'page');
+  }
+
+  function recordLocation(pageIndex = Math.min(pages.length - 1, sheet * per)): void {
+    const next = locationAt(pageIndex);
+    if (!next) return;
+    currentLocation = next;
+    progressSync.navigate(next);
+  }
+
   function commit(n: number): void {
     const next = clampSheet(n, totalSheets, limit);
     sheet = next;
-    recordAnchor();
-    library.setProgress(progressKey, next, anchor);
-  }
-
-  // Reflow renumbers the whole book: at a narrower size a 30-page novel becomes
-  // 52 pages, and the stored sheet index then points somewhere else entirely.
-  // The reader's position in the text is what gets kept.
-  let anchor: ReadingAnchor | null = untrack(() => library.anchorFor(progressKey));
-
-  function recordAnchor(): void {
-    const p = pages[Math.min(pages.length - 1, sheet * per)];
-    if (p) anchor = { chapter: p.chapter, at: p.at || 0 };
+    pageIdx = null;
+    recordLocation(Math.min(pages.length - 1, next * per));
   }
 
   $effect(() => {
     const currentPages = pages;
     const currentPer = per;
+    const location = currentLocation;
     untrack(() => {
-      if (!anchor) {
-        recordAnchor();
-        return;
-      }
-      const next = clampSheet(
-        Math.floor(pageForAnchor(currentPages, anchor) / currentPer),
-        totalSheets,
-        limit
-      );
-      if (next !== sheet) {
-        sheet = next;
-        library.setProgress(progressKey, next, anchor);
+      if (!location) return;
+      const pageIndex = pageIndexForLocation(document, currentPages, location);
+      if (pageIndex === null) return;
+      sheet = clampSheet(Math.floor(pageIndex / currentPer), totalSheets, limit);
+      if (location.format === 'comic') {
+        pageIdx = pageIndex;
+        const source = document.format === 'comic'
+          ? document.pages.find((page) => page.id === location.pageId)
+          : undefined;
+        panelIdx = location.panelOrdinal === null
+          ? 0
+          : Math.max(0, source?.panels.findIndex((panel) => panel.ordinal === location.panelOrdinal) ?? 0);
       }
     });
   });
@@ -325,10 +382,11 @@
     turning = null;
     drag = null;
     commit(n);
+    void progressSync.flush();
   }
 
-  function goToBookmark(bookmark: number): void {
-    go(bookmark);
+  function goToBookmark(bookmark: { id: string; sheet: number }): void {
+    go(bookmark.sheet);
     tocOpen = false;
   }
 
@@ -439,14 +497,60 @@
     pageIdx = p;
     panelIdx = i;
     sheet = nextSheet;
-    recordAnchor();
-    library.setProgress(progressKey, nextSheet, anchor);
+    recordLocation(p);
   }
 
   function toggleGuided(): void {
     comicMode = guided ? 'page' : 'panel';
     panelIdx = 0;
     pageIdx = sheet * per;
+    const nextMode = comicMode === 'panel' ? 'guided' : 'page';
+    void persistenceAdapter
+      .saveTitlePreferences({
+        comicMode: nextMode,
+        expectedVersion: readerState.titlePreferences?.version ?? 0
+      })
+      .then((value) => {
+        readerState.titlePreferences = value;
+      })
+      .catch(() => {});
+    recordLocation(pageIdx);
+  }
+
+  async function toggleBookmark(): Promise<void> {
+    await progressSync.flush();
+    const location = currentLocation ?? locationAt(currentPage);
+    if (!location) return;
+    if (currentBookmark) {
+      await persistenceAdapter.deleteBookmark(currentBookmark.id);
+      readerState.bookmarks = readerState.bookmarks.filter(
+        (bookmark) => bookmark.id !== currentBookmark.id
+      );
+      return;
+    }
+    const bookmark = await persistenceAdapter.createBookmark(location);
+    if (!readerState.bookmarks.some((candidate) => candidate.id === bookmark.id)) {
+      readerState.bookmarks = [...readerState.bookmarks, bookmark];
+    }
+  }
+
+  async function updatePreferences(
+    values: Partial<Pick<ReaderInitialStateDto['preferences'], 'fontSize' | 'typeface' | 'paper'>>
+  ): Promise<void> {
+    const value = await persistenceAdapter.savePreferences({
+      fontSize: values.fontSize ?? prefs.fontSize,
+      typeface: values.typeface ?? prefs.typeface,
+      paper: values.paper ?? prefs.paper,
+      expectedVersion: prefs.version
+    });
+    readerState.preferences = value;
+  }
+
+  async function acknowledgeMigration(): Promise<void> {
+    const notice = readerState.migrationNotice;
+    if (!notice) return;
+    await persistenceAdapter.acknowledgeMigration(notice.targetRevisionId);
+    readerState.migrationNotice = { ...notice, acknowledged: true };
   }
 
   function onPointerDown(event: PointerEvent): void {
@@ -491,10 +595,25 @@
     if (event.key === 'Escape') onclose?.();
   }
 
+  const syncMessage = $derived(
+    syncState.status === 'pending'
+      ? 'Saving reading position'
+      : syncState.status === 'retrying'
+        ? 'Retrying reading position save'
+        : syncState.status === 'failed'
+          ? 'Reading position was not saved'
+          : syncState.status === 'conflict'
+            ? 'Reading position changed on another device; the latest saved position is shown'
+            : syncState.status === 'synced'
+              ? 'Reading position saved'
+              : ''
+  );
+
   $effect(() => () => {
     cancelAnimationFrame(raf);
     clearTimeout(flipTimer);
     clearTimeout(openTimer);
+    progressSync.dispose();
   });
 
   function jumpToChapter(ci: number): void {
@@ -504,7 +623,12 @@
   }
 </script>
 
-<svelte:window bind:innerWidth={vw} bind:innerHeight={vh} onkeydown={onKeydown} />
+<svelte:window
+  bind:innerWidth={vw}
+  bind:innerHeight={vh}
+  onkeydown={onKeydown}
+  onpagehide={() => progressSync.dispose()}
+/>
 
 <div
   class="shell"
@@ -516,12 +640,12 @@
     isComic={hasGuidedView}
     isFixed={false}
     {narrow}
-    bookmarked={bookmarks.includes(sheet)}
+    bookmarked={Boolean(currentBookmark)}
     {guided}
     {progress}
     onclose={() => onclose?.()}
     oncontents={() => (tocOpen = !tocOpen)}
-    onbookmark={() => library.toggleBookmark(progressKey, sheet)}
+    onbookmark={() => void toggleBookmark()}
     onguided={toggleGuided}
     oncontrols={() => (controlsOpen = !controlsOpen)}
   />
@@ -535,16 +659,16 @@
       contentsOpen={tocOpen}
       {controlsOpen}
       {chapters}
-      {bookmarks}
+      bookmarks={bookmarkViews}
       {per}
       {prefs}
       typefaces={typefaceOptions}
       papers={paperOptions}
       onchapter={jumpToChapter}
       onbookmark={goToBookmark}
-      onfontsize={(fontSize) => library.setPref('fontSize', fontSize)}
-      ontypeface={(typeface) => library.setPref('typeface', typeface)}
-      onpaper={(nextPaper) => library.setPref('paper', nextPaper)}
+      onfontsize={(fontSize) => void updatePreferences({ fontSize })}
+      ontypeface={(typeface) => void updatePreferences({ typeface })}
+      onpaper={(nextPaper) => void updatePreferences({ paper: nextPaper })}
     />
 
     {#if phase === 'closed'}
@@ -629,6 +753,17 @@
     onprevious={() => turn(-1)}
     onnext={() => turn(1)}
   />
+
+  <p class="reader-status" aria-live="polite">{syncMessage}</p>
+  {#if readerState.migrationNotice && !readerState.migrationNotice.acknowledged}
+    <aside class="edition-notice" aria-live="polite">
+      <span>
+        Your saved position was checked against this edition
+        {readerState.migrationNotice.progress === 'reset' ? ' and reset to the beginning' : ''}.
+      </span>
+      <button type="button" onclick={() => void acknowledgeMigration()}>Dismiss</button>
+    </aside>
+  {/if}
 </div>
 
 <style>
@@ -688,6 +823,37 @@
     justify-content: center;
     perspective: 2200px;
     perspective-origin: 50% 45%;
+  }
+
+  .reader-status {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .edition-notice {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    padding: 10px 18px;
+    border-top: 1px solid var(--line);
+    background: var(--surface);
+    color: var(--muted);
+    font-size: 13px;
+  }
+
+  .edition-notice button {
+    border: 0;
+    background: none;
+    color: var(--accent);
+    cursor: pointer;
   }
 
 </style>
