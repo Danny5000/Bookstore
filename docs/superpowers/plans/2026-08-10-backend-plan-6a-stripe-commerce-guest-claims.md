@@ -257,7 +257,7 @@ Add exhaustive Zod validation at the SDK boundary. Paginate Checkout line items 
 
 ## Target persistence model
 
-Create `src/lib/server/db/schema/commerce.ts`, export it from `src/lib/server/db/schema/index.ts`, and generate `drizzle/0005_plan6a_commerce.sql` plus the matching Drizzle metadata. Do not hand-edit the generated snapshot or journal.
+Create `src/lib/server/db/schema/commerce.ts`, export it from `src/lib/server/db/schema/index.ts`, and generate `drizzle/0005_public_firelord.sql` plus the matching Drizzle metadata. Do not hand-edit the generated snapshot or journal.
 
 Freeze these PostgreSQL enum values; adding a new provider state requires an explicit normalized mapping and migration, not storing arbitrary Stripe text:
 
@@ -298,7 +298,7 @@ Migration SQL must backfill one active `preserved` grant for every `entitlements
 ### Contracts, schema, configuration, and platform seams
 
 - `src/lib/types/commerce.ts` — browser-safe cart, quote, checkout, status, and claim contracts.
-- `src/lib/server/db/schema/commerce.ts`, `index.ts`, `operations.ts`, `drizzle/0005_plan6a_commerce.sql`, `drizzle/meta/**` — commerce persistence, preserved-grant backfill, and outbox deduplication.
+- `src/lib/server/db/schema/commerce.ts`, `index.ts`, `operations.ts`, `drizzle/0005_public_firelord.sql`, `drizzle/meta/**` — commerce persistence, preserved-grant backfill, and outbox deduplication.
 - `src/lib/server/config/schema.ts`, `load.ts`, config tests, `.env.example` — validated disabled/test/Stripe runtime, tax, webhook, duration, and throttle settings.
 - `src/lib/server/http/strict-json.ts` — extracted bounded strict JSON and same-origin helpers shared by reader and commerce mutation routes.
 - `src/lib/server/outbox/repository.ts` — optional stable outbox deduplication key.
@@ -498,9 +498,9 @@ git commit -m "feat: add commerce contracts and configuration"
 - Modify: `src/lib/server/outbox/repository.ts`, `src/lib/server/outbox/repository.test.ts`
 - Create: `tests/integration/commerce-schema.test.ts`
 - Modify: `tests/integration/setup.ts`
-- Generate: `drizzle/0005_plan6a_commerce.sql`, `drizzle/meta/_journal.json`, matching snapshot
+- Generate: `drizzle/0005_public_firelord.sql`, `drizzle/meta/_journal.json`, matching snapshot
 
-- [ ] **Step 1: Write failing schema declaration tests**
+- [x] **Step 1: Write failing schema declaration tests**
 
 Inspect Drizzle metadata and assert all commerce tables/enums exist; unique provider/order/source indexes exist; money, ISO currency, digest, and grant-consistency checks exist; and no column stores raw provider JSON, Checkout/receipt/action URLs, billing/card data, or secrets.
 
@@ -512,7 +512,7 @@ npx vitest run src/lib/server/db/schema/commerce.test.ts
 
 Expected: FAIL because the schema is missing.
 
-- [ ] **Step 2: Declare the schema without generating SQL yet**
+- [x] **Step 2: Declare the schema without generating SQL yet**
 
 Use the exact persistence table in this plan. Export select/insert types. Include checks such as:
 
@@ -531,7 +531,7 @@ Use `onDelete: 'restrict'` for historical order/payment/provider/title/user/gues
 
 Run the focused schema test and `npm run check`. Expected: PASS.
 
-- [ ] **Step 3: Write failing outbox deduplication tests**
+- [x] **Step 3: Write failing outbox deduplication tests**
 
 Extend the input contract with `deduplicationKey?: string | null`. Prove two retries with the same stable key return one logical outbox row/job, different keys remain distinct, and reusing a key with a different topic or payload throws an invariant error.
 
@@ -543,13 +543,13 @@ npx vitest run src/lib/server/outbox/repository.test.ts
 
 Expected: FAIL.
 
-- [ ] **Step 4: Implement stable outbox deduplication**
+- [x] **Step 4: Implement stable outbox deduplication**
 
 When a key is supplied, derive the dispatch job key `outbox-key:<sha256(key)>`, insert conflict-safely, and load the existing outbox row by its unique key. Preserve UUID behavior when omitted. Compare existing JSONB by canonical database value, not property-order-sensitive `JSON.stringify`. Commerce keys contain internal IDs only, for example `commerce:receipt:order:<orderId>:v1`; never email addresses.
 
 Run the focused outbox test. Expected: PASS.
 
-- [ ] **Step 5: Generate and inspect migration 0005**
+- [x] **Step 5: Generate and inspect migration 0005**
 
 Run:
 
@@ -575,7 +575,7 @@ on conflict do nothing;
 
 Review enum order, non-destructive ALTERs, FKs, partial unique indexes, checks, and backfill. Never hand-rewrite the generated snapshot/journal.
 
-- [ ] **Step 6: Write failing PostgreSQL migration/constraint tests**
+- [x] **Step 6: Write failing PostgreSQL migration/constraint tests**
 
 Prove one active and one revoked pre-commerce entitlement backfill to one and zero preserved grants respectively; a second migration run does not duplicate; invalid source/item/user/state combinations fail; unique order/title, PaymentIntent, event, and provider IDs fail; negative money, invalid currency/digest, and impossible paid identity fail; multiple independent grants for one user/title remain legal; no-user purchase grants may be unclaimed/suspended/revoked but never active; and deletion of referenced users/titles/orders is restricted rather than erasing historical commerce facts.
 
@@ -587,7 +587,7 @@ npm run test:integration -- tests/integration/commerce-schema.test.ts
 
 Expected: row-local/unique constraints pass. Keep cumulative refund-sum validation for Task 12 because it requires locked multi-row service logic.
 
-- [ ] **Step 7: Update integration reset order and make schema tests green**
+- [x] **Step 7: Update integration reset order and make schema tests green**
 
 Add commerce tables to `tests/integration/setup.ts` in dependent-first order before entitlements, outbox/jobs, catalog, identity, and auth tables.
 
@@ -601,7 +601,7 @@ npm run check
 
 Expected: PASS.
 
-- [ ] **Step 8: Verify and commit Task 2**
+- [x] **Step 8: Verify and commit Task 2**
 
 Run:
 

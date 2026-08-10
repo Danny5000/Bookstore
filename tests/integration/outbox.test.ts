@@ -2,7 +2,10 @@ import { count, eq } from 'drizzle-orm';
 import { describe, expect, it, vi } from 'vitest';
 import { jobs, outboxMessages } from '$lib/server/db/schema';
 import { createOutboxDispatchHandler } from '$lib/server/outbox/dispatcher';
-import { enqueueOutboxMessage } from '$lib/server/outbox/repository';
+import {
+  enqueueOutboxMessage,
+  OutboxDeduplicationInvariantError
+} from '$lib/server/outbox/repository';
 import { databaseClient } from './database';
 
 describe('transactional outbox', () => {
@@ -36,6 +39,61 @@ describe('transactional outbox', () => {
     const [jobCount] = await databaseClient.db.select({ value: count() }).from(jobs);
     expect(messageCount?.value).toBe(0);
     expect(jobCount?.value).toBe(0);
+  });
+
+  it('deduplicates stable retries by canonical JSONB value and rejects conflicting reuse', async () => {
+    const deduplicationKey = 'commerce:receipt:order:order-1:v1';
+    const first = await databaseClient.db.transaction((transaction) =>
+      enqueueOutboxMessage(transaction, {
+        topic: 'commerce.receipt',
+        payload: { orderId: 'order-1', version: 1 },
+        deduplicationKey
+      })
+    );
+    const second = await databaseClient.db.transaction((transaction) =>
+      enqueueOutboxMessage(transaction, {
+        topic: 'commerce.receipt',
+        payload: { version: 1, orderId: 'order-1' },
+        deduplicationKey
+      })
+    );
+
+    expect(second.id).toBe(first.id);
+    const [messageCount] = await databaseClient.db
+      .select({ value: count() })
+      .from(outboxMessages);
+    const [jobCount] = await databaseClient.db.select({ value: count() }).from(jobs);
+    expect(messageCount?.value).toBe(1);
+    expect(jobCount?.value).toBe(1);
+
+    await expect(
+      databaseClient.db.transaction((transaction) =>
+        enqueueOutboxMessage(transaction, {
+          topic: 'commerce.receipt',
+          payload: { orderId: 'order-2', version: 1 },
+          deduplicationKey
+        })
+      )
+    ).rejects.toBeInstanceOf(OutboxDeduplicationInvariantError);
+  });
+
+  it('keeps different stable outbox keys distinct', async () => {
+    const first = await databaseClient.db.transaction((transaction) =>
+      enqueueOutboxMessage(transaction, {
+        topic: 'commerce.receipt',
+        payload: { orderId: 'order-1' },
+        deduplicationKey: 'commerce:receipt:order:order-1:v1'
+      })
+    );
+    const second = await databaseClient.db.transaction((transaction) =>
+      enqueueOutboxMessage(transaction, {
+        topic: 'commerce.receipt',
+        payload: { orderId: 'order-2' },
+        deduplicationKey: 'commerce:receipt:order:order-2:v1'
+      })
+    );
+
+    expect(second.id).not.toBe(first.id);
   });
 
   it('dispatches once and treats an already-delivered message as idempotent', async () => {

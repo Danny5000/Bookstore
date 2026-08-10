@@ -36,6 +36,13 @@
       "when": 1786320570009,
       "tag": "0004_plan5_reader_library",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1786379056134,
+      "tag": "0005_public_firelord",
+      "breakpoints": true
     }
   ]
 }

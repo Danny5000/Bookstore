@@ -64,6 +64,7 @@ export const outboxMessages = pgTable(
     id: uuid('id').defaultRandom().primaryKey(),
     topic: text('topic').notNull(),
     payload: jsonb('payload').$type<JsonObject>().notNull(),
+    deduplicationKey: text('deduplication_key'),
     dispatchJobId: uuid('dispatch_job_id')
       .notNull()
       .references(() => jobs.id, { onDelete: 'restrict' }),
@@ -75,6 +76,9 @@ export const outboxMessages = pgTable(
   },
   (table) => [
     uniqueIndex('outbox_messages_dispatch_job_unique').on(table.dispatchJobId),
+    uniqueIndex('outbox_messages_deduplication_key_unique')
+      .on(table.deduplicationKey)
+      .where(sql`${table.deduplicationKey} is not null`),
     index('outbox_messages_status_created_idx').on(table.status, table.createdAt),
     check(
       'outbox_delivered_has_timestamp',
