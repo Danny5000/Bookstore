@@ -941,7 +941,7 @@ git commit -m "feat: migrate reader state by exact content"
 - Create: `src/routes/api/reader-state/[titleId]/migration-notice/+server.ts`
 - Create: `src/routes/api/reader-state/[titleId]/migration-notice/route.test.ts`
 
-- [ ] **Step 1: Write failing route-support security tests**
+- [x] **Step 1: Write failing route-support security tests**
 
 Test the shared route boundary directly:
 
@@ -953,7 +953,7 @@ Test the shared route boundary directly:
 - domain not-found/authorization becomes uniform `404`, stale version becomes `409` with only `code` and safe current DTO, temporary database/storage failure becomes `503`;
 - responses use `Cache-Control: no-store` and preserve/generate the existing correlation ID policy.
 
-- [ ] **Step 2: Write failing handler tests for every mutation**
+- [x] **Step 2: Write failing handler tests for every mutation**
 
 Mock the service boundary and assert each route:
 
@@ -964,7 +964,7 @@ Mock the service boundary and assert each route:
 - maps stale/invalid/not-found errors correctly;
 - never serializes a database row or Error object directly.
 
-- [ ] **Step 3: Prove route tests fail**
+- [x] **Step 3: Prove route tests fail**
 
 Run:
 
@@ -974,7 +974,7 @@ npx vitest run src/routes/api/reader-state
 
 Expected: FAIL because the routes and support module do not exist.
 
-- [ ] **Step 4: Implement the route support boundary**
+- [x] **Step 4: Implement the route support boundary**
 
 Use one bounded strict-JSON parser and one domain-error mapper. The handler pattern should remain narrow:
 
@@ -995,11 +995,11 @@ export const PUT: RequestHandler = async (event) => {
 
 Adapt the database source to the repository's established `locals`/runtime pattern rather than opening a new pool. Set the request size limit to `16 KiB`, sufficient for these scalar payloads. Keep CSRF validation independent of CORS response headers.
 
-- [ ] **Step 5: Implement all six mutation resources**
+- [x] **Step 5: Implement all six mutation resources**
 
 Use the methods and schemas specified in the file map. `PATCH migration-notice` carries only `targetRevisionId`; the service derives user/title and verifies it is still the current target. Bookmark delete derives bookmark ownership from the actor and path title. Do not add GET endpoints; initial state comes from the reader loader.
 
-- [ ] **Step 6: Run route, service, and static gates**
+- [x] **Step 6: Run route, service, and static gates**
 
 Run:
 
@@ -1012,7 +1012,7 @@ npm run lint
 
 Expected: all route/service tests pass, integration state behavior remains transactional, and static gates are clean.
 
-- [ ] **Step 7: Commit reader-state routes**
+- [x] **Step 7: Commit reader-state routes**
 
 ```powershell
 git add src/routes/api/reader-state
