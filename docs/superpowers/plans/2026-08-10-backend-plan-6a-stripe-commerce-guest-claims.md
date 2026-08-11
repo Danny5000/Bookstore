@@ -1727,7 +1727,7 @@ Use `superpowers:requesting-code-review` against the full Plan 6A branch diff. R
 
 Apply accepted findings with `superpowers:receiving-code-review` and `superpowers:test-driven-development`. Re-run the smallest proving test first, then the full gate in Step 4 and the isolated production-image rebuild/smoke in Step 5. Refresh the recorded release evidence from those final runs, then commit review fixes separately with a precise message.
 
-- [ ] **Step 10: Offer integration choices**
+- [x] **Step 10: Offer integration choices**
 
 After the final reviewed branch is clean and green, use `superpowers:finishing-a-development-branch` and offer the user its structured merge/PR/keep/discard options. Do not merge, push, or delete the worktree without the user's explicit choice.
 
