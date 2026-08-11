@@ -46,7 +46,9 @@ describe('catalog inputs', () => {
   it.each([
     { slug: 'Not Valid', currency: 'USD', priceMinor: 100 },
     { slug: 'valid', currency: 'US', priceMinor: 100 },
-    { slug: 'valid', currency: 'USD', priceMinor: -1 }
+    { slug: 'valid', currency: 'USD', priceMinor: -1 },
+    { slug: 'valid', currency: 'USD', priceMinor: 0 },
+    { slug: 'valid', currency: 'USD', priceMinor: 50_000_000 }
   ])('rejects invalid title money or slug fields', (invalid) => {
     expect(() =>
       parseCreateTitleInput({
@@ -76,7 +78,7 @@ describe('catalog inputs', () => {
     }
   );
 
-  it.each(['ABC', 'ISK', 'UGX'])(
+  it.each(['ABC', 'IRR', 'KPW', 'ISK', 'UGX'])(
     'rejects unsupported %s create and metadata inputs',
     (currency) => {
       const metadata = {
@@ -241,5 +243,15 @@ describe('catalog inputs', () => {
     expect(parseTitlePublicationActionInput({ titleId })).toEqual({ titleId });
     expect(() => parseRevisionPublicationActionInput({ titleId, revisionId: 'bad' })).toThrow();
     expect(() => parseTitlePublicationActionInput({ titleId, revisionId })).toThrow();
+  });
+
+  it('canonicalizes title IDs before the shared publication lock boundary', () => {
+    expect(parseTitlePublicationActionInput({ titleId: titleId.toUpperCase() })).toEqual({
+      titleId
+    });
+    expect(parseRevisionPublicationActionInput({
+      titleId: titleId.toUpperCase(),
+      revisionId
+    })).toEqual({ titleId, revisionId });
   });
 });

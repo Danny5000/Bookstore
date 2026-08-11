@@ -1,10 +1,62 @@
 import { readFile } from 'node:fs/promises';
-import { execFile } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
+import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 const root = new URL('../', import.meta.url);
 const executeFile = promisify(execFile);
+const stripePreflightPath = fileURLToPath(
+  new URL('./stripe-secret-preflight.mjs', import.meta.url)
+);
+
+function runStripePreflight(overrides: NodeJS.ProcessEnv = {}) {
+  const environment = { ...process.env };
+  delete environment.STRIPE_SECRET_KEY;
+  delete environment.STRIPE_WEBHOOK_SECRET;
+  for (const [name, value] of Object.entries(overrides)) {
+    if (value === undefined) delete environment[name];
+    else environment[name] = value;
+  }
+  return spawnSync(process.execPath, [stripePreflightPath], {
+    encoding: 'utf8',
+    env: environment
+  });
+}
+
+function documentedPosixPreflight(runbook: string): string {
+  const script = runbook.match(
+    /On a Docker-only Linux VPS[\s\S]*?```sh\r?\n(?<script>[\s\S]*?)\r?\n```/u
+  )?.groups?.script;
+  if (!script) throw new Error('Documented POSIX Stripe preflight was not found');
+  return script;
+}
+
+function posixShellPath(): string {
+  if (process.platform !== 'win32') return '/bin/sh';
+  const gitExecPath = spawnSync('git', ['--exec-path'], { encoding: 'utf8' });
+  if (gitExecPath.status !== 0 || !gitExecPath.stdout.trim()) {
+    throw new Error('Git for Windows is required to exercise the documented POSIX preflight');
+  }
+  const gitRoot = dirname(dirname(dirname(gitExecPath.stdout.trim())));
+  return join(gitRoot, 'bin', 'sh.exe');
+}
+
+function runDocumentedPosixPreflight(script: string, overrides: NodeJS.ProcessEnv = {}) {
+  const environment = { ...process.env };
+  delete environment.STRIPE_SECRET_KEY;
+  delete environment.STRIPE_WEBHOOK_SECRET;
+  for (const [name, value] of Object.entries(overrides)) {
+    if (value === undefined) delete environment[name];
+    else environment[name] = value;
+  }
+  return spawnSync(posixShellPath(), ['-s'], {
+    encoding: 'utf8',
+    env: environment,
+    input: script
+  });
+}
 
 interface ComposeService {
   environment?: Record<string, string>;
@@ -59,6 +111,75 @@ function mountedSecretSources(service: ComposeService): string[] {
 }
 
 describe('commerce operations contract', () => {
+  it.each([
+    ['missing secret key', { STRIPE_WEBHOOK_SECRET: 'whsec_private_webhook_value' }],
+    ['missing webhook secret', { STRIPE_SECRET_KEY: 'sk_test_private_key_value' }],
+    ['empty secret key', {
+      STRIPE_SECRET_KEY: '   ',
+      STRIPE_WEBHOOK_SECRET: 'whsec_private_webhook_value'
+    }],
+    ['empty webhook secret', {
+      STRIPE_SECRET_KEY: 'sk_test_private_key_value',
+      STRIPE_WEBHOOK_SECRET: ''
+    }]
+  ] as const)('rejects %s without printing either credential', (_label, environment) => {
+    const result = runStripePreflight(environment);
+    const output = `${result.stdout}${result.stderr}`;
+
+    expect(result.status).toBe(1);
+    expect(output).toContain('[stripe-preflight] required Stripe credentials are missing or empty');
+    expect(output).not.toContain('sk_test_private_key_value');
+    expect(output).not.toContain('whsec_private_webhook_value');
+  });
+
+  it('accepts both non-empty credentials without printing their values', () => {
+    const result = runStripePreflight({
+      STRIPE_SECRET_KEY: 'sk_test_private_key_value',
+      STRIPE_WEBHOOK_SECRET: 'whsec_private_webhook_value'
+    });
+    const output = `${result.stdout}${result.stderr}`;
+
+    expect(result.status).toBe(0);
+    expect(output).toContain('[stripe-preflight] required Stripe credentials are present');
+    expect(output).not.toContain('sk_test_private_key_value');
+    expect(output).not.toContain('whsec_private_webhook_value');
+  });
+
+  it('executes the exact documented POSIX fallback for missing, blank, and present values', async () => {
+    const script = documentedPosixPreflight(await source('docs/commerce-and-guest-claims.md'));
+    const scenarios = [
+      ['both missing', {}, 1],
+      ['empty secret key', {
+        STRIPE_SECRET_KEY: '',
+        STRIPE_WEBHOOK_SECRET: 'whsec_private_webhook_value'
+      }, 1],
+      ['empty webhook secret', {
+        STRIPE_SECRET_KEY: 'sk_test_private_key_value',
+        STRIPE_WEBHOOK_SECRET: ''
+      }, 1],
+      ['whitespace secret key', {
+        STRIPE_SECRET_KEY: ' \t ',
+        STRIPE_WEBHOOK_SECRET: 'whsec_private_webhook_value'
+      }, 1],
+      ['whitespace webhook secret', {
+        STRIPE_SECRET_KEY: 'sk_test_private_key_value',
+        STRIPE_WEBHOOK_SECRET: ' \t '
+      }, 1],
+      ['both present', {
+        STRIPE_SECRET_KEY: 'sk_test_private_key_value',
+        STRIPE_WEBHOOK_SECRET: 'whsec_private_webhook_value'
+      }, 0]
+    ] as const;
+
+    for (const [name, environment, expectedStatus] of scenarios) {
+      const result = runDocumentedPosixPreflight(script, environment);
+      const output = `${result.stdout}${result.stderr}`;
+      expect(result.status, name).toBe(expectedStatus);
+      expect(output, name).not.toContain('sk_test_private_key_value');
+      expect(output, name).not.toContain('whsec_private_webhook_value');
+    }
+  });
+
   it('keeps every production application process disabled and maintenance-only', async () => {
     const compose = await composeConfiguration('compose.prod.yaml');
     for (const name of ['app', 'worker', 'migrate', 'bootstrap-admin']) {
@@ -148,13 +269,14 @@ describe('commerce operations contract', () => {
   });
 
   it('documents safe commerce, claim, reconciliation, and manual-checkpoint operations', async () => {
-    const [runbook, readme, runtime, database, authentication, library] = await Promise.all([
+    const [runbook, readme, runtime, database, authentication, library, plan] = await Promise.all([
       source('docs/commerce-and-guest-claims.md'),
       source('README.md'),
       source('docs/runtime-environments.md'),
       source('docs/database-and-workers.md'),
       source('docs/authentication-and-email.md'),
-      source('docs/customer-library-and-reader.md')
+      source('docs/customer-library-and-reader.md'),
+      source('docs/superpowers/plans/2026-08-10-backend-plan-6a-stripe-commerce-guest-claims.md')
     ]);
     for (const expected of [
       '2026-07-29.dahlia',
@@ -177,6 +299,37 @@ describe('commerce operations contract', () => {
     expect(database).toContain('stripe_events');
     expect(authentication).toContain('guest purchase');
     expect(library).toContain('entitlement_grants');
+    expect(runbook).toContain('guest identity email plaintext');
+    expect(runbook).not.toContain('guest email digests');
+    expect(plan).toContain(
+      'Focused route/runtime tests cover live-mode mismatch, expired or rotated order status, and disabled-Stripe 503 responses.'
+    );
+
+    const posixPreflight = documentedPosixPreflight(runbook);
+    expect(posixPreflight).toContain('stripe_credential_present()');
+    expect(posixPreflight).toContain('case "${1-}" in');
+    expect(posixPreflight).toContain('*[![:space:]]*) return 0 ;;');
+    expect(posixPreflight).toContain(
+      'stripe_credential_present "${STRIPE_SECRET_KEY-}"'
+    );
+    expect(posixPreflight).toContain(
+      'stripe_credential_present "${STRIPE_WEBHOOK_SECRET-}"'
+    );
+    expect(posixPreflight).not.toContain('[ -z ');
+    expect(posixPreflight).not.toMatch(/printf[^\n]*\$\{?STRIPE_/u);
+
+    const preflightCommand = 'npm run stripe:preflight';
+    const overlayUpCommand =
+      'docker compose --file compose.prod.yaml --file compose.stripe.yaml up --detach --wait';
+    for (const [name, document] of [
+      ['commerce runbook', runbook],
+      ['runtime runbook', runtime]
+    ] as const) {
+      expect(document.indexOf(preflightCommand), name).toBeGreaterThan(-1);
+      expect(document.indexOf(overlayUpCommand), name).toBeGreaterThan(
+        document.indexOf(preflightCommand)
+      );
+    }
   });
 
   it('keeps example credentials empty and non-secret', async () => {

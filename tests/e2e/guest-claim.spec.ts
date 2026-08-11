@@ -1,9 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import { and, eq } from 'drizzle-orm';
 import { expect, test, type BrowserContext, type Page } from '@playwright/test';
-import { entitlementGrants, orders, user } from '$lib/server/db/schema';
+import { entitlementGrants, orders, outboxMessages, user } from '$lib/server/db/schema';
+import { authEmailPayloadSchema } from '$lib/server/email/payload';
 import { validEpubFixture } from '../fixtures/publications';
-import { firstHttpLink, waitForLatestTextEmail } from './mailpit';
+import {
+  firstHttpLink,
+  navigateSensitiveAction,
+  waitForLatestTextEmail,
+  waitForNewerTextEmail
+} from './mailpit';
 import { createCommerceHarness } from './commerce-harness';
 import { assertCommercePrivacy } from './commerce-privacy';
 import { publishCommerceProse } from './commerce-publication';
@@ -83,6 +89,20 @@ async function startGuestCheckout(
   return { orderId, checkoutAttemptId };
 }
 
+async function verificationEmailCount(
+  database: E2EDatabase,
+  email: string
+): Promise<number> {
+  const messages = await database.db
+    .select({ payload: outboxMessages.payload })
+    .from(outboxMessages)
+    .where(eq(outboxMessages.topic, 'email.auth.v1'));
+  return messages
+    .map((message) => authEmailPayloadSchema.parse(message.payload))
+    .filter((message) => message.template === 'auth.email-verification' && message.to === email)
+    .length;
+}
+
 async function expectClaimedGrantCount(
   database: E2EDatabase,
   email: string,
@@ -144,6 +164,7 @@ test('guest receipts claim every same-email purchase and reject action replay', 
     });
 
     let completedCheckoutAttemptId: string | undefined;
+    let latestClaimMessage: string | undefined;
     for (let purchase = 0; purchase < 2; purchase += 1) {
       const { orderId, checkoutAttemptId } = await startGuestCheckout(
         guestPage,
@@ -169,15 +190,19 @@ test('guest receipts claim every same-email purchase and reject action replay', 
       if (purchase === 0) {
         await assertTerminalCheckoutAttempt(database, orderId, checkoutAttemptId);
       }
+      latestClaimMessage = latestClaimMessage
+        ? await waitForNewerTextEmail(
+            guestEmail,
+            latestClaimMessage,
+            15_000,
+            'Claim your purchase'
+          )
+        : await waitForLatestTextEmail(guestEmail, 15_000, 'Claim your purchase');
     }
 
-    const claimMessage = await waitForLatestTextEmail(
-      guestEmail,
-      15_000,
-      'Claim your purchase'
-    );
-    const claimLink = firstHttpLink(claimMessage);
-    await guestPage.goto(claimLink);
+    if (!latestClaimMessage) throw new Error('Expected a guest claim email');
+    const claimLink = firstHttpLink(latestClaimMessage);
+    await navigateSensitiveAction(guestPage, claimLink);
     await expect(guestPage.getByRole('heading', { name: 'Purchases claimed' })).toBeVisible();
     await expectClaimedGrantCount(database, guestEmail, publishedTitle.titleId, 2);
     await guestPage.getByRole('link', { name: 'Open your library' }).click();
@@ -191,7 +216,7 @@ test('guest receipts claim every same-email purchase and reject action replay', 
     await replayPage.getByRole('button', { name: 'Send claim link' }).click();
     await expect(replayPage.getByRole('status')).toContainText('If eligible purchases exist');
     await expect(replayPage.locator('main')).not.toContainText(absentEmail);
-    await replayPage.goto(claimLink);
+    await navigateSensitiveAction(replayPage, claimLink);
     await expect(replayPage.getByRole('heading', { name: 'Link unavailable' })).toBeVisible();
     assertCommercePrivacy('guest browser', await guestPage.locator('body').innerText());
     assertCommercePrivacy(
@@ -209,11 +234,12 @@ test('guest receipts claim every same-email purchase and reject action replay', 
   }
 });
 
-test('an unverified password account verifies before claiming its guest purchase', async ({ browser }) => {
+test('a pre-existing unverified credential is recovered before claiming its guest purchase', async ({ browser }) => {
   test.setTimeout(240_000);
   const suffix = randomUUID();
   const email = `${suffix}@example.com`;
-  const password = 'plan-six-unverified-password-2026';
+  const attackerPassword = 'plan-six-attacker-password-2026';
+  const victimPassword = 'plan-six-victim-password-2026';
   const database = await openE2EDatabase();
   const commerce = createCommerceHarness(database, baseURL);
   const { context: adminContext, page: adminPage } = await administrator(browser);
@@ -221,9 +247,13 @@ test('an unverified password account verifies before claiming its guest purchase
   const guestPage = await guestContext.newPage();
   const accountContext = await browser.newContext({ baseURL });
   const accountPage = await accountContext.newPage();
+  const recoveryContext = await browser.newContext({ baseURL });
+  const recoveryPage = await recoveryContext.newPage();
+  const signInContext = await browser.newContext({ baseURL });
   const browserLogs: string[] = [];
   guestPage.on('console', (message) => browserLogs.push(message.text()));
   accountPage.on('console', (message) => browserLogs.push(message.text()));
+  recoveryPage.on('console', (message) => browserLogs.push(message.text()));
   try {
     const publishedTitle = await publishCommerceProse(adminPage, {
       slug: `unverified-claim-${suffix}`,
@@ -239,13 +269,37 @@ test('an unverified password account verifies before claiming its guest purchase
     await accountPage.getByRole('button', { name: 'Create an account' }).click();
     await accountPage.getByLabel('Display name').fill('Unverified Claim Customer');
     await accountPage.getByLabel('Email').fill(email);
-    await accountPage.getByLabel('Password', { exact: true }).fill(password);
-    await accountPage.getByLabel('Confirm password').fill(password);
+    await accountPage.getByLabel('Password', { exact: true }).fill(attackerPassword);
+    await accountPage.getByLabel('Confirm password').fill(attackerPassword);
     await accountPage.getByRole('button', { name: 'Create account' }).click();
     await expect(accountPage.getByText('Check your email to finish registration.')).toBeVisible();
     const initialVerification = firstHttpLink(
       await waitForLatestTextEmail(email, 10_000, 'verify your email address')
     );
+    const verificationMessagesBeforeRecovery = await verificationEmailCount(database, email);
+    await navigateSensitiveAction(accountPage, initialVerification);
+    await expect(accountPage.locator('header').getByRole('button', { name: 'Sign in' })).toBeVisible();
+    const attackerSignIn = await accountContext.request.post('/api/auth/sign-in/email', {
+      data: { email, password: attackerPassword, rememberMe: true },
+      headers: { origin: baseURL }
+    });
+    expect(attackerSignIn.status()).toBe(200);
+    await accountPage.reload();
+    await expect(accountPage.locator('header').getByText(email)).toBeVisible();
+    const [preExistingUser] = await database.db
+      .select({ id: user.id })
+      .from(user)
+      .where(eq(user.email, email))
+      .limit(1);
+    if (!preExistingUser) throw new Error('Expected pre-existing recovery account');
+    await database.db
+      .update(user)
+      .set({ emailVerified: false })
+      .where(eq(user.id, preExistingUser.id));
+    const attackerSessionBeforeRecovery = await accountContext.request.get('/api/auth/get-session');
+    expect((await attackerSessionBeforeRecovery.json()) as object).toMatchObject({
+      user: { email }
+    });
 
     await commerce.fulfillCheckout(orderId, { state: 'paid', email });
     await expect(guestPage.getByRole('status')).toContainText('Purchase complete', {
@@ -257,27 +311,50 @@ test('an unverified password account verifies before claiming its guest purchase
       [email]
     );
     await waitForLatestTextEmail(email, 15_000, 'Subtotal:');
-
-    await accountPage.goto(initialVerification);
-    await accountPage.goto('/claim');
-    await accountPage.getByLabel('Checkout email').fill(email);
-    await accountPage.getByRole('button', { name: 'Send claim link' }).click();
-    await expect(accountPage.getByRole('status')).toContainText('If eligible purchases exist');
-    const claimLink = firstHttpLink(
-      await waitForLatestTextEmail(email, 15_000, 'Claim your purchase')
+    const resetLink = firstHttpLink(
+      await waitForLatestTextEmail(email, 15_000, 'reset your password')
     );
-    await accountPage.goto(claimLink);
-    await expect(accountPage.getByRole('heading', { name: 'Purchases claimed' })).toBeVisible();
+    expect(resetLink).not.toContain(encodeURIComponent(email));
+    await navigateSensitiveAction(recoveryPage, resetLink);
+    await expect(recoveryPage).toHaveURL(/\/reset-password\?purpose=commerce-claim&token=/u);
+    await recoveryPage.getByLabel('Checkout email').fill(email);
+    await recoveryPage.getByLabel('New password', { exact: true }).fill(victimPassword);
+    await recoveryPage.getByLabel('Confirm new password').fill(victimPassword);
+    await recoveryPage.getByRole('button', { name: 'Update password and continue' }).click();
+    await expect(recoveryPage.getByRole('status')).toContainText('password has been updated');
+    const claimPurchases = recoveryPage.getByRole('link', { name: 'Claim your purchases' });
+    await expect(claimPurchases).toBeVisible();
+
+    const attackerSessionAfterRecovery = await accountContext.request.get('/api/auth/get-session');
+    expect(await attackerSessionAfterRecovery.json()).toBeNull();
+    const oldPasswordSignIn = await signInContext.request.post('/api/auth/sign-in/email', {
+      data: { email, password: attackerPassword, rememberMe: true },
+      headers: { origin: baseURL }
+    });
+    expect(oldPasswordSignIn.status()).not.toBe(200);
+
+    await claimPurchases.click();
+    await expect(recoveryPage.getByRole('heading', { name: 'Purchases claimed' })).toBeVisible();
+    expect(await verificationEmailCount(database, email)).toBe(
+      verificationMessagesBeforeRecovery
+    );
     await expectClaimedGrantCount(database, email, publishedTitle.titleId, 1);
-    assertCommercePrivacy('guest browser', await accountPage.locator('body').innerText());
+    const newPasswordSignIn = await signInContext.request.post('/api/auth/sign-in/email', {
+      data: { email, password: victimPassword, rememberMe: true },
+      headers: { origin: baseURL }
+    });
+    expect(newPasswordSignIn.status()).toBe(200);
+    assertCommercePrivacy('guest browser', await recoveryPage.locator('body').innerText());
     assertCommercePrivacy(
       'guest console',
       browserLogs,
-      [email, initialVerification, claimLink]
+      [email, initialVerification, resetLink]
     );
     assertCommercePrivacy('guest database', await commerce.privacySnapshot([orderId]));
   } finally {
     await database.close();
+    await signInContext.close();
+    await recoveryContext.close();
     await accountContext.close();
     await guestContext.close();
     await adminContext.close();

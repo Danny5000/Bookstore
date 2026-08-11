@@ -113,10 +113,11 @@ For a deliberate future test-mode checkpoint, supply both Stripe values from pro
 
 ```powershell
 docker compose --file compose.prod.yaml --file compose.stripe.yaml config --quiet
+npm run stripe:preflight
 docker compose --file compose.prod.yaml --file compose.stripe.yaml up --detach --wait
 ```
 
-`docker compose config` verifies the merged structure, but it does not verify that environment-backed secret values are present. Check that both Stripe variables are non-empty without printing them before any container-creation command.
+`docker compose config` verifies the merged structure, but it does not verify that environment-backed secret values are present. The Node.js-based `npm run stripe:preflight` command exits nonzero when either Stripe variable is missing or empty and never prints either value. Run it before any Stripe-overlay container-creation command. A Docker-only Linux VPS without host Node.js can use the nonprinting POSIX-shell equivalent in [commerce and guest-claim operations](commerce-and-guest-claims.md).
 
 `compose.stripe.yaml` mounts the two environment-backed secrets only into app and worker. It does not alter `APPLICATION_MODE=maintenance`, live mode, or the existing database/auth/SMTP secret mounts, and it is not a storefront launch switch.
 

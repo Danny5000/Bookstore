@@ -6,8 +6,16 @@ import {
   UnverifiedBootstrapAccountError,
   bootstrapFirstAdministrator
 } from '$lib/server/auth/bootstrap-admin';
-import { account, auditEvents, outboxMessages, user, userRoles } from '$lib/server/db/schema';
-import { databaseClient } from './database';
+import { createAuthServer } from '$lib/server/auth/options';
+import {
+  account,
+  auditEvents,
+  credentialAuthority,
+  outboxMessages,
+  user,
+  userRoles
+} from '$lib/server/db/schema';
+import { applicationConfig, databaseClient } from './database';
 
 async function createExistingUser(emailVerified: boolean) {
   const [created] = await databaseClient.db
@@ -20,6 +28,10 @@ async function createExistingUser(emailVerified: boolean) {
     providerId: 'credential',
     userId: created.id,
     password: 'existing-password-hash'
+  });
+  await databaseClient.db.insert(credentialAuthority).values({
+    userId: created.id,
+    authorizedPasswordHash: 'existing-password-hash'
   });
   return created;
 }
@@ -52,6 +64,38 @@ describe('bootstrapFirstAdministrator', () => {
         password: 'A-secure-bootstrap-password'
       })
     ).toBe(true);
+    expect(
+      await databaseClient.db
+        .select({ userId: credentialAuthority.userId })
+        .from(credentialAuthority)
+    ).toEqual([{ userId: result.userId }]);
+    const auth = createAuthServer({
+      database: databaseClient.db,
+      config: applicationConfig,
+      queueVerificationEmail: async () => undefined,
+      queueResetEmail: async () => undefined,
+      queueMagicEmail: async () => undefined,
+      queueCommerceClaimEmail: async () => undefined,
+      canSendMagicLink: async () => true,
+      canSendCommerceMagicLink: async () => true,
+      onUserCreated: async () => undefined
+    });
+    const signedIn = await auth.handler(new Request(
+      `${applicationConfig.origin}/api/auth/sign-in/email`,
+      {
+        method: 'POST',
+        headers: {
+          origin: applicationConfig.origin,
+          'content-type': 'application/json',
+          'x-forwarded-for': '192.0.2.150'
+        },
+        body: JSON.stringify({
+          email: 'owner@example.com',
+          password: 'A-secure-bootstrap-password'
+        })
+      }
+    ));
+    expect(signedIn.status).toBe(200);
     expect(
       await databaseClient.db.select().from(userRoles).where(eq(userRoles.userId, result.userId))
     ).toEqual([

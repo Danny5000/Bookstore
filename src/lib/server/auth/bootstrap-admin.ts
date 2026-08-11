@@ -2,7 +2,7 @@ import { eq, sql } from 'drizzle-orm';
 import { hashPassword } from 'better-auth/crypto';
 import { appendAuditEvent } from '$lib/server/audit/service';
 import type { Database } from '$lib/server/db/client';
-import { account, user, userRoles } from '$lib/server/db/schema';
+import { account, credentialAuthority, user, userRoles } from '$lib/server/db/schema';
 import { withTransaction } from '$lib/server/db/transaction';
 import { normalizeEmailAddress } from './identity';
 
@@ -57,6 +57,10 @@ export async function bootstrapFirstAdministrator(
         providerId: 'credential',
         userId: target.id,
         password: passwordHash
+      });
+      await transaction.insert(credentialAuthority).values({
+        userId: target.id,
+        authorizedPasswordHash: passwordHash
       });
       createdUser = true;
     } else if (!target.emailVerified) {

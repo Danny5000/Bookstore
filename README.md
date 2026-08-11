@@ -99,7 +99,7 @@ Production is still `APPLICATION_MODE=maintenance`. Plan 6B must add fee, balanc
 
 Better Auth provides verified email/password accounts, password reset, magic links, and PostgreSQL-backed sessions and rate limits. Every protected route enforces authorization on the server. Administrators manage audited roles at `/admin/users`, including transactional final-admin protection. Third-party OAuth remains out of scope.
 
-Versioned authentication and commerce messages use the PostgreSQL outbox and provider-neutral SMTP adapter; development mail is captured by Mailpit. Paid guests receive a receipt and one-use claim action, while unverified password accounts verify before claiming. Publication files are never email attachments. Entitled customers download retained originals through the authenticated application route, which supports HEAD and single byte ranges and records a redacted audit event. Local disk is implemented; the S3 provider remains a fail-at-startup interface stub with no AWS SDK installed.
+Versioned authentication and commerce messages use the PostgreSQL outbox and provider-neutral SMTP adapter; development mail is captured by Mailpit. Paid guests receive a receipt and one-use claim action. Any existing password account uses exact-purpose commerce recovery: the mailbox owner resets the credential, all prior sessions are revoked, and only reset-derived one-use authorization can attach purchases. Publication files are never email attachments. Entitled customers download retained originals through the authenticated application route, which supports HEAD and single byte ranges and records a redacted audit event. Local disk is implemented; the S3 provider remains a fail-at-startup interface stub with no AWS SDK installed.
 
 ## Deferred work
 

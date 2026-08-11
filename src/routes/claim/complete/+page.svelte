@@ -25,7 +25,7 @@
     {:else if data.state === 'sign_in'}
       <h1 id="claim-status-heading" class="display">Sign in to continue</h1>
       <p>Use a verified account with the same checkout email, then return through a new claim link.</p>
-      <a class="primary" href={resolve('/?auth=required')}>Sign in</a>
+      <a class="primary" href={resolve('/?auth=required&returnTo=%2Fclaim%2Fcomplete')}>Sign in</a>
       <a href={resolve('/claim')}>Request another claim link</a>
     {:else if data.state === 'not_claimed'}
       <h1 id="claim-status-heading" class="display">Claim not completed</h1>

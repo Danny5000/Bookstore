@@ -29,7 +29,7 @@ STRIPE_TAX_CODE_PROSE=
 STRIPE_TAX_CODE_COMIC=
 ```
 
-`STRIPE_CHECKOUT_DURATION_SECONDS` is deliberately fixed at `1800`. Webhook signatures accept the configured tolerance, up to the validated 900-second bound; the default is 300 seconds. Currency is snapshotted per item and order, never converted, and mixed-currency carts are rejected. Display uses the ISO exponent from `Intl.NumberFormat`; unsupported codes and Stripe's exceptional ISK/UGX charge-unit semantics are rejected at catalog and provider boundaries.
+`STRIPE_CHECKOUT_DURATION_SECONDS` is deliberately fixed at `1800`. Webhook signatures accept the configured tolerance, up to the validated 900-second bound; the default is 300 seconds. Currency is snapshotted per item and order, never converted, and mixed-currency carts are rejected. The accepted set is pinned to Stripe's [supported presentment currencies](https://docs.stripe.com/currencies) as reviewed on 2026-08-10, intersected with runtime `Intl.NumberFormat` support; Stripe's exceptional ISK/UGX charge-unit semantics remain deliberately excluded. Catalog prices are positive and at most `49,999,999` minor units, and a complete Checkout subtotal has the same ceiling. Canonical provider amounts are capped at `99,999,999` minor units, leaving explicit headroom for automatic tax while rejecting oversized provider snapshots.
 
 When `STRIPE_AUTOMATIC_TAX_ENABLED=true`, both `STRIPE_TAX_CODE_PROSE` and `STRIPE_TAX_CODE_COMIC` are required Stripe `txcd_...` codes selected for the operator's products and jurisdictions. Automatic tax remains off until those codes and the Stripe account's tax configuration have been reviewed. The application still stores canonical Stripe-calculated subtotal, tax, and total values after payment.
 
@@ -80,15 +80,27 @@ Restore `STRIPE_ENABLED=false` after the checkpoint unless local test-mode use i
 
 A canonically paid guest Checkout must contain a normalized Checkout email. Fulfillment creates or reuses a `guest_identities` record, attaches the paid order and unclaimed purchase grants, and enqueues a combined receipt/claim message on `email.commerce.v1`. Until claim, the guest has no library, reader, or download authority.
 
-The action link is one-use. A signed-in verified account may claim every eligible purchase for the same normalized email in one locked transaction. Replaying the action is safe and grants nothing twice. The `/claim` request form always returns the same generic response for present, absent, and already-claimed email addresses.
+The emailed action is one-use, and `/claim/complete` also requires a project-owned one-use authorization cookie bound to the normalized purchase email. The claim service requires and consumes that authorization in the same locked transaction that attaches purchases, so a direct visit, ordinary verification link, ordinary password reset, or ordinary magic link cannot claim. A signed-in verified account claims every eligible purchase for the same normalized email in one transaction; exact authorization replay grants nothing twice. The `/claim` request form always returns the same generic response for present, absent, and already-claimed email addresses.
 
-If a guest email already belongs to an unverified password account, the receipt directs the customer through normal email verification first. After verification, request a fresh claim link at `/claim`; the claim never treats an unverified account or browser-submitted email as ownership proof. Magic-link and password-reset behavior remains documented in [authentication and email operations](authentication-and-email.md).
+When no password credential exists, the commerce email may use a one-use magic link. Every ordinary and commerce magic link also has a project marker bound to the authorized credential generation at issuance. After Better Auth creates a session, the hook atomically consumes the marker and rechecks that generation; stale or in-flight links crossing a password reset have their session deleted and cookie expired. A verified credential that appeared after issuance remains present and rejects the magic action. If only an unverified credential appeared, Better Auth removes it after mailbox proof and the application may remove orphan authority and continue passwordless when no reset is active or the exact live reset marker remains unapplied. Once a reset has applied its new hash, that newer mailbox-proven generation wins: the older magic action is rejected even if Better Auth cleanup removed the credential. Any surviving authority row makes the next claim request route to exact-purpose password recovery rather than another magic link. A successful magic action also invalidates every pending native/project reset and clears passwordless reset authority while holding the user lock, so an older unapplied reset cannot take over the claimed account later. A magic-derived authorization is rejected if a password credential exists when the claim transaction runs.
 
-Use Mailpit to inspect local receipt, claim, and verification messages. Do not print outbox payloads or action URLs into terminal diagnostics.
+When any password credential already exists, whether verified or unverified, commerce claiming requires the exact-purpose password-recovery email. Successful reset changes the password first, revokes every prior session, marks only the reset-token-bound account verified, and then mints reset-derived commerce authorization. Project-owned credential authority serializes sibling and in-flight resets: only a live native token may be mailed, completion must match the exact hash applied by that token, and stale rollback is compare-and-swap. Requesting recovery alone does not disable the current authorized password. The reset page signs in explicitly with the newly chosen password before offering `/claim/complete`; no follow-up verification message is used. Ordinary email verification never auto-signs in, and the in-session change-password endpoint is disabled so password changes use the serialized recovery boundary. If post-reset authorization creation or sign-in fails, the consumed form is replaced with generic recovery guidance and never claims; a fresh mailbox reset is the only recovery.
+
+Use Mailpit to inspect local receipt, claim, and recovery messages. Do not print outbox payloads or action URLs into terminal diagnostics. Passwords, reset tokens, magic tokens, claim authorization values, and cookies must never enter logs, audits, URLs beyond Better Auth's required action token, or support screenshots.
+
+## Signed-account duplicate-purchase holds
+
+Signed-in quotes expose four disjoint partitions: purchasable items, `alreadyOwnedTitleIds`, `claimableTitleIds`, and `reservedTitleIds`. Claimable means a paid, unclaimed guest purchase matches the verified account email. Reserved means another purchase may still resolve, including an account or same-email guest grant suspended by an open dispute. These are duplicate-charge safety holds, not finite-inventory reservations; anonymous cross-device deduplication remains out of scope until a canonical paid email exists.
+
+For the same user/title, `checkout_pending`, `checkout_open`, `payment_pending`, `failed`, and `exception` orders remain reserved. A same-attempt pending/open request is resumable only within the shared 30-second provider-call safety window; after that it fails closed, but elapsed local time alone never releases the title. Canonical paid ownership supersedes a hold. Only a signature-verified, canonically reduced Checkout Session `expired` state releases it; an expired order cannot later become paid or exception.
+
+Signed asynchronous `failed` remains unresolved because a later canonical success is supported. The browser continues polling, preserves its checkout attempt and cart, and tells the customer not to start another checkout. Ambiguous pending, failed, or exception holds require provider-verified operational recovery in Plan 7. Never release one with a manual status edit or an elapsed-time SQL update.
 
 ## Webhook and worker lifecycle
 
 `POST /api/webhooks/stripe` reads bounded untouched bytes, verifies the `Stripe-Signature`, rejects live/test-mode mismatch, minimizes the supported event, and transactionally inserts one `stripe_events` row plus one deduplicated `commerce.stripe-event` job. Duplicate deliveries converge on the same row/job; a conflicting reuse of a provider event ID cannot overwrite accepted evidence.
+
+Configure the Stripe Dashboard endpoint with API version `2026-07-29.dahlia` and only this Plan 6A allowlist: `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed`, `checkout.session.expired`, `refund.created`, `refund.updated`, `refund.failed`, `charge.dispute.created`, `charge.dispute.updated`, `charge.dispute.closed`, `charge.dispute.funds_withdrawn`, and `charge.dispute.funds_reinstated`. Do not subscribe this endpoint to broad `*` delivery; Plan 6B will explicitly extend the list for its financial imports.
 
 The worker retrieves canonical provider state outside a database transaction. It then enters short ordered transactions to reduce payment, refund, or dispute state; update purchase grants and the effective entitlement projection; enqueue deduplicated `email.commerce.v1` messages; append a minimized audit event; and mark the event processed. After an operation-local event or identity lock, purchase facts are always locked as order, payment, refunds, allocations, disputes, items, sorted entitlement scopes, then grants. Provider/SMTP calls are never held inside database transactions.
 
@@ -113,7 +125,7 @@ docker compose --file compose.prod.yaml ps
 docker compose --file compose.prod.yaml logs --tail 100 app worker
 ```
 
-Logs must contain only safe categories and correlation/record IDs. Do not enable provider request/response logging. Never select or print `purchase_email`, guest email digests, outbox payloads, email bodies, cookies, tokens, Checkout URLs, Stripe signatures, or any secret/card/address data.
+Logs must contain only safe categories and correlation/record IDs. Do not enable provider request/response logging. Never select or print guest identity email plaintext (`orders.purchase_email` or `guest_identities.email`), outbox payloads, email bodies, cookies, tokens, Checkout URLs, Stripe signatures, credential-authority hashes/reset epochs, or any secret/card/address data.
 
 Safe database inspection can use identifiers, statuses, counts, timestamps, and minimized reconciliation state:
 
@@ -170,10 +182,31 @@ docker compose --file compose.prod.yaml config --quiet
 
 ```powershell
 docker compose --file compose.prod.yaml --file compose.stripe.yaml config --quiet
+npm run stripe:preflight
 docker compose --file compose.prod.yaml --file compose.stripe.yaml up --detach --wait
 ```
 
-`docker compose config` verifies the merged structure, but it does not verify that environment-backed secret values are present. The deployment preflight must check that both Stripe variables are non-empty without printing them; container creation is the first Compose operation that consumes those values.
+`docker compose config` verifies the merged structure, but it does not verify that environment-backed secret values are present. `npm run stripe:preflight` requires the repository's documented Node.js/npm toolchain, exits nonzero when either variable is missing or empty, and reports only presence without printing either value. Run it after exporting the deployment secrets and before every Stripe-overlay command that can create a container.
+
+On a Docker-only Linux VPS without host Node.js, use this dependency-free POSIX-shell equivalent and continue only when it exits zero:
+
+```sh
+stripe_credential_present() {
+  case "${1-}" in
+    *[![:space:]]*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if ! stripe_credential_present "${STRIPE_SECRET_KEY-}" ||
+   ! stripe_credential_present "${STRIPE_WEBHOOK_SECRET-}"; then
+  printf '%s\n' '[stripe-preflight] required Stripe credentials are missing or empty' >&2
+  exit 1
+fi
+printf '%s\n' '[stripe-preflight] required Stripe credentials are present'
+```
+
+Neither preflight prints credential values. Container creation is the first Compose operation that consumes them.
 
 The overlay does not alter `APPLICATION_MODE=maintenance`, `STRIPE_LIVE_MODE=false`, database/auth/SMTP secrets, or the migration/bootstrap tools. Do not use it as a production-launch switch. Plan 7 owns the deployment launch gate and Hetzner hardening.
 

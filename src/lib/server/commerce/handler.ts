@@ -3,7 +3,7 @@ import type { Database } from '$lib/server/db/client';
 import { stripeEvents, type StripeEventRow } from '$lib/server/db/schema';
 import { PermanentJobError } from '$lib/server/jobs/runner';
 import type { JobHandler } from '$lib/server/jobs/types';
-import { PermanentCommerceError } from './errors';
+import { PermanentCommerceError, RetryableProviderError } from './errors';
 import { parseStripeEventJobPayload } from './job';
 import type {
   CheckoutSnapshot,
@@ -108,6 +108,17 @@ export function createStripeEventHandler(
           ? null
           : await gateway.retrievePayment(session.paymentIntentId);
         throwIfAborted(signal);
+        if (
+          payment &&
+          payment.paymentIntentId === session.paymentIntentId &&
+          (
+            payment.latestChargeId !== session.latestChargeId ||
+            (session.paymentStatus === 'unpaid' && payment.state === 'succeeded') ||
+            (session.paymentStatus === 'paid' && payment.state !== 'succeeded')
+          )
+        ) {
+          throw new RetryableProviderError();
+        }
         await dependencies.fulfillCheckout(database, { stripeEventId, session, payment });
         return;
       }

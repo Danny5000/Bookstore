@@ -8,8 +8,10 @@ import {
 function dependencies() {
   return {
     canSendMagicLink: vi.fn(async () => true),
+    canSendCommerceMagicLink: vi.fn(async () => true),
     queueMagicEmail: vi.fn(async () => undefined),
-    queueCommerceClaimEmail: vi.fn(async () => undefined)
+    queueCommerceClaimEmail: vi.fn(async () => undefined),
+    registerMagicLink: vi.fn(async () => true)
   };
 }
 
@@ -19,7 +21,7 @@ const url = 'https://books.example.com/api/auth/magic-link/verify?token=private-
 describe('magic-link email metadata routing', () => {
   it('keeps absent metadata on the generic auth email path', async () => {
     const deps = dependencies();
-    await sendRoutedMagicLink(deps, { email, url, metadata: undefined }, 900);
+    await sendRoutedMagicLink(deps, { email, url, token: 'private-token', metadata: undefined }, 900);
     expect(deps.canSendMagicLink).toHaveBeenCalledWith(email);
     expect(deps.queueMagicEmail).toHaveBeenCalledWith({
       template: 'auth.magic-link',
@@ -27,6 +29,9 @@ describe('magic-link email metadata routing', () => {
       recipientName: email,
       actionUrl: url,
       expiresInSeconds: 900
+    });
+    expect(deps.registerMagicLink).toHaveBeenCalledWith({
+      token: 'private-token', email, purpose: 'account', expiresInSeconds: 900
     });
     expect(deps.queueCommerceClaimEmail).not.toHaveBeenCalled();
   });
@@ -36,23 +41,44 @@ describe('magic-link email metadata routing', () => {
     const orderId = randomUUID();
     const metadata = { purpose: 'commerce-claim', orderId };
     expect(commerceClaimMetadataSchema.parse(metadata)).toEqual(metadata);
-    await sendRoutedMagicLink(deps, { email, url, metadata }, 900);
+    await sendRoutedMagicLink(deps, { email, url, token: 'private-token', metadata }, 900);
+    expect(deps.registerMagicLink).toHaveBeenCalledWith({
+      token: 'private-token', email, purpose: 'commerce-claim', expiresInSeconds: 900
+    });
     expect(deps.queueCommerceClaimEmail).toHaveBeenCalledWith({
       orderId,
       email,
       claimUrl: url
     });
-    expect(deps.canSendMagicLink).toHaveBeenCalledWith(email);
+    expect(deps.canSendCommerceMagicLink).toHaveBeenCalledWith(email);
     expect(deps.queueMagicEmail).not.toHaveBeenCalled();
   });
 
   it('suppresses commerce metadata when credential proof still blocks magic sign-in', async () => {
     const deps = dependencies();
-    deps.canSendMagicLink.mockResolvedValueOnce(false);
+    deps.canSendCommerceMagicLink.mockResolvedValueOnce(false);
     await sendRoutedMagicLink(deps, {
       email,
       url,
+      token: 'private-token',
       metadata: { purpose: 'commerce-claim', orderId: randomUUID() }
+    }, 900);
+    expect(deps.queueCommerceClaimEmail).not.toHaveBeenCalled();
+    expect(deps.queueMagicEmail).not.toHaveBeenCalled();
+    expect(deps.registerMagicLink).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    undefined,
+    { purpose: 'commerce-claim' as const, orderId: randomUUID() }
+  ])('does not queue mail when the generation marker cannot be registered', async (metadata) => {
+    const deps = dependencies();
+    deps.registerMagicLink.mockResolvedValueOnce(false);
+    await sendRoutedMagicLink(deps, {
+      email,
+      url,
+      token: 'private-token',
+      metadata
     }, 900);
     expect(deps.queueCommerceClaimEmail).not.toHaveBeenCalled();
     expect(deps.queueMagicEmail).not.toHaveBeenCalled();
@@ -67,10 +93,11 @@ describe('magic-link email metadata routing', () => {
     { purpose: 'commerce-claim', orderId: randomUUID(), email: 'victim@example.com' }
   ])('silently suppresses invalid or expanded metadata without generic fallback', async (metadata) => {
     const deps = dependencies();
-    await sendRoutedMagicLink(deps, { email, url, metadata }, 900);
+    await sendRoutedMagicLink(deps, { email, url, token: 'private-token', metadata }, 900);
     expect(deps.queueCommerceClaimEmail).not.toHaveBeenCalled();
     expect(deps.queueMagicEmail).not.toHaveBeenCalled();
     expect(deps.canSendMagicLink).not.toHaveBeenCalled();
+    expect(deps.canSendCommerceMagicLink).not.toHaveBeenCalled();
   });
 
   it('does not log a token or action URL while routing', async () => {
@@ -81,6 +108,7 @@ describe('magic-link email metadata routing', () => {
     await sendRoutedMagicLink(deps, {
       email,
       url,
+      token: 'private-token',
       metadata: { purpose: 'commerce-claim', orderId: randomUUID() }
     }, 900);
     expect(log).not.toHaveBeenCalled();

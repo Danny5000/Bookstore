@@ -3,9 +3,14 @@ import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
 import type { Actor } from '$lib/server/auth/admin-policy';
 import {
   entitlements,
+  entitlementGrants,
+  guestIdentities,
+  orderItems,
+  orders,
   revisionPresentations,
   titleRevisions,
-  titles
+  titles,
+  user
 } from '$lib/server/db/schema';
 import type { DatabaseExecutor, DatabaseTransaction } from '$lib/server/db/transaction';
 import {
@@ -29,7 +34,16 @@ export interface QuoteFingerprintInputV1 {
   actorUserId: string | null;
   items: QuoteFingerprintItemV1[];
   alreadyOwnedTitleIds: string[];
+  claimableTitleIds: string[];
+  reservedTitleIds: string[];
   unavailableTitleIds: string[];
+}
+
+export const CHECKOUT_PROVIDER_CALL_WINDOW_SECONDS = 30;
+
+export function checkoutProviderStartDeadline(createdAt: Date): Date {
+  const epochSeconds = Math.floor(createdAt.getTime() / 1000);
+  return new Date((epochSeconds + CHECKOUT_PROVIDER_CALL_WINDOW_SECONDS) * 1000);
 }
 
 function rawCompare(left: string, right: string): number {
@@ -50,17 +64,19 @@ export function createQuoteFingerprint(input: QuoteFingerprintInputV1): string {
         presentationPublishedAt: item.presentationPublishedAt
       })),
     alreadyOwnedTitleIds: [...input.alreadyOwnedTitleIds].sort(rawCompare),
+    claimableTitleIds: [...input.claimableTitleIds].sort(rawCompare),
+    reservedTitleIds: [...input.reservedTitleIds].sort(rawCompare),
     unavailableTitleIds: [...input.unavailableTitleIds].sort(rawCompare)
   };
   return createHash('sha256').update(JSON.stringify(canonical), 'utf8').digest('hex');
 }
 
 function validatedTitleIds(titleIds: readonly string[]): string[] {
-  const parsed = quoteRequestSchema.safeParse({ titleIds: [...titleIds] });
-  if (!parsed.success || new Set(parsed.data.titleIds).size !== parsed.data.titleIds.length) {
+  const parsed = quoteRequestSchema.shape.titleIds.safeParse([...titleIds]);
+  if (!parsed.success || new Set(parsed.data).size !== parsed.data.length) {
     throw new InvalidCartError();
   }
-  return [...parsed.data.titleIds].sort(rawCompare);
+  return [...parsed.data].sort(rawCompare);
 }
 
 function actorUserId(actor: Actor): string | null {
@@ -70,7 +86,9 @@ function actorUserId(actor: Actor): string | null {
 async function buildQuote(
   database: DatabaseExecutor,
   actor: Actor,
-  requestedTitleIds: readonly string[]
+  requestedTitleIds: readonly string[],
+  checkoutAttemptId: string | null,
+  now: Date
 ): Promise<CommerceQuoteDto> {
   const rows = await database
     .select({
@@ -126,7 +144,10 @@ async function buildQuote(
 
   const userId = actorUserId(actor);
   const ownedIds = new Set<string>();
+  const claimableIds = new Set<string>();
+  const reservedIds = new Set<string>();
   if (userId && eligible.length > 0) {
+    const eligibleTitleIds = eligible.map((row) => row.titleId);
     const activeEntitlements = await database
       .select({ titleId: entitlements.titleId })
       .from(entitlements)
@@ -135,16 +156,91 @@ async function buildQuote(
           eq(entitlements.userId, userId),
           inArray(
             entitlements.titleId,
-            eligible.map((row) => row.titleId)
+            eligibleTitleIds
           ),
           isNull(entitlements.revokedAt)
         )
-      );
+    );
     for (const entitlement of activeEntitlements) ownedIds.add(entitlement.titleId);
+
+    const [account] = await database
+      .select({ email: user.email, emailVerified: user.emailVerified })
+      .from(user)
+      .where(eq(user.id, userId))
+      .limit(1);
+    if (account?.emailVerified) {
+      const claimablePurchases = await database
+        .select({ titleId: orderItems.titleId, state: entitlementGrants.state })
+        .from(orderItems)
+        .innerJoin(orders, eq(orders.id, orderItems.orderId))
+        .innerJoin(guestIdentities, eq(guestIdentities.id, orders.guestIdentityId))
+        .innerJoin(entitlementGrants, eq(entitlementGrants.orderItemId, orderItems.id))
+        .where(and(
+          eq(orders.status, 'paid'),
+          eq(orders.purchaseEmail, account.email),
+          isNull(orders.initiatingUserId),
+          isNull(guestIdentities.claimedByUserId),
+          inArray(entitlementGrants.state, ['unclaimed', 'suspended']),
+          inArray(orderItems.titleId, eligibleTitleIds)
+        ));
+      for (const purchase of claimablePurchases) {
+        if (purchase.state === 'unclaimed') claimableIds.add(purchase.titleId);
+        else reservedIds.add(purchase.titleId);
+      }
+    }
+
+    const suspendedAccountPurchases = await database
+      .select({ titleId: entitlementGrants.titleId })
+      .from(entitlementGrants)
+      .where(and(
+        eq(entitlementGrants.userId, userId),
+        eq(entitlementGrants.source, 'purchase'),
+        eq(entitlementGrants.state, 'suspended'),
+        inArray(entitlementGrants.titleId, eligibleTitleIds)
+      ));
+    for (const purchase of suspendedAccountPurchases) reservedIds.add(purchase.titleId);
+
+    const activeReservations = await database
+      .select({
+        titleId: orderItems.titleId,
+        checkoutAttemptId: orders.clientCheckoutAttemptId,
+        status: orders.status,
+        createdAt: orders.createdAt
+      })
+      .from(orderItems)
+      .innerJoin(orders, eq(orders.id, orderItems.orderId))
+      .where(and(
+        eq(orders.initiatingUserId, userId),
+        inArray(orderItems.titleId, eligibleTitleIds),
+        inArray(orders.status, [
+          'checkout_pending',
+          'checkout_open',
+          'payment_pending',
+          'failed',
+          'exception'
+        ])
+      ));
+    for (const reservation of activeReservations) {
+      const isResumableSelfAttempt =
+        checkoutAttemptId !== null &&
+        reservation.checkoutAttemptId === checkoutAttemptId &&
+        (reservation.status === 'checkout_pending' || reservation.status === 'checkout_open') &&
+        now.getTime() <= checkoutProviderStartDeadline(reservation.createdAt).getTime();
+      if (!isResumableSelfAttempt) reservedIds.add(reservation.titleId);
+    }
+    for (const titleId of ownedIds) {
+      claimableIds.delete(titleId);
+      reservedIds.delete(titleId);
+    }
+    for (const titleId of claimableIds) reservedIds.delete(titleId);
   }
 
   const purchasable = eligible
-    .filter((row) => !ownedIds.has(row.titleId))
+    .filter((row) =>
+      !ownedIds.has(row.titleId) &&
+      !claimableIds.has(row.titleId) &&
+      !reservedIds.has(row.titleId)
+    )
     .sort((left, right) => rawCompare(left.titleId, right.titleId));
   const currencies = new Set(purchasable.map((row) => row.currency));
   if (currencies.size > 1) throw new InvalidCartError();
@@ -167,6 +263,8 @@ async function buildQuote(
     currency: row.currency
   }));
   const alreadyOwnedTitleIds = [...ownedIds].sort(rawCompare);
+  const claimableTitleIds = [...claimableIds].sort(rawCompare);
+  const reservedTitleIds = [...reservedIds].sort(rawCompare);
   const subtotalMinor = items.reduce((total, item) => total + item.unitSubtotalMinor, 0);
   const fingerprint = createQuoteFingerprint({
     version: 1,
@@ -179,6 +277,8 @@ async function buildQuote(
       presentationPublishedAt: row.presentationPublishedAt!.toISOString()
     })),
     alreadyOwnedTitleIds,
+    claimableTitleIds,
+    reservedTitleIds,
     unavailableTitleIds: [...unavailableTitleIds]
   });
 
@@ -188,6 +288,8 @@ async function buildQuote(
     subtotalMinor,
     items,
     alreadyOwnedTitleIds,
+    claimableTitleIds,
+    reservedTitleIds,
     unavailableTitleIds: [...unavailableTitleIds],
     taxNotice: 'calculated_at_checkout',
     canCheckout: items.length > 0
@@ -197,15 +299,19 @@ async function buildQuote(
 export async function quoteCart(
   database: DatabaseExecutor,
   actor: Actor,
-  titleIds: readonly string[]
+  titleIds: readonly string[],
+  checkoutAttemptId: string | null = null,
+  now = new Date()
 ): Promise<CommerceQuoteDto> {
-  return buildQuote(database, actor, validatedTitleIds(titleIds));
+  return buildQuote(database, actor, validatedTitleIds(titleIds), checkoutAttemptId, now);
 }
 
 export async function lockAndQuoteCart(
   transaction: DatabaseTransaction,
   actor: Actor,
-  titleIds: readonly string[]
+  titleIds: readonly string[],
+  checkoutAttemptId: string | null = null,
+  now = new Date()
 ): Promise<CommerceQuoteDto> {
   const requestedTitleIds = validatedTitleIds(titleIds);
   for (const titleId of requestedTitleIds) {
@@ -220,5 +326,5 @@ export async function lockAndQuoteCart(
       requestedTitleIds.map((titleId) => ({ userId, titleId }))
     );
   }
-  return buildQuote(transaction, actor, requestedTitleIds);
+  return buildQuote(transaction, actor, requestedTitleIds, checkoutAttemptId, now);
 }

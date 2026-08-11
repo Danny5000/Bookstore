@@ -99,12 +99,20 @@ test('delayed payments, refunds, preserved grants, and disputes converge on effe
     const failedAttempt = await cartAttempt(customerPage);
     await commerce.fulfillCheckout(failedOrder, { state: 'pending', email });
     await commerce.fulfillCheckout(failedOrder, { state: 'failed', email });
-    await expect(customerPage.getByRole('alert')).toContainText('Payment was not completed', {
+    await expect(customerPage.getByRole('alert')).toContainText(
+      'Payment confirmation is still resolving',
+      {
+        timeout: 10_000
+      }
+    );
+    await expect.poll(() => cartAttempt(customerPage)).toBe(failedAttempt);
+    expect((await customerContext.request.get(`/library/${second.titleId}/download`)).status())
+      .toBe(404);
+    await commerce.fulfillCheckout(failedOrder, { state: 'expired', email });
+    await expect(customerPage.getByRole('alert')).toContainText('Checkout expired', {
       timeout: 10_000
     });
     await expect.poll(() => cartAttempt(customerPage)).not.toBe(failedAttempt);
-    expect((await customerContext.request.get(`/library/${second.titleId}/download`)).status())
-      .toBe(404);
 
     const multiOrder = await startAccountCheckout(customerPage, customerContext, [first.slug]);
     orderIds.push(multiOrder);

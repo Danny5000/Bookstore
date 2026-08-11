@@ -45,7 +45,13 @@ export type FulfillmentCommand =
       purchaseEmail: string;
     }
   | {
-      state: 'failed' | 'expired';
+      state: 'failed';
+      orderId: string;
+      session: CheckoutSnapshot;
+      payment: PaymentSnapshot;
+    }
+  | {
+      state: 'expired';
       orderId: string;
       session: CheckoutSnapshot;
     };
@@ -152,6 +158,8 @@ export function validateFulfillmentCommand(input: ValidateFulfillmentInput): Ful
   if (
     payment.liveMode !== input.expectedLiveMode ||
     payment.paymentIntentId !== session.paymentIntentId ||
+    payment.metadataVersion !== '1' ||
+    payment.metadataOrderId !== input.order.id ||
     payment.latestChargeId !== session.latestChargeId ||
     payment.currency.toUpperCase() !== input.order.currency ||
     payment.currency !== session.currency ||
@@ -171,7 +179,7 @@ export function validateFulfillmentCommand(input: ValidateFulfillmentInput): Ful
     return { state: 'pending', orderId: input.order.id, session, payment };
   }
   if (session.paymentStatus === 'unpaid' && payment.state === 'failed') {
-    return { state: 'failed', orderId: input.order.id, session };
+    return { state: 'failed', orderId: input.order.id, session, payment };
   }
   return permanent();
 }
@@ -259,15 +267,13 @@ function assertCheckoutEvent(row: StripeEventRow, session: CheckoutSnapshot): vo
 
 function assertExistingPayment(
   existing: typeof payments.$inferSelect,
-  command: Extract<FulfillmentCommand, { state: 'pending' | 'paid' }>
+  command: Extract<FulfillmentCommand, { state: 'pending' | 'paid' | 'failed' }>
 ): void {
   if (
     existing.orderId !== command.orderId ||
     existing.stripePaymentIntentId !== command.payment.paymentIntentId ||
     existing.amountMinor !== command.payment.amountMinor ||
-    existing.currency !== command.payment.currency.toUpperCase() ||
-    (existing.stripeLatestChargeId !== null &&
-      command.payment.latestChargeId !== existing.stripeLatestChargeId)
+    existing.currency !== command.payment.currency.toUpperCase()
   ) permanent();
 }
 
@@ -287,17 +293,18 @@ function assertSucceededPayment(
 async function storePaymentEvidence(
   transaction: DatabaseTransaction,
   existing: typeof payments.$inferSelect | undefined,
-  command: Extract<FulfillmentCommand, { state: 'pending' | 'paid' }>,
+  command: Extract<FulfillmentCommand, { state: 'pending' | 'paid' | 'failed' }>,
   now: Date
 ): Promise<typeof payments.$inferSelect> {
   if (existing) assertExistingPayment(existing, command);
   const paid = command.state === 'paid';
+  const failed = command.state === 'failed';
   if (!existing) {
     const [inserted] = await transaction.insert(payments).values({
       orderId: command.orderId,
       stripePaymentIntentId: command.payment.paymentIntentId,
       stripeLatestChargeId: command.payment.latestChargeId,
-      status: paid ? 'succeeded' : 'pending',
+      status: paid ? 'succeeded' : failed ? 'failed' : 'pending',
       amountMinor: command.payment.amountMinor,
       currency: command.payment.currency.toUpperCase(),
       paymentMethodCategory: command.payment.paymentMethodCategory,
@@ -313,8 +320,19 @@ async function storePaymentEvidence(
     return existing;
   }
   if (!paid) {
-    if (existing.status !== 'pending') permanent();
-    return existing;
+    const [updated] = await transaction
+      .update(payments)
+      .set({
+        stripeLatestChargeId: command.payment.latestChargeId,
+        status: existing.status === 'failed' || failed ? 'failed' : 'pending',
+        paymentMethodCategory: command.payment.paymentMethodCategory,
+        paidAt: null,
+        updatedAt: now
+      })
+      .where(eq(payments.id, existing.id))
+      .returning();
+    if (!updated) permanent();
+    return updated;
   }
   const [updated] = await transaction
     .update(payments)
@@ -527,6 +545,11 @@ export async function fulfillCheckoutEvent(
       await dependencies.completeStripeEvent(transaction, event.id, now);
       return;
     }
+    if (order.status === 'expired') {
+      if (command.state !== 'expired') permanent();
+      await dependencies.completeStripeEvent(transaction, event.id, now);
+      return;
+    }
     if (order.status === 'exception') permanent();
 
     if (command.state === 'pending') {
@@ -543,6 +566,7 @@ export async function fulfillCheckoutEvent(
       await storePaymentEvidence(transaction, existingPayment, command, now);
       await finalizePaidOrder(transaction, order, items, command, dependencies, now);
     } else if (command.state === 'failed') {
+      await storePaymentEvidence(transaction, existingPayment, command, now);
       if (['checkout_pending', 'checkout_open', 'payment_pending'].includes(order.status)) {
         await transaction.update(orders).set({
           status: 'failed',
@@ -551,7 +575,9 @@ export async function fulfillCheckoutEvent(
           updatedAt: now
         }).where(eq(orders.id, order.id));
       }
-    } else if (order.status === 'checkout_pending' || order.status === 'checkout_open') {
+    } else if ([
+      'checkout_pending', 'checkout_open', 'payment_pending', 'failed'
+    ].includes(order.status)) {
       await transaction.update(orders).set({
         status: 'expired',
         stripeCheckoutSessionId: command.session.providerSessionId,
@@ -608,7 +634,7 @@ export async function recordFulfillmentException(
       .for('update');
     if (!event || event.status !== 'pending') return;
     const order = await findExceptionOrder(transaction, event, input.orderId);
-    if (order && order.status !== 'paid') {
+    if (order && order.status !== 'paid' && order.status !== 'expired') {
       await transaction
         .update(orders)
         .set({ status: 'exception', updatedAt: now })

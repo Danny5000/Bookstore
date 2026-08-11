@@ -35,8 +35,8 @@ describe('commerce cart contracts', () => {
     const allowed = Array.from({ length: MAX_CART_TITLES }, () => randomUUID());
     const oversized = [...allowed, randomUUID()];
 
-    expect(quoteRequestSchema.safeParse({ titleIds: allowed }).success).toBe(true);
-    expect(quoteRequestSchema.safeParse({ titleIds: oversized }).success).toBe(false);
+    expect(quoteRequestSchema.safeParse({ titleIds: allowed, checkoutAttemptId: randomUUID() }).success).toBe(true);
+    expect(quoteRequestSchema.safeParse({ titleIds: oversized, checkoutAttemptId: randomUUID() }).success).toBe(false);
     expect(
       cartStateV1Schema.safeParse({
         version: 1,
@@ -47,7 +47,20 @@ describe('commerce cart contracts', () => {
   });
 
   it('requires at least one title when requesting a quote', () => {
-    expect(quoteRequestSchema.safeParse({ titleIds: [] }).success).toBe(false);
+    expect(quoteRequestSchema.safeParse({ titleIds: [], checkoutAttemptId: randomUUID() }).success).toBe(false);
+  });
+
+  it('canonicalizes UUID case before cart dedupe, fingerprinting, and advisory locking', () => {
+    const mixedCaseTitleId = titleId.toUpperCase();
+    const mixedCaseAttemptId = checkoutAttemptId.toUpperCase();
+
+    expect(quoteRequestSchema.parse({
+      titleIds: [mixedCaseTitleId],
+      checkoutAttemptId: mixedCaseAttemptId
+    })).toEqual({
+      titleIds: [titleId],
+      checkoutAttemptId
+    });
   });
 });
 

@@ -32,6 +32,8 @@ const quote: CommerceQuoteDto = {
     currency: 'USD'
   }],
   alreadyOwnedTitleIds: [],
+  claimableTitleIds: [],
+  reservedTitleIds: [],
   unavailableTitleIds: [],
   taxNotice: 'calculated_at_checkout',
   canCheckout: true
@@ -44,14 +46,17 @@ const jsonResponse = (body: unknown, status = 200): Response =>
   });
 
 describe('commerce browser client', () => {
-  it('quotes with only title IDs and validates the private response', async () => {
+  it('quotes with title IDs plus the current attempt and validates the private response', async () => {
     const fetcher = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => jsonResponse(quote));
-    await expect(requestQuote(fetcher, [uuid(1)])).resolves.toEqual(quote);
+    await expect(requestQuote(fetcher, [uuid(1)], uuid(100))).resolves.toEqual(quote);
     expect(fetcher).toHaveBeenCalledWith('/api/commerce/quote', expect.objectContaining({
       method: 'POST',
-      body: JSON.stringify({ titleIds: [uuid(1)] })
+      body: JSON.stringify({ titleIds: [uuid(1)], checkoutAttemptId: uuid(100) })
     }));
-    expect(JSON.parse(fetcher.mock.calls[0]![1]!.body as string)).toEqual({ titleIds: [uuid(1)] });
+    expect(JSON.parse(fetcher.mock.calls[0]![1]!.body as string)).toEqual({
+      titleIds: [uuid(1)],
+      checkoutAttemptId: uuid(100)
+    });
   });
 
   it.each([
@@ -61,18 +66,18 @@ describe('commerce browser client', () => {
     [200, { ...quote, subtotalMinor: '12.99' }, 'invalid_response']
   ])('maps quote response %# to a stable client error', async (status, body, kind) => {
     const fetcher = vi.fn(async () => jsonResponse(body, status));
-    await expect(requestQuote(fetcher, [uuid(1)])).rejects.toMatchObject({ kind });
+    await expect(requestQuote(fetcher, [uuid(1)], uuid(100))).rejects.toMatchObject({ kind });
   });
 
   it('aborts the prior request and ignores a stale out-of-order result', async () => {
     const resolvers: Array<(value: CommerceQuoteDto) => void> = [];
     const signals: AbortSignal[] = [];
-    const coordinator = new QuoteRequestCoordinator((_fetcher, ids, signal) => {
+    const coordinator = new QuoteRequestCoordinator((_fetcher, ids, _attemptId, signal) => {
       signals.push(signal);
       return new Promise((resolve) => resolvers.push(resolve));
     });
-    const first = coordinator.refresh(vi.fn(), [uuid(1)]);
-    const second = coordinator.refresh(vi.fn(), [uuid(2)]);
+    const first = coordinator.refresh(vi.fn(), [uuid(1)], uuid(100));
+    const second = coordinator.refresh(vi.fn(), [uuid(2)], uuid(101));
     expect(signals[0]!.aborted).toBe(true);
 
     resolvers[1]!({ ...quote, fingerprint: 'b'.repeat(64) });
@@ -102,14 +107,16 @@ describe('commerce browser client', () => {
     const reviewed = {
       ...quote,
       alreadyOwnedTitleIds: [uuid(2)],
-      unavailableTitleIds: [uuid(3)]
+      claimableTitleIds: [uuid(3)],
+      reservedTitleIds: [uuid(4)],
+      unavailableTitleIds: [uuid(5)]
     };
     expect(buildCheckoutRequest(
-      [uuid(1), uuid(2), uuid(3)],
+      [uuid(1), uuid(2), uuid(3), uuid(4), uuid(5)],
       reviewed,
       uuid(100)
     )).toEqual({
-      titleIds: [uuid(1), uuid(2), uuid(3)],
+      titleIds: [uuid(1), uuid(2), uuid(3), uuid(4), uuid(5)],
       quoteFingerprint: quote.fingerprint,
       checkoutAttemptId: uuid(100)
     });
@@ -171,13 +178,13 @@ describe('commerce browser client', () => {
       status: 200,
       headers: { 'content-type': 'application/json' }
     }));
-    await expect(requestQuote(fetcher, [uuid(1)])).rejects.toBeInstanceOf(CheckoutClientError);
+    await expect(requestQuote(fetcher, [uuid(1)], uuid(100))).rejects.toBeInstanceOf(CheckoutClientError);
   });
 
   it('polls private order status immediately and every two seconds until terminal', async () => {
     const responses = [
       { status: 'pending' as const },
-      { status: 'pending' as const },
+      { status: 'failed' as const, message: 'Payment confirmation is still resolving.' },
       { status: 'paid' as const, libraryUrl: '/library' as const }
     ];
     const fetcher = vi.fn(async () => jsonResponse(responses.shift()));
@@ -194,7 +201,7 @@ describe('commerce browser client', () => {
       outcome: 'terminal',
       status: { status: 'paid', libraryUrl: '/library' }
     });
-    expect(observed).toEqual(['pending', 'pending', 'paid']);
+    expect(observed).toEqual(['pending', 'failed', 'paid']);
     expect(fetcher).toHaveBeenCalledTimes(3);
     expect(fetcher).toHaveBeenCalledWith(
       `/api/commerce/orders/${uuid(200)}/status`,

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { expect, test, type Locator, type Page } from '@playwright/test';
-import { firstHttpLink, waitForLatestTextEmail } from './mailpit';
+import { firstHttpLink, navigateSensitiveAction, waitForLatestTextEmail } from './mailpit';
 
 const originalPassword = 'customer-password-2026';
 const newPassword = 'customer-new-password-2026';
@@ -58,25 +58,23 @@ test('customer can complete password, reset, and magic-link journeys', async ({ 
   const verificationLink = firstHttpLink(
     await waitForLatestTextEmail(email, 10_000, 'verify your email address')
   );
-  await page.goto(verificationLink);
-  await expect(page.locator('header').getByText(email)).toBeVisible();
+  await navigateSensitiveAction(page, verificationLink);
+  await expect(page.locator('header').getByRole('button', { name: 'Sign in' })).toBeVisible();
+  await expect(page.locator('header').getByText(email)).toHaveCount(0);
 
   const cleanVerificationContext = await browser.newContext({
     baseURL: 'http://127.0.0.1:4173'
   });
   const cleanVerificationPage = await cleanVerificationContext.newPage();
-  await cleanVerificationPage.goto(verificationLink);
+  await navigateSensitiveAction(cleanVerificationPage, verificationLink);
   await expect(cleanVerificationPage).toHaveURL(/error=INVALID_TOKEN/);
   await expect(
     cleanVerificationPage.locator('header').getByRole('button', { name: 'Sign in' })
   ).toBeVisible();
   await cleanVerificationContext.close();
 
-  await signOut(page);
-  await expect(page.locator('header').getByRole('button', { name: 'Sign in' })).toBeVisible();
   await signIn(page, email, originalPassword);
   await expect(page.locator('header').getByText(email)).toBeVisible();
-
   await signOut(page);
   await openSignIn(page);
   await page.getByRole('button', { name: 'Forgot password?' }).click();
@@ -89,7 +87,7 @@ test('customer can complete password, reset, and magic-link journeys', async ({ 
   const resetLink = firstHttpLink(
     await waitForLatestTextEmail(email, 10_000, 'reset your password')
   );
-  await page.goto(resetLink);
+  await navigateSensitiveAction(page, resetLink);
   await page.getByLabel('New password', { exact: true }).fill(newPassword);
   await page.getByLabel('Confirm new password').fill(newPassword);
   const updatePassword = page.getByRole('button', { name: 'Update password' });
@@ -114,12 +112,12 @@ test('customer can complete password, reset, and magic-link journeys', async ({ 
   await page.getByRole('button', { name: 'Email me a link' }).click();
   await expect(page.getByText('If sign-in is available, a link is on its way.')).toBeVisible();
   const magicLink = firstHttpLink(await waitForLatestTextEmail(email, 10_000, 'sign in'));
-  await page.goto(magicLink);
+  await navigateSensitiveAction(page, magicLink);
   await expect(page.locator('header').getByText(email)).toBeVisible();
 
   const cleanMagicContext = await browser.newContext({ baseURL: 'http://127.0.0.1:4173' });
   const cleanMagicPage = await cleanMagicContext.newPage();
-  await cleanMagicPage.goto(magicLink);
+  await navigateSensitiveAction(cleanMagicPage, magicLink);
   await expect(cleanMagicPage).toHaveURL(/error=INVALID_TOKEN/);
   await expect(cleanMagicPage.locator('header').getByRole('button', { name: 'Sign in' })).toBeVisible();
   await cleanMagicContext.close();

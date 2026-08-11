@@ -1,6 +1,10 @@
 import { z } from 'zod';
-import { isSupportedCommerceCurrency } from '$lib/commerce/money';
+import {
+  isSupportedCommerceCurrency,
+  MAX_CATALOG_PRICE_MINOR
+} from '$lib/commerce/money';
 import { parsePanelRegion, parsePresentationInput } from './content';
+import { canonicalUuidSchema } from '$lib/validation/uuid';
 
 const optionalTrimmedText = z
   .string()
@@ -16,7 +20,7 @@ const titleMetadataShape = {
   subtitle: optionalTrimmedText,
   description: z.string().trim().min(1).max(20_000),
   creatorName: z.string().trim().min(1).max(300),
-  priceMinor: z.number().int().nonnegative().max(2_147_483_647),
+  priceMinor: z.number().int().positive().max(MAX_CATALOG_PRICE_MINOR),
   currency: z
     .string()
     .trim()
@@ -31,18 +35,18 @@ const createTitleInputSchema = z.strictObject({
 });
 
 const createRevisionInputSchema = z.strictObject({
-  titleId: z.uuid(),
+  titleId: canonicalUuidSchema,
   parentRevisionId: z.uuid().nullable().optional().transform((value) => value ?? null),
   changeSummary: z.string().trim().min(1).max(2_000)
 });
 
 const updateTitleMetadataInputSchema = z.strictObject({
-  titleId: z.uuid(),
+  titleId: canonicalUuidSchema,
   ...titleMetadataShape
 });
 
 const confirmCoverSuggestionInputSchema = z.strictObject({
-  titleId: z.uuid(),
+  titleId: canonicalUuidSchema,
   revisionId: z.uuid(),
   suggestionId: z.uuid()
 });
@@ -80,7 +84,7 @@ const draftPanelSchema = z
   });
 
 const presentationCommandShape = {
-  titleId: z.uuid(),
+  titleId: canonicalUuidSchema,
   revisionId: z.uuid(),
   presentationId: z.uuid(),
   expectedUpdatedAt: optimisticTimestampSchema
@@ -139,10 +143,10 @@ const saveDraftPresentationInputSchema = z
 
 const publishReaderSettingsInputSchema = z.strictObject(presentationCommandShape);
 const revisionPublicationActionInputSchema = z.strictObject({
-  titleId: z.uuid(),
+  titleId: canonicalUuidSchema,
   revisionId: z.uuid()
 });
-const titlePublicationActionInputSchema = z.strictObject({ titleId: z.uuid() });
+const titlePublicationActionInputSchema = z.strictObject({ titleId: canonicalUuidSchema });
 
 export type CreateTitleInput = z.output<typeof createTitleInputSchema>;
 export type CreateRevisionInput = z.output<typeof createRevisionInputSchema>;

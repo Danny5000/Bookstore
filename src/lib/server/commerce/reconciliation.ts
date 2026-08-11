@@ -11,7 +11,7 @@ import {
   stripeEvents,
   type StripeEventRow
 } from '$lib/server/db/schema';
-import { PermanentCommerceError } from './errors';
+import { LocalCommerceNotReadyError, PermanentCommerceError } from './errors';
 import { lockEntitlementScopes, lockOrder } from './lock';
 import type { PaymentSnapshot, VerifiedStripeEvent } from './stripe/types';
 
@@ -66,10 +66,22 @@ function assertCanonicalPayment(
   if (
     provider.liveMode !== event.liveMode ||
     provider.paymentIntentId !== local.stripePaymentIntentId ||
+    provider.metadataVersion !== '1' ||
+    provider.metadataOrderId !== local.orderId ||
     provider.state !== 'succeeded' ||
-    local.status !== 'succeeded' ||
     provider.amountMinor !== local.amountMinor ||
-    provider.currency.toUpperCase() !== local.currency ||
+    provider.currency.toUpperCase() !== local.currency
+  ) permanentReconciliationFailure();
+}
+
+function assertCompletedCanonicalPayment(
+  local: typeof payments.$inferSelect,
+  provider: PaymentSnapshot,
+  event: StripeEventRow
+): void {
+  assertCanonicalPayment(local, provider, event);
+  if (
+    local.status !== 'succeeded' ||
     provider.latestChargeId !== local.stripeLatestChargeId ||
     provider.paidAt?.getTime() !== local.paidAt?.getTime() ||
     provider.paymentMethodCategory !== local.paymentMethodCategory
@@ -81,35 +93,51 @@ export async function lockCanonicalPaymentOrder(
   providerPayment: PaymentSnapshot,
   event: StripeEventRow
 ) {
-  const [candidate] = await transaction
-    .select()
-    .from(payments)
-    .where(eq(payments.stripePaymentIntentId, providerPayment.paymentIntentId))
-    .limit(1);
-  if (!candidate) permanentReconciliationFailure();
-  await lockOrder(transaction, candidate.orderId);
+  if (
+    providerPayment.liveMode !== event.liveMode ||
+    providerPayment.state !== 'succeeded' ||
+    providerPayment.metadataVersion !== '1'
+  ) permanentReconciliationFailure();
+
+  await lockOrder(transaction, providerPayment.metadataOrderId);
   const [order] = await transaction
     .select()
     .from(orders)
-    .where(eq(orders.id, candidate.orderId))
+    .where(eq(orders.id, providerPayment.metadataOrderId))
     .limit(1)
     .for('update');
   const [payment] = await transaction
     .select()
     .from(payments)
-    .where(and(
-      eq(payments.id, candidate.id),
-      eq(payments.stripePaymentIntentId, providerPayment.paymentIntentId)
-    ))
+    .where(eq(payments.stripePaymentIntentId, providerPayment.paymentIntentId))
     .limit(1)
     .for('update');
-  if (!payment) permanentReconciliationFailure();
+  if (!payment) {
+    if (
+      !order ||
+      order.status === 'paid' ||
+      order.status === 'exception' ||
+      order.currency !== providerPayment.currency.toUpperCase() ||
+      order.subtotalMinor > providerPayment.amountMinor ||
+      (order.totalMinor !== null && order.totalMinor !== providerPayment.amountMinor)
+    ) permanentReconciliationFailure();
+    throw new LocalCommerceNotReadyError();
+  }
   assertCanonicalPayment(payment, providerPayment, event);
   if (
     !order ||
     payment.orderId !== order.id ||
-    order.status !== 'paid' ||
     order.currency !== payment.currency ||
+    order.status === 'exception' ||
+    (order.totalMinor !== null && order.totalMinor !== payment.amountMinor)
+  ) permanentReconciliationFailure();
+  if (payment.status !== 'succeeded') {
+    if (order.status === 'paid') permanentReconciliationFailure();
+    throw new LocalCommerceNotReadyError();
+  }
+  assertCompletedCanonicalPayment(payment, providerPayment, event);
+  if (
+    order.status !== 'paid' ||
     order.totalMinor !== payment.amountMinor
   ) permanentReconciliationFailure();
   return { payment, order };

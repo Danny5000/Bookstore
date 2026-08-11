@@ -23,7 +23,10 @@ import {
 } from './errors';
 import { lockCheckoutAttempt } from './lock';
 import { lockOrder } from './lock';
-import { lockAndQuoteCart } from './quote';
+import {
+  checkoutProviderStartDeadline,
+  lockAndQuoteCart
+} from './quote';
 import { consumeRateLimit, rateLimitScopeDigest } from './rate-limit';
 import { deriveOrderStatusCredential } from './status-cookie';
 import type {
@@ -70,6 +73,14 @@ function rawCompare(left: string, right: string): number {
 
 function equalStringLists(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function containsAllAcceptedTitles(
+  requestedTitleIds: readonly string[],
+  acceptedTitleIds: readonly string[]
+): boolean {
+  const requested = new Set(requestedTitleIds);
+  return acceptedTitleIds.length > 0 && acceptedTitleIds.every((titleId) => requested.has(titleId));
 }
 
 function equalSha256(left: string, right: string): boolean {
@@ -136,8 +147,27 @@ async function reuseAcceptedOrder(
   if (
     !exactActor(existing, input.actor) ||
     !equalSha256(existing.quoteFingerprintSha256, validated.quoteFingerprint) ||
-    !equalStringLists(items.map((item) => item.titleId), validated.titleIds) ||
-    !['checkout_pending', 'checkout_open', 'payment_pending'].includes(existing.status)
+    !containsAllAcceptedTitles(validated.titleIds, items.map((item) => item.titleId)) ||
+    !['checkout_pending', 'checkout_open'].includes(existing.status)
+  ) throw new CommerceConflictError('CHECKOUT_ATTEMPT_CONFLICT');
+  const now = input.now ?? new Date();
+  if (
+    now.getTime() > checkoutProviderStartDeadline(existing.createdAt).getTime()
+  ) throw new CommerceConflictError('CHECKOUT_ATTEMPT_CONFLICT');
+
+  const currentQuote = await lockAndQuoteCart(
+    database,
+    input.actor,
+    validated.titleIds,
+    validated.checkoutAttemptId,
+    now
+  );
+  const acceptedTitleIds = items.map((item) => item.titleId);
+  const currentAcceptedTitleIds = currentQuote.items.map((item) => item.titleId);
+  if (
+    !equalSha256(currentQuote.fingerprint, existing.quoteFingerprintSha256) ||
+    !currentQuote.canCheckout ||
+    !equalStringLists(acceptedTitleIds, currentAcceptedTitleIds)
   ) throw new CommerceConflictError('CHECKOUT_ATTEMPT_CONFLICT');
 
   if (
@@ -195,7 +225,13 @@ export async function createAcceptedOrder(
         ) } as const;
       }
 
-      const quote = await lockAndQuoteCart(transaction, input.actor, validated.titleIds);
+      const quote = await lockAndQuoteCart(
+        transaction,
+        input.actor,
+        validated.titleIds,
+        validated.checkoutAttemptId,
+        now
+      );
       if (!equalSha256(quote.fingerprint, validated.quoteFingerprint) || !quote.canCheckout) {
         throw new CartChangedError(quote);
       }
@@ -332,6 +368,28 @@ function validProviderId(value: string): boolean {
   return /^[A-Za-z0-9_-]{1,255}$/u.test(value);
 }
 
+async function auditSessionConflict(
+  database: DatabaseExecutor,
+  dependencies: AttachCheckoutSessionDependencies,
+  input: AttachCheckoutSessionInput,
+  order: OrderRow,
+  category: 'provider_session_conflict' | 'provider_session_returned_expired'
+): Promise<void> {
+  await dependencies.appendAuditEvent(database, {
+    actor: input.actor,
+    action: 'commerce.checkout_session_conflict',
+    outcome: 'failed',
+    resourceType: 'order',
+    resourceId: order.id,
+    correlationId: input.correlationId,
+    after: {
+      orderId: order.id,
+      category,
+      hadAttachedSession: order.stripeCheckoutSessionId !== null
+    }
+  });
+}
+
 export async function attachCheckoutSession(
   database: Database,
   input: AttachCheckoutSessionInput,
@@ -356,6 +414,16 @@ export async function attachCheckoutSession(
     const sameSession = order.stripeCheckoutSessionId === input.providerSessionId;
     const sameExpiry = order.checkoutExpiresAt?.getTime() === input.checkoutExpiresAt.getTime();
     if (sameSession && sameExpiry) {
+      if (!['checkout_pending', 'checkout_open'].includes(order.status)) {
+        await auditSessionConflict(
+          transaction,
+          dependencies,
+          input,
+          order,
+          'provider_session_conflict'
+        );
+        return { conflict: true };
+      }
       if (order.status === 'checkout_pending') {
         await transaction.update(orders).set({
           status: 'checkout_open',
@@ -366,6 +434,22 @@ export async function attachCheckoutSession(
     }
 
     if (order.stripeCheckoutSessionId === null && order.status === 'checkout_pending') {
+      if (input.checkoutExpiresAt.getTime() <= now.getTime()) {
+        await transaction.update(orders).set({
+          status: 'checkout_open',
+          stripeCheckoutSessionId: input.providerSessionId,
+          checkoutExpiresAt: input.checkoutExpiresAt,
+          updatedAt: now
+        }).where(eq(orders.id, order.id));
+        await auditSessionConflict(
+          transaction,
+          dependencies,
+          input,
+          order,
+          'provider_session_returned_expired'
+        );
+        return { conflict: true };
+      }
       await transaction.update(orders).set({
         status: 'checkout_open',
         stripeCheckoutSessionId: input.providerSessionId,
@@ -375,23 +459,19 @@ export async function attachCheckoutSession(
       return { conflict: false };
     }
 
-    await transaction.update(orders).set({
-      status: 'exception',
-      updatedAt: now
-    }).where(eq(orders.id, order.id));
-    await dependencies.appendAuditEvent(transaction, {
-      actor: input.actor,
-      action: 'commerce.checkout_session_conflict',
-      outcome: 'failed',
-      resourceType: 'order',
-      resourceId: order.id,
-      correlationId: input.correlationId,
-      after: {
-        orderId: order.id,
-        category: 'provider_session_conflict',
-        hadAttachedSession: order.stripeCheckoutSessionId !== null
-      }
-    });
+    if (['checkout_pending', 'checkout_open', 'payment_pending'].includes(order.status)) {
+      await transaction.update(orders).set({
+        status: 'exception',
+        updatedAt: now
+      }).where(eq(orders.id, order.id));
+    }
+    await auditSessionConflict(
+      transaction,
+      dependencies,
+      input,
+      order,
+      'provider_session_conflict'
+    );
     return { conflict: true };
   });
   if (result.conflict) throw new PermanentCommerceError();
@@ -485,7 +565,7 @@ export async function orchestrateCheckout(
     checkoutExpiresAt: created.expiresAt,
     actor: input.actor,
     correlationId: input.correlationId,
-    ...(input.now === undefined ? {} : { now: input.now })
+    now: dependencies.currentTime()
   });
   return {
     orderId: accepted.order.id,

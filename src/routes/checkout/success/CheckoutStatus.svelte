@@ -48,14 +48,19 @@
       <h1 class="display">Purchase complete</h1>
       <p>Check your email for a secure claim link. You can claim the purchase after signing in or creating an account.</p>
     </div>
+  {:else if status.status === 'failed'}
+    <div class="panel failure" role="alert">
+      <h1 class="display">Payment confirmation is still resolving</h1>
+      <p>
+        Do not start another checkout for these titles. Refresh this status later, or contact support
+        if it does not update.
+      </p>
+      <button class="btn" type="button" onclick={refresh}>Refresh status</button>
+    </div>
   {:else}
     <div class="panel failure" role="alert">
       <h1 class="display">
-        {status.status === 'expired'
-          ? 'Checkout expired'
-          : status.status === 'failed'
-            ? 'Payment was not completed'
-            : 'Purchase confirmation needs review'}
+        {status.status === 'expired' ? 'Checkout expired' : 'Purchase confirmation needs review'}
       </h1>
       <p>
         {status.status === 'exception'

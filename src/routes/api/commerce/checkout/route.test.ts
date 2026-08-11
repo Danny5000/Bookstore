@@ -72,6 +72,8 @@ const quote: CommerceQuoteDto = {
   subtotalMinor: 1500,
   items: [],
   alreadyOwnedTitleIds: [],
+  claimableTitleIds: [],
+  reservedTitleIds: [],
   unavailableTitleIds: [titleId],
   taxNotice: 'calculated_at_checkout',
   canCheckout: false

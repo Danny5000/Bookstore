@@ -143,7 +143,23 @@ export function createPostgresJobRepository(
       return result.rows[0] ?? null;
     },
 
-    async complete(jobId, workerId): Promise<void> {
+    async renewLease(jobId, workerId): Promise<boolean> {
+      const renewedAt = now();
+      const [renewed] = await database
+        .update(jobs)
+        .set({ lockedAt: renewedAt, updatedAt: renewedAt })
+        .where(
+          and(
+            eq(jobs.id, jobId),
+            eq(jobs.status, 'running'),
+            eq(jobs.lockedBy, workerId)
+          )
+        )
+        .returning({ id: jobs.id });
+      return renewed !== undefined;
+    },
+
+    async complete(jobId, workerId): Promise<boolean> {
       const completedAt = now();
       const [completed] = await database
         .update(jobs)
@@ -163,11 +179,11 @@ export function createPostgresJobRepository(
           )
         )
         .returning({ id: jobs.id });
-      if (!completed) throw new Error('Job lease was lost before completion');
+      return completed !== undefined;
     },
 
-    async fail(jobId, workerId, safeError, retryable): Promise<void> {
-      await withTransaction(database, async (transaction) => {
+    async fail(jobId, workerId, safeError, retryable): Promise<boolean> {
+      return withTransaction(database, async (transaction) => {
         const [job] = await transaction
           .select()
           .from(jobs)
@@ -180,7 +196,7 @@ export function createPostgresJobRepository(
           )
           .for('update')
           .limit(1);
-        if (!job) throw new Error('Job lease was lost before failure handling');
+        if (!job) return false;
 
         const failedAt = now();
         const exhausted = !retryable || job.attempts >= job.maxAttempts;
@@ -202,6 +218,7 @@ export function createPostgresJobRepository(
             updatedAt: failedAt
           })
           .where(eq(jobs.id, job.id));
+        return true;
       });
     }
   };

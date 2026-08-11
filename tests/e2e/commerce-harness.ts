@@ -138,6 +138,8 @@ export function createCommerceHarness(database: E2EDatabase, applicationOrigin: 
     ) throw new Error('E2E payment is not canonically paid');
     return {
       paymentIntentId: payment.stripePaymentIntentId,
+      metadataVersion: '1',
+      metadataOrderId: payment.orderId,
       latestChargeId: payment.stripeLatestChargeId,
       liveMode: false,
       state: 'succeeded',
@@ -232,6 +234,8 @@ export function createCommerceHarness(database: E2EDatabase, applicationOrigin: 
     if (!isExpired) {
       fixture.harness.setPayment({
         paymentIntentId,
+        metadataVersion: '1',
+        metadataOrderId: order.id,
         latestChargeId: chargeId,
         liveMode: false,
         state: paymentState,

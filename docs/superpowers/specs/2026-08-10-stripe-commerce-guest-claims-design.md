@@ -106,7 +106,7 @@ The storefront adds:
 - An accessible cart count in the shared header.
 - Add, remove, and view-cart controls on catalog and title pages.
 - A dedicated `/cart` page with current covers, title metadata, price, currency, ownership, and availability.
-- Clear empty, changed, unavailable, mixed-currency, already-owned, pending, and retry states.
+- Clear empty, changed, unavailable, mixed-currency, already-owned, ready-to-claim, reserved, pending, and retry states.
 
 The cart permits at most 25 distinct titles and fixes quantity at one. This application limit is intentionally smaller than Stripe Checkout's provider maximum.
 
@@ -120,15 +120,23 @@ A purchasable title must:
 - Have a current active revision and published presentation.
 - Have a positive price.
 - Use the same currency as every other cart item.
-- Not already have an active entitlement for the signed-in user.
+- Not already have an active entitlement, paid same-email guest purchase ready to claim, suspended purchase grant, or unresolved purchase hold for the signed-in user.
 
-The server reports unavailable and already-owned entries without disclosing private-title data. A cart containing only rejected entries cannot begin Checkout.
+The server reports disjoint `alreadyOwnedTitleIds`, `claimableTitleIds`, `reservedTitleIds`, and unavailable entries without disclosing private-title data. Ownership has precedence over claimable, which has precedence over reserved, so every requested ID appears in exactly one quote partition. A cart containing only rejected entries cannot begin Checkout. Ready-to-claim items link to `/claim` without putting an email in the URL.
 
 ### 5.3 Changed quotes
 
 Checkout submission includes the most recently displayed quote fingerprint. The server reloads and locks the relevant title and entitlement rows. If title membership, availability, ownership, price, or currency differs, it returns `CART_CHANGED` with a new safe quote and creates neither an order nor a Stripe Session. The customer must explicitly confirm the revised cart.
 
 This rule prevents silent price increases, purchases of newly unavailable material, and duplicate account purchases.
+
+### 5.4 Signed-account duplicate-purchase holds
+
+For a signed-in user/title, an unresolved order in `checkout_pending`, `checkout_open`, `payment_pending`, `failed`, or `exception` is a purchase hold. The same rule covers a matching paid but unclaimed guest purchase and direct-user or same-email guest purchase grants suspended by an open dispute. These holds prevent a second one-time charge; they are not finite-inventory reservations. Anonymous cross-device deduplication remains out of scope before fulfillment establishes a canonical paid email.
+
+Only a signature-verified, canonically reduced Checkout Session `expired` state releases a hold. Wall-clock age cannot prove that an earlier Session was not created or paid while its webhook was delayed, so `checkout_pending` never releases solely because a local deadline passed. Paid ownership supersedes the hold. An ambiguous hold requires provider-verified operational recovery in Plan 7, never a manual database state edit.
+
+The current attempt is excluded from its own quote only while a pending/open order remains safely resumable within the shared 30-second provider-call window. At the boundary or afterward, the old attempt conflicts and the quote reports the title reserved. A changed or partially rejected cart cannot mutate the immutable accepted item set; it must rotate to a fresh attempt after the old hold is resolved.
 
 ## 6. Commerce data model
 
@@ -265,7 +273,7 @@ Plan 6A does not maintain reusable Stripe Customer records. Stripe may represent
 
 On successful Session creation, the app stores the unique Session ID, expiration, and `checkout_open` state. The URL remains only in the immediate server response used for browser navigation and is never persisted. The browser receives a redirect, not secret provider data.
 
-If the network response is lost, the same local checkout attempt retries the same order, deterministic expiration, and Stripe idempotency key. A 30-second outbound-call safety margin prevents a first provider request after Stripe's minimum-expiration boundary; an attempt that has become too old is explicitly rotated by the cart before retry. If Stripe created the Session but the local update failed, metadata and the later verified webhook can still attach the Session to the existing order. A conflicting Session ID places the order in `exception`.
+If the network response is lost, the same local checkout attempt retries the same order, deterministic expiration, and Stripe idempotency key only inside the shared 30-second outbound-call safety window. Once that window closes, orchestration conflicts instead of calling Stripe again, while the title remains reserved until signed canonical terminal evidence arrives. If Stripe created the Session but the local update failed, metadata and the later verified webhook can still attach the Session to the existing order. A delayed exact attachment is accepted only while the order is `checkout_pending` or `checkout_open`; payment-pending, paid, failed, expired, and exception states conflict rather than returning a stale hosted URL. An already-expired provider response is retained as a fulfillable reserved association but never returned as a usable redirect. A conflicting Session ID places the order in `exception`.
 
 An unchanged open order may return its existing unexpired Checkout URL. A changed cart creates a new order after explicit quote confirmation. Abandoned or canceled browser navigation does not grant access.
 
@@ -286,12 +294,13 @@ The success URL identifies the order but does not include a claim token, email, 
 
 The status endpoint returns a minimal view:
 
-- `pending`: payment or webhook processing has not completed.
+- `pending`: payment or webhook processing has not completed, including a signed asynchronous failure that can still be superseded by later canonical success.
 - `paid`: account customer may open the library.
 - `paid_guest`: purchase succeeded and the customer should check email to claim it.
-- `failed`, `expired`, or `exception`: safe next-step guidance without provider details.
+- `expired`: the signed terminal state that releases the purchase hold and permits a fresh attempt.
+- `exception`: safe support guidance without provider details; the purchase hold remains.
 
-The success page polls with a bounded interval and stops on a terminal state, navigation, or timeout. It cannot retrieve Stripe state or invoke fulfillment. Losing a guest status cookie reveals no email and does not prevent receipt or claim through email.
+The success page polls with a bounded interval and stops on a true terminal state, navigation, or timeout. A locally normalized asynchronous `failed` state is deliberately nonterminal: the browser continues polling, preserves the checkout attempt and cart, and warns against another checkout because a later canonical success remains valid. It cannot retrieve Stripe state or invoke fulfillment. Losing a guest status cookie reveals no email and does not prevent receipt or claim through email.
 
 Canceling returns to the intact cart. The cart removes paid title IDs only after the browser observes canonical paid status or later sees those titles as actively owned.
 
@@ -303,14 +312,20 @@ Canceling returns to the intact cart. The cart removes paid title IDs only after
 
 The receiver also requires event live/test mode to match explicit application configuration. This prevents a valid test event from mutating a live deployment or a live event from mutating a test deployment.
 
-Valid unsupported events return `200` without durable application work. Supported event families are:
+The Stripe Dashboard endpoint uses API version `2026-07-29.dahlia`. Valid unsupported events return `200` without durable application work. The exact Plan 6A allowlist is:
 
 - `checkout.session.completed`
 - `checkout.session.async_payment_succeeded`
 - `checkout.session.async_payment_failed`
 - `checkout.session.expired`
-- Current Refund create/update/failure events
-- Current Dispute create/update/close/funds-change events needed to determine canonical state
+- `refund.created`
+- `refund.updated`
+- `refund.failed`
+- `charge.dispute.created`
+- `charge.dispute.updated`
+- `charge.dispute.closed`
+- `charge.dispute.funds_withdrawn`
+- `charge.dispute.funds_reinstated`
 
 Plan 6B will extend the allowlist for balance-transaction and payout reconciliation.
 
@@ -341,7 +356,7 @@ Missing, conflicting, or over-limit data transitions the order or provider recor
 
 ### 10.2 Delayed payment methods
 
-A completed Session whose canonical payment status is unpaid moves to `payment_pending` and grants nothing. A later asynchronous success event can advance it to paid. An asynchronous failure can move an unpaid order to failed. A succeeded payment never regresses to failed because an older event arrives later.
+A completed Session whose canonical payment status is unpaid moves to `payment_pending` and grants nothing. A later asynchronous success event can advance it to paid. An asynchronous failure can move an unpaid order to failed, but failed remains reserved because a later canonical success is supported. A later signed Session-expired reduction may move failed to the sole releasing `expired` state. Once expired, every later paid/pending/failed/exception mutation is rejected; a succeeded payment never regresses because an older event arrives later.
 
 ### 10.3 Atomic paid transition
 
@@ -363,28 +378,30 @@ If any write fails, the whole transition rolls back and the job retries. Concurr
 
 ### 11.1 Combined purchase and claim message
 
-After guest fulfillment, a deduplicated commerce email job asks Better Auth to issue a one-use magic link with:
+After guest fulfillment, a deduplicated commerce email job first checks whether the normalized paid email belongs to an account with a password credential. With no credential, it asks Better Auth to issue a one-use magic link with:
 
 - The normalized paid-order email.
 - A same-origin claim completion callback.
 - Strict commerce metadata identifying the safe versioned email template and order summary source.
 
-The installed Better Auth plugin passes metadata to its mail callback. The callback uses a commerce receipt-and-claim template instead of the generic sign-in template and enqueues it with a stable outbox deduplication key. The message contains safe order snapshots and a **Claim your purchases** action.
+The installed Better Auth plugin passes metadata to its mail callback. The callback uses a commerce receipt-and-claim template instead of the generic sign-in template and enqueues it with a stable outbox deduplication key. The message contains safe order snapshots and a **Claim your purchases** action. At link consumption, the server locks and rechecks account state. If a credential appeared after issuance, the link cannot mint commerce authorization; a magic-derived authorization is likewise rejected if a credential exists when claiming.
 
-If a matching unverified password account exists, the flow preserves Plan 3's protection against replacing that pending credential identity with a magic link. It sends the purchase receipt and directs the existing one-use email-verification flow to the claim completion callback. Email verification auto-signs in, after which claiming proceeds normally.
+If any matching password account exists, verified or unverified, the flow sends the safe receipt and an exact-purpose Better Auth password-reset message rather than a claim magic link. The reset token is the email proof. Better Auth changes the password and revokes all sessions before the application consumes the bound commerce-reset marker, marks that exact account verified, and mints a reset-derived one-use claim authorization cookie. The reset page then signs in explicitly with the new password and links to `/claim/complete`; no follow-up verification email is sent. Ordinary verification does not auto-sign in, stale ordinary verification markers are invalidated by commerce recovery, and ordinary verification/reset/magic callbacks cannot mint commerce authorization. In-session change-password is disabled so an in-flight old session cannot overwrite recovery; late old-password sign-in is revalidated against the current credential hash. A mismatch or guard fault scrubs the valid cookie before fallible exact-session cleanup, clears the pending Better Auth session, and returns only the ordinary generic invalid-credentials response. Magic generation checks use the same cleanup invariant and additionally clear redirect state.
+
+Project-owned `credential_authority` is the durable credential-generation boundary and lives outside generated Better Auth schema. Migration backfills every exact legacy credential hash and fails on duplicate/null legacy credentials; tests execute the real migration SQL and prove invalid legacy shapes roll back. First-admin bootstrap establishes authority atomically, while ordinary registration's separate post-create transaction must finish before signup returns and leaves any partial credential sign-in fail-closed/reset-recoverable. Password and credential-bound magic sessions require the live account hash to equal the authorized hash. Every magic action has a hashed one-use marker bound to that generation, so post-reset and in-flight stale links delete their newly created session and expire its cookie. If Better Auth strips an intervening unverified credential after mailbox proof, the link may remove orphan authority and proceed passwordless only with no reset epoch or an exact live unapplied epoch marker; an applied/missing/expired/malformed/ambiguous reset marker rejects because the applied reset is newer mailbox-proven authority. Any surviving authority routes a new claim request to password recovery. A verified intervening credential also remains and rejects. Every successful magic action invalidates pending reset tokens and clears its reset epoch/passwordless authority under the user lock. Reset issuance promotes only its exact live Better Auth token, rotates a per-user epoch while leaving the current authorized password usable, and invalidates sibling native tokens. Each reset marker records a digest of the exact hash it applied; completion must match it, and stale rollback restores prior authority only by compare-and-swap. Missing/mismatched state fails closed and is recovered only by a fresh mailbox reset, never by blessing the live hash.
 
 Expired links can be re-requested from a generic claim page. Responses never reveal whether an email has an account, guest identity, paid order, or unclaimed purchase.
 
 ### 11.2 Claim transaction
 
-The claim completion route requires a current Better Auth session with a verified normalized email. It then locks:
+The claim completion route requires a current Better Auth session with a verified normalized email and the narrowly scoped HttpOnly commerce-authorization cookie. It then locks:
 
 - The matching guest identity.
 - All paid purchase grants for that identity/email.
 - Their order items.
 - Every affected user/title entitlement projection scope.
 
-The transaction sets the guest identity's claimant once, associates all eligible grants with the authenticated user, derives each grant's active/suspended/revoked state from current payment, refund, and dispute data, reprojects entitlements, and appends one audit event with aggregate counts rather than order contents.
+The transaction rechecks whether the account has a credential, requires reset-derived authority when it does, and consumes the email-bound authorization in the same transaction as the claim. It sets the guest identity's claimant once, associates all eligible grants with the authenticated user, derives each grant's active/suspended/revoked state from current payment, refund, and dispute data, reprojects entitlements, and appends one audit event with aggregate counts rather than order contents. A rollback preserves the one-use authorization for a safe retry; a committed authorization cannot be replayed.
 
 Repeated claims by the same user are idempotent. A guest identity already claimed by a different user is an exception and reveals no purchase detail. Because application users have unique normalized emails, ordinary legitimate claims converge on one user.
 
@@ -490,7 +507,8 @@ The application pins and documents the Stripe SDK API version used to create and
 - Cart controls are native buttons or links with explicit accessible names and visible focus.
 - Cart count changes are announced without stealing focus.
 - Quote changes, checkout errors, and pending status use `role=status` or `role=alert` according to urgency.
-- Currency is formatted with `Intl.NumberFormat`; server logic never parses formatted money.
+- Currency is accepted only from Stripe's official presentment list pinned on 2026-08-10 and runtime `Intl` support, then formatted with `Intl.NumberFormat`; server logic never parses formatted money. ISK and UGX remain excluded because their Stripe charge-unit semantics differ from the ISO exponent.
+- Positive catalog prices and Checkout subtotals are capped at `49,999,999` minor units. Provider snapshots are capped at `99,999,999`, retaining automatic-tax headroom.
 - The cart and success page work with keyboard navigation and responsive layouts consistent with the existing storefront.
 - Loading and polling states do not trap the user or cause repeated navigation.
 - Delayed payment messaging makes clear that access begins only after payment confirmation.
@@ -527,7 +545,7 @@ Real PostgreSQL integration tests cover:
 - Atomic payment, grants, entitlements, outbox, and audit rollback.
 - Concurrent payment, claim, refund, and dispute projection.
 - Guest identity creation from canonical email and claim idempotency.
-- Unverified credential-account claim fallback.
+- Passwordless magic and verified/unverified credential-recovery matrices, including stale/in-flight magic, sibling/in-flight reset, session-revocation, and one-use claim races.
 - Refund and dispute access emails only on effective changes.
 - Unauthorized and expired order-status access.
 
@@ -541,7 +559,7 @@ Playwright covers:
 - Mixed-currency and already-owned handling.
 - Price or availability changes requiring explicit re-confirmation.
 - Signed-in paid fulfillment reaching the library.
-- Guest paid fulfillment, Mailpit claim, account creation/sign-in, and library access.
+- Representative guest paid fulfillment, Mailpit recovery/claim, explicit post-reset sign-in, and library access; deterministic integration tests own the full identity/race matrix.
 - Delayed payment pending and later success.
 - Refund revocation with another valid grant preserving access.
 - Dispute suspension and won-dispute restoration.
@@ -573,7 +591,7 @@ Plan 6A adds a commerce and guest-claim runbook documenting:
 - Matching Stripe API/webhook versions.
 - Dashboard-managed payment methods and delayed-payment behavior.
 - Stripe Tax activation prerequisites, tax behavior, and format tax-code settings.
-- Mailpit receipt, verification fallback, and claim testing.
+- Mailpit receipt, passwordless magic, password-account recovery/session revocation, and one-use authorized claim testing.
 - Order, job, event, payment, refund, dispute, grant, and audit diagnosis.
 - Safe retry rules and exception escalation.
 - Stripe Dashboard refund and dispute handling.
@@ -593,7 +611,8 @@ Plan 6A is complete when:
 - Duplicate, delayed, and out-of-order events cannot duplicate or regress fulfillment.
 - A paid account order creates active grants and effective entitlements atomically.
 - A paid guest order creates unclaimed grants and one safe claim path.
-- A verified claim attaches every eligible purchase for that email idempotently.
+- A verified, one-use-authorized claim attaches every eligible purchase for that email idempotently; password accounts rotate credentials and revoke sessions first.
+- A signed-in customer cannot begin a second one-time purchase while an earlier order, claimable guest purchase, or suspended grant can still resolve.
 - Unclaimed guest purchases cannot read or download protected material.
 - Full item refunds revoke only the affected grant; ambiguous partial multi-title refunds remain exceptions.
 - Open disputes suspend affected grants, won disputes restore them, and lost disputes revoke them.

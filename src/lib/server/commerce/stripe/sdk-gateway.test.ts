@@ -124,6 +124,12 @@ describe('Stripe SDK gateway', () => {
         pale_orbit_metadata_version: '1',
         pale_orbit_order_id: input.orderId
       },
+      payment_intent_data: {
+        metadata: {
+          pale_orbit_metadata_version: '1',
+          pale_orbit_order_id: input.orderId
+        }
+      },
       customer_email: 'reader@example.com',
       expires_at: Math.floor(input.expiresAt.getTime() / 1000),
       success_url: input.successUrl,
@@ -189,6 +195,21 @@ describe('Stripe SDK gateway', () => {
     await expect(createStripeSdkGateway(options).createCheckoutSession(checkoutInputFixture({
       expiresAt: new Date('2026-08-10T12:30:00.987Z')
     }))).rejects.toBeInstanceOf(PermanentCommerceError);
+    expect(sdk.client.checkout.sessions.create).not.toHaveBeenCalled();
+  });
+
+  it('rejects a 25-item subtotal overflow before calling Stripe', async () => {
+    const items = Array.from({ length: 25 }, (_, index) => ({
+      orderItemId: `00000000-0000-4000-8000-${(index + 1).toString().padStart(12, '0')}`,
+      title: `Title ${index + 1}`,
+      format: 'prose' as const,
+      unitSubtotalMinor: 2_000_000,
+      taxCode: 'txcd_10000000'
+    }));
+
+    await expect(createStripeSdkGateway(options).createCheckoutSession(
+      checkoutInputFixture({ items })
+    )).rejects.toBeInstanceOf(PermanentCommerceError);
     expect(sdk.client.checkout.sessions.create).not.toHaveBeenCalled();
   });
 
@@ -270,6 +291,10 @@ describe('Stripe SDK gateway', () => {
   it('normalizes payment, refund, and dispute retrieval without sensitive details', async () => {
     sdk.client.paymentIntents.retrieve.mockResolvedValue({
       id: 'pi_test_fixture_101',
+      metadata: {
+        pale_orbit_metadata_version: '1',
+        pale_orbit_order_id: '00000000-0000-4000-8000-000000000101'
+      },
       latest_charge: { id: 'ch_test_fixture_101', created: 1_786_362_060 },
       livemode: false,
       status: 'succeeded',
@@ -303,6 +328,8 @@ describe('Stripe SDK gateway', () => {
     const payment = await gateway.retrievePayment('pi_test_fixture_101');
     expect(payment).toEqual({
       paymentIntentId: 'pi_test_fixture_101',
+      metadataVersion: '1',
+      metadataOrderId: '00000000-0000-4000-8000-000000000101',
       latestChargeId: 'ch_test_fixture_101',
       liveMode: false,
       state: 'succeeded',
@@ -318,6 +345,33 @@ describe('Stripe SDK gateway', () => {
     await expect(gateway.retrieveDispute('dp_test_fixture_101')).resolves.toMatchObject({
       state: 'open', reason: 'fraudulent', chargeId: 'ch_test_fixture_101'
     });
+  });
+
+  it.each([
+    ['missing', {}],
+    ['wrong version', {
+      pale_orbit_metadata_version: '2',
+      pale_orbit_order_id: '00000000-0000-4000-8000-000000000101'
+    }],
+    ['expanded', {
+      pale_orbit_metadata_version: '1',
+      pale_orbit_order_id: '00000000-0000-4000-8000-000000000101',
+      unrelated: 'value'
+    }]
+  ])('rejects %s PaymentIntent order metadata', async (_label, metadata) => {
+    sdk.client.paymentIntents.retrieve.mockResolvedValue({
+      id: 'pi_test_fixture_101',
+      metadata,
+      latest_charge: { id: 'ch_test_fixture_101', created: 1_786_362_060 },
+      livemode: false,
+      status: 'succeeded',
+      amount: 1403,
+      currency: 'usd',
+      payment_method: { id: 'pm_private', type: 'card' }
+    });
+
+    await expect(createStripeSdkGateway(options).retrievePayment('pi_test_fixture_101'))
+      .rejects.toBeInstanceOf(PermanentCommerceError);
   });
 
   it('verifies exact bytes, hashes them, and rejects an unsupported API version', () => {

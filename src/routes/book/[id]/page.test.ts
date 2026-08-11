@@ -22,8 +22,8 @@ describe('public title purchase controls', () => {
             format: 'prose',
             extentCount: 120,
             extentUnit: 'pages',
-            priceMinor: 1299,
-            currency: 'USD',
+            priceMinor: 1234,
+            currency: 'JPY',
             cover: null
           }
         } as never
@@ -32,6 +32,9 @@ describe('public title purchase controls', () => {
 
     expect(body).toMatch(/aria-label="Add The Glass Moon to cart"/u);
     expect(body).toContain('Add to cart');
+    expect(body).toContain('¥1,234');
+    expect(body).not.toContain('¥12.34');
+    expect(body).toContain('Tax calculated at checkout');
     expect(body).not.toMatch(/checkout is not|not connected|purchasing opens/iu);
   });
 });

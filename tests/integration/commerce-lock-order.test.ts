@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { PoolClient } from 'pg';
 import { describe, expect, it } from 'vitest';
+import { createCommerceClaimAuthorization } from '$lib/server/auth/commerce-claim-authorization';
 import { claimGuestPurchases } from '$lib/server/commerce/claims';
 import { fulfillDisputeEvent } from '$lib/server/commerce/disputes';
 import { setPreservedGrantState } from '$lib/server/commerce/grants';
@@ -25,6 +26,7 @@ const eventCreatedAt = new Date('2026-08-10T14:01:00.000Z');
 
 interface LockFixture {
   claimantId: string;
+  claimantEmail: string;
   disputeId: string;
   grantId: string;
   itemId: string;
@@ -143,6 +145,7 @@ async function createLockFixture(
 
   return {
     claimantId,
+    claimantEmail: email,
     disputeId: dispute.id,
     grantId: grant.id,
     itemId,
@@ -266,6 +269,8 @@ function reconcileDispute(fixture: LockFixture, stripeEventId: string): Promise<
     },
     payment: {
       paymentIntentId: fixture.paymentIntentId,
+      metadataVersion: '1' as const,
+      metadataOrderId: fixture.orderId,
       latestChargeId: `ch_lock_${fixture.orderId}`,
       liveMode: false,
       state: 'succeeded',
@@ -309,6 +314,8 @@ function reconcileRefund(fixture: LockFixture, stripeEventId: string): Promise<v
     },
     payment: {
       paymentIntentId: fixture.paymentIntentId,
+      metadataVersion: '1' as const,
+      metadataOrderId: fixture.orderId,
       latestChargeId: `ch_lock_${fixture.orderId}`,
       liveMode: false,
       state: 'succeeded',
@@ -376,9 +383,14 @@ async function expectNoEntitlementDeadlock(
 async function expectNoClaimCreationDeadlock(fixture: LockFixture): Promise<void> {
   const blocker = await beginClaimCreationBlocker(fixture.refundId, fixture.grantId);
   let released = false;
+  const authorizationToken = await createCommerceClaimAuthorization(databaseClient.db, {
+    email: fixture.claimantEmail,
+    kind: 'password-reset'
+  });
   const claim = claimGuestPurchases(databaseClient.db, {
     userId: fixture.claimantId,
-    correlationId: `lock-order-new-preserved-claim-${fixture.orderId}`
+    correlationId: `lock-order-new-preserved-claim-${fixture.orderId}`,
+    authorizationToken
   });
   let preservation: Promise<void> | undefined;
   void claim.catch(() => undefined);
@@ -407,9 +419,14 @@ describe('commerce transaction lock order', () => {
   it('lets a refund holder lock an item while a guest claim waits on the refund', async () => {
     const fixture = await createLockFixture();
     const blocker = await beginBlocker(fixture.refundId);
+    const authorizationToken = await createCommerceClaimAuthorization(databaseClient.db, {
+      email: fixture.claimantEmail,
+      kind: 'password-reset'
+    });
     const claim = claimGuestPurchases(databaseClient.db, {
       userId: fixture.claimantId,
-      correlationId: `lock-order-claim-${fixture.orderId}`
+      correlationId: `lock-order-claim-${fixture.orderId}`,
+      authorizationToken
     });
     void claim.catch(() => undefined);
 
@@ -497,12 +514,17 @@ describe('commerce transaction lock order', () => {
 
   it('serializes guest claims with preserved-grant changes without deadlocking', async () => {
     const fixture = await createLockFixture({ assignedPurchase: true });
+    const authorizationToken = await createCommerceClaimAuthorization(databaseClient.db, {
+      email: fixture.claimantEmail,
+      kind: 'password-reset'
+    });
 
     await expectNoEntitlementDeadlock(
       fixture,
       () => claimGuestPurchases(databaseClient.db, {
         userId: fixture.claimantId,
-        correlationId: `lock-order-preserved-claim-${fixture.orderId}`
+        correlationId: `lock-order-preserved-claim-${fixture.orderId}`,
+        authorizationToken
       })
     );
   }, 15_000);

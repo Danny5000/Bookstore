@@ -1,11 +1,12 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import type { LayoutData } from './$types';
-  import { invalidateAll, replaceState } from '$app/navigation';
+  import { goto, invalidateAll, replaceState } from '$app/navigation';
   import { resolve } from '$app/paths';
   import '../app.css';
   import Header from '$lib/components/Header.svelte';
   import AuthModal from '$lib/components/AuthModal.svelte';
+  import { allowedAuthReturnTo } from '$lib/auth/return-to';
   import { page } from '$app/stores';
 
   interface Props {
@@ -41,7 +42,12 @@
   }
 
   function authenticated(): void {
+    const returnTo = allowedAuthReturnTo($page.url.searchParams.get('returnTo'));
     authOpen = false;
+    if (returnTo) {
+      void goto(resolve(returnTo)).then(() => invalidateAll());
+      return;
+    }
     clearAuthRequest();
     void invalidateAll();
   }

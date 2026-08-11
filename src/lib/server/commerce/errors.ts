@@ -16,6 +16,15 @@ export class RetryableProviderError extends Error {
   }
 }
 
+export class LocalCommerceNotReadyError extends Error {
+  readonly code = 'LOCAL_COMMERCE_NOT_READY' as const;
+
+  constructor(options?: ErrorOptions) {
+    super('Local commerce state is not ready for reconciliation.', options);
+    this.name = 'LocalCommerceNotReadyError';
+  }
+}
+
 export class CommerceRateLimitError extends Error {
   readonly code = 'RATE_LIMITED' as const;
 
@@ -29,6 +38,7 @@ export type CommerceConflictCode =
   | 'GRANT_PERMANENTLY_REVOKED'
   | 'PRESERVED_GRANT_IMMUTABLE'
   | 'CHECKOUT_ATTEMPT_CONFLICT'
+  | 'CLAIM_AUTHORIZATION_REQUIRED'
   | 'IDENTITY_ALREADY_CLAIMED'
   | 'STALE_COMMERCE_STATE';
 
@@ -36,6 +46,7 @@ const CONFLICT_MESSAGES: Readonly<Record<CommerceConflictCode, string>> = {
   GRANT_PERMANENTLY_REVOKED: 'A permanently revoked grant cannot be reactivated.',
   PRESERVED_GRANT_IMMUTABLE: 'Provider state cannot mutate a preserved grant.',
   CHECKOUT_ATTEMPT_CONFLICT: 'The checkout attempt conflicts with existing state.',
+  CLAIM_AUTHORIZATION_REQUIRED: 'The purchase claim requires fresh email authorization.',
   IDENTITY_ALREADY_CLAIMED: 'The guest identity is already claimed.',
   STALE_COMMERCE_STATE: 'The commerce state changed during the operation.'
 };

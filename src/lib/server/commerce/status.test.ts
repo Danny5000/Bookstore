@@ -101,5 +101,13 @@ describe('minimal authorized order status', () => {
       expect(result.status).toBe(status);
       expect(result).toHaveProperty('message');
     }
+    expect(authorizeOrderStatus(row({ status: 'failed' }), {
+      actor: account,
+      statusToken: null,
+      now
+    })).toEqual({
+      status: 'failed',
+      message: 'Payment confirmation is still resolving. Do not start another checkout.'
+    });
   });
 });

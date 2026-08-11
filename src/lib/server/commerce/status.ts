@@ -41,7 +41,7 @@ function statusDto(order: OrderRow): OrderStatusDto {
       : { status: 'paid', libraryUrl: '/library' };
   }
   const messages: Record<'failed' | 'expired' | 'exception', string> = {
-    failed: 'Payment was not completed. Your cart is still available.',
+    failed: 'Payment confirmation is still resolving. Do not start another checkout.',
     expired: 'Checkout expired. Return to your cart to try again.',
     exception: 'This purchase needs review. Contact support if its status does not update.'
   };

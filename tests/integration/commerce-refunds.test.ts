@@ -177,6 +177,8 @@ function snapshots(
     },
     payment: {
       paymentIntentId: fixture.paymentIntentId,
+      metadataVersion: '1' as const,
+      metadataOrderId: fixture.orderId,
       latestChargeId: `ch_test_${fixture.orderId}`,
       liveMode: false,
       state: 'succeeded' as const,
@@ -352,6 +354,52 @@ describe('canonical refund fulfillment', () => {
     expect((await databaseClient.db.select().from(stripeEvents)
       .where(eq(stripeEvents.id, replay.id)))[0]?.status).toBe('processed');
     expect(await databaseClient.db.select().from(outboxMessages)).toHaveLength(1);
+  });
+
+  it.each(['failed', 'canceled'] as const)(
+    'preserves terminal %s refund state against a delayed pending snapshot',
+    async (terminalState) => {
+      const fixture = await createPurchase([1403]);
+      const providerRefundId = `re_test_${randomUUID()}`;
+      const terminal = await createRefundEvent(providerRefundId, 1);
+      await fulfillRefundEvent(
+        databaseClient.db,
+        snapshots(fixture, terminal, 1403, terminalState, 1),
+        dependencies()
+      );
+      const delayed = await createRefundEvent(providerRefundId, 2);
+      await fulfillRefundEvent(
+        databaseClient.db,
+        snapshots(fixture, delayed, 1403, 'pending', 1),
+        dependencies()
+      );
+
+      expect((await databaseClient.db.select().from(refunds))[0]?.status).toBe(terminalState);
+      expect((await databaseClient.db.select().from(stripeEvents)
+        .where(eq(stripeEvents.id, delayed.id)))[0]?.status).toBe('processed');
+    }
+  );
+
+  it('rejects incompatible terminal refund states without overwriting stored evidence', async () => {
+    const fixture = await createPurchase([1403]);
+    const providerRefundId = `re_test_${randomUUID()}`;
+    const failed = await createRefundEvent(providerRefundId, 1);
+    await fulfillRefundEvent(
+      databaseClient.db,
+      snapshots(fixture, failed, 1403, 'failed', 1),
+      dependencies()
+    );
+    const canceled = await createRefundEvent(providerRefundId, 2);
+
+    await expect(fulfillRefundEvent(
+      databaseClient.db,
+      snapshots(fixture, canceled, 1403, 'canceled', 1),
+      dependencies()
+    )).rejects.toBeInstanceOf(PermanentCommerceError);
+
+    expect((await databaseClient.db.select().from(refunds))[0]?.status).toBe('failed');
+    expect((await databaseClient.db.select().from(stripeEvents)
+      .where(eq(stripeEvents.id, canceled.id)))[0]?.status).toBe('pending');
   });
 
   it('serializes concurrent over-refunds without exceeding the item total', async () => {

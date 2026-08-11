@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { expect, test, type BrowserContext, type Locator, type Page } from '@playwright/test';
-import { firstHttpLink, waitForLatestTextEmail } from './mailpit';
+import { firstHttpLink, navigateSensitiveAction, waitForLatestTextEmail } from './mailpit';
 
 const baseURL = 'http://127.0.0.1:4173';
 const customerPassword = 'customer-admin-password-2026';
@@ -49,8 +49,12 @@ async function registerAndVerifyCustomer(context: BrowserContext, email: string)
   const verificationLink = firstHttpLink(
     await waitForLatestTextEmail(email, 10_000, 'verify your email address')
   );
-  await page.goto(verificationLink);
-  await expect(page.locator('header').getByText(email)).toBeVisible();
+  await navigateSensitiveAction(page, verificationLink);
+  await expect(page.locator('header').getByRole('button', { name: 'Sign in' })).toBeVisible();
+  await signIn(page, email, customerPassword);
+  const session = await context.request.get('/api/auth/get-session');
+  expect(session.status()).toBe(200);
+  expect((await session.json()) as object).toMatchObject({ user: { email } });
   return page;
 }
 

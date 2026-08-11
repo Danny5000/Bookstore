@@ -8,7 +8,11 @@ import {
 import { paymentSnapshotFixture } from '../../../../tests/fixtures/stripe/payment';
 import { refundSnapshotFixture } from '../../../../tests/fixtures/stripe/refund';
 import { disputeSnapshotFixture } from '../../../../tests/fixtures/stripe/dispute';
-import { PermanentCommerceError, RetryableProviderError } from './errors';
+import {
+  LocalCommerceNotReadyError,
+  PermanentCommerceError,
+  RetryableProviderError
+} from './errors';
 import { STRIPE_EVENT_JOB } from './job';
 import { createStripeEventHandler } from './handler';
 import { PermanentJobError } from '$lib/server/jobs/runner';
@@ -315,5 +319,60 @@ describe('Stripe event handler provider ordering', () => {
       expect.anything(),
       { stripeEventId: test.row.id, orderId: session.metadataOrderId }
     );
+  });
+
+  it('retries when adjacent Checkout and PaymentIntent reads observe different charges', async () => {
+    const test = harness();
+    const running = test.handler(job(test.row.id), new AbortController().signal);
+    test.load.resolve(test.row);
+    await settle();
+    test.checkout.resolve(checkoutSnapshotFixture({ latestChargeId: 'ch_test_attempt_old' }));
+    await settle();
+    test.payment.resolve(paymentSnapshotFixture({ latestChargeId: 'ch_test_attempt_new' }));
+    test.mutation.resolve();
+
+    await expect(running).rejects.toBeInstanceOf(RetryableProviderError);
+    expect(test.dependencies.fulfillCheckout).not.toHaveBeenCalled();
+    expect(test.dependencies.recordException).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['unpaid', 'succeeded'],
+    ['paid', 'pending'],
+    ['paid', 'failed']
+  ] as const)(
+    'retries when Checkout is %s but the same-charge PaymentIntent is %s',
+    async (paymentStatus, paymentState) => {
+      const latestChargeId = 'ch_test_same_attempt';
+      const test = harness();
+      const running = test.handler(job(test.row.id), new AbortController().signal);
+      test.load.resolve(test.row);
+      await settle();
+      test.checkout.resolve(checkoutSnapshotFixture({ paymentStatus, latestChargeId }));
+      await settle();
+      test.payment.resolve(paymentSnapshotFixture({
+        state: paymentState,
+        latestChargeId,
+        ...(paymentState === 'succeeded' ? {} : { paidAt: null })
+      }));
+      test.mutation.resolve();
+
+      await expect(running).rejects.toBeInstanceOf(RetryableProviderError);
+      expect(test.dependencies.fulfillCheckout).not.toHaveBeenCalled();
+      expect(test.dependencies.recordException).not.toHaveBeenCalled();
+    }
+  );
+
+  it('leaves local-not-ready reconciliation retryable instead of recording an exception', async () => {
+    const row = event({ eventType: 'refund.updated', objectId: 're_test_fixture_101' });
+    const test = harness(row);
+    test.gateway.retrieveRefund.mockResolvedValueOnce(refundSnapshotFixture());
+    test.gateway.retrievePayment.mockResolvedValueOnce(paymentSnapshotFixture());
+    test.dependencies.fulfillRefund.mockRejectedValueOnce(new LocalCommerceNotReadyError());
+    const running = test.handler(job(row.id), new AbortController().signal);
+    test.load.resolve(row);
+
+    await expect(running).rejects.toBeInstanceOf(LocalCommerceNotReadyError);
+    expect(test.dependencies.recordException).not.toHaveBeenCalled();
   });
 });

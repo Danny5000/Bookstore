@@ -45,6 +45,7 @@
   <div class="cart-action">
     <CartToggle {titleId} titleLabel={title} />
   </div>
+  <div class="tax-note">Tax calculated at checkout</div>
 </article>
 
 <style>
@@ -95,5 +96,12 @@
   .cart-action {
     display: flex;
     margin-top: 12px;
+  }
+
+  .tax-note {
+    margin-top: 8px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--muted);
   }
 </style>

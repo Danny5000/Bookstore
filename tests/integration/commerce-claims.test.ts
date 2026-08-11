@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { eq } from 'drizzle-orm';
 import { describe, expect, it, vi } from 'vitest';
 import { findOrCreateGuestIdentity } from '$lib/server/auth/identity';
+import { createCommerceClaimAuthorization } from '$lib/server/auth/commerce-claim-authorization';
 import {
   claimGuestPurchases,
   requestGuestClaimEmails,
@@ -12,6 +13,7 @@ import { COMMERCE_CLAIM_REQUEST_JOB } from '$lib/server/commerce/claim-email';
 import { projectEffectiveEntitlement } from '$lib/server/commerce/grants';
 import {
   auditEvents,
+  account,
   applicationRateLimits,
   disputes,
   entitlementGrants,
@@ -156,8 +158,17 @@ async function createGuestPurchase(input: {
   return { identity, titleId: title.id, orderId, itemId };
 }
 
-function command(userId: string) {
-  return { userId, correlationId: `claim-${randomUUID()}` };
+async function command(userId: string) {
+  const [claimant] = await databaseClient.db
+    .select({ email: user.email })
+    .from(user)
+    .where(eq(user.id, userId));
+  if (!claimant) throw new Error('Expected claim user');
+  const authorizationToken = await createCommerceClaimAuthorization(databaseClient.db, {
+    email: claimant.email,
+    kind: 'password-reset'
+  });
+  return { userId, correlationId: `claim-${randomUUID()}`, authorizationToken };
 }
 
 describe('atomic guest purchase claiming', () => {
@@ -173,7 +184,7 @@ describe('atomic guest purchase claiming', () => {
     const project = vi.fn(projectEffectiveEntitlement);
     const result = await claimGuestPurchases(
       databaseClient.db,
-      { ...command(claimant.id), correlationId: 'multi-claim@example.com' },
+      { ...await command(claimant.id), correlationId: 'multi-claim@example.com' },
       { projectEntitlement: project }
     );
 
@@ -205,7 +216,7 @@ describe('atomic guest purchase claiming', () => {
     expect(audits[0]?.correlationId).toMatch(/^[0-9a-f-]{36}$/u);
     expect(JSON.stringify(audits)).not.toMatch(/multi-claim@|Private claim|pi_test|cs_test/iu);
 
-    const replay = await claimGuestPurchases(databaseClient.db, command(claimant.id));
+    const replay = await claimGuestPurchases(databaseClient.db, await command(claimant.id));
     expect(replay).toEqual({
       claimed: true,
       changed: false,
@@ -225,7 +236,7 @@ describe('atomic guest purchase claiming', () => {
     const lost = await createGuestPurchase({ email, adverse: 'lost-dispute' });
     const permanent = await createGuestPurchase({ email, adverse: 'permanent' });
 
-    await claimGuestPurchases(databaseClient.db, command(claimant.id));
+    await claimGuestPurchases(databaseClient.db, await command(claimant.id));
     const grants = await databaseClient.db.select().from(entitlementGrants);
     const state = (itemId: string) => grants.find((grant) => grant.orderItemId === itemId)?.state;
     expect(state(active.itemId)).toBe('active');
@@ -241,13 +252,13 @@ describe('atomic guest purchase claiming', () => {
   it('denies unverified, different-email, and foreign-claimed identities generically', async () => {
     const purchase = await createGuestPurchase({ email: 'owner@example.com' });
     const unverified = await createUser('owner@example.com', false);
-    await expect(claimGuestPurchases(databaseClient.db, command(unverified.id)))
+    await expect(claimGuestPurchases(databaseClient.db, await command(unverified.id)))
       .rejects.toBeInstanceOf(PermanentCommerceError);
     await databaseClient.db.update(user)
       .set({ email: 'unverified-moved@example.com' })
       .where(eq(user.id, unverified.id));
     const otherEmail = await createUser('other@example.com');
-    await expect(claimGuestPurchases(databaseClient.db, command(otherEmail.id)))
+    await expect(claimGuestPurchases(databaseClient.db, await command(otherEmail.id)))
       .resolves.toEqual({
         claimed: false,
         changed: false,
@@ -256,7 +267,7 @@ describe('atomic guest purchase claiming', () => {
       });
 
     const firstClaimant = await createUser('owner@example.com');
-    await claimGuestPurchases(databaseClient.db, command(firstClaimant.id));
+    await claimGuestPurchases(databaseClient.db, await command(firstClaimant.id));
     const replacement = await createUser('replacement@example.com');
     await databaseClient.db.update(user)
       .set({ email: 'moved@example.com' })
@@ -264,7 +275,7 @@ describe('atomic guest purchase claiming', () => {
     await databaseClient.db.update(user)
       .set({ email: 'owner@example.com' })
       .where(eq(user.id, replacement.id));
-    await expect(claimGuestPurchases(databaseClient.db, command(replacement.id)))
+    await expect(claimGuestPurchases(databaseClient.db, await command(replacement.id)))
       .rejects.toMatchObject({
         code: 'IDENTITY_ALREADY_CLAIMED'
       });
@@ -279,12 +290,83 @@ describe('atomic guest purchase claiming', () => {
     await createGuestPurchase({ email });
     await createGuestPurchase({ email });
     const [first, second] = await Promise.all([
-      claimGuestPurchases(databaseClient.db, command(claimant.id)),
-      claimGuestPurchases(databaseClient.db, command(claimant.id))
+      claimGuestPurchases(databaseClient.db, await command(claimant.id)),
+      claimGuestPurchases(databaseClient.db, await command(claimant.id))
     ]);
     expect([first.changed, second.changed].sort()).toEqual([false, true]);
     expect(await databaseClient.db.select().from(auditEvents)
       .where(eq(auditEvents.action, 'commerce.guest_claimed'))).toHaveLength(1);
+  });
+
+  it('atomically consumes one authorization across concurrent use and exact replay', async () => {
+    const email = 'one-use-claim@example.com';
+    const claimant = await createUser(email);
+    await createGuestPurchase({ email });
+    const authorizationToken = await createCommerceClaimAuthorization(databaseClient.db, {
+      email,
+      kind: 'password-reset'
+    });
+    const input = {
+      userId: claimant.id,
+      correlationId: `claim-${randomUUID()}`,
+      authorizationToken
+    };
+
+    const concurrent = await Promise.allSettled([
+      claimGuestPurchases(databaseClient.db, input),
+      claimGuestPurchases(databaseClient.db, input)
+    ]);
+    expect(concurrent.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(concurrent.filter((result) => result.status === 'rejected')).toEqual([
+      expect.objectContaining({
+        reason: expect.objectContaining({ code: 'CLAIM_AUTHORIZATION_REQUIRED' })
+      })
+    ]);
+    await expect(claimGuestPurchases(databaseClient.db, input)).rejects.toMatchObject({
+      code: 'CLAIM_AUTHORIZATION_REQUIRED'
+    });
+    expect(await databaseClient.db.select().from(auditEvents)
+      .where(eq(auditEvents.action, 'commerce.guest_claimed'))).toHaveLength(1);
+    expect(await databaseClient.db.select().from(entitlements)).toHaveLength(1);
+  });
+
+  it('requires one email-bound authorization and rejects magic authority for a credential account', async () => {
+    const email = 'credential-claim@example.com';
+    const claimant = await createUser(email);
+    await databaseClient.db.insert(account).values({
+      id: randomUUID(),
+      accountId: claimant.id,
+      providerId: 'credential',
+      userId: claimant.id,
+      password: 'test-only-hash'
+    });
+    await createGuestPurchase({ email });
+
+    await expect(claimGuestPurchases(databaseClient.db, {
+      userId: claimant.id,
+      correlationId: `claim-${randomUUID()}`
+    } as never)).rejects.toBeInstanceOf(PermanentCommerceError);
+
+    const magicAuthorization = await createCommerceClaimAuthorization(databaseClient.db, {
+      email,
+      kind: 'commerce-magic'
+    });
+    await expect(claimGuestPurchases(databaseClient.db, {
+      userId: claimant.id,
+      correlationId: `claim-${randomUUID()}`,
+      authorizationToken: magicAuthorization
+    })).rejects.toMatchObject({ code: 'CLAIM_AUTHORIZATION_REQUIRED' });
+    expect(await databaseClient.db.select().from(entitlements)).toHaveLength(0);
+
+    const resetAuthorization = await createCommerceClaimAuthorization(databaseClient.db, {
+      email,
+      kind: 'password-reset'
+    });
+    await expect(claimGuestPurchases(databaseClient.db, {
+      userId: claimant.id,
+      correlationId: `claim-${randomUUID()}`,
+      authorizationToken: resetAuthorization
+    })).resolves.toMatchObject({ claimed: true, changed: true });
   });
 
   it('rolls identity, grants, entitlements, and audit back after a mid-claim failure', async () => {
@@ -292,6 +374,10 @@ describe('atomic guest purchase claiming', () => {
     const claimant = await createUser(email);
     const first = await createGuestPurchase({ email });
     await createGuestPurchase({ email });
+    const authorizationToken = await createCommerceClaimAuthorization(
+      databaseClient.db,
+      { email, kind: 'password-reset' }
+    );
     let projections = 0;
     const dependencies: ClaimGuestPurchasesDependencies = {
       projectEntitlement: async (...args) => {
@@ -304,7 +390,11 @@ describe('atomic guest purchase claiming', () => {
 
     await expect(claimGuestPurchases(
       databaseClient.db,
-      command(claimant.id),
+      {
+        userId: claimant.id,
+        correlationId: `claim-${randomUUID()}`,
+        authorizationToken
+      },
       dependencies
     )).rejects.toThrow('forced claim projection failure');
     expect((await databaseClient.db.select().from(guestIdentities)
@@ -317,6 +407,11 @@ describe('atomic guest purchase claiming', () => {
     );
     expect(await databaseClient.db.select().from(entitlements)).toHaveLength(0);
     expect(await databaseClient.db.select().from(auditEvents)).toHaveLength(0);
+    await expect(claimGuestPurchases(databaseClient.db, {
+      userId: claimant.id,
+      correlationId: `claim-${randomUUID()}`,
+      authorizationToken
+    })).resolves.toMatchObject({ claimed: true });
   });
 });
 
@@ -373,7 +468,7 @@ describe('enumeration-resistant claim requests', () => {
     const email = 'already-claimed@example.com';
     await createGuestPurchase({ email });
     const claimant = await createUser(email);
-    await claimGuestPurchases(databaseClient.db, command(claimant.id));
+    await claimGuestPurchases(databaseClient.db, await command(claimant.id));
     await expect(requestGuestClaimEmails(databaseClient.db, {
       email,
       requestIp: '203.0.113.93',

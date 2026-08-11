@@ -86,6 +86,7 @@ const rawLinePageSchema = z.object({
 });
 const rawPaymentSchema = z.object({
   id: providerIdSchema,
+  metadata: providerMetadataSchema,
   latest_charge: z.union([
     providerIdSchema,
     z.object({ id: providerIdSchema, created: unixSecondsSchema })
@@ -234,6 +235,12 @@ export function createStripeSdkGateway(options: StripeSdkGatewayOptions): Stripe
           pale_orbit_metadata_version: '1',
           pale_orbit_order_id: input.orderId
         },
+        payment_intent_data: {
+          metadata: {
+            pale_orbit_metadata_version: '1',
+            pale_orbit_order_id: input.orderId
+          }
+        },
         ...(input.accountEmail === null ? {} : { customer_email: input.accountEmail }),
         expires_at: Math.floor(input.expiresAt.getTime() / 1000),
         success_url: input.successUrl,
@@ -352,6 +359,10 @@ export function createStripeSdkGateway(options: StripeSdkGatewayOptions): Stripe
       }));
       const payment = parseProvider(rawPaymentSchema, raw);
       assertLiveMode(payment.livemode, options.expectedLiveMode);
+      assertOnlyKeys(payment.metadata, [
+        'pale_orbit_metadata_version',
+        'pale_orbit_order_id'
+      ]);
       const latestChargeId = referencedId(payment.latest_charge);
       const paidAt =
         payment.status === 'succeeded' && payment.latest_charge && typeof payment.latest_charge !== 'string'
@@ -363,6 +374,8 @@ export function createStripeSdkGateway(options: StripeSdkGatewayOptions): Stripe
           : null;
       return parsePaymentSnapshot({
         paymentIntentId: payment.id,
+        metadataVersion: payment.metadata.pale_orbit_metadata_version,
+        metadataOrderId: payment.metadata.pale_orbit_order_id,
         latestChargeId,
         liveMode: payment.livemode,
         state: normalizePaymentState(payment.status),

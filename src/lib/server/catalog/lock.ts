@@ -3,6 +3,7 @@ import { requireCapability, type Actor, type AdministratorActor } from '$lib/ser
 import { listRolesForUser } from '$lib/server/auth/identity';
 import { titles, type TitleRow } from '$lib/server/db/schema';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
+import { canonicalizeUuid } from '$lib/validation/uuid';
 import { CatalogDomainError } from './errors';
 
 export interface LockedAdminTitle {
@@ -17,8 +18,9 @@ export async function withLockedAdminTitle<T>(
   work: (context: LockedAdminTitle) => Promise<T>
 ): Promise<T> {
   requireCapability(actorSnapshot, 'catalog.manage');
+  const canonicalTitleId = canonicalizeUuid(titleId);
   await transaction.execute(
-    sql`select pg_advisory_xact_lock(hashtextextended(${titleId}, 0))`
+    sql`select pg_advisory_xact_lock(hashtextextended(${canonicalTitleId}, 0))`
   );
   const actor: Actor = {
     type: 'user',
@@ -29,7 +31,7 @@ export async function withLockedAdminTitle<T>(
   const [title] = await transaction
     .select()
     .from(titles)
-    .where(eq(titles.id, titleId))
+    .where(eq(titles.id, canonicalTitleId))
     .for('update')
     .limit(1);
   if (!title) throw new CatalogDomainError('title_not_found');

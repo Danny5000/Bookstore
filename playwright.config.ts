@@ -73,10 +73,11 @@ export default defineConfig({
       AUTH_RESET_EXPIRES_SECONDS: process.env.AUTH_RESET_EXPIRES_SECONDS ?? '600',
       AUTH_MAGIC_EXPIRES_SECONDS: process.env.AUTH_MAGIC_EXPIRES_SECONDS ?? '600',
       AUTH_RATE_LIMIT_WINDOW_SECONDS: process.env.AUTH_RATE_LIMIT_WINDOW_SECONDS ?? '60',
-      AUTH_RATE_LIMIT_MAX: process.env.AUTH_RATE_LIMIT_MAX ?? '100',
-      // Parallel browser journeys share the loopback IP. Keep the production default
-      // covered by integration tests without allowing unrelated E2E workers to collide.
-      AUTH_LOGIN_RATE_LIMIT_MAX: '20',
+      // Every E2E context shares the loopback IP, so layout session polling and legitimate
+      // cross-journey sign-ins otherwise consume one suite-wide bucket. Integration tests
+      // retain the production limiter values and prove the endpoint-specific boundaries.
+      AUTH_RATE_LIMIT_MAX: '100000',
+      AUTH_LOGIN_RATE_LIMIT_MAX: '10000',
       AUTH_EMAIL_RATE_LIMIT_MAX: process.env.AUTH_EMAIL_RATE_LIMIT_MAX ?? '3',
       STRIPE_ENABLED: 'false',
       STRIPE_TEST_FIXTURE_MODE: 'true',

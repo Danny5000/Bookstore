@@ -7,6 +7,7 @@ import {
   claimEmailJobPayloadSchema,
   createClaimEmailHandler,
   createClaimEmailOperations,
+  loadClaimEmailEligibility,
   queueCommerceClaimEmail
 } from '$lib/server/commerce/claim-email';
 import {
@@ -16,15 +17,22 @@ import {
   parseCommerceEmailPayload
 } from '$lib/server/commerce/email/payload';
 import { fulfillCheckoutEvent } from '$lib/server/commerce/fulfillment';
+import { applyCurrentPasswordResetCredential } from '$lib/server/auth/commerce-claim-authorization';
 import { createAuthServer } from '$lib/server/auth/options';
-import { canSendMagicLink, ensureCustomerRole } from '$lib/server/auth/identity';
+import {
+  canSendCommerceMagicLink,
+  canSendMagicLink,
+  ensureCustomerRole
+} from '$lib/server/auth/identity';
 import {
   account,
+  credentialAuthority,
   guestIdentities,
   jobs,
   orderItems,
   orders,
   outboxMessages,
+  session,
   stripeEvents,
   titles,
   user,
@@ -121,6 +129,7 @@ function createCommerceAuth() {
     queueCommerceClaimEmail: (input) =>
       queueCommerceClaimEmail(databaseClient.db, messages, input),
     canSendMagicLink: (email) => canSendMagicLink(databaseClient.db, email),
+    canSendCommerceMagicLink: (email) => canSendCommerceMagicLink(databaseClient.db, email),
     onUserCreated: (userId) => ensureCustomerRole(databaseClient.db, userId)
   });
   return { auth, messages };
@@ -293,6 +302,8 @@ describe('commerce email persistence', () => {
       },
       payment: {
         paymentIntentId,
+        metadataVersion: '1',
+        metadataOrderId: orderId,
         latestChargeId: chargeId,
         liveMode: false,
         state: 'succeeded',
@@ -345,11 +356,11 @@ describe('commerce email persistence', () => {
     const token = new URL(payload.claimUrl).searchParams.get('token');
     if (!token) throw new Error('Expected magic token');
     const tokenRowsBeforeReplay = await databaseClient.db.select().from(verification);
-    expect(tokenRowsBeforeReplay).toHaveLength(1);
+    expect(tokenRowsBeforeReplay).toHaveLength(2);
     expect(JSON.stringify(tokenRowsBeforeReplay)).not.toContain(token);
 
     await handler(claimJob(fixture.orderId), new AbortController().signal);
-    expect(await databaseClient.db.select().from(verification)).toHaveLength(1);
+    expect(await databaseClient.db.select().from(verification)).toHaveLength(2);
 
     await createClaimEmailHandler(createClaimEmailOperations(
       databaseClient.db,
@@ -374,16 +385,356 @@ describe('commerce email persistence', () => {
       throw new Error('Expected replacement guest claim payload');
     }
     expect(replacementPayload.claimUrl).not.toBe(payload.claimUrl);
-    expect(await databaseClient.db.select().from(verification)).toHaveLength(2);
+    // Better Auth retains both hashed native tokens; the project guard rotates
+    // to one current marker, so the older link cannot create a session.
+    expect(await databaseClient.db.select().from(verification)).toHaveLength(3);
 
-    const request = () => auth.handler(new Request(payload.claimUrl, {
+    const stale = await auth.handler(new Request(payload.claimUrl, {
+      headers: { origin: applicationConfig.origin },
+      redirect: 'manual'
+    }));
+    expect(stale.status).toBe(401);
+    const staleCookies = stale.headers.get('set-cookie') ?? '';
+    expect(staleCookies)
+      .not.toContain('pale-orbit-commerce-claim=');
+    expect(staleCookies).toMatch(/(?:better-auth|__Secure-better-auth)\.session_token=/u);
+    expect(staleCookies).toMatch(/Max-Age=0/iu);
+    expect(await databaseClient.db.select().from(session)).toHaveLength(0);
+
+    const request = () => auth.handler(new Request(replacementPayload.claimUrl, {
       headers: { origin: applicationConfig.origin },
       redirect: 'manual'
     }));
     const first = await request();
-    expect(first.headers.get('set-cookie')).not.toBeNull();
+    expect(first.status).toBe(302);
+    const firstCookies = first.headers.get('set-cookie') ?? '';
+    expect(firstCookies).toMatch(/(?:better-auth|__Secure-better-auth)\.session_token=/u);
+    expect(firstCookies).toContain('pale-orbit-commerce-claim=');
+    expect(firstCookies).toMatch(/HttpOnly/iu);
+    expect(firstCookies).toMatch(/SameSite=Lax/iu);
+    expect(firstCookies).toContain('Path=/claim/complete');
+    expect(await databaseClient.db.select().from(session)).toHaveLength(1);
+    expect((await databaseClient.db.select().from(verification)).filter((row) =>
+      row.identifier.startsWith('pale-orbit:commerce-claim-authorization:')
+    )).toHaveLength(1);
     const reused = await request();
     expect(reused.headers.get('set-cookie')).toBeNull();
+    expect(await databaseClient.db.select().from(session)).toHaveLength(1);
+  });
+
+  it('cannot turn a pre-issued commerce magic link into claim authority after a credential appears', async () => {
+    const email = 'magic-credential-race@example.com';
+    const fixture = await createPaidOrder('guest', email);
+    const { auth, messages } = createCommerceAuth();
+    await createClaimEmailHandler(createClaimEmailOperations(
+      databaseClient.db,
+      auth,
+      messages,
+      applicationConfig.origin
+    ))(claimJob(fixture.orderId), new AbortController().signal);
+    const payload = parseCommerceEmailPayload(
+      (await databaseClient.db.select().from(outboxMessages)
+        .where(eq(outboxMessages.topic, 'email.commerce.v1')))[0]?.payload,
+      applicationConfig.origin
+    );
+    if (payload.template !== 'commerce.guest-receipt-claim') {
+      throw new Error('Expected guest claim payload');
+    }
+
+    const credentialUserId = randomUUID();
+    await databaseClient.db.insert(user).values({
+      id: credentialUserId,
+      name: 'Verified credential claimant',
+      email,
+      emailVerified: true
+    });
+    await databaseClient.db.insert(account).values({
+      id: randomUUID(),
+      accountId: email,
+      providerId: 'credential',
+      userId: credentialUserId,
+      password: 'test-only-credential-hash'
+    });
+    await databaseClient.db.insert(credentialAuthority).values({
+      userId: credentialUserId,
+      authorizedPasswordHash: 'test-only-credential-hash'
+    });
+
+    const verified = await auth.handler(new Request(payload.claimUrl, {
+      headers: { origin: applicationConfig.origin },
+      redirect: 'manual'
+    }));
+    expect(verified.status).toBe(401);
+    expect(await verified.clone().json()).toEqual({
+      code: 'INVALID_TOKEN',
+      message: 'Invalid or expired authentication link'
+    });
+    const rejectedCookies = verified.headers.get('set-cookie') ?? '';
+    expect(rejectedCookies)
+      .not.toContain('pale-orbit-commerce-claim=');
+    expect(rejectedCookies).toMatch(/(?:better-auth|__Secure-better-auth)\.session_token=/u);
+    expect(rejectedCookies).toMatch(/Max-Age=0/iu);
+    expect(await databaseClient.db.select().from(session)).toHaveLength(0);
+    expect((await databaseClient.db.select().from(verification)).filter((row) =>
+      row.identifier.startsWith('pale-orbit:commerce-claim-authorization:')
+    )).toHaveLength(0);
+  });
+
+  it('accepts commerce magic after stripping an intervening unverified credential', async () => {
+    const email = 'magic-unverified-credential-race@example.com';
+    const fixture = await createPaidOrder('guest', email);
+    const { auth, messages } = createCommerceAuth();
+    await createClaimEmailHandler(createClaimEmailOperations(
+      databaseClient.db,
+      auth,
+      messages,
+      applicationConfig.origin
+    ))(claimJob(fixture.orderId), new AbortController().signal);
+    const payload = parseCommerceEmailPayload(
+      (await databaseClient.db.select().from(outboxMessages)
+        .where(eq(outboxMessages.topic, 'email.commerce.v1')))[0]?.payload,
+      applicationConfig.origin
+    );
+    if (payload.template !== 'commerce.guest-receipt-claim') {
+      throw new Error('Expected guest claim payload');
+    }
+
+    const credentialUserId = randomUUID();
+    await databaseClient.db.insert(user).values({
+      id: credentialUserId,
+      name: 'Unverified credential claimant',
+      email,
+      emailVerified: false
+    });
+    await databaseClient.db.insert(account).values({
+      id: randomUUID(),
+      accountId: email,
+      providerId: 'credential',
+      userId: credentialUserId,
+      password: 'test-only-unverified-credential-hash'
+    });
+    await databaseClient.db.insert(credentialAuthority).values({
+      userId: credentialUserId,
+      authorizedPasswordHash: 'test-only-unverified-credential-hash'
+    });
+    const attackerSessionToken = 'attacker-session-before-mailbox-proof';
+    await databaseClient.db.insert(session).values({
+      token: attackerSessionToken,
+      userId: credentialUserId,
+      expiresAt: new Date('2026-08-11T12:00:00.000Z'),
+      updatedAt: new Date('2026-08-10T12:00:00.000Z')
+    });
+
+    const verified = await auth.handler(new Request(payload.claimUrl, {
+      headers: { origin: applicationConfig.origin },
+      redirect: 'manual'
+    }));
+    expect(verified.status).toBe(302);
+    const cookies = verified.headers.get('set-cookie') ?? '';
+    expect(cookies).toMatch(/(?:better-auth|__Secure-better-auth)\.session_token=/u);
+    expect(cookies).toContain('pale-orbit-commerce-claim=');
+    expect(await databaseClient.db.select().from(account)
+      .where(eq(account.userId, credentialUserId))).toHaveLength(0);
+    expect(await databaseClient.db.select().from(credentialAuthority)
+      .where(eq(credentialAuthority.userId, credentialUserId))).toHaveLength(0);
+    expect(await databaseClient.db.select().from(session)
+      .where(eq(session.token, attackerSessionToken))).toHaveLength(0);
+    const survivingSessions = await databaseClient.db.select({ token: session.token })
+      .from(session)
+      .where(eq(session.userId, credentialUserId));
+    expect(survivingSessions).toHaveLength(1);
+    expect(survivingSessions[0]?.token).not.toBe(attackerSessionToken);
+    expect((await databaseClient.db.select().from(verification)).filter((row) =>
+      row.identifier.startsWith('pale-orbit:commerce-claim-authorization:')
+    )).toHaveLength(1);
+
+    const ordinaryRequest = await auth.handler(new Request(
+      `${applicationConfig.origin}/api/auth/sign-in/magic-link`,
+      {
+        method: 'POST',
+        headers: {
+          origin: applicationConfig.origin,
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({ email, callbackURL: '/' })
+      }
+    ));
+    expect(ordinaryRequest.status).toBe(200);
+    const ordinaryPayload = authEmailPayloadSchema.parse(
+      (await databaseClient.db.select().from(outboxMessages)
+        .where(eq(outboxMessages.topic, 'email.auth.v1'))).at(-1)?.payload
+    );
+    expect(ordinaryPayload.template).toBe('auth.magic-link');
+    expect((await auth.handler(new Request(ordinaryPayload.actionUrl, {
+      headers: { origin: applicationConfig.origin },
+      redirect: 'manual'
+    }))).status).toBe(302);
+  });
+
+  it('rejects older commerce magic after a newer reset generation has applied', async () => {
+    const email = 'magic-applied-reset-race@example.com';
+    const fixture = await createPaidOrder('guest', email);
+    const { auth, messages } = createCommerceAuth();
+    await createClaimEmailHandler(createClaimEmailOperations(
+      databaseClient.db,
+      auth,
+      messages,
+      applicationConfig.origin
+    ))(claimJob(fixture.orderId), new AbortController().signal);
+    const payload = parseCommerceEmailPayload(
+      (await databaseClient.db.select().from(outboxMessages)
+        .where(eq(outboxMessages.topic, 'email.commerce.v1')))[0]?.payload,
+      applicationConfig.origin
+    );
+    if (payload.template !== 'commerce.guest-receipt-claim') {
+      throw new Error('Expected guest claim payload');
+    }
+
+    const credentialUserId = randomUUID();
+    await databaseClient.db.insert(user).values({
+      id: credentialUserId,
+      name: 'Applied reset claimant',
+      email,
+      emailVerified: false
+    });
+    await databaseClient.db.insert(account).values({
+      id: randomUUID(),
+      accountId: email,
+      providerId: 'credential',
+      userId: credentialUserId,
+      password: 'authorized-before-applied-reset'
+    });
+    await databaseClient.db.insert(credentialAuthority).values({
+      userId: credentialUserId,
+      authorizedPasswordHash: 'authorized-before-applied-reset'
+    });
+    expect((await auth.handler(new Request(
+      `${applicationConfig.origin}/api/auth/request-password-reset`,
+      {
+        method: 'POST',
+        headers: {
+          origin: applicationConfig.origin,
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({ email, redirectTo: '/reset-password' })
+      }
+    ))).status).toBe(200);
+    const resetPayload = authEmailPayloadSchema.parse(
+      (await databaseClient.db.select().from(outboxMessages)
+        .where(eq(outboxMessages.topic, 'email.auth.v1'))).at(-1)?.payload
+    );
+    expect(resetPayload.template).toBe('auth.password-reset');
+    const resetToken = new URL(resetPayload.actionUrl).pathname.split('/').at(-1);
+    if (!resetToken) throw new Error('Expected applied reset token');
+    expect(await applyCurrentPasswordResetCredential(databaseClient.db, {
+      token: resetToken,
+      passwordHash: 'newer-mailbox-proven-applied-hash'
+    })).toBe(true);
+    // Better Auth can already have decided to revoke an unproven credential
+    // before the reset applies; deleting here models that deterministic
+    // cleanup/completion interleaving without timing-dependent barriers.
+    await databaseClient.db.delete(account).where(eq(account.userId, credentialUserId));
+
+    const rejected = await auth.handler(new Request(payload.claimUrl, {
+      headers: { origin: applicationConfig.origin },
+      redirect: 'manual'
+    }));
+    expect(rejected.status).toBe(401);
+    expect(await rejected.clone().json()).toEqual({
+      code: 'INVALID_TOKEN',
+      message: 'Invalid or expired authentication link'
+    });
+    const cookies = rejected.headers.get('set-cookie') ?? '';
+    expect(cookies).not.toContain('pale-orbit-commerce-claim=');
+    expect(cookies).toMatch(/(?:better-auth|__Secure-better-auth)\.session_token=/u);
+    expect(cookies).toMatch(/Max-Age=0/iu);
+    expect(await databaseClient.db.select().from(session)).toHaveLength(0);
+    expect((await databaseClient.db.select().from(verification)).filter((row) =>
+      row.identifier.startsWith('pale-orbit:commerce-claim-authorization:')
+    )).toHaveLength(0);
+    expect(await loadClaimEmailEligibility(databaseClient.db, fixture.orderId)).toMatchObject({
+      accountState: 'password-recovery',
+      email
+    });
+  });
+
+  it('invalidates a pending reset when passwordless commerce magic proves ownership', async () => {
+    const email = 'passwordless-magic-reset-race@example.com';
+    const fixture = await createPaidOrder('guest', email);
+    const passwordlessUserId = randomUUID();
+    await databaseClient.db.insert(user).values({
+      id: passwordlessUserId,
+      name: 'Passwordless claimant',
+      email,
+      emailVerified: true
+    });
+    const { auth, messages } = createCommerceAuth();
+    await createClaimEmailHandler(createClaimEmailOperations(
+      databaseClient.db,
+      auth,
+      messages,
+      applicationConfig.origin
+    ))(claimJob(fixture.orderId), new AbortController().signal);
+    const payload = parseCommerceEmailPayload(
+      (await databaseClient.db.select().from(outboxMessages)
+        .where(eq(outboxMessages.topic, 'email.commerce.v1')))[0]?.payload,
+      applicationConfig.origin
+    );
+    if (payload.template !== 'commerce.guest-receipt-claim') {
+      throw new Error('Expected guest claim payload');
+    }
+
+    const resetRequested = await auth.handler(new Request(
+      `${applicationConfig.origin}/api/auth/request-password-reset`,
+      {
+        method: 'POST',
+        headers: {
+          origin: applicationConfig.origin,
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({ email, redirectTo: '/reset-password' })
+      }
+    ));
+    expect(resetRequested.status).toBe(200);
+    const resetPayload = authEmailPayloadSchema.parse(
+      (await databaseClient.db.select().from(outboxMessages)
+        .where(eq(outboxMessages.topic, 'email.auth.v1'))).at(-1)?.payload
+    );
+    expect(resetPayload.template).toBe('auth.password-reset');
+    const resetToken = new URL(resetPayload.actionUrl).pathname.split('/').at(-1);
+    if (!resetToken) throw new Error('Expected pending password reset token');
+
+    const claimed = await auth.handler(new Request(payload.claimUrl, {
+      headers: { origin: applicationConfig.origin },
+      redirect: 'manual'
+    }));
+    expect(claimed.status).toBe(302);
+    expect(claimed.headers.get('set-cookie') ?? '')
+      .toContain('pale-orbit-commerce-claim=');
+    expect(await databaseClient.db.select().from(credentialAuthority)
+      .where(eq(credentialAuthority.userId, passwordlessUserId))).toHaveLength(0);
+    expect((await databaseClient.db.select().from(verification)).filter((row) =>
+      row.identifier.startsWith('reset-password:') ||
+      row.identifier.startsWith('pale-orbit:auth-password-reset:')
+    )).toHaveLength(0);
+
+    const staleReset = await auth.handler(new Request(
+      `${applicationConfig.origin}/api/auth/reset-password`,
+      {
+        method: 'POST',
+        headers: {
+          origin: applicationConfig.origin,
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+          token: resetToken,
+          newPassword: 'Stale-passwordless-reset-2026'
+        })
+      }
+    ));
+    expect(staleReset.status).not.toBe(200);
+    expect(await databaseClient.db.select().from(account)
+      .where(eq(account.userId, passwordlessUserId))).toHaveLength(0);
   });
 
   it('silently refuses mismatched commerce metadata without exposing another order', async () => {
@@ -434,7 +785,7 @@ describe('commerce email persistence', () => {
     expect(payload.template).toBe('commerce.guest-receipt-claim');
   });
 
-  it('preserves unverified password proof and sends a receipt without a claim action', async () => {
+  it('forces password recovery for any credential account and blocks direct commerce magic', async () => {
     const email = 'pending-credential@example.com';
     const fixture = await createPaidOrder('guest', email);
     const userId = randomUUID();
@@ -442,7 +793,7 @@ describe('commerce email persistence', () => {
       id: userId,
       name: 'Pending credential',
       email,
-      emailVerified: false
+      emailVerified: true
     });
     await databaseClient.db.insert(account).values({
       id: randomUUID(),
@@ -478,20 +829,21 @@ describe('commerce email persistence', () => {
 
     const rows = await databaseClient.db.select().from(outboxMessages);
     const commerce = rows.find((row) => row.topic === 'email.commerce.v1');
-    const verificationMail = rows.find((row) => row.topic === 'email.auth.v1');
+    const recoveryMail = rows.find((row) => row.topic === 'email.auth.v1');
     const commercePayload = parseCommerceEmailPayload(
       commerce?.payload,
       applicationConfig.origin
     );
     expect(commercePayload.template).toBe('commerce.account-receipt');
     expect(JSON.stringify(commercePayload)).not.toContain('claimUrl');
-    const authPayload = authEmailPayloadSchema.parse(verificationMail?.payload);
+    const authPayload = authEmailPayloadSchema.parse(recoveryMail?.payload);
     expect(authPayload).toMatchObject({
-      template: 'auth.email-verification',
+      template: 'auth.password-reset',
       to: email
     });
-    expect(new URL(authPayload.actionUrl).searchParams.get('callbackURL'))
-      .toBe('/claim/complete');
+    expect(decodeURIComponent(
+      new URL(authPayload.actionUrl).searchParams.get('callbackURL') ?? ''
+    )).toBe('/reset-password?purpose=commerce-claim');
     expect(await databaseClient.db.select().from(verification)).not.toHaveLength(0);
   });
 });

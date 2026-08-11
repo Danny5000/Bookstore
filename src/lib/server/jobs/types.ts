@@ -13,11 +13,12 @@ export type JobHandler = (job: JobRecord, signal: AbortSignal) => Promise<void>;
 
 export interface JobRepository {
   claimNext(workerId: string): Promise<JobRecord | null>;
-  complete(jobId: string, workerId: string): Promise<void>;
+  renewLease(jobId: string, workerId: string): Promise<boolean>;
+  complete(jobId: string, workerId: string): Promise<boolean>;
   fail(
     jobId: string,
     workerId: string,
     safeError: string,
     retryable: boolean
-  ): Promise<void>;
+  ): Promise<boolean>;
 }

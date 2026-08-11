@@ -1,10 +1,12 @@
 import { createHmac, randomUUID } from 'node:crypto';
 import { and, asc, eq, inArray, isNull } from 'drizzle-orm';
 import { normalizeEmailAddress } from '$lib/server/auth/identity';
+import { consumeCommerceClaimAuthorizationInTransaction } from '$lib/server/auth/commerce-claim-authorization';
 import { appendAuditEvent as defaultAppendAuditEvent } from '$lib/server/audit/service';
 import type { Database } from '$lib/server/db/client';
 import {
   disputes,
+  account,
   entitlementGrants,
   guestIdentities,
   orderItems,
@@ -68,6 +70,7 @@ export function deriveClaimedPurchaseGrantState(
 export interface ClaimGuestPurchasesInput {
   userId: string;
   correlationId: string;
+  authorizationToken: string;
   now?: Date;
 }
 
@@ -111,8 +114,45 @@ function assertClaimInput(input: ClaimGuestPurchasesInput): void {
     !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu
       .test(input.userId) ||
     typeof input.correlationId !== 'string' ||
+    !/^[A-Za-z0-9_-]{43}$/u.test(input.authorizationToken) ||
     (input.now !== undefined && Number.isNaN(input.now.getTime()))
   ) permanent();
+}
+
+async function lockClaimant(
+  transaction: DatabaseTransaction,
+  claimant: { userId: string; verifiedEmail: string }
+): Promise<void> {
+  const [lockedClaimant] = await transaction
+    .select()
+    .from(user)
+    .where(eq(user.id, claimant.userId))
+    .limit(1)
+    .for('update');
+  if (
+    !lockedClaimant ||
+    normalizedVerifiedEmail(lockedClaimant) !== claimant.verifiedEmail
+  ) permanent();
+}
+
+async function authorizeLockedClaimant(
+  transaction: DatabaseTransaction,
+  input: { userId: string; email: string; token: string; now: Date }
+): Promise<void> {
+  const [credential] = await transaction
+    .select({ id: account.id })
+    .from(account)
+    .where(and(eq(account.userId, input.userId), eq(account.providerId, 'credential')))
+    .limit(1)
+    .for('update');
+  const kind = await consumeCommerceClaimAuthorizationInTransaction(transaction, {
+    token: input.token,
+    email: input.email,
+    now: input.now
+  });
+  if (!kind || (credential && kind !== 'password-reset')) {
+    throw new CommerceConflictError('CLAIM_AUTHORIZATION_REQUIRED');
+  }
 }
 
 function safeAuditCorrelationId(value: string): string {
@@ -292,6 +332,7 @@ export async function claimGuestPurchases(
       .limit(1);
     if (!account) permanent();
     const email = normalizedVerifiedEmail(account);
+    const claimant = { userId: account.id, verifiedEmail: email };
 
     const [identity] = await transaction
       .select()
@@ -299,8 +340,24 @@ export async function claimGuestPurchases(
       .where(eq(guestIdentities.email, email))
       .limit(1)
       .for('update');
-    if (!identity) return EMPTY_RESULT;
+    if (!identity) {
+      await lockClaimant(transaction, claimant);
+      await authorizeLockedClaimant(transaction, {
+        userId: account.id,
+        email,
+        token: input.authorizationToken,
+        now
+      });
+      return EMPTY_RESULT;
+    }
     if (identity.claimedByUserId && identity.claimedByUserId !== account.id) {
+      await lockClaimant(transaction, claimant);
+      await authorizeLockedClaimant(transaction, {
+        userId: account.id,
+        email,
+        token: input.authorizationToken,
+        now
+      });
       throw new CommerceConflictError('IDENTITY_ALREADY_CLAIMED');
     }
 
@@ -314,11 +371,26 @@ export async function claimGuestPurchases(
       ))
       .orderBy(asc(orders.id))
       .for('update');
-    if (paidOrders.length === 0) return EMPTY_RESULT;
+    if (paidOrders.length === 0) {
+      await lockClaimant(transaction, claimant);
+      await authorizeLockedClaimant(transaction, {
+        userId: account.id,
+        email,
+        token: input.authorizationToken,
+        now
+      });
+      return EMPTY_RESULT;
+    }
 
     const facts = await lockClaimFacts(transaction, paidOrders, {
       userId: account.id,
       verifiedEmail: email
+    });
+    await authorizeLockedClaimant(transaction, {
+      userId: account.id,
+      email,
+      token: input.authorizationToken,
+      now
     });
     const orderById = new Map(paidOrders.map((order) => [order.id, order]));
     const uniqueTitleIds = [...new Set(facts.items.map((item) => item.titleId))]

@@ -1,5 +1,10 @@
 import { z, type ZodType } from 'zod';
-import { isSupportedCommerceCurrency } from '$lib/commerce/money';
+import {
+  isSupportedCommerceCurrency,
+  MAX_CATALOG_PRICE_MINOR,
+  MAX_CHECKOUT_SUBTOTAL_MINOR,
+  MAX_STRIPE_AMOUNT_MINOR
+} from '$lib/commerce/money';
 import { permanentStripeFailure } from './errors';
 import type {
   CheckoutSnapshot,
@@ -13,8 +18,9 @@ import type {
 
 const providerIdSchema = z.string().trim().min(1).max(255).regex(/^[A-Za-z0-9_-]+$/u);
 const uuidSchema = z.uuid();
-const moneySchema = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
+const moneySchema = z.number().int().min(0).max(MAX_STRIPE_AMOUNT_MINOR);
 const positiveMoneySchema = moneySchema.refine((value) => value > 0);
+const catalogPriceSchema = z.number().int().positive().max(MAX_CATALOG_PRICE_MINOR);
 const dateSchema = z.date().refine((value) => Number.isFinite(value.getTime()));
 const normalizedEmailSchema = z.string().trim().toLowerCase().max(320).pipe(z.email());
 const currencySchema = z.string().regex(/^[a-z]{3}$/u).refine(
@@ -97,6 +103,8 @@ const checkoutSnapshotSchema = z.strictObject({
 
 const paymentSnapshotSchema = z.strictObject({
   paymentIntentId: providerIdSchema,
+  metadataVersion: z.literal('1'),
+  metadataOrderId: uuidSchema,
   latestChargeId: providerIdSchema.nullable(),
   liveMode: z.boolean(),
   state: z.enum(['pending', 'succeeded', 'failed']),
@@ -181,11 +189,12 @@ export const createCheckoutSessionInputSchema = z.strictObject({
     orderItemId: uuidSchema,
     title: z.string().trim().min(1).max(500),
     format: z.enum(['prose', 'comic']),
-    unitSubtotalMinor: positiveMoneySchema,
+    unitSubtotalMinor: catalogPriceSchema,
     taxCode: z.string().regex(/^txcd_[A-Za-z0-9]+$/u).max(200).nullable()
   })).min(1).max(25)
 }).superRefine((value, context) => {
   const orderItemIds = new Set<string>();
+  let subtotalMinor = 0;
   for (const [index, item] of value.items.entries()) {
     if (orderItemIds.has(item.orderItemId)) {
       context.addIssue({ code: 'custom', path: ['items', index, 'orderItemId'], message: 'duplicate order item' });
@@ -194,6 +203,14 @@ export const createCheckoutSessionInputSchema = z.strictObject({
       context.addIssue({ code: 'custom', path: ['items', index, 'taxCode'], message: 'automatic tax requires a tax code' });
     }
     orderItemIds.add(item.orderItemId);
+    subtotalMinor += item.unitSubtotalMinor;
+  }
+  if (!Number.isSafeInteger(subtotalMinor) || subtotalMinor > MAX_CHECKOUT_SUBTOTAL_MINOR) {
+    context.addIssue({
+      code: 'custom',
+      path: ['items'],
+      message: 'checkout subtotal exceeds the supported limit'
+    });
   }
 }) satisfies ZodType<CreateCheckoutSessionInput>;
 

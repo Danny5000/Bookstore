@@ -2,6 +2,7 @@
   import { resolve } from '$app/paths';
   import CartToggle from '$lib/components/CartToggle.svelte';
   import CoverArt from '$lib/components/CoverArt.svelte';
+  import { formatMinorCurrency } from '$lib/commerce/money';
   import type { PageData } from './$types';
 
   interface Props {
@@ -10,11 +11,7 @@
 
   let { data }: Props = $props();
   const title = $derived(data.title);
-  const price = $derived(
-    new Intl.NumberFormat('en-US', { style: 'currency', currency: title.currency }).format(
-      title.priceMinor / 100
-    )
-  );
+  const price = $derived(formatMinorCurrency(title.priceMinor, title.currency));
 </script>
 
 <svelte:head><title>{title.title} · Pale Orbit Press</title></svelte:head>
@@ -30,6 +27,7 @@
         <span class="price">{price}</span>
         <CartToggle titleId={title.id} titleLabel={title.title} />
       </div>
+      <p class="tax-note mono">Tax calculated at checkout</p>
       <a class="btn ghost" href={resolve('/read/[id]', { id: title.slug })}>Read the free preview</a>
     </div>
 
@@ -67,6 +65,7 @@
   .buttons .btn { text-align: center; }
   .purchase-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 10px 0; }
   .price { font-family: var(--font-mono); color: var(--ink); }
+  .tax-note { margin: -2px 0 2px; font-size: 10px; color: var(--muted); }
   .art { display: flex; align-items: center; justify-content: center; min-height: 430px; }
   dl { display: grid; gap: 8px; margin: 22px 0 0; font-family: var(--font-mono); font-size: 11px; color: var(--muted); }
   dl > div { display: flex; justify-content: space-between; }

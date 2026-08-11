@@ -144,11 +144,20 @@ async function storeDispute(
     !sameInstant(existing.providerCreatedAt, values.providerCreatedAt as Date)
   ) permanentReconciliationFailure();
   const incomingUpdatedAt = values.providerUpdatedAt as Date;
+  if (
+    existing.status !== values.status &&
+    existing.status !== 'open' &&
+    values.status !== 'open'
+  ) permanentReconciliationFailure();
   if (incomingUpdatedAt.getTime() < existing.providerUpdatedAt.getTime()) return existing;
+  if (existing.status !== 'open' && values.status === 'open') return existing;
   if (
     sameInstant(incomingUpdatedAt, existing.providerUpdatedAt) &&
-    (existing.status !== values.status || existing.reason !== (values.reason ?? null))
-  ) permanentReconciliationFailure();
+    existing.status === values.status &&
+    existing.reason !== (values.reason ?? null)
+  ) {
+    permanentReconciliationFailure();
+  }
   const [updated] = await transaction
     .update(disputes)
     .set({

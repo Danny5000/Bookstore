@@ -28,6 +28,8 @@ function input(): QuoteFingerprintInputV1 {
       }
     ],
     alreadyOwnedTitleIds: [uuid(4), uuid(3)],
+    claimableTitleIds: [uuid(8), uuid(7)],
+    reservedTitleIds: [uuid(10), uuid(9)],
     unavailableTitleIds: [uuid(6), uuid(5)]
   };
 }
@@ -39,6 +41,8 @@ describe('createQuoteFingerprint', () => {
       ...original,
       items: [...original.items].reverse(),
       alreadyOwnedTitleIds: [...original.alreadyOwnedTitleIds].reverse(),
+      claimableTitleIds: [...original.claimableTitleIds].reverse(),
+      reservedTitleIds: [...original.reservedTitleIds].reverse(),
       unavailableTitleIds: [...original.unavailableTitleIds].reverse()
     };
     const localeCompare = vi.spyOn(String.prototype, 'localeCompare');
@@ -99,6 +103,20 @@ describe('createQuoteFingerprint', () => {
       mutate: (value: QuoteFingerprintInputV1) => ({
         ...value,
         alreadyOwnedTitleIds: [...value.alreadyOwnedTitleIds, uuid(8)]
+      })
+    },
+    {
+      label: 'claimable purchase',
+      mutate: (value: QuoteFingerprintInputV1) => ({
+        ...value,
+        claimableTitleIds: [...value.claimableTitleIds, uuid(11)]
+      })
+    },
+    {
+      label: 'active reservation',
+      mutate: (value: QuoteFingerprintInputV1) => ({
+        ...value,
+        reservedTitleIds: [...value.reservedTitleIds, uuid(12)]
       })
     },
     {

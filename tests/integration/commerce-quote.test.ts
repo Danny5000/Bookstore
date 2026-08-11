@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import type { Actor } from '$lib/server/auth/admin-policy';
+import { findOrCreateGuestIdentity } from '$lib/server/auth/identity';
 import { updateTitleMetadata } from '$lib/server/catalog/titles';
 import { InvalidCartError } from '$lib/server/commerce/errors';
 import { lockAndQuoteCart, quoteCart } from '$lib/server/commerce/quote';
@@ -9,6 +10,9 @@ import { setPreservedGrantState } from '$lib/server/commerce/grants';
 import {
   proseBlocks,
   proseSections,
+  entitlementGrants,
+  orderItems,
+  orders,
   revisionPresentations,
   titleRevisions,
   titles,
@@ -29,6 +33,68 @@ async function createCustomer(): Promise<Extract<Actor, { type: 'user' }>> {
     emailVerified: true
   });
   return { type: 'user', id, roles: ['customer'] };
+}
+
+async function createPurchaseFact(input: {
+  titleId: string;
+  purchaseEmail: string;
+  initiatingUserId?: string;
+  grantUserId?: string | null;
+  grantState: 'unclaimed' | 'active' | 'suspended' | 'revoked';
+  orderStatus?: 'paid' | 'checkout_pending';
+}) {
+  const guestIdentity = input.initiatingUserId
+    ? null
+    : await findOrCreateGuestIdentity(databaseClient.db, input.purchaseEmail);
+  const orderId = randomUUID();
+  const itemId = randomUUID();
+  const paid = (input.orderStatus ?? 'paid') === 'paid';
+  await databaseClient.db.insert(orders).values({
+    id: orderId,
+    status: input.orderStatus ?? 'paid',
+    initiatingUserId: input.initiatingUserId ?? null,
+    guestIdentityId: guestIdentity?.id ?? null,
+    purchaseEmail: input.purchaseEmail,
+    currency: 'USD',
+    subtotalMinor: 1000,
+    taxMinor: paid ? 0 : null,
+    totalMinor: paid ? 1000 : null,
+    clientCheckoutAttemptId: randomUUID(),
+    quoteFingerprintSha256: 'a'.repeat(64),
+    stripeCheckoutSessionId: paid ? `cs_test_${orderId}` : null,
+    statusTokenSha256: 'b'.repeat(64),
+    checkoutExpiresAt: paid ? new Date('2026-08-10T12:30:00.000Z') : null,
+    paidAt: paid ? new Date('2026-08-10T12:05:00.000Z') : null
+  });
+  await databaseClient.db.insert(orderItems).values({
+    id: itemId,
+    orderId,
+    titleId: input.titleId,
+    titleSnapshot: 'Purchase fact title',
+    creatorNameSnapshot: 'Purchase fact creator',
+    format: 'prose',
+    currency: 'USD',
+    unitSubtotalMinor: 1000,
+    taxMinor: paid ? 0 : null,
+    totalMinor: paid ? 1000 : null,
+    stripeLineItemId: paid ? `li_test_${itemId}` : null
+  });
+  await databaseClient.db.insert(entitlementGrants).values({
+    titleId: input.titleId,
+    userId: input.grantUserId ?? null,
+    source: 'purchase',
+    orderItemId: itemId,
+    state: input.grantState,
+    stateReason: `test_${input.grantState}`,
+    grantedAt: new Date('2026-08-10T12:05:00.000Z'),
+    suspendedAt: input.grantState === 'suspended'
+      ? new Date('2026-08-10T13:00:00.000Z')
+      : null,
+    revokedAt: input.grantState === 'revoked'
+      ? new Date('2026-08-10T13:00:00.000Z')
+      : null
+  });
+  return { orderId, itemId };
 }
 
 async function createAdministrator(): Promise<Extract<Actor, { type: 'user' }>> {
@@ -256,6 +322,82 @@ describe('authoritative commerce quotes', () => {
     expect(quote.alreadyOwnedTitleIds).toEqual([owned.title.id]);
     expect(quote.items.map((item) => item.titleId)).toEqual([revoked.title.id]);
     expect(quote.subtotalMinor).toBe(1000);
+  });
+
+  it('blocks suspended account purchases and same-email guest purchases until resolution', async () => {
+    const customer = await createCustomer();
+    const [account] = await databaseClient.db.select().from(user)
+      .where(eq(user.id, customer.id));
+    if (!account) throw new Error('Expected customer');
+    const accountPurchase = await createQuoteTitle({ label: 'Suspended Account Purchase' });
+    const guestPurchase = await createQuoteTitle({ label: 'Suspended Guest Purchase' });
+    const revokedPurchase = await createQuoteTitle({ label: 'Revoked Purchase' });
+    await createPurchaseFact({
+      titleId: accountPurchase.title.id,
+      purchaseEmail: account.email,
+      initiatingUserId: customer.id,
+      grantUserId: customer.id,
+      grantState: 'suspended'
+    });
+    await createPurchaseFact({
+      titleId: guestPurchase.title.id,
+      purchaseEmail: account.email,
+      grantState: 'suspended'
+    });
+    await createPurchaseFact({
+      titleId: revokedPurchase.title.id,
+      purchaseEmail: account.email,
+      initiatingUserId: customer.id,
+      grantUserId: customer.id,
+      grantState: 'revoked'
+    });
+
+    const quote = await quoteCart(databaseClient.db, customer, [
+      accountPurchase.title.id,
+      guestPurchase.title.id,
+      revokedPurchase.title.id
+    ]);
+
+    expect(quote).toMatchObject({
+      items: [{ titleId: revokedPurchase.title.id }],
+      claimableTitleIds: [],
+      reservedTitleIds: [accountPurchase.title.id, guestPurchase.title.id].sort()
+    });
+  });
+
+  it('returns a disjoint partition with owned precedence over claimable and reserved facts', async () => {
+    const customer = await createCustomer();
+    const [account] = await databaseClient.db.select().from(user)
+      .where(eq(user.id, customer.id));
+    if (!account) throw new Error('Expected customer');
+    const fixture = await createQuoteTitle({ label: 'Overlapping Purchase Facts' });
+    await databaseClient.db.transaction((transaction) => setPreservedGrantState(transaction, {
+      userId: customer.id,
+      titleId: fixture.title.id,
+      active: true,
+      stateReason: 'test_overlap_owned'
+    }));
+    await createPurchaseFact({
+      titleId: fixture.title.id,
+      purchaseEmail: account.email,
+      grantState: 'unclaimed'
+    });
+    await createPurchaseFact({
+      titleId: fixture.title.id,
+      purchaseEmail: account.email,
+      initiatingUserId: customer.id,
+      grantUserId: customer.id,
+      grantState: 'suspended',
+      orderStatus: 'checkout_pending'
+    });
+
+    await expect(quoteCart(databaseClient.db, customer, [fixture.title.id])).resolves.toMatchObject({
+      items: [],
+      alreadyOwnedTitleIds: [fixture.title.id],
+      claimableTitleIds: [],
+      reservedTitleIds: [],
+      unavailableTitleIds: []
+    });
   });
 
   it('rejects duplicate and 26-title requests while accepting 25 unknown IDs safely', async () => {

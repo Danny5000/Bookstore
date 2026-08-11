@@ -1,22 +1,25 @@
 import { z } from 'zod';
+import { canonicalUuidSchema } from '$lib/validation/uuid';
 
 export const MAX_CART_TITLES = 25;
-export const cartTitleIdSchema = z.uuid();
+export const cartTitleIdSchema = canonicalUuidSchema;
+export const checkoutAttemptIdSchema = canonicalUuidSchema;
 
 export const cartStateV1Schema = z.strictObject({
   version: z.literal(1),
   titleIds: z.array(cartTitleIdSchema).max(MAX_CART_TITLES),
-  checkoutAttemptId: z.uuid()
+  checkoutAttemptId: checkoutAttemptIdSchema
 });
 
 export const quoteRequestSchema = z.strictObject({
-  titleIds: z.array(cartTitleIdSchema).min(1).max(MAX_CART_TITLES)
+  titleIds: z.array(cartTitleIdSchema).min(1).max(MAX_CART_TITLES),
+  checkoutAttemptId: checkoutAttemptIdSchema
 });
 
 export const checkoutRequestSchema = z.strictObject({
   titleIds: z.array(cartTitleIdSchema).min(1).max(MAX_CART_TITLES),
   quoteFingerprint: z.string().regex(/^[a-f0-9]{64}$/u),
-  checkoutAttemptId: z.uuid()
+  checkoutAttemptId: checkoutAttemptIdSchema
 });
 
 export const claimRequestSchema = z.strictObject({
@@ -45,6 +48,8 @@ export interface CommerceQuoteDto {
   subtotalMinor: number;
   items: CommerceQuoteItemDto[];
   alreadyOwnedTitleIds: string[];
+  claimableTitleIds: string[];
+  reservedTitleIds: string[];
   unavailableTitleIds: string[];
   taxNotice: 'calculated_at_checkout';
   canCheckout: boolean;

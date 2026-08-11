@@ -1,4 +1,5 @@
 import { and, eq } from 'drizzle-orm';
+import { isSupportedCommerceCurrency, MAX_CATALOG_PRICE_MINOR } from '$lib/commerce/money';
 import { requireCapability, type Actor } from '$lib/server/auth/admin-policy';
 import { appendAuditEvent } from '$lib/server/audit/service';
 import type { AuditRequestMetadata } from '$lib/server/audit/request-metadata';
@@ -26,6 +27,16 @@ interface PublicationCommand<T> {
   correlationId: string;
   requestMetadata?: AuditRequestMetadata;
   input: T;
+}
+
+function requireStorefrontMoney(title: TitleRow): void {
+  if (
+    title.priceMinor <= 0 ||
+    title.priceMinor > MAX_CATALOG_PRICE_MINOR ||
+    !isSupportedCommerceCurrency(title.currency)
+  ) {
+    throw new CatalogDomainError('publication_precondition');
+  }
 }
 
 async function lockRevision(
@@ -151,6 +162,7 @@ export async function publishTitleToStorefront(
       if (context.title.visibility !== 'private' || !context.title.activeRevisionId) {
         throw new CatalogDomainError('publication_precondition');
       }
+      requireStorefrontMoney(context.title);
       const active = await lockRevision(transaction, input.titleId, context.title.activeRevisionId);
       if (active.state !== 'active') throw new CatalogDomainError('publication_precondition');
       await requirePublishedSettings(transaction, active.id);

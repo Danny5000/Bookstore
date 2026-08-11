@@ -43,6 +43,14 @@ describe('loadCartState', () => {
       })
     },
     {
+      label: 'mixed-case duplicate title IDs',
+      value: JSON.stringify({
+        version: 1,
+        titleIds: [uuid(2), uuid(2).toUpperCase()],
+        checkoutAttemptId: uuid(1)
+      })
+    },
+    {
       label: 'malformed title ID',
       value: JSON.stringify({
         version: 1,
@@ -132,7 +140,7 @@ describe('cart state edits', () => {
     });
   });
 
-  it('rotates a terminal failed attempt without removing cart titles', () => {
+  it('rotates an explicitly abandoned attempt without removing cart titles', () => {
     expect(rotateCheckoutAttempt(initial, () => uuid(103))).toEqual({
       ...initial,
       checkoutAttemptId: uuid(103)

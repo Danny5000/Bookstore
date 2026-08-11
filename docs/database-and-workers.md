@@ -109,7 +109,7 @@ Authentication email uses the versioned `email.auth.v1` topic and a stable Messa
 
 Commerce webhook acceptance inserts a minimized `stripe_events` row and a deduplicated `commerce.stripe-event` job in one transaction. The handler retrieves canonical Stripe state without holding a PostgreSQL connection, then uses ordered short transactions for payment/refund/dispute reduction, `entitlement_grants` and effective `entitlements`, `email.commerce.v1` outbox messages, minimized audit events, and final event status. Duplicate/out-of-order jobs converge on canonical state. Guest claim preparation uses `commerce.claim-email` and enumeration-resistant requests use `commerce.claim-email-request`.
 
-Safe operations may inspect IDs, types/topics, status, attempts, reconciliation state, and timestamps. Do not select job/outbox payloads, purchase emails, action URLs, webhook signatures, raw provider bodies, secrets, or card/address data. Preserve failed jobs and event exceptions for review; Plan 7 owns an authorized retry control. See [commerce and guest-claim operations](commerce-and-guest-claims.md).
+Safe operations may inspect IDs, types/topics, status, attempts, reconciliation state, and timestamps. Do not select job/outbox payloads, purchase emails, action URLs, webhook signatures, raw provider bodies, credential-authority hashes/reset epochs, secrets, or card/address data. Credential-authority integrity diagnostics return aggregate mismatch counts only and never repair state by copying the live account hash. Preserve failed jobs and event exceptions for review; Plan 7 owns an authorized retry control. See [commerce and guest-claim operations](commerce-and-guest-claims.md).
 
 ## Scope of later plans
 

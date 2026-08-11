@@ -7,6 +7,7 @@ import {
 } from '$lib/server/commerce/disputes';
 import { createCommerceMessageEnqueuer } from '$lib/server/commerce/email/enqueue';
 import { parseCommerceEmailPayload } from '$lib/server/commerce/email/payload';
+import { PermanentCommerceError } from '$lib/server/commerce/errors';
 import { projectEffectiveEntitlement } from '$lib/server/commerce/grants';
 import {
   auditEvents,
@@ -178,6 +179,8 @@ function command(
     },
     payment: {
       paymentIntentId: fixture.paymentIntentId,
+      metadataVersion: '1' as const,
+      metadataOrderId: fixture.orderId,
       latestChargeId: `ch_test_${fixture.orderId}`,
       liveMode: false,
       state: 'succeeded' as const,
@@ -254,14 +257,106 @@ describe('canonical dispute fulfillment', () => {
       .where(eq(stripeEvents.id, stale.id)))[0]?.status).toBe('processed');
   });
 
-  it('makes loss permanent even if a later canonical row says won', async () => {
+  it.each([
+    ['won', 'active'],
+    ['lost', 'revoked']
+  ] as const)(
+    'advances an open dispute to %s when signed events share the same provider second',
+    async (terminalState, expectedGrantState) => {
+      const fixture = await createPurchase();
+      const disputeId = `dp_test_${randomUUID()}`;
+      const sharedSecond = new Date('2026-08-10T14:01:00.000Z');
+      const opened = await createDisputeEvent(disputeId, 1, sharedSecond);
+      await fulfillDisputeEvent(
+        databaseClient.db,
+        command(fixture, opened, 'open', 1),
+        dependencies()
+      );
+      const terminal = await createDisputeEvent(disputeId, 2, sharedSecond);
+      await fulfillDisputeEvent(
+        databaseClient.db,
+        command(fixture, terminal, terminalState, 2),
+        dependencies()
+      );
+
+      expect((await databaseClient.db.select().from(disputes))[0]?.status).toBe(terminalState);
+      expect((await databaseClient.db.select().from(entitlementGrants))[0]?.state)
+        .toBe(expectedGrantState);
+      expect((await databaseClient.db.select().from(stripeEvents)
+        .where(eq(stripeEvents.id, terminal.id)))[0]?.status).toBe('processed');
+    }
+  );
+
+  it('does not regress a terminal dispute to open at the same provider second', async () => {
+    const fixture = await createPurchase();
+    const disputeId = `dp_test_${randomUUID()}`;
+    const sharedSecond = new Date('2026-08-10T14:01:00.000Z');
+    const won = await createDisputeEvent(disputeId, 1, sharedSecond);
+    await fulfillDisputeEvent(databaseClient.db, command(fixture, won, 'won', 1), dependencies());
+    const delayedOpen = await createDisputeEvent(disputeId, 2, sharedSecond);
+
+    await fulfillDisputeEvent(
+      databaseClient.db,
+      command(fixture, delayedOpen, 'open', 2),
+      dependencies()
+    );
+
+    expect((await databaseClient.db.select().from(disputes))[0]?.status).toBe('won');
+    expect((await databaseClient.db.select().from(entitlementGrants))[0]?.state).toBe('active');
+    expect((await databaseClient.db.select().from(stripeEvents)
+      .where(eq(stripeEvents.id, delayedOpen.id)))[0]?.status).toBe('processed');
+  });
+
+  it('does not regress a terminal dispute to a later open snapshot', async () => {
+    const fixture = await createPurchase();
+    const disputeId = `dp_test_${randomUUID()}`;
+    const won = await createDisputeEvent(disputeId, 1);
+    await fulfillDisputeEvent(databaseClient.db, command(fixture, won, 'won', 1), dependencies());
+    const laterOpen = await createDisputeEvent(disputeId, 2);
+
+    await fulfillDisputeEvent(
+      databaseClient.db,
+      command(fixture, laterOpen, 'open', 2),
+      dependencies()
+    );
+
+    expect((await databaseClient.db.select().from(disputes))[0]?.status).toBe('won');
+    expect((await databaseClient.db.select().from(entitlementGrants))[0]?.state).toBe('active');
+    expect((await databaseClient.db.select().from(stripeEvents)
+      .where(eq(stripeEvents.id, laterOpen.id)))[0]?.status).toBe('processed');
+  });
+
+  it('rejects conflicting terminal dispute states at the same provider second', async () => {
+    const fixture = await createPurchase();
+    const disputeId = `dp_test_${randomUUID()}`;
+    const sharedSecond = new Date('2026-08-10T14:01:00.000Z');
+    const won = await createDisputeEvent(disputeId, 1, sharedSecond);
+    await fulfillDisputeEvent(databaseClient.db, command(fixture, won, 'won', 1), dependencies());
+    const lost = await createDisputeEvent(disputeId, 2, sharedSecond);
+
+    await expect(fulfillDisputeEvent(
+      databaseClient.db,
+      command(fixture, lost, 'lost', 2),
+      dependencies()
+    )).rejects.toBeInstanceOf(PermanentCommerceError);
+
+    expect((await databaseClient.db.select().from(disputes))[0]?.status).toBe('won');
+    expect((await databaseClient.db.select().from(stripeEvents)
+      .where(eq(stripeEvents.id, lost.id)))[0]?.status).toBe('pending');
+  });
+
+  it('rejects a later conflicting terminal state and preserves permanent loss', async () => {
     const fixture = await createPurchase();
     const disputeId = `dp_test_${randomUUID()}`;
     const lost = await createDisputeEvent(disputeId, 1);
     await fulfillDisputeEvent(databaseClient.db, command(fixture, lost, 'lost', 1), dependencies());
     const won = await createDisputeEvent(disputeId, 2);
-    await fulfillDisputeEvent(databaseClient.db, command(fixture, won, 'won', 2), dependencies());
-    expect((await databaseClient.db.select().from(disputes))[0]?.status).toBe('won');
+    await expect(fulfillDisputeEvent(
+      databaseClient.db,
+      command(fixture, won, 'won', 2),
+      dependencies()
+    )).rejects.toBeInstanceOf(PermanentCommerceError);
+    expect((await databaseClient.db.select().from(disputes))[0]?.status).toBe('lost');
     expect((await databaseClient.db.select().from(entitlementGrants))[0]).toMatchObject({
       state: 'revoked',
       stateReason: 'dispute_lost'
@@ -269,6 +364,8 @@ describe('canonical dispute fulfillment', () => {
     expect((await databaseClient.db.select().from(entitlements))[0]?.revokedAt)
       .toEqual(expect.any(Date));
     expect(await accessMessages()).toHaveLength(1);
+    expect((await databaseClient.db.select().from(stripeEvents)
+      .where(eq(stripeEvents.id, won.id)))[0]?.status).toBe('pending');
   });
 
   it('does not restore a fully refunded grant after a won dispute', async () => {

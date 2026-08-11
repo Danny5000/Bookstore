@@ -3,6 +3,7 @@ import { and, eq } from 'drizzle-orm';
 import type { Database } from '$lib/server/db/client';
 import {
   account,
+  credentialAuthority,
   guestIdentities,
   orders,
   user
@@ -82,7 +83,7 @@ export async function queueCommerceClaimEmail(
   });
 }
 
-export type ClaimEmailAccountState = 'magic-link' | 'unverified-password';
+export type ClaimEmailAccountState = 'magic-link' | 'password-recovery';
 
 export interface ClaimEmailEligibility {
   orderId: string;
@@ -116,11 +117,11 @@ export async function loadClaimEmailEligibility(
   if (!identity || identity.email !== email) return null;
 
   const [matchingUser] = await database
-    .select({ id: user.id, emailVerified: user.emailVerified })
+    .select({ id: user.id })
     .from(user)
     .where(eq(user.email, email))
     .limit(1);
-  if (!matchingUser || matchingUser.emailVerified) {
+  if (!matchingUser) {
     return { orderId: order.id, email, accountState: 'magic-link' };
   }
   const [credential] = await database
@@ -131,10 +132,17 @@ export async function loadClaimEmailEligibility(
       eq(account.providerId, 'credential')
     ))
     .limit(1);
+  const [authority] = credential
+    ? []
+    : await database
+        .select({ userId: credentialAuthority.userId })
+        .from(credentialAuthority)
+        .where(eq(credentialAuthority.userId, matchingUser.id))
+        .limit(1);
   return {
     orderId: order.id,
     email,
-    accountState: credential ? 'unverified-password' : 'magic-link'
+    accountState: credential || authority ? 'password-recovery' : 'magic-link'
   };
 }
 
@@ -142,7 +150,7 @@ export interface ClaimEmailOperations {
   receiptExists(orderId: string): Promise<boolean>;
   loadEligibility(orderId: string): Promise<ClaimEmailEligibility | null>;
   requestMagicLink(input: { orderId: string; email: string }): Promise<void>;
-  requestVerification(input: { orderId: string; email: string }): Promise<void>;
+  requestPasswordRecovery(input: { orderId: string; email: string }): Promise<void>;
   enqueueReceiptWithoutClaim(orderId: string): Promise<void>;
 }
 
@@ -165,8 +173,8 @@ export function createClaimEmailHandler(
       throw new PermanentJobError('Commerce claim-email order is not eligible');
     }
     throwIfAborted(signal);
-    if (eligibility.accountState === 'unverified-password') {
-      await operations.requestVerification(eligibility);
+    if (eligibility.accountState === 'password-recovery') {
+      await operations.requestPasswordRecovery(eligibility);
       throwIfAborted(signal);
       await operations.enqueueReceiptWithoutClaim(orderId);
       return;
@@ -205,11 +213,11 @@ export function createClaimEmailOperations(
         headers
       });
     },
-    async requestVerification(input) {
-      await auth.api.sendVerificationEmail({
+    async requestPasswordRecovery(input) {
+      await auth.api.requestPasswordReset({
         body: {
           email: input.email,
-          callbackURL: '/claim/complete'
+          redirectTo: '/reset-password?purpose=commerce-claim'
         },
         headers
       });

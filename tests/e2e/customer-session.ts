@@ -1,5 +1,5 @@
 import { expect, type BrowserContext, type Page } from '@playwright/test';
-import { firstHttpLink, waitForLatestTextEmail } from './mailpit';
+import { firstHttpLink, navigateSensitiveAction, waitForLatestTextEmail } from './mailpit';
 import { signIn, waitForHydratedHandler } from './publication-admin';
 
 export async function registerAndVerifyCustomer(
@@ -21,8 +21,12 @@ export async function registerAndVerifyCustomer(
   const verificationLink = firstHttpLink(
     await waitForLatestTextEmail(input.email, 10_000, 'verify your email address')
   );
-  await page.goto(verificationLink);
-  await expect(page.locator('header').getByText(input.email)).toBeVisible();
+  await navigateSensitiveAction(page, verificationLink);
+  await expect(page.locator('header').getByRole('button', { name: 'Sign in' })).toBeVisible();
+  await signIn(page, input.email, input.password);
+  const session = await context.request.get('/api/auth/get-session');
+  expect(session.status()).toBe(200);
+  expect((await session.json()) as object).toMatchObject({ user: { email: input.email } });
   return page;
 }
 

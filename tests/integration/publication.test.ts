@@ -730,6 +730,34 @@ describe('reader presentation drafts and publication', () => {
 });
 
 describe('reviewed publication lifecycle', () => {
+  it.each([
+    ['zero price', 'zero-price', { priceMinor: 0 }],
+    ['price above the catalog ceiling', 'price-ceiling', { priceMinor: 50_000_000 }],
+    ['currency outside the pinned Stripe allowlist', 'currency-allowlist', { currency: 'KPW' }]
+  ])('rejects storefront publication with %s', async (label, slugSuffix, invalidMoney) => {
+    const candidate = await publishProseSettings(undefined, `invalid-money-${slugSuffix}`);
+    await activatePrivateRevision(databaseClient.db, {
+      actor: admin,
+      correlationId: `activate-invalid-money-${label}`,
+      input: { titleId: candidate.title.id, revisionId: candidate.revision.id }
+    });
+    await databaseClient.db
+      .update(titles)
+      .set(invalidMoney)
+      .where(eq(titles.id, candidate.title.id));
+
+    await expect(publishTitleToStorefront(databaseClient.db, {
+      actor: admin,
+      correlationId: `publish-invalid-money-${label}`,
+      input: { titleId: candidate.title.id }
+    })).rejects.toMatchObject({ code: 'publication_precondition' });
+    const [title] = await databaseClient.db
+      .select({ visibility: titles.visibility })
+      .from(titles)
+      .where(eq(titles.id, candidate.title.id));
+    expect(title?.visibility).toBe('private');
+  });
+
   it('activates a reviewed revision privately and explicitly publishes and withdraws it', async () => {
     const candidate = await publishProseSettings();
 

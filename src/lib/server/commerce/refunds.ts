@@ -310,7 +310,12 @@ async function storeCanonicalRefund(
     return inserted;
   }
   assertExistingRefund(existing, canonical, paymentId);
-  const status = existing.status === 'succeeded' ? 'succeeded' : canonical.state;
+  const status = (() => {
+    if (existing.status === canonical.state) return existing.status;
+    if (existing.status === 'pending') return canonical.state;
+    if (canonical.state === 'pending') return existing.status;
+    return permanent();
+  })();
   const [updated] = await transaction
     .update(refunds)
     .set({

@@ -48,7 +48,12 @@ export const POST: RequestHandler = async (event) => {
     const input = await readStrictJson(event.request, quoteRequestSchema, {
       maxBytes: MAX_QUOTE_JSON_BYTES
     });
-    const quote = await quoteCart(getDatabaseClient().db, event.locals.actor, input.titleIds);
+    const quote = await quoteCart(
+      getDatabaseClient().db,
+      event.locals.actor,
+      input.titleIds,
+      input.checkoutAttemptId
+    );
     return privateJson(quote);
   } catch (error) {
     if (error instanceof StrictHttpError) {

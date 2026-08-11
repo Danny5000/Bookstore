@@ -88,3 +88,22 @@ export async function canSendMagicLink(database: Database, email: string): Promi
     .limit(1);
   return credentialAccount === undefined;
 }
+
+export async function canSendCommerceMagicLink(
+  database: Database,
+  email: string
+): Promise<boolean> {
+  const normalizedEmail = normalizeEmailAddress(email);
+  const [existingUser] = await database
+    .select({ id: user.id })
+    .from(user)
+    .where(eq(user.email, normalizedEmail))
+    .limit(1);
+  if (!existingUser) return true;
+  const [credentialAccount] = await database
+    .select({ id: account.id })
+    .from(account)
+    .where(and(eq(account.userId, existingUser.id), eq(account.providerId, 'credential')))
+    .limit(1);
+  return credentialAccount === undefined;
+}

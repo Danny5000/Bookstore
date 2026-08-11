@@ -11,7 +11,7 @@ describe('formatMinorCurrency', () => {
     expect(formatMinorCurrency(amount, currency)).toBe(expected);
   });
 
-  it.each(['ABC', 'ISK', 'UGX'])(
+  it.each(['ABC', 'IRR', 'KPW', 'ISK', 'UGX'])(
     'rejects currencies outside the supported commerce subset for %s',
     (currency) => {
       expect(() => formatMinorCurrency(1234, currency)).toThrow(/unsupported currency/iu);

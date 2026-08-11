@@ -6,7 +6,7 @@
 
 **Architecture:** The browser persists only versioned title IDs and a checkout-attempt UUID. PostgreSQL owns accepted price snapshots, orders, payments, provider events, purchase grants, refunds, disputes, and effective entitlement projection. Thin SvelteKit routes validate same-origin bounded requests; a narrow Stripe adapter performs every provider call outside database transactions; durable PostgreSQL jobs retrieve canonical provider state and apply monotonic transitions atomically with outbox email and append-only audit records.
 
-**Tech Stack:** Node.js 26.7.0, npm 11.19.0, SvelteKit 2.70.2, Svelte 5.56.8, TypeScript 6.0.3, PostgreSQL 18.4, Drizzle ORM 0.45.2 and Drizzle Kit 0.31.10, Better Auth 1.6.26, Stripe Node 22.4.0 pinned to API version `2026-07-29.dahlia`, Zod 4.4.3, Nodemailer 9.0.5, Vitest 4.1.10, and Playwright 1.62.1.
+**Tech Stack:** Node.js 26.7.0, npm 11.19.0, SvelteKit 2.70.2, Svelte 5.56.8, TypeScript 6.0.3, PostgreSQL 18.4, Drizzle ORM 0.45.2 and Drizzle Kit 0.31.10, Better Auth 1.6.26, Stripe Node 22.5.0 pinned to API version `2026-07-29.dahlia`, Zod 4.4.3, Nodemailer 9.0.5, Vitest 4.1.10, and Playwright 1.62.1.
 
 ---
 
@@ -34,9 +34,9 @@ Preserve these boundaries in every task:
 
 Task 1 must repeat the registry, peer-range, and audit checks before changing dependencies. The 2026-08-10 preflight found:
 
-- `stripe@22.4.0` is the current installed/wanted/latest Stripe SDK and supports Node 26. Pin its application API version to `2026-07-29.dahlia`; never rely on the SDK's implicit default.
+- `stripe@22.5.0` is the current installed/wanted/latest Stripe SDK and supports Node 26. Pin its application API version to `2026-07-29.dahlia`; never rely on the SDK's implicit default.
 - `tsx` has a safe patch from `4.23.11` to `4.23.12`; take that patch and update the lockfile.
-- TypeScript `7.0.2` is newer than the installed `6.0.3`, but `typescript-eslint@8.66.0` supports `<6.1.0`. Retain TypeScript `6.0.3` and record the peer-range reason.
+- TypeScript `7.0.2` is newer than the installed `6.0.3`, but `typescript-eslint@8.67.0` supports `<6.1.0`. Retain TypeScript `6.0.3` and record the peer-range reason.
 - The existing low/moderate cookie and Drizzle Kit development-path advisories have no safe in-range fix and are already dispositioned. Do not accept npm's invalid framework or Drizzle downgrade suggestions.
 
 No Stripe credential is needed to write this plan or complete its automated implementation and test suites. Stop only at Task 15's optional manual Stripe checkpoint and ask the user to add these values to the ignored local `.env`:
@@ -53,10 +53,11 @@ The user must obtain `STRIPE_WEBHOOK_SECRET` from the local `stripe listen --for
 
 ## Domain invariants
 
-- A cart contains version `1`, at most 25 distinct title UUIDs, and one client checkout-attempt UUID. Quantity is structurally one.
-- A quote is authoritative only for the exact ordered title set, current public/active/published availability, immutable current price/currency snapshots, and current account ownership used to compute its SHA-256 fingerprint.
+- A cart contains version `1`, at most 25 distinct title UUIDs, and one client checkout-attempt UUID. Every externally supplied UUID is canonicalized to lowercase before deduplication, sorting, fingerprinting, equality, or advisory locking. Quantity is structurally one.
+- A quote is authoritative only for the exact ordered title set, current public/active/published availability, immutable current price/currency snapshots, and disjoint account ownership/claimable/purchase-hold state used to compute its SHA-256 fingerprint.
 - A checkout accepts one currency. Mixed-currency input is rejected; currencies are never converted or summed.
-- Browser display and provider validation share the ISO currency exponent from `Intl`; unsupported codes and Stripe's exceptional ISK/UGX charge-unit semantics are rejected before publication/Checkout.
+- Browser display and provider validation use a presentment-currency allowlist pinned from Stripe's official currency documentation on 2026-08-10, intersect it with runtime `Intl` support for ISO exponents, and reject unsupported codes plus Stripe's exceptional ISK/UGX charge-unit semantics before publication/Checkout.
+- Catalog prices are positive and at most `49,999,999` minor units. A complete Checkout subtotal has the same ceiling; canonical provider snapshots cap each monetary amount at `99,999,999`, reserving automatic-tax headroom.
 - Signed-in checkout identity is permanently the authenticated verified user and that user's normalized account email. A payer-edited Checkout contact email cannot redirect ownership or application email.
 - Guest purchase identity is created only from a canonically paid Checkout Session email. Browser-submitted email is never purchase authority.
 - A local order and its item snapshots commit before Checkout Session creation. Stripe uses the order UUID as its idempotency key.
@@ -68,6 +69,8 @@ The user must obtain `STRIPE_WEBHOOK_SECRET` from the local `stripe listen --for
 - One durable grant explains each independent access source. `preserved` grants explain pre-commerce access; `purchase` grants point to exactly one order item.
 - The effective entitlement for `(user, title)` is active if and only if at least one grant in that scope is active. Projection always locks the user/title scope before re-reading every grant.
 - Unclaimed guest grants have no user and no access. Claiming attaches all eligible grants for the verified normalized email in one idempotent transaction.
+- Claim completion requires a current verified session plus a project-owned, one-use, normalized-email-bound authorization. Any password-bearing account must rotate its password and revoke all sessions through the exact commerce recovery link before reset-derived authorization is minted; ordinary verification/reset/magic flows never authorize a claim.
+- Signed-in `checkout_pending`, `checkout_open`, `payment_pending`, `failed`, and `exception` orders, same-email unclaimed purchases, and suspended purchase grants block a second one-time purchase. Local elapsed time never releases an ambiguous order; only signed canonical `expired` releases it. Anonymous cross-device deduplication remains out of scope before a canonical paid email exists.
 - Succeeded refund allocations can only accumulate. Automatic allocation is limited to single-title refunds and complete remaining-order refunds; partial multi-title refunds enter `exception` and do not guess access.
 - A purchase grant is refund-revoked only when cumulative succeeded allocations reach the item's complete paid total.
 - An open dispute suspends the affected payment's otherwise-valid purchase grants; a won/reinstated dispute restores otherwise-valid grants; a lost dispute permanently revokes them. Another active grant preserves effective access.
@@ -81,12 +84,12 @@ Create `src/lib/types/commerce.ts` with strict Zod input schemas and output-only
 import { z } from 'zod';
 
 export const MAX_CART_TITLES = 25;
-export const cartTitleIdSchema = z.uuid();
+export const cartTitleIdSchema = z.uuid().transform((value) => value.toLowerCase());
 
 export const cartStateV1Schema = z.strictObject({
   version: z.literal(1),
   titleIds: z.array(cartTitleIdSchema).max(MAX_CART_TITLES),
-  checkoutAttemptId: z.uuid()
+  checkoutAttemptId: z.uuid().transform((value) => value.toLowerCase())
 });
 export type CartStateV1 = z.output<typeof cartStateV1Schema>;
 
@@ -111,6 +114,8 @@ export interface CommerceQuoteDto {
   subtotalMinor: number;
   items: CommerceQuoteItemDto[];
   alreadyOwnedTitleIds: string[];
+  claimableTitleIds: string[];
+  reservedTitleIds: string[];
   unavailableTitleIds: string[];
   taxNotice: 'calculated_at_checkout';
   canCheckout: boolean;
@@ -119,7 +124,7 @@ export interface CommerceQuoteDto {
 export const checkoutRequestSchema = z.strictObject({
   titleIds: z.array(cartTitleIdSchema).min(1).max(MAX_CART_TITLES),
   quoteFingerprint: z.string().regex(/^[a-f0-9]{64}$/u),
-  checkoutAttemptId: z.uuid()
+  checkoutAttemptId: z.uuid().transform((value) => value.toLowerCase())
 });
 
 export type CheckoutResultDto =
@@ -362,13 +367,13 @@ npm --version
 npm outdated --json
 npm view stripe version engines --json
 npm view tsx version engines --json
-npm view typescript-eslint@8.66.0 peerDependencies --json
+npm view typescript-eslint@8.67.0 peerDependencies --json
 npm audit --omit=dev --audit-level=high
 npm audit --audit-level=high
 npm ls --depth=0
 ```
 
-Expected: Node `v26.7.0`, npm `11.19.0`; Stripe remains `22.4.0`; `tsx` reports the `4.23.12` patch; TypeScript 7 remains outside the linter peer range; no unexplained high/critical production advisory; dependency tree exits cleanly. If registry evidence differs, review official migration notes before changing the disposition.
+Expected: Node `v26.7.0`, npm `11.19.0`; Stripe remains `22.5.0`; `tsx` reports the `4.23.12` patch; TypeScript 7 remains outside the linter peer range; no unexplained high/critical production advisory; dependency tree exits cleanly. If registry evidence differs, review official migration notes before changing the disposition.
 
 - [x] **Step 2: Write failing shared-contract tests**
 
@@ -466,7 +471,7 @@ npm install --save-dev --save-exact tsx@4.23.12
 npm ls --depth=0
 ```
 
-Expected: a clean dependency tree. Keep Stripe `22.4.0` and TypeScript `6.0.3` unchanged. Update `docs/dependency-decisions.md` with the date, commands, explicit Stripe API version, `tsx` patch, TypeScript peer-range hold, and audit disposition without pasting full audit output.
+Expected: a clean dependency tree. Keep Stripe `22.5.0` and TypeScript `6.0.3` unchanged. Update `docs/dependency-decisions.md` with the date, commands, explicit Stripe API version, `tsx` patch, TypeScript peer-range hold, and audit disposition without pasting full audit output.
 
 - [x] **Step 7: Verify and commit Task 1**
 
@@ -739,21 +744,23 @@ type QuoteFingerprintInputV1 = {
     presentationPublishedAt: string;
   }>;
   alreadyOwnedTitleIds: string[];
+  claimableTitleIds: string[];
+  reservedTitleIds: string[];
   unavailableTitleIds: string[];
 };
 ```
 
-Prove membership, price, currency, revision, publication, and ownership changes alter SHA-256 while input ordering does not. Never locale-sort. Run focused test. Expected: FAIL then PASS after pure implementation.
+Prove membership, price, currency, revision, publication, ownership, claimable, and reserved changes alter SHA-256 while input ordering does not. Canonicalize UUIDs before deduplication and bytewise sorting; mixed-case spellings of one UUID are duplicates and must never select different advisory locks. Never locale-sort. Run focused test. Expected: FAIL then PASS after pure implementation.
 
 - [x] **Step 4: Write failing PostgreSQL quote tests**
 
-Cover public/published/active/positive-price titles; private, draft, inactive, zero-price, and missing-presentation titles; mixed currencies; active/revoked ownership; duplicates; unknown IDs; and 25/26 boundaries. Unknown/private IDs return only requested IDs in the unavailable list. Promise-barrier tests must prove locked re-quote observes concurrent catalog and entitlement changes.
+Cover public/published/active/positive-price titles; private, draft, inactive, zero-price, and missing-presentation titles; mixed currencies; active/revoked ownership; same-email unclaimed guest purchases; active and suspended purchase grants; unresolved order states; duplicates including mixed-case UUIDs; unknown IDs; and 25/26 boundaries. Quote partitions must be disjoint with owned over claimable over reserved precedence. Unknown/private IDs return only requested IDs in the unavailable list. Promise-barrier tests must prove locked re-quote observes concurrent catalog, entitlement, claim, reservation, and mixed-case publication changes.
 
 Run `npm run test:integration -- tests/integration/commerce-quote.test.ts`. Expected: FAIL.
 
 - [x] **Step 5: Implement quote and locked re-quote**
 
-Return only safe published DTOs. For checkout, acquire sorted Plan 4 title locks, then authenticated user/title locks, and re-read. Do not hold these locks across Stripe calls.
+Return only safe published DTOs. For checkout, acquire canonical sorted Plan 4 title locks, then authenticated user/title locks, and re-read. Reservation reads under those scopes must not invert the fulfillment/claim order by taking order rows after entitlement locks. Do not hold these locks across Stripe calls.
 
 ```ts
 export async function lockAndQuoteCart(
@@ -763,7 +770,7 @@ export async function lockAndQuoteCart(
 ): Promise<CommerceQuote>;
 ```
 
-Reject duplicate/oversized/mixed-currency input as `INVALID_CART`; `canCheckout=false` when nothing remains. Run quote tests. Expected: PASS.
+Reject duplicate/oversized/mixed-currency input as `INVALID_CART`; `canCheckout=false` when nothing remains. A same-attempt pending/open hold is excluded only inside the shared 30-second provider-call safety window; payment-pending, failed, exception, suspended, and stale self-attempt states remain reserved. Only canonically expired orders release. Run quote tests. Expected: PASS.
 
 - [x] **Step 6: Write failing atomic rate-limit tests**
 
@@ -904,7 +911,7 @@ Run focused tests. Expected: FAIL then PASS after implementation.
 
 - [x] **Step 2: Write failing durable-order integration tests**
 
-Cover account and guest order creation, immutable item snapshots, one currency, status hash only, unique attempt idempotency, no order for `CART_CHANGED`, no order for zero accepted items, concurrent same attempt yielding one order, and rollback of order/items/audit together.
+Cover account and guest order creation, immutable item snapshots, one currency, status hash only, unique canonical attempt idempotency, no order for `CART_CHANGED`, no order for zero accepted items, concurrent same attempt yielding one order, signed-in distinct-attempt duplicate-purchase serialization, partial accepted/rejected cart retry, and rollback of order/items/audit together.
 
 For signed-in orders, snapshot only the verified account email and user. Guest orders begin with both purchase email and guest identity null. Assert audit details contain counts/currency/amounts/internal IDs but no title text, email, token, or request headers.
 
@@ -912,9 +919,9 @@ Run `npm run test:integration -- tests/integration/commerce-orders.test.ts`. Exp
 
 - [x] **Step 3: Implement locked accepted-order creation**
 
-Inside one transaction: apply checkout throttle, call `lockAndQuoteCart`, constant-time compare the submitted fingerprint, create `checkout_pending` order/items/status digest, and append `commerce.checkout_created`. Return the plaintext status token only to the route call stack.
+Inside one transaction: apply checkout throttle, call `lockAndQuoteCart`, constant-time compare the submitted fingerprint, create `checkout_pending` order/items/status digest, and append `commerce.checkout_created`. A distinct signed-in attempt cannot accept a title held by pending/open/payment-pending/failed/exception state, a same-email guest purchase, or a suspended grant. Return the plaintext status token only to the route call stack.
 
-For a retry with the same attempt UUID, lock/load the existing order and verify exact actor, quote membership/fingerprint, and nonterminal state. Reuse the order and re-derive the same guest status credential without changing its stored digest. A terminal order, changed exact cart, secret mismatch, or attempt too old to preserve Stripe's minimum expiration returns `CHECKOUT_ATTEMPT_CONFLICT`; the browser rotates the attempt before retrying. Never reuse paid/failed/expired/exception attempts.
+For a retry with the same attempt UUID, acquire the same canonical title and entitlement scopes, lock/load the existing order, and recheck ownership/claimable conflicts before verifying actor, immutable accepted subset/fingerprint, and resumable state. Reuse only pending/open orders inside the shared 30-second provider-call window and re-derive the same guest status credential without changing its stored digest. A changed quote, stale attempt, payment-pending, paid, failed, expired, exception, secret mismatch, or newly owned/claimable title returns `CHECKOUT_ATTEMPT_CONFLICT`; the browser rotates only when a fresh quote is actually available. A stale or ambiguous old order remains a hold until signed canonical resolution—never release it from `createdAt` alone.
 
 Run integration tests. Expected: PASS.
 
@@ -927,13 +934,13 @@ Assert ordering with deferred promises:
 3. Gateway call begins.
 4. Session attachment uses a new short transaction.
 
-Test successful attach, same-ID retry, conflicting Session ID to `exception`, retryable provider failure leaving recoverable `checkout_pending`, lost response followed by same idempotency-key retry, local attachment failure followed by webhook recovery, and no Session creation after cart change.
+Test successful attach, same-ID retry only for pending/open, terminal-state same-ID conflict, conflicting Session ID to `exception`, retryable provider failure leaving reserved `checkout_pending`, lost response followed by same idempotency-key retry inside the safety window, local attachment failure followed by webhook recovery, provider return after the safety/expiry boundary, webhook-before-delayed-attach, and no Session creation after cart change.
 
 Expected RED until orchestration exists.
 
 - [x] **Step 5: Implement Checkout orchestration and attachment**
 
-Map stored items—not browser DTOs—to `CreateCheckoutSessionInput`. Use order UUID for metadata and idempotency. Attach only Session ID, expiry, and state; do not persist the Checkout URL. Return the URL to the route. Reissuing the same idempotent create request recovers a lost URL/response. A conflicting provider ID becomes a permanent exception with a minimized audit event and no grants.
+Map stored items—not browser DTOs—to `CreateCheckoutSessionInput`. Use order UUID for metadata and idempotency. Attach only Session ID, expiry, and state; do not persist the Checkout URL. Return the URL only when attachment observes a safely resumable pending/open state and an unexpired provider Session. A delayed already-expired provider result retains the exact association in a fulfillable reserved state but returns a safe conflict so a signed webhook can decide paid versus expired. Reissuing the same idempotent create request recovers a lost URL/response only inside the safety window. A conflicting provider ID becomes a permanent exception with a minimized audit event and no grants.
 
 Run focused/unit/integration tests. Expected: PASS.
 
@@ -1198,7 +1205,7 @@ const commerceClaimMetadataSchema = z.strictObject({
 });
 ```
 
-Prove absent metadata sends generic auth magic email; valid metadata plus matching canonically paid guest order enqueues the commerce claim receipt; invalid/mismatched metadata reveals nothing and cannot retrieve another order; token/action URL is never logged; and token verification remains atomic one-use.
+Prove absent metadata sends generic auth magic email; valid metadata plus a matching canonically paid guest order and no credential enqueues the commerce claim receipt; invalid/mismatched metadata reveals nothing and cannot retrieve another order; direct commerce metadata cannot bypass the credential gate; a verified credential inserted after magic issuance prevents commerce authorization, while an intervening unverified credential stripped by Better Auth leaves no orphan authority and both ordinary and commerce magic remain usable; a successful magic action cancels pending resets; token/action URL is never logged; and token verification remains atomic one-use.
 
 Run auth/claim-email tests. Expected: FAIL.
 
@@ -1206,9 +1213,11 @@ Run auth/claim-email tests. Expected: FAIL.
 
 The claim-email job first checks the stable outbox key. If already present, complete without minting another token. Otherwise load the paid guest order and current identity eligibility.
 
-- Normal/no account: call a worker-safe Better Auth server's `signInMagicLink` API with same-origin `/claim/complete`, `/claim/complete?error=...`, and strict metadata. Its callback re-loads and matches order/email before enqueuing the combined receipt/claim outbox message.
-- Matching verified account: magic link may sign it in, then claim.
-- Matching unverified password account: preserve Plan 3's protection; enqueue a receipt without a claim action and request the existing one-use verification email with `/claim/complete` callback. Do not allow magic link to replace the pending credential proof.
+- No password credential and no surviving credential-authority row: call a worker-safe Better Auth server's `signInMagicLink` API with same-origin `/claim/complete`, `/claim/complete?error=...`, and strict metadata. Its callback re-loads and matches order/email before enqueuing the combined receipt/claim outbox message. At verification, lock/recheck the credential generation before minting magic-derived claim authorization. A verified credential that appeared after issuance rejects. An unverified credential that Better Auth stripped after mailbox proof may remove orphan authority and proceed passwordless only with no reset epoch or the exact live unapplied epoch marker; applied/missing/expired/malformed/ambiguous reset evidence rejects. A surviving authority row routes a fresh claim request to password recovery.
+- Any matching password credential, verified or unverified: never issue commerce magic. Enqueue the safe receipt plus an exact-purpose password-reset message. Successful reset changes the password, revokes sessions, marks only the reset-token-bound account verified, and then mints reset-derived claim authorization. The page signs in with the new password; there is no follow-up verification message.
+- Ordinary verification, reset, and magic flows cannot mint commerce authorization. Verification does not auto-sign in. Block in-session `/change-password`, and revalidate a successfully verified password hash after session creation so a sign-in that races reset is deleted and rejected generically. Any password-authority or magic-generation guard fault must first scrub the valid cookie and clear the pending Better Auth session, then attempt exact session deletion and return a generic 401; magic rejection also removes redirect state. Cleanup failure never returns a usable token.
+
+Every password credential must also have project-owned `credential_authority` outside generated Better Auth schema. Migration `0006` backfills the exact legacy hashes and fails on duplicate/null credential state; integration tests execute the actual SQL and prove both failures roll back. Bootstrap establishes authority atomically; ordinary registration completes a separate post-create authority transaction before returning, with partial failure sign-in fail-closed/reset-recoverable. All magic links carry a hashed project marker bound to the authorized generation and delete any session created from a stale/missing/mismatched marker. Successful magic invalidates all outstanding native/project resets under the user lock, preserving a live authorized credential while clearing its epoch or deleting passwordless/orphan authority. Reset issuance promotes only its exact live native token, rotates a per-user epoch without disabling the current authorized password, invalidates siblings, and binds completion to the digest of the exact hash that request applied. Stale rollback is compare-and-swap, so it cannot overwrite a newer applied reset. Missing/mismatched authority fails closed and is recovered only by a fresh mailbox reset. `npm run auth:schema` must leave the project-owned table intact.
 
 `createAuthServer` must remain constructible in the worker without `getRequestEvent` or SvelteKit cookie plugin. Route runtime still adds `sveltekitCookies`; worker runtime does not.
 
@@ -1264,15 +1273,15 @@ Won disputes do not override a full refund or permanent revocation. Multiple dis
 
 - [x] **Step 2: Write failing claim integration tests**
 
-Cover a verified session claiming every paid unclaimed purchase for normalized email; several orders/titles; same-user replay; a matching verified preexisting account; unverified-session denial; different email; identity already claimed by another user; concurrent claim attempts; current refund/dispute-derived active/suspended/revoked states; one projection per affected scope; and aggregate audit with no order contents/email.
+Cover a verified session plus one-use authorization claiming every paid unclaimed purchase for normalized email; several orders/titles; same-user claim with a fresh authorization; exact-token sequential replay and concurrent double-use; a matching verified preexisting account; missing/mismatched authorization; magic-derived authority rejected for a credential account; unverified-session denial; different email; identity already claimed by another user; concurrent claim attempts; current refund/dispute-derived active/suspended/revoked states; one projection per affected scope; and aggregate audit with no order contents/email.
 
-Force a mid-claim failure and prove guest identity, grants, entitlements, and audit all roll back. Unclaimed grants must remain unable to read/download before commit.
+Force a mid-claim failure and prove authorization consumption, guest identity, grants, entitlements, and audit all roll back. Unclaimed grants must remain unable to read/download before commit.
 
 Run `npm run test:integration -- tests/integration/commerce-claims.test.ts`. Expected: FAIL.
 
 - [x] **Step 3: Implement the atomic claim transaction**
 
-Require a current user whose `emailVerified` is true and normalize its email. Lock matching guest identity, then all paid guest orders/items/grants, then sorted user/title scopes. If `claimedByUserId` is null set it once; if it is the same user continue idempotently; if different, throw a generic permanent conflict.
+Require a current user whose `emailVerified` is true, normalize its email, and require the opaque authorization token at the service boundary. Lock matching guest identity, all paid guest purchase facts, sorted user/title scopes, then the claimant. Recheck credential state and atomically consume the email-bound authorization: any credential requires reset-derived authority, while magic-derived authority is valid only if no credential exists. If `claimedByUserId` is null set it once; if it is the same user continue idempotently with a fresh authorization; if different, throw a generic permanent conflict.
 
 Attach every eligible no-user purchase grant, derive its current state from locked payment/refund/allocation/dispute data, project entitlements, and append one `commerce.guest_claimed` audit with claimed-order/title counts. Never include email/title snapshots/provider IDs in audit.
 
@@ -1282,7 +1291,7 @@ Run integration tests. Expected: PASS.
 
 `/claim` accepts a same-origin form email and always returns the same status text whether no identity, already claimed, unverified credential, or eligible purchases exist. A server service normalizes the email, applies the application-owned `commerce.claim-request` fixed-window limit using an HMAC scope over normalized email plus request IP and the existing auth email-limit settings, queries eligible guest orders without returning the result to the page, and enqueues deduplicated `{ orderId }` claim-email jobs. No job payload or key contains the submitted email. No match is a successful no-op.
 
-`/claim/complete` requires a verified current session, calls claim service, maps expired/invalid auth-link query to safe retry guidance, maps every identity conflict/no-purchase condition to the same generic result, and links to `/library` only after successful/idempotent claim. It never renders email or order details.
+`/claim/complete` requires a verified current session and the narrowly scoped HttpOnly commerce-authorization cookie, calls claim service, and clears the cookie only after a terminal expected result. Missing authorization never calls the service. The route maps expired/invalid auth-link query to safe retry guidance, maps every identity conflict/no-purchase condition to the same generic result, and links to `/library` only after successful/idempotent claim. It never renders email or order details.
 
 Expected: FAIL until routes exist.
 
@@ -1479,9 +1488,9 @@ Run cart page/client tests. Expected: PASS.
 
 - [x] **Step 5: Write failing success/cancel polling tests**
 
-Success loader accepts only an order UUID query value and exposes no status itself. Browser polls private status every two seconds with immediate first request, stops on terminal state/navigation/abort or after 60 seconds, and never calls Stripe/fulfillment. It renders delayed-payment pending guidance, account library action, guest check-email guidance without displaying email, safe failed/expired/exception recovery, and a timeout refresh action.
+Success loader accepts only an order UUID query value and exposes no status itself. Browser polls private status every two seconds with immediate first request, stops on a true terminal state/navigation/abort or after 60 seconds, and never calls Stripe/fulfillment. It renders delayed-payment pending guidance, account library action, guest check-email guidance without displaying email, safe expired/exception recovery, and a timeout refresh action. Signed asynchronous `failed` remains unresolved because later canonical success is allowed: continue polling, preserve pending checkout/cart state, and say not to start another checkout while support/reconciliation resolves it.
 
-On paid/paid_guest, remove only pending accepted title IDs from the current cart and create a fresh attempt UUID; titles added afterward remain. On failed/expired keep cart contents. Cancel clears pending session state but keeps the cart, then redirects 303 to `/cart?canceled=1`.
+On paid/paid_guest, remove only pending accepted title IDs from the current cart and create a fresh attempt UUID; titles added afterward remain. On signed canonical expired, keep cart contents but clear the old pending state and rotate the attempt so a fresh quote may proceed. On failed, retain both the pending state and attempt; never promise a retry. Cancel clears pending session state but keeps the cart, then redirects 303 to `/cart?canceled=1`.
 
 Expected: FAIL.
 
@@ -1536,7 +1545,7 @@ Publish at least two positive-price same-currency fixtures. Test add/remove/pers
 
 - [x] **Step 3: Add the guest claim journey**
 
-Test guest Checkout, unclaimed no-access boundary, signed fulfillment, Mailpit combined receipt/claim, one-use magic link, account creation/sign-in, claim of all same-email purchases, replay idempotency, and library access. Add the matching unverified password-account path: receipt plus verification callback, then claim after verification.
+Integration coverage proves the complete passwordless/password-account matrix, ordinary-verification/direct-claim denial, credential-after-magic races, action replay, sibling/in-flight reset serialization, and no follow-up verification message. The representative Playwright guest journey covers signed fulfillment, Mailpit recovery, attacker password/session revocation, explicit sign-in with the victim's new password, direct reset-derived claim, and library access. This division keeps the browser journey realistic while deterministic integration barriers prove the complete concurrency matrix.
 
 Never assert/render raw email outside Mailpit test inspection or log an action URL.
 
@@ -1546,7 +1555,7 @@ Test completed-unpaid pending UI, later async success, async failure without acc
 
 - [x] **Step 5: Add abuse/error/privacy journeys**
 
-Cover mixed currency, already-owned item, unavailable title, 26 items, duplicate checkout submit, invalid signature, duplicate webhook, live-mode mismatch, unauthorized/expired/rotated order status, generic claim request enumeration resistance, disabled Stripe 503, and removed prototype commerce paths remaining 404.
+Browser journeys cover mixed currency, already-owned item, unavailable title, 26 items, duplicate checkout submit, invalid signature, duplicate webhook, unauthorized order status, generic claim request enumeration resistance, and removed prototype commerce paths remaining 404. Focused route/runtime tests cover live-mode mismatch, expired or rotated order status, and disabled-Stripe 503 responses.
 
 Search captured page content, response DTOs, logs, audits, and database fixtures for forbidden secret/card/address/raw-event fields.
 
@@ -1606,7 +1615,8 @@ Document:
 
 - Disabled-by-default development and production behavior.
 - Exact nonsecret settings, API version `2026-07-29.dahlia`, the 30-minute configured hold plus bounded provider-creation allowance, webhook tolerance, tax-exclusive prices, format tax codes, Dashboard-managed payment methods with adaptive pricing disabled, and delayed-payment behavior.
-- Local Mailpit receipt, guest claim, unverified-password fallback, refund, dispute, job retry, event/order/payment/grant/audit diagnosis.
+- Exact Dashboard webhook allowlist for Checkout completion/async failure/expiry, Refund create/update/failure, and Dispute create/update/close/funds changes.
+- Local Mailpit receipt, guest claim, password-account recovery/session revocation, passwordless magic fallback, signed-account duplicate-purchase holds, refund, dispute, job retry, event/order/payment/grant/audit diagnosis.
 - Stripe Dashboard remains the refund/dispute-response UI.
 - Partial multi-title refund exceptions await Plan 6B allocation.
 - Plan 6B fee/balance/payout/reconciliation/dashboard work and production launch gate remain incomplete.
@@ -1664,7 +1674,7 @@ git diff --check
 git status --short
 ```
 
-Expected: every command exits zero; no unexplained high/critical production advisory; all commerce tests use fixtures; working tree contains only intended Task 15 docs/Compose edits.
+Expected: every command exits zero; no unexplained high/critical production advisory; all commerce tests use fixtures; the initial Task 15 run contains only intended Task 15 docs/Compose edits, while a Step 9 rerun may also contain the separately reviewed corrective implementation and test changes.
 
 - [x] **Step 5: Build and smoke the production image with Stripe disabled**
 
@@ -1711,11 +1721,11 @@ git commit -m "docs: add commerce operations runbook"
 
 Stage `compose.dev.yaml` only if changed.
 
-- [ ] **Step 9: Request final code review and address findings**
+- [x] **Step 9: Request final code review and address findings**
 
 Use `superpowers:requesting-code-review` against the full Plan 6A branch diff. Review for authorization, amount/currency correctness, lock order, transaction/provider boundaries, event idempotency, monotonic state, outbox deduplication, PII/secret minimization, claim identity, refund allocation, dispute restoration, fixture isolation, accessibility, and Plan 6B scope leakage.
 
-Apply accepted findings with `superpowers:receiving-code-review` and `superpowers:test-driven-development`. Re-run the smallest proving test first, then the full gate in Step 4. Commit review fixes separately with a precise message.
+Apply accepted findings with `superpowers:receiving-code-review` and `superpowers:test-driven-development`. Re-run the smallest proving test first, then the full gate in Step 4 and the isolated production-image rebuild/smoke in Step 5. Refresh the recorded release evidence from those final runs, then commit review fixes separately with a precise message.
 
 - [ ] **Step 10: Offer integration choices**
 
@@ -1735,7 +1745,8 @@ After the final reviewed branch is clean and green, use `superpowers:finishing-a
 | Paid account order atomically creates active access | 2, 3, 8, 9, 14 |
 | Paid guest order remains unclaimed/no-access | 2, 3, 8, 9, 10, 14 |
 | Verified normalized email claims all eligible purchases | 9, 10, 14 |
-| Unverified password account uses verification fallback | 9, 10, 14 |
+| Any password account rotates credentials/revokes sessions before reset-authorized claim | 9, 10, 14 |
+| Signed account cannot start a second one-time purchase while an order/grant is unresolved | 4, 6, 8, 13, 14 |
 | Full item refunds revoke only their grant; ambiguous partial multi-title stays exception | 11, 14 |
 | Open/won/lost disputes suspend/restore/revoke purchase grants | 12, 14 |
 | Another active purchase/preserved grant preserves effective access | 2, 3, 11, 12, 14 |

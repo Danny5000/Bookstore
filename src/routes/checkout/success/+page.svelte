@@ -16,7 +16,9 @@
   let timedOut = $state(false);
   let pollFailed = $state(false);
 
-  function finishTerminal(terminal: Exclude<OrderStatusDto, { status: 'pending' }>): void {
+  function finishTerminal(
+    terminal: Exclude<OrderStatusDto, { status: 'pending' | 'failed' }>
+  ): void {
     if (terminal.status === 'paid' || terminal.status === 'paid_guest') {
       const pending = loadPendingCheckout(globalThis.sessionStorage);
       cart.completePaid(pending?.acceptedTitleIds ?? []);

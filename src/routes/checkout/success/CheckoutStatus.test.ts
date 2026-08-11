@@ -24,7 +24,19 @@ describe('CheckoutStatus', () => {
     expect(body).not.toMatch(/http-equiv|window\.location/iu);
   });
 
-  it.each(['failed', 'expired', 'exception'] as const)(
+  it('renders a failed provider attempt as unresolved without promising another checkout', () => {
+    const { body } = render(CheckoutStatus, {
+      props: { status: { status: 'failed', message: 'private provider detail' } }
+    });
+    expect(body).toMatch(/role="alert"/u);
+    expect(body).toContain('Payment confirmation is still resolving');
+    expect(body).toContain('Refresh status');
+    expect(body).not.toContain('Return to your cart');
+    expect(body).not.toMatch(/try again/iu);
+    expect(body).not.toContain('private provider detail');
+  });
+
+  it.each(['expired', 'exception'] as const)(
     'renders %s as an actionable safe failure',
     (status) => {
       const { body } = render(CheckoutStatus, {

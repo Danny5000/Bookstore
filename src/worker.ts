@@ -3,7 +3,11 @@ import { rm, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { loadApplicationConfig } from '$lib/server/config/load';
 import { createAuthServer } from '$lib/server/auth/options';
-import { canSendMagicLink, ensureCustomerRole } from '$lib/server/auth/identity';
+import {
+  canSendCommerceMagicLink,
+  canSendMagicLink,
+  ensureCustomerRole
+} from '$lib/server/auth/identity';
 import {
   COMMERCE_CLAIM_EMAIL_JOB,
   COMMERCE_CLAIM_REQUEST_JOB,
@@ -61,6 +65,7 @@ const workerAuth = createAuthServer({
   queueCommerceClaimEmail: (input) =>
     queueCommerceClaimEmail(databaseClient.db, commerceMessages, input),
   canSendMagicLink: (email) => canSendMagicLink(databaseClient.db, email),
+  canSendCommerceMagicLink: (email) => canSendCommerceMagicLink(databaseClient.db, email),
   onUserCreated: (userId) => ensureCustomerRole(databaseClient.db, userId)
 });
 const stripeRuntime = createStripeCommerceRuntime(config);
@@ -146,6 +151,7 @@ try {
     workerId,
     concurrency: config.jobs.concurrency,
     pollIntervalMs: config.jobs.pollIntervalMs,
+    heartbeatIntervalMs: Math.max(1, Math.floor(config.jobs.leaseMs / 3)),
     signal: controller.signal
   });
 } catch (error: unknown) {

@@ -261,4 +261,17 @@ describe('Checkout orchestration', () => {
       vi.useRealTimers();
     }
   });
+
+  it('uses post-provider time when attaching a response that arrives after expiry', async () => {
+    const deps = dependencies();
+    vi.mocked(deps.currentTime)
+      .mockReturnValueOnce(new Date('2026-08-10T12:00:10.000Z'))
+      .mockReturnValueOnce(new Date('2026-08-10T12:31:01.000Z'));
+
+    await orchestrateCheckout({} as never, input, options, deps);
+
+    expect(deps.attachCheckoutSession).toHaveBeenCalledWith({}, expect.objectContaining({
+      now: new Date('2026-08-10T12:31:01.000Z')
+    }));
+  });
 });

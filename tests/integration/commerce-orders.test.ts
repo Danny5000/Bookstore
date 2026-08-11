@@ -2,6 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { count, eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import type { Actor } from '$lib/server/auth/admin-policy';
+import { createCommerceClaimAuthorization } from '$lib/server/auth/commerce-claim-authorization';
+import { findOrCreateGuestIdentity } from '$lib/server/auth/identity';
+import { claimGuestPurchases } from '$lib/server/commerce/claims';
 import {
   CartChangedError,
   CommerceConflictError,
@@ -10,12 +13,16 @@ import {
 } from '$lib/server/commerce/errors';
 import { attachCheckoutSession, createAcceptedOrder } from '$lib/server/commerce/orders';
 import { quoteCart } from '$lib/server/commerce/quote';
+import { setPreservedGrantState } from '$lib/server/commerce/grants';
 import { matchesOrderStatusToken } from '$lib/server/commerce/status-cookie';
 import { getAuthorizedOrderStatus } from '$lib/server/commerce/status';
 import {
   auditEvents,
+  entitlementGrants,
+  entitlements,
   orderItems,
   orders,
+  payments,
   proseBlocks,
   proseSections,
   revisionPresentations,
@@ -82,6 +89,61 @@ async function createOrderTitle(label: string, priceMinor = 1000) {
     .set({ activeRevisionId: revision.id })
     .where(eq(titles.id, title.id));
   return title;
+}
+
+async function createPaidGuestPurchase(email: string, titleId: string): Promise<void> {
+  const identity = await findOrCreateGuestIdentity(databaseClient.db, email);
+  const orderId = randomUUID();
+  const itemId = randomUUID();
+  await databaseClient.db.insert(orders).values({
+    id: orderId,
+    status: 'paid',
+    initiatingUserId: null,
+    guestIdentityId: identity.id,
+    purchaseEmail: identity.email,
+    currency: 'USD',
+    subtotalMinor: 1000,
+    taxMinor: 0,
+    totalMinor: 1000,
+    clientCheckoutAttemptId: randomUUID(),
+    quoteFingerprintSha256: 'c'.repeat(64),
+    stripeCheckoutSessionId: `cs_test_${orderId}`,
+    statusTokenSha256: 'd'.repeat(64),
+    checkoutExpiresAt: new Date('2026-08-10T12:30:00.000Z'),
+    paidAt: new Date('2026-08-10T12:05:00.000Z')
+  });
+  await databaseClient.db.insert(orderItems).values({
+    id: itemId,
+    orderId,
+    titleId,
+    titleSnapshot: 'Guest purchase title',
+    creatorNameSnapshot: 'Guest purchase creator',
+    format: 'prose',
+    currency: 'USD',
+    unitSubtotalMinor: 1000,
+    taxMinor: 0,
+    totalMinor: 1000,
+    stripeLineItemId: `li_test_${itemId}`
+  });
+  await databaseClient.db.insert(payments).values({
+    orderId,
+    stripePaymentIntentId: `pi_test_${orderId}`,
+    stripeLatestChargeId: `ch_test_${orderId}`,
+    status: 'succeeded',
+    amountMinor: 1000,
+    currency: 'USD',
+    paymentMethodCategory: 'card',
+    paidAt: new Date('2026-08-10T12:05:00.000Z')
+  });
+  await databaseClient.db.insert(entitlementGrants).values({
+    titleId,
+    userId: null,
+    source: 'purchase',
+    orderItemId: itemId,
+    state: 'unclaimed',
+    stateReason: 'payment_succeeded',
+    grantedAt: new Date('2026-08-10T12:05:00.000Z')
+  });
 }
 
 function orderInput(
@@ -243,6 +305,250 @@ describe('durable accepted commerce orders', () => {
     expect(audit).toHaveLength(1);
   });
 
+  it('serializes distinct signed-in attempts to one active title reservation', async () => {
+    const customer = await createCustomer('Reserved Order Customer');
+    const title = await createOrderTitle('Reserved Order Title');
+    const now = new Date('2026-08-10T12:00:00.000Z');
+    const firstAttemptId = randomUUID();
+    const secondAttemptId = randomUUID();
+    const [firstQuote, secondQuote] = await Promise.all([
+      quoteCart(databaseClient.db, customer, [title.id], firstAttemptId),
+      quoteCart(databaseClient.db, customer, [title.id], secondAttemptId)
+    ]);
+    const firstInput = orderInput(customer, [title.id], firstQuote.fingerprint, {
+      checkoutAttemptId: firstAttemptId,
+      now
+    });
+    const secondInput = orderInput(customer, [title.id], secondQuote.fingerprint, {
+      checkoutAttemptId: secondAttemptId,
+      now
+    });
+
+    const outcomes = await Promise.allSettled([
+      createAcceptedOrder(databaseClient.db, firstInput),
+      createAcceptedOrder(databaseClient.db, secondInput)
+    ]);
+
+    expect(outcomes.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1);
+    const rejected = outcomes.find((outcome) => outcome.status === 'rejected');
+    expect(rejected).toMatchObject({
+      status: 'rejected',
+      reason: {
+        quote: {
+          items: [],
+          reservedTitleIds: [title.id],
+          canCheckout: false
+        }
+      }
+    });
+    expect(await databaseClient.db.select().from(orders)
+      .where(eq(orders.initiatingUserId, customer.id))).toHaveLength(1);
+  });
+
+  it('resumes its own pending attempt and never releases ambiguous states on elapsed local time', async () => {
+    const customer = await createCustomer('Reservation Lifetime Customer');
+    const title = await createOrderTitle('Reservation Lifetime Title');
+    const createdAt = new Date('2026-08-10T12:00:00.000Z');
+    const checkoutAttemptId = randomUUID();
+    const quote = await quoteCart(databaseClient.db, customer, [title.id], checkoutAttemptId);
+    const input = orderInput(customer, [title.id], quote.fingerprint, {
+      checkoutAttemptId,
+      now: createdAt
+    });
+    const accepted = await createAcceptedOrder(databaseClient.db, input);
+
+    await expect(quoteCart(
+      databaseClient.db,
+      customer,
+      [title.id],
+      checkoutAttemptId,
+      new Date(createdAt.getTime() + 1_000)
+    )).resolves.toMatchObject({
+      items: [{ titleId: title.id }],
+      reservedTitleIds: []
+    });
+
+    const atProviderDeadline = new Date(createdAt.getTime() + 30_000);
+    await expect(createAcceptedOrder(databaseClient.db, {
+      ...input,
+      now: atProviderDeadline
+    })).resolves.toMatchObject({ reused: true, order: { id: accepted.order.id } });
+    await expect(quoteCart(
+      databaseClient.db,
+      customer,
+      [title.id],
+      checkoutAttemptId,
+      atProviderDeadline
+    )).resolves.toMatchObject({
+      items: [{ titleId: title.id }],
+      reservedTitleIds: []
+    });
+
+    const afterPendingDeadline = new Date(createdAt.getTime() + 30_001);
+    await expect(createAcceptedOrder(databaseClient.db, {
+      ...input,
+      now: afterPendingDeadline
+    })).rejects.toMatchObject({ code: 'CHECKOUT_ATTEMPT_CONFLICT' });
+    await expect(quoteCart(
+      databaseClient.db,
+      customer,
+      [title.id],
+      randomUUID(),
+      afterPendingDeadline
+    )).resolves.toMatchObject({
+      items: [],
+      reservedTitleIds: [title.id],
+      canCheckout: false
+    });
+
+    await databaseClient.db.update(orders).set({
+      status: 'checkout_open',
+      stripeCheckoutSessionId: `cs_test_${accepted.order.id}`,
+      checkoutExpiresAt: new Date(createdAt.getTime() + 1_860_000)
+    }).where(eq(orders.id, accepted.order.id));
+    await expect(quoteCart(
+      databaseClient.db,
+      customer,
+      [title.id],
+      checkoutAttemptId,
+      new Date(createdAt.getTime() + 1_000)
+    )).resolves.toMatchObject({
+      items: [{ titleId: title.id }],
+      reservedTitleIds: []
+    });
+    await databaseClient.db.update(orders).set({ status: 'payment_pending' })
+      .where(eq(orders.id, accepted.order.id));
+    await expect(quoteCart(
+      databaseClient.db,
+      customer,
+      [title.id],
+      checkoutAttemptId,
+      new Date(createdAt.getTime() + 1_000)
+    )).resolves.toMatchObject({
+      items: [],
+      reservedTitleIds: [title.id]
+    });
+
+    for (const status of [
+      'checkout_pending', 'checkout_open', 'payment_pending', 'failed', 'exception'
+    ] as const) {
+      await databaseClient.db.update(orders).set({ status }).where(eq(orders.id, accepted.order.id));
+      await expect(quoteCart(
+        databaseClient.db,
+        customer,
+        [title.id],
+        randomUUID(),
+        new Date('2026-08-12T12:00:00.000Z')
+      )).resolves.toMatchObject({
+        items: [],
+        reservedTitleIds: [title.id],
+        canCheckout: false
+      });
+    }
+  });
+
+  it('reuses a partially accepted cart with its exact original reviewed partition', async () => {
+    const customer = await createCustomer('Partial Reservation Customer');
+    const reserved = await createOrderTitle('Partial Reserved Title');
+    const available = await createOrderTitle('Partial Available Title');
+    const firstAttemptId = randomUUID();
+    const firstQuote = await quoteCart(
+      databaseClient.db, customer, [reserved.id], firstAttemptId
+    );
+    const reservation = await createAcceptedOrder(databaseClient.db, orderInput(
+      customer,
+      [reserved.id],
+      firstQuote.fingerprint,
+      { checkoutAttemptId: firstAttemptId }
+    ));
+
+    const partialAttemptId = randomUUID();
+    const requested = [reserved.id, available.id];
+    const partialQuote = await quoteCart(
+      databaseClient.db, customer, requested, partialAttemptId
+    );
+    expect(partialQuote).toMatchObject({
+      items: [{ titleId: available.id }],
+      reservedTitleIds: [reserved.id]
+    });
+    const partialInput = orderInput(customer, requested, partialQuote.fingerprint, {
+      checkoutAttemptId: partialAttemptId
+    });
+    const first = await createAcceptedOrder(databaseClient.db, partialInput);
+    const retried = await createAcceptedOrder(databaseClient.db, partialInput);
+
+    expect(first.items.map((item) => item.titleId)).toEqual([available.id]);
+    expect(retried).toMatchObject({
+      reused: true,
+      order: { id: first.order.id }
+    });
+    await databaseClient.db.update(orders).set({ status: 'expired' })
+      .where(eq(orders.id, reservation.order.id));
+    await expect(createAcceptedOrder(databaseClient.db, partialInput)).rejects.toMatchObject({
+      code: 'CHECKOUT_ATTEMPT_CONFLICT'
+    });
+  });
+
+  it('rechecks ownership under the entitlement scope before reusing an attempt', async () => {
+    const customer = await createCustomer('Reuse Ownership Customer');
+    const title = await createOrderTitle('Reuse Ownership Title');
+    const checkoutAttemptId = randomUUID();
+    const quote = await quoteCart(databaseClient.db, customer, [title.id], checkoutAttemptId);
+    const input = orderInput(customer, [title.id], quote.fingerprint, { checkoutAttemptId });
+    await createAcceptedOrder(databaseClient.db, input);
+    await databaseClient.db.transaction((transaction) => setPreservedGrantState(transaction, {
+      userId: customer.id,
+      titleId: title.id,
+      active: true,
+      stateReason: 'test_reuse_became_owned'
+    }));
+
+    await expect(createAcceptedOrder(databaseClient.db, input)).rejects.toMatchObject({
+      code: 'CHECKOUT_ATTEMPT_CONFLICT'
+    });
+  });
+
+  it('serializes a same-email guest claim against stale signed-in checkout acceptance', async () => {
+    const customer = await createCustomer('Concurrent Guest Claim Customer');
+    const [account] = await databaseClient.db.select().from(user)
+      .where(eq(user.id, customer.id));
+    if (!account) throw new Error('Expected customer');
+    const title = await createOrderTitle('Concurrent Guest Claim Title');
+    const checkoutAttemptId = randomUUID();
+    const staleQuote = await quoteCart(
+      databaseClient.db, customer, [title.id], checkoutAttemptId
+    );
+    await createPaidGuestPurchase(account.email, title.id);
+    const checkoutInput = orderInput(customer, [title.id], staleQuote.fingerprint, {
+      checkoutAttemptId
+    });
+    const authorizationToken = await createCommerceClaimAuthorization(databaseClient.db, {
+      email: account.email,
+      kind: 'password-reset'
+    });
+
+    const [claimResult, checkoutResult] = await Promise.allSettled([
+      claimGuestPurchases(databaseClient.db, {
+        userId: customer.id,
+        correlationId: `claim-${randomUUID()}`,
+        authorizationToken
+      }),
+      createAcceptedOrder(databaseClient.db, checkoutInput)
+    ]);
+
+    expect(claimResult).toMatchObject({ status: 'fulfilled' });
+    expect(checkoutResult).toMatchObject({
+      status: 'rejected',
+      reason: { code: 'CART_CHANGED' }
+    });
+    expect(await databaseClient.db.select().from(orders)
+      .where(eq(orders.initiatingUserId, customer.id))).toHaveLength(0);
+    expect(await databaseClient.db.select().from(entitlements)
+      .where(eq(entitlements.userId, customer.id))).toEqual([
+      expect.objectContaining({ titleId: title.id, revokedAt: null })
+    ]);
+  });
+
   it('rejects exact reuse after the checkout attempt reaches a terminal state', async () => {
     const title = await createOrderTitle('Terminal Checkout Attempt Title');
     const actor: Actor = { type: 'anonymous' };
@@ -344,6 +650,77 @@ describe('durable accepted commerce orders', () => {
     });
     expect(JSON.stringify(ownAudit)).not.toMatch(/cs_test_|Session Attachment Title/iu);
   });
+
+  it('does not reopen a checkout when its provider response arrives after expiry', async () => {
+    const title = await createOrderTitle('Late Session Attachment Title');
+    const actor: Actor = { type: 'anonymous' };
+    const quote = await quoteCart(databaseClient.db, actor, [title.id]);
+    const accepted = await createAcceptedOrder(
+      databaseClient.db,
+      orderInput(actor, [title.id], quote.fingerprint, {
+        now: new Date('2026-08-10T12:00:00.000Z')
+      })
+    );
+    const expiresAt = new Date('2026-08-10T12:31:00.000Z');
+
+    await expect(attachCheckoutSession(databaseClient.db, {
+      orderId: accepted.order.id,
+      providerSessionId: 'cs_test_late_attachment_101',
+      checkoutExpiresAt: expiresAt,
+      actor,
+      correlationId: `attach-${randomUUID()}`,
+      now: new Date('2026-08-10T12:31:01.000Z')
+    })).rejects.toBeInstanceOf(PermanentCommerceError);
+
+    await expect(databaseClient.db.select().from(orders)
+      .where(eq(orders.id, accepted.order.id))).resolves.toEqual([
+      expect.objectContaining({
+        status: 'checkout_open',
+        stripeCheckoutSessionId: 'cs_test_late_attachment_101',
+        checkoutExpiresAt: expiresAt
+      })
+    ]);
+  });
+
+  it.each(['payment_pending', 'paid', 'failed', 'expired', 'exception'] as const)(
+    'rejects a delayed exact attach after the order becomes %s',
+    async (terminalStatus) => {
+    const title = await createOrderTitle('Webhook Before Attach Title');
+    const actor = await createCustomer(`Attach terminal ${terminalStatus}`);
+    const quote = await quoteCart(databaseClient.db, actor, [title.id]);
+    const accepted = await createAcceptedOrder(
+      databaseClient.db,
+      orderInput(actor, [title.id], quote.fingerprint)
+    );
+    const providerSessionId = 'cs_test_webhook_before_attach_101';
+    const checkoutExpiresAt = new Date(accepted.order.createdAt.getTime() + 1_860_000);
+    await databaseClient.db.update(orders).set({
+      status: terminalStatus,
+      stripeCheckoutSessionId: providerSessionId,
+      checkoutExpiresAt,
+      ...(terminalStatus === 'paid'
+        ? {
+            taxMinor: 0,
+            totalMinor: accepted.order.subtotalMinor,
+            paidAt: new Date(accepted.order.createdAt.getTime() + 5_000)
+          }
+        : {})
+    }).where(eq(orders.id, accepted.order.id));
+
+    await expect(attachCheckoutSession(databaseClient.db, {
+      orderId: accepted.order.id,
+      providerSessionId,
+      checkoutExpiresAt,
+      actor,
+      correlationId: `attach-${randomUUID()}`,
+      now: new Date(accepted.order.createdAt.getTime() + 10_000)
+    })).rejects.toBeInstanceOf(PermanentCommerceError);
+    await expect(databaseClient.db.select().from(orders)
+      .where(eq(orders.id, accepted.order.id))).resolves.toEqual([
+      expect.objectContaining({ status: terminalStatus, stripeCheckoutSessionId: providerSessionId })
+    ]);
+    }
+  );
 
   it('authorizes persisted status only by the initiating account or exact guest cookie', async () => {
     const account = await createCustomer('Status Account');

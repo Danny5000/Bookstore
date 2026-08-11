@@ -15,7 +15,9 @@ const quote: CommerceQuoteDto = {
     format: 'prose', coverUrl: null, unitSubtotalMinor: 1299, currency: 'USD'
   }],
   alreadyOwnedTitleIds: [uuid(2)],
-  unavailableTitleIds: [uuid(3)],
+  claimableTitleIds: [uuid(3)],
+  reservedTitleIds: [uuid(4)],
+  unavailableTitleIds: [uuid(5)],
   taxNotice: 'calculated_at_checkout',
   canCheckout: true
 };
@@ -62,14 +64,18 @@ describe('CartReview states', () => {
     expect(body).not.toContain('BHD 12.34');
   });
 
-  it('renders owned and unavailable rejections generically with remove controls', () => {
+  it('renders owned, claimable, reserved, and unavailable partitions generically', () => {
     const { body } = render(CartReview, { props: { ...props, phase: 'ready', quote } });
     expect(body).toContain('already in your library');
+    expect(body).toContain('ready to claim');
+    expect(body).toContain('prior purchase or checkout');
+    expect(body).toMatch(/href="\/claim"[^>]*>Claim this purchase/u);
     expect(body).toContain('currently unavailable');
     expect(body).toContain('Remove owned item 1');
     expect(body).toContain('Remove unavailable item 1');
-    expect(body).not.toContain(uuid(2));
-    expect(body).not.toContain(uuid(3));
+    for (const value of [uuid(2), uuid(3), uuid(4), uuid(5)]) {
+      expect(body).not.toContain(value);
+    }
   });
 
   it('requires explicit reconfirmation after a changed quote', () => {

@@ -5,7 +5,8 @@ import { CommerceConflictError } from '$lib/server/commerce/errors';
 
 const dependencies = vi.hoisted(() => ({
   database: {},
-  claimGuestPurchases: vi.fn()
+  claimGuestPurchases: vi.fn(),
+  deleteCookie: vi.fn()
 }));
 
 vi.mock('$lib/server/db/runtime', () => ({
@@ -36,13 +37,20 @@ function event(options: {
   locals?: typeof verifiedLocals | Record<string, unknown>;
   search?: string;
   requestId?: string;
+  authorizationToken?: string | null;
 } = {}) {
   const headers = new Headers();
   if (options.requestId) headers.set('x-request-id', options.requestId);
   return {
     locals: options.locals ?? verifiedLocals,
     url: new URL(`https://books.example.com/claim/complete${options.search ?? ''}`),
-    request: new Request('https://books.example.com/claim/complete', { headers })
+    request: new Request('https://books.example.com/claim/complete', { headers }),
+    cookies: {
+      get: () => options.authorizationToken === null
+        ? undefined
+        : options.authorizationToken ?? 'A'.repeat(43),
+      delete: dependencies.deleteCookie
+    }
   };
 }
 
@@ -54,7 +62,10 @@ const claimed = {
 };
 
 describe('/claim/complete', () => {
-  beforeEach(() => dependencies.claimGuestPurchases.mockResolvedValue(claimed));
+  beforeEach(() => {
+    dependencies.claimGuestPurchases.mockResolvedValue(claimed);
+    dependencies.deleteCookie.mockReset();
+  });
 
   it.each([true, false])('links to the library only after a successful or idempotent claim', async (changed) => {
     dependencies.claimGuestPurchases.mockResolvedValueOnce({ ...claimed, changed });
@@ -62,8 +73,13 @@ describe('/claim/complete', () => {
     expect(data).toEqual({ state: 'claimed' });
     expect(dependencies.claimGuestPurchases).toHaveBeenCalledWith(dependencies.database, {
       userId,
-      correlationId: 'claim-complete-request'
+      correlationId: 'claim-complete-request',
+      authorizationToken: 'A'.repeat(43)
     });
+    expect(dependencies.deleteCookie).toHaveBeenCalledWith(
+      'pale-orbit-commerce-claim',
+      { path: '/claim/complete' }
+    );
     const { body } = render(CompletePage, { props: { data: { user: null, ...data } as never } });
     expect(body).toContain('href="/library"');
     expect(body).not.toMatch(/private@example|claimedOrderCount|claimedTitleCount/iu);
@@ -99,6 +115,12 @@ describe('/claim/complete', () => {
     expect(body).not.toContain('private-provider-detail');
   });
 
+  it('never claims for a verified session without the one-use emailed authorization', async () => {
+    const data = await load(event({ authorizationToken: null }) as never);
+    expect(data).toEqual({ state: 'not_claimed' });
+    expect(dependencies.claimGuestPurchases).not.toHaveBeenCalled();
+  });
+
   it.each([
     {
       actor: { type: 'anonymous' },
@@ -117,6 +139,10 @@ describe('/claim/complete', () => {
     const data = await load(event({ locals }) as never);
     expect(data).toEqual({ state: 'sign_in' });
     expect(dependencies.claimGuestPurchases).not.toHaveBeenCalled();
+    const { body } = render(CompletePage, {
+      props: { data: { user: null, ...data } as never }
+    });
+    expect(body).toContain('returnTo=%2Fclaim%2Fcomplete');
   });
 
   it('renders a safe temporary state for unexpected failures', async () => {
@@ -125,6 +151,7 @@ describe('/claim/complete', () => {
     );
     const data = await load(event() as never);
     expect(data).toEqual({ state: 'unavailable' });
+    expect(dependencies.deleteCookie).not.toHaveBeenCalled();
     expect(JSON.stringify(data)).not.toMatch(/database|example|order/iu);
   });
 });

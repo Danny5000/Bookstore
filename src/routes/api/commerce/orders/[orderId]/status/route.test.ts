@@ -58,7 +58,7 @@ describe('GET /api/commerce/orders/[orderId]/status', () => {
   it.each([
     [{ status: 'paid', libraryUrl: '/library' }],
     [{ status: 'paid_guest', claimMessage: 'Check your email for a secure link to claim this purchase.' }],
-    [{ status: 'failed', message: 'Payment was not completed.' }],
+    [{ status: 'failed', message: 'Payment confirmation is still resolving.' }],
     [{ status: 'expired', message: 'Checkout expired.' }],
     [{ status: 'exception', message: 'This purchase needs review.' }]
   ])('passes through a safe DTO without adding order detail', async (status) => {

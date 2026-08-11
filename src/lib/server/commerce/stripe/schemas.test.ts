@@ -136,4 +136,50 @@ describe('canonical Stripe boundary schemas', () => {
     };
     expect(createCheckoutSessionInputSchema.safeParse(input).success).toBe(false);
   });
+
+  it('caps every canonical provider amount at the hard Stripe snapshot ceiling', () => {
+    const overProviderCeiling = 100_000_000;
+    expect(() => parseCheckoutSnapshot(checkoutSnapshotFixture({
+      subtotalMinor: overProviderCeiling,
+      taxMinor: 0,
+      totalMinor: overProviderCeiling,
+      lineItems: checkoutSnapshotFixture().lineItems.map((line) => ({
+        ...line,
+        subtotalMinor: overProviderCeiling,
+        taxMinor: 0,
+        totalMinor: overProviderCeiling
+      }))
+    }))).toThrow();
+    expect(() => parsePaymentSnapshot(paymentSnapshotFixture({ amountMinor: overProviderCeiling }))).toThrow();
+    expect(() => parseRefundSnapshot(refundSnapshotFixture({ amountMinor: overProviderCeiling }))).toThrow();
+    expect(() => parseDisputeSnapshot(disputeSnapshotFixture({ amountMinor: overProviderCeiling }))).toThrow();
+  });
+
+  it('accepts 25 items at the checkout subtotal ceiling and rejects aggregate overflow', () => {
+    const items = Array.from({ length: 25 }, (_, index) => ({
+      orderItemId: `00000000-0000-4000-8000-${(index + 1).toString().padStart(12, '0')}`,
+      title: `Title ${index + 1}`,
+      format: 'prose' as const,
+      unitSubtotalMinor: index === 0 ? 1_999_999 : 2_000_000,
+      taxCode: 'txcd_10000000'
+    }));
+    const input = {
+      orderId: '00000000-0000-4000-8000-000000000101',
+      accountEmail: null,
+      currency: 'usd',
+      automaticTaxEnabled: true,
+      expiresAt: new Date('2026-08-10T12:30:00.000Z'),
+      successUrl: 'https://books.example.com/checkout/success',
+      cancelUrl: 'https://books.example.com/checkout/cancel',
+      items
+    };
+
+    expect(createCheckoutSessionInputSchema.safeParse(input).success).toBe(true);
+    expect(createCheckoutSessionInputSchema.safeParse({
+      ...input,
+      items: items.map((item, index) =>
+        index === 0 ? { ...item, unitSubtotalMinor: 2_000_000 } : item
+      )
+    }).success).toBe(false);
+  });
 });

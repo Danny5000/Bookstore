@@ -32,6 +32,8 @@ export interface CheckoutSnapshot {
 
 export interface PaymentSnapshot {
   paymentIntentId: string;
+  metadataVersion: '1';
+  metadataOrderId: string;
   latestChargeId: string | null;
   liveMode: boolean;
   state: 'pending' | 'succeeded' | 'failed';

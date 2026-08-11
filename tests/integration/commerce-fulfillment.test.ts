@@ -34,7 +34,7 @@ interface Fixture {
 
 async function createFixture(options: {
   guest?: boolean;
-  orderStatus?: 'checkout_pending' | 'checkout_open' | 'payment_pending' | 'paid';
+  orderStatus?: 'checkout_pending' | 'checkout_open' | 'payment_pending' | 'paid' | 'failed' | 'expired';
   eventType?: string;
   attachSession?: boolean;
   customerEmail?: string;
@@ -165,6 +165,8 @@ async function createFixture(options: {
     },
     payment: {
       paymentIntentId,
+      metadataVersion: '1',
+      metadataOrderId: orderId,
       latestChargeId: chargeId,
       liveMode: false,
       state: 'succeeded',
@@ -408,6 +410,231 @@ describe('canonical Stripe checkout fulfillment', () => {
       .where(eq(orders.id, alreadyPaid.orderId)))[0]?.status).toBe('paid');
   });
 
+  it('releases failed only after signed expiry and rejects every later non-expired command', async () => {
+    const fixture = await createFixture({
+      orderStatus: 'failed',
+      eventType: 'checkout.session.expired'
+    });
+    const expiredSession = {
+      ...fixture.session,
+      status: 'expired' as const,
+      paymentStatus: 'unpaid' as const,
+      paymentIntentId: null,
+      latestChargeId: null
+    };
+    await fulfillCheckoutEvent(databaseClient.db, {
+      stripeEventId: fixture.stripeEventId,
+      session: expiredSession,
+      payment: null
+    }, dependencies());
+    expect((await databaseClient.db.select().from(orders)
+      .where(eq(orders.id, fixture.orderId)))[0]?.status).toBe('expired');
+
+    const [latePaidEvent] = await databaseClient.db.insert(stripeEvents).values({
+      providerEventId: `evt_test_${randomUUID()}`,
+      eventType: 'checkout.session.async_payment_succeeded',
+      objectId: fixture.session.providerSessionId,
+      liveMode: false,
+      apiVersion: '2026-07-29.dahlia',
+      providerCreatedAt: new Date('2026-08-10T12:31:00.000Z'),
+      rawBodySha256: '9'.repeat(64)
+    }).returning();
+    if (!latePaidEvent) throw new Error('Expected late event');
+
+    await expect(fulfillCheckoutEvent(databaseClient.db, {
+      stripeEventId: latePaidEvent.id,
+      session: fixture.session,
+      payment: fixture.payment
+    }, dependencies())).rejects.toBeInstanceOf(PermanentCommerceError);
+    expect((await databaseClient.db.select().from(orders)
+      .where(eq(orders.id, fixture.orderId)))[0]?.status).toBe('expired');
+    expect(await databaseClient.db.select().from(entitlementGrants)
+      .where(eq(entitlementGrants.orderItemId, fixture.orderItemId))).toHaveLength(0);
+  });
+
+  it('keeps repeated failure terminal and permits only a later canonical success', async () => {
+    const fixture = await createFixture({ eventType: 'checkout.session.completed' });
+    const pendingSession = {
+      ...fixture.session,
+      paymentStatus: 'unpaid' as const,
+      latestChargeId: null
+    };
+    const pendingPayment = {
+      ...fixture.payment,
+      state: 'pending' as const,
+      latestChargeId: null,
+      paidAt: null,
+      paymentMethodCategory: null
+    };
+    await fulfillCheckoutEvent(databaseClient.db, {
+      stripeEventId: fixture.stripeEventId,
+      session: pendingSession,
+      payment: pendingPayment
+    }, dependencies());
+
+    const [failedEvent] = await databaseClient.db.insert(stripeEvents).values({
+      providerEventId: `evt_test_${randomUUID()}`,
+      eventType: 'checkout.session.async_payment_failed',
+      objectId: fixture.session.providerSessionId,
+      liveMode: false,
+      apiVersion: '2026-07-29.dahlia',
+      providerCreatedAt: new Date('2026-08-10T12:07:00.000Z'),
+      rawBodySha256: 'e'.repeat(64)
+    }).returning();
+    if (!failedEvent) throw new Error('Expected failed event');
+
+    await fulfillCheckoutEvent(databaseClient.db, {
+      stripeEventId: failedEvent.id,
+      session: pendingSession,
+      payment: { ...pendingPayment, state: 'failed' }
+    }, dependencies());
+
+    expect((await databaseClient.db.select().from(payments)
+      .where(eq(payments.orderId, fixture.orderId)))[0]).toMatchObject({
+      status: 'failed',
+      paidAt: null
+    });
+
+    const [repeatedFailedEvent, succeededEvent] = await databaseClient.db
+      .insert(stripeEvents)
+      .values([
+        {
+          providerEventId: `evt_test_${randomUUID()}`,
+          eventType: 'checkout.session.async_payment_failed',
+          objectId: fixture.session.providerSessionId,
+          liveMode: false,
+          apiVersion: '2026-07-29.dahlia',
+          providerCreatedAt: new Date('2026-08-10T12:08:00.000Z'),
+          rawBodySha256: 'f'.repeat(64)
+        },
+        {
+          providerEventId: `evt_test_${randomUUID()}`,
+          eventType: 'checkout.session.async_payment_succeeded',
+          objectId: fixture.session.providerSessionId,
+          liveMode: false,
+          apiVersion: '2026-07-29.dahlia',
+          providerCreatedAt: new Date('2026-08-10T12:09:00.000Z'),
+          rawBodySha256: '0'.repeat(64)
+        }
+      ])
+      .returning();
+    if (!repeatedFailedEvent || !succeededEvent) throw new Error('Expected follow-up events');
+
+    await fulfillCheckoutEvent(databaseClient.db, {
+      stripeEventId: repeatedFailedEvent.id,
+      session: pendingSession,
+      payment: { ...pendingPayment, state: 'failed' }
+    }, dependencies());
+    expect((await databaseClient.db.select().from(payments)
+      .where(eq(payments.orderId, fixture.orderId)))[0]?.status).toBe('failed');
+
+    await fulfillCheckoutEvent(databaseClient.db, {
+      stripeEventId: succeededEvent.id,
+      session: fixture.session,
+      payment: fixture.payment
+    }, dependencies());
+    expect((await databaseClient.db.select().from(payments)
+      .where(eq(payments.orderId, fixture.orderId)))[0]?.status).toBe('succeeded');
+    expect((await databaseClient.db.select().from(orders)
+      .where(eq(orders.id, fixture.orderId)))[0]?.status).toBe('paid');
+    expect(await databaseClient.db.select().from(entitlementGrants)).toHaveLength(1);
+  });
+
+  it('advances failed charge evidence when the same PaymentIntent is attempted again', async () => {
+    const fixture = await createFixture({ eventType: 'checkout.session.async_payment_failed' });
+    const oldChargeId = `ch_test_old_${randomUUID()}`;
+    const newChargeId = `ch_test_new_${randomUUID()}`;
+    const failedSession = {
+      ...fixture.session,
+      paymentStatus: 'unpaid' as const,
+      latestChargeId: oldChargeId
+    };
+    const failedPayment = {
+      ...fixture.payment,
+      state: 'failed' as const,
+      latestChargeId: oldChargeId,
+      paidAt: null
+    };
+    await fulfillCheckoutEvent(databaseClient.db, {
+      stripeEventId: fixture.stripeEventId,
+      session: failedSession,
+      payment: failedPayment
+    }, dependencies());
+
+    const [retriedEvent] = await databaseClient.db.insert(stripeEvents).values({
+      providerEventId: `evt_test_${randomUUID()}`,
+      eventType: 'checkout.session.async_payment_failed',
+      objectId: fixture.session.providerSessionId,
+      liveMode: false,
+      apiVersion: '2026-07-29.dahlia',
+      providerCreatedAt: new Date('2026-08-10T12:08:00.000Z'),
+      rawBodySha256: '1'.repeat(64)
+    }).returning();
+    if (!retriedEvent) throw new Error('Expected retried payment event');
+
+    await fulfillCheckoutEvent(databaseClient.db, {
+      stripeEventId: retriedEvent.id,
+      session: { ...failedSession, latestChargeId: newChargeId },
+      payment: { ...failedPayment, latestChargeId: newChargeId }
+    }, dependencies());
+
+    expect((await databaseClient.db.select().from(payments)
+      .where(eq(payments.orderId, fixture.orderId)))[0]).toMatchObject({
+      status: 'failed',
+      stripeLatestChargeId: newChargeId,
+      paidAt: null
+    });
+  });
+
+  it('fulfills a retried PaymentIntent when success replaces failed charge evidence', async () => {
+    const fixture = await createFixture({ eventType: 'checkout.session.async_payment_failed' });
+    const oldChargeId = `ch_test_old_${randomUUID()}`;
+    const newChargeId = `ch_test_new_${randomUUID()}`;
+    const failedSession = {
+      ...fixture.session,
+      paymentStatus: 'unpaid' as const,
+      latestChargeId: oldChargeId
+    };
+    const failedPayment = {
+      ...fixture.payment,
+      state: 'failed' as const,
+      latestChargeId: oldChargeId,
+      paidAt: null
+    };
+    await fulfillCheckoutEvent(databaseClient.db, {
+      stripeEventId: fixture.stripeEventId,
+      session: failedSession,
+      payment: failedPayment
+    }, dependencies());
+
+    const [succeededEvent] = await databaseClient.db.insert(stripeEvents).values({
+      providerEventId: `evt_test_${randomUUID()}`,
+      eventType: 'checkout.session.async_payment_succeeded',
+      objectId: fixture.session.providerSessionId,
+      liveMode: false,
+      apiVersion: '2026-07-29.dahlia',
+      providerCreatedAt: new Date('2026-08-10T12:09:00.000Z'),
+      rawBodySha256: '2'.repeat(64)
+    }).returning();
+    if (!succeededEvent) throw new Error('Expected succeeded payment event');
+
+    await fulfillCheckoutEvent(databaseClient.db, {
+      stripeEventId: succeededEvent.id,
+      session: { ...fixture.session, latestChargeId: newChargeId },
+      payment: { ...fixture.payment, latestChargeId: newChargeId }
+    }, dependencies());
+
+    expect((await databaseClient.db.select().from(payments)
+      .where(eq(payments.orderId, fixture.orderId)))[0]).toMatchObject({
+      status: 'succeeded',
+      stripeLatestChargeId: newChargeId,
+      paidAt: fixture.payment.paidAt
+    });
+    expect((await databaseClient.db.select().from(orders)
+      .where(eq(orders.id, fixture.orderId)))[0]?.status).toBe('paid');
+    expect(await databaseClient.db.select().from(entitlementGrants)).toHaveLength(1);
+  });
+
   it('keeps duplicate, out-of-order, and concurrent success jobs monotonic', async () => {
     const fixture = await createFixture();
     const [secondEvent] = await databaseClient.db.insert(stripeEvents).values({
@@ -541,5 +768,19 @@ describe('canonical Stripe checkout fulfillment', () => {
       action: 'commerce.fulfillment_exception', outcome: 'failed'
     });
     expect(JSON.stringify(audit)).not.toMatch(/private fulfillment|@example|cs_test|pi_test|ch_test/iu);
+  });
+
+  it('never regresses a signed-expired order back into a purchase reservation', async () => {
+    const fixture = await createFixture({ orderStatus: 'expired' });
+
+    await recordFulfillmentException(databaseClient.db, {
+      stripeEventId: fixture.stripeEventId,
+      orderId: fixture.orderId
+    });
+
+    expect((await databaseClient.db.select({ status: orders.status }).from(orders)
+      .where(eq(orders.id, fixture.orderId)))[0]?.status).toBe('expired');
+    expect((await databaseClient.db.select({ status: stripeEvents.status }).from(stripeEvents)
+      .where(eq(stripeEvents.id, fixture.stripeEventId)))[0]?.status).toBe('exception');
   });
 });

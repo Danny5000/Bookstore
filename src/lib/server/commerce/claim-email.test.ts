@@ -29,7 +29,7 @@ function operations(overrides: Partial<ClaimEmailOperations> = {}): ClaimEmailOp
       accountState: 'magic-link' as const
     })),
     requestMagicLink: vi.fn(async () => undefined),
-    requestVerification: vi.fn(async () => undefined),
+    requestPasswordRecovery: vi.fn(async () => undefined),
     enqueueReceiptWithoutClaim: vi.fn(async () => undefined),
     ...overrides
   };
@@ -67,24 +67,24 @@ describe('commerce claim-email job', () => {
       email: 'guest@example.com',
       accountState: 'magic-link'
     });
-    expect(ops.requestVerification).not.toHaveBeenCalled();
+    expect(ops.requestPasswordRecovery).not.toHaveBeenCalled();
     expect(ops.enqueueReceiptWithoutClaim).not.toHaveBeenCalled();
   });
 
-  it('requests credential verification before enqueueing a receipt with no claim action', async () => {
+  it('forces credential recovery before enqueueing a receipt with no claim action', async () => {
     const order: string[] = [];
     const record = job();
     const ops = operations({
       loadEligibility: vi.fn(async (orderId) => ({
         orderId,
         email: 'pending@example.com',
-        accountState: 'unverified-password' as const
+        accountState: 'password-recovery' as const
       })),
-      requestVerification: vi.fn(async () => { order.push('verification'); }),
+      requestPasswordRecovery: vi.fn(async () => { order.push('recovery'); }),
       enqueueReceiptWithoutClaim: vi.fn(async () => { order.push('receipt'); })
     });
     await createClaimEmailHandler(ops)(record, new AbortController().signal);
-    expect(order).toEqual(['verification', 'receipt']);
+    expect(order).toEqual(['recovery', 'receipt']);
     expect(ops.requestMagicLink).not.toHaveBeenCalled();
   });
 

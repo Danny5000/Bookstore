@@ -106,6 +106,8 @@ docker compose --file compose.prod.yaml up --detach --wait app worker
 
 Use an explicit `COMPOSE_PROJECT_NAME` in production so the volume name is stable. Encrypt and copy the backup set off the VPS. Copying `/var/lib/postgresql` from a running container is not an accepted backup: filesystem copies can capture torn or version-dependent database state. PostgreSQL logical `pg_dump`/`pg_restore` is the supported path.
 
+The logical dump must retain `credential_authority` together with Better Auth `user`, `account`, `session`, and `verification` rows. Credential authority is durable security state, not a cache: its authorized hash defines the only password generation permitted to create a session, while its reset epoch serializes in-flight recovery. Never omit, transform, print, or separately restore `authorized_password_hash` or `reset_epoch_sha256`.
+
 ## Integrity sampling
 
 After backup, compare a sample of database checksums to the volume. Query several current covers and revision originals:
@@ -115,7 +117,7 @@ docker compose --file compose.prod.yaml exec -T postgres psql -U $env:DATABASE_U
 docker compose --file compose.prod.yaml exec -T postgres psql -U $env:DATABASE_USER -d $env:DATABASE_NAME -c 'select original_storage_key, original_checksum_sha256 from title_revisions where original_storage_key is not null order by created_at desc limit 5;'
 ```
 
-Hash those exact paths from a read-only volume helper with `sha256sum`. Also verify that each active title points to an active revision, that active revisions have one published presentation, that sampled prose-image/comic-page/cover rows have corresponding objects, and that the six Plan 5 reader tables plus prose/comic semantic fingerprint columns are present in the logical dump. A backup is not considered valid until this sampling and an isolated restore succeed.
+Hash those exact paths from a read-only volume helper with `sha256sum`. Also verify that each active title points to an active revision, that active revisions have one published presentation, that sampled prose-image/comic-page/cover rows have corresponding objects, and that the six Plan 5 reader tables plus prose/comic semantic fingerprint columns are present in the logical dump. For credential authority, return aggregate counts only: every `provider_id='credential'` account must have exactly one authority row whose non-null authorized hash matches the account, and every authority row with a non-null authorized hash must have exactly one credential account with that hash. A passwordless row with `authorized_password_hash` null and a live `reset_epoch_sha256` is a legitimate pending reset; null/null is constraint-invalid. Run this check only with app/worker stopped. Do not project either hash or the reset epoch into terminal output, backup manifests, or support records. A backup is not considered valid until this sampling and an isolated restore succeed.
 
 ## Isolated restore rehearsal
 
@@ -132,7 +134,7 @@ docker compose --project-name $restoreProject --file compose.prod.yaml --profile
 docker compose --project-name $restoreProject --file compose.prod.yaml --profile tools run --rm storage-cleanup
 ```
 
-Compare the restored migration journal, row counts, active-revision/published-presentation pointers, retained-original and cover manifests, and SHA-256 samples. Start app and worker only on an isolated network, confirm `/health/ready`, admin review, and sampled previews, then destroy only the named restore project with `docker compose --project-name $restoreProject --file compose.prod.yaml down --volumes`. Production replacement requires a separately approved maintenance and rollback procedure.
+Compare the restored migration journal, row counts, active-revision/published-presentation pointers, retained-original and cover manifests, and SHA-256 samples. Before starting the restored app, run an aggregate-only credential-authority integrity check: missing authority for a credential, duplicate credential accounts, null credential hashes, credential/authority generation mismatch, and orphan non-null authority without exactly one matching credential must all be zero. A passwordless null-hash authority is valid only while its non-null reset epoch represents pending recovery. Never display the compared values. Do not repair a mismatch by blessing the current account hash or editing an epoch; keep the restore in maintenance and require a fresh mailbox reset for the affected account after the restore is accepted. Start app and worker only on an isolated network, confirm `/health/ready`, an actual bootstrap/admin password sign-in, admin review, and sampled previews, then destroy only the named restore project with `docker compose --project-name $restoreProject --file compose.prod.yaml down --volumes`. Production replacement requires a separately approved maintenance and rollback procedure.
 
 ## Future provider migration
 

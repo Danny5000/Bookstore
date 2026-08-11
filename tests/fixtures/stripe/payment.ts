@@ -5,6 +5,8 @@ export function paymentSnapshotFixture(
 ): PaymentSnapshot {
   return {
     paymentIntentId: 'pi_test_fixture_101',
+    metadataVersion: '1',
+    metadataOrderId: '00000000-0000-4000-8000-000000000101',
     latestChargeId: 'ch_test_fixture_101',
     liveMode: false,
     state: 'succeeded',

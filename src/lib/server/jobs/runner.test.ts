@@ -14,8 +14,32 @@ const job: JobRecord = {
 function repositoryReturning(record: JobRecord): JobRepository {
   return {
     claimNext: vi.fn().mockResolvedValueOnce(record).mockResolvedValue(null),
-    complete: vi.fn().mockResolvedValue(undefined),
-    fail: vi.fn().mockResolvedValue(undefined)
+    renewLease: vi.fn().mockResolvedValue(true),
+    complete: vi.fn().mockResolvedValue(true),
+    fail: vi.fn().mockResolvedValue(true)
+  };
+}
+
+function controlledSleep() {
+  const releases: Array<() => void> = [];
+  const sleep = vi.fn((_milliseconds: number, signal: AbortSignal) =>
+    new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      releases.push(finish);
+      signal.addEventListener('abort', finish, { once: true });
+    }));
+  return {
+    sleep,
+    releaseNext() {
+      const release = releases.shift();
+      if (!release) throw new Error('Expected a pending controlled sleep');
+      release();
+    }
   };
 }
 
@@ -31,11 +55,13 @@ describe('runWorker', () => {
       workerId: 'worker-test',
       concurrency: 1,
       pollIntervalMs: 1,
+      heartbeatIntervalMs: 1,
       signal: controller.signal,
       sleep: async () => controller.abort()
     });
 
-    expect(handler).toHaveBeenCalledWith(job, controller.signal);
+    expect(handler).toHaveBeenCalledWith(job, expect.any(AbortSignal));
+    expect(handler.mock.calls[0]?.[1]).not.toBe(controller.signal);
     expect(repository.complete).toHaveBeenCalledWith(job.id, 'worker-test');
     expect(repository.fail).not.toHaveBeenCalled();
   });
@@ -57,6 +83,7 @@ describe('runWorker', () => {
       workerId: 'worker-test',
       concurrency: 1,
       pollIntervalMs: 1,
+      heartbeatIntervalMs: 1,
       signal: controller.signal,
       sleep: async () => controller.abort()
     });
@@ -79,6 +106,7 @@ describe('runWorker', () => {
       workerId: 'worker-test',
       concurrency: 1,
       pollIntervalMs: 1,
+      heartbeatIntervalMs: 1,
       signal: controller.signal,
       sleep: async () => controller.abort()
     });
@@ -94,7 +122,7 @@ describe('runWorker', () => {
   it('runs two independent lease-owner slots concurrently and stops both on abort', async () => {
     const controller = new AbortController();
     const seenWorkers = new Set<string>();
-    const complete = vi.fn().mockResolvedValue(undefined);
+    const complete = vi.fn().mockResolvedValue(true);
     const repository: JobRepository = {
       claimNext: vi.fn(async (workerId: string) => {
         if (seenWorkers.has(workerId)) return null;
@@ -105,8 +133,9 @@ describe('runWorker', () => {
           lockedBy: workerId
         };
       }),
+      renewLease: vi.fn().mockResolvedValue(true),
       complete,
-      fail: vi.fn().mockResolvedValue(undefined)
+      fail: vi.fn().mockResolvedValue(true)
     };
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
@@ -125,6 +154,7 @@ describe('runWorker', () => {
       workerId: 'worker-concurrent',
       concurrency: 2,
       pollIntervalMs: 1,
+      heartbeatIntervalMs: 1,
       signal: controller.signal,
       sleep: async () => controller.abort()
     });
@@ -134,5 +164,153 @@ describe('runWorker', () => {
     release();
     await running;
     expect(complete).toHaveBeenCalledTimes(2);
+  });
+
+  it('renews an owned lease while a handler is running and stops after completion', async () => {
+    const controller = new AbortController();
+    const repository = repositoryReturning(job);
+    const heartbeat = controlledSleep();
+    let releaseHandler!: () => void;
+    const heldHandler = new Promise<void>((resolve) => { releaseHandler = resolve; });
+    const handler = vi.fn(async () => heldHandler);
+
+    const running = runWorker({
+      repository,
+      handlers: new Map([['test.handle', handler]]),
+      workerId: 'worker-test',
+      concurrency: 1,
+      pollIntervalMs: 1,
+      heartbeatIntervalMs: 25,
+      signal: controller.signal,
+      heartbeatSleep: heartbeat.sleep,
+      sleep: async () => controller.abort()
+    });
+
+    await vi.waitFor(() => expect(heartbeat.sleep).toHaveBeenCalledTimes(1));
+    heartbeat.releaseNext();
+    await vi.waitFor(() => expect(repository.renewLease).toHaveBeenCalledWith(
+      job.id,
+      'worker-test'
+    ));
+    releaseHandler();
+    await running;
+
+    expect(repository.complete).toHaveBeenCalledOnce();
+    const renewalCount = vi.mocked(repository.renewLease).mock.calls.length;
+    await Promise.resolve();
+    expect(repository.renewLease).toHaveBeenCalledTimes(renewalCount);
+  });
+
+  it('aborts the handler and skips terminal writes when lease renewal loses ownership', async () => {
+    const controller = new AbortController();
+    const repository = repositoryReturning(job);
+    vi.mocked(repository.renewLease).mockResolvedValue(false);
+    const heartbeat = controlledSleep();
+    let handlerSignal: AbortSignal | undefined;
+    const handler = vi.fn(async (_record: JobRecord, signal: AbortSignal) => {
+      handlerSignal = signal;
+      await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), {
+        once: true
+      }));
+    });
+
+    const running = runWorker({
+      repository,
+      handlers: new Map([['test.handle', handler]]),
+      workerId: 'worker-test',
+      concurrency: 1,
+      pollIntervalMs: 1,
+      heartbeatIntervalMs: 25,
+      signal: controller.signal,
+      heartbeatSleep: heartbeat.sleep,
+      sleep: async () => controller.abort()
+    });
+
+    await vi.waitFor(() => expect(heartbeat.sleep).toHaveBeenCalledTimes(1));
+    heartbeat.releaseNext();
+    await running;
+
+    expect(handlerSignal?.aborted).toBe(true);
+    expect(handlerSignal?.reason).toMatchObject({ name: 'JobLeaseLostError' });
+    expect(repository.complete).not.toHaveBeenCalled();
+    expect(repository.fail).not.toHaveBeenCalled();
+  });
+
+  it('conservatively aborts and skips terminal writes when lease renewal throws', async () => {
+    const controller = new AbortController();
+    const repository = repositoryReturning(job);
+    vi.mocked(repository.renewLease).mockRejectedValue(new Error('database unavailable'));
+    const heartbeat = controlledSleep();
+    let handlerSignal: AbortSignal | undefined;
+    const handler = vi.fn(async (_record: JobRecord, signal: AbortSignal) => {
+      handlerSignal = signal;
+      await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), {
+        once: true
+      }));
+    });
+
+    const running = runWorker({
+      repository,
+      handlers: new Map([['test.handle', handler]]),
+      workerId: 'worker-test',
+      concurrency: 1,
+      pollIntervalMs: 1,
+      heartbeatIntervalMs: 25,
+      signal: controller.signal,
+      heartbeatSleep: heartbeat.sleep,
+      sleep: async () => controller.abort()
+    });
+
+    await vi.waitFor(() => expect(heartbeat.sleep).toHaveBeenCalledTimes(1));
+    heartbeat.releaseNext();
+    await running;
+
+    expect(handlerSignal?.reason).toMatchObject({ name: 'JobLeaseLostError' });
+    expect(repository.complete).not.toHaveBeenCalled();
+    expect(repository.fail).not.toHaveBeenCalled();
+  });
+
+  it('treats a stale completion as lost ownership without attempting a stale failure', async () => {
+    const controller = new AbortController();
+    const repository = repositoryReturning(job);
+    vi.mocked(repository.complete).mockResolvedValue(false);
+
+    await expect(runWorker({
+      repository,
+      handlers: new Map([['test.handle', vi.fn().mockResolvedValue(undefined)]]),
+      workerId: 'worker-test',
+      concurrency: 1,
+      pollIntervalMs: 1,
+      heartbeatIntervalMs: 25,
+      signal: controller.signal,
+      sleep: async () => controller.abort()
+    })).resolves.toBeUndefined();
+
+    expect(repository.fail).not.toHaveBeenCalled();
+  });
+
+  it('does not crash when ambiguous completion is followed by a stale failure write', async () => {
+    const controller = new AbortController();
+    const repository = repositoryReturning(job);
+    vi.mocked(repository.complete).mockRejectedValue(new Error('ambiguous completion'));
+    vi.mocked(repository.fail).mockResolvedValue(false);
+
+    await expect(runWorker({
+      repository,
+      handlers: new Map([['test.handle', vi.fn().mockResolvedValue(undefined)]]),
+      workerId: 'worker-test',
+      concurrency: 1,
+      pollIntervalMs: 1,
+      heartbeatIntervalMs: 25,
+      signal: controller.signal,
+      sleep: async () => controller.abort()
+    })).resolves.toBeUndefined();
+
+    expect(repository.fail).toHaveBeenCalledWith(
+      job.id,
+      'worker-test',
+      'Transient job completion failure',
+      true
+    );
   });
 });

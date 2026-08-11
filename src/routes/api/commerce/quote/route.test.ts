@@ -30,6 +30,7 @@ vi.mock('$lib/server/commerce/rate-limit', () => ({
 import { POST } from './+server';
 
 const titleId = randomUUID();
+const checkoutAttemptId = randomUUID();
 const customer: Actor = { type: 'user', id: randomUUID(), roles: ['customer'] };
 const quote: CommerceQuoteDto = {
   fingerprint: 'b'.repeat(64),
@@ -46,6 +47,8 @@ const quote: CommerceQuoteDto = {
     currency: 'usd'
   }],
   alreadyOwnedTitleIds: [],
+  claimableTitleIds: [],
+  reservedTitleIds: [],
   unavailableTitleIds: [],
   taxNotice: 'calculated_at_checkout',
   canCheckout: true
@@ -87,7 +90,9 @@ describe('POST /api/commerce/quote', () => {
   });
 
   it('throttles the actor and returns only the authoritative private quote', async () => {
-    const response = await POST(event(JSON.stringify({ titleIds: [titleId] })) as never);
+    const response = await POST(event(JSON.stringify({
+      titleIds: [titleId], checkoutAttemptId
+    })) as never);
 
     expect(response.status).toBe(200);
     expect(response.headers.get('cache-control')).toBe('no-store');
@@ -106,17 +111,18 @@ describe('POST /api/commerce/quote', () => {
     expect(dependencies.quoteCart).toHaveBeenCalledWith(
       dependencies.database,
       customer,
-      [titleId]
+      [titleId],
+      checkoutAttemptId
     );
   });
 
   it.each([
-    ['wrong origin', event(JSON.stringify({ titleIds: [titleId] }), { origin: 'https://evil.example' }), 403, 'forbidden'],
-    ['missing origin', event(JSON.stringify({ titleIds: [titleId] }), { origin: null }), 403, 'forbidden'],
+    ['wrong origin', event(JSON.stringify({ titleIds: [titleId], checkoutAttemptId }), { origin: 'https://evil.example' }), 403, 'forbidden'],
+    ['missing origin', event(JSON.stringify({ titleIds: [titleId], checkoutAttemptId }), { origin: null }), 403, 'forbidden'],
     ['invalid JSON', event('{bad'), 400, 'INVALID_JSON'],
     ['unsupported media', event('{}', { contentType: 'text/plain' }), 415, 'UNSUPPORTED_MEDIA_TYPE'],
-    ['invalid input', event(JSON.stringify({ titleIds: [] })), 422, 'INVALID_INPUT'],
-    ['oversized input', event(JSON.stringify({ titleIds: [titleId], padding: 'x'.repeat(9_000) })), 413, 'PAYLOAD_TOO_LARGE']
+    ['invalid input', event(JSON.stringify({ titleIds: [], checkoutAttemptId })), 422, 'INVALID_INPUT'],
+    ['oversized input', event(JSON.stringify({ titleIds: [titleId], checkoutAttemptId, padding: 'x'.repeat(9_000) })), 413, 'PAYLOAD_TOO_LARGE']
   ])('maps %s to a private response', async (_label, requestEvent, status, code) => {
     const response = await POST(requestEvent as never);
     expect(response.status).toBe(status);
@@ -132,7 +138,7 @@ describe('POST /api/commerce/quote', () => {
       retryAfterSeconds: 17
     });
 
-    const response = await POST(event(JSON.stringify({ titleIds: [titleId] })) as never);
+    const response = await POST(event(JSON.stringify({ titleIds: [titleId], checkoutAttemptId })) as never);
     expect(response.status).toBe(429);
     expect(response.headers.get('retry-after')).toBe('17');
     expect(await response.json()).toEqual({ code: 'RATE_LIMITED' });
@@ -141,12 +147,12 @@ describe('POST /api/commerce/quote', () => {
 
   it('maps invalid carts and unexpected failures without leaking details', async () => {
     dependencies.quoteCart.mockRejectedValueOnce(new InvalidCartError());
-    const invalid = await POST(event(JSON.stringify({ titleIds: [titleId, titleId] })) as never);
+    const invalid = await POST(event(JSON.stringify({ titleIds: [titleId, titleId], checkoutAttemptId })) as never);
     expect(invalid.status).toBe(422);
     expect(await invalid.json()).toEqual({ code: 'INVALID_CART' });
 
     dependencies.quoteCart.mockRejectedValueOnce(new Error('private database detail'));
-    const unavailable = await POST(event(JSON.stringify({ titleIds: [titleId] })) as never);
+    const unavailable = await POST(event(JSON.stringify({ titleIds: [titleId], checkoutAttemptId })) as never);
     expect(unavailable.status).toBe(503);
     expect(await unavailable.json()).toEqual({ code: 'TEMPORARILY_UNAVAILABLE' });
   });

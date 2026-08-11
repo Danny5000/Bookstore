@@ -112,6 +112,39 @@
       </section>
     {/if}
 
+    {#if quote.claimableTitleIds.length > 0}
+      <section class="rejected" aria-labelledby="claimable-heading">
+        <h2 id="claimable-heading">Ready to claim</h2>
+        <p><a href={resolve('/claim')}>Claim this purchase</a></p>
+        {#each quote.claimableTitleIds as titleId, index (titleId)}
+          <div>
+            <span>A guest purchase for this item is ready to claim.</span>
+            <button
+              type="button"
+              aria-label={`Remove claimable item ${index + 1}`}
+              onclick={() => onremove(titleId)}
+            >Remove</button>
+          </div>
+        {/each}
+      </section>
+    {/if}
+
+    {#if quote.reservedTitleIds.length > 0}
+      <section class="rejected" aria-labelledby="reserved-heading">
+        <h2 id="reserved-heading">Checkout in progress</h2>
+        {#each quote.reservedTitleIds as titleId, index (titleId)}
+          <div>
+            <span>A prior purchase or checkout for this item is still being resolved.</span>
+            <button
+              type="button"
+              aria-label={`Remove reserved item ${index + 1}`}
+              onclick={() => onremove(titleId)}
+            >Remove</button>
+          </div>
+        {/each}
+      </section>
+    {/if}
+
     {#if quote.unavailableTitleIds.length > 0}
       <section class="rejected" aria-labelledby="unavailable-heading">
         <h2 id="unavailable-heading">Unavailable</h2>

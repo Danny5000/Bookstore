@@ -35,7 +35,10 @@
       : 'quote_unavailable';
   }
 
-  async function refresh(titleIds: readonly string[]): Promise<void> {
+  async function refresh(
+    titleIds: readonly string[],
+    checkoutAttemptId: string
+  ): Promise<void> {
     requiresConfirmation = false;
     issue = null;
     quote = null;
@@ -46,7 +49,11 @@
     }
     phase = 'loading';
     try {
-      const result = await quoteRequests.refresh(globalThis.fetch, titleIds);
+      const result = await quoteRequests.refresh(
+        globalThis.fetch,
+        titleIds,
+        checkoutAttemptId
+      );
       if (result.status === 'stale') return;
       quote = result.quote;
       phase = 'ready';
@@ -98,7 +105,8 @@
 
   $effect(() => {
     const titleIds = cart.titleIds;
-    void refresh(titleIds);
+    const checkoutAttemptId = cart.checkoutAttemptId;
+    void refresh(titleIds, checkoutAttemptId);
     return () => quoteRequests.cancel();
   });
 </script>
@@ -114,5 +122,5 @@
   {submitting}
   onremove={remove}
   oncheckout={checkout}
-  onretry={() => refresh(cart.titleIds)}
+  onretry={() => refresh(cart.titleIds, cart.checkoutAttemptId)}
 />

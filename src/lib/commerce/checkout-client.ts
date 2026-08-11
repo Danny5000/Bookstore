@@ -59,6 +59,8 @@ const quoteSchema = z.strictObject({
   subtotalMinor: moneySchema,
   items: z.array(quoteItemSchema).max(MAX_CART_TITLES),
   alreadyOwnedTitleIds: z.array(z.uuid()).max(MAX_CART_TITLES),
+  claimableTitleIds: z.array(z.uuid()).max(MAX_CART_TITLES),
+  reservedTitleIds: z.array(z.uuid()).max(MAX_CART_TITLES),
   unavailableTitleIds: z.array(z.uuid()).max(MAX_CART_TITLES),
   taxNotice: z.literal('calculated_at_checkout'),
   canCheckout: z.boolean()
@@ -66,6 +68,8 @@ const quoteSchema = z.strictObject({
   const everyId = [
     ...quote.items.map((item) => item.titleId),
     ...quote.alreadyOwnedTitleIds,
+    ...quote.claimableTitleIds,
+    ...quote.reservedTitleIds,
     ...quote.unavailableTitleIds
   ];
   if (new Set(everyId).size !== everyId.length) {
@@ -157,9 +161,13 @@ function errorKindForStatus(
 export async function requestQuote(
   fetcher: CommerceFetch,
   titleIds: readonly string[],
+  checkoutAttemptId: string,
   signal?: AbortSignal
 ): Promise<CommerceQuoteDto> {
-  const response = await sendJson(fetcher, '/api/commerce/quote', { titleIds: [...titleIds] }, signal);
+  const response = await sendJson(fetcher, '/api/commerce/quote', {
+    titleIds: [...titleIds],
+    checkoutAttemptId
+  }, signal);
   const body = await responseJson(response);
   if (!response.ok) throw new CheckoutClientError(errorKindForStatus(response, body, false));
   const parsed = quoteSchema.safeParse(body);
@@ -232,6 +240,8 @@ export function buildCheckoutRequest(
     ? new Set([
         ...parsedQuote.data.items.map((item) => item.titleId),
         ...parsedQuote.data.alreadyOwnedTitleIds,
+        ...parsedQuote.data.claimableTitleIds,
+        ...parsedQuote.data.reservedTitleIds,
         ...parsedQuote.data.unavailableTitleIds
       ])
     : null;
@@ -257,6 +267,7 @@ export type QuoteRequestResult =
 type QuoteRequester = (
   fetcher: CommerceFetch,
   titleIds: readonly string[],
+  checkoutAttemptId: string,
   signal: AbortSignal
 ) => Promise<CommerceQuoteDto>;
 
@@ -266,13 +277,17 @@ export class QuoteRequestCoordinator {
 
   constructor(private readonly requester: QuoteRequester = requestQuote) {}
 
-  async refresh(fetcher: CommerceFetch, titleIds: readonly string[]): Promise<QuoteRequestResult> {
+  async refresh(
+    fetcher: CommerceFetch,
+    titleIds: readonly string[],
+    checkoutAttemptId: string
+  ): Promise<QuoteRequestResult> {
     this.controller?.abort();
     const version = ++this.version;
     const controller = new AbortController();
     this.controller = controller;
     try {
-      const quote = await this.requester(fetcher, titleIds, controller.signal);
+      const quote = await this.requester(fetcher, titleIds, checkoutAttemptId, controller.signal);
       return version === this.version && !controller.signal.aborted
         ? { status: 'current', quote }
         : { status: 'stale' };
@@ -394,9 +409,15 @@ export interface PollOrderStatusOptions {
 }
 
 export type PollOrderStatusResult =
-  | { outcome: 'terminal'; status: Exclude<OrderStatusDto, { status: 'pending' }> }
+  | { outcome: 'terminal'; status: Exclude<OrderStatusDto, { status: 'pending' | 'failed' }> }
   | { outcome: 'timeout' }
   | { outcome: 'aborted' };
+
+function isTerminalOrderStatus(
+  status: OrderStatusDto
+): status is Exclude<OrderStatusDto, { status: 'pending' | 'failed' }> {
+  return status.status !== 'pending' && status.status !== 'failed';
+}
 
 export async function pollOrderStatus(
   fetcher: CommerceFetch,
@@ -424,7 +445,7 @@ export async function pollOrderStatus(
       throw error;
     }
     options.onStatus?.(status);
-    if (status.status !== 'pending') return { outcome: 'terminal', status };
+    if (isTerminalOrderStatus(status)) return { outcome: 'terminal', status };
     const remaining = timeoutMs - (now() - startedAt);
     if (remaining <= 0) return { outcome: 'timeout' };
     try {

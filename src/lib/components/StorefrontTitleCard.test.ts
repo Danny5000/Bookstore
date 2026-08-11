@@ -45,5 +45,6 @@ describe('StorefrontTitleCard', () => {
 
     expect(body).toContain('¥1,234');
     expect(body).not.toContain('¥12.34');
+    expect(body).toContain('Tax calculated at checkout');
   });
 });

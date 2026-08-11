@@ -3,17 +3,13 @@
   import BookVolume from '$lib/components/BookVolume.svelte';
   import CartToggle from '$lib/components/CartToggle.svelte';
   import StorefrontTitleCard from '$lib/components/StorefrontTitleCard.svelte';
+  import { formatMinorCurrency } from '$lib/commerce/money';
   import type { PageData } from './$types';
 
   interface Props { data: PageData; }
   let { data }: Props = $props();
   const featured = $derived(data.titles[0]);
 
-  function money(priceMinor: number, currency: string): string {
-    return new Intl.NumberFormat('en-US', { style: 'currency', currency }).format(
-      priceMinor / 100
-    );
-  }
 </script>
 
 <svelte:head><title>Pale Orbit Press</title></svelte:head>
@@ -34,6 +30,7 @@
         <a class="btn ghost" href={resolve('/catalog')}>Browse the catalog</a>
         <CartToggle titleId={featured.id} titleLabel={featured.title} />
       </div>
+      <p class="tax-note mono">Tax calculated at checkout</p>
     </div>
 
     <a class="art" href={resolve('/book/[id]', { id: featured.slug })}>
@@ -41,7 +38,7 @@
         title={featured.title}
         format={featured.format}
         creatorName={featured.creatorName}
-        priceLabel={money(featured.priceMinor, featured.currency)}
+        priceLabel={formatMinorCurrency(featured.priceMinor, featured.currency)}
         coverSeed={featured.id}
         coverUrl={featured.cover?.url ?? null}
         width={296}
@@ -95,6 +92,7 @@
   h1 { font-size: clamp(44px, 6vw, 82px); line-height: 0.98; margin: 24px 0; }
   .copy p, .empty-hero p { max-width: 48ch; font-size: 17px; line-height: 1.65; color: var(--muted); margin: 0 0 36px; text-wrap: pretty; }
   .actions { display: flex; gap: 12px; flex-wrap: wrap; }
+  .copy .tax-note { margin: 12px 0 0; font-size: 11px; line-height: 1.4; }
   .accent { color: var(--accent); }
   .art { display: flex; justify-content: center; align-items: center; perspective: 2200px; perspective-origin: 50% 45%; }
   .section-head { display: flex; align-items: baseline; justify-content: space-between; border-top: 1px solid var(--line); padding-top: 22px; margin-bottom: 26px; }

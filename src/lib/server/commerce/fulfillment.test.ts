@@ -97,10 +97,15 @@ describe('canonical fulfillment validation', () => {
     expect(validate({ session: pendingSession, payment: pendingPayment })).toMatchObject({
       state: 'pending', orderId: FIXTURE_ORDER_ID
     });
+    const failedPayment = paymentSnapshotFixture({
+      state: 'failed', latestChargeId: null, paidAt: null
+    });
     expect(validate({
       session: pendingSession,
-      payment: paymentSnapshotFixture({ state: 'failed', latestChargeId: null, paidAt: null })
-    })).toEqual({ state: 'failed', orderId: FIXTURE_ORDER_ID, session: pendingSession });
+      payment: failedPayment
+    })).toEqual({
+      state: 'failed', orderId: FIXTURE_ORDER_ID, session: pendingSession, payment: failedPayment
+    });
     const expired = checkoutSnapshotFixture({
       status: 'expired',
       paymentStatus: 'unpaid',
