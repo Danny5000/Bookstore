@@ -498,6 +498,8 @@ Plan 6A is implemented and verified with mocked Stripe adapter responses, signed
 
 Import balance transactions and payouts, allocate processing and dispute fees, resolve ambiguous refund allocations, reconcile settlement state, and provide the administrator sales and estimated-payout dashboard.
 
+The approved detailed design is [Plan 6B: Stripe Financial Reconciliation and Reporting](2026-08-11-stripe-financial-reconciliation-reporting-design.md). Implementation remains pending.
+
 ### Plan 7: Production hardening and Hetzner operations
 
 Complete container hardening, rate limits, structured logging, health and capacity monitoring, backup/restore automation and documentation, production smoke tests, deployment runbook, and the interface expected by a future GitHub Actions pipeline.
