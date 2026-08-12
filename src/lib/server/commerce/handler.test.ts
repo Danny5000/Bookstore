@@ -74,6 +74,12 @@ function harness(row = event()) {
     retrievePayment: vi.fn(() => payment.promise),
     retrieveRefund: vi.fn(() => refund.promise),
     retrieveDispute: vi.fn(() => dispute.promise),
+    retrieveCharge: vi.fn(),
+    retrieveBalanceTransaction: vi.fn(),
+    retrievePayout: vi.fn(),
+    listBalanceTransactionsForSource: vi.fn(),
+    listBalanceTransactionsForPayout: vi.fn(),
+    listPayouts: vi.fn(),
     verifyWebhook: vi.fn()
   };
   const dependencies = {

@@ -173,7 +173,9 @@ function snapshots(
       amountMinor,
       currency: 'usd',
       reason: 'requested_by_customer' as const,
-      providerCreatedAt: new Date(`2026-08-10T13:0${sequence}:00.000Z`)
+      providerCreatedAt: new Date(`2026-08-10T13:0${sequence}:00.000Z`),
+      balanceTransactionId: null,
+      failureBalanceTransactionId: null
     },
     payment: {
       paymentIntentId: fixture.paymentIntentId,

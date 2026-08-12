@@ -13,6 +13,7 @@ export function disputeSnapshotFixture(
     currency: 'usd',
     reason: 'fraudulent',
     providerCreatedAt: new Date('2026-08-10T14:00:00.000Z'),
+    balanceTransactionIds: ['txn_test_dispute_withdrawal_101'],
     ...overrides
   };
 }

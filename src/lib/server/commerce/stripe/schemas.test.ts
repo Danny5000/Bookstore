@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { PermanentCommerceError } from '$lib/server/commerce/errors';
 import { checkoutSnapshotFixture, createdCheckoutFixture } from '../../../../../tests/fixtures/stripe/checkout';
 import { disputeSnapshotFixture } from '../../../../../tests/fixtures/stripe/dispute';
 import { paymentSnapshotFixture } from '../../../../../tests/fixtures/stripe/payment';
@@ -43,13 +44,38 @@ describe('canonical Stripe boundary schemas', () => {
       amountMinor: 1403,
       currency: 'usd',
       reason: 'fraudulent',
-      providerCreatedAt: new Date('2026-08-10T14:00:00.000Z')
+      providerCreatedAt: new Date('2026-08-10T14:00:00.000Z'),
+      balanceTransactionIds: ['txn_test_dispute_withdrawal_101']
     };
     expect(parseDisputeSnapshot(snapshot)).toEqual(snapshot);
     expect(() => parseDisputeSnapshot({
       ...snapshot,
       providerUpdatedAt: new Date('2026-08-10T14:01:00.000Z')
     })).toThrow();
+  });
+
+  it('requires bounded canonical refund and dispute balance-transaction linkage', () => {
+    expect(parseRefundSnapshot(refundSnapshotFixture())).toEqual(refundSnapshotFixture());
+    expect(parseDisputeSnapshot(disputeSnapshotFixture({ balanceTransactionIds: [] })))
+      .toMatchObject({ balanceTransactionIds: [] });
+    expect(parseDisputeSnapshot(disputeSnapshotFixture({
+      balanceTransactionIds: ['txn_withdrawal', 'txn_reinstatement']
+    }))).toMatchObject({ balanceTransactionIds: ['txn_withdrawal', 'txn_reinstatement'] });
+
+    expect(() => parseRefundSnapshot({
+      ...refundSnapshotFixture(),
+      balanceTransactionId: undefined
+    })).toThrow(PermanentCommerceError);
+    expect(() => parseRefundSnapshot(refundSnapshotFixture({
+      balanceTransactionId: 'txn_same',
+      failureBalanceTransactionId: 'txn_same'
+    }))).toThrow(PermanentCommerceError);
+    expect(() => parseDisputeSnapshot(disputeSnapshotFixture({
+      balanceTransactionIds: ['txn_1', 'txn_2', 'txn_3']
+    }))).toThrow(PermanentCommerceError);
+    expect(() => parseDisputeSnapshot(disputeSnapshotFixture({
+      balanceTransactionIds: ['txn_same', 'txn_same']
+    }))).toThrow(PermanentCommerceError);
   });
 
   it.each([

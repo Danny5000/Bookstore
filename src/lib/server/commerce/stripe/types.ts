@@ -1,3 +1,20 @@
+import type {
+  BalanceTransactionSnapshot,
+  ChargeSnapshot,
+  PayoutSnapshot,
+  StripeListPage,
+  StripePageRequest
+} from './financial-types';
+
+export type {
+  BalanceTransactionFeeDetailSnapshot,
+  BalanceTransactionSnapshot,
+  ChargeSnapshot,
+  PayoutSnapshot,
+  StripeListPage,
+  StripePageRequest
+} from './financial-types';
+
 export const STRIPE_API_VERSION = '2026-07-29.dahlia' as const;
 
 export interface CheckoutLineSnapshot {
@@ -52,6 +69,8 @@ export interface RefundSnapshot {
   currency: string;
   reason: 'duplicate' | 'fraudulent' | 'requested_by_customer' | 'other' | null;
   providerCreatedAt: Date;
+  balanceTransactionId: string | null;
+  failureBalanceTransactionId: string | null;
 }
 
 export interface DisputeSnapshot {
@@ -64,6 +83,7 @@ export interface DisputeSnapshot {
   currency: string;
   reason: string | null;
   providerCreatedAt: Date;
+  balanceTransactionIds: readonly string[];
 }
 
 export interface VerifiedStripeEvent {
@@ -105,5 +125,17 @@ export interface StripeCommerceGateway {
   retrievePayment(id: string): Promise<PaymentSnapshot>;
   retrieveRefund(id: string): Promise<RefundSnapshot>;
   retrieveDispute(id: string): Promise<DisputeSnapshot>;
+  retrieveCharge(id: string): Promise<ChargeSnapshot>;
+  retrieveBalanceTransaction(id: string): Promise<BalanceTransactionSnapshot>;
+  retrievePayout(id: string): Promise<PayoutSnapshot>;
+  listBalanceTransactionsForSource(
+    sourceId: string,
+    request: StripePageRequest
+  ): Promise<StripeListPage<BalanceTransactionSnapshot>>;
+  listBalanceTransactionsForPayout(
+    payoutId: string,
+    request: StripePageRequest
+  ): Promise<StripeListPage<BalanceTransactionSnapshot>>;
+  listPayouts(request: StripePageRequest): Promise<StripeListPage<PayoutSnapshot>>;
   verifyWebhook(rawBody: Uint8Array, signature: string): VerifiedStripeEvent;
 }

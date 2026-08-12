@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto';
 import { permanentStripeFailure } from './errors';
 import {
+  createFixtureStripeFinancialEvidence,
+  type StripeFinancialFixtureHarness
+} from './fixture-financial';
+import {
   createCheckoutSessionInputSchema,
   parseCheckoutSnapshot,
   parseDisputeSnapshot,
@@ -32,7 +36,7 @@ function webhookKey(rawBody: Uint8Array, signature: string): string {
   return `${digest(rawBody)}:${digest(signature)}`;
 }
 
-export interface StripeFixtureHarness {
+export interface StripeFixtureHarness extends StripeFinancialFixtureHarness {
   createdCheckoutInputs(): CreateCheckoutSessionInput[];
   setCheckout(value: unknown): void;
   setPayment(value: unknown): void;
@@ -54,6 +58,7 @@ export function createFixtureStripeGateway(): StripeFixture {
   const refunds = new Map<string, RefundSnapshot>();
   const disputes = new Map<string, DisputeSnapshot>();
   const webhooks = new Map<string, VerifiedStripeEvent>();
+  const financial = createFixtureStripeFinancialEvidence();
 
   const gateway: StripeCommerceGateway = {
     async createCheckoutSession(value) {
@@ -92,6 +97,8 @@ export function createFixtureStripeGateway(): StripeFixture {
       return clone(value);
     },
 
+    ...financial.gateway,
+
     verifyWebhook(rawBody, signature) {
       const value = webhooks.get(webhookKey(rawBody, signature));
       if (!value) throw permanentStripeFailure();
@@ -100,6 +107,7 @@ export function createFixtureStripeGateway(): StripeFixture {
   };
 
   const harness: StripeFixtureHarness = {
+    ...financial.harness,
     createdCheckoutInputs: () => clone(checkoutInputs),
     setCheckout(value) {
       const parsed = parseCheckoutSnapshot(value);
@@ -129,6 +137,7 @@ export function createFixtureStripeGateway(): StripeFixture {
       refunds.clear();
       disputes.clear();
       webhooks.clear();
+      financial.harness.resetFinancial();
     }
   };
 

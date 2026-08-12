@@ -14,6 +14,7 @@ import {
 } from '../../../../../tests/fixtures/stripe/events';
 import { paymentSnapshotFixture } from '../../../../../tests/fixtures/stripe/payment';
 import { refundSnapshotFixture } from '../../../../../tests/fixtures/stripe/refund';
+import { chargeSnapshotFixture } from '../../../../../tests/fixtures/stripe/charge';
 import { createFixtureStripeGateway, FIXTURE_CHECKOUT_ORIGIN } from './fixture-gateway';
 
 describe('fixture Stripe gateway', () => {
@@ -37,6 +38,7 @@ describe('fixture Stripe gateway', () => {
     fixture.harness.setPayment(paymentSnapshotFixture());
     fixture.harness.setRefund(refundSnapshotFixture());
     fixture.harness.setDispute(disputeSnapshotFixture());
+    fixture.harness.setCharge(chargeSnapshotFixture());
 
     const first = await fixture.gateway.retrieveCheckoutSession(checkout.providerSessionId);
     first.lineItems.splice(0);
@@ -44,6 +46,7 @@ describe('fixture Stripe gateway', () => {
     await expect(fixture.gateway.retrievePayment('pi_test_fixture_101')).resolves.toEqual(paymentSnapshotFixture());
     await expect(fixture.gateway.retrieveRefund('re_test_fixture_101')).resolves.toEqual(refundSnapshotFixture());
     await expect(fixture.gateway.retrieveDispute('dp_test_fixture_101')).resolves.toEqual(disputeSnapshotFixture());
+    await expect(fixture.gateway.retrieveCharge('ch_test_fixture_101')).resolves.toEqual(chargeSnapshotFixture());
 
     expect(() => fixture.harness.setPayment({
       ...paymentSnapshotFixture(),

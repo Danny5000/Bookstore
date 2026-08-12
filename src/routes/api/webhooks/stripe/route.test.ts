@@ -40,6 +40,12 @@ function gateway(): StripeCommerceGateway {
     retrievePayment: unused,
     retrieveRefund: unused,
     retrieveDispute: unused,
+    retrieveCharge: unused,
+    retrieveBalanceTransaction: unused,
+    retrievePayout: unused,
+    listBalanceTransactionsForSource: unused,
+    listBalanceTransactionsForPayout: unused,
+    listPayouts: unused,
     verifyWebhook: dependencies.verifyWebhook
   };
 }

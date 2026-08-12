@@ -380,7 +380,8 @@ function reconcileDispute(
       amountMinor: 1403,
       currency: 'usd',
       reason: 'fraudulent',
-      providerCreatedAt
+      providerCreatedAt,
+      balanceTransactionIds: []
     },
     payment: {
       paymentIntentId: fixture.paymentIntentId,
@@ -724,7 +725,9 @@ function reconcileRefund(
       amountMinor: 1403,
       currency: 'usd',
       reason: 'requested_by_customer',
-      providerCreatedAt
+      providerCreatedAt,
+      balanceTransactionId: null,
+      failureBalanceTransactionId: null
     },
     payment: {
       paymentIntentId: fixture.paymentIntentId,

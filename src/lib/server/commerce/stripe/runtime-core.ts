@@ -33,6 +33,12 @@ const disabledGateway: StripeCommerceGateway = {
   async retrievePayment() { throw checkoutUnavailable(); },
   async retrieveRefund() { throw checkoutUnavailable(); },
   async retrieveDispute() { throw checkoutUnavailable(); },
+  async retrieveCharge() { throw checkoutUnavailable(); },
+  async retrieveBalanceTransaction() { throw checkoutUnavailable(); },
+  async retrievePayout() { throw checkoutUnavailable(); },
+  async listBalanceTransactionsForSource() { throw checkoutUnavailable(); },
+  async listBalanceTransactionsForPayout() { throw checkoutUnavailable(); },
+  async listPayouts() { throw checkoutUnavailable(); },
   verifyWebhook() { throw checkoutUnavailable(); }
 };
 

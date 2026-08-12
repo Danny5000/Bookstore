@@ -7,18 +7,28 @@ import {
 } from '$lib/server/commerce/errors';
 import { permanentStripeFailure, retryableStripeFailure } from './errors';
 import {
+  parseFinancialProviderId,
+  parseStripePageRequest
+} from './financial-schemas';
+import {
+  balanceTransactionListPath,
+  balanceTransactionRetrievePath,
+  mapSdkBalanceTransaction,
+  mapSdkBalanceTransactionPage,
+  mapSdkCharge,
+  mapSdkDispute,
+  mapSdkPayout,
+  mapSdkPayoutPage,
+  mapSdkRefund
+} from './sdk-financial-evidence';
+import { parseExactFinancialResponse } from './sdk-financial-json';
+import {
   createCheckoutSessionInputSchema,
-  normalizeDisputeReason,
-  normalizeDisputeState,
   normalizePaymentMethodCategory,
   normalizePaymentState,
-  normalizeRefundReason,
-  normalizeRefundState,
   parseCheckoutSnapshot,
   parseCreatedCheckoutSession,
-  parseDisputeSnapshot,
   parsePaymentSnapshot,
-  parseRefundSnapshot,
   parseVerifiedStripeEvent
 } from './schemas';
 import {
@@ -35,7 +45,7 @@ export interface StripeSdkGatewayOptions {
   webhookToleranceSeconds: number;
 }
 
-const providerIdSchema = z.string().trim().min(1).max(255).regex(/^[A-Za-z0-9_-]+$/u);
+const providerIdSchema = z.string().min(1).max(255).regex(/^[A-Za-z0-9_-]+$/u);
 const providerMetadataSchema = z.record(z.string(), z.string());
 const idObjectSchema = z.object({ id: providerIdSchema });
 const idReferenceSchema = z.union([providerIdSchema, idObjectSchema]);
@@ -100,27 +110,6 @@ const rawPaymentSchema = z.object({
     z.object({ id: providerIdSchema, type: z.string() })
   ]).nullable()
 });
-const rawRefundSchema = z.object({
-  id: providerIdSchema,
-  payment_intent: nullableIdReferenceSchema,
-  livemode: z.boolean(),
-  status: z.string().nullable(),
-  amount: z.number(),
-  currency: z.string(),
-  reason: z.string().nullable(),
-  created: unixSecondsSchema
-});
-const rawDisputeSchema = z.object({
-  id: providerIdSchema,
-  payment_intent: nullableIdReferenceSchema,
-  charge: idReferenceSchema,
-  livemode: z.boolean(),
-  status: z.string(),
-  amount: z.number(),
-  currency: z.string(),
-  reason: z.string().nullable(),
-  created: unixSecondsSchema
-});
 const rawEventSchema = z.object({
   id: providerIdSchema,
   type: z.string(),
@@ -156,12 +145,6 @@ function referencedId(value: z.output<typeof idReferenceSchema> | null): string 
   return typeof value === 'string' ? value : value.id;
 }
 
-function requireReferencedId(value: z.output<typeof nullableIdReferenceSchema>): string {
-  const id = referencedId(value);
-  if (!id) throw permanentStripeFailure();
-  return id;
-}
-
 function assertOnlyKeys(value: Record<string, string>, expected: readonly string[]): void {
   const actual = Object.keys(value).sort();
   const sortedExpected = [...expected].sort();
@@ -180,17 +163,19 @@ function assertLiveMode(actual: boolean, expected: boolean): void {
 }
 
 function mapProviderFailure(cause: unknown): PermanentCommerceError | RetryableProviderError {
-  if (cause instanceof PermanentCommerceError || cause instanceof RetryableProviderError) return cause;
+  if (cause instanceof PermanentCommerceError) return permanentStripeFailure();
+  if (cause instanceof RetryableProviderError) return retryableStripeFailure();
   const parsed = providerErrorShape.safeParse(cause);
   if (parsed.success) {
     const { type, statusCode } = parsed.data;
     if (
       type === 'StripeConnectionError' ||
       type === 'StripeRateLimitError' ||
+      statusCode === 429 ||
       (statusCode !== undefined && statusCode >= 500)
-    ) return retryableStripeFailure(cause);
+    ) return retryableStripeFailure();
   }
-  return permanentStripeFailure(cause);
+  return permanentStripeFailure();
 }
 
 async function providerCall<Output>(work: () => Promise<Output>): Promise<Output> {
@@ -199,6 +184,13 @@ async function providerCall<Output>(work: () => Promise<Output>): Promise<Output
   } catch (error) {
     throw mapProviderFailure(error);
   }
+}
+
+async function rawFinancialRequest(client: Stripe, path: string): Promise<unknown> {
+  const stream = await providerCall(() =>
+    client.rawRequest('GET', path, undefined, { streaming: true })
+  );
+  return parseExactFinancialResponse(stream);
 }
 
 function assertReturnUrl(value: string, origin: string): void {
@@ -389,37 +381,68 @@ export function createStripeSdkGateway(options: StripeSdkGatewayOptions): Stripe
     async retrieveRefund(untrustedId) {
       const id = providerId(untrustedId);
       const raw = await providerCall(() => client.refunds.retrieve(id));
-      const refund = parseProvider(rawRefundSchema, raw);
-      assertLiveMode(refund.livemode, options.expectedLiveMode);
-      if (!refund.status) throw permanentStripeFailure();
-      return parseRefundSnapshot({
-        providerRefundId: refund.id,
-        paymentIntentId: requireReferencedId(refund.payment_intent),
-        liveMode: refund.livemode,
-        state: normalizeRefundState(refund.status),
-        amountMinor: refund.amount,
-        currency: refund.currency,
-        reason: normalizeRefundReason(refund.reason),
-        providerCreatedAt: unixDate(refund.created)
-      });
+      return mapSdkRefund(raw, options.expectedLiveMode);
     },
 
     async retrieveDispute(untrustedId) {
       const id = providerId(untrustedId);
       const raw = await providerCall(() => client.disputes.retrieve(id));
-      const dispute = parseProvider(rawDisputeSchema, raw);
-      assertLiveMode(dispute.livemode, options.expectedLiveMode);
-      return parseDisputeSnapshot({
-        providerDisputeId: dispute.id,
-        paymentIntentId: requireReferencedId(dispute.payment_intent),
-        chargeId: requireReferencedId(dispute.charge),
-        liveMode: dispute.livemode,
-        state: normalizeDisputeState(dispute.status),
-        amountMinor: dispute.amount,
-        currency: dispute.currency,
-        reason: normalizeDisputeReason(dispute.reason),
-        providerCreatedAt: unixDate(dispute.created)
-      });
+      return mapSdkDispute(raw, options.expectedLiveMode);
+    },
+
+    async retrieveCharge(untrustedId) {
+      const id = parseFinancialProviderId(untrustedId);
+      const raw = await providerCall(() => client.charges.retrieve(id));
+      return mapSdkCharge(raw, options.expectedLiveMode);
+    },
+
+    async retrieveBalanceTransaction(untrustedId) {
+      const id = parseFinancialProviderId(untrustedId);
+      const raw = await rawFinancialRequest(
+        client,
+        balanceTransactionRetrievePath(id)
+      );
+      return mapSdkBalanceTransaction(raw, options.expectedLiveMode);
+    },
+
+    async retrievePayout(untrustedId) {
+      const id = parseFinancialProviderId(untrustedId);
+      const raw = await providerCall(() => client.payouts.retrieve(id));
+      return mapSdkPayout(raw, options.expectedLiveMode);
+    },
+
+    async listBalanceTransactionsForSource(untrustedSourceId, untrustedRequest) {
+      const source = parseFinancialProviderId(untrustedSourceId);
+      const request = parseStripePageRequest(untrustedRequest);
+      const rawPage = await rawFinancialRequest(
+        client,
+        balanceTransactionListPath(request, { source })
+      );
+      return mapSdkBalanceTransactionPage(rawPage, request, options.expectedLiveMode);
+    },
+
+    async listBalanceTransactionsForPayout(untrustedPayoutId, untrustedRequest) {
+      const payout = parseFinancialProviderId(untrustedPayoutId);
+      const request = parseStripePageRequest(untrustedRequest);
+      const rawPage = await rawFinancialRequest(
+        client,
+        balanceTransactionListPath(request, { payout })
+      );
+      return mapSdkBalanceTransactionPage(rawPage, request, options.expectedLiveMode);
+    },
+
+    async listPayouts(untrustedRequest) {
+      const request = parseStripePageRequest(untrustedRequest);
+      const created = {
+        ...(request.createdGte === undefined ? {} : { gte: request.createdGte }),
+        ...(request.createdLt === undefined ? {} : { lt: request.createdLt })
+      };
+      const rawPage = await providerCall(() => client.payouts.list({
+        limit: request.limit,
+        ...(request.startingAfter === undefined ? {} : { starting_after: request.startingAfter }),
+        ...(Object.keys(created).length === 0 ? {} : { created })
+      }));
+      return mapSdkPayoutPage(rawPage, request, options.expectedLiveMode);
     },
 
     verifyWebhook(rawBody, signature) {

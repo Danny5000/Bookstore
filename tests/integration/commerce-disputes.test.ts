@@ -175,7 +175,8 @@ function command(
       amountMinor: fixture.items.reduce((sum, item) => sum + item.totalMinor, 0),
       currency: 'usd',
       reason: 'fraudulent',
-      providerCreatedAt: new Date('2026-08-10T14:00:00.000Z')
+      providerCreatedAt: new Date('2026-08-10T14:00:00.000Z'),
+      balanceTransactionIds: []
     },
     payment: {
       paymentIntentId: fixture.paymentIntentId,

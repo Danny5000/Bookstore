@@ -267,7 +267,9 @@ export function createCommerceHarness(database: E2EDatabase, applicationOrigin: 
       amountMinor: options.amountMinor ?? payment.amountMinor,
       currency: payment.currency.toLowerCase(),
       reason: 'requested_by_customer',
-      providerCreatedAt: options.providerCreatedAt ?? new Date()
+      providerCreatedAt: options.providerCreatedAt ?? new Date(),
+      balanceTransactionId: null,
+      failureBalanceTransactionId: null
     };
     fixture.harness.setPayment(canonical);
     fixture.harness.setRefund(refund);
@@ -292,7 +294,8 @@ export function createCommerceHarness(database: E2EDatabase, applicationOrigin: 
       amountMinor: payment.amountMinor,
       currency: payment.currency.toLowerCase(),
       reason: options.reason ?? 'fraudulent',
-      providerCreatedAt
+      providerCreatedAt,
+      balanceTransactionIds: []
     };
     fixture.harness.setPayment(canonical);
     fixture.harness.setDispute(dispute);

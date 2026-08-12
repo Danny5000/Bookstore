@@ -183,7 +183,9 @@ async function createReadinessFixture(): Promise<ReadinessFixture> {
       amountMinor: 1403,
       currency: 'usd',
       reason: 'requested_by_customer',
-      providerCreatedAt: new Date('2026-08-10T12:07:00.000Z')
+      providerCreatedAt: new Date('2026-08-10T12:07:00.000Z'),
+      balanceTransactionId: null,
+      failureBalanceTransactionId: null
     },
     dispute: {
       providerDisputeId: disputeId,
@@ -194,7 +196,8 @@ async function createReadinessFixture(): Promise<ReadinessFixture> {
       amountMinor: 1403,
       currency: 'usd',
       reason: 'fraudulent',
-      providerCreatedAt: new Date('2026-08-10T12:07:00.000Z')
+      providerCreatedAt: new Date('2026-08-10T12:07:00.000Z'),
+      balanceTransactionIds: []
     }
   };
 }

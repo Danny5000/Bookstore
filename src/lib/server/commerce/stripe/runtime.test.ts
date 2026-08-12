@@ -34,6 +34,14 @@ describe('Stripe commerce runtime selection', () => {
     await expect(runtime.gateway.retrievePayment('pi_test')).rejects.toBeInstanceOf(
       CheckoutUnavailableError
     );
+    for (const operation of [
+      () => runtime.gateway.retrieveCharge('ch_test'),
+      () => runtime.gateway.retrieveBalanceTransaction('txn_test'),
+      () => runtime.gateway.retrievePayout('po_test'),
+      () => runtime.gateway.listBalanceTransactionsForSource('ch_test', { limit: 1 }),
+      () => runtime.gateway.listBalanceTransactionsForPayout('po_test', { limit: 1 }),
+      () => runtime.gateway.listPayouts({ limit: 1 })
+    ]) await expect(operation()).rejects.toBeInstanceOf(CheckoutUnavailableError);
     expect(() => runtime.gateway.verifyWebhook(new Uint8Array(), 'signature')).toThrow(
       CheckoutUnavailableError
     );

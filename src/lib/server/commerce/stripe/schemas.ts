@@ -16,12 +16,12 @@ import type {
   VerifiedStripeEvent
 } from './types';
 
-const providerIdSchema = z.string().trim().min(1).max(255).regex(/^[A-Za-z0-9_-]+$/u);
+export const providerIdSchema = z.string().min(1).max(255).regex(/^[A-Za-z0-9_-]+$/u);
 const uuidSchema = z.uuid();
 const moneySchema = z.number().int().min(0).max(MAX_STRIPE_AMOUNT_MINOR);
 const positiveMoneySchema = moneySchema.refine((value) => value > 0);
 const catalogPriceSchema = z.number().int().positive().max(MAX_CATALOG_PRICE_MINOR);
-const dateSchema = z.date().refine((value) => Number.isFinite(value.getTime()));
+export const dateSchema = z.date().refine((value) => Number.isFinite(value.getTime()));
 const normalizedEmailSchema = z.string().trim().toLowerCase().max(320).pipe(z.email());
 const currencySchema = z.string().regex(/^[a-z]{3}$/u).refine(
   isSupportedCommerceCurrency,
@@ -129,7 +129,20 @@ const refundSnapshotSchema = z.strictObject({
   amountMinor: positiveMoneySchema,
   currency: currencySchema,
   reason: z.enum(['duplicate', 'fraudulent', 'requested_by_customer', 'other']).nullable(),
-  providerCreatedAt: dateSchema
+  providerCreatedAt: dateSchema,
+  balanceTransactionId: providerIdSchema.nullable(),
+  failureBalanceTransactionId: providerIdSchema.nullable()
+}).superRefine((value, context) => {
+  if (
+    value.balanceTransactionId !== null &&
+    value.balanceTransactionId === value.failureBalanceTransactionId
+  ) {
+    context.addIssue({
+      code: 'custom',
+      path: ['failureBalanceTransactionId'],
+      message: 'duplicate refund balance transaction'
+    });
+  }
 });
 
 const disputeReasonValues = [
@@ -161,7 +174,16 @@ const disputeSnapshotSchema = z.strictObject({
   amountMinor: positiveMoneySchema,
   currency: currencySchema,
   reason: disputeReasonSchema.nullable(),
-  providerCreatedAt: dateSchema
+  providerCreatedAt: dateSchema,
+  balanceTransactionIds: z.array(providerIdSchema).max(2)
+}).superRefine((value, context) => {
+  if (new Set(value.balanceTransactionIds).size !== value.balanceTransactionIds.length) {
+    context.addIssue({
+      code: 'custom',
+      path: ['balanceTransactionIds'],
+      message: 'duplicate dispute balance transaction'
+    });
+  }
 });
 
 const verifiedStripeEventSchema = z.strictObject({
