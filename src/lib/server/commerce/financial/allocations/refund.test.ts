@@ -310,7 +310,7 @@ describe('refund allocation plans', () => {
     const original: FinancialAllocationPlan = {
       allocationIdentity: 'refund:original:gross', balanceTransactionId: 'bt-original',
       basis: 'gross_amount', scope: 'title', currency: 'USD', expectedEffectMinor: -500,
-      algorithmVersion: 1, sourceFingerprint: 'c'.repeat(64), supersedesSetId: null, reversalOfSetId: null,
+      algorithmVersion: 1, sourceFingerprint: 'c'.repeat(64), supersedesSetId: 'previous-title-gross', reversalOfSetId: null,
       items: [
         { orderItemId: 'item-a', component: 'refund_subtotal', effectMinor: -300, currency: 'USD', tieBreakKey: 'a' },
         { orderItemId: 'item-b', component: 'refund_tax', effectMinor: -200, currency: 'USD', tieBreakKey: 'b' }
@@ -324,11 +324,11 @@ describe('refund allocation plans', () => {
     expect(gross.items.map((item) => item.effectMinor)).toEqual([300, 200]);
   });
 
-  it('allows only an exact account cancellation and refuses unresolved or chained originals', () => {
+  it('allows an exact current superseding account cancellation and refuses invalid shapes', () => {
     const account: FinancialAllocationPlan = {
       allocationIdentity: 'refund:original:account', balanceTransactionId: 'bt-original',
       basis: 'gross_amount', scope: 'account', currency: 'USD', expectedEffectMinor: -500,
-      algorithmVersion: 1, sourceFingerprint: 'c'.repeat(64), supersedesSetId: null, reversalOfSetId: null, items: []
+      algorithmVersion: 1, sourceFingerprint: 'c'.repeat(64), supersedesSetId: 'previous-unresolved-gross', reversalOfSetId: null, items: []
     };
     const input: FailedRefundAllocationInput = {
       ...base, amountMinor: 500, feeMinor: 0, netMinor: 500, feeDetails: [],
@@ -339,6 +339,9 @@ describe('refund allocation plans', () => {
     expect(() => buildFailedRefundAllocationPlan({ ...input, amountMinor: 499, netMinor: 499 })).toThrow(/financial reconciliation/i);
     expect(() => buildFailedRefundAllocationPlan({ ...input, originalGrossPlan: { ...account, scope: 'unresolved' } })).toThrow(/financial reconciliation/i);
     expect(() => buildFailedRefundAllocationPlan({ ...input, originalGrossPlan: { ...account, reversalOfSetId: 'older-set' } })).toThrow(/financial reconciliation/i);
+    expect(() => buildFailedRefundAllocationPlan({ ...input, originalGrossPlan: { ...account, supersedesSetId: '' } })).toThrow(/financial reconciliation/i);
+    expect(() => buildFailedRefundAllocationPlan({ ...input, originalGrossPlan: { ...account, supersedesSetId: 42 as unknown as string } })).toThrow(/financial reconciliation/i);
+    expect(() => buildFailedRefundAllocationPlan({ ...input, originalGrossPlan: { ...account, supersedesSetId: 'account-gross' } })).toThrow(/financial reconciliation/i);
     expect(() => buildFailedRefundAllocationPlan({ ...input, originalGrossSetId: '' })).toThrow(/financial reconciliation/i);
   });
 
@@ -370,7 +373,7 @@ describe('refund allocation plans', () => {
     const originalGrossPlan: FinancialAllocationPlan = {
       allocationIdentity: 'refund:original:gross', balanceTransactionId: 'bt-original',
       basis: 'gross_amount', scope: 'title', currency: 'USD', expectedEffectMinor: -500,
-      algorithmVersion: 1, sourceFingerprint: 'c'.repeat(64), supersedesSetId: null,
+      algorithmVersion: 1, sourceFingerprint: 'c'.repeat(64), supersedesSetId: 'previous-title-gross',
       reversalOfSetId: null,
       items: [
         { orderItemId: 'item-a', component: 'refund_subtotal', effectMinor: -300, currency: 'USD', tieBreakKey: 'item-a' },
@@ -380,7 +383,7 @@ describe('refund allocation plans', () => {
     const originalFeePlan: FinancialAllocationPlan = {
       allocationIdentity: 'refund:original:fee', balanceTransactionId: 'bt-original',
       basis: 'fee', scope: 'title', currency: 'USD', expectedEffectMinor: -10,
-      algorithmVersion: 1, sourceFingerprint: 'c'.repeat(64), supersedesSetId: null,
+      algorithmVersion: 1, sourceFingerprint: 'c'.repeat(64), supersedesSetId: 'previous-title-fee',
       reversalOfSetId: null,
       items: [
         { orderItemId: 'item-a', component: 'refund_fee', effectMinor: -1, currency: 'USD', tieBreakKey: 'item-a:refund_fee' },
@@ -423,7 +426,7 @@ describe('refund allocation plans', () => {
     const originalFeePlan: FinancialAllocationPlan = {
       allocationIdentity: 'refund:original:fee', balanceTransactionId: 'bt-original',
       basis: 'fee', scope: 'title', currency: 'USD', expectedEffectMinor: -10,
-      algorithmVersion: 1, sourceFingerprint: 'c'.repeat(64), supersedesSetId: null,
+      algorithmVersion: 1, sourceFingerprint: 'c'.repeat(64), supersedesSetId: 'previous-title-fee',
       reversalOfSetId: null,
       items: [
         { orderItemId: 'item-a', component: 'refund_fee', effectMinor: -7, currency: 'USD', tieBreakKey: 'item-a:refund_fee' },
@@ -466,7 +469,9 @@ describe('refund allocation plans', () => {
       { name: 'account scope', input: { ...valid, originalFeePlan: { ...originalFeePlan, scope: 'account', items: [] } }, safeCode: 'source_linkage_mismatch' },
       { name: 'unresolved scope', input: { ...valid, originalFeePlan: { ...originalFeePlan, scope: 'unresolved', items: [] } }, safeCode: 'source_linkage_mismatch' },
       { name: 'already reverses', input: { ...valid, originalFeePlan: { ...originalFeePlan, reversalOfSetId: 'older-fee-set' } }, safeCode: 'source_linkage_mismatch' },
-      { name: 'already supersedes', input: { ...valid, originalFeePlan: { ...originalFeePlan, supersedesSetId: 'older-fee-set' } }, safeCode: 'source_linkage_mismatch' },
+      { name: 'empty predecessor set id', input: { ...valid, originalFeePlan: { ...originalFeePlan, supersedesSetId: '' } }, safeCode: 'source_linkage_mismatch' },
+      { name: 'non-string predecessor set id', input: { ...valid, originalFeePlan: { ...originalFeePlan, supersedesSetId: {} as unknown as string } }, safeCode: 'source_linkage_mismatch' },
+      { name: 'self predecessor set id', input: { ...valid, originalFeePlan: { ...originalFeePlan, supersedesSetId: 'set-original-fee' } }, safeCode: 'source_linkage_mismatch' },
       { name: 'wrong balance transaction', input: { ...valid, originalFeePlan: { ...originalFeePlan, balanceTransactionId: 'bt-other' } }, safeCode: 'source_linkage_mismatch' },
       { name: 'wrong source fingerprint', input: { ...valid, originalFeePlan: { ...originalFeePlan, sourceFingerprint: 'd'.repeat(64) } }, safeCode: 'source_linkage_mismatch' },
       { name: 'wrong algorithm version', input: { ...valid, originalFeePlan: { ...originalFeePlan, algorithmVersion: 2 } }, safeCode: 'source_linkage_mismatch' },

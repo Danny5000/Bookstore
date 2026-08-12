@@ -50,7 +50,7 @@ function compareChronology(
 }
 
 function assertNonEmptyId(value: string): void {
-  if (value.length === 0) linkageMismatch();
+  if (typeof value !== 'string' || value.length === 0) linkageMismatch();
 }
 
 function assertRefundBoundary(input: RefundAllocationInput): void {
@@ -222,13 +222,17 @@ function assertFailedRefundBoundary(input: FailedRefundAllocationInput): void {
 
 function assertOriginalPlan(plan: FinancialAllocationPlan, setId: string, input: FailedRefundAllocationInput): void {
   assertNonEmptyId(setId);
+  if (plan.supersedesSetId !== null) {
+    assertNonEmptyId(plan.supersedesSetId);
+    if (plan.supersedesSetId === setId) linkageMismatch();
+  }
   assertAllocationPlanConserves(plan);
   if (plan.currency !== input.settlementCurrency) {
     throw new PermanentFinancialError('currency_mismatch');
   }
   if (
     plan.basis !== 'gross_amount' ||
-    plan.reversalOfSetId !== null || plan.supersedesSetId !== null ||
+    plan.reversalOfSetId !== null ||
     plan.balanceTransactionId === input.balanceTransactionId
   ) linkageMismatch();
 }
@@ -240,6 +244,10 @@ function assertOriginalFeeEvidence(input: FailedRefundAllocationInput): void {
   if (setId === null || plan === null) return;
 
   assertNonEmptyId(setId);
+  if (plan.supersedesSetId !== null) {
+    assertNonEmptyId(plan.supersedesSetId);
+    if (plan.supersedesSetId === setId) linkageMismatch();
+  }
   assertAllocationPlanConserves(plan);
   if (plan.currency !== input.settlementCurrency) {
     throw new PermanentFinancialError('currency_mismatch');
@@ -248,7 +256,6 @@ function assertOriginalFeeEvidence(input: FailedRefundAllocationInput): void {
     plan.basis !== 'fee' ||
     plan.scope !== 'title' ||
     plan.reversalOfSetId !== null ||
-    plan.supersedesSetId !== null ||
     plan.balanceTransactionId !== input.originalGrossPlan.balanceTransactionId ||
     plan.sourceFingerprint !== input.originalGrossPlan.sourceFingerprint ||
     plan.algorithmVersion !== input.originalGrossPlan.algorithmVersion

@@ -130,9 +130,8 @@ export interface FinalizedDisputeRefund {
  * The bounded provider-neutral evidence persisted with a dispute withdrawal.
  * A reinstatement names the exact withdrawal allocation it restores.
  */
-export interface DisputePresentmentEffect {
+interface DisputePresentmentEffectFields {
   readonly allocationId: string;
-  readonly withdrawalSetId: string;
   readonly disputeId: string;
   readonly providerCreatedAt: string;
   readonly providerTransactionId: string;
@@ -140,9 +139,26 @@ export interface DisputePresentmentEffect {
   readonly subtotalMinor: number;
   readonly taxMinor: number;
   readonly presentmentCurrency: string;
-  readonly effect: 'withdrawal' | 'reinstatement';
-  readonly reversalOfAllocationId: string | null;
 }
+
+/** A newly built withdrawal effect awaiting the repository-assigned gross-set ID. */
+export type UnboundDisputePresentmentEffect = DisputePresentmentEffectFields & {
+  readonly withdrawalSetId: null;
+  readonly effect: 'withdrawal';
+  readonly reversalOfAllocationId: null;
+};
+
+/** Persisted presentment history with an exact withdrawal gross-set reference. */
+export type BoundDisputePresentmentEffect = DisputePresentmentEffectFields & {
+  readonly withdrawalSetId: string;
+} & (
+  | { readonly effect: 'withdrawal'; readonly reversalOfAllocationId: null }
+  | { readonly effect: 'reinstatement'; readonly reversalOfAllocationId: string }
+);
+
+export type DisputePresentmentEffect =
+  | UnboundDisputePresentmentEffect
+  | BoundDisputePresentmentEffect;
 
 export interface DisputeAllocationPlanBundle extends FinancialAllocationPlanBundle {
   readonly presentmentEffects: readonly DisputePresentmentEffect[];
@@ -159,8 +175,8 @@ export interface DisputeAllocationInput extends FinancialAllocationMetadata {
   /** Immutable original payment components; caller-computed exposure is never accepted. */
   readonly paymentItems: readonly DisputePaymentItem[];
   readonly finalizedRefunds: readonly FinalizedDisputeRefund[];
-  readonly priorPresentmentEffects: readonly DisputePresentmentEffect[];
-  /** Required for a withdrawal and persisted alongside its returned effects. */
+  readonly priorPresentmentEffects: readonly BoundDisputePresentmentEffect[];
+  /** New withdrawals are built unbound; other effects also leave this null. */
   readonly withdrawalSetId: string | null;
   readonly reversesSetId: string | null;
   readonly reversesFeeSetId: string | null;

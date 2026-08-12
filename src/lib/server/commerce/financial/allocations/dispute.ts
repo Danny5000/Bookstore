@@ -10,11 +10,12 @@ import {
   planWeights
 } from './common';
 import type {
+  BoundDisputePresentmentEffect,
   DisputeAllocationInput,
   DisputeAllocationPlanBundle,
   DisputePaymentItem,
-  DisputePresentmentEffect,
-  FinalizedDisputeRefund
+  FinalizedDisputeRefund,
+  UnboundDisputePresentmentEffect
 } from './types';
 
 type Capacity = { subtotalMinor: number; taxMinor: number };
@@ -152,7 +153,7 @@ function assertRefund(refund: FinalizedDisputeRefund, currency: string): number 
   return providerCreatedAtMs;
 }
 
-function validatePresentmentEffect(effect: DisputePresentmentEffect, currency: string): number {
+function validatePresentmentEffect(effect: BoundDisputePresentmentEffect, currency: string): number {
   assertId(effect.allocationId);
   assertId(effect.withdrawalSetId);
   assertId(effect.disputeId);
@@ -177,7 +178,7 @@ function replayPriorEffects(
   capacity: Map<string, Capacity>,
   currentProviderCreatedAtMs: number
 ): {
-  readonly withdrawals: Map<string, DisputePresentmentEffect>;
+  readonly withdrawals: Map<string, BoundDisputePresentmentEffect>;
   readonly reversedWithdrawalIds: ReadonlySet<string>;
 } {
   const effects = input.priorPresentmentEffects.map((effect) => ({
@@ -190,7 +191,7 @@ function replayPriorEffects(
   })).sort((left, right) => compareChronology(left.chronology, right.chronology));
   const seenIds = new Set<string>();
   const reversed = new Set<string>();
-  const withdrawals = new Map<string, DisputePresentmentEffect>();
+  const withdrawals = new Map<string, BoundDisputePresentmentEffect>();
   const current = {
     providerCreatedAtMs: currentProviderCreatedAtMs,
     providerTransactionId: input.providerTransactionId,
@@ -236,7 +237,7 @@ function remainingWeights(capacity: Map<string, Capacity>): ComponentWeight[] {
 function withdrawalEffects(
   input: DisputeAllocationInput,
   presentmentItems: readonly FinancialAllocationItem[]
-): readonly DisputePresentmentEffect[] {
+): readonly UnboundDisputePresentmentEffect[] {
   const rows = new Map<string, { subtotalMinor: number; taxMinor: number }>();
   for (const item of presentmentItems) {
     const row = rows.get(item.orderItemId) ?? { subtotalMinor: 0, taxMinor: 0 };
@@ -246,7 +247,7 @@ function withdrawalEffects(
   }
   return [...rows.entries()].map(([orderItemId, row]) => ({
     allocationId: `${input.allocationIdentityPrefix}:presentment:${orderItemId}`,
-    withdrawalSetId: input.withdrawalSetId!, disputeId: input.disputeId,
+    withdrawalSetId: null, disputeId: input.disputeId,
     providerCreatedAt: input.providerCreatedAt, providerTransactionId: input.providerTransactionId,
     orderItemId, ...row, presentmentCurrency: input.presentmentCurrency,
     effect: 'withdrawal', reversalOfAllocationId: null
@@ -255,16 +256,16 @@ function withdrawalEffects(
 
 function assertWithdrawalShape(input: DisputeAllocationInput): void {
   if (
-    !input.withdrawalSetId || input.reversesSetId !== null || input.reversesFeeSetId !== null ||
+    input.withdrawalSetId !== null || input.reversesSetId !== null || input.reversesFeeSetId !== null ||
     input.withdrawalGrossPlan !== null || input.withdrawalFeePlan !== null
   ) linkageMismatch();
 }
 
 function assertReinstatementShape(
   input: DisputeAllocationInput,
-  withdrawals: Map<string, DisputePresentmentEffect>,
+  withdrawals: Map<string, BoundDisputePresentmentEffect>,
   reversedWithdrawalIds: ReadonlySet<string>
-): readonly DisputePresentmentEffect[] {
+): readonly BoundDisputePresentmentEffect[] {
   if (
     input.withdrawalSetId !== null || !input.reversesSetId || input.reversesFeeSetId !== null ||
     input.withdrawalFeePlan !== null || !input.withdrawalGrossPlan
@@ -292,8 +293,8 @@ function assertWithdrawalPlan(plan: FinancialAllocationPlan, input: DisputeAlloc
 
 function reinstatementEffects(
   input: DisputeAllocationInput,
-  original: readonly DisputePresentmentEffect[]
-): readonly DisputePresentmentEffect[] {
+  original: readonly BoundDisputePresentmentEffect[]
+): readonly BoundDisputePresentmentEffect[] {
   const weights = original.map((effect) => ({
     orderItemId: effect.allocationId,
     component: 'dispute_reinstatement' as const,
