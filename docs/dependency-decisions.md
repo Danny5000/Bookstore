@@ -1,6 +1,6 @@
 # Dependency decisions
 
-Checked against the npm registry on 2026-08-10.
+Checked against the npm registry on 2026-08-11.
 
 | Package | Selected line | Decision |
 | --- | --- | --- |
@@ -22,7 +22,7 @@ Checked against the npm registry on 2026-08-10.
 | node-postgres (`pg`) | 8.23.0 | Current stable pooled PostgreSQL driver supported by Drizzle; web, worker, and migration processes own separate bounded pools. |
 | `@types/pg` | 8.21.0 | Current node-postgres type declarations required by the strict TypeScript build. |
 | tsx | 4.23.12 | Current stable development-only TypeScript runner for worker, migration, and test orchestration entry points. Updated from 4.23.11 as a compatible patch. |
-| Better Auth | 1.6.26 | Current stable authentication runtime; its peer ranges accept the selected SvelteKit, Svelte, Drizzle, PostgreSQL, and Vitest versions. |
+| Better Auth | 1.6.26 exact | Authentication runtime pinned with its matching CLI while the 1.6.27 session and authentication surface changes receive the dedicated schema-generation and adversarial auth regression gate described below. |
 | Better Auth CLI | 1.6.26 exact, on demand | Schema generation must match the runtime exactly; keep it outside the installed tree until its unfixed tool-only advisory is removed. |
 | Nodemailer | 9.0.5 | Current stable SMTP implementation behind the provider-neutral email adapter. |
 | `@types/nodemailer` | 8.0.1 | Current published declarations; remove when Nodemailer ships compatible declarations directly. |
@@ -33,8 +33,9 @@ Checked against the npm registry on 2026-08-10.
 | `file-type` | 22.0.1 | Current stable signature detector used only as a format hint; successful decoding and domain validation remain authoritative. |
 | `fast-xml-parser` | 5.10.1 | Current stable bounded XML parser; ingestion rejects document types and entities before parsing untrusted EPUB or ComicInfo metadata. |
 | fflate | 0.8.3 | Current stable test-only archive writer used to generate deterministic valid and hostile fixtures; it is not part of production ingestion. |
+| globals | 17.9.0 | Direct lint-data dependency. The 17.10.0 data-only update is deferred to the next dependency-maintenance gate so Plan 6B-I's financial boundary does not mix in unrelated lint-environment drift. |
 
-TypeScript 6.0.3 remains intentional while the registry latest is 7.0.2: as checked on 2026-08-10,
+TypeScript 6.0.3 remains intentional while the registry latest is 7.0.2: as checked on 2026-08-11,
 `typescript-eslint` 8.67.0 accepts TypeScript `>=4.8.4 <6.1.0` and
 `svelte-check` 4.7.5 accepts TypeScript 5 or 6. Remove this pin when both stable
 packages support TypeScript 7.
@@ -60,6 +61,10 @@ longer contains the advisory.
 Drizzle Kit 0.31.10 also reports four moderate dependency-path findings through its deprecated `@esbuild-kit/esm-loader` dependency and esbuild 0.18.20. npm retains Drizzle Kit in the pruned dependency tree to satisfy Better Auth's optional peer, so these paths also appear in `npm audit --omit=dev`; the application nevertheless invokes Drizzle Kit only as a local/CI migration generator and checker and never imports or exposes its development server in a production process. The advisory concerns an exposed esbuild development server. Drizzle Kit 0.31.10 is the current stable release, while npm's suggested `0.18.1` resolution is an incompatible downgrade. Do not expose Drizzle Kit's development server to untrusted networks. Remove this exception when a stable Drizzle Kit release removes the deprecated loader path or upgrades its affected esbuild dependency.
 
 The 2026-08-10 Plan 6A preflight used `npm outdated --json`, `npm view`, both audit modes, and `npm ls --depth=0`. It found no high or critical advisory, confirmed Stripe 22.5.0 and tsx 4.23.12 as current, and reconfirmed `typescript-eslint@8.67.0` requires TypeScript `<6.1.0`.
+
+The 2026-08-11 Plan 6B-I preflight ran on Node 26.7.0 with npm 11.19.0. Stripe 22.5.0 remains current and supports Node 18 or newer; TypeScript 7.0.2 remains incompatible with the selected `typescript-eslint@8.67.0` peer range of `>=4.8.4 <6.1.0`. `npm outdated --json` reported only Better Auth 1.6.27, `globals` 17.10.0, and the intentional TypeScript 7 line. Better Auth 1.6.27 changes packaged session and authentication route artifacts, so it is deferred until a dedicated maintenance change updates the runtime and exact CLI together, regenerates and compares the auth schema, and reruns the full stale-bearer, credential-authority, reset-race, sign-in, and browser gates. The `globals` update is removed from this defer at the next dependency-maintenance change after lint and the full release gate pass with its revised environment data.
+
+Both audit modes remained free of high and critical findings. The production-tree audit reported three low and four moderate paths; the full-tree audit reported four low and four moderate paths. All are the already accepted `cookie` and Drizzle Kit/esbuild findings below. `npm ls --depth=0` completed without missing or invalid direct dependencies. No Plan 6B runtime dependency was added.
 
 Stripe 22.5.0 emits one fixed, nonsecret plugin-hint line on SDK import when either `CLAUDECODE` or `CLAUDE_CODE_CHILD_SESSION` is nonempty. The installed SDK exposes no suppression setting. Production Compose explicitly enumerates container environment and forwards neither variable, so production app/worker logs are unaffected. A host-run development process launched inside Claude may emit the marker; unset both detection variables before process start when clean local stderr is required. Do not patch the installed package or pin an older SDK solely to suppress this development-only hint.
 
