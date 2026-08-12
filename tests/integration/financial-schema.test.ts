@@ -59,6 +59,9 @@ interface AllocationSetInput {
   currency?: string;
   sourceFingerprintSha256?: string;
   supersedesSetId?: string | null;
+  reversalOfSetId?: string | null;
+  algorithmVersion?: number;
+  classifierVersion?: number;
 }
 
 let sequence = 0;
@@ -220,8 +223,8 @@ function insertAllocationSet(input: AllocationSetInput) {
     `insert into financial_allocation_sets
        (allocation_identity, balance_transaction_id, source_kind, source_internal_id,
         basis, scope, expected_effect_minor, currency, algorithm_version,
-        classifier_version, source_fingerprint_sha256, supersedes_set_id)
-     values ($1, $2, 'refund', $3, $4, $5, $6, $7, 1, 1, $8, $9)
+        classifier_version, source_fingerprint_sha256, supersedes_set_id, reversal_of_set_id)
+     values ($1, $2, 'refund', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
      returning id`,
     [
       nextToken('allocation'),
@@ -231,8 +234,11 @@ function insertAllocationSet(input: AllocationSetInput) {
       input.scope ?? 'title',
       input.expectedEffectMinor,
       input.currency ?? 'USD',
+      input.algorithmVersion ?? 1,
+      input.classifierVersion ?? 1,
       input.sourceFingerprintSha256 ?? 'd'.repeat(64),
-      input.supersedesSetId ?? null
+      input.supersedesSetId ?? null,
+      input.reversalOfSetId ?? null
     ]
   );
 }
@@ -249,6 +255,152 @@ function insertAllocationItem(
      values ($1, $2, $3, $4, 'USD', $5)
      returning id`,
     [allocationSetId, orderItemId, component, effectMinor, nextToken('tie')]
+  );
+}
+
+interface CorrectionProjectionFixture {
+  graph: CommerceGraph;
+  balanceTransactionId: string;
+  baseSetId: string;
+  alternateOrderItemId: string;
+}
+
+interface CorrectionItemInput {
+  domain: 'presentment' | 'settlement';
+  sourceAllocationSetId: string | null;
+  orderItemId: string;
+  component: 'refund_subtotal' | 'refund_tax' | 'refund_fee';
+  approvedAbsoluteMinor: number;
+  deltaMinor: number;
+}
+
+async function createCorrectionProjectionFixture(
+  label: string,
+  alternateSubtotalMinor = 1000
+): Promise<CorrectionProjectionFixture> {
+  const graph = await createCommerceGraph(label);
+  const alternateTitleId = await createTitle(`${label}-alternate`);
+  const alternateItem = await expectSingleRow(
+    databaseClient.pool.query<{ id: string }>(
+      `insert into order_items
+         (order_id, title_id, title_snapshot, creator_name_snapshot, format, currency,
+          unit_subtotal_minor, tax_minor, total_minor)
+       values ($1, $2, 'Alternate title', 'Creator', 'prose', 'USD', $3, 0, $3)
+       returning id`,
+      [graph.orderId, alternateTitleId, alternateSubtotalMinor]
+    ),
+    `${label} alternate order item`
+  );
+  const transaction = await expectSingleRow(
+    insertBalanceTransaction({
+      sourceFamily: 'refund',
+      sourceId: nextToken(`${label}_provider_refund`),
+      amountMinor: 100,
+      feeMinor: 0,
+      netMinor: 100
+    }),
+    `${label} correction balance transaction`
+  );
+  const base = await expectSingleRow(
+    insertAllocationSet({
+      balanceTransactionId: transaction.id,
+      sourceInternalId: graph.refundId,
+      expectedEffectMinor: 100,
+      sourceFingerprintSha256: 'c'.repeat(64)
+    }),
+    `${label} correction base set`
+  );
+  await expectSingleRow(
+    insertAllocationItem(base.id, graph.orderItemId, 100),
+    `${label} correction base item`
+  );
+  await databaseClient.pool.query(
+    `insert into financial_classification_versions
+       (subject_type, subject_id, classifier_version, classification, source_fingerprint_sha256)
+     values ('balance_transaction', $1, 1, 'refund', repeat('c', 64))`,
+    [transaction.id]
+  );
+  await databaseClient.pool.query(
+    `insert into refund_allocation_components
+       (refund_allocation_id, refund_id, order_item_id, subtotal_minor, tax_minor,
+        total_minor, currency)
+     values ($1, $2, $3, 100, 0, 100, 'USD')`,
+    [graph.refundAllocationId, graph.refundId, graph.orderItemId]
+  );
+  return {
+    graph,
+    balanceTransactionId: transaction.id,
+    baseSetId: base.id,
+    alternateOrderItemId: alternateItem.id
+  };
+}
+
+async function insertCorrectionSet(
+  fixture: CorrectionProjectionFixture,
+  label: string
+): Promise<string> {
+  const correction = await expectSingleRow(
+    databaseClient.pool.query<{ id: string }>(
+      `insert into refund_reporting_correction_sets
+         (refund_id, correction_version, kind, base_allocation_set_id,
+          source_fingerprint_sha256, approved_by_admin_id, created_by_admin_id,
+          correlation_id)
+       values ($1, 1, 'allocation_attribution_correction', $2, repeat('c', 64),
+               $3, $3, $4)
+       returning id`,
+      [fixture.graph.refundId, fixture.baseSetId, fixture.graph.adminId, nextToken(label)]
+    ),
+    `${label} correction set`
+  );
+  return correction.id;
+}
+
+async function insertCorrectionItems(
+  correctionSetId: string,
+  label: string,
+  items: readonly CorrectionItemInput[]
+): Promise<void> {
+  for (const item of items) {
+    await expectSingleRow(
+      databaseClient.pool.query<{ id: string }>(
+        `insert into refund_reporting_correction_items
+           (correction_set_id, domain, source_allocation_set_id, order_item_id,
+            component, currency, approved_absolute_minor, delta_minor,
+            stable_tie_break_key)
+         values ($1, $2, $3, $4, $5, 'USD', $6, $7, $8)
+         returning id`,
+        [
+          correctionSetId,
+          item.domain,
+          item.sourceAllocationSetId,
+          item.orderItemId,
+          item.component,
+          item.approvedAbsoluteMinor,
+          item.deltaMinor,
+          nextToken(`${label}_item`)
+        ]
+      ),
+      `${label} correction item`
+    );
+  }
+}
+
+async function readGrossProjectionHead(balanceTransactionId: string): Promise<{
+  base_set_id: string | null;
+  compatible_correction_tip_id: string | null;
+  is_complete: boolean;
+  missing_source_count: number;
+  proposed_issue_code: string | null;
+}> {
+  return expectSingleRow(
+    databaseClient.pool.query(
+      `select base_set_id, compatible_correction_tip_id, is_complete,
+              missing_source_count, proposed_issue_code
+       from current_financial_projection_heads
+       where balance_transaction_id = $1 and basis = 'gross_amount'`,
+      [balanceTransactionId]
+    ),
+    'one gross projection head'
   );
 }
 
@@ -721,6 +873,35 @@ describe('Plan 6B financial schema', () => {
 
     expect(knownFamilyWithoutId.id).not.toBe(sourceLess.id);
   });
+  it('permits one immutable reversal chain per exact target allocation set', async () => {
+    await expectFinancialSchemaPresent('migration 0007 must install reversal-chain constraints');
+    const graph = await createCommerceGraph('reversal-chain');
+    const [targetTransaction, firstReversalTransaction, secondReversalTransaction] = await Promise.all(
+      ['target', 'first', 'second'].map(async (label) => expectSingleRow(
+        insertBalanceTransaction({ sourceFamily: 'refund', sourceId: nextToken(`re_${label}`),
+          amountMinor: 100, feeMinor: 0, netMinor: 100 }),
+        `${label} reversal-chain transaction`
+      ))
+    );
+    const target = await expectSingleRow(insertAllocationSet({
+      balanceTransactionId: targetTransaction!.id, sourceInternalId: graph.refundId,
+      expectedEffectMinor: 100, sourceFingerprintSha256: 'c'.repeat(64)
+    }), 'reversal target');
+    const root = await expectSingleRow(insertAllocationSet({
+      balanceTransactionId: firstReversalTransaction!.id, sourceInternalId: graph.refundId,
+      expectedEffectMinor: 100, sourceFingerprintSha256: 'c'.repeat(64), reversalOfSetId: target.id
+    }), 'first reversal root');
+    await expectSingleRow(insertAllocationSet({
+      balanceTransactionId: firstReversalTransaction!.id, sourceInternalId: graph.refundId,
+      expectedEffectMinor: 100, sourceFingerprintSha256: 'c'.repeat(64),
+      supersedesSetId: root.id, reversalOfSetId: target.id
+    }), 'append-only successor in the same reversal chain');
+    await expectConstraint(insertAllocationSet({
+      balanceTransactionId: secondReversalTransaction!.id, sourceInternalId: graph.refundId,
+      expectedEffectMinor: 100, sourceFingerprintSha256: 'c'.repeat(64), reversalOfSetId: target.id
+    }), '23505', 'a second independent reversal root cannot cite the same target');
+  });
+
   it('projects base, successor, fork, unresolved, and stale-correction states', async () => {
     await expectFinancialSchemaPresent(
       'migration 0007 must exist before exercising the current-projection views'
@@ -787,6 +968,20 @@ describe('Plan 6B financial schema', () => {
       base_set_id: base.id,
       compatible_correction_tip_id: null,
       scope: 'title',
+      is_complete: false,
+      missing_source_count: 1,
+      proposed_issue_code: 'missing_source'
+    });
+    await databaseClient.pool.query(
+      `insert into financial_classification_versions
+         (subject_type, subject_id, classifier_version, classification, source_fingerprint_sha256)
+       values ('balance_transaction', $1, 1, 'refund', repeat('c', 64))`,
+      [transaction.id]
+    );
+    expect(await readGrossHead(transaction.id)).toEqual({
+      base_set_id: base.id,
+      compatible_correction_tip_id: null,
+      scope: 'title',
       is_complete: true,
       missing_source_count: 0,
       proposed_issue_code: null
@@ -799,6 +994,167 @@ describe('Plan 6B financial schema', () => {
         effect_minor: 100
       }
     ]);
+
+    const zeroFeeSet = await expectSingleRow(
+      insertAllocationSet({
+        balanceTransactionId: transaction.id,
+        sourceInternalId: graph.refundId,
+        basis: 'fee',
+        expectedEffectMinor: 0,
+        sourceFingerprintSha256: 'c'.repeat(64)
+      }),
+      'explicit zero-fee allocation set'
+    );
+    const zeroFeeHead = await databaseClient.pool.query<ProjectionHead>(
+      `select base_set_id, compatible_correction_tip_id, scope, is_complete,
+              missing_source_count, proposed_issue_code
+       from current_financial_projection_heads
+       where balance_transaction_id = $1 and basis = 'fee'`,
+      [transaction.id]
+    );
+    expect(zeroFeeHead.rows).toEqual([{
+      base_set_id: zeroFeeSet.id,
+      compatible_correction_tip_id: null,
+      scope: 'title',
+      is_complete: true,
+      missing_source_count: 0,
+      proposed_issue_code: null
+    }]);
+
+    const incompleteFeeTransaction = await expectSingleRow(
+      insertBalanceTransaction({
+        sourceFamily: 'refund',
+        sourceId: nextToken('re_fee_detail'),
+        amountMinor: 100,
+        feeMinor: 10,
+        netMinor: 90
+      }),
+      'fee-detail completeness transaction'
+    );
+    await databaseClient.pool.query(
+      `insert into financial_classification_versions
+         (subject_type, subject_id, classifier_version, classification, source_fingerprint_sha256)
+       values ('balance_transaction', $1, 1, 'refund', repeat('c', 64))`,
+      [incompleteFeeTransaction.id]
+    );
+    const incompleteFeeSet = await expectSingleRow(
+      insertAllocationSet({
+        balanceTransactionId: incompleteFeeTransaction.id,
+        sourceInternalId: graph.refundId,
+        basis: 'fee',
+        expectedEffectMinor: -10,
+        sourceFingerprintSha256: 'c'.repeat(64)
+      }),
+      'nonzero fee allocation set'
+    );
+    await expectSingleRow(
+      insertAllocationItem(incompleteFeeSet.id, graph.orderItemId, -10, 'refund_fee'),
+      'nonzero fee allocation item'
+    );
+    const readFeeDetailHead = async (): Promise<ProjectionHead> => {
+      const result = await databaseClient.pool.query<ProjectionHead>(
+        `select base_set_id, compatible_correction_tip_id, scope, is_complete,
+                missing_source_count, proposed_issue_code
+         from current_financial_projection_heads
+         where balance_transaction_id = $1 and basis = 'fee'`,
+        [incompleteFeeTransaction.id]
+      );
+      expect(result.rows).toHaveLength(1);
+      return result.rows[0]!;
+    };
+    expect(await readFeeDetailHead()).toMatchObject({
+      is_complete: false,
+      missing_source_count: 1,
+      proposed_issue_code: 'allocation_mismatch'
+    });
+    const feeDetail = await expectSingleRow(
+      databaseClient.pool.query<{ id: string }>(
+        `insert into stripe_balance_transaction_fee_details
+           (balance_transaction_id, ordinal, raw_type, amount_minor, currency,
+            fingerprint_sha256)
+         values ($1, 0, 'stripe_fee', 10, 'USD', repeat('e', 64))
+         returning id`,
+        [incompleteFeeTransaction.id]
+      ),
+      'complete fee-detail money evidence'
+    );
+    expect(await readFeeDetailHead()).toMatchObject({
+      is_complete: false,
+      missing_source_count: 1,
+      proposed_issue_code: 'missing_source'
+    });
+    await databaseClient.pool.query(
+      `insert into financial_classification_versions
+         (subject_type, subject_id, classifier_version, classification, source_fingerprint_sha256)
+       values ('fee_detail', $1, 1, 'refund_fee', repeat('e', 64))`,
+      [feeDetail.id]
+    );
+    expect(await readFeeDetailHead()).toMatchObject({
+      base_set_id: incompleteFeeSet.id,
+      is_complete: true,
+      missing_source_count: 0,
+      proposed_issue_code: null
+    });
+
+    const mixedUnknownTransaction = await expectSingleRow(
+      insertBalanceTransaction({
+        sourceFamily: 'refund',
+        sourceId: nextToken('re_fee_unknown'),
+        amountMinor: 100,
+        feeMinor: 10,
+        netMinor: 90
+      }),
+      'mixed unknown fee-detail transaction'
+    );
+    await databaseClient.pool.query(
+      `insert into financial_classification_versions
+         (subject_type, subject_id, classifier_version, classification, source_fingerprint_sha256)
+       values ('balance_transaction', $1, 1, 'refund', repeat('c', 64))`,
+      [mixedUnknownTransaction.id]
+    );
+    const mixedUnknownSet = await expectSingleRow(
+      insertAllocationSet({
+        balanceTransactionId: mixedUnknownTransaction.id,
+        sourceInternalId: graph.refundId,
+        basis: 'fee',
+        expectedEffectMinor: -10,
+        sourceFingerprintSha256: 'c'.repeat(64)
+      }),
+      'mixed unknown fee allocation set'
+    );
+    await expectSingleRow(
+      insertAllocationItem(mixedUnknownSet.id, graph.orderItemId, -10, 'refund_fee'),
+      'mixed unknown fee allocation item'
+    );
+    const mixedDetails = await databaseClient.pool.query<{ id: string; ordinal: number }>(
+      `insert into stripe_balance_transaction_fee_details
+         (balance_transaction_id, ordinal, raw_type, amount_minor, currency,
+          fingerprint_sha256)
+       values ($1, 0, 'future_fee', 5, 'USD', repeat('1', 64)),
+              ($1, 1, 'stripe_fee', 5, 'USD', repeat('2', 64))
+       returning id, ordinal`,
+      [mixedUnknownTransaction.id]
+    );
+    const unknownDetail = mixedDetails.rows.find((detail) => detail.ordinal === 0);
+    expect(unknownDetail).toBeDefined();
+    await databaseClient.pool.query(
+      `insert into financial_classification_versions
+         (subject_type, subject_id, classifier_version, classification, source_fingerprint_sha256)
+       values ('fee_detail', $1, 1, 'unknown', repeat('1', 64))`,
+      [unknownDetail!.id]
+    );
+    const mixedUnknownHead = await databaseClient.pool.query<ProjectionHead>(
+      `select base_set_id, compatible_correction_tip_id, scope, is_complete,
+              missing_source_count, proposed_issue_code
+       from current_financial_projection_heads
+       where balance_transaction_id = $1 and basis = 'fee'`,
+      [mixedUnknownTransaction.id]
+    );
+    expect(mixedUnknownHead.rows).toEqual([expect.objectContaining({
+      is_complete: false,
+      missing_source_count: 1,
+      proposed_issue_code: 'unsupported_category'
+    })]);
 
     const successor = await expectSingleRow(
       insertAllocationSet({
@@ -877,6 +1233,12 @@ describe('Plan 6B financial schema', () => {
       }),
       'unresolved allocation set'
     );
+    await databaseClient.pool.query(
+      `insert into financial_classification_versions
+         (subject_type, subject_id, classifier_version, classification, source_fingerprint_sha256)
+       values ('balance_transaction', $1, 1, 'other', repeat('c', 64))`,
+      [unresolvedTransaction.id]
+    );
     expect(await readGrossHead(unresolvedTransaction.id)).toEqual({
       base_set_id: unresolved.id,
       compatible_correction_tip_id: null,
@@ -908,6 +1270,12 @@ describe('Plan 6B financial schema', () => {
     await expectSingleRow(
       insertAllocationItem(staleBase.id, staleGraph.orderItemId, 70),
       'stale-correction original item'
+    );
+    await databaseClient.pool.query(
+      `insert into financial_classification_versions
+         (subject_type, subject_id, classifier_version, classification, source_fingerprint_sha256)
+       values ('balance_transaction', $1, 1, 'refund', repeat('c', 64))`,
+      [staleTransaction.id]
     );
     const oldCorrection = await expectSingleRow(
       databaseClient.pool.query<{ id: string }>(
@@ -956,6 +1324,269 @@ describe('Plan 6B financial schema', () => {
       proposed_issue_code: 'correction_rebase_required'
     });
     expect((await readProjectionItems(staleTransaction.id)).rows).toEqual([]);
+  });
+
+  it('publishes only arithmetically valid, order-bound, capacity-safe corrections', async () => {
+    const valid = await createCorrectionProjectionFixture('compatible-correction');
+    const validCorrectionId = await insertCorrectionSet(valid, 'compatible-correction');
+    await insertCorrectionItems(validCorrectionId, 'compatible-correction', [
+      {
+        domain: 'settlement',
+        sourceAllocationSetId: valid.baseSetId,
+        orderItemId: valid.graph.orderItemId,
+        component: 'refund_subtotal',
+        approvedAbsoluteMinor: 40,
+        deltaMinor: -60
+      },
+      {
+        domain: 'settlement',
+        sourceAllocationSetId: valid.baseSetId,
+        orderItemId: valid.alternateOrderItemId,
+        component: 'refund_subtotal',
+        approvedAbsoluteMinor: 60,
+        deltaMinor: 60
+      },
+      {
+        domain: 'presentment',
+        sourceAllocationSetId: null,
+        orderItemId: valid.graph.orderItemId,
+        component: 'refund_subtotal',
+        approvedAbsoluteMinor: 40,
+        deltaMinor: -60
+      },
+      {
+        domain: 'presentment',
+        sourceAllocationSetId: null,
+        orderItemId: valid.alternateOrderItemId,
+        component: 'refund_subtotal',
+        approvedAbsoluteMinor: 60,
+        deltaMinor: 60
+      }
+    ]);
+    expect(await readGrossProjectionHead(valid.balanceTransactionId)).toMatchObject({
+      base_set_id: valid.baseSetId,
+      compatible_correction_tip_id: validCorrectionId,
+      is_complete: true,
+      missing_source_count: 0,
+      proposed_issue_code: null
+    });
+    expect(
+      (
+        await databaseClient.pool.query<{
+          order_item_id: string;
+          effect_minor: number;
+        }>(
+          `select order_item_id, effect_minor
+           from current_financial_projection_items
+           where balance_transaction_id = $1 and basis = 'gross_amount'
+           order by effect_minor`,
+          [valid.balanceTransactionId]
+        )
+      ).rows
+    ).toEqual([
+      { order_item_id: valid.graph.orderItemId, effect_minor: 40 },
+      { order_item_id: valid.alternateOrderItemId, effect_minor: 60 }
+    ]);
+
+    const malformedDelta = await createCorrectionProjectionFixture('malformed-delta');
+    const malformedDeltaCorrectionId = await insertCorrectionSet(
+      malformedDelta,
+      'malformed-delta'
+    );
+    await insertCorrectionItems(malformedDeltaCorrectionId, 'malformed-delta', [
+      {
+        domain: 'settlement',
+        sourceAllocationSetId: malformedDelta.baseSetId,
+        orderItemId: malformedDelta.graph.orderItemId,
+        component: 'refund_subtotal',
+        approvedAbsoluteMinor: 100,
+        deltaMinor: 1
+      }
+    ]);
+    expect.soft(await readGrossProjectionHead(malformedDelta.balanceTransactionId)).toMatchObject({
+      compatible_correction_tip_id: null,
+      is_complete: false,
+      missing_source_count: 1,
+      proposed_issue_code: 'correction_rebase_required'
+    });
+
+    const emptyCorrection = await createCorrectionProjectionFixture('empty-correction');
+    await insertCorrectionSet(emptyCorrection, 'empty-correction');
+    expect.soft(await readGrossProjectionHead(emptyCorrection.balanceTransactionId)).toMatchObject({
+      compatible_correction_tip_id: null,
+      is_complete: false,
+      missing_source_count: 1,
+      proposed_issue_code: 'correction_rebase_required'
+    });
+
+    const foreignItem = await createCorrectionProjectionFixture('foreign-correction-item');
+    const unrelated = await createCommerceGraph('foreign-correction-order');
+    const foreignCorrectionId = await insertCorrectionSet(foreignItem, 'foreign-correction-item');
+    await insertCorrectionItems(foreignCorrectionId, 'foreign-correction-item', [
+      {
+        domain: 'settlement',
+        sourceAllocationSetId: foreignItem.baseSetId,
+        orderItemId: foreignItem.graph.orderItemId,
+        component: 'refund_subtotal',
+        approvedAbsoluteMinor: 0,
+        deltaMinor: -100
+      },
+      {
+        domain: 'settlement',
+        sourceAllocationSetId: foreignItem.baseSetId,
+        orderItemId: unrelated.orderItemId,
+        component: 'refund_subtotal',
+        approvedAbsoluteMinor: 100,
+        deltaMinor: 100
+      }
+    ]);
+    expect.soft(await readGrossProjectionHead(foreignItem.balanceTransactionId)).toMatchObject({
+      compatible_correction_tip_id: null,
+      is_complete: false,
+      missing_source_count: 1,
+      proposed_issue_code: 'correction_rebase_required'
+    });
+
+    const overCapacity = await createCorrectionProjectionFixture('correction-capacity', 100);
+    const otherRefund = await expectSingleRow(
+      databaseClient.pool.query<{ id: string }>(
+        `insert into refunds
+           (payment_id, stripe_refund_id, status, amount_minor, currency, provider_created_at)
+         values ($1, $2, 'succeeded', 60, 'USD', clock_timestamp())
+         returning id`,
+        [overCapacity.graph.paymentId, nextToken('capacity_refund')]
+      ),
+      'other succeeded refund consuming item capacity'
+    );
+    const otherAllocation = await expectSingleRow(
+      databaseClient.pool.query<{ id: string }>(
+        `insert into refund_allocations (refund_id, order_item_id, amount_minor, source)
+         values ($1, $2, 60, 'automatic')
+         returning id`,
+        [otherRefund.id, overCapacity.alternateOrderItemId]
+      ),
+      'other refund allocation consuming item capacity'
+    );
+    await databaseClient.pool.query(
+      `insert into refund_allocation_components
+         (refund_allocation_id, refund_id, order_item_id, subtotal_minor, tax_minor,
+          total_minor, currency)
+       values ($1, $2, $3, 60, 0, 60, 'USD')`,
+      [otherAllocation.id, otherRefund.id, overCapacity.alternateOrderItemId]
+    );
+    const overCapacityCorrectionId = await insertCorrectionSet(overCapacity, 'correction-capacity');
+    await insertCorrectionItems(overCapacityCorrectionId, 'correction-capacity', [
+      {
+        domain: 'settlement',
+        sourceAllocationSetId: overCapacity.baseSetId,
+        orderItemId: overCapacity.graph.orderItemId,
+        component: 'refund_subtotal',
+        approvedAbsoluteMinor: 50,
+        deltaMinor: -50
+      },
+      {
+        domain: 'settlement',
+        sourceAllocationSetId: overCapacity.baseSetId,
+        orderItemId: overCapacity.alternateOrderItemId,
+        component: 'refund_subtotal',
+        approvedAbsoluteMinor: 50,
+        deltaMinor: 50
+      },
+      {
+        domain: 'presentment',
+        sourceAllocationSetId: null,
+        orderItemId: overCapacity.graph.orderItemId,
+        component: 'refund_subtotal',
+        approvedAbsoluteMinor: 50,
+        deltaMinor: -50
+      },
+      {
+        domain: 'presentment',
+        sourceAllocationSetId: null,
+        orderItemId: overCapacity.alternateOrderItemId,
+        component: 'refund_subtotal',
+        approvedAbsoluteMinor: 50,
+        deltaMinor: 50
+      }
+    ]);
+    expect.soft(await readGrossProjectionHead(overCapacity.balanceTransactionId)).toMatchObject({
+      compatible_correction_tip_id: null,
+      is_complete: false,
+      missing_source_count: 1,
+      proposed_issue_code: 'correction_rebase_required'
+    });
+  });
+
+  it('selects current classifier and allocation versions exactly in the presence of future history', async () => {
+    const current = await createCorrectionProjectionFixture('current-with-future');
+    await databaseClient.pool.query(
+      `insert into financial_classification_versions
+         (subject_type, subject_id, classifier_version, classification, source_fingerprint_sha256)
+       values ('balance_transaction', $1, 2, 'unknown', repeat('c', 64))`,
+      [current.balanceTransactionId]
+    );
+    const futureSuccessor = await expectSingleRow(
+      insertAllocationSet({
+        balanceTransactionId: current.balanceTransactionId,
+        sourceInternalId: current.graph.refundId,
+        expectedEffectMinor: 100,
+        sourceFingerprintSha256: 'c'.repeat(64),
+        supersedesSetId: current.baseSetId,
+        algorithmVersion: 2,
+        classifierVersion: 2
+      }),
+      'future allocation successor'
+    );
+    await expectSingleRow(
+      insertAllocationItem(futureSuccessor.id, current.alternateOrderItemId, 100),
+      'future allocation successor item'
+    );
+    expect(await readGrossProjectionHead(current.balanceTransactionId)).toMatchObject({
+      base_set_id: current.baseSetId,
+      compatible_correction_tip_id: null,
+      is_complete: true,
+      missing_source_count: 0,
+      proposed_issue_code: null
+    });
+
+    const futureOnlyGraph = await createCommerceGraph('future-only');
+    const futureOnlyTransaction = await expectSingleRow(
+      insertBalanceTransaction({
+        sourceFamily: 'refund',
+        sourceId: nextToken('future_only_refund'),
+        amountMinor: 100,
+        netMinor: 100
+      }),
+      'future-only balance transaction'
+    );
+    await databaseClient.pool.query(
+      `insert into financial_classification_versions
+         (subject_type, subject_id, classifier_version, classification, source_fingerprint_sha256)
+       values ('balance_transaction', $1, 2, 'refund', repeat('c', 64))`,
+      [futureOnlyTransaction.id]
+    );
+    const futureOnlySet = await expectSingleRow(
+      insertAllocationSet({
+        balanceTransactionId: futureOnlyTransaction.id,
+        sourceInternalId: futureOnlyGraph.refundId,
+        expectedEffectMinor: 100,
+        sourceFingerprintSha256: 'c'.repeat(64),
+        algorithmVersion: 2,
+        classifierVersion: 2
+      }),
+      'future-only allocation set'
+    );
+    await expectSingleRow(
+      insertAllocationItem(futureOnlySet.id, futureOnlyGraph.orderItemId, 100),
+      'future-only allocation item'
+    );
+    expect(await readGrossProjectionHead(futureOnlyTransaction.id)).toMatchObject({
+      base_set_id: null,
+      compatible_correction_tip_id: null,
+      is_complete: false,
+      missing_source_count: 1,
+      proposed_issue_code: 'missing_source'
+    });
   });
 
   it('enforces immutable draft, correction, and finalization provenance graphs', async () => {

@@ -96,7 +96,7 @@ export type CurrentEffectiveAllocationProjection =
       readonly status: 'missing';
       readonly balanceTransactionId: string;
       readonly basis: AllocationBasis;
-      readonly safeCode: 'missing_source';
+      readonly safeCode: 'missing_source' | 'allocation_incomplete';
     }
   | {
       readonly status: 'exception';
@@ -105,8 +105,11 @@ export type CurrentEffectiveAllocationProjection =
       readonly safeCode:
         | 'allocation_fork'
         | 'allocation_mismatch'
+        | 'classification_fork'
         | 'correction_rebase_required'
-        | 'currency_mismatch';
+        | 'currency_mismatch'
+        | 'immutable_mismatch'
+        | 'unsupported_category';
     };
 
 export interface CurrentPayoutEvidence {
@@ -114,6 +117,8 @@ export interface CurrentPayoutEvidence {
   readonly authoritativeMembershipCount: number;
   readonly paidAutomaticStandardCompletedCount: number;
   readonly conflictingMembershipCount: number;
+  readonly hasOpenExceptionIssue: boolean;
+  readonly hasMissingPayoutReversal: boolean;
 }
 
 export interface PublicFinancialStateInput {

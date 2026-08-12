@@ -21,6 +21,7 @@ import {
   entitlementGrantStatus,
   entitlementGrants,
   orderItems,
+  payments,
   refundAllocations,
   refunds
 } from './commerce';
@@ -28,7 +29,11 @@ import {
   FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
   FINANCIAL_CLASSIFIER_VERSION
 } from '../../commerce/financial/constants';
-import { stripeBalanceTransactions } from './financial-provider';
+import {
+  financialClassificationVersions,
+  stripeBalanceTransactionFeeDetails,
+  stripeBalanceTransactions
+} from './financial-provider';
 
 export const allocationBasisValues = ['gross_amount', 'fee'] as const;
 export const allocationScopeValues = ['title', 'account', 'unresolved'] as const;
@@ -155,6 +160,9 @@ export const financialAllocationSets = pgTable(
     uniqueIndex('financial_allocation_sets_successor_unique')
       .on(table.supersedesSetId)
       .where(sql`${table.supersedesSetId} is not null`),
+    uniqueIndex('financial_allocation_sets_reversal_root_unique')
+      .on(table.reversalOfSetId)
+      .where(sql`${table.reversalOfSetId} is not null and ${table.supersedesSetId} is null`),
     index('financial_allocation_sets_transaction_basis_idx').on(
       table.balanceTransactionId,
       table.basis,
@@ -681,11 +689,63 @@ export const currentFinancialProjectionHeads = pgView('current_financial_project
   missingSourceCount: integer('missing_source_count').notNull(),
   proposedIssueCode: varchar('proposed_issue_code', { length: 100 })
 }).as(sql`
-  with eligible_allocation_sets as (
+  with current_parent_classification_candidates as (
+    select
+      bt.id as balance_transaction_id,
+      count(classification.id)::integer as decision_count,
+      count(*) filter (where classification.classification = 'unknown')::integer as unknown_count
+    from ${stripeBalanceTransactions} bt
+    left join ${financialClassificationVersions} classification
+      on classification.subject_type = 'balance_transaction'
+      and classification.subject_id = bt.id
+      and classification.source_fingerprint_sha256 = bt.fingerprint_sha256
+      and classification.classifier_version = ${FINANCIAL_CLASSIFIER_VERSION}
+    group by bt.id
+  ), current_fee_detail_classification_candidates as (
+    select
+      detail.balance_transaction_id,
+      detail.id as fee_detail_id,
+      detail.amount_minor,
+      detail.currency,
+      count(classification.id)::integer as decision_count,
+      count(*) filter (where classification.classification = 'unknown')::integer as unknown_count
+    from ${stripeBalanceTransactionFeeDetails} detail
+    left join ${financialClassificationVersions} classification
+      on classification.subject_type = 'fee_detail'
+      and classification.subject_id = detail.id
+      and classification.source_fingerprint_sha256 = detail.fingerprint_sha256
+      and classification.classifier_version = ${FINANCIAL_CLASSIFIER_VERSION}
+    group by detail.balance_transaction_id, detail.id, detail.amount_minor, detail.currency
+  ), current_fee_classification_candidates as (
+    select
+      bt.id as balance_transaction_id,
+      count(detail.fee_detail_id)::integer as detail_count,
+      coalesce(sum(detail.amount_minor), 0::bigint) as detail_amount_sum,
+      count(detail.fee_detail_id) filter (where detail.currency <> bt.currency)::integer as currency_mismatch_count,
+      coalesce(sum(detail.decision_count), 0::bigint)::integer as decision_count,
+      coalesce(sum(detail.unknown_count), 0::bigint)::integer as unknown_count
+    from ${stripeBalanceTransactions} bt
+    left join current_fee_detail_classification_candidates detail
+      on detail.balance_transaction_id = bt.id
+    group by bt.id
+  ), current_classification_status as (
+    select
+      parent.balance_transaction_id,
+      parent.decision_count as parent_decision_count,
+      parent.unknown_count as parent_unknown_count,
+      fee.detail_count as fee_detail_count,
+      fee.detail_amount_sum as fee_detail_amount_sum,
+      fee.currency_mismatch_count as fee_currency_mismatch_count,
+      fee.decision_count as fee_decision_count,
+      fee.unknown_count as fee_unknown_count
+    from current_parent_classification_candidates parent
+    join current_fee_classification_candidates fee
+      on fee.balance_transaction_id = parent.balance_transaction_id
+  ), eligible_allocation_sets as (
     select s.*
     from ${financialAllocationSets} s
-    where s.classifier_version <= ${FINANCIAL_CLASSIFIER_VERSION}
-      and s.algorithm_version <= ${FINANCIAL_ALLOCATION_ALGORITHM_VERSION}
+    where s.classifier_version = ${FINANCIAL_CLASSIFIER_VERSION}
+      and s.algorithm_version = ${FINANCIAL_ALLOCATION_ALGORITHM_VERSION}
   ), eligible_base_tips_unranked as (
     select s.*
     from eligible_allocation_sets s
@@ -713,16 +773,30 @@ export const currentFinancialProjectionHeads = pgView('current_financial_project
       (array_agg(base.source_internal_id order by base.id) filter (where base.id is not null))[1] as source_internal_id,
       (array_agg(base.source_fingerprint_sha256 order by base.id) filter (where base.id is not null))[1] as source_fingerprint_sha256,
       bt.fingerprint_sha256 as provider_fingerprint,
+      classification.parent_decision_count,
+      classification.parent_unknown_count,
+      classification.fee_detail_count,
+      classification.fee_detail_amount_sum,
+      classification.fee_currency_mismatch_count,
+      classification.fee_decision_count,
+      classification.fee_unknown_count,
       case when basis.value = 'gross_amount'::financial_allocation_basis then bt.amount_minor else -bt.fee_minor end as provider_expected_effect,
+      bt.fee_minor as provider_fee_minor,
       bt.currency as provider_currency
     from ${stripeBalanceTransactions} bt
     cross join (values
       ('gross_amount'::financial_allocation_basis),
       ('fee'::financial_allocation_basis)
     ) basis(value)
+    join current_classification_status classification
+      on classification.balance_transaction_id = bt.id
     left join eligible_base_tips base
       on base.balance_transaction_id = bt.id and base.basis = basis.value
-    group by bt.id, basis.value, bt.amount_minor, bt.fee_minor, bt.currency, bt.fingerprint_sha256
+    group by bt.id, basis.value, bt.amount_minor, bt.fee_minor, bt.currency, bt.fingerprint_sha256,
+      classification.parent_decision_count, classification.parent_unknown_count,
+      classification.fee_detail_count, classification.fee_detail_amount_sum,
+      classification.fee_currency_mismatch_count, classification.fee_decision_count,
+      classification.fee_unknown_count
   ), base_item_rollup as (
     select
       s.id as base_set_id,
@@ -732,11 +806,47 @@ export const currentFinancialProjectionHeads = pgView('current_financial_project
     from eligible_base_tips s
     left join ${financialItemAllocations} item on item.allocation_set_id = s.id
     group by s.id
-  ), current_correction_tips as (
+  ), refund_presentment_components as (
+    select
+      allocation.refund_id,
+      allocation.order_item_id,
+      allocation.currency,
+      component.component,
+      component.amount_minor
+    from ${refundAllocationComponents} allocation
+    cross join lateral (values
+      ('refund_subtotal'::financial_component, allocation.subtotal_minor),
+      ('refund_tax'::financial_component, allocation.tax_minor)
+    ) component(component, amount_minor)
+  ), correction_tip_candidates as (
+    select correction.*
+    from ${refundReportingCorrectionSets} correction
+    where not exists (
+      select 1 from ${refundReportingCorrectionSets} successor
+      where successor.predecessor_correction_set_id = correction.id
+    )
+  ), correction_prevalidation as (
     select
       correction.*,
+      correction_refund.payment_id as refund_payment_id,
+      correction_refund.currency as refund_currency,
+      correction_payment.order_id as refund_order_id,
+      case when
+        exists (
+          select 1
+          from ${refundReportingCorrectionItems} correction_item
+          where correction_item.correction_set_id = correction.id
+        ) and
+        correction_refund.status = 'succeeded' and
+        correction_refund.currency = correction_payment.currency and
+        anchor.id is not null and
+        anchor.tip_count = 1 and
+        anchor.source_kind = 'refund'::financial_allocation_source_kind and
+        anchor.source_internal_id = correction.refund_id and
+        anchor.source_fingerprint_sha256 = correction.source_fingerprint_sha256
+      then 0 else 1 end::bigint as invalid_refund_context_count,
       (
-        select count(*)::integer
+        select count(*)
         from ${refundReportingCorrectionItems} correction_item
         left join eligible_base_tips item_source
           on item_source.id = correction_item.source_allocation_set_id
@@ -750,12 +860,209 @@ export const currentFinancialProjectionHeads = pgView('current_financial_project
             item_source.source_fingerprint_sha256 <> correction.source_fingerprint_sha256 or
             correction_item.currency <> item_source.currency
           )
-      ) as invalid_settlement_source_count
-    from ${refundReportingCorrectionSets} correction
-    where not exists (
-      select 1 from ${refundReportingCorrectionSets} successor
-      where successor.predecessor_correction_set_id = correction.id
-    )
+      ) as invalid_settlement_source_count,
+      (
+        select count(*)
+        from (
+          select
+            correction_item.domain,
+            correction_item.source_allocation_set_id,
+            correction_item.currency
+          from ${refundReportingCorrectionItems} correction_item
+          where correction_item.correction_set_id = correction.id
+          group by correction_item.domain,
+            correction_item.source_allocation_set_id,
+            correction_item.currency
+          having sum(correction_item.delta_minor::bigint) <> 0
+        ) invalid_delta_group
+      ) as invalid_delta_group_count,
+      (
+        select count(*)
+        from ${refundReportingCorrectionItems} correction_item
+        where correction_item.correction_set_id = correction.id
+          and (
+            not exists (
+              select 1
+              from ${orderItems} order_item
+              where order_item.id = correction_item.order_item_id
+                and order_item.order_id = correction_payment.order_id
+                and (
+                  correction_item.domain <> 'presentment' or
+                  order_item.currency = correction_item.currency
+                )
+            ) or (
+              correction_item.domain = 'presentment' and
+              correction_item.currency <> correction_refund.currency
+            )
+          )
+      ) as invalid_order_item_count,
+      (
+        select count(*)
+        from ${refundReportingCorrectionItems} correction_item
+        left join ${financialItemAllocations} base_item
+          on base_item.allocation_set_id = correction_item.source_allocation_set_id
+          and base_item.order_item_id = correction_item.order_item_id
+          and base_item.component = correction_item.component
+        where correction_item.correction_set_id = correction.id
+          and correction_item.domain = 'settlement'
+          and (
+            correction_item.approved_absolute_minor::bigint <>
+              coalesce(base_item.effect_minor, 0)::bigint + correction_item.delta_minor::bigint or
+            (base_item.id is not null and base_item.currency <> correction_item.currency)
+          )
+      ) as invalid_settlement_arithmetic_count,
+      (
+        select count(*)
+        from ${financialItemAllocations} base_item
+        where base_item.effect_minor <> 0
+          and exists (
+            select 1
+            from ${refundReportingCorrectionItems} source_item
+            where source_item.correction_set_id = correction.id
+              and source_item.domain = 'settlement'
+              and source_item.source_allocation_set_id = base_item.allocation_set_id
+          )
+          and not exists (
+            select 1
+            from ${refundReportingCorrectionItems} correction_item
+            where correction_item.correction_set_id = correction.id
+              and correction_item.domain = 'settlement'
+              and correction_item.source_allocation_set_id = base_item.allocation_set_id
+              and correction_item.order_item_id = base_item.order_item_id
+              and correction_item.component = base_item.component
+              and correction_item.currency = base_item.currency
+          )
+      ) as missing_settlement_base_count,
+      (
+        select count(*)
+        from ${refundReportingCorrectionItems} correction_item
+        left join refund_presentment_components base_component
+          on base_component.refund_id = correction.refund_id
+          and base_component.order_item_id = correction_item.order_item_id
+          and base_component.component = correction_item.component
+        where correction_item.correction_set_id = correction.id
+          and correction_item.domain = 'presentment'
+          and (
+            correction_item.approved_absolute_minor < 0 or
+            correction_item.approved_absolute_minor::bigint <>
+              coalesce(base_component.amount_minor, 0)::bigint + correction_item.delta_minor::bigint or
+            (base_component.refund_id is not null and
+              base_component.currency <> correction_item.currency)
+          )
+      ) as invalid_presentment_arithmetic_count,
+      (
+        select count(*)
+        from refund_presentment_components base_component
+        where base_component.refund_id = correction.refund_id
+          and base_component.amount_minor <> 0
+          and exists (
+            select 1
+            from ${refundReportingCorrectionItems} presentment_item
+            where presentment_item.correction_set_id = correction.id
+              and presentment_item.domain = 'presentment'
+          )
+          and not exists (
+            select 1
+            from ${refundReportingCorrectionItems} correction_item
+            where correction_item.correction_set_id = correction.id
+              and correction_item.domain = 'presentment'
+              and correction_item.order_item_id = base_component.order_item_id
+              and correction_item.component = base_component.component
+              and correction_item.currency = base_component.currency
+          )
+      ) as missing_presentment_base_count
+    from correction_tip_candidates correction
+    join ${refunds} correction_refund on correction_refund.id = correction.refund_id
+    join ${payments} correction_payment on correction_payment.id = correction_refund.payment_id
+    left join eligible_base_tips anchor on anchor.id = correction.base_allocation_set_id
+  ), prevalidated_correction_tips as (
+    select
+      correction.*,
+      (
+        correction.invalid_refund_context_count +
+        correction.invalid_settlement_source_count +
+        correction.invalid_delta_group_count +
+        correction.invalid_order_item_count +
+        correction.invalid_settlement_arithmetic_count +
+        correction.missing_settlement_base_count +
+        correction.invalid_presentment_arithmetic_count +
+        correction.missing_presentment_base_count
+      )::bigint as invalid_noncapacity_count
+    from correction_prevalidation correction
+  ), effective_presentment_components as (
+    select
+      effective_refund.payment_id,
+      base_component.refund_id,
+      base_component.order_item_id,
+      base_component.component,
+      base_component.currency,
+      base_component.amount_minor::bigint as effect_minor
+    from refund_presentment_components base_component
+    join ${refunds} effective_refund on effective_refund.id = base_component.refund_id
+    where effective_refund.status = 'succeeded'
+      and not exists (
+        select 1
+        from prevalidated_correction_tips correction
+        where correction.refund_id = base_component.refund_id
+          and correction.invalid_noncapacity_count = 0
+          and exists (
+            select 1
+            from ${refundReportingCorrectionItems} correction_item
+            where correction_item.correction_set_id = correction.id
+              and correction_item.domain = 'presentment'
+          )
+      )
+    union all
+    select
+      correction.refund_payment_id as payment_id,
+      correction.refund_id,
+      correction_item.order_item_id,
+      correction_item.component,
+      correction_item.currency,
+      correction_item.approved_absolute_minor::bigint as effect_minor
+    from prevalidated_correction_tips correction
+    join ${refundReportingCorrectionItems} correction_item
+      on correction_item.correction_set_id = correction.id
+      and correction_item.domain = 'presentment'
+    where correction.invalid_noncapacity_count = 0
+  ), presentment_capacity_status as (
+    select
+      effect.payment_id,
+      effect.order_item_id,
+      effect.component,
+      effect.currency,
+      sum(effect.effect_minor)::bigint as cumulative_effect_minor,
+      case effect.component
+        when 'refund_subtotal'::financial_component then order_item.unit_subtotal_minor
+        when 'refund_tax'::financial_component then coalesce(order_item.tax_minor, 0)
+        else 0
+      end::bigint as capacity_minor
+    from effective_presentment_components effect
+    join ${orderItems} order_item on order_item.id = effect.order_item_id
+    group by effect.payment_id, effect.order_item_id, effect.component, effect.currency,
+      order_item.unit_subtotal_minor, order_item.tax_minor
+  ), current_correction_tips as (
+    select
+      correction.*,
+      (
+        correction.invalid_noncapacity_count + (
+          select count(*)
+          from ${refundReportingCorrectionItems} correction_item
+          left join presentment_capacity_status capacity
+            on capacity.payment_id = correction.refund_payment_id
+            and capacity.order_item_id = correction_item.order_item_id
+            and capacity.component = correction_item.component
+            and capacity.currency = correction_item.currency
+          where correction_item.correction_set_id = correction.id
+            and correction_item.domain = 'presentment'
+            and (
+              capacity.order_item_id is null or
+              capacity.cumulative_effect_minor < 0 or
+              capacity.cumulative_effect_minor > capacity.capacity_minor
+            )
+        )
+      )::bigint as invalid_correction_count
+    from prevalidated_correction_tips correction
   ), correction_rollup as (
     select
       correction.refund_id,
@@ -763,7 +1070,7 @@ export const currentFinancialProjectionHeads = pgView('current_financial_project
       (array_agg(correction.id order by correction.id))[1] as correction_tip_id,
       (array_agg(correction.base_allocation_set_id order by correction.id))[1] as anchor_base_set_id,
       (array_agg(correction.source_fingerprint_sha256 order by correction.id))[1] as correction_fingerprint,
-      coalesce(sum(correction.invalid_settlement_source_count), 0::bigint) as invalid_settlement_source_count
+      coalesce(sum(correction.invalid_correction_count), 0::bigint) as invalid_correction_count
     from current_correction_tips correction
     group by correction.refund_id
   ), correction_status as (
@@ -771,7 +1078,7 @@ export const currentFinancialProjectionHeads = pgView('current_financial_project
       correction.*,
       (
         correction.correction_count = 1 and
-        correction.invalid_settlement_source_count = 0 and
+        correction.invalid_correction_count = 0 and
         anchor.id is not null and
         anchor.tip_count = 1 and
         anchor.source_kind = 'refund'::financial_allocation_source_kind and
@@ -824,38 +1131,54 @@ export const currentFinancialProjectionHeads = pgView('current_financial_project
     case when base_count = 1 then expected_effect_minor else null::integer end as expected_effect_minor,
     (
       base_count = 1 and scope <> 'unresolved'::financial_allocation_scope and
+      parent_decision_count = 1 and parent_unknown_count = 0 and
+      (basis <> 'fee'::financial_allocation_basis or
+        (fee_decision_count = fee_detail_count and fee_unknown_count = 0 and
+          fee_detail_amount_sum = provider_fee_minor and fee_currency_mismatch_count = 0)) and
       source_fingerprint_sha256 = provider_fingerprint and
       currency = provider_currency and expected_effect_minor = provider_expected_effect and
       (
         (
           correction_count = 0 and
-          ((scope = 'title' and base_item_count > 0 and base_item_currency_mismatch_count = 0 and base_item_effect_sum = expected_effect_minor) or (scope = 'account' and base_item_count = 0))
+          ((scope = 'title' and (base_item_count > 0 or expected_effect_minor = 0) and base_item_currency_mismatch_count = 0 and base_item_effect_sum = expected_effect_minor) or (scope = 'account' and base_item_count = 0))
         ) or (
           correction_count = 1 and correction_is_compatible and
           (
             (correction_item_count > 0 and scope = 'title' and correction_item_currency_mismatch_count = 0 and correction_item_effect_sum = expected_effect_minor) or
-            (correction_item_count = 0 and ((scope = 'title' and base_item_count > 0 and base_item_currency_mismatch_count = 0 and base_item_effect_sum = expected_effect_minor) or (scope = 'account' and base_item_count = 0)))
+            (correction_item_count = 0 and ((scope = 'title' and (base_item_count > 0 or expected_effect_minor = 0) and base_item_currency_mismatch_count = 0 and base_item_effect_sum = expected_effect_minor) or (scope = 'account' and base_item_count = 0)))
           )
         )
       )
     )::boolean as is_complete,
     case when
       base_count = 1 and scope <> 'unresolved'::financial_allocation_scope and
+      parent_decision_count = 1 and parent_unknown_count = 0 and
+      (basis <> 'fee'::financial_allocation_basis or
+        (fee_decision_count = fee_detail_count and fee_unknown_count = 0 and
+          fee_detail_amount_sum = provider_fee_minor and fee_currency_mismatch_count = 0)) and
       source_fingerprint_sha256 = provider_fingerprint and
       currency = provider_currency and expected_effect_minor = provider_expected_effect and
       (
         (
           correction_count = 0 and
-          ((scope = 'title' and base_item_count > 0 and base_item_currency_mismatch_count = 0 and base_item_effect_sum = expected_effect_minor) or (scope = 'account' and base_item_count = 0))
+          ((scope = 'title' and (base_item_count > 0 or expected_effect_minor = 0) and base_item_currency_mismatch_count = 0 and base_item_effect_sum = expected_effect_minor) or (scope = 'account' and base_item_count = 0))
         ) or (
           correction_count = 1 and correction_is_compatible and
           (
             (correction_item_count > 0 and scope = 'title' and correction_item_currency_mismatch_count = 0 and correction_item_effect_sum = expected_effect_minor) or
-            (correction_item_count = 0 and ((scope = 'title' and base_item_count > 0 and base_item_currency_mismatch_count = 0 and base_item_effect_sum = expected_effect_minor) or (scope = 'account' and base_item_count = 0)))
+            (correction_item_count = 0 and ((scope = 'title' and (base_item_count > 0 or expected_effect_minor = 0) and base_item_currency_mismatch_count = 0 and base_item_effect_sum = expected_effect_minor) or (scope = 'account' and base_item_count = 0)))
           )
         )
       ) then 0 else 1 end::integer as missing_source_count,
     case
+      when parent_decision_count = 0 then 'missing_source'::varchar(100)
+      when parent_decision_count > 1 then 'classification_fork'::varchar(100)
+      when parent_unknown_count > 0 then 'unsupported_category'::varchar(100)
+      when basis = 'fee'::financial_allocation_basis and fee_currency_mismatch_count > 0 then 'currency_mismatch'::varchar(100)
+      when basis = 'fee'::financial_allocation_basis and fee_detail_amount_sum <> provider_fee_minor then 'allocation_mismatch'::varchar(100)
+      when basis = 'fee'::financial_allocation_basis and fee_decision_count > fee_detail_count then 'classification_fork'::varchar(100)
+      when basis = 'fee'::financial_allocation_basis and fee_unknown_count > 0 then 'unsupported_category'::varchar(100)
+      when basis = 'fee'::financial_allocation_basis and fee_decision_count < fee_detail_count then 'missing_source'::varchar(100)
       when base_count = 0 then 'missing_source'::varchar(100)
       when base_count > 1 then 'allocation_fork'::varchar(100)
       when source_fingerprint_sha256 <> provider_fingerprint then 'immutable_mismatch'::varchar(100)
@@ -867,7 +1190,7 @@ export const currentFinancialProjectionHeads = pgView('current_financial_project
       when correction_count = 1 and correction_item_count > 0 and correction_item_currency_mismatch_count > 0 then 'currency_mismatch'::varchar(100)
       when correction_count = 1 and correction_item_count > 0 and (scope <> 'title' or correction_item_effect_sum <> expected_effect_minor) then 'allocation_mismatch'::varchar(100)
       when (correction_count = 0 or correction_item_count = 0) and base_item_currency_mismatch_count > 0 then 'currency_mismatch'::varchar(100)
-      when (correction_count = 0 or correction_item_count = 0) and ((scope = 'title' and (base_item_count = 0 or base_item_effect_sum <> expected_effect_minor)) or (scope = 'account' and base_item_count <> 0)) then 'allocation_mismatch'::varchar(100)
+      when (correction_count = 0 or correction_item_count = 0) and ((scope = 'title' and ((base_item_count = 0 and expected_effect_minor <> 0) or base_item_effect_sum <> expected_effect_minor)) or (scope = 'account' and base_item_count <> 0)) then 'allocation_mismatch'::varchar(100)
       else null::varchar(100)
     end as proposed_issue_code
   from resolved

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import type { SQL } from 'drizzle-orm';
 import { getTableConfig, getViewConfig, type PgTable } from 'drizzle-orm/pg-core';
 import {
   allocationBasisEnum,
@@ -45,6 +46,13 @@ const checkNames = (table: PgTable) => configFor(table).checks.map((item) => ite
 const uniqueNames = (table: PgTable) =>
   configFor(table).uniqueConstraints.map((item) => item.name);
 const tableName = (table: PgTable) => configFor(table).name;
+const renderedSql = (query: SQL) =>
+  query.toQuery({
+    casing: {} as never,
+    escapeName: (name) => `"${name}"`,
+    escapeParam: (index) => `$${index + 1}`,
+    escapeString: (value) => `'${value}'`
+  }).sql.replaceAll(/\s+/gu, ' ');
 const foreignKeySignatures = () =>
   TABLES.flatMap((table) =>
     configFor(table).foreignKeys.map((foreignKey) => {
@@ -125,6 +133,7 @@ describe('financial allocation schema declarations', () => {
     expect(indexNames(financialAllocationSets)).toEqual(
       expect.arrayContaining([
         'financial_allocation_sets_identity_unique',
+        'financial_allocation_sets_reversal_root_unique',
         'financial_allocation_sets_successor_unique',
         'financial_allocation_sets_transaction_basis_idx'
       ])
@@ -204,6 +213,22 @@ describe('financial allocation schema declarations', () => {
         'refund_allocation_finalization_effects_draft_version_positive',
         'refund_allocation_finalization_effects_transition_consistent'
       ])
+    );
+  });
+
+  it('selects only the exact current classification/allocation versions and counts fee subjects once', () => {
+    const query = renderedSql(getViewConfig(currentFinancialProjectionHeads).query);
+
+    expect(query).toMatch(/where s\.classifier_version = 1/u);
+    expect(query).not.toMatch(/s\.classifier_version <= 1/u);
+    expect(query).toMatch(/s\.algorithm_version = 1/u);
+    expect(query).not.toMatch(/s\.algorithm_version <= 1/u);
+    expect(query).toContain('current_fee_detail_classification_candidates');
+    expect(query).toMatch(
+      /group by detail\.balance_transaction_id, detail\.id, detail\.amount_minor, detail\.currency/u
+    );
+    expect(query).toMatch(
+      /case when parent_decision_count = 0[\s\S]+?parent_unknown_count > 0[\s\S]+?base_count = 0/u
     );
   });
 

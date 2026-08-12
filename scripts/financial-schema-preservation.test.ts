@@ -1,6 +1,11 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { getViewConfig } from 'drizzle-orm/pg-core';
 import { describe, expect, it } from 'vitest';
+import {
+  currentFinancialProjectionHeads,
+  currentFinancialProjectionItems
+} from '../src/lib/server/db/schema/financial-allocation';
 
 function source(relativePath: string): string {
   const path = fileURLToPath(new URL(relativePath, import.meta.url));
@@ -74,6 +79,24 @@ const NARROW_UPDATE_GUARD_TABLES = [
   'financial_reconciliation_issues'
 ] as const;
 
+function renderedProjectionHeads(): string {
+  return getViewConfig(currentFinancialProjectionHeads).query.toQuery({
+    casing: {} as never,
+    escapeName: (name) => `"${name}"`,
+    escapeParam: (index) => `$${index + 1}`,
+    escapeString: (value) => `'${value}'`
+  }).sql.replaceAll('\r\n', '\n');
+}
+
+function renderedProjectionItems(): string {
+  return getViewConfig(currentFinancialProjectionItems).query.toQuery({
+    casing: {} as never,
+    escapeName: (name) => `"${name}"`,
+    escapeParam: (index) => `$${index + 1}`,
+    escapeString: (value) => `'${value}'`
+  }).sql.replaceAll('\r\n', '\n');
+}
+
 function triggerAttachment(tableName: string): RegExp {
   return new RegExp(
     `create\\s+trigger\\s+"?[a-z0-9_]+"?\\s+before\\s+(?:update\\s+or\\s+delete|delete\\s+or\\s+update)\\s+on\\s+"?(?:public\\.)?"?${tableName}"?`,
@@ -107,13 +130,61 @@ describe('Plan 6B financial schema preservation', () => {
     const provider = source('../src/lib/server/db/schema/financial-provider.ts');
     const allocation = source('../src/lib/server/db/schema/financial-allocation.ts');
     const migration = source('../drizzle/0007_plan6b_financial_reconciliation.sql');
-    const combined = `${provider}\n${allocation}\n${migration}`;
+    const snapshot = source('../drizzle/meta/0007_snapshot.json');
+    const combined = `${provider}\n${allocation}\n${migration}\n${snapshot}`;
 
     for (const tableName of [...PROVIDER_TABLES, ...ALLOCATION_TABLES]) {
       expect(migration).toContain(`"${tableName}"`);
     }
     expect(migration).toContain('current_financial_projection_heads');
     expect(migration).toContain('current_financial_projection_items');
+    const projectionHeads = renderedProjectionHeads();
+    const snapshotJson = JSON.parse(snapshot) as {
+      views: Record<string, { definition: string }>;
+    };
+    expect(
+      snapshotJson.views['public.current_financial_projection_heads']?.definition.replaceAll(
+        '\r\n',
+        '\n'
+      )
+    ).toBe(projectionHeads);
+    expect(migration.replaceAll('\r\n', '\n')).toContain(
+      `CREATE VIEW "public"."current_financial_projection_heads" AS (${projectionHeads}\n);`
+    );
+    const projectionItems = renderedProjectionItems();
+    expect(
+      snapshotJson.views['public.current_financial_projection_items']?.definition.replaceAll(
+        '\r\n',
+        '\n'
+      )
+    ).toBe(projectionItems);
+    expect(migration.replaceAll('\r\n', '\n')).toContain(
+      `CREATE VIEW "public"."current_financial_projection_items" AS (${projectionItems}\n);`
+    );
+    for (const generatedContract of [migration, snapshot]) {
+      expect(generatedContract).toContain('current_parent_classification_candidates');
+      expect(generatedContract).toContain('current_fee_detail_classification_candidates');
+      expect(generatedContract).toContain('current_fee_classification_candidates');
+      expect(generatedContract).toMatch(/classifier_version\s*=\s*1/iu);
+      expect(generatedContract).not.toMatch(/classifier_version\s*<=\s*1/iu);
+      expect(generatedContract).toMatch(/algorithm_version\s*=\s*1/iu);
+      expect(generatedContract).not.toMatch(/algorithm_version\s*<=\s*1/iu);
+      expect(generatedContract).toMatch(
+        /group\s+by\s+(?:"?detail"?\.)?"?balance_transaction_id"?,\s*(?:"?detail"?\.)?"?id"?/iu
+      );
+      expect(generatedContract).toContain('fee_detail_amount_sum');
+      expect(generatedContract).toContain('invalid_delta_group_count');
+      expect(generatedContract).toContain('invalid_settlement_arithmetic_count');
+      expect(generatedContract).toContain('invalid_presentment_arithmetic_count');
+      expect(generatedContract).toContain('presentment_capacity_status');
+      expect(generatedContract).toMatch(/base_item_count\s*=\s*0\s+and\s+expected_effect_minor\s*<>\s*0/iu);
+    }
+    for (const generatedContract of [allocation, migration, snapshot]) {
+      expect(generatedContract).toContain('financial_allocation_sets_reversal_root_unique');
+      expect(generatedContract).toMatch(
+        /reversal_of_set_id[\s\S]+?supersedes_set_id[\s\S]+?is\s+null/iu
+      );
+    }
 
     const forbiddenColumnDeclarations = [
       /(?:varchar|text|jsonb)\(['"]raw_(?:payload|response)['"]/u,
