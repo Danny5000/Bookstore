@@ -10,6 +10,7 @@ import {
   createFinancialCompositeReplayScanJob,
   createFinancialHourlyScanJob,
   createFinancialInitialScanJob,
+  createFinancialPayoutContinuationJob,
   createFinancialPayoutEventJob,
   createFinancialPayoutImpactScanJob,
   createFinancialPayoutRelatedJob,
@@ -23,6 +24,7 @@ import {
   parseFinancialHourlyScanJobPayload,
   parseFinancialInitialScanJobPayload,
   parseFinancialJobIdentity,
+  parseFinancialPayoutContinuationJobPayload,
   parseFinancialPayoutEventJobPayload,
   parseFinancialPayoutImpactScanJobPayload,
   parseFinancialPayoutRelatedJobPayload,
@@ -131,7 +133,7 @@ describe('financial job identities', () => {
     expect(parseFinancialSourcePayoutImpactJobPayload(impact.payload)).toEqual(impact.payload);
   });
 
-  it('creates event, hourly scan, and canonical related-payout identities', () => {
+  it('creates event, hourly scan, canonical related-payout, and import continuation identities', () => {
     const event = createFinancialPayoutEventJob({
       providerPayoutId: 'po_financial_701',
       providerEventId: 'evt_financial_702'
@@ -175,6 +177,32 @@ describe('financial job identities', () => {
       maxAttempts: 12
     });
     expect(parseFinancialPayoutRelatedJobPayload(related.payload)).toEqual(related.payload);
+
+    const continuation = createFinancialPayoutContinuationJob({
+      providerPayoutId: 'po_financial_701',
+      payoutId: PAYOUT_ID.toUpperCase(),
+      runId: SCAN_RUN_ID.toUpperCase(),
+      payoutGeneration: 0,
+      cursorDigestSha256: CURSOR_DIGEST
+    });
+    expect(continuation).toEqual({
+      type: FINANCIAL_PAYOUT_JOB,
+      payload: {
+        providerPayoutId: 'po_financial_701',
+        trigger: {
+          kind: 'continuation',
+          payoutId: PAYOUT_ID,
+          runId: SCAN_RUN_ID,
+          payoutGeneration: 0,
+          cursorDigestSha256: CURSOR_DIGEST
+        }
+      },
+      deduplicationKey:
+        `financial:payout:import:${PAYOUT_ID}:${SCAN_RUN_ID}:0:${CURSOR_DIGEST}`,
+      maxAttempts: 12
+    });
+    expect(parseFinancialPayoutContinuationJobPayload(continuation.payload))
+      .toEqual(continuation.payload);
   });
 
   it('creates initial, hourly, payout-impact, and composite replay scan roots', () => {
@@ -328,6 +356,13 @@ describe('financial job identities', () => {
         sourcePayoutId: 'po_roundtrip_701',
         sourceFingerprintSha256: FINGERPRINT
       }),
+      createFinancialPayoutContinuationJob({
+        providerPayoutId: 'po_roundtrip_701',
+        payoutId: PAYOUT_ID,
+        runId: SCAN_RUN_ID,
+        payoutGeneration: 0,
+        cursorDigestSha256: CURSOR_DIGEST
+      }),
       createFinancialInitialScanJob(),
       createFinancialHourlyScanJob({ scanGenerationHour: HOUR }),
       createFinancialPayoutImpactScanJob({ payoutId: PAYOUT_ID, payoutGeneration: 1 }),
@@ -381,6 +416,17 @@ describe('financial job identities', () => {
       limit: 100,
       ...overrides
     });
+    const payoutContinuation = (overrides: Partial<Parameters<
+      typeof createFinancialPayoutContinuationJob
+    >[0]> = {}) =>
+      createFinancialPayoutContinuationJob({
+        providerPayoutId: 'po_generation_701',
+        payoutId: PAYOUT_ID,
+        runId: SCAN_RUN_ID,
+        payoutGeneration: 0,
+        cursorDigestSha256: CURSOR_DIGEST,
+        ...overrides
+      });
     const distinctPairs = [
       [
         createFinancialSourceEventJob({
@@ -469,6 +515,10 @@ describe('financial job identities', () => {
       [continuation(), continuation({ scanRunId: alternateId })],
       [continuation(), continuation({ phase: 'payout_impact_page' })],
       [continuation(), continuation({ cursorDigestSha256: 'c'.repeat(64) })],
+      [payoutContinuation(), payoutContinuation({ payoutId: alternateId })],
+      [payoutContinuation(), payoutContinuation({ runId: alternateId })],
+      [payoutContinuation(), payoutContinuation({ payoutGeneration: 1 })],
+      [payoutContinuation(), payoutContinuation({ cursorDigestSha256: 'c'.repeat(64) })],
       [classification(), classification({ classifierVersion: 2 })],
       [classification(), classification({ allocationAlgorithmVersion: 2 })],
       [classification(), classification({ subjectId: alternateId })],
@@ -515,6 +565,17 @@ describe('financial job identities', () => {
       sourceId: 'ch_provider_not_internal',
       trigger: { kind: 'payout_impact', payoutId: PAYOUT_ID, payoutGeneration: 1 }
     }));
+    expectInvalid(() => parseFinancialPayoutContinuationJobPayload({
+      providerPayoutId: 'po_financial_701',
+      trigger: {
+        kind: 'continuation',
+        payoutId: PAYOUT_ID,
+        runId: SCAN_RUN_ID,
+        payoutGeneration: 0,
+        cursorDigestSha256: CURSOR_DIGEST,
+        startingAfter: 'txn_private_provider_cursor'
+      }
+    }));
   });
 
   it.each([
@@ -548,6 +609,36 @@ describe('financial job identities', () => {
         payoutId: PAYOUT_ID, payoutGeneration
       }));
     }
+    for (const payoutGeneration of [-1, 2_147_483_648, 1.5]) {
+      expectInvalid(() => createFinancialPayoutContinuationJob({
+        providerPayoutId: 'po_financial_701',
+        payoutId: PAYOUT_ID,
+        runId: SCAN_RUN_ID,
+        payoutGeneration,
+        cursorDigestSha256: CURSOR_DIGEST
+      }));
+    }
+    expect(createFinancialPayoutContinuationJob({
+      providerPayoutId: 'po_financial_701',
+      payoutId: PAYOUT_ID,
+      runId: SCAN_RUN_ID,
+      payoutGeneration: 2_147_483_647,
+      cursorDigestSha256: CURSOR_DIGEST
+    }).payload.trigger.payoutGeneration).toBe(2_147_483_647);
+    expectInvalid(() => createFinancialPayoutContinuationJob({
+      providerPayoutId: 'po_financial_701',
+      payoutId: 'po_not_an_internal_uuid',
+      runId: SCAN_RUN_ID,
+      payoutGeneration: 0,
+      cursorDigestSha256: CURSOR_DIGEST
+    }));
+    expectInvalid(() => createFinancialPayoutContinuationJob({
+      providerPayoutId: 'po_financial_701',
+      payoutId: PAYOUT_ID,
+      runId: SCAN_RUN_ID,
+      payoutGeneration: 0,
+      cursorDigestSha256: CURSOR_DIGEST.toUpperCase()
+    }));
     for (const classifierVersion of [0, 2_147_483_648, 1.5]) {
       expectInvalid(() => createFinancialCompositeReplayScanJob({
         classifierVersion, allocationAlgorithmVersion: 1

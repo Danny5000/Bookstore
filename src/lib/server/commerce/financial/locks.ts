@@ -35,7 +35,10 @@ export interface PayoutImportLockInput {
 export interface PayoutImportLockRows {
   readonly payoutId: string;
   readonly runId: string;
-  readonly financialGeneration: number;
+  readonly disposition: 'fresh' | 'stale' | 'published_replay';
+  readonly payoutFinancialGeneration: number;
+  readonly runGeneration: number;
+  readonly runState: 'collecting' | 'publishable' | 'published' | 'abandoned' | 'exception';
   readonly balanceTransactionIds: readonly string[];
   readonly issueIds: readonly string[];
 }
@@ -254,15 +257,44 @@ export async function lockPayoutImportRows(
   await advisory(tx, `pale-orbit:financial:payout:${input.payoutId}`);
   const payouts = await rows(tx, sql`
     select id, financial_generation as "financialGeneration" from stripe_payouts
-    where id = ${input.payoutId} and financial_generation = ${input.expectedGeneration} for update
+    where id = ${input.payoutId} for update
   `) as Array<{ id: string; financialGeneration: number }>;
-  if (payouts.length !== 1 || payouts[0]?.financialGeneration !== input.expectedGeneration) stateChanged();
+  if (payouts.length !== 1) stateChanged();
   await advisory(tx, `pale-orbit:financial:payout-run:${input.runId}`);
   const runs = await rows(tx, sql`
-    select id, generation from payout_import_runs
-    where id = ${input.runId} and payout_id = ${input.payoutId} and generation = ${input.expectedGeneration} for update
-  `) as Array<{ id: string; generation: number }>;
-  if (runs.length !== 1 || runs[0]?.generation !== input.expectedGeneration) stateChanged();
+    select id, generation, state from payout_import_runs
+    where id = ${input.runId} and payout_id = ${input.payoutId} for update
+  `) as Array<{ id: string; generation: number; state: string }>;
+  if (runs.length !== 1) stateChanged();
+  const payoutFinancialGeneration = payouts[0]!.financialGeneration;
+  const runGeneration = runs[0]!.generation;
+  const runState = runs[0]!.state;
+  if (!nonnegativeInt32(payoutFinancialGeneration) || !nonnegativeInt32(runGeneration) ||
+    !['collecting', 'publishable', 'published', 'abandoned', 'exception'].includes(runState)) {
+    stateChanged();
+  }
+  const canonicalRunState = runState as PayoutImportLockRows['runState'];
+  const disposition: PayoutImportLockRows['disposition'] =
+    canonicalRunState === 'published' && runGeneration === input.expectedGeneration &&
+      payoutFinancialGeneration === runGeneration + 1
+      ? 'published_replay'
+      : (canonicalRunState === 'collecting' || canonicalRunState === 'publishable') &&
+          runGeneration === input.expectedGeneration &&
+          payoutFinancialGeneration === input.expectedGeneration
+        ? 'fresh'
+        : 'stale';
+  if (disposition !== 'fresh') {
+    return {
+      payoutId: input.payoutId,
+      runId: input.runId,
+      disposition,
+      payoutFinancialGeneration,
+      runGeneration,
+      runState: canonicalRunState,
+      balanceTransactionIds: [],
+      issueIds: []
+    };
+  }
   const entries = await rows(tx, sql`
     select entry.balance_transaction_id as "balanceTransactionId"
     from payout_import_run_entries entry where entry.run_id = ${input.runId}
@@ -294,5 +326,14 @@ export async function lockPayoutImportRows(
     where resource_type = 'payout' and resource_id = ${input.payoutId}::uuid
     order by resource_type, resource_id, safe_code for update
   `) as Array<{ id: string }>;
-  return { payoutId: input.payoutId, runId: input.runId, financialGeneration: payouts[0]?.financialGeneration ?? input.expectedGeneration, balanceTransactionIds, issueIds: issues.map((row) => row.id) };
+  return {
+    payoutId: input.payoutId,
+    runId: input.runId,
+    disposition,
+    payoutFinancialGeneration,
+    runGeneration,
+    runState: canonicalRunState,
+    balanceTransactionIds,
+    issueIds: issues.map((row) => row.id)
+  };
 }

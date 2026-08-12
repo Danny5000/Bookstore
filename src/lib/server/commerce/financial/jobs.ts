@@ -19,6 +19,7 @@ const eventIdSchema = z.string().min(5).max(255).regex(/^evt_[A-Za-z0-9_-]+$/u);
 const payoutProviderIdSchema = z.string().min(4).max(255).regex(/^po_[A-Za-z0-9_-]+$/u);
 const sha256Schema = z.string().length(64).regex(/^[a-f0-9]{64}$/u);
 const positiveInt32Schema = z.number().int().min(1).max(FINANCIAL_GENERATION_MAX);
+const nonnegativeInt32Schema = z.number().int().min(0).max(FINANCIAL_GENERATION_MAX);
 const pageLimitSchema = z.number().int().min(1).max(100);
 const utcHourSchema = z.string().regex(/^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):00:00\.000Z$/u)
   .refine((value) => {
@@ -87,6 +88,16 @@ const payoutRelatedPayloadSchema = z.strictObject({
   (value) => value.providerPayoutId !== value.trigger.sourcePayoutId,
   { path: ['trigger', 'sourcePayoutId'], message: 'related payout cannot reference itself' }
 );
+const payoutContinuationPayloadSchema = z.strictObject({
+  providerPayoutId: payoutProviderIdSchema,
+  trigger: z.strictObject({
+    kind: z.literal('continuation'),
+    payoutId: uuidSchema,
+    runId: uuidSchema,
+    payoutGeneration: nonnegativeInt32Schema,
+    cursorDigestSha256: sha256Schema
+  })
+});
 
 const initialScanPayloadSchema = z.strictObject({
   kind: z.literal('initial'),
@@ -133,10 +144,13 @@ export type FinancialSourceJobPayload =
 export type FinancialPayoutEventJobPayload = z.output<typeof payoutEventPayloadSchema>;
 export type FinancialPayoutScanJobPayload = z.output<typeof payoutScanPayloadSchema>;
 export type FinancialPayoutRelatedJobPayload = z.output<typeof payoutRelatedPayloadSchema>;
+export type FinancialPayoutContinuationJobPayload =
+  z.output<typeof payoutContinuationPayloadSchema>;
 export type FinancialPayoutJobPayload =
   | FinancialPayoutEventJobPayload
   | FinancialPayoutScanJobPayload
-  | FinancialPayoutRelatedJobPayload;
+  | FinancialPayoutRelatedJobPayload
+  | FinancialPayoutContinuationJobPayload;
 export type FinancialInitialScanJobPayload = z.output<typeof initialScanPayloadSchema>;
 export type FinancialHourlyScanJobPayload = z.output<typeof hourlyScanPayloadSchema>;
 export type FinancialPayoutImpactScanJobPayload = z.output<typeof payoutImpactScanPayloadSchema>;
@@ -372,6 +386,35 @@ export function createFinancialPayoutRelatedJob(input: {
   );
 }
 
+export function parseFinancialPayoutContinuationJobPayload(
+  value: unknown
+): FinancialPayoutContinuationJobPayload {
+  return parseStrict(payoutContinuationPayloadSchema, value);
+}
+
+export function createFinancialPayoutContinuationJob(input: {
+  providerPayoutId: string;
+  payoutId: string;
+  runId: string;
+  payoutGeneration: number;
+  cursorDigestSha256: string;
+}): FinancialJobSpec<typeof FINANCIAL_PAYOUT_JOB, FinancialPayoutContinuationJobPayload> {
+  const payload = parseFinancialPayoutContinuationJobPayload({
+    providerPayoutId: input.providerPayoutId,
+    trigger: {
+      kind: 'continuation',
+      payoutId: input.payoutId,
+      runId: input.runId,
+      payoutGeneration: input.payoutGeneration,
+      cursorDigestSha256: input.cursorDigestSha256
+    }
+  });
+  return payoutSpec(
+    payload,
+    `financial:payout:import:${payload.trigger.payoutId}:${payload.trigger.runId}:${payload.trigger.payoutGeneration}:${payload.trigger.cursorDigestSha256}`
+  );
+}
+
 export function parseFinancialInitialScanJobPayload(value: unknown): FinancialInitialScanJobPayload {
   return parseStrict(initialScanPayloadSchema, value);
 }
@@ -556,6 +599,13 @@ function expectedIdentity(type: FinancialJobIdentity['type'], payload: unknown):
       return payoutSpec(
         parsed,
         `stripe:financial-payout:link:${parsed.trigger.sourcePayoutId}:${parsed.providerPayoutId}:${parsed.trigger.sourceFingerprintSha256}`
+      );
+    }
+    if (triggerKind === 'continuation') {
+      const parsed = parseFinancialPayoutContinuationJobPayload(payload);
+      return payoutSpec(
+        parsed,
+        `financial:payout:import:${parsed.trigger.payoutId}:${parsed.trigger.runId}:${parsed.trigger.payoutGeneration}:${parsed.trigger.cursorDigestSha256}`
       );
     }
     return invalidJobPayload();

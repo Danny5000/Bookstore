@@ -316,7 +316,8 @@ async function createPurchaseFixture(sourceId: string): Promise<PurchaseFixture>
 
 async function createPayoutFixture(
   balanceTransactionIds: readonly string[],
-  publishMemberships: boolean
+  publishMemberships: boolean,
+  runState: 'publishable' | 'published' = 'published'
 ): Promise<PayoutFixture> {
   const generation = 1;
   const [payout] = await databaseClient.db.insert(stripePayouts).values({
@@ -338,13 +339,13 @@ async function createPayoutFixture(
   const [run] = await databaseClient.db.insert(payoutImportRuns).values({
     payoutId: payout.id,
     generation,
-    state: 'published',
+    state: runState,
     candidateCount: balanceTransactionIds.length,
     pageCount: 1,
-    safeOutcome: 'published',
+    safeOutcome: runState === 'published' ? 'published' : null,
     startedAt: fixtureTime,
     updatedAt: fixtureTime,
-    completedAt: fixtureTime
+    completedAt: runState === 'published' ? fixtureTime : null
   }).returning();
   if (!run) throw new Error('Expected payout run fixture');
   if (balanceTransactionIds.length > 0) {
@@ -584,7 +585,7 @@ describe('financial lock ordering', () => {
     ]);
     const [lowId, highId] = staged.map((row) => row.balanceTransactionId).sort();
     if (!lowId || !highId) throw new Error('Expected two staged balance transactions');
-    const publicationPayout = await createPayoutFixture([highId, lowId], false);
+    const publicationPayout = await createPayoutFixture([highId, lowId], false, 'publishable');
     const projectionPayout = await createPayoutFixture([], false);
     const purchase = await createPurchaseFixture('ch_reverse_input');
     const blocker = await beginBlocker(

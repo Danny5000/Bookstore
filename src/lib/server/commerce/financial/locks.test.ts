@@ -193,9 +193,10 @@ describe('financial lock ordering', () => {
     expect(locked.classifications).toEqual([classification]);
   });
 
-  it('locks payout import rows without accepting a purchase callback and revalidates the generation', async () => {
+  it('locks fresh payout import rows without accepting a purchase callback and returns both generations and state', async () => {
     const database = executor([
-      [], [{ id: PAYOUT_ID, financialGeneration: 3 }], [], [{ id: RUN_ID, generation: 3 }],
+      [], [{ id: PAYOUT_ID, financialGeneration: 3 }], [],
+      [{ id: RUN_ID, generation: 3, state: 'publishable' }],
       [{ balanceTransactionId: BT_A }], [], [{ id: BT_A }], [],
       ...ALL_FINANCIAL_ISSUE_CODES.map(() => []), [{ id: FEE_A }]
     ]);
@@ -216,14 +217,65 @@ describe('financial lock ordering', () => {
     expect(parameters).toContain(`pale-orbit:financial:issue:payout:${PAYOUT_ID}:currency_mismatch`);
     expect(parameters).toContain(`pale-orbit:financial:issue:payout:${PAYOUT_ID}:missing_source`);
     expect(parameters).toContain(`pale-orbit:financial:issue:payout:${PAYOUT_ID}:unsupported_category`);
-    expect(locked.issueIds).toEqual([FEE_A]);
+    expect(locked).toMatchObject({
+      disposition: 'fresh',
+      payoutFinancialGeneration: 3,
+      runGeneration: 3,
+      runState: 'publishable',
+      issueIds: [FEE_A]
+    });
+    const payoutRead = database.calls.map(rendered)
+      .find((query) => query.includes('from stripe_payouts'));
+    const runRead = database.calls.map(rendered)
+      .find((query) => query.includes('from payout_import_runs'));
+    expect(payoutRead).not.toContain('financial_generation =');
+    expect(runRead).not.toContain('generation =');
   });
 
-  it('rejects a payout-import run whose generation does not match the locked payout generation', async () => {
+  it('returns stale after locking payout and run when either generation no longer matches', async () => {
     const database = executor([
-      [], [{ id: PAYOUT_ID, financialGeneration: 3 }], [], [{ id: RUN_ID, generation: 2 }]
+      [], [{ id: PAYOUT_ID, financialGeneration: 3 }], [],
+      [{ id: RUN_ID, generation: 2, state: 'publishable' }]
     ]);
     await expect(lockPayoutImportRows(database.tx, { payoutId: PAYOUT_ID, runId: RUN_ID, expectedGeneration: 3 }))
-      .rejects.toMatchObject({ safeCode: 'state_changed' });
+      .resolves.toEqual({
+        payoutId: PAYOUT_ID,
+        runId: RUN_ID,
+        disposition: 'stale',
+        payoutFinancialGeneration: 3,
+        runGeneration: 2,
+        runState: 'publishable',
+        balanceTransactionIds: [],
+        issueIds: []
+      });
+    expect(database.calls).toHaveLength(4);
+  });
+
+  it('distinguishes an exact published replay after its generation increment', async () => {
+    const database = executor([
+      [], [{ id: PAYOUT_ID, financialGeneration: 4 }], [],
+      [{ id: RUN_ID, generation: 3, state: 'published' }]
+    ]);
+    await expect(lockPayoutImportRows(database.tx, {
+      payoutId: PAYOUT_ID, runId: RUN_ID, expectedGeneration: 3
+    })).resolves.toMatchObject({
+      disposition: 'published_replay',
+      payoutFinancialGeneration: 4,
+      runGeneration: 3,
+      runState: 'published',
+      balanceTransactionIds: [],
+      issueIds: []
+    });
+    expect(database.calls).toHaveLength(4);
+  });
+
+  it('fails closed on an unknown locked payout-import state', async () => {
+    const database = executor([
+      [], [{ id: PAYOUT_ID, financialGeneration: 3 }], [],
+      [{ id: RUN_ID, generation: 3, state: 'mystery' }]
+    ]);
+    await expect(lockPayoutImportRows(database.tx, {
+      payoutId: PAYOUT_ID, runId: RUN_ID, expectedGeneration: 3
+    })).rejects.toMatchObject({ safeCode: 'state_changed' });
   });
 });
