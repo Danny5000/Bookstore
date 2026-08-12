@@ -1,4 +1,4 @@
-import { asc, eq, inArray } from 'drizzle-orm';
+import { asc, eq } from 'drizzle-orm';
 import { normalizeEmailAddress } from '$lib/server/auth/identity';
 import { appendAuditEvent as defaultAppendAuditEvent } from '$lib/server/audit/service';
 import type { Database } from '$lib/server/db/client';
@@ -65,10 +65,11 @@ export interface NewRefundAllocation {
 
 export type RefundAllocationResult =
   | { state: 'allocated'; allocations: readonly NewRefundAllocation[] }
-  | { state: 'noop' | 'exception'; allocations: readonly [] };
+  | { state: 'noop' | 'needs_review' | 'exception'; allocations: readonly [] };
 
 const exception = (): RefundAllocationResult => ({ state: 'exception', allocations: [] });
 const noop = (): RefundAllocationResult => ({ state: 'noop', allocations: [] });
+const needsReview = (): RefundAllocationResult => ({ state: 'needs_review', allocations: [] });
 
 function compareRefunds(
   left: RefundAllocationRefundFact,
@@ -196,10 +197,11 @@ export function allocateDeterministicRefunds(
   const remainingRefundTotal = safeMoneyTotal([...remainingByRefund.values()]);
   if (
     remainingItemTotal === null ||
-    remainingRefundTotal === null ||
-    remainingRefundTotal !== remainingItemTotal ||
-    (refundedTotal !== itemTotal && remainingRefunds.length !== 1)
+    remainingRefundTotal === null
   ) return exception();
+  if (remainingRefundTotal !== remainingItemTotal) {
+    return remainingRefundTotal < remainingItemTotal ? needsReview() : exception();
+  }
 
   const allocations: NewRefundAllocation[] = [];
   for (const refund of remainingRefunds) {
@@ -302,7 +304,8 @@ async function storeCanonicalRefund(
       currency: canonical.currency.toUpperCase(),
       reason: canonical.reason,
       providerCreatedAt: canonical.providerCreatedAt,
-      reconciliationStatus: 'pending',
+      allocationStatus: canonical.state === 'succeeded' ? 'needs_review' : 'not_applicable',
+      financialEvidenceStatus: 'pending',
       createdAt: now,
       updatedAt: now
     }).returning();
@@ -321,7 +324,10 @@ async function storeCanonicalRefund(
     .set({
       status,
       reason: status === existing.status ? existing.reason : canonical.reason,
-      reconciliationStatus: 'pending',
+      allocationStatus: status === 'succeeded'
+        ? existing.allocationStatus
+        : 'not_applicable',
+      financialEvidenceStatus: 'pending',
       updatedAt: now
     })
     .where(eq(refunds.id, existing.id))
@@ -397,8 +403,8 @@ export async function fulfillRefundEvent(
     );
     const facts = await lockPaymentAccessFacts(transaction, payment, order);
     const allRefunds = facts.refunds;
-    const lockedAllocations = facts.allocations;
-    const items = facts.items;
+    const lockedAllocations = facts.refundAllocations;
+    const items = facts.orderItems;
     const grants = facts.grants;
 
     const allocation = allocateDeterministicRefunds({
@@ -421,15 +427,40 @@ export async function fulfillRefundEvent(
         amountMinor: row.amountMinor
       }))
     });
-    const reconciliationStatus = allocation.state === 'exception' ? 'exception' : 'pending';
-    await transaction
-      .update(refunds)
-      .set({ reconciliationStatus, updatedAt: now })
-      .where(inArray(refunds.id, allRefunds.map((refund) => refund.id)));
+    const allAllocations = [...lockedAllocations, ...allocation.allocations];
+    const allocatedByRefund = new Map<string, number>();
+    for (const row of allAllocations) {
+      const total = (allocatedByRefund.get(row.refundId) ?? 0) + row.amountMinor;
+      if (!Number.isSafeInteger(total)) permanent();
+      allocatedByRefund.set(row.refundId, total);
+    }
+    for (const refund of allRefunds) {
+      const allocationStatus = (() => {
+        if (refund.status !== 'succeeded') return 'not_applicable' as const;
+        if (allocation.state === 'exception') return 'exception' as const;
+        if ((allocatedByRefund.get(refund.id) ?? 0) === refund.amountMinor) {
+          return 'finalized' as const;
+        }
+        if (allocation.state === 'needs_review') {
+          return refund.allocationStatus === 'draft' ? 'draft' as const : 'needs_review' as const;
+        }
+        return 'exception' as const;
+      })();
+      await transaction
+        .update(refunds)
+        .set({
+          allocationStatus,
+          financialEvidenceStatus: allocation.state === 'exception' ? 'exception' : 'pending',
+          updatedAt: now
+        })
+        .where(eq(refunds.id, refund.id));
+    }
 
-    const eventStatus = allocation.state === 'exception' ? 'exception' : 'processed';
+    const eventStatus = allocation.state === 'exception' || allocation.state === 'needs_review'
+      ? 'exception'
+      : 'processed';
     let affectedTitleCount = 0;
-    if (allocation.state !== 'exception') {
+    if (allocation.state === 'allocated' || allocation.state === 'noop') {
       for (const row of allocation.allocations) {
         await dependencies.createAllocation(transaction, {
           refundId: row.refundId,
@@ -439,7 +470,6 @@ export async function fulfillRefundEvent(
           createdAt: now
         });
       }
-      const allAllocations = [...lockedAllocations, ...allocation.allocations];
       const fullyAllocatedItems = new Set(items.filter((item) => {
         const total = allAllocations
           .filter((row) => row.orderItemId === item.id)

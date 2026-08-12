@@ -2,13 +2,31 @@ import { and, asc, eq, inArray } from 'drizzle-orm';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
 import {
   disputes,
+  disputeItemAllocations,
   entitlementGrants,
   orderItems,
   orders,
   payments,
+  refundAllocationComponents,
+  refundAllocationDraftItems,
+  refundAllocationDrafts,
   refundAllocations,
+  refundReportingCorrectionItems,
+  refundReportingCorrectionSets,
   refunds,
   stripeEvents,
+  type DisputeItemAllocationRow,
+  type DisputeRow,
+  type OrderItemRow,
+  type OrderRow,
+  type PaymentRow,
+  type RefundAllocationComponentRow,
+  type RefundAllocationDraftItemRow,
+  type RefundAllocationDraftRow,
+  type RefundAllocationRow,
+  type RefundReportingCorrectionItemRow,
+  type RefundReportingCorrectionSetRow,
+  type RefundRow,
   type StripeEventRow
 } from '$lib/server/db/schema';
 import { LocalCommerceNotReadyError, PermanentCommerceError } from './errors';
@@ -143,22 +161,57 @@ export async function lockCanonicalPaymentOrder(
   return { payment, order };
 }
 
+export interface PaymentPurchaseFacts {
+  payment: PaymentRow;
+  order: OrderRow;
+  refunds: readonly RefundRow[];
+  refundDrafts: readonly RefundAllocationDraftRow[];
+  refundDraftItems: readonly RefundAllocationDraftItemRow[];
+  refundAllocations: readonly RefundAllocationRow[];
+  refundComponents: readonly RefundAllocationComponentRow[];
+  correctionSets: readonly RefundReportingCorrectionSetRow[];
+  correctionItems: readonly RefundReportingCorrectionItemRow[];
+  disputes: readonly DisputeRow[];
+  disputeItemAllocations: readonly DisputeItemAllocationRow[];
+  orderItems: readonly OrderItemRow[];
+}
+
 /**
  * Once operation-local event or identity rows are locked, every commerce mutation follows the
- * same purchase-graph order: order, payment, refunds, allocations, disputes, items, entitlement
- * scopes, then grants. Keeping this sequence shared prevents cross-flow deadlocks.
+ * same purchase-graph order: order, payment, refunds, refund drafts/items, finalized refund
+ * allocations/components, correction sets/items, disputes/item allocations, then order items.
+ * Financial rows and entitlement scopes/grants extend this sequence in their own shared seams.
  */
-export async function lockPaymentAccessFacts(
+export async function lockPaymentPurchaseFacts(
   transaction: DatabaseTransaction,
-  payment: typeof payments.$inferSelect,
-  order: typeof orders.$inferSelect
-) {
+  payment: PaymentRow,
+  order: OrderRow
+): Promise<PaymentPurchaseFacts> {
   const lockedRefunds = await transaction
     .select()
     .from(refunds)
     .where(eq(refunds.paymentId, payment.id))
     .orderBy(asc(refunds.id))
     .for('update');
+  const lockedRefundDrafts = lockedRefunds.length === 0
+    ? []
+    : await transaction
+        .select()
+        .from(refundAllocationDrafts)
+        .where(inArray(refundAllocationDrafts.refundId, lockedRefunds.map((row) => row.id)))
+        .orderBy(asc(refundAllocationDrafts.id))
+        .for('update');
+  const lockedRefundDraftItems = lockedRefundDrafts.length === 0
+    ? []
+    : await transaction
+        .select()
+        .from(refundAllocationDraftItems)
+        .where(inArray(
+          refundAllocationDraftItems.draftId,
+          lockedRefundDrafts.map((row) => row.id)
+        ))
+        .orderBy(asc(refundAllocationDraftItems.id))
+        .for('update');
   const lockedAllocations = lockedRefunds.length === 0
     ? []
     : await transaction
@@ -167,12 +220,56 @@ export async function lockPaymentAccessFacts(
         .where(inArray(refundAllocations.refundId, lockedRefunds.map((row) => row.id)))
         .orderBy(asc(refundAllocations.id))
         .for('update');
+  const lockedRefundComponents = lockedRefunds.length === 0
+    ? []
+    : await transaction
+        .select()
+        .from(refundAllocationComponents)
+        .where(inArray(
+          refundAllocationComponents.refundId,
+          lockedRefunds.map((row) => row.id)
+        ))
+        .orderBy(asc(refundAllocationComponents.id))
+        .for('update');
+  const lockedCorrectionSets = lockedRefunds.length === 0
+    ? []
+    : await transaction
+        .select()
+        .from(refundReportingCorrectionSets)
+        .where(inArray(
+          refundReportingCorrectionSets.refundId,
+          lockedRefunds.map((row) => row.id)
+        ))
+        .orderBy(asc(refundReportingCorrectionSets.id))
+        .for('update');
+  const lockedCorrectionItems = lockedCorrectionSets.length === 0
+    ? []
+    : await transaction
+        .select()
+        .from(refundReportingCorrectionItems)
+        .where(inArray(
+          refundReportingCorrectionItems.correctionSetId,
+          lockedCorrectionSets.map((row) => row.id)
+        ))
+        .orderBy(asc(refundReportingCorrectionItems.id))
+        .for('update');
   const lockedDisputes = await transaction
     .select()
     .from(disputes)
     .where(eq(disputes.paymentId, payment.id))
     .orderBy(asc(disputes.id))
     .for('update');
+  const lockedDisputeItemAllocations = lockedDisputes.length === 0
+    ? []
+    : await transaction
+        .select()
+        .from(disputeItemAllocations)
+        .where(inArray(
+          disputeItemAllocations.disputeId,
+          lockedDisputes.map((row) => row.id)
+        ))
+        .orderBy(asc(disputeItemAllocations.id))
+        .for('update');
   const items = await transaction
     .select()
     .from(orderItems)
@@ -187,6 +284,29 @@ export async function lockPaymentAccessFacts(
   if (aggregate === null || aggregate !== payment.amountMinor) {
     permanentReconciliationFailure();
   }
+  return {
+    payment,
+    order,
+    refunds: lockedRefunds,
+    refundDrafts: lockedRefundDrafts,
+    refundDraftItems: lockedRefundDraftItems,
+    refundAllocations: lockedAllocations,
+    refundComponents: lockedRefundComponents,
+    correctionSets: lockedCorrectionSets,
+    correctionItems: lockedCorrectionItems,
+    disputes: lockedDisputes,
+    disputeItemAllocations: lockedDisputeItemAllocations,
+    orderItems: items
+  };
+}
+
+export async function lockPaymentAccessFacts(
+  transaction: DatabaseTransaction,
+  payment: PaymentRow,
+  order: OrderRow
+) {
+  const purchaseFacts = await lockPaymentPurchaseFacts(transaction, payment, order);
+  const items = purchaseFacts.orderItems;
   const candidateGrants = await transaction
     .select()
     .from(entitlementGrants)
@@ -228,10 +348,7 @@ export async function lockPaymentAccessFacts(
     })
   ) permanentReconciliationFailure();
   return {
-    refunds: lockedRefunds,
-    allocations: lockedAllocations,
-    disputes: lockedDisputes,
-    items,
+    ...purchaseFacts,
     grants
   };
 }

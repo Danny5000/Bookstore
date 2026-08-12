@@ -269,7 +269,8 @@ describe('canonical refund fulfillment', () => {
     expect(await databaseClient.db.select().from(refundAllocations)).toHaveLength(0);
     expect((await databaseClient.db.select().from(refunds))[0]).toMatchObject({
       status: 'succeeded',
-      reconciliationStatus: 'exception'
+      allocationStatus: 'needs_review',
+      financialEvidenceStatus: 'pending'
     });
     expect((await databaseClient.db.select().from(stripeEvents))[0]).toMatchObject({
       status: 'exception',
@@ -278,6 +279,72 @@ describe('canonical refund fulfillment', () => {
     expect((await databaseClient.db.select().from(entitlementGrants))
       .every((grant) => grant.state === 'active')).toBe(true);
     expect(await databaseClient.db.select().from(outboxMessages)).toHaveLength(0);
+  });
+
+  it('marks every succeeded refund as an allocation exception when a complete legacy graph exceeds item capacity', async () => {
+    const fixture = await createPurchase([1000, 1500]);
+    const firstProviderRefundId = `re_test_${randomUUID()}`;
+    const secondProviderRefundId = `re_test_${randomUUID()}`;
+    const seededRefunds = await databaseClient.db.insert(refunds).values([
+      {
+        paymentId: fixture.paymentId,
+        stripeRefundId: firstProviderRefundId,
+        status: 'succeeded',
+        amountMinor: 800,
+        currency: 'USD',
+        reason: 'requested_by_customer',
+        providerCreatedAt: new Date('2026-08-10T13:01:00.000Z'),
+        allocationStatus: 'finalized'
+      },
+      {
+        paymentId: fixture.paymentId,
+        stripeRefundId: secondProviderRefundId,
+        status: 'succeeded',
+        amountMinor: 800,
+        currency: 'USD',
+        reason: 'requested_by_customer',
+        providerCreatedAt: new Date('2026-08-10T13:02:00.000Z'),
+        allocationStatus: 'finalized'
+      }
+    ]).returning();
+    const refundsByProviderId = new Map(
+      seededRefunds.map((refund) => [refund.stripeRefundId, refund])
+    );
+    await databaseClient.db.insert(refundAllocations).values([
+      {
+        refundId: refundsByProviderId.get(firstProviderRefundId)!.id,
+        orderItemId: fixture.items[0]!.id,
+        amountMinor: 800,
+        source: 'automatic'
+      },
+      {
+        refundId: refundsByProviderId.get(secondProviderRefundId)!.id,
+        orderItemId: fixture.items[0]!.id,
+        amountMinor: 800,
+        source: 'automatic'
+      }
+    ]);
+    const event = await createRefundEvent(firstProviderRefundId, 1);
+
+    await fulfillRefundEvent(
+      databaseClient.db,
+      snapshots(fixture, event, 800, 'succeeded', 1),
+      dependencies()
+    );
+
+    const persistedRefunds = await databaseClient.db.select().from(refunds);
+    expect(persistedRefunds).toHaveLength(2);
+    for (const refund of persistedRefunds) {
+      expect(refund).toMatchObject({
+        status: 'succeeded',
+        allocationStatus: 'exception',
+        financialEvidenceStatus: 'exception'
+      });
+    }
+    expect((await databaseClient.db.select().from(stripeEvents))[0]).toMatchObject({
+      status: 'exception',
+      processedAt: expect.any(Date)
+    });
   });
 
   it('recomputes prior ambiguous rows when cumulative refunds prove the whole order', async () => {
@@ -289,7 +356,10 @@ describe('canonical refund fulfillment', () => {
     expect((await databaseClient.db.select().from(refundAllocations))
       .reduce((sum, allocation) => sum + allocation.amountMinor, 0)).toBe(2500);
     expect((await databaseClient.db.select().from(refunds))
-      .every((refund) => refund.reconciliationStatus === 'pending')).toBe(true);
+      .every((refund) =>
+        refund.allocationStatus === 'finalized' &&
+        refund.financialEvidenceStatus === 'pending'
+      )).toBe(true);
     expect((await databaseClient.db.select().from(entitlementGrants))
       .every((grant) => grant.state === 'revoked')).toBe(true);
   });
@@ -304,7 +374,11 @@ describe('canonical refund fulfillment', () => {
         snapshots(fixture, event, 1403, state),
         dependencies()
       );
-      expect((await databaseClient.db.select().from(refunds))[0]?.status).toBe(state);
+      expect((await databaseClient.db.select().from(refunds))[0]).toMatchObject({
+        status: state,
+        allocationStatus: 'not_applicable',
+        financialEvidenceStatus: 'pending'
+      });
       expect(await databaseClient.db.select().from(refundAllocations)).toHaveLength(0);
       expect((await databaseClient.db.select().from(entitlementGrants))[0]?.state).toBe('active');
       expect((await databaseClient.db.select().from(stripeEvents))[0]?.status).toBe('processed');

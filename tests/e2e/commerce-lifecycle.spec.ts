@@ -125,11 +125,17 @@ test('delayed payments, refunds, preserved grants, and disputes converge on effe
 
     const partialRefundId = await commerce.fulfillRefund(multiOrder, { amountMinor: 100 });
     const [partialRefund] = await database.db
-      .select({ reconciliationStatus: refunds.reconciliationStatus })
+      .select({
+        allocationStatus: refunds.allocationStatus,
+        financialEvidenceStatus: refunds.financialEvidenceStatus
+      })
       .from(refunds)
       .where(eq(refunds.stripeRefundId, partialRefundId))
       .limit(1);
-    expect(partialRefund?.reconciliationStatus).toBe('exception');
+    expect(partialRefund).toMatchObject({
+      allocationStatus: 'needs_review',
+      financialEvidenceStatus: 'pending'
+    });
     expect((await customerContext.request.get(`/library/${first.titleId}/download`)).status())
       .toBe(200);
     expect((await customerContext.request.get(`/library/${second.titleId}/download`)).status())

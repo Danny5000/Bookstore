@@ -50,6 +50,13 @@
       "when": 1786407372329,
       "tag": "0006_credential_authority",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1786504656905,
+      "tag": "0007_plan6b_financial_reconciliation",
+      "breakpoints": true
     }
   ]
 }

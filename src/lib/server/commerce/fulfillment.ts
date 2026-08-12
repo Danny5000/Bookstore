@@ -309,6 +309,7 @@ async function storePaymentEvidence(
       currency: command.payment.currency.toUpperCase(),
       paymentMethodCategory: command.payment.paymentMethodCategory,
       paidAt: paid ? command.payment.paidAt : null,
+      financialEvidenceStatus: 'pending',
       updatedAt: now
     }).returning();
     if (!inserted) permanent();
@@ -327,6 +328,7 @@ async function storePaymentEvidence(
         status: existing.status === 'failed' || failed ? 'failed' : 'pending',
         paymentMethodCategory: command.payment.paymentMethodCategory,
         paidAt: null,
+        financialEvidenceStatus: 'pending',
         updatedAt: now
       })
       .where(eq(payments.id, existing.id))
@@ -341,6 +343,7 @@ async function storePaymentEvidence(
       status: 'succeeded',
       paymentMethodCategory: command.payment.paymentMethodCategory,
       paidAt: command.payment.paidAt,
+      financialEvidenceStatus: 'pending',
       updatedAt: now
     })
     .where(eq(payments.id, existing.id))

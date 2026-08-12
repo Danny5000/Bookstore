@@ -7,13 +7,14 @@ import {
   entitlementGrantSource,
   entitlementGrantStatus,
   entitlementGrants,
-  financialReconciliationStatus,
+  financialEvidenceStatusEnum,
   orderItems,
   orderStatus,
   orders,
   paymentStatus,
   payments,
   refundAllocationSource,
+  refundAllocationStatusEnum,
   refundAllocations,
   refundStatus,
   refunds,
@@ -36,6 +37,17 @@ const TABLES = [
 const configFor = (table: PgTable) => getTableConfig(table);
 const indexNames = (table: PgTable) => configFor(table).indexes.map((item) => item.config.name);
 const checkNames = (table: PgTable) => configFor(table).checks.map((item) => item.name);
+const uniqueSignatures = (table: PgTable) =>
+  configFor(table).uniqueConstraints
+    .map((constraint) => `${constraint.name}(${constraint.columns.map((column) => column.name).join(',')})`)
+    .sort();
+const foreignKeySignatures = (table: PgTable) =>
+  configFor(table).foreignKeys
+    .map((foreignKey) => {
+      const reference = foreignKey.reference();
+      return `${reference.columns.map((column) => column.name).join(',')} -> ${configFor(reference.foreignTable).name}(${reference.foreignColumns.map((column) => column.name).join(',')}) [${foreignKey.onDelete}]`;
+    })
+    .sort();
 
 describe('commerce schema declarations', () => {
   it('declares the complete commerce table and enum vocabulary', () => {
@@ -62,7 +74,7 @@ describe('commerce schema declarations', () => {
     expect(paymentStatus.enumValues).toEqual(['pending', 'succeeded', 'failed']);
     expect(refundStatus.enumValues).toEqual(['pending', 'succeeded', 'failed', 'canceled']);
     expect(disputeStatus.enumValues).toEqual(['open', 'won', 'lost']);
-    expect(entitlementGrantSource.enumValues).toEqual(['purchase', 'preserved']);
+    expect(entitlementGrantSource.enumValues).toEqual(['purchase', 'preserved', 'administrative']);
     expect(entitlementGrantStatus.enumValues).toEqual([
       'unclaimed',
       'active',
@@ -71,9 +83,16 @@ describe('commerce schema declarations', () => {
     ]);
     expect(refundAllocationSource.enumValues).toEqual(['automatic', 'administrative']);
     expect(stripeEventStatus.enumValues).toEqual(['pending', 'processed', 'exception']);
-    expect(financialReconciliationStatus.enumValues).toEqual([
+    expect(financialEvidenceStatusEnum.enumValues).toEqual([
       'pending',
-      'reconciled',
+      'fee_reconciled',
+      'exception'
+    ]);
+    expect(refundAllocationStatusEnum.enumValues).toEqual([
+      'not_applicable',
+      'needs_review',
+      'draft',
+      'finalized',
       'exception'
     ]);
   });
@@ -100,11 +119,15 @@ describe('commerce schema declarations', () => {
     );
     expect(indexNames(refunds)).toContain('refunds_stripe_refund_unique');
     expect(indexNames(refundAllocations)).toContain('refund_allocations_refund_item_unique');
+    expect(uniqueSignatures(refundAllocations)).toContain(
+      'refund_allocations_provenance_unique(id,refund_id,order_item_id)'
+    );
     expect(indexNames(disputes)).toContain('disputes_stripe_dispute_unique');
     expect(indexNames(entitlementGrants)).toEqual(
       expect.arrayContaining([
         'entitlement_grants_purchase_item_unique',
-        'entitlement_grants_preserved_user_title_unique'
+        'entitlement_grants_preserved_user_title_unique',
+        'entitlement_grants_administrative_recovery_unique'
       ])
     );
     expect(indexNames(stripeEvents)).toContain('stripe_events_provider_event_unique');
@@ -139,6 +162,24 @@ describe('commerce schema declarations', () => {
         'grants_active_has_user',
         'grants_source_consistent'
       ])
+    );
+    expect(uniqueSignatures(entitlementGrants)).toContain(
+      'entitlement_grants_purchase_provenance_unique(id,order_item_id)'
+    );
+    expect(foreignKeySignatures(entitlementGrants)).toContain(
+      'recovery_refund_allocation_id -> refund_allocations(id) [restrict]'
+    );
+    expect(configFor(entitlementGrants).columns.map((column) => column.name)).toContain(
+      'recovery_refund_allocation_id'
+    );
+    expect(configFor(refunds).columns.map((column) => column.name)).toEqual(
+      expect.arrayContaining(['allocation_status', 'financial_evidence_status'])
+    );
+    expect(configFor(payments).columns.map((column) => column.name)).toContain(
+      'financial_evidence_status'
+    );
+    expect(configFor(disputes).columns.map((column) => column.name)).toContain(
+      'financial_evidence_status'
     );
     expect(checkNames(stripeEvents)).toContain('stripe_events_payload_digest_sha256');
     expect(checkNames(applicationRateLimits)).toEqual(

@@ -225,7 +225,11 @@ describe('canonical Stripe checkout fulfillment', () => {
     });
     expect(await databaseClient.db.select().from(payments)
       .where(eq(payments.orderId, fixture.orderId))).toEqual([
-      expect.objectContaining({ status: 'pending', amountMinor: 1403 })
+      expect.objectContaining({
+        status: 'pending',
+        amountMinor: 1403,
+        financialEvidenceStatus: 'pending'
+      })
     ]);
     expect(await databaseClient.db.select().from(entitlementGrants)).toHaveLength(0);
     expect(await databaseClient.db.select().from(entitlements)).toHaveLength(0);
@@ -260,7 +264,11 @@ describe('canonical Stripe checkout fulfillment', () => {
     expect(identities).toEqual([
       expect.objectContaining({ id: guestOrder!.guestIdentityId, email: 'guest@example.com' })
     ]);
-    expect(await databaseClient.db.select().from(payments)).toHaveLength(2);
+    const storedPayments = await databaseClient.db.select().from(payments);
+    expect(storedPayments).toHaveLength(2);
+    expect(storedPayments.every((payment) =>
+      payment.financialEvidenceStatus === 'pending'
+    )).toBe(true);
     const grants = await databaseClient.db.select().from(entitlementGrants);
     expect(grants.find((grant) => grant.orderItemId === account.orderItemId)).toMatchObject({
       state: 'active', userId: account.userId, stateReason: 'payment_succeeded'

@@ -33,6 +33,7 @@
     "test:unit": "vitest run",
     "test:integration:raw": "vitest run --config vitest.integration.config.ts",
     "test:integration": "tsx scripts/with-test-database.ts npm run test:integration:raw",
+    "test:plan6b-upgrade": "tsx scripts/with-plan6b-upgrade-database.ts --phase-command tsx tests/integration/financial-migration.test.ts",
     "test:e2e:raw": "playwright test",
     "test:e2e": "tsx scripts/with-test-database.ts --worker --bootstrap-admin npm run test:e2e:raw",
     "test:e2e:headed:raw": "playwright test --headed",

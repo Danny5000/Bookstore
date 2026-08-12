@@ -215,6 +215,10 @@ describe('canonical dispute fulfillment', () => {
     const paymentBefore = await databaseClient.db.select().from(payments);
     const itemsBefore = await databaseClient.db.select().from(orderItems);
     await fulfillDisputeEvent(databaseClient.db, command(fixture, event, 'open', 1), dependencies());
+    expect((await databaseClient.db.select().from(disputes))[0]).toMatchObject({
+      status: 'open',
+      financialEvidenceStatus: 'pending'
+    });
     expect((await databaseClient.db.select().from(entitlementGrants))
       .every((grant) => grant.state === 'suspended')).toBe(true);
     expect((await databaseClient.db.select().from(entitlements))

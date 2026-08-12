@@ -164,7 +164,7 @@ async function storeDispute(
       status: values.status,
       reason: values.reason,
       providerUpdatedAt: incomingUpdatedAt,
-      reconciliationStatus: 'pending',
+      financialEvidenceStatus: 'pending',
       updatedAt: now
     })
     .where(eq(disputes.id, existing.id))
@@ -269,14 +269,14 @@ export async function fulfillDisputeEvent(
         canonicalDispute.providerCreatedAt.getTime(),
         event.providerCreatedAt.getTime()
       )),
-      reconciliationStatus: 'pending',
+      financialEvidenceStatus: 'pending',
       createdAt: now,
       updatedAt: now
     }, now);
 
     const refundById = new Map(facts.refunds.map((refund) => [refund.id, refund]));
     const allocationsByItem = new Map<string, number>();
-    for (const allocation of facts.allocations) {
+    for (const allocation of facts.refundAllocations) {
       if (refundById.get(allocation.refundId)?.status !== 'succeeded') continue;
       const total = (allocationsByItem.get(allocation.orderItemId) ?? 0) +
         allocation.amountMinor;
@@ -289,7 +289,7 @@ export async function fulfillDisputeEvent(
         )
       : [...facts.disputes, canonicalDisputeRow];
     const disputeStates = allDisputes.map((dispute) => dispute.status);
-    const itemById = new Map(facts.items.map((item) => [item.id, item]));
+    const itemById = new Map(facts.orderItems.map((item) => [item.id, item]));
     const changedScopes: Array<{ userId: string; titleId: string }> = [];
     const nextStates: DisputedPurchaseGrantState[] = [];
     for (const grant of facts.grants) {

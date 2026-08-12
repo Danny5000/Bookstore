@@ -2,6 +2,8 @@ export * from './auth';
 export * from './auth-security';
 export * from './catalog';
 export * from './commerce';
+export * from './financial-allocation';
+export * from './financial-provider';
 export * from './identity';
 export * from './json';
 export * from './library';

@@ -95,11 +95,16 @@ describe('deterministic refund allocation', () => {
     });
   });
 
-  it('returns an exception with no guessed rows for a partial multi-title refund', () => {
+  it('marks partial multi-title refunds for review without guessing rows', () => {
     expect(allocateDeterministicRefunds(facts({
       items: [item('item-a', 1000), item('item-b', 1500)],
       refunds: [refund('refund-1', 800)]
-    }))).toEqual({ state: 'exception', allocations: [] });
+    }))).toEqual({ state: 'needs_review', allocations: [] });
+
+    expect(allocateDeterministicRefunds(facts({
+      items: [item('item-a', 1000), item('item-b', 1500)],
+      refunds: [refund('refund-1', 300), refund('refund-2', 500)]
+    }))).toEqual({ state: 'needs_review', allocations: [] });
   });
 
   it('allocates one remaining refund when it exactly fills all remaining item capacity', () => {

@@ -9,6 +9,7 @@ import {
   primaryKey,
   text,
   timestamp,
+  unique,
   uniqueIndex,
   uuid,
   varchar
@@ -34,7 +35,7 @@ export const commerceRefundStatusValues = [
   'canceled'
 ] as const;
 export const commerceDisputeStatusValues = ['open', 'won', 'lost'] as const;
-export const entitlementGrantSourceValues = ['purchase', 'preserved'] as const;
+export const entitlementGrantSourceValues = ['purchase', 'preserved', 'administrative'] as const;
 export const entitlementGrantStatusValues = [
   'unclaimed',
   'active',
@@ -43,9 +44,16 @@ export const entitlementGrantStatusValues = [
 ] as const;
 export const refundAllocationSourceValues = ['automatic', 'administrative'] as const;
 export const stripeEventStatusValues = ['pending', 'processed', 'exception'] as const;
-export const financialReconciliationStatusValues = [
+export const financialEvidenceStatusValues = [
   'pending',
-  'reconciled',
+  'fee_reconciled',
+  'exception'
+] as const;
+export const refundAllocationStatusValues = [
+  'not_applicable',
+  'needs_review',
+  'draft',
+  'finalized',
   'exception'
 ] as const;
 
@@ -66,9 +74,13 @@ export const refundAllocationSource = pgEnum(
   refundAllocationSourceValues
 );
 export const stripeEventStatus = pgEnum('stripe_event_status', stripeEventStatusValues);
-export const financialReconciliationStatus = pgEnum(
-  'financial_reconciliation_status',
-  financialReconciliationStatusValues
+export const financialEvidenceStatusEnum = pgEnum(
+  'financial_evidence_status',
+  financialEvidenceStatusValues
+);
+export const refundAllocationStatusEnum = pgEnum(
+  'refund_allocation_status',
+  refundAllocationStatusValues
 );
 
 export const orders = pgTable(
@@ -206,7 +218,7 @@ export const payments = pgTable(
     currency: varchar('currency', { length: 3 }).notNull(),
     paymentMethodCategory: varchar('payment_method_category', { length: 50 }),
     paidAt: timestamp('paid_at', { withTimezone: true }),
-    reconciliationStatus: financialReconciliationStatus('reconciliation_status')
+    financialEvidenceStatus: financialEvidenceStatusEnum('financial_evidence_status')
       .default('pending')
       .notNull(),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
@@ -245,7 +257,10 @@ export const refunds = pgTable(
     currency: varchar('currency', { length: 3 }).notNull(),
     reason: varchar('reason', { length: 100 }),
     providerCreatedAt: timestamp('provider_created_at', { withTimezone: true }).notNull(),
-    reconciliationStatus: financialReconciliationStatus('reconciliation_status')
+    allocationStatus: refundAllocationStatusEnum('allocation_status')
+      .default('not_applicable')
+      .notNull(),
+    financialEvidenceStatus: financialEvidenceStatusEnum('financial_evidence_status')
       .default('pending')
       .notNull(),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
@@ -277,6 +292,11 @@ export const refundAllocations = pgTable(
   },
   (table) => [
     uniqueIndex('refund_allocations_refund_item_unique').on(table.refundId, table.orderItemId),
+    unique('refund_allocations_provenance_unique').on(
+      table.id,
+      table.refundId,
+      table.orderItemId
+    ),
     index('refund_allocations_item_idx').on(table.orderItemId, table.createdAt),
     check('refund_allocations_amount_nonnegative', sql`${table.amountMinor} >= 0`)
   ]
@@ -296,7 +316,7 @@ export const disputes = pgTable(
     reason: varchar('reason', { length: 100 }),
     providerCreatedAt: timestamp('provider_created_at', { withTimezone: true }).notNull(),
     providerUpdatedAt: timestamp('provider_updated_at', { withTimezone: true }).notNull(),
-    reconciliationStatus: financialReconciliationStatus('reconciliation_status')
+    financialEvidenceStatus: financialEvidenceStatusEnum('financial_evidence_status')
       .default('pending')
       .notNull(),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
@@ -328,6 +348,10 @@ export const entitlementGrants = pgTable(
     orderItemId: uuid('order_item_id').references(() => orderItems.id, {
       onDelete: 'restrict'
     }),
+    recoveryRefundAllocationId: uuid('recovery_refund_allocation_id').references(
+      () => refundAllocations.id,
+      { onDelete: 'restrict' }
+    ),
     state: entitlementGrantStatus('state').notNull(),
     stateReason: varchar('state_reason', { length: 100 }).notNull(),
     grantedAt: timestamp('granted_at', { withTimezone: true }).defaultNow().notNull(),
@@ -343,6 +367,13 @@ export const entitlementGrants = pgTable(
     uniqueIndex('entitlement_grants_preserved_user_title_unique')
       .on(table.userId, table.titleId)
       .where(sql`${table.source} = 'preserved'`),
+    uniqueIndex('entitlement_grants_administrative_recovery_unique')
+      .on(table.recoveryRefundAllocationId)
+      .where(sql`${table.source} = 'administrative'`),
+    unique('entitlement_grants_purchase_provenance_unique').on(
+      table.id,
+      table.orderItemId
+    ),
     index('entitlement_grants_user_title_idx').on(table.userId, table.titleId, table.state),
     index('entitlement_grants_title_state_idx').on(table.titleId, table.state),
     check(
@@ -355,7 +386,25 @@ export const entitlementGrants = pgTable(
     ),
     check(
       'grants_source_consistent',
-      sql`(${table.source} = 'purchase') = (${table.orderItemId} is not null) and (${table.source} <> 'preserved' or ${table.userId} is not null)`
+      sql`(
+        ${table.source} = 'purchase' and
+        ${table.orderItemId} is not null and
+        ${table.recoveryRefundAllocationId} is null and
+        ${table.stateReason} <> 'refund_allocation_recovery'
+      ) or (
+        ${table.source} = 'preserved' and
+        ${table.userId} is not null and
+        ${table.orderItemId} is null and
+        ${table.recoveryRefundAllocationId} is null and
+        ${table.stateReason} <> 'refund_allocation_recovery'
+      ) or (
+        ${table.source} = 'administrative' and
+        ${table.userId} is not null and
+        ${table.orderItemId} is null and
+        ${table.recoveryRefundAllocationId} is not null and
+        ${table.stateReason} = 'refund_allocation_recovery' and
+        ${table.state} in ('active', 'revoked')
+      )`
     ),
     check(
       'grants_state_reason_safe',
