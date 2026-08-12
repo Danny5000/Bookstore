@@ -1,4 +1,8 @@
 export type FinancialSourceKind = 'payment' | 'refund' | 'dispute';
+export type FinancialAllocationSourceKind =
+  | FinancialSourceKind
+  | 'payout'
+  | 'adjustment';
 export type FinancialEvidenceStatus = 'pending' | 'fee_reconciled' | 'exception';
 export type PublicFinancialState = FinancialEvidenceStatus | 'payout_reconciled';
 export type AllocationBasis = 'gross_amount' | 'fee';
@@ -57,12 +61,13 @@ export interface FinancialAllocationPlan {
   readonly algorithmVersion: number;
   readonly sourceFingerprint: string;
   readonly supersedesSetId: string | null;
+  readonly reversalOfSetId: string | null;
   readonly items: readonly FinancialAllocationItem[];
 }
 
 export interface PersistFinancialAllocationPlanInput {
   readonly plan: FinancialAllocationPlan;
-  readonly sourceKind: FinancialSourceKind;
+  readonly sourceKind: FinancialAllocationSourceKind;
   readonly sourceId: string;
   readonly classificationVersion: number;
   readonly correlationId: string;
