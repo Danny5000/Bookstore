@@ -962,11 +962,16 @@ async function assertHistoryGuards(pool: Pool, fixture: LegacyFixture): Promise<
      where id = $1`,
     [ids.issue]
   );
-  await pool.query(
+  await expectMutationRejected(
+    pool,
     `update financial_reconciliation_issues
-     set state = 'resolved', resolved_by_admin_id = $2, resolved_at = clock_timestamp(),
-         last_observed_at = clock_timestamp()
+     set state = 'resolved', resolved_at = clock_timestamp()
      where id = $1`,
+    [ids.issue],
+    'issues cannot bypass the guarded resolver'
+  );
+  await pool.query(
+    `select * from resolve_financial_reconciliation_issue($1, $2)`,
     [ids.issue, fixture.userId]
   );
   await expectMutationRejected(

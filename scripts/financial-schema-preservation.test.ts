@@ -197,5 +197,8 @@ describe('Plan 6B financial schema preservation', () => {
     expect(migration).toMatch(/state[\s\S]+?active[\s\S]+?finalized/iu);
     expect(migration).toMatch(/occurrence_count/iu);
     expect(migration).toMatch(/resolved_at/iu);
+    expect(migration).toContain('CREATE FUNCTION "public"."resolve_financial_reconciliation_issue"');
+    expect(migration).toContain("set_config('pale_orbit.financial_issue_resolution', p_issue_id::text, true)");
+    expect(migration).toContain("current_setting('pale_orbit.financial_issue_resolution', true) IS DISTINCT FROM OLD.id::text");
   });
 });

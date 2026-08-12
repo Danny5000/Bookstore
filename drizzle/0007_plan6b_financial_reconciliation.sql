@@ -1140,18 +1140,41 @@ BEGIN
 END;
 $$;--> statement-breakpoint
 CREATE TRIGGER "refund_allocation_draft_items_validate_insert" BEFORE INSERT ON "refund_allocation_draft_items" FOR EACH ROW EXECUTE FUNCTION "public"."plan6b_validate_refund_draft_item_insert"();--> statement-breakpoint
+CREATE FUNCTION "public"."resolve_financial_reconciliation_issue"(
+  p_issue_id uuid,
+  p_resolved_by_admin_id uuid
+) RETURNS SETOF "public"."financial_reconciliation_issues"
+LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM set_config('pale_orbit.financial_issue_resolution', p_issue_id::text, true);
+  RETURN QUERY
+  UPDATE "financial_reconciliation_issues"
+  SET "state" = 'resolved', "resolved_at" = now(), "resolved_by_admin_id" = p_resolved_by_admin_id
+  WHERE "id" = p_issue_id AND "state" = 'open'
+  RETURNING *;
+END;
+$$;--> statement-breakpoint
 CREATE FUNCTION "public"."plan6b_validate_issue_transition"() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
   IF TG_OP = 'DELETE' THEN
     RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'financial issue history cannot be deleted';
   END IF;
+  IF OLD.state = 'resolved' THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'resolved financial issue history is immutable';
+  END IF;
+  IF NEW.state = 'resolved' AND (
+    current_setting('pale_orbit.financial_issue_resolution', true) IS DISTINCT FROM OLD.id::text OR
+    NEW.resolved_at IS NULL OR NEW.occurrence_count <> OLD.occurrence_count OR
+    NEW.last_observed_at IS DISTINCT FROM OLD.last_observed_at
+  ) THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'financial issue resolution requires the guarded resolver';
+  END IF;
   IF NEW.id IS DISTINCT FROM OLD.id OR NEW.resource_type IS DISTINCT FROM OLD.resource_type OR
      NEW.resource_id IS DISTINCT FROM OLD.resource_id OR NEW.safe_code IS DISTINCT FROM OLD.safe_code OR
      NEW.impact IS DISTINCT FROM OLD.impact OR NEW.first_observed_at IS DISTINCT FROM OLD.first_observed_at OR
      NEW.correlation_id IS DISTINCT FROM OLD.correlation_id OR NEW.occurrence_count < OLD.occurrence_count OR
      NEW.last_observed_at < OLD.last_observed_at OR
-     (OLD.state = 'resolved' AND NEW.state <> 'resolved') OR
      (OLD.state = 'open' AND NEW.state NOT IN ('open', 'resolved')) THEN
     RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'invalid financial issue history mutation';
   END IF;
