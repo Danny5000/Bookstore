@@ -95,6 +95,18 @@ function uploadError(cause: unknown): UploadError {
   return new UploadError('malformed_multipart', 'Multipart upload is malformed');
 }
 
+const multipartContentType =
+  /^[\x20\t]*multipart\/form-data[\x20\t]*;[\x20\t]*boundary[\x20\t]*=[\x20\t]*(?:"([^"\\]*)"|([^;\x20\t]+))[\x20\t]*$/iu;
+const rfc2046Boundary =
+  /^[0-9A-Za-z'()+_,./:=?-](?:[0-9A-Za-z'()+_,./:=? -]{0,68}[0-9A-Za-z'()+_,./:=?-])?$/u;
+
+function hasSafeMultipartBoundary(contentType: string): boolean {
+  const match = multipartContentType.exec(contentType);
+  if (!match) return false;
+  const boundary = match[1] === undefined ? match[2]! : match[1];
+  return rfc2046Boundary.test(boundary);
+}
+
 export async function parseSingleFileMultipart<TFields>(
   request: Request,
   options: ParseSingleFileMultipartOptions<TFields>
@@ -104,7 +116,7 @@ export async function parseSingleFileMultipart<TFields>(
   }
   if (!request.body) throw new UploadError('malformed_multipart', 'Multipart body is required');
   const contentType = request.headers.get('content-type');
-  if (!contentType?.toLowerCase().startsWith('multipart/form-data')) {
+  if (!contentType || !hasSafeMultipartBoundary(contentType)) {
     throw new UploadError('malformed_multipart', 'Multipart content type is required');
   }
 
