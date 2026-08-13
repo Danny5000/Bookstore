@@ -96,6 +96,28 @@ const SAFE_MONEY_MAX_SQL = sql.raw(String(SAFE_MONEY_MAX));
 const SAFE_MONEY_MIN_SQL = sql.raw(String(-SAFE_MONEY_MAX));
 const GENERATION_MAX_SQL = sql.raw(String(GENERATION_MAX));
 
+export const financialProjectionVersions = pgTable(
+  'financial_projection_versions',
+  {
+    singleton: boolean('singleton').default(true).primaryKey(),
+    classifierVersion: integer('classifier_version').notNull(),
+    allocationAlgorithmVersion: integer('allocation_algorithm_version').notNull(),
+    activatedAt: timestamp('activated_at', { withTimezone: true }).defaultNow().notNull(),
+    activationCorrelationId: varchar('activation_correlation_id', { length: 100 }).notNull()
+  },
+  (table) => [
+    check('financial_projection_versions_singleton_true', sql`${table.singleton} = true`),
+    check(
+      'financial_projection_versions_versions_positive',
+      sql`${table.classifierVersion} > 0 and ${table.allocationAlgorithmVersion} > 0`
+    ),
+    check(
+      'financial_projection_versions_correlation_safe',
+      sql`char_length(${table.activationCorrelationId}) between 1 and 100`
+    )
+  ]
+);
+
 export const stripeBalanceTransactions = pgTable(
   'stripe_balance_transactions',
   {
@@ -482,6 +504,8 @@ export const financialScanRuns = pgTable(
   ]
 );
 
+export type FinancialProjectionVersionRow = typeof financialProjectionVersions.$inferSelect;
+export type NewFinancialProjectionVersionRow = typeof financialProjectionVersions.$inferInsert;
 export type StripeBalanceTransactionRow = typeof stripeBalanceTransactions.$inferSelect;
 export type NewStripeBalanceTransactionRow = typeof stripeBalanceTransactions.$inferInsert;
 export type StripeBalanceTransactionFeeDetailRow =

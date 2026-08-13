@@ -26,7 +26,8 @@ import { allocateFeeDetails, basePlan } from '../allocations/common';
 import { buildFailedRefundAllocationPlan, buildRefundAllocationPlan } from '../allocations/refund';
 import {
   loadCurrentEffectiveAllocationProjection,
-  persistFinancialAllocationPlanLocked
+  persistFinancialAllocationPlanLocked,
+  persistFinancialAllocationReplayPlanLocked
 } from '../allocations/repository';
 import type { ClassifiedFeeDetail, EarlierFinalizedRefundComponent } from '../allocations/types';
 import {
@@ -66,6 +67,9 @@ const ALLOCATION_KEYS = ['id', 'orderItemId', 'amountMinor'] as const;
 const COMPONENT_KEYS = [
   'refundAllocationId', 'orderItemId', 'subtotalMinor', 'taxMinor', 'currency'
 ] as const;
+const REPLAY_VERSION_KEYS = [
+  'classifierVersion', 'allocationAlgorithmVersion', 'replayId'
+] as const;
 
 type QueryResult = { rows?: unknown[] };
 
@@ -97,6 +101,46 @@ interface RefundHistoryRow {
 
 interface StoredPlan {
   readonly id: string;
+  readonly plan: FinancialAllocationPlan;
+}
+
+export interface LockedRefundProjectionReplayVersion {
+  readonly classifierVersion: number;
+  readonly allocationAlgorithmVersion: number;
+  readonly replayId: string;
+}
+
+export interface LockedRefundProjectionReplayReplacement {
+  readonly balanceTransactionId: string;
+  readonly basis: 'gross_amount' | 'fee';
+  readonly previousSetId: string | null;
+  readonly replacementSetId: string;
+  readonly sourceFingerprint: string;
+  readonly disposition: 'inserted' | 'unchanged';
+}
+
+export type LockedRefundProjectionReplayResult =
+  | {
+      readonly status: 'replayed' | 'unchanged';
+      readonly refundId: string;
+      readonly replacements: readonly LockedRefundProjectionReplayReplacement[];
+    }
+  | {
+      readonly status: 'exception';
+      readonly refundId: string;
+      readonly safeCode: FinancialIssueCode;
+      readonly impact: FinancialIssueImpact;
+    };
+
+interface RefundProjectionVersionTarget {
+  readonly classifierVersion: number;
+  readonly allocationAlgorithmVersion: number;
+  readonly replayId: string | null;
+}
+
+interface PersistedRefundProjectionPlan {
+  readonly setId: string;
+  readonly disposition: 'inserted' | 'unchanged';
   readonly plan: FinancialAllocationPlan;
 }
 
@@ -362,6 +406,22 @@ function assertLockedRefundProjectionInput(
   }
 }
 
+function assertLockedRefundProjectionReplayVersion(
+  value: unknown
+): asserts value is LockedRefundProjectionReplayVersion {
+  if (!exactObject(value, REPLAY_VERSION_KEYS) ||
+    typeof value.classifierVersion !== 'number' ||
+    !Number.isSafeInteger(value.classifierVersion) || value.classifierVersion < 1 ||
+    value.classifierVersion > 2_147_483_647 ||
+    typeof value.allocationAlgorithmVersion !== 'number' ||
+    !Number.isSafeInteger(value.allocationAlgorithmVersion) ||
+    value.allocationAlgorithmVersion < 1 || value.allocationAlgorithmVersion > 2_147_483_647 ||
+    typeof value.replayId !== 'string' ||
+    value.replayId !== `c${value.classifierVersion}-a${value.allocationAlgorithmVersion}`) {
+    invalidLockedInput();
+  }
+}
+
 function sameInstant(left: Date, right: Date): boolean {
   return Number.isFinite(left.getTime()) && Number.isFinite(right.getTime()) &&
     left.getTime() === right.getTime();
@@ -404,14 +464,15 @@ function classificationComponent(value: string | null): ClassifiedFeeDetail['com
 
 async function loadFeeDetails(
   transaction: DatabaseTransaction,
-  balanceTransactionId: string
+  balanceTransactionId: string,
+  classifierVersion: number
 ): Promise<readonly ClassifiedFeeDetail[]> {
   const details = await rows(transaction, sql`
     select detail.amount_minor as "amountMinor", decision.classification
     from stripe_balance_transaction_fee_details detail
     left join financial_classification_versions decision
       on decision.subject_type = 'fee_detail' and decision.subject_id = detail.id
-      and decision.classifier_version = ${FINANCIAL_CLASSIFIER_VERSION}
+      and decision.classifier_version = ${classifierVersion}
       and decision.source_fingerprint_sha256 = detail.fingerprint_sha256
     where detail.balance_transaction_id = ${balanceTransactionId}
     order by detail.ordinal
@@ -564,10 +625,11 @@ async function loadRefundRouting(database: Database, refundId: string): Promise<
   return routing;
 }
 
-export async function recomputeLockedRefundFinancialProjection(
+async function recomputeLockedRefundFinancialProjectionAtVersion(
   transaction: DatabaseTransaction,
-  input: LockedRefundProjectionInput
-): Promise<RefundFinancialRecomputeResult> {
+  input: LockedRefundProjectionInput,
+  target: RefundProjectionVersionTarget
+): Promise<RefundFinancialRecomputeResult | LockedRefundProjectionReplayResult> {
   assertLockedRefundProjectionInput(input);
   const [localState] = await rows(transaction, sql`
     select financial_evidence_status as "financialEvidenceStatus"
@@ -629,7 +691,7 @@ export async function recomputeLockedRefundFinancialProjection(
           from stripe_balance_transactions balance
           left join financial_classification_versions decision
             on decision.subject_type = 'balance_transaction' and decision.subject_id = balance.id
-            and decision.classifier_version = ${FINANCIAL_CLASSIFIER_VERSION}
+            and decision.classifier_version = ${target.classifierVersion}
             and decision.source_fingerprint_sha256 = balance.fingerprint_sha256
           where balance.id in (${sql.join(
             input.balanceTransactionIds.map((id) => sql`${id}::uuid`), sql`, `
@@ -670,10 +732,13 @@ export async function recomputeLockedRefundFinancialProjection(
           throw new PermanentFinancialError('currency_mismatch');
         }
 
-        const primaryFeeDetails = await loadFeeDetails(projectionTx, primary.id);
+        const primaryFeeDetails = await loadFeeDetails(
+          projectionTx, primary.id, target.classifierVersion
+        );
         const primaryCurrent = await loadCurrentStoredPlans(projectionTx, input.refundId, primary.id);
         const primaryMode = hasFinalizedAttribution ? 'finalized' : failure ? 'account' : 'unresolved';
-        const primaryPrefix = `refund:${input.refundId}:${primary.id}:${primaryMode}`;
+        const replaySuffix = target.replayId === null ? '' : `:replay:${target.replayId}`;
+        const primaryPrefix = `refund:${input.refundId}:${primary.id}:${primaryMode}${replaySuffix}`;
         const metadata = {
           sourceKind: 'refund' as const,
           sourceId: input.refundId,
@@ -684,7 +749,7 @@ export async function recomputeLockedRefundFinancialProjection(
           feeMinor: primary.feeMinor,
           netMinor: primary.netMinor,
           sourceFingerprint: primary.fingerprintSha256,
-          algorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+          algorithmVersion: target.allocationAlgorithmVersion,
           supersedesGrossSetId: predecessorFor(
             primaryCurrent.get('gross_amount'), `${primaryPrefix}:gross`
           ),
@@ -767,18 +832,27 @@ export async function recomputeLockedRefundFinancialProjection(
           ];
         }
 
-        const persisted: Array<{ setId: string; disposition: 'inserted' | 'unchanged' }> = [];
+        const persisted: PersistedRefundProjectionPlan[] = [];
         for (const plan of primaryPlans) {
-          persisted.push(await persistFinancialAllocationPlanLocked(projectionTx, {
+          const persistInput = {
             plan, sourceKind: 'refund', sourceId: input.refundId,
-            classificationVersion: FINANCIAL_CLASSIFIER_VERSION,
+            classificationVersion: target.classifierVersion,
             correlationId: input.correlationId
-          }));
+          } as const;
+          const stored = target.replayId === null
+            ? await persistFinancialAllocationPlanLocked(projectionTx, persistInput)
+            : await persistFinancialAllocationReplayPlanLocked(projectionTx, persistInput, {
+                classifierVersion: target.classifierVersion,
+                allocationAlgorithmVersion: target.allocationAlgorithmVersion
+              });
+          persisted.push({ ...stored, plan });
         }
         if (failure) {
-          const failureFeeDetails = await loadFeeDetails(projectionTx, failure.id);
+          const failureFeeDetails = await loadFeeDetails(
+            projectionTx, failure.id, target.classifierVersion
+          );
           const failureCurrent = await loadCurrentStoredPlans(projectionTx, input.refundId, failure.id);
-          const failurePrefix = `refund:${input.refundId}:${failure.id}:failure`;
+          const failurePrefix = `refund:${input.refundId}:${failure.id}:failure${replaySuffix}`;
           const failurePlans = buildFailedRefundAllocationPlan({
             sourceKind: 'refund', sourceId: input.refundId,
             balanceTransactionId: failure.id,
@@ -788,7 +862,7 @@ export async function recomputeLockedRefundFinancialProjection(
             feeMinor: failure.feeMinor,
             netMinor: failure.netMinor,
             sourceFingerprint: failure.fingerprintSha256,
-            algorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+            algorithmVersion: target.allocationAlgorithmVersion,
             supersedesGrossSetId: predecessorFor(
               failureCurrent.get('gross_amount'), `${failurePrefix}:gross`
             ),
@@ -803,12 +877,23 @@ export async function recomputeLockedRefundFinancialProjection(
             feeDetails: failureFeeDetails
           }).plans;
           for (const plan of failurePlans) {
-            persisted.push(await persistFinancialAllocationPlanLocked(projectionTx, {
+            const persistInput = {
               plan, sourceKind: 'refund', sourceId: input.refundId,
-              classificationVersion: FINANCIAL_CLASSIFIER_VERSION,
+              classificationVersion: target.classifierVersion,
               correlationId: input.correlationId
-            }));
+            } as const;
+            const stored = target.replayId === null
+              ? await persistFinancialAllocationPlanLocked(projectionTx, persistInput)
+              : await persistFinancialAllocationReplayPlanLocked(projectionTx, persistInput, {
+                  classifierVersion: target.classifierVersion,
+                  allocationAlgorithmVersion: target.allocationAlgorithmVersion
+                });
+            persisted.push({ ...stored, plan });
           }
+        }
+
+        if (target.replayId !== null) {
+          return { kind: 'replay' as const, persisted };
         }
 
         const projections = await loadCurrentEffectiveAllocationProjection(projectionTx, {
@@ -852,6 +937,40 @@ export async function recomputeLockedRefundFinancialProjection(
     }
   })();
 
+  if (outcome.kind === 'replay') {
+    if (target.replayId === null) {
+      throw new PermanentFinancialError('source_linkage_mismatch');
+    }
+    return {
+      status: outcome.persisted.some((row) => row.disposition === 'inserted')
+        ? 'replayed'
+        : 'unchanged',
+      refundId: input.refundId,
+      replacements: outcome.persisted.map((row) => ({
+        balanceTransactionId: row.plan.balanceTransactionId,
+        basis: row.plan.basis,
+        previousSetId: row.plan.supersedesSetId,
+        replacementSetId: row.setId,
+        sourceFingerprint: row.plan.sourceFingerprint,
+        disposition: row.disposition
+      }))
+    };
+  }
+  if (target.replayId !== null) {
+    if (outcome.kind === 'pending') {
+      return {
+        status: 'exception', refundId: input.refundId,
+        safeCode: outcome.safeCode, impact: 'pending'
+      };
+    }
+    if (outcome.kind === 'issue') {
+      return {
+        status: 'exception', refundId: input.refundId,
+        safeCode: outcome.safeCode, impact: outcome.impact
+      };
+    }
+    throw new PermanentFinancialError('source_linkage_mismatch');
+  }
   if (outcome.kind === 'pending') {
     return recordLockedRefundIssue(transaction, input, outcome.safeCode, 'pending');
   }
@@ -905,6 +1024,32 @@ export async function recomputeLockedRefundFinancialProjection(
     allocationSetIds: outcome.persisted.map((row) => row.setId),
     resolvedIssueIds
   };
+}
+
+export async function recomputeLockedRefundFinancialProjection(
+  transaction: DatabaseTransaction,
+  input: LockedRefundProjectionInput
+): Promise<RefundFinancialRecomputeResult> {
+  return recomputeLockedRefundFinancialProjectionAtVersion(transaction, input, {
+    classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+    allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+    replayId: null
+  }) as Promise<RefundFinancialRecomputeResult>;
+}
+
+/**
+ * Rebuilds the complete, already-locked refund source chronology for an explicit deployed
+ * projection pair. The caller owns the canonical payment-purchase and financial row locks,
+ * issue transitions, correction rebasing, and activation transaction.
+ */
+export async function recomputeLockedRefundFinancialProjectionForVersion(
+  transaction: DatabaseTransaction,
+  input: LockedRefundProjectionInput,
+  target: LockedRefundProjectionReplayVersion
+): Promise<LockedRefundProjectionReplayResult> {
+  assertLockedRefundProjectionReplayVersion(target);
+  return recomputeLockedRefundFinancialProjectionAtVersion(transaction, input, target) as
+    Promise<LockedRefundProjectionReplayResult>;
 }
 
 export async function reconcileRefundFinancialSource(

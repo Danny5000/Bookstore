@@ -44,16 +44,25 @@ function isBoundedAllocationSetCollision(error: unknown): boolean {
   return candidate.cause !== error && isBoundedAllocationSetCollision(candidate.cause);
 }
 
-function validate(input: PersistFinancialAllocationPlanInput): void {
+interface AuthorizedProjectionVersion {
+  readonly classifierVersion: number;
+  readonly allocationAlgorithmVersion: number;
+}
+
+function validate(
+  input: PersistFinancialAllocationPlanInput,
+  authorized: AuthorizedProjectionVersion
+): void {
   if (!exact(input, ['plan','sourceKind','sourceId','classificationVersion','correlationId'])) fail('source_linkage_mismatch');
   const plan = input.plan;
   if (!exact(plan, ['allocationIdentity','balanceTransactionId','basis','scope','currency','expectedEffectMinor','algorithmVersion','sourceFingerprint','supersedesSetId','reversalOfSetId','items'])) fail('source_linkage_mismatch');
   if (!['payment','refund','dispute','payout','adjustment'].includes(input.sourceKind) || !UUID.test(input.sourceId) ||
-      input.classificationVersion !== FINANCIAL_CLASSIFIER_VERSION ||
+      input.classificationVersion !== authorized.classifierVersion ||
       typeof input.correlationId !== 'string' || input.correlationId.length < 1 || input.correlationId.length > 100 ||
       typeof plan.allocationIdentity !== 'string' || plan.allocationIdentity.length < 1 || plan.allocationIdentity.length > 255 ||
       !UUID.test(plan.balanceTransactionId) || !['gross_amount','fee'].includes(plan.basis) || !['title','account','unresolved'].includes(plan.scope) ||
-      !CURRENCY.test(plan.currency) || !money(plan.expectedEffectMinor) || plan.algorithmVersion !== FINANCIAL_ALLOCATION_ALGORITHM_VERSION ||
+      !CURRENCY.test(plan.currency) || !money(plan.expectedEffectMinor) ||
+      plan.algorithmVersion !== authorized.allocationAlgorithmVersion ||
       !FP.test(plan.sourceFingerprint) || (plan.supersedesSetId !== null && !UUID.test(plan.supersedesSetId)) ||
       (plan.reversalOfSetId !== null && !UUID.test(plan.reversalOfSetId)) || !Array.isArray(plan.items) || plan.items.length > 100) fail('source_linkage_mismatch');
   if (plan.supersedesSetId !== null && plan.supersedesSetId === plan.reversalOfSetId) fail('source_linkage_mismatch');
@@ -73,8 +82,12 @@ function validate(input: PersistFinancialAllocationPlanInput): void {
 }
 
 interface SetRow { id: string; allocationIdentity: string; balanceTransactionId: string; sourceKind: string; sourceId: string; basis: string; scope: string; expectedEffectMinor: number; currency: string; algorithmVersion: number; classifierVersion: number; sourceFingerprint: string; supersedesSetId: string|null; reversalOfSetId: string|null }
-export async function persistFinancialAllocationPlanLocked(tx: DatabaseTransaction, input: PersistFinancialAllocationPlanInput): Promise<{setId:string;disposition:'inserted'|'unchanged'}> {
-  validate(input); const p=input.plan;
+async function persistFinancialAllocationPlanForVersionLocked(
+  tx: DatabaseTransaction,
+  input: PersistFinancialAllocationPlanInput,
+  authorized: AuthorizedProjectionVersion
+): Promise<{setId:string;disposition:'inserted'|'unchanged'}> {
+  validate(input, authorized); const p=input.plan;
   await rows(tx, sql`select pg_advisory_xact_lock(hashtextextended(${`pale-orbit:financial:allocation:${p.balanceTransactionId}:${p.basis}`}, 0))`);
   const bt = (await rows(tx, sql`select id, amount_minor as "amountMinor", fee_minor as "feeMinor", currency, fingerprint_sha256 as fingerprint, source_family as "providerSourceFamily", source_id as "providerSourceId" from stripe_balance_transactions where id=${p.balanceTransactionId} for update`))[0] as {amountMinor:number;feeMinor:number;currency:string;fingerprint:string;providerSourceFamily:string|null;providerSourceId:string|null}|undefined;
   if (!bt || bt.fingerprint!==p.sourceFingerprint) fail('source_linkage_mismatch');
@@ -155,6 +168,30 @@ export async function persistFinancialAllocationPlanLocked(tx: DatabaseTransacti
   if(!inserted) throw new Error('allocation set insert returned no row');
   for(const item of [...p.items].sort((a,b)=>compareCodePoints(a.tieBreakKey,b.tieBreakKey)||compareCodePoints(a.orderItemId,b.orderItemId)||compareCodePoints(a.component,b.component))) await rows(tx,sql`insert into financial_item_allocations(allocation_set_id,order_item_id,component,effect_minor,currency,tie_break_key) values(${inserted.id},${item.orderItemId},${item.component},${item.effectMinor},${item.currency},${item.tieBreakKey})`);
   return {setId:inserted.id,disposition:'inserted'};
+}
+
+export async function persistFinancialAllocationPlanLocked(
+  tx: DatabaseTransaction,
+  input: PersistFinancialAllocationPlanInput
+): Promise<{setId:string;disposition:'inserted'|'unchanged'}> {
+  return persistFinancialAllocationPlanForVersionLocked(tx, input, {
+    classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+    allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
+  });
+}
+
+export async function persistFinancialAllocationReplayPlanLocked(
+  tx: DatabaseTransaction,
+  input: PersistFinancialAllocationPlanInput,
+  authorized: AuthorizedProjectionVersion
+): Promise<{setId:string;disposition:'inserted'|'unchanged'}> {
+  if (!exact(authorized, ['classifierVersion', 'allocationAlgorithmVersion']) ||
+    !Number.isSafeInteger(authorized.classifierVersion) || authorized.classifierVersion < 1 ||
+    authorized.classifierVersion > 2_147_483_647 ||
+    !Number.isSafeInteger(authorized.allocationAlgorithmVersion) ||
+    authorized.allocationAlgorithmVersion < 1 ||
+    authorized.allocationAlgorithmVersion > 2_147_483_647) fail('source_linkage_mismatch');
+  return persistFinancialAllocationPlanForVersionLocked(tx, input, authorized);
 }
 
 export async function loadCurrentEffectiveAllocationProjection(executor: DatabaseExecutor,input:{balanceTransactionIds:readonly string[]}):Promise<readonly CurrentEffectiveAllocationProjection[]> {

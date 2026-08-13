@@ -225,16 +225,35 @@ describe('financial allocation schema declarations', () => {
   it('selects only the exact current classification/allocation versions and counts fee subjects once', () => {
     const query = renderedSql(getViewConfig(currentFinancialProjectionHeads).query);
 
-    expect(query).toMatch(/where s\.classifier_version = 1/u);
-    expect(query).not.toMatch(/s\.classifier_version <= 1/u);
-    expect(query).toMatch(/s\.algorithm_version = 1/u);
-    expect(query).not.toMatch(/s\.algorithm_version <= 1/u);
+    expect(query).toContain('from "financial_projection_versions"');
+    expect(query).toMatch(
+      /where s\.classifier_version = active_projection_version\.classifier_version/u
+    );
+    expect(query).toMatch(
+      /s\.algorithm_version = active_projection_version\.allocation_algorithm_version/u
+    );
+    expect(query).not.toMatch(/s\.(?:classifier|algorithm)_version = 1/u);
     expect(query).toContain('current_fee_detail_classification_candidates');
     expect(query).toMatch(
       /group by detail\.balance_transaction_id, detail\.id, detail\.amount_minor, detail\.currency/u
     );
     expect(query).toMatch(
-      /case when parent_decision_count = 0[\s\S]+?parent_unknown_count > 0[\s\S]+?base_count = 0/u
+      /when parent_decision_count = 0[\s\S]+?parent_unknown_count > 0[\s\S]+?base_count = 0/u
+    );
+    expect(query).toMatch(
+      /issue\.resource_type = 'balance_transaction'[\s\S]+?issue\.safe_code = 'correction_rebase_required'/u
+    );
+    expect(query).toMatch(
+      /when correction_rebase_issue_count > 0 then 'correction_rebase_required'/u
+    );
+    expect(query).toMatch(
+      /issue\.safe_code = 'classification_fork'[\s\S]+?issue\.resource_type = 'balance_transaction'/u
+    );
+    expect(query).toMatch(
+      /issue\.safe_code = 'classification_fork'[\s\S]+?issue\.resource_type = 'fee_detail'/u
+    );
+    expect(query).toMatch(
+      /when classification_fork_issue_count > 0 then 'classification_fork'/u
     );
   });
 

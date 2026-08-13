@@ -13,6 +13,7 @@ function source(relativePath: string): string {
 }
 
 const PROVIDER_TABLES = [
+  'financial_projection_versions',
   'stripe_balance_transactions',
   'stripe_balance_transaction_fee_details',
   'financial_classification_versions',
@@ -37,6 +38,7 @@ const ALLOCATION_TABLES = [
 ] as const;
 
 const ROW_ALIASES = [
+  'FinancialProjectionVersionRow',
   'StripeBalanceTransactionRow',
   'StripeBalanceTransactionFeeDetailRow',
   'FinancialClassificationVersionRow',
@@ -72,6 +74,7 @@ const IMMUTABLE_GUARD_TABLES = [
 ] as const;
 
 const NARROW_UPDATE_GUARD_TABLES = [
+  'financial_projection_versions',
   'stripe_balance_transactions',
   'stripe_payouts',
   'refund_allocation_drafts',
@@ -162,13 +165,20 @@ describe('Plan 6B financial schema preservation', () => {
       `CREATE VIEW "public"."current_financial_projection_items" AS (${projectionItems}\n);`
     );
     for (const generatedContract of [migration, snapshot]) {
+      expect(generatedContract).toContain('financial_projection_versions');
+      expect(generatedContract).toMatch(
+        /classifier_version\s*=\s*active_projection_version\.classifier_version/iu
+      );
+      expect(generatedContract).toMatch(
+        /algorithm_version\s*=\s*active_projection_version\.allocation_algorithm_version/iu
+      );
       expect(generatedContract).toContain('current_parent_classification_candidates');
       expect(generatedContract).toContain('current_fee_detail_classification_candidates');
       expect(generatedContract).toContain('current_fee_classification_candidates');
-      expect(generatedContract).toMatch(/classifier_version\s*=\s*1/iu);
-      expect(generatedContract).not.toMatch(/classifier_version\s*<=\s*1/iu);
-      expect(generatedContract).toMatch(/algorithm_version\s*=\s*1/iu);
-      expect(generatedContract).not.toMatch(/algorithm_version\s*<=\s*1/iu);
+      expect(generatedContract).not.toMatch(/classifier_version\s*=\s*1/iu);
+      expect(generatedContract).not.toMatch(/algorithm_version\s*=\s*1/iu);
+      expect(generatedContract).toContain('correction_rebase_required');
+      expect(generatedContract).toContain("resource_type = 'balance_transaction'");
       expect(generatedContract).toMatch(
         /group\s+by\s+(?:"?detail"?\.)?"?balance_transaction_id"?,\s*(?:"?detail"?\.)?"?id"?/iu
       );
@@ -284,6 +294,15 @@ describe('Plan 6B financial schema preservation', () => {
     );
     expect(migration).toMatch(
       /create\s+trigger\s+"dispute_item_allocations_validate_gross_set"\s+before\s+insert\s+on\s+"dispute_item_allocations"/iu
+    );
+  });
+
+  it('resets and reseeds the singleton active projection pair in integration cleanup', () => {
+    const setup = source('../tests/integration/setup.ts');
+
+    expect(setup).toMatch(/truncate table[\s\S]+?financial_projection_versions/iu);
+    expect(setup).toMatch(
+      /insert\s+into\s+financial_projection_versions[\s\S]+?values\s*\(true,\s*1,\s*1,/iu
     );
   });
 });

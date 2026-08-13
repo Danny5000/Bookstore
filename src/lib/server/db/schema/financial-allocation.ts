@@ -26,11 +26,8 @@ import {
   refunds
 } from './commerce';
 import {
-  FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
-  FINANCIAL_CLASSIFIER_VERSION
-} from '../../commerce/financial/constants';
-import {
   financialClassificationVersions,
+  financialProjectionVersions,
   stripeBalanceTransactionFeeDetails,
   stripeBalanceTransactions
 } from './financial-provider';
@@ -703,18 +700,23 @@ export const currentFinancialProjectionHeads = pgView('current_financial_project
   missingSourceCount: integer('missing_source_count').notNull(),
   proposedIssueCode: varchar('proposed_issue_code', { length: 100 })
 }).as(sql`
-  with current_parent_classification_candidates as (
+  with active_projection_version as (
+    select classifier_version, allocation_algorithm_version
+    from ${financialProjectionVersions}
+    where singleton = true
+  ), current_parent_classification_candidates as (
     select
       bt.id as balance_transaction_id,
       count(classification.id)::integer as decision_count,
       count(*) filter (where classification.classification = 'unknown')::integer as unknown_count
     from ${stripeBalanceTransactions} bt
+    cross join active_projection_version
     left join ${financialClassificationVersions} classification
       on classification.subject_type = 'balance_transaction'
       and classification.subject_id = bt.id
       and classification.source_fingerprint_sha256 = bt.fingerprint_sha256
-      and classification.classifier_version = ${FINANCIAL_CLASSIFIER_VERSION}
-    group by bt.id
+      and classification.classifier_version = active_projection_version.classifier_version
+    group by bt.id, active_projection_version.classifier_version
   ), current_fee_detail_classification_candidates as (
     select
       detail.balance_transaction_id,
@@ -724,12 +726,14 @@ export const currentFinancialProjectionHeads = pgView('current_financial_project
       count(classification.id)::integer as decision_count,
       count(*) filter (where classification.classification = 'unknown')::integer as unknown_count
     from ${stripeBalanceTransactionFeeDetails} detail
+    cross join active_projection_version
     left join ${financialClassificationVersions} classification
       on classification.subject_type = 'fee_detail'
       and classification.subject_id = detail.id
       and classification.source_fingerprint_sha256 = detail.fingerprint_sha256
-      and classification.classifier_version = ${FINANCIAL_CLASSIFIER_VERSION}
-    group by detail.balance_transaction_id, detail.id, detail.amount_minor, detail.currency
+      and classification.classifier_version = active_projection_version.classifier_version
+    group by detail.balance_transaction_id, detail.id, detail.amount_minor, detail.currency,
+      active_projection_version.classifier_version
   ), current_fee_classification_candidates as (
     select
       bt.id as balance_transaction_id,
@@ -758,8 +762,9 @@ export const currentFinancialProjectionHeads = pgView('current_financial_project
   ), eligible_allocation_sets as (
     select s.*
     from ${financialAllocationSets} s
-    where s.classifier_version = ${FINANCIAL_CLASSIFIER_VERSION}
-      and s.algorithm_version = ${FINANCIAL_ALLOCATION_ALGORITHM_VERSION}
+    cross join active_projection_version
+    where s.classifier_version = active_projection_version.classifier_version
+      and s.algorithm_version = active_projection_version.allocation_algorithm_version
   ), eligible_base_tips_unranked as (
     select s.*
     from eligible_allocation_sets s
@@ -1112,6 +1117,33 @@ export const currentFinancialProjectionHeads = pgView('current_financial_project
     join ${financialAllocationSets} source on source.id = item.source_allocation_set_id
     where item.domain = 'settlement'
     group by item.source_allocation_set_id, item.correction_set_id
+  ), open_correction_rebase_issues as (
+    select issue.resource_id as balance_transaction_id, count(*)::integer as issue_count
+    from ${financialReconciliationIssues} issue
+    where issue.resource_type = 'balance_transaction'
+      and issue.safe_code = 'correction_rebase_required'
+      and issue.state = 'open'
+      and issue.impact = 'exception'
+    group by issue.resource_id
+  ), open_classification_fork_issues as (
+    select affected.balance_transaction_id, count(*)::integer as issue_count
+    from (
+      select issue.resource_id as balance_transaction_id
+      from ${financialReconciliationIssues} issue
+      where issue.safe_code = 'classification_fork'
+        and issue.resource_type = 'balance_transaction'
+        and issue.state = 'open'
+        and issue.impact = 'exception'
+      union all
+      select detail.balance_transaction_id
+      from ${financialReconciliationIssues} issue
+      join ${stripeBalanceTransactionFeeDetails} detail on detail.id = issue.resource_id
+      where issue.safe_code = 'classification_fork'
+        and issue.resource_type = 'fee_detail'
+        and issue.state = 'open'
+        and issue.impact = 'exception'
+    ) affected
+    group by affected.balance_transaction_id
   ), resolved as (
     select
       base.*,
@@ -1124,7 +1156,9 @@ export const currentFinancialProjectionHeads = pgView('current_financial_project
       coalesce(correction.is_compatible, false) as correction_is_compatible,
       coalesce(correction_items.item_count, 0) as correction_item_count,
       coalesce(correction_items.item_effect_sum, 0::bigint) as correction_item_effect_sum,
-      coalesce(correction_items.currency_mismatch_count, 0) as correction_item_currency_mismatch_count
+      coalesce(correction_items.currency_mismatch_count, 0) as correction_item_currency_mismatch_count,
+      coalesce(rebase_issue.issue_count, 0) as correction_rebase_issue_count,
+      coalesce(classification_issue.issue_count, 0) as classification_fork_issue_count
     from base_rollup base
     left join base_item_rollup items on items.base_set_id = base.base_set_id
     left join correction_status correction
@@ -1133,18 +1167,34 @@ export const currentFinancialProjectionHeads = pgView('current_financial_project
     left join correction_item_rollup correction_items
       on correction_items.base_set_id = base.base_set_id
       and correction_items.correction_set_id = correction.correction_tip_id
+    left join open_correction_rebase_issues rebase_issue
+      on rebase_issue.balance_transaction_id = base.balance_transaction_id
+    left join open_classification_fork_issues classification_issue
+      on classification_issue.balance_transaction_id = base.balance_transaction_id
   )
   select
     balance_transaction_id,
     basis,
-    case when base_count = 1 then base_set_id else null::uuid end as base_set_id,
-    case when base_count = 1 and correction_count = 1 and correction_is_compatible
+    case when base_count = 1 and correction_rebase_issue_count = 0 and
+      classification_fork_issue_count = 0
+      then base_set_id else null::uuid end as base_set_id,
+    case when base_count = 1 and correction_rebase_issue_count = 0 and
+      classification_fork_issue_count = 0 and
+      correction_count = 1 and correction_is_compatible
       then correction_tip_id else null::uuid end as compatible_correction_tip_id,
-    case when base_count = 1 then scope else null::financial_allocation_scope end as scope,
-    case when base_count = 1 then currency else null::varchar(3) end as currency,
-    case when base_count = 1 then expected_effect_minor else null::integer end as expected_effect_minor,
+    case when base_count = 1 and correction_rebase_issue_count = 0 and
+      classification_fork_issue_count = 0
+      then scope else null::financial_allocation_scope end as scope,
+    case when base_count = 1 and correction_rebase_issue_count = 0 and
+      classification_fork_issue_count = 0
+      then currency else null::varchar(3) end as currency,
+    case when base_count = 1 and correction_rebase_issue_count = 0 and
+      classification_fork_issue_count = 0
+      then expected_effect_minor else null::integer end as expected_effect_minor,
     (
-      base_count = 1 and scope <> 'unresolved'::financial_allocation_scope and
+      correction_rebase_issue_count = 0 and classification_fork_issue_count = 0 and
+      base_count = 1 and
+      scope <> 'unresolved'::financial_allocation_scope and
       parent_decision_count = 1 and parent_unknown_count = 0 and
       (basis <> 'fee'::financial_allocation_basis or
         (fee_decision_count = fee_detail_count and fee_unknown_count = 0 and
@@ -1164,7 +1214,9 @@ export const currentFinancialProjectionHeads = pgView('current_financial_project
         )
       )
     )::boolean as is_complete,
-    case when
+    case when correction_rebase_issue_count > 0 then 1
+    when classification_fork_issue_count > 0 then 1
+    when
       base_count = 1 and scope <> 'unresolved'::financial_allocation_scope and
       parent_decision_count = 1 and parent_unknown_count = 0 and
       (basis <> 'fee'::financial_allocation_basis or
@@ -1185,6 +1237,8 @@ export const currentFinancialProjectionHeads = pgView('current_financial_project
         )
       ) then 0 else 1 end::integer as missing_source_count,
     case
+      when correction_rebase_issue_count > 0 then 'correction_rebase_required'::varchar(100)
+      when classification_fork_issue_count > 0 then 'classification_fork'::varchar(100)
       when parent_decision_count = 0 then 'missing_source'::varchar(100)
       when parent_decision_count > 1 then 'classification_fork'::varchar(100)
       when parent_unknown_count > 0 then 'unsupported_category'::varchar(100)

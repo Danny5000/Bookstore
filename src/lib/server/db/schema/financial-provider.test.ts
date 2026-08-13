@@ -6,6 +6,7 @@ import {
   financialClassificationEnum,
   financialClassificationSubjectTypeEnum,
   financialClassificationVersions,
+  financialProjectionVersions,
   financialScanRuns,
   financialScanStateEnum,
   payoutImportRunEntries,
@@ -21,6 +22,7 @@ import {
 } from './financial-provider';
 
 const TABLES = [
+  financialProjectionVersions,
   stripeBalanceTransactions,
   stripeBalanceTransactionFeeDetails,
   financialClassificationVersions,
@@ -46,6 +48,7 @@ const foreignKeySignatures = () =>
 describe('financial provider schema declarations', () => {
   it('declares the exact provider table and enum vocabulary', () => {
     expect(TABLES.map((table) => configFor(table).name)).toEqual([
+      'financial_projection_versions',
       'stripe_balance_transactions',
       'stripe_balance_transaction_fee_details',
       'financial_classification_versions',
@@ -115,6 +118,10 @@ describe('financial provider schema declarations', () => {
         ])
       )
     ).toEqual({
+      financial_projection_versions: [
+        'singleton', 'classifier_version', 'allocation_algorithm_version', 'activated_at',
+        'activation_correlation_id'
+      ],
       stripe_balance_transactions: [
         'id', 'provider_id', 'live_mode', 'source_family', 'source_id', 'raw_type',
         'reporting_category', 'balance_type', 'amount_minor', 'fee_minor', 'net_minor',
@@ -157,6 +164,7 @@ describe('financial provider schema declarations', () => {
   });
 
   it('declares provider identity, scan, and publication indexes', () => {
+    expect(configFor(financialProjectionVersions).columns[0]?.primary).toBe(true);
     expect(indexNames(stripeBalanceTransactions)).toEqual(
       expect.arrayContaining([
         'stripe_balance_transactions_provider_unique',
@@ -236,6 +244,14 @@ describe('financial provider schema declarations', () => {
         })
       )
     ).toEqual({
+      financial_projection_versions: {
+        indexes: [], unique: [],
+        checks: [
+          'financial_projection_versions_correlation_safe',
+          'financial_projection_versions_singleton_true',
+          'financial_projection_versions_versions_positive'
+        ]
+      },
       stripe_balance_transactions: {
         indexes: ['stripe_balance_transactions_currency_created_idx', 'stripe_balance_transactions_provider_unique', 'stripe_balance_transactions_source_idx', 'stripe_balance_transactions_status_available_idx'],
         unique: [],

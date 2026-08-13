@@ -8,7 +8,8 @@ import { lockPaymentPurchaseFacts } from '$lib/server/commerce/reconciliation';
 import { lockCanonicalPaymentPurchaseFacts } from './payment';
 import {
   loadCurrentEffectiveAllocationProjection,
-  persistFinancialAllocationPlanLocked
+  persistFinancialAllocationPlanLocked,
+  persistFinancialAllocationReplayPlanLocked
 } from '../allocations/repository';
 import { observeFinancialIssue, resolveFinancialIssueAfterRecompute } from '../issues';
 import { lockFinancialProjectionRows } from '../locks';
@@ -19,7 +20,12 @@ import type {
   FinancialAllocationPlan,
   LockedRefundProjectionInput
 } from '../types';
-import { recomputeLockedRefundFinancialProjection, reconcileRefundFinancialSource } from './refund';
+import {
+  recomputeLockedRefundFinancialProjection,
+  recomputeLockedRefundFinancialProjectionForVersion,
+  reconcileRefundFinancialSource
+} from './refund';
+import * as refundSource from './refund';
 
 vi.mock('../ledger', () => ({ stageBalanceTransaction: vi.fn() }));
 vi.mock('./payment', () => ({ lockCanonicalPaymentPurchaseFacts: vi.fn() }));
@@ -28,7 +34,8 @@ vi.mock('$lib/server/commerce/reconciliation', () => ({ lockPaymentPurchaseFacts
 vi.mock('../locks', () => ({ lockFinancialProjectionRows: vi.fn() }));
 vi.mock('../allocations/repository', () => ({
   loadCurrentEffectiveAllocationProjection: vi.fn(),
-  persistFinancialAllocationPlanLocked: vi.fn()
+  persistFinancialAllocationPlanLocked: vi.fn(),
+  persistFinancialAllocationReplayPlanLocked: vi.fn()
 }));
 vi.mock('../issues', () => ({
   observeFinancialIssue: vi.fn(),
@@ -47,6 +54,12 @@ const issueId = '00000000-0000-4000-8000-000000000211';
 const createdAt = new Date('2026-08-10T00:00:00.000Z');
 const fingerprint = 'a'.repeat(64);
 const dialect = new PgDialect();
+
+describe('versioned locked refund projection replay', () => {
+  it('exports a provider-free explicit-version replay seam', () => {
+    expect(refundSource).toHaveProperty('recomputeLockedRefundFinancialProjectionForVersion');
+  });
+});
 
 interface CanonicalBalanceRow {
   readonly id: string;
@@ -503,6 +516,68 @@ describe('recomputeLockedRefundFinancialProjection', () => {
       setId: `00000000-0000-4000-8000-${String(400 + persistedIndex++).padStart(12, '0')}`,
       disposition: 'inserted'
     }));
+    vi.mocked(persistFinancialAllocationReplayPlanLocked).mockImplementation(async () => ({
+      setId: `00000000-0000-4000-8000-${String(500 + persistedIndex++).padStart(12, '0')}`,
+      disposition: 'inserted'
+    }));
+  });
+
+  it('rebuilds locked immutable refund facts for an explicit pair without source status side effects', async () => {
+    const balance = canonicalBalance();
+    const transaction = projectionTransaction({
+      balances: [balance],
+      history: [{
+        refundId,
+        providerCreatedAt: createdAt,
+        refundStatus: 'succeeded',
+        allocationStatus: 'finalized',
+        refundAllocationId: allocationId,
+        orderItemId: itemId,
+        subtotalMinor: 400,
+        taxMinor: 100,
+        currency: 'USD'
+      }],
+      feeDetails: { [balanceId]: [{ amountMinor: 10, classification: 'refund_fee' }] }
+    });
+
+    await expect(recomputeLockedRefundFinancialProjectionForVersion(
+      transaction,
+      lockedInput(),
+      { classifierVersion: 2, allocationAlgorithmVersion: 3, replayId: 'c2-a3' }
+    )).resolves.toEqual({
+      status: 'replayed',
+      refundId,
+      replacements: [
+        expect.objectContaining({
+          balanceTransactionId: balanceId,
+          basis: 'gross_amount',
+          previousSetId: null,
+          replacementSetId: expect.any(String),
+          sourceFingerprint: fingerprint,
+          disposition: 'inserted'
+        }),
+        expect.objectContaining({
+          balanceTransactionId: balanceId,
+          basis: 'fee',
+          previousSetId: null,
+          replacementSetId: expect.any(String),
+          sourceFingerprint: fingerprint,
+          disposition: 'inserted'
+        })
+      ]
+    });
+
+    expect(persistFinancialAllocationPlanLocked).not.toHaveBeenCalled();
+    expect(persistFinancialAllocationReplayPlanLocked).toHaveBeenCalledTimes(2);
+    for (const [, persistInput, authorized] of
+      vi.mocked(persistFinancialAllocationReplayPlanLocked).mock.calls) {
+      expect(authorized).toEqual({ classifierVersion: 2, allocationAlgorithmVersion: 3 });
+      expect(persistInput.classificationVersion).toBe(2);
+      expect(persistInput.plan.algorithmVersion).toBe(3);
+      expect(persistInput.plan.allocationIdentity).toContain(':replay:c2-a3:');
+    }
+    expect(loadCurrentEffectiveAllocationProjection).not.toHaveBeenCalled();
+    expect(transaction.update).not.toHaveBeenCalled();
   });
 
   it('rejects malformed locked facts before issuing projection queries', async () => {

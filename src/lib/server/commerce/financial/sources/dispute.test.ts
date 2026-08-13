@@ -10,13 +10,17 @@ import { lockCanonicalPaymentPurchaseFacts } from './payment';
 import { buildDisputeAllocationPlan } from '../allocations/dispute';
 import {
   loadCurrentEffectiveAllocationProjection,
-  persistFinancialAllocationPlanLocked
+  persistFinancialAllocationPlanLocked,
+  persistFinancialAllocationReplayPlanLocked
 } from '../allocations/repository';
 import { observeFinancialIssue, resolveFinancialIssueAfterRecompute } from '../issues';
 import { lockFinancialProjectionRows, type FinancialProjectionLockRows } from '../locks';
 import { stageBalanceTransaction } from '../ledger';
 import { PermanentFinancialError } from '../errors';
-import { reconcileDisputeFinancialSource } from './dispute';
+import {
+  recomputeLockedDisputeFinancialProjectionForVersion,
+  reconcileDisputeFinancialSource
+} from './dispute';
 
 vi.mock('../ledger', () => ({ stageBalanceTransaction: vi.fn() }));
 vi.mock('./payment', () => ({ lockCanonicalPaymentPurchaseFacts: vi.fn() }));
@@ -25,7 +29,8 @@ vi.mock('$lib/server/commerce/reconciliation', () => ({ lockPaymentPurchaseFacts
 vi.mock('../allocations/dispute', () => ({ buildDisputeAllocationPlan: vi.fn() }));
 vi.mock('../allocations/repository', () => ({
   loadCurrentEffectiveAllocationProjection: vi.fn(),
-  persistFinancialAllocationPlanLocked: vi.fn()
+  persistFinancialAllocationPlanLocked: vi.fn(),
+  persistFinancialAllocationReplayPlanLocked: vi.fn()
 }));
 vi.mock('../issues', () => ({
   observeFinancialIssue: vi.fn(),
@@ -290,6 +295,128 @@ function gateway(trace: string[]): StripeCommerceGateway {
     })
   } as unknown as StripeCommerceGateway;
 }
+
+describe('versioned locked dispute projection replay', () => {
+  beforeEach(() => vi.resetAllMocks());
+
+  it('reconstructs a withdrawal from locked local facts at the explicit pair', async () => {
+    const fingerprint = 'a'.repeat(64);
+    const insertedGross = '00000000-0000-4000-8000-000000000320';
+    const insertedFee = '00000000-0000-4000-8000-000000000321';
+    const plans = [
+      { allocationIdentity: `dispute:${disputeId}:${balanceId}:replay:c2-a3:gross`,
+        balanceTransactionId: balanceId, basis: 'gross_amount', scope: 'title',
+        currency: 'USD', expectedEffectMinor: -100, algorithmVersion: 3,
+        sourceFingerprint: fingerprint, supersedesSetId: null, reversalOfSetId: null,
+        items: [] },
+      { allocationIdentity: `dispute:${disputeId}:${balanceId}:replay:c2-a3:fee`,
+        balanceTransactionId: balanceId, basis: 'fee', scope: 'title', currency: 'USD',
+        expectedEffectMinor: 0, algorithmVersion: 3, sourceFingerprint: fingerprint,
+        supersedesSetId: null, reversalOfSetId: null, items: [] }
+    ] as never;
+    vi.mocked(buildDisputeAllocationPlan).mockReturnValue({ plans,
+      presentmentEffects: [] } as never);
+    vi.mocked(persistFinancialAllocationReplayPlanLocked)
+      .mockResolvedValueOnce({ setId: insertedGross, disposition: 'inserted' })
+      .mockResolvedValueOnce({ setId: insertedFee, disposition: 'inserted' });
+    const execute = vi.fn()
+      .mockResolvedValueOnce({ rows: [{ id: balanceId, providerId: 'txn_dispute',
+        sourceId: 'dp_dispute_trace', amountMinor: -100, feeMinor: 0,
+        netMinor: -100, currency: 'USD', fingerprintSha256: fingerprint,
+        providerCreatedAt: createdAt, classification: 'dispute_withdrawal' }] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] });
+    const tx = { execute, transaction: vi.fn() } as unknown as DatabaseTransaction;
+    vi.mocked(tx.transaction).mockImplementation(async (work) => work(tx));
+    const facts = { ...lockedFacts(), payment: { id: paymentId, orderId } } as never;
+    const projectionLocks = projectionLockRows({
+      balanceTransactions: [{ id: balanceId, fingerprintSha256: fingerprint }]
+    });
+
+    await expect(recomputeLockedDisputeFinancialProjectionForVersion(tx, {
+      orderId, paymentId, balanceTransactionIds: [balanceId], purchaseFacts: facts,
+      projectionLocks, correlationId: 'dispute-replay-c2-a3'
+    }, { classifierVersion: 2, allocationAlgorithmVersion: 3, replayId: 'c2-a3' }))
+      .resolves.toEqual({ status: 'replayed', replacements: [
+        expect.objectContaining({ balanceTransactionId: balanceId, disputeId,
+          basis: 'gross_amount', previousSetId: null,
+          replacementSetId: insertedGross, disposition: 'inserted' }),
+        expect.objectContaining({ balanceTransactionId: balanceId, disputeId,
+          basis: 'fee', previousSetId: null,
+          replacementSetId: insertedFee, disposition: 'inserted' })
+      ] });
+
+    expect(buildDisputeAllocationPlan).toHaveBeenCalledWith(expect.objectContaining({
+      algorithmVersion: 3, effect: 'withdrawal', sourceFingerprint: fingerprint
+    }));
+    expect(persistFinancialAllocationReplayPlanLocked).toHaveBeenCalledTimes(2);
+    expect(tx.transaction).toHaveBeenCalledOnce();
+    for (const [, persistInput, version] of
+      vi.mocked(persistFinancialAllocationReplayPlanLocked).mock.calls) {
+      expect(persistInput.classificationVersion).toBe(2);
+      expect(version).toEqual({ classifierVersion: 2, allocationAlgorithmVersion: 3 });
+    }
+  });
+
+  it('rolls back earlier sibling writes when a later replay subject fails safely', async () => {
+    const laterBalanceId = '00000000-0000-4000-8000-000000000322';
+    const fingerprint = 'a'.repeat(64);
+    const plans = [
+      { allocationIdentity: `dispute:${disputeId}:${balanceId}:replay:c2-a3:gross`,
+        balanceTransactionId: balanceId, basis: 'gross_amount', scope: 'title',
+        currency: 'USD', expectedEffectMinor: -100, algorithmVersion: 3,
+        sourceFingerprint: fingerprint, supersedesSetId: null, reversalOfSetId: null,
+        items: [] },
+      { allocationIdentity: `dispute:${disputeId}:${balanceId}:replay:c2-a3:fee`,
+        balanceTransactionId: balanceId, basis: 'fee', scope: 'title', currency: 'USD',
+        expectedEffectMinor: 0, algorithmVersion: 3, sourceFingerprint: fingerprint,
+        supersedesSetId: null, reversalOfSetId: null, items: [] }
+    ] as never;
+    vi.mocked(buildDisputeAllocationPlan).mockReturnValue({ plans,
+      presentmentEffects: [] } as never);
+    vi.mocked(persistFinancialAllocationReplayPlanLocked)
+      .mockResolvedValueOnce({ setId: grossSetId, disposition: 'inserted' })
+      .mockResolvedValueOnce({ setId: feeSetId, disposition: 'inserted' });
+    const execute = vi.fn()
+      .mockResolvedValueOnce({ rows: [
+        { id: balanceId, providerId: 'txn_dispute', sourceId: 'dp_dispute_trace',
+          amountMinor: -100, feeMinor: 0, netMinor: -100, currency: 'USD',
+          fingerprintSha256: fingerprint, providerCreatedAt: createdAt,
+          classification: 'dispute_withdrawal' },
+        { id: laterBalanceId, providerId: 'txn_missing', sourceId: 'dp_missing',
+          amountMinor: -100, feeMinor: 0, netMinor: -100, currency: 'USD',
+          fingerprintSha256: fingerprint,
+          providerCreatedAt: new Date(createdAt.getTime() + 1000),
+          classification: 'dispute_withdrawal' }
+      ] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] });
+    let rolledBack = false;
+    const tx = { execute, transaction: vi.fn() } as unknown as DatabaseTransaction;
+    vi.mocked(tx.transaction).mockImplementation(async (work) => {
+      try {
+        return await work(tx);
+      } catch (error) {
+        rolledBack = true;
+        throw error;
+      }
+    });
+    const facts = { ...lockedFacts(), payment: { id: paymentId, orderId } } as never;
+    const projectionLocks = projectionLockRows({ balanceTransactions: [
+      { id: balanceId, fingerprintSha256: fingerprint },
+      { id: laterBalanceId, fingerprintSha256: fingerprint }
+    ] });
+
+    await expect(recomputeLockedDisputeFinancialProjectionForVersion(tx, {
+      orderId, paymentId, balanceTransactionIds: [balanceId, laterBalanceId],
+      purchaseFacts: facts, projectionLocks, correlationId: 'dispute-replay-rollback'
+    }, { classifierVersion: 2, allocationAlgorithmVersion: 3, replayId: 'c2-a3' }))
+      .resolves.toEqual({ status: 'exception', safeCode: 'source_linkage_mismatch' });
+
+    expect(persistFinancialAllocationReplayPlanLocked).toHaveBeenCalledTimes(2);
+    expect(rolledBack).toBe(true);
+  });
+});
 
 describe('reconcileDisputeFinancialSource', () => {
   beforeEach(() => {

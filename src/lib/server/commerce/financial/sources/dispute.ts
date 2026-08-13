@@ -17,7 +17,8 @@ import type { DatabaseTransaction } from '$lib/server/db/transaction';
 import { buildDisputeAllocationPlan } from '../allocations/dispute';
 import {
   loadCurrentEffectiveAllocationProjection,
-  persistFinancialAllocationPlanLocked
+  persistFinancialAllocationPlanLocked,
+  persistFinancialAllocationReplayPlanLocked
 } from '../allocations/repository';
 import type {
   BoundDisputePresentmentEffect,
@@ -28,7 +29,11 @@ import type {
 import { FINANCIAL_ALLOCATION_ALGORITHM_VERSION, FINANCIAL_CLASSIFIER_VERSION } from '../constants';
 import { PermanentFinancialError, RetryableFinancialError } from '../errors';
 import { observeFinancialIssue, resolveFinancialIssueAfterRecompute } from '../issues';
-import { lockFinancialProjectionRows } from '../locks';
+import {
+  lockFinancialProjectionRows,
+  type FinancialProjectionLockRows
+} from '../locks';
+import type { PaymentPurchaseFacts } from '$lib/server/commerce/reconciliation';
 import type {
   FinancialAllocationPlan,
   FinancialIssueCode,
@@ -72,6 +77,20 @@ const CROSS_DISPUTE_PROJECTION_ISSUE_CODES: readonly FinancialIssueCode[] = [
   'allocation_mismatch',
   'correction_rebase_required'
 ];
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const FINGERPRINT = /^[a-f0-9]{64}$/u;
+const CURRENCY = /^[A-Z]{3}$/u;
+const SAFE_MONEY = 99_999_999;
+
+function exact(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value) &&
+    Reflect.ownKeys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function boundedMoney(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= -SAFE_MONEY &&
+    (value as number) <= SAFE_MONEY;
+}
 
 async function rows(tx: DatabaseTransaction, query: ReturnType<typeof sql>): Promise<unknown[]> {
   return ((await tx.execute(query)) as QueryResult).rows ?? [];
@@ -202,6 +221,51 @@ interface LockedBalance {
   readonly currency: string;
   readonly fingerprintSha256: string;
   readonly providerCreatedAt: Date;
+}
+
+export interface LockedDisputeProjectionReplayVersion {
+  readonly classifierVersion: number;
+  readonly allocationAlgorithmVersion: number;
+  readonly replayId: string;
+}
+
+export interface LockedDisputeProjectionReplayInput {
+  readonly orderId: string;
+  readonly paymentId: string;
+  readonly balanceTransactionIds: readonly string[];
+  readonly purchaseFacts: PaymentPurchaseFacts;
+  readonly projectionLocks: FinancialProjectionLockRows;
+  readonly correlationId: string;
+}
+
+export interface LockedDisputeProjectionReplayReplacement {
+  readonly balanceTransactionId: string;
+  readonly disputeId: string;
+  readonly basis: 'gross_amount' | 'fee';
+  readonly previousSetId: string | null;
+  readonly replacementSetId: string;
+  readonly sourceFingerprint: string;
+  readonly disposition: 'inserted' | 'unchanged';
+}
+
+export type LockedDisputeProjectionReplayResult =
+  | {
+      readonly status: 'replayed' | 'unchanged';
+      readonly replacements: readonly LockedDisputeProjectionReplayReplacement[];
+    }
+  | {
+      readonly status: 'exception';
+      readonly safeCode: FinancialIssueCode;
+    };
+
+class DisputeReplayRollback extends Error {
+  readonly safeCode: FinancialIssueCode;
+
+  constructor(safeCode: FinancialIssueCode) {
+    super('Dispute projection replay must roll back.');
+    this.name = 'DisputeReplayRollback';
+    this.safeCode = safeCode;
+  }
 }
 
 interface StoredSet {
@@ -443,6 +507,316 @@ async function persistPresentmentEffects(
     } as BoundDisputePresentmentEffect);
   }
   return bound;
+}
+
+interface ReplayStoredTip {
+  readonly id: string;
+  readonly balanceTransactionId: string;
+  readonly basis: 'gross_amount' | 'fee';
+  readonly allocationIdentity: string;
+  readonly supersedesSetId: string | null;
+}
+
+interface ReplayDisputeBalance extends LockedBalance {
+  readonly classification: string | null;
+}
+
+function assertDisputeReplayBoundary(
+  input: unknown,
+  target: unknown
+): asserts input is LockedDisputeProjectionReplayInput {
+  if (!exact(input, [
+    'orderId', 'paymentId', 'balanceTransactionIds', 'purchaseFacts',
+    'projectionLocks', 'correlationId'
+  ]) || !UUID.test(input.orderId as string) || !UUID.test(input.paymentId as string) ||
+    !Array.isArray(input.balanceTransactionIds) || input.balanceTransactionIds.length < 1 ||
+    input.balanceTransactionIds.length > 100 ||
+    input.balanceTransactionIds.some((id) => typeof id !== 'string' || !UUID.test(id)) ||
+    new Set(input.balanceTransactionIds).size !== input.balanceTransactionIds.length ||
+    !input.purchaseFacts || typeof input.purchaseFacts !== 'object' ||
+    !input.projectionLocks || typeof input.projectionLocks !== 'object' ||
+    typeof input.correlationId !== 'string' || input.correlationId.length < 1 ||
+    input.correlationId.length > 100 || !exact(target, [
+      'classifierVersion', 'allocationAlgorithmVersion', 'replayId'
+    ]) || typeof target.classifierVersion !== 'number' ||
+    !Number.isSafeInteger(target.classifierVersion) || target.classifierVersion < 1 ||
+    target.classifierVersion > 2_147_483_647 ||
+    typeof target.allocationAlgorithmVersion !== 'number' ||
+    !Number.isSafeInteger(target.allocationAlgorithmVersion) ||
+    target.allocationAlgorithmVersion < 1 || target.allocationAlgorithmVersion > 2_147_483_647 ||
+    target.replayId !== `c${target.classifierVersion}-a${target.allocationAlgorithmVersion}`) {
+    throw new PermanentFinancialError('source_linkage_mismatch');
+  }
+}
+
+function predecessorForReplay(
+  tip: ReplayStoredTip | undefined,
+  desiredIdentity: string
+): string | null {
+  if (!tip) return null;
+  return tip.allocationIdentity === desiredIdentity ? tip.supersedesSetId : tip.id;
+}
+
+/**
+ * Rebuilds the complete already-locked dispute chronology using only durable local facts.
+ * The caller owns the canonical purchase/payout/financial lock closure and issue transitions.
+ */
+async function recomputeLockedDisputeFinancialProjectionForVersionInSavepoint(
+  tx: DatabaseTransaction,
+  input: LockedDisputeProjectionReplayInput,
+  target: LockedDisputeProjectionReplayVersion
+): Promise<LockedDisputeProjectionReplayResult> {
+  assertDisputeReplayBoundary(input, target);
+  if (input.purchaseFacts.order.id !== input.orderId ||
+    input.purchaseFacts.payment.id !== input.paymentId ||
+    input.purchaseFacts.payment.orderId !== input.orderId) {
+    throw new PermanentFinancialError('source_linkage_mismatch');
+  }
+  const lockedIds = new Set(input.projectionLocks.balanceTransactions.map((row) => row.id));
+  if (input.balanceTransactionIds.some((id) => !lockedIds.has(id))) {
+    throw new PermanentFinancialError('source_linkage_mismatch');
+  }
+  const balances = await rows(tx, sql`
+    select balance.id, balance.provider_id as "providerId", balance.source_id as "sourceId",
+      balance.amount_minor as "amountMinor", balance.fee_minor as "feeMinor",
+      balance.net_minor as "netMinor", balance.currency,
+      balance.fingerprint_sha256 as "fingerprintSha256",
+      balance.provider_created_at as "providerCreatedAt", decision.classification
+    from stripe_balance_transactions balance
+    left join financial_classification_versions decision
+      on decision.subject_type = 'balance_transaction' and decision.subject_id = balance.id
+      and decision.classifier_version = ${target.classifierVersion}
+      and decision.source_fingerprint_sha256 = balance.fingerprint_sha256
+    where balance.id in (${sql.join(
+      input.balanceTransactionIds.map((id) => sql`${id}::uuid`), sql`, `
+    )}) and balance.source_family = 'dispute'
+    order by balance.provider_created_at, balance.provider_id, balance.id
+    for update of balance
+  `) as ReplayDisputeBalance[];
+  if (balances.length !== input.balanceTransactionIds.length ||
+    new Set(balances.map((row) => row.id)).size !== balances.length ||
+    balances.some((balance) => !UUID.test(balance.id) || !FINGERPRINT.test(balance.fingerprintSha256) ||
+      !input.projectionLocks.balanceTransactions.some((locked) => locked.id === balance.id &&
+        locked.fingerprintSha256 === balance.fingerprintSha256) ||
+      typeof balance.sourceId !== 'string' || balance.sourceId.length < 1 ||
+      !boundedMoney(balance.amountMinor) || !boundedMoney(balance.feeMinor) ||
+      balance.feeMinor < 0 || !boundedMoney(balance.netMinor) ||
+      BigInt(balance.amountMinor) - BigInt(balance.feeMinor) !== BigInt(balance.netMinor) ||
+      !CURRENCY.test(balance.currency) ||
+      !['dispute_withdrawal', 'dispute_reinstatement', 'fee_credit']
+        .includes(balance.classification ?? ''))) {
+    return { status: 'exception', safeCode: 'source_linkage_mismatch' };
+  }
+  const tips = await rows(tx, sql`
+    select allocation.id, allocation.balance_transaction_id as "balanceTransactionId",
+      allocation.basis, allocation.allocation_identity as "allocationIdentity",
+      allocation.supersedes_set_id as "supersedesSetId"
+    from financial_allocation_sets allocation
+    where allocation.balance_transaction_id in (${sql.join(
+      input.balanceTransactionIds.map((id) => sql`${id}::uuid`), sql`, `
+    )}) and not exists (
+      select 1 from financial_allocation_sets successor
+      where successor.supersedes_set_id = allocation.id
+    )
+    order by allocation.balance_transaction_id, allocation.basis, allocation.id
+    for update
+  `) as ReplayStoredTip[];
+  if (tips.some((tip) => !UUID.test(tip.id) ||
+    !input.balanceTransactionIds.includes(tip.balanceTransactionId)) ||
+    input.balanceTransactionIds.some((id) =>
+      tips.filter((tip) => tip.balanceTransactionId === id && tip.basis === 'gross_amount').length > 1 ||
+      tips.filter((tip) => tip.balanceTransactionId === id && tip.basis === 'fee').length > 1)) {
+    return { status: 'exception', safeCode: 'allocation_fork' };
+  }
+
+  const planBySetId = new Map<string, FinancialAllocationPlan>();
+  const causalRootByGrossSet = new Map<string, string>();
+  const activeSetByBalanceBasis = new Map<string, string>();
+  for (const tip of tips) {
+    const plan = await loadStoredPlan(tx, tip.id, tip.basis);
+    planBySetId.set(tip.id, plan);
+    activeSetByBalanceBasis.set(`${tip.balanceTransactionId}:${tip.basis}`, tip.id);
+    if (tip.basis === 'gross_amount') {
+      causalRootByGrossSet.set(tip.id,
+        (await loadCausalRootPlan(tx, tip.id, tip.basis, planBySetId)).setId);
+    }
+  }
+
+  const priorEffects: BoundDisputePresentmentEffect[] = [];
+  const replacements: LockedDisputeProjectionReplayReplacement[] = [];
+  for (const balance of balances) {
+    const sourceDispute = input.purchaseFacts.disputes.find((candidate) =>
+      candidate.stripeDisputeId === balance.sourceId);
+    if (!sourceDispute || sourceDispute.paymentId !== input.paymentId) {
+      return { status: 'exception', safeCode: 'source_linkage_mismatch' };
+    }
+    const detailRows = await rows(tx, sql`
+      select detail.amount_minor as "amountMinor", decision.classification
+      from stripe_balance_transaction_fee_details detail
+      left join financial_classification_versions decision
+        on decision.subject_type = 'fee_detail' and decision.subject_id = detail.id
+        and decision.classifier_version = ${target.classifierVersion}
+        and decision.source_fingerprint_sha256 = detail.fingerprint_sha256
+      where detail.balance_transaction_id = ${balance.id}
+      order by detail.ordinal
+      for update of detail
+    `) as Array<{ amountMinor: number; classification: string | null }>;
+    const componentByClassification = {
+      dispute_fee: 'dispute_fee', provider_fee_tax: 'provider_fee_tax',
+      fee_credit: 'fee_credit', other: 'other'
+    } as const;
+    const feeDetails: ClassifiedFeeDetail[] = [];
+    for (const detail of detailRows) {
+      const component = componentByClassification[
+        detail.classification as keyof typeof componentByClassification
+      ];
+      if (!boundedMoney(detail.amountMinor) || detail.amountMinor < 0 || !component) {
+        return { status: 'exception', safeCode: 'unsupported_category' };
+      }
+      feeDetails.push({ amountMinor: -detail.amountMinor, component });
+    }
+    if (detailRows.reduce((sum, row) => sum + BigInt(row.amountMinor), 0n) !==
+      BigInt(balance.feeMinor)) {
+      return { status: 'exception', safeCode: 'allocation_mismatch' };
+    }
+    const effectKind = balance.classification === 'dispute_withdrawal'
+      ? 'withdrawal' as const
+      : balance.classification === 'dispute_reinstatement'
+        ? 'reinstatement' as const
+        : 'fee_credit' as const;
+    const outstandingSetIds = [...new Set(priorEffects.filter((row) =>
+      row.disputeId === sourceDispute.id && row.effect === 'withdrawal' &&
+      !priorEffects.some((candidate) => candidate.effect === 'reinstatement' &&
+        candidate.reversalOfAllocationId === row.allocationId)
+    ).map((row) => row.withdrawalSetId))];
+    if (effectKind !== 'withdrawal' && outstandingSetIds.length !== 1) {
+      return { status: 'exception', safeCode: 'allocation_mismatch' };
+    }
+    const outstandingGrossSetId = effectKind === 'withdrawal' ? null : outstandingSetIds[0]!;
+    const causalWithdrawal = outstandingGrossSetId === null ? null :
+      await loadCausalRootPlan(tx, outstandingGrossSetId, 'gross_amount', planBySetId);
+    const currentWithdrawalGrossSetId = causalWithdrawal === null ? null :
+      activeSetByBalanceBasis.get(`${causalWithdrawal.plan.balanceTransactionId}:gross_amount`) ?? null;
+    const currentWithdrawalGrossPlan = currentWithdrawalGrossSetId === null ? null :
+      planBySetId.get(currentWithdrawalGrossSetId) ?? null;
+    let reversesFeeSetId: string | null = null;
+    let withdrawalFeePlan: FinancialAllocationPlan | null = null;
+    if (effectKind === 'fee_credit') {
+      if (!currentWithdrawalGrossPlan) {
+        return { status: 'exception', safeCode: 'source_linkage_mismatch' };
+      }
+      reversesFeeSetId = activeSetByBalanceBasis.get(
+        `${currentWithdrawalGrossPlan.balanceTransactionId}:fee`
+      ) ?? null;
+      withdrawalFeePlan = reversesFeeSetId === null ? null :
+        planBySetId.get(reversesFeeSetId) ?? null;
+      if (!withdrawalFeePlan) return { status: 'exception', safeCode: 'allocation_mismatch' };
+    }
+    const finalizedRefunds: FinalizedDisputeRefund[] = input.purchaseFacts.refundComponents
+      .flatMap((component) => {
+        const refund = input.purchaseFacts.refunds.find((candidate) =>
+          candidate.id === component.refundId);
+        return !refund || refund.status !== 'succeeded' ||
+          refund.providerCreatedAt.getTime() >= new Date(balance.providerCreatedAt).getTime()
+          ? [] : [{ refundId: refund.id,
+              providerCreatedAt: refund.providerCreatedAt.toISOString(),
+              orderItemId: component.orderItemId, subtotalMinor: component.subtotalMinor,
+              taxMinor: component.taxMinor, presentmentCurrency: component.currency }];
+      });
+    const grossTip = tips.find((tip) => tip.balanceTransactionId === balance.id &&
+      tip.basis === 'gross_amount');
+    const feeTip = tips.find((tip) => tip.balanceTransactionId === balance.id &&
+      tip.basis === 'fee');
+    const prefix = `dispute:${sourceDispute.id}:${balance.id}:replay:${target.replayId}`;
+    const exactOutstandingPresentment = outstandingGrossSetId === null ? null :
+      -priorEffects.filter((row) => row.disputeId === sourceDispute.id &&
+        row.effect === 'withdrawal' && row.withdrawalSetId === outstandingGrossSetId &&
+        !priorEffects.some((candidate) => candidate.effect === 'reinstatement' &&
+          candidate.reversalOfAllocationId === row.allocationId))
+        .reduce((sum, row) => sum + row.subtotalMinor + row.taxMinor, 0);
+    const presentmentCurrency = effectKind === 'fee_credit'
+      ? balance.currency : sourceDispute.currency;
+    const presentmentAmountMinor = effectKind === 'fee_credit'
+      ? Math.abs(balance.amountMinor)
+      : balance.currency === sourceDispute.currency
+        ? Math.abs(balance.amountMinor)
+        : effectKind === 'reinstatement'
+          ? (exactOutstandingPresentment ?? 0)
+          : sourceDispute.amountMinor;
+    const bundle = buildDisputeAllocationPlan({
+      sourceKind: 'dispute', sourceId: sourceDispute.id, disputeId: sourceDispute.id,
+      balanceTransactionId: balance.id, providerTransactionId: balance.providerId,
+      providerCreatedAt: new Date(balance.providerCreatedAt).toISOString(),
+      allocationIdentityPrefix: prefix, settlementCurrency: balance.currency,
+      amountMinor: balance.amountMinor, feeMinor: balance.feeMinor, netMinor: balance.netMinor,
+      sourceFingerprint: balance.fingerprintSha256,
+      algorithmVersion: target.allocationAlgorithmVersion,
+      supersedesGrossSetId: predecessorForReplay(grossTip, `${prefix}:gross`),
+      supersedesFeeSetId: predecessorForReplay(feeTip, `${prefix}:fee`),
+      effect: effectKind, presentmentAmountMinor, presentmentCurrency,
+      paymentItems: input.purchaseFacts.orderItems.map((item) => {
+        if (item.taxMinor === null) throw new PermanentFinancialError('allocation_mismatch');
+        return { orderItemId: item.id, subtotalMinor: item.unitSubtotalMinor,
+          taxMinor: item.taxMinor, presentmentCurrency: item.currency };
+      }),
+      finalizedRefunds, priorPresentmentEffects: [...priorEffects], withdrawalSetId: null,
+      reversesSetId: effectKind === 'reinstatement' ? outstandingGrossSetId : null,
+      reversesFeeSetId,
+      withdrawalGrossPlan: effectKind === 'reinstatement' ? currentWithdrawalGrossPlan : null,
+      withdrawalFeePlan, feeDetails
+    });
+    const pair: Array<{ setId: string; disposition: 'inserted' | 'unchanged';
+      plan: FinancialAllocationPlan }> = [];
+    for (const plan of bundle.plans) {
+      const saved = await persistFinancialAllocationReplayPlanLocked(tx, {
+        plan, sourceKind: 'dispute', sourceId: sourceDispute.id,
+        classificationVersion: target.classifierVersion,
+        correlationId: input.correlationId
+      }, { classifierVersion: target.classifierVersion,
+        allocationAlgorithmVersion: target.allocationAlgorithmVersion });
+      pair.push({ ...saved, plan });
+      planBySetId.set(saved.setId, plan);
+      activeSetByBalanceBasis.set(`${balance.id}:${plan.basis}`, saved.setId);
+      replacements.push({ balanceTransactionId: balance.id, disputeId: sourceDispute.id,
+        basis: plan.basis, previousSetId: plan.supersedesSetId,
+        replacementSetId: saved.setId, sourceFingerprint: plan.sourceFingerprint,
+        disposition: saved.disposition });
+      if (plan.basis === 'gross_amount') {
+        causalRootByGrossSet.set(saved.setId, grossTip === undefined ? saved.setId :
+          causalRootByGrossSet.get(grossTip.id) ?? grossTip.id);
+      }
+    }
+    if (bundle.presentmentEffects.length > 0) {
+      priorEffects.push(...await persistPresentmentEffects(tx, sourceDispute.id,
+        pair[0]!.setId, causalRootByGrossSet.get(pair[0]!.setId) ?? pair[0]!.setId,
+        bundle.presentmentEffects));
+    }
+  }
+  return replacements.some((row) => row.disposition === 'inserted')
+    ? { status: 'replayed', replacements }
+    : { status: 'unchanged', replacements };
+}
+
+export async function recomputeLockedDisputeFinancialProjectionForVersion(
+  tx: DatabaseTransaction,
+  input: LockedDisputeProjectionReplayInput,
+  target: LockedDisputeProjectionReplayVersion
+): Promise<LockedDisputeProjectionReplayResult> {
+  assertDisputeReplayBoundary(input, target);
+  try {
+    return await tx.transaction(async (replayTx) => {
+      const result = await recomputeLockedDisputeFinancialProjectionForVersionInSavepoint(
+        replayTx, input, target
+      );
+      if (result.status === 'exception') throw new DisputeReplayRollback(result.safeCode);
+      return result;
+    });
+  } catch (error) {
+    if (error instanceof DisputeReplayRollback) {
+      return { status: 'exception', safeCode: error.safeCode };
+    }
+    throw error;
+  }
 }
 
 export async function reconcileDisputeFinancialSource(

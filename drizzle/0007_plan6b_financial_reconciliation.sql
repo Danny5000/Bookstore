@@ -242,6 +242,22 @@ CREATE TABLE "financial_classification_versions" (
 	CONSTRAINT "financial_classification_versions_fingerprint_sha256" CHECK ("financial_classification_versions"."source_fingerprint_sha256" ~ '^[a-f0-9]{64}$')
 );
 --> statement-breakpoint
+CREATE TABLE "financial_projection_versions" (
+	"singleton" boolean PRIMARY KEY DEFAULT true NOT NULL,
+	"classifier_version" integer NOT NULL,
+	"allocation_algorithm_version" integer NOT NULL,
+	"activated_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"activation_correlation_id" varchar(100) NOT NULL,
+	CONSTRAINT "financial_projection_versions_singleton_true" CHECK ("financial_projection_versions"."singleton" = true),
+	CONSTRAINT "financial_projection_versions_versions_positive" CHECK ("financial_projection_versions"."classifier_version" > 0 and "financial_projection_versions"."allocation_algorithm_version" > 0),
+	CONSTRAINT "financial_projection_versions_correlation_safe" CHECK (char_length("financial_projection_versions"."activation_correlation_id") between 1 and 100)
+);
+--> statement-breakpoint
+INSERT INTO "financial_projection_versions"
+  ("singleton", "classifier_version", "allocation_algorithm_version",
+    "activation_correlation_id")
+VALUES (true, 1, 1, 'migration-c1-a1');
+--> statement-breakpoint
 CREATE TABLE "financial_scan_runs" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
 	"root_key" varchar(512) NOT NULL,
@@ -763,18 +779,23 @@ ALTER TABLE "entitlement_grants" ADD CONSTRAINT "grants_source_consistent" CHECK
         "entitlement_grants"."state" in ('active', 'revoked')
       ));--> statement-breakpoint
 CREATE VIEW "public"."current_financial_projection_heads" AS (
-  with current_parent_classification_candidates as (
+  with active_projection_version as (
+    select classifier_version, allocation_algorithm_version
+    from "financial_projection_versions"
+    where singleton = true
+  ), current_parent_classification_candidates as (
     select
       bt.id as balance_transaction_id,
       count(classification.id)::integer as decision_count,
       count(*) filter (where classification.classification = 'unknown')::integer as unknown_count
     from "stripe_balance_transactions" bt
+    cross join active_projection_version
     left join "financial_classification_versions" classification
       on classification.subject_type = 'balance_transaction'
       and classification.subject_id = bt.id
       and classification.source_fingerprint_sha256 = bt.fingerprint_sha256
-      and classification.classifier_version = 1
-    group by bt.id
+      and classification.classifier_version = active_projection_version.classifier_version
+    group by bt.id, active_projection_version.classifier_version
   ), current_fee_detail_classification_candidates as (
     select
       detail.balance_transaction_id,
@@ -784,12 +805,14 @@ CREATE VIEW "public"."current_financial_projection_heads" AS (
       count(classification.id)::integer as decision_count,
       count(*) filter (where classification.classification = 'unknown')::integer as unknown_count
     from "stripe_balance_transaction_fee_details" detail
+    cross join active_projection_version
     left join "financial_classification_versions" classification
       on classification.subject_type = 'fee_detail'
       and classification.subject_id = detail.id
       and classification.source_fingerprint_sha256 = detail.fingerprint_sha256
-      and classification.classifier_version = 1
-    group by detail.balance_transaction_id, detail.id, detail.amount_minor, detail.currency
+      and classification.classifier_version = active_projection_version.classifier_version
+    group by detail.balance_transaction_id, detail.id, detail.amount_minor, detail.currency,
+      active_projection_version.classifier_version
   ), current_fee_classification_candidates as (
     select
       bt.id as balance_transaction_id,
@@ -818,8 +841,9 @@ CREATE VIEW "public"."current_financial_projection_heads" AS (
   ), eligible_allocation_sets as (
     select s.*
     from "financial_allocation_sets" s
-    where s.classifier_version = 1
-      and s.algorithm_version = 1
+    cross join active_projection_version
+    where s.classifier_version = active_projection_version.classifier_version
+      and s.algorithm_version = active_projection_version.allocation_algorithm_version
   ), eligible_base_tips_unranked as (
     select s.*
     from eligible_allocation_sets s
@@ -1172,6 +1196,33 @@ CREATE VIEW "public"."current_financial_projection_heads" AS (
     join "financial_allocation_sets" source on source.id = item.source_allocation_set_id
     where item.domain = 'settlement'
     group by item.source_allocation_set_id, item.correction_set_id
+  ), open_correction_rebase_issues as (
+    select issue.resource_id as balance_transaction_id, count(*)::integer as issue_count
+    from "financial_reconciliation_issues" issue
+    where issue.resource_type = 'balance_transaction'
+      and issue.safe_code = 'correction_rebase_required'
+      and issue.state = 'open'
+      and issue.impact = 'exception'
+    group by issue.resource_id
+  ), open_classification_fork_issues as (
+    select affected.balance_transaction_id, count(*)::integer as issue_count
+    from (
+      select issue.resource_id as balance_transaction_id
+      from "financial_reconciliation_issues" issue
+      where issue.safe_code = 'classification_fork'
+        and issue.resource_type = 'balance_transaction'
+        and issue.state = 'open'
+        and issue.impact = 'exception'
+      union all
+      select detail.balance_transaction_id
+      from "financial_reconciliation_issues" issue
+      join "stripe_balance_transaction_fee_details" detail on detail.id = issue.resource_id
+      where issue.safe_code = 'classification_fork'
+        and issue.resource_type = 'fee_detail'
+        and issue.state = 'open'
+        and issue.impact = 'exception'
+    ) affected
+    group by affected.balance_transaction_id
   ), resolved as (
     select
       base.*,
@@ -1184,7 +1235,9 @@ CREATE VIEW "public"."current_financial_projection_heads" AS (
       coalesce(correction.is_compatible, false) as correction_is_compatible,
       coalesce(correction_items.item_count, 0) as correction_item_count,
       coalesce(correction_items.item_effect_sum, 0::bigint) as correction_item_effect_sum,
-      coalesce(correction_items.currency_mismatch_count, 0) as correction_item_currency_mismatch_count
+      coalesce(correction_items.currency_mismatch_count, 0) as correction_item_currency_mismatch_count,
+      coalesce(rebase_issue.issue_count, 0) as correction_rebase_issue_count,
+      coalesce(classification_issue.issue_count, 0) as classification_fork_issue_count
     from base_rollup base
     left join base_item_rollup items on items.base_set_id = base.base_set_id
     left join correction_status correction
@@ -1193,18 +1246,34 @@ CREATE VIEW "public"."current_financial_projection_heads" AS (
     left join correction_item_rollup correction_items
       on correction_items.base_set_id = base.base_set_id
       and correction_items.correction_set_id = correction.correction_tip_id
+    left join open_correction_rebase_issues rebase_issue
+      on rebase_issue.balance_transaction_id = base.balance_transaction_id
+    left join open_classification_fork_issues classification_issue
+      on classification_issue.balance_transaction_id = base.balance_transaction_id
   )
   select
     balance_transaction_id,
     basis,
-    case when base_count = 1 then base_set_id else null::uuid end as base_set_id,
-    case when base_count = 1 and correction_count = 1 and correction_is_compatible
+    case when base_count = 1 and correction_rebase_issue_count = 0 and
+      classification_fork_issue_count = 0
+      then base_set_id else null::uuid end as base_set_id,
+    case when base_count = 1 and correction_rebase_issue_count = 0 and
+      classification_fork_issue_count = 0 and
+      correction_count = 1 and correction_is_compatible
       then correction_tip_id else null::uuid end as compatible_correction_tip_id,
-    case when base_count = 1 then scope else null::financial_allocation_scope end as scope,
-    case when base_count = 1 then currency else null::varchar(3) end as currency,
-    case when base_count = 1 then expected_effect_minor else null::integer end as expected_effect_minor,
+    case when base_count = 1 and correction_rebase_issue_count = 0 and
+      classification_fork_issue_count = 0
+      then scope else null::financial_allocation_scope end as scope,
+    case when base_count = 1 and correction_rebase_issue_count = 0 and
+      classification_fork_issue_count = 0
+      then currency else null::varchar(3) end as currency,
+    case when base_count = 1 and correction_rebase_issue_count = 0 and
+      classification_fork_issue_count = 0
+      then expected_effect_minor else null::integer end as expected_effect_minor,
     (
-      base_count = 1 and scope <> 'unresolved'::financial_allocation_scope and
+      correction_rebase_issue_count = 0 and classification_fork_issue_count = 0 and
+      base_count = 1 and
+      scope <> 'unresolved'::financial_allocation_scope and
       parent_decision_count = 1 and parent_unknown_count = 0 and
       (basis <> 'fee'::financial_allocation_basis or
         (fee_decision_count = fee_detail_count and fee_unknown_count = 0 and
@@ -1224,7 +1293,9 @@ CREATE VIEW "public"."current_financial_projection_heads" AS (
         )
       )
     )::boolean as is_complete,
-    case when
+    case when correction_rebase_issue_count > 0 then 1
+    when classification_fork_issue_count > 0 then 1
+    when
       base_count = 1 and scope <> 'unresolved'::financial_allocation_scope and
       parent_decision_count = 1 and parent_unknown_count = 0 and
       (basis <> 'fee'::financial_allocation_basis or
@@ -1245,6 +1316,8 @@ CREATE VIEW "public"."current_financial_projection_heads" AS (
         )
       ) then 0 else 1 end::integer as missing_source_count,
     case
+      when correction_rebase_issue_count > 0 then 'correction_rebase_required'::varchar(100)
+      when classification_fork_issue_count > 0 then 'classification_fork'::varchar(100)
       when parent_decision_count = 0 then 'missing_source'::varchar(100)
       when parent_decision_count > 1 then 'classification_fork'::varchar(100)
       when parent_unknown_count > 0 then 'unsupported_category'::varchar(100)
@@ -1346,6 +1419,24 @@ CREATE TRIGGER "refund_reporting_correction_sets_immutable" BEFORE UPDATE OR DEL
 CREATE TRIGGER "refund_reporting_correction_items_immutable" BEFORE UPDATE OR DELETE ON "refund_reporting_correction_items" FOR EACH ROW EXECUTE FUNCTION "public"."plan6b_reject_history_mutation"();--> statement-breakpoint
 CREATE TRIGGER "refund_allocation_finalization_effects_immutable" BEFORE UPDATE OR DELETE ON "refund_allocation_finalization_effects" FOR EACH ROW EXECUTE FUNCTION "public"."plan6b_reject_history_mutation"();--> statement-breakpoint
 CREATE TRIGGER "refund_allocations_immutable" BEFORE UPDATE OR DELETE ON "refund_allocations" FOR EACH ROW EXECUTE FUNCTION "public"."plan6b_reject_history_mutation"();--> statement-breakpoint
+CREATE FUNCTION "public"."plan6b_validate_projection_version_transition"() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'active financial projection version cannot be deleted';
+  END IF;
+  IF NEW.singleton IS DISTINCT FROM OLD.singleton OR
+     NEW.classifier_version < OLD.classifier_version OR
+     NEW.allocation_algorithm_version < OLD.allocation_algorithm_version OR
+     (NEW.classifier_version = OLD.classifier_version AND
+       NEW.allocation_algorithm_version = OLD.allocation_algorithm_version) OR
+     NEW.activated_at < OLD.activated_at THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'invalid financial projection version transition';
+  END IF;
+  RETURN NEW;
+END;
+$$;--> statement-breakpoint
+CREATE TRIGGER "financial_projection_versions_narrow_update" BEFORE UPDATE OR DELETE ON "financial_projection_versions" FOR EACH ROW EXECUTE FUNCTION "public"."plan6b_validate_projection_version_transition"();--> statement-breakpoint
 CREATE FUNCTION "public"."plan6b_validate_balance_transaction_transition"() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN

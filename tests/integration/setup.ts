@@ -13,7 +13,8 @@ beforeEach(async () => {
       stripe_payout_balance_transactions, payout_import_run_entries,
       payout_import_runs, stripe_balance_transaction_fee_details,
       stripe_payouts, stripe_balance_transactions,
-      financial_classification_versions, financial_reconciliation_issues,
+      financial_projection_versions, financial_classification_versions,
+      financial_reconciliation_issues,
       financial_scan_runs,
       entitlement_grants, refund_allocations, disputes, refunds,
       payments, order_items, orders, stripe_events, application_rate_limits,
@@ -25,6 +26,11 @@ beforeEach(async () => {
       audit_events, outbox_messages, jobs, title_revisions, titles,
       guest_identities, user_roles, verification, account, session, rate_limit, "user"
     restart identity cascade
+  `);
+  await databaseClient.db.execute(sql`
+    insert into financial_projection_versions
+      (singleton, classifier_version, allocation_algorithm_version, activation_correlation_id)
+    values (true, 1, 1, 'integration-reset-c1-a1')
   `);
 });
 
