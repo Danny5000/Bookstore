@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-11
 
-**Status:** Approved
+**Status:** 6B-I candidate — independent review pending; 6B-II pending
 
 **Depends on:** Plans 1-6A, `2026-08-08-bookstore-full-stack-design.md`, and `2026-08-10-stripe-commerce-guest-claims-design.md`
 
@@ -99,6 +99,8 @@ Plan 6B is one design with two implementation checkpoints:
 - **6B-II — Admin resolution and reporting:** capabilities, sales overview, refund review, payout views, reporting corrections, CSV, audit, accessibility, documentation, and full release gates.
 
 Each checkpoint receives an independent code review. The second checkpoint cannot treat the first as complete until ledger replay, concurrency, migration, and currency invariants have passed their focused gates.
+
+The checkpoint-I candidate implements the ingestion/reconciliation half above and is awaiting independent review. Sales navigation, administrator resolution/reporting routes, payout views, corrections, recovery grants, and CSV remain disabled until 6B-II. Production remains in maintenance mode and Plan 7 retains launch ownership. See the [Stripe financial reconciliation operations guide](../../stripe-financial-reconciliation.md) for the candidate runtime and recovery boundary.
 
 ## 5. Financial authority and currency model
 
@@ -311,7 +313,7 @@ The explicit Stripe webhook allowlist adds:
 
 The endpoint is never configured for `*`. `payout.reconciliation_completed` is the authoritative signal that transactions in an automatic payout can be queried; `payout.paid` alone is not that signal. See [Stripe event types](https://docs.stripe.com/api/events/types) and [payout reconciliation](https://docs.stripe.com/payouts/reconciliation).
 
-The existing raw-body signature verification, API-version check, event digest collision handling, minimal `stripe_events` persistence, atomic event/job insertion, and immediate response behavior remain unchanged. The Stripe endpoint delivery API version stays aligned with the repository's explicit `2026-07-29.dahlia` SDK pin and is reverified during implementation against [Stripe API versioning](https://docs.stripe.com/api/versioning).
+The existing raw-body signature verification, API-version check, event digest collision handling, minimal `stripe_events` persistence, atomic event/job insertion, and immediate response behavior remain unchanged. The Stripe endpoint delivery API version is pinned to `2026-07-29.dahlia`, aligned with the repository's SDK gateway pin, and must stay aligned during future provider upgrades; see [Stripe API versioning](https://docs.stripe.com/api/versioning).
 
 ## 9. Jobs, recurring scheduling, and backfill
 
@@ -824,7 +826,7 @@ Each checkpoint runs its focused static, lint, unit, integration, schema, and di
 
 Plan 6B updates:
 
-- The commerce runbook with the exact payout event allowlist, pinned webhook/API version, automatic-versus-manual limitations, scan cadence, freshness semantics, and issue handling.
+- The [Stripe financial reconciliation operations guide](../../stripe-financial-reconciliation.md) and commerce runbook with the exact payout event allowlist, pinned webhook/API version, automatic-versus-manual limitations, scan cadence, freshness semantics, and issue handling.
 - Runtime documentation with Stripe-disabled and overlay behavior unchanged.
 - Backup/restore documentation with ledger, payout, allocation, issue, draft, correction, and checkpoint invariants.
 - The admin guide with signed metric definitions, UTC boundaries, currency domains, draft/finalization consequences, reporting-only corrections, administrative access recovery, CSV privacy, and audit behavior.

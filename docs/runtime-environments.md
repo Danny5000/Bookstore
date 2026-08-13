@@ -2,7 +2,7 @@
 
 ## Scope
 
-The repository supplies a development environment and a production infrastructure baseline. Authentication, administration, PostgreSQL catalog data, private publication storage, ingestion, Stripe commerce, guest claims, entitlement grants, customer libraries, reader state, and entitled original downloads are durable. Stripe is disabled by default. Production intentionally remains in maintenance mode while Plan 6B financial reporting and the Plan 7 launch gate are incomplete.
+The repository supplies a development environment and a production infrastructure baseline. Authentication, administration, PostgreSQL catalog data, private publication storage, ingestion, Stripe commerce, guest claims, entitlement grants, customer libraries, reader state, entitled original downloads, and local financial reconciliation are durable. Stripe is disabled by default. The financial checkpoint status is **6B-I candidate — independent review pending; 6B-II pending**. Production intentionally remains in maintenance mode, Sales remains disabled, and Plan 7 owns the launch gate.
 
 ## Required toolchain
 
@@ -98,7 +98,7 @@ Every required application value also supports a mutually exclusive `<NAME>_FILE
 
 ## Production baseline
 
-Production does not use an environment file. The deployment process exports the image/origin/database values, a generated `AUTH_SECRET`, provider SMTP values, and the first-administrator values. See [authentication and email operations](authentication-and-email.md) for that contract and [commerce and guest-claim operations](commerce-and-guest-claims.md) for Stripe. Base production requires no Stripe credentials and keeps `STRIPE_ENABLED=false`. Then run:
+Production does not use an environment file. The deployment process exports the image/origin/database values, a generated `AUTH_SECRET`, provider SMTP values, and the first-administrator values. See [authentication and email operations](authentication-and-email.md) for that contract, [commerce and guest-claim operations](commerce-and-guest-claims.md) for Stripe Checkout/webhooks, and [Stripe financial reconciliation](stripe-financial-reconciliation.md) for ledger and worker recovery. Base production requires no Stripe credentials and keeps `STRIPE_ENABLED=false`. Then run:
 
 ```powershell
 docker compose --file compose.prod.yaml config --quiet
@@ -119,7 +119,9 @@ docker compose --file compose.prod.yaml --file compose.stripe.yaml up --detach -
 
 `docker compose config` verifies the merged structure, but it does not verify that environment-backed secret values are present. The Node.js-based `npm run stripe:preflight` command exits nonzero when either Stripe variable is missing or empty and never prints either value. Run it before any Stripe-overlay container-creation command. A Docker-only Linux VPS without host Node.js can use the nonprinting POSIX-shell equivalent in [commerce and guest-claim operations](commerce-and-guest-claims.md).
 
-`compose.stripe.yaml` mounts the two environment-backed secrets only into app and worker. It does not alter `APPLICATION_MODE=maintenance`, live mode, or the existing database/auth/SMTP secret mounts, and it is not a storefront launch switch.
+`compose.stripe.yaml` mounts the two environment-backed secrets only into app and worker and enables their Stripe gateway against the pinned `2026-07-29.dahlia` API version. The app owns Checkout and webhook acceptance; the worker owns canonical source/payout retrieval and hourly recovery. The overlay adds no service, port, Redis dependency, or credential to migration/bootstrap/storage-cleanup/Caddy/PostgreSQL. Provider calls finish outside financial database transactions. It does not alter `APPLICATION_MODE=maintenance`, live mode, or the existing database/auth/SMTP secret mounts, and it is not a storefront launch switch.
+
+With the base runtime disabled, provider scan roots are not scheduled and the disabled gateway cannot perform source or payout retrieval. The worker may still ensure the version-keyed classifier/allocation replay root because that work uses durable local evidence only. In fixture or Stripe mode it additionally ensures an initial recovery root and one root per UTC hour; each local batch or provider page is capped at 100, initial payout discovery looks back seven days before the earliest local paid order, and hourly discovery overlaps 72 hours. These are convergence boundaries, not a promise that an administrator report is fresh; Sales remains unavailable until Plan 6B-II.
 
 Caddy's internal port 2015 health endpoint is container-only and avoids coupling container health to the configured public hostname or TLS redirect behavior.
 
@@ -148,5 +150,5 @@ docker compose --file compose.prod.yaml --profile tools run --rm storage-cleanup
 - Plan 4 supplies private storage, bounded ingestion, revision publication, cleanup, and the current backup/restore procedure.
 - Plan 5 supplies server-owned customer libraries, full entitled reading, optimistic reader state, exact revision migration, and authenticated original downloads. See [customer library, reader state, and original downloads](customer-library-and-reader.md).
 - Plan 6A supplies Stripe Checkout/event reconciliation, guest claiming, purchase grants, and refund/dispute access changes.
-- Plan 6B supplies processing-fee, balance-transaction, payout, allocation, and administrator sales/estimated-payout reporting.
+- Plan 6B status is **6B-I candidate — independent review pending; 6B-II pending**. Checkpoint I supplies local processing-fee, balance-transaction, payout, allocation, issue, scheduler, and replay boundaries; checkpoint II still owns administrator resolution and sales/estimated-payout reporting.
 - Plan 7 adds deployment automation, off-host backup scheduling, monitoring/alert delivery, final capacity tuning, and the read-only-rootfs review.

@@ -2,7 +2,7 @@
 
 ## Release state and authority
 
-Plan 6A implements the multi-title cart, Stripe-hosted Checkout, signed asynchronous fulfillment, guest purchase claiming, purchase-backed entitlement grants, and refund/dispute access changes. Development and production remain credential-free and disabled by default. Production is still fixed to `APPLICATION_MODE=maintenance`; completing Plan 6A does not publish the Hetzner storefront.
+Plan 6A implements the multi-title cart, Stripe-hosted Checkout, signed asynchronous fulfillment, guest purchase claiming, purchase-backed entitlement grants, and refund/dispute access changes. The financial checkpoint status is **6B-I candidate — independent review pending; 6B-II pending**. The candidate adds local financial ingestion and reconciliation, but no Sales route or administrator reporting workflow is enabled. Development and production remain credential-free and Stripe-disabled by default. Production is still fixed to `APPLICATION_MODE=maintenance`; neither checkpoint publishes the Hetzner storefront, which remains Plan 7 work.
 
 PostgreSQL is authoritative. Browser cart data contains title IDs and a client attempt UUID only. The server re-quotes current public titles, ownership, currency, and prices before creating immutable `orders` and `order_items`. A successful browser redirect never grants access. Only a signature-verified Stripe event followed by canonical Checkout Session and Payment retrieval can make an order paid and create an `entitlement_grants` row. The `entitlements` table is the effective user/title projection used by the library, reader, and download routes.
 
@@ -100,9 +100,9 @@ Signed asynchronous `failed` remains unresolved because a later canonical succes
 
 `POST /api/webhooks/stripe` reads bounded untouched bytes, verifies the `Stripe-Signature`, rejects live/test-mode mismatch, minimizes the supported event, and transactionally inserts one `stripe_events` row plus one deduplicated `commerce.stripe-event` job. Duplicate deliveries converge on the same row/job; a conflicting reuse of a provider event ID cannot overwrite accepted evidence.
 
-Configure the Stripe Dashboard endpoint with API version `2026-07-29.dahlia` and only this Plan 6A allowlist: `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed`, `checkout.session.expired`, `refund.created`, `refund.updated`, `refund.failed`, `charge.dispute.created`, `charge.dispute.updated`, `charge.dispute.closed`, `charge.dispute.funds_withdrawn`, and `charge.dispute.funds_reinstated`. Do not subscribe this endpoint to broad `*` delivery; Plan 6B will explicitly extend the list for its financial imports.
+Configure the Stripe Dashboard endpoint with API version `2026-07-29.dahlia` and only this exact allowlist: `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed`, `checkout.session.expired`, `refund.created`, `refund.updated`, `refund.failed`, `charge.dispute.created`, `charge.dispute.updated`, `charge.dispute.closed`, `charge.dispute.funds_withdrawn`, `charge.dispute.funds_reinstated`, `payout.created`, `payout.updated`, `payout.paid`, `payout.failed`, `payout.canceled`, and `payout.reconciliation_completed`. The last six are the complete payout-event extension. Do not subscribe this endpoint to broad `*` delivery; `payout.paid` alone never proves exact membership.
 
-The worker retrieves canonical provider state outside a database transaction. It then enters short ordered transactions to reduce payment, refund, or dispute state; update purchase grants and the effective entitlement projection; enqueue deduplicated `email.commerce.v1` messages; append a minimized audit event; and mark the event processed. After an operation-local event or identity lock, purchase facts are always locked as order, payment, refunds, allocations, disputes, items, sorted entitlement scopes, then grants. Provider/SMTP calls are never held inside database transactions.
+The worker retrieves canonical provider state outside a database transaction. It then enters short ordered transactions to reduce payment, refund, or dispute state; update purchase grants and the effective entitlement projection; enqueue deduplicated `email.commerce.v1` messages; append a minimized audit event; and mark the event processed. The same commit hands payment/refund/dispute facts to a deduplicated `commerce.financial-source` job. A payout event is marked processed while atomically handing its canonical provider ID to `commerce.financial-payout`; the later job performs retrieval. After an operation-local event or identity lock, purchase facts are always locked as order, payment, refunds, allocations, disputes, items, sorted entitlement scopes, then grants. Provider/SMTP calls are never held inside database transactions.
 
 Relevant audit actions are:
 
@@ -144,7 +144,11 @@ where id = '<event-uuid>';
 
 select id, type, status, attempts, max_attempts, run_at, updated_at
 from jobs
-where type in ('commerce.stripe-event', 'commerce.claim-email', 'commerce.claim-email-request')
+where type in (
+  'commerce.stripe-event', 'commerce.claim-email', 'commerce.claim-email-request',
+  'commerce.financial-source', 'commerce.financial-payout',
+  'commerce.financial-scan', 'commerce.financial-classification'
+)
 order by created_at desc
 limit 50;
 
@@ -158,7 +162,7 @@ where resource_id = '<order-or-event-uuid>'
 order by occurred_at;
 ```
 
-A Stripe event job gets 12 attempts, covering about 18.5 minutes with the production 1-second base and 5-minute backoff cap. If Stripe redelivers an exact event after those attempts are exhausted, acceptance atomically re-arms the same deduplicated job only while the event remains pending; processed, exception, and conflicting events are never re-armed. Otherwise preserve failed jobs and exception events for investigation. Plan 7 owns the authorized job-retry UI, so do not hand-edit attempts or status. Verify network/configuration, canonical Stripe object state, live mode, currency, order amount, and worker health. Stripe retries non-2xx webhook delivery; application job retries use the configured bounded backoff. Ordinary quote, checkout, and claim-request throttle consumption also removes a bounded batch of expired rows from its own namespace, so no separate rate-limit cleanup command is required.
+A Stripe event job gets 12 attempts, covering about 18.5 minutes with the production 1-second base and 5-minute backoff cap. If Stripe redelivers an exact event after those attempts are exhausted, acceptance atomically re-arms the same deduplicated job only while the event remains pending; processed, exception, and conflicting events are never re-armed. Otherwise preserve failed jobs and exception events for investigation. Financial source/payout jobs get 12 attempts, scan jobs get 8, and classification jobs get 5. Exhausted transient financial work remains durable; a later hourly generation, payout-generation impact scan, or classifier-version replay can enqueue a new permanent key. Plan 7 owns the authorized job-retry UI, so do not hand-edit attempts or status. Verify network/configuration, canonical Stripe object state, live mode, currency, order amount, and worker health. Stripe retries non-2xx webhook delivery; application job retries use the configured bounded backoff. Ordinary quote, checkout, and claim-request throttle consumption also removes a bounded batch of expired rows from its own namespace, so no separate rate-limit cleanup command is required.
 
 For receipt/claim delivery, inspect only outbox topic/status/deduplication key and job status—not the payload. Confirm Mailpit/SMTP reachability and worker health. A delivered outbox row suppresses ordinary replay, though an SMTP crash window can still produce a harmless duplicate message.
 
@@ -166,9 +170,21 @@ For receipt/claim delivery, inspect only outbox topic/status/deduplication key a
 
 Initiate refunds and respond to disputes in Stripe Dashboard. Signed events cause the application to retrieve canonical Refund, Dispute, and Payment state before changing access.
 
-A full refund that maps exactly to one item permanently revokes that purchase grant. Complete cumulative refunds can revoke all funded grants. For a partial multi-title refund with no stored provider allocation, the application records `reconciliation_status=exception` and keeps access rather than guessing which title to revoke. Plan 6B will add administrative allocation and financial reconciliation for these exceptions.
+A full refund that maps exactly to one item permanently revokes that purchase grant. Complete cumulative refunds can revoke all funded grants. For a partial multi-title refund with no stored provider allocation, the Plan 6A event remains an access-safe exception and keeps access rather than guessing. The Plan 6B-I financial projection records the orthogonal state as `needs_review` plus `pending` and opens an `allocation_incomplete` issue. Plan 6B-II will add the administrator draft/finalization workflow; direct SQL allocation is unsupported.
 
 An open dispute suspends otherwise-active purchase grants funded by the payment. A won dispute restores only grants that are not fully refunded or permanently revoked. A lost dispute permanently revokes them. Another active purchase grant or preserved administrative grant keeps effective access, because `entitlements` is recomputed from all grants rather than toggled from one event.
+
+## Financial ingestion and recovery boundary
+
+The Plan 6B-I candidate keeps financial consumers and operational inspection on local durable facts; it never makes a live Stripe call from a report. `commerce.financial-source` imports canonical payment, refund, and dispute balance transactions and fee details, verifies provider linkage, appends versioned classifications, and writes exactly conserving allocation sets. Amount and net values are signed minor-unit integers, fees are nonnegative, and every balance transaction satisfies `net = amount - fee`. Customer-presentment currency and Stripe-settlement currency remain separate; the application performs no conversion and never invents a mixed-currency total.
+
+When runtime mode is fixture or Stripe, each worker polling loop ensures an initial provider root and one UTC-hour-keyed recovery root. The initial payout range begins seven days before the earliest local paid order, or seven days before the current hour when none exists. Hourly payout discovery overlaps the prior 72 hours. Every local batch or provider page is limited to 100 resources, commits its cursor/checkpoint, and enqueues a bounded continuation. A completed scan means only that its bounded local/provider pages committed; it does not prove that Stripe has no newer activity or that every source is report-complete.
+
+A separate classifier/allocation-version root is ensured when its composite version changes, including while Stripe is disabled. It reads only durable local evidence, appends decisions and superseding allocation sets, and recomputes issues; it never rewrites provider history. Provider roots do not run in disabled mode. There is no manual synchronization endpoint.
+
+`commerce.financial-payout` may publish exact membership only for an automatic standard payout whose canonical status is currently `paid`, whose `reconciliation_status` is `completed`, and whose filtered balance-transaction pagination completed without linkage, collision, currency, or membership conflict. Publication increments a payout generation and queues bounded impact work. Manual and instant payouts remain `fee_reconciled` with no application-assigned membership; a later failure, cancellation, or reversal preserves history and reopens derived state.
+
+Safe financial states are `pending`, `fee_reconciled`, `payout_reconciled`, and `exception`. Open issues use bounded codes such as `missing_source`, `unsupported_category`, `immutable_mismatch`, `currency_mismatch`, `allocation_incomplete`, `payout_incomplete`, or `payout_membership_conflict`. Inspect internal IDs, codes, state, impact, counts, currencies, and timestamps only. There is no generic Resolve action: an issue closes only when canonical recomputation proves its invariant after new evidence or an authorized append-only workflow. Never update ledger, allocation, membership, checkpoint, classification, or issue rows directly. See [Stripe financial reconciliation](stripe-financial-reconciliation.md) for the complete operating and recovery procedure.
 
 ## Production Compose overlay
 
@@ -210,6 +226,6 @@ Neither preflight prints credential values. Container creation is the first Comp
 
 The overlay does not alter `APPLICATION_MODE=maintenance`, `STRIPE_LIVE_MODE=false`, database/auth/SMTP secrets, or the migration/bootstrap tools. Do not use it as a production-launch switch. Plan 7 owns the deployment launch gate and Hetzner hardening.
 
-## Deferred Plan 6B work
+## Checkpoint status and deferred reporting
 
-Plan 6B remains pending. It will import Stripe balance transactions and payouts, reconcile processing/refund/dispute fees, allocate ambiguous refunds, expose per-title copies/gross/fees/estimated payout reporting, and distinguish estimates from settled payout revenue. Plan 6A does not claim fee-accurate revenue, payout reconciliation, or an administrator sales dashboard. Production launch also remains incomplete while maintenance mode is fixed.
+Status: **6B-I candidate — independent review pending; 6B-II pending**. The candidate supplies the local ingestion, allocation, issue, payout, scheduler, and replay boundaries described above. Plan 6B-II still owns administrator refund resolution, per-title copies/gross/fees/estimated-payout reporting, payout views, reporting corrections, access-recovery controls, and aggregate CSV. Sales navigation remains disabled until that checkpoint is implemented and reviewed. Production remains in maintenance mode, and Plan 7 owns launch.

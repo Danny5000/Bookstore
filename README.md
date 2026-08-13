@@ -32,6 +32,7 @@ docker compose --env-file .env --file compose.dev.yaml up --build --wait
 Operational references:
 
 - [Commerce and guest claims](docs/commerce-and-guest-claims.md)
+- [Stripe financial reconciliation](docs/stripe-financial-reconciliation.md)
 - [Authentication and email](docs/authentication-and-email.md)
 - [Customer library, reader state, and downloads](docs/customer-library-and-reader.md)
 - [Runtime environments](docs/runtime-environments.md)
@@ -50,7 +51,7 @@ npm run build
 npm run verify
 ```
 
-Development uses the PostgreSQL catalog, private EPUB/CBZ storage, background ingestion, revision review/publication, public previews, server-owned commerce and entitlement grants, customer libraries and reader state, authenticated original downloads, and an audited admin dashboard. Stripe is disabled by default and production Compose remains fixed to maintenance mode while Plan 6B financial reporting and the later production launch gate remain incomplete.
+Development uses the PostgreSQL catalog, private EPUB/CBZ storage, background ingestion, revision review/publication, public previews, server-owned commerce and entitlement grants, customer libraries and reader state, authenticated original downloads, and an audited admin dashboard. Stripe is disabled by default and production Compose remains fixed to maintenance mode. The financial checkpoint status is **6B-I candidate — independent review pending; 6B-II pending**; Sales navigation and administrator reporting remain disabled, and Plan 7 owns the production launch gate.
 
 ## Routes
 
@@ -65,7 +66,7 @@ Development uses the PostgreSQL catalog, private EPUB/CBZ storage, background in
 | `/read/[id]` | Public preview by slug or entitled full reader by title ID |
 | `/library` | Server-owned entitled shelf, resume state, and downloads |
 | `/library/[titleId]/download` | Re-authorized EPUB/CBZ/ZIP original stream |
-| `/admin` | Protected publication, user, audit, and reporting dashboard |
+| `/admin` | Protected publication, user, and audit dashboard; Sales remains disabled |
 | `/studio` | Redirect to the database-backed admin catalog |
 
 ## Reader
@@ -93,7 +94,9 @@ Public catalog, detail, and preview loaders read only active public revisions wi
 
 Plan 6A provides a bounded quantity-one multi-title cart, server-owned quotes, immutable order snapshots, Stripe-hosted Checkout, signed idempotent webhook processing, account and guest fulfillment, one-use guest claims, and refund/dispute-driven purchase grants. A redirect never creates access: canonical asynchronous Stripe processing is the only purchase fulfillment authority. Prices are tax-exclusive, mixed currencies are rejected, and Stripe remains disabled unless explicit validated test-mode configuration enables it.
 
-Production is still `APPLICATION_MODE=maintenance`. Plan 6B must add fee, balance-transaction, payout, ambiguous-refund allocation, and administrator sales/estimated-payout reporting. See the [commerce operations runbook](docs/commerce-and-guest-claims.md).
+The Plan 6B-I candidate adds local canonical balance-transaction and payout ingestion, signed fee/net allocation, reconciliation issues, hourly recovery scans, and versioned classification replay. It does not expose administrator resolution or reporting. Exact automatic-standard payout association requires complete membership plus current paid status; manual and instant payouts remain fee-reconciled without invented membership. See the [commerce operations runbook](docs/commerce-and-guest-claims.md) and [financial reconciliation guide](docs/stripe-financial-reconciliation.md).
+
+Production is still `APPLICATION_MODE=maintenance`. Stripe remains disabled in the base stack, the Sales navigation remains unavailable, and Plan 7—not the Stripe overlay—owns storefront launch.
 
 ## Authentication and delivery
 
@@ -103,6 +106,6 @@ Versioned authentication and commerce messages use the PostgreSQL outbox and pro
 
 ## Deferred work
 
-- Stripe processing-fee, balance, payout, ambiguous-refund allocation, and sales/estimated-payout reporting (Plan 6B).
+- Plan 6B-II administrator refund resolution, sales/estimated-payout reporting, payout views, and aggregate CSV.
 - Production launch, deployment automation, monitoring, and off-host backup scheduling (Plan 7).
 - Search, series grouping, pre-orders, and reviews.
