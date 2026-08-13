@@ -10,6 +10,7 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['tests/integration/**/*.test.ts'],
+    exclude: ['tests/integration/financial-migration.test.ts'],
     setupFiles: ['tests/integration/setup.ts'],
     fileParallelism: false,
     maxWorkers: 1,

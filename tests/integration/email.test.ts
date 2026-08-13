@@ -50,7 +50,11 @@ describe('SMTP outbox delivery', () => {
       expiresInSeconds: 601
     });
 
-    const repository = createPostgresJobRepository(databaseClient.db, config.jobs);
+    const repository = createPostgresJobRepository(
+      databaseClient.db,
+      config.jobs,
+      () => new Date(Date.now() + 1_000)
+    );
     const transport = createNodemailerEmailTransport(config.smtp);
     const dispatch = createOutboxDispatchHandler(
       databaseClient.db,
