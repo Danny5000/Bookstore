@@ -212,6 +212,11 @@ export type RefundFinancialRecomputeResult =
       readonly resolvedIssueIds: readonly string[];
     }
   | {
+      readonly status: 'unchanged';
+      readonly refundId: string;
+      readonly financialEvidenceStatus: 'fee_reconciled';
+    }
+  | {
       readonly status: 'pending';
       readonly refundId: string;
       readonly financialEvidenceStatus: 'pending';

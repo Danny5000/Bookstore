@@ -277,7 +277,11 @@ function assertReinstatementShape(
   if (exact.length === 0) linkageMismatch();
   if (exact.some((effect) => reversedWithdrawalIds.has(effect.allocationId))) linkageMismatch();
   const expected = exact.reduce((sum, effect) => sum + effect.subtotalMinor + effect.taxMinor, 0);
-  if (expected !== input.withdrawalGrossPlan.expectedEffectMinor) linkageMismatch();
+  if (input.presentmentCurrency === input.settlementCurrency &&
+    expected !== input.withdrawalGrossPlan.expectedEffectMinor) linkageMismatch();
+  if (input.presentmentCurrency !== input.settlementCurrency &&
+    (input.amountMinor !== -input.withdrawalGrossPlan.expectedEffectMinor ||
+      input.presentmentAmountMinor !== -expected)) mismatch();
   if (input.presentmentAmountMinor > -expected) mismatch();
   return exact;
 }
@@ -285,9 +289,11 @@ function assertReinstatementShape(
 function assertWithdrawalPlan(plan: FinancialAllocationPlan, input: DisputeAllocationInput): void {
   assertAllocationPlanConserves(plan);
   if (plan.currency !== input.settlementCurrency) throw new PermanentFinancialError('currency_mismatch');
+  if (plan.supersedesSetId !== null &&
+    (typeof plan.supersedesSetId !== 'string' || plan.supersedesSetId.length === 0)) linkageMismatch();
   if (
     plan.basis !== 'gross_amount' || plan.scope !== 'title' || plan.expectedEffectMinor >= 0 ||
-    plan.reversalOfSetId !== null || plan.supersedesSetId !== null || plan.balanceTransactionId === input.balanceTransactionId
+    plan.reversalOfSetId !== null || plan.balanceTransactionId === input.balanceTransactionId
   ) linkageMismatch();
 }
 
@@ -329,9 +335,11 @@ function feeCreditItems(input: DisputeAllocationInput): readonly FinancialAlloca
   const plan = input.withdrawalFeePlan;
   assertAllocationPlanConserves(plan);
   if (plan.currency !== input.settlementCurrency) throw new PermanentFinancialError('currency_mismatch');
+  if (plan.supersedesSetId !== null &&
+    (typeof plan.supersedesSetId !== 'string' || plan.supersedesSetId.length === 0)) linkageMismatch();
   if (
     plan.basis !== 'fee' || plan.scope !== 'title' || plan.expectedEffectMinor >= 0 ||
-    plan.reversalOfSetId !== null || plan.supersedesSetId !== null || plan.balanceTransactionId === input.balanceTransactionId ||
+    plan.reversalOfSetId !== null || plan.balanceTransactionId === input.balanceTransactionId ||
     input.amountMinor > -plan.expectedEffectMinor
   ) linkageMismatch();
   return allocateComponents(
@@ -346,7 +354,7 @@ export function buildDisputeAllocationPlan(input: DisputeAllocationInput): Dispu
   if (input.effect === 'fee_credit') {
     const grossItems = feeCreditItems(input);
     return { plans: [
-      basePlan(input, { basis: 'gross_amount', scope: 'title', expectedEffectMinor: input.amountMinor, items: grossItems, reversalOfSetId: input.reversesFeeSetId }),
+      basePlan(input, { basis: 'gross_amount', scope: 'title', expectedEffectMinor: input.amountMinor, items: grossItems, reversalOfSetId: null }),
       basePlan(input, { basis: 'fee', scope: 'title', expectedEffectMinor: 0, items: [] })
     ], presentmentEffects: [] };
   }

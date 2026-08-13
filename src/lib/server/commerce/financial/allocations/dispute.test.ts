@@ -356,10 +356,72 @@ describe('buildDisputeAllocationPlan', () => {
       reversesSetId: null, reversesFeeSetId: 'set-withdrawal-fee', withdrawalSetId: null, withdrawalGrossPlan: null,
       withdrawalFeePlan: { ...persistedWithdrawal(), basis: 'fee', expectedEffectMinor: -15, items: [{ orderItemId: 'item-a', component: 'dispute_fee', effectMinor: -15, currency: 'USD', tieBreakKey: 'item-a:dispute_fee' }] }
     }));
-    expect(credit.plans[0]).toMatchObject({ basis: 'gross_amount', expectedEffectMinor: 15, reversalOfSetId: 'set-withdrawal-fee' });
+    expect(credit.plans[0]).toMatchObject({ basis: 'gross_amount', expectedEffectMinor: 15, reversalOfSetId: null });
     expect(credit.plans[0].items.every((item) => item.component === 'fee_credit' && item.effectMinor > 0)).toBe(true);
     expect(credit.plans[1].items).toEqual([]);
     expect(build(baseInput({ feeMinor: 0, netMinor: -600, feeDetails: [] })).plans[1].items).toEqual([]);
+  });
+
+  it('fails closed for a partial FX reinstatement without exact presentment evidence', () => {
+    const original = {
+      ...persistedWithdrawal(), currency: 'EUR', expectedEffectMinor: -540,
+      items: persistedWithdrawal().items.map((item, index) => ({
+        ...item, currency: 'EUR', effectMinor: index === 0 ? -378 : -162
+      }))
+    };
+    const reinstatement = baseInput({
+      effect: 'reinstatement', settlementCurrency: 'EUR',
+      balanceTransactionId: 'bt-fx-reinstatement',
+      providerTransactionId: 'txn-fx-reinstatement',
+      providerCreatedAt: '2026-08-03T00:00:00.000Z',
+      allocationIdentityPrefix: 'dispute:dispute-1:bt-fx-reinstatement',
+      amountMinor: 270, feeMinor: 0, netMinor: 270,
+      presentmentAmountMinor: 300, feeDetails: [],
+      reversesSetId: 'set-withdrawal-1', withdrawalSetId: null,
+      withdrawalGrossPlan: original, priorPresentmentEffects: priorWithdrawalEffects()
+    });
+
+    expectSafeFailure(() => build(reinstatement), 'allocation_mismatch');
+    expect(build({
+      ...reinstatement, amountMinor: 540, netMinor: 540, presentmentAmountMinor: 600
+    }).presentmentEffects.reduce(
+      (sum, effect) => sum + effect.subtotalMinor + effect.taxMinor, 0
+    )).toBe(600);
+  });
+
+  it('accepts versioned current withdrawal evidence but rejects malformed predecessors', () => {
+    const supersededGross = { ...persistedWithdrawal(), supersedesSetId: 'set-root' };
+    expect(build(baseInput({
+      effect: 'reinstatement', balanceTransactionId: 'bt-versioned-reinstatement',
+      providerTransactionId: 'txn-versioned-reinstatement',
+      providerCreatedAt: '2026-08-03T00:00:00.000Z',
+      allocationIdentityPrefix: 'dispute:dispute-1:bt-versioned-reinstatement',
+      amountMinor: 600, feeMinor: 0, netMinor: 600, presentmentAmountMinor: 600,
+      feeDetails: [], reversesSetId: 'set-withdrawal-1', withdrawalSetId: null,
+      withdrawalGrossPlan: supersededGross, priorPresentmentEffects: priorWithdrawalEffects()
+    })).plans[0].reversalOfSetId).toBe('set-withdrawal-1');
+
+    const credit = {
+      effect: 'fee_credit', balanceTransactionId: 'bt-versioned-credit',
+      providerTransactionId: 'txn-versioned-credit',
+      providerCreatedAt: '2026-08-03T00:00:00.000Z',
+      allocationIdentityPrefix: 'dispute:dispute-1:bt-versioned-credit',
+      amountMinor: 15, feeMinor: 0, netMinor: 15, presentmentAmountMinor: 15,
+      feeDetails: [], reversesSetId: null, reversesFeeSetId: 'set-current-fee',
+      withdrawalSetId: null, withdrawalGrossPlan: null,
+      withdrawalFeePlan: { ...persistedWithdrawal(), basis: 'fee',
+        expectedEffectMinor: -15, supersedesSetId: 'set-root-fee',
+        items: [{ orderItemId: 'item-a', component: 'dispute_fee', effectMinor: -15,
+          currency: 'USD', tieBreakKey: 'item-a:dispute_fee' }] }
+    };
+    expect(build(baseInput(credit)).plans[0].expectedEffectMinor).toBe(15);
+    for (const supersedesSetId of ['', 7]) {
+      expectSafeFailure(() => build(baseInput({
+        ...credit, withdrawalFeePlan: {
+          ...credit.withdrawalFeePlan, supersedesSetId: supersedesSetId as string
+        }
+      })), 'source_linkage_mismatch');
+    }
   });
 
   it('falls back to immutable payment subtotals for a tax-only multi-title dispute fee', () => {

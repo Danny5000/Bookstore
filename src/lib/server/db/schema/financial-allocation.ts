@@ -153,6 +153,10 @@ export const financialAllocationSets = pgTable(
       table.basis,
       table.currency
     ),
+    unique('financial_allocation_sets_source_identity_unique').on(
+      table.id,
+      table.sourceInternalId
+    ),
     uniqueIndex('financial_allocation_sets_identity_unique').on(table.allocationIdentity),
     uniqueIndex('financial_allocation_sets_root_unique')
       .on(table.balanceTransactionId, table.basis, table.sourceFingerprintSha256)
@@ -369,6 +373,7 @@ export const disputeItemAllocations = pgTable(
     disputeId: uuid('dispute_id')
       .notNull()
       .references(() => disputes.id, { onDelete: 'restrict' }),
+    grossAllocationSetId: uuid('gross_allocation_set_id').notNull(),
     orderItemId: uuid('order_item_id')
       .notNull()
       .references(() => orderItems.id, { onDelete: 'restrict' }),
@@ -385,6 +390,15 @@ export const disputeItemAllocations = pgTable(
   },
   (table) => [
     uniqueIndex('dispute_item_allocations_identity_unique').on(table.allocationIdentity),
+    uniqueIndex('dispute_item_allocations_gross_set_item_unique').on(
+      table.grossAllocationSetId,
+      table.orderItemId
+    ),
+    foreignKey({
+      name: 'dispute_item_allocations_gross_set_graph_fk',
+      columns: [table.grossAllocationSetId, table.disputeId],
+      foreignColumns: [financialAllocationSets.id, financialAllocationSets.sourceInternalId]
+    }).onDelete('restrict'),
     index('dispute_item_allocations_dispute_item_idx').on(
       table.disputeId,
       table.orderItemId,

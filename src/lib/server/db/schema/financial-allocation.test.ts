@@ -138,6 +138,9 @@ describe('financial allocation schema declarations', () => {
         'financial_allocation_sets_transaction_basis_idx'
       ])
     );
+    expect(uniqueNames(financialAllocationSets)).toContain(
+      'financial_allocation_sets_source_identity_unique'
+    );
     expect(indexNames(financialItemAllocations)).toContain(
       'financial_item_allocations_set_item_component_unique'
     );
@@ -199,6 +202,9 @@ describe('financial allocation schema declarations', () => {
     expect(checkNames(disputeItemAllocations)).toContain(
       'dispute_item_allocations_total_consistent'
     );
+    expect(getTableConfig(disputeItemAllocations).columns.map((column) => column.name)).toContain(
+      'gross_allocation_set_id'
+    );
     expect(checkNames(refundAllocationDrafts)).toEqual(
       expect.arrayContaining([
         'refund_allocation_drafts_version_positive',
@@ -235,6 +241,7 @@ describe('financial allocation schema declarations', () => {
   it('keeps every allocation-history foreign key restrictive', () => {
     expect(foreignKeySignatures()).toEqual([
       'dispute_item_allocations(dispute_id) -> disputes(id) [restrict]',
+      'dispute_item_allocations(gross_allocation_set_id,dispute_id) -> financial_allocation_sets(id,source_internal_id) [restrict]',
       'dispute_item_allocations(order_item_id) -> order_items(id) [restrict]',
       'dispute_item_allocations(reverses_allocation_id) -> dispute_item_allocations(id) [restrict]',
       'financial_allocation_sets(balance_transaction_id) -> stripe_balance_transactions(id) [restrict]',

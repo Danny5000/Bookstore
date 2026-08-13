@@ -4038,6 +4038,12 @@
           "primaryKey": false,
           "notNull": true
         },
+        "gross_allocation_set_id": {
+          "name": "gross_allocation_set_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
         "order_item_id": {
           "name": "order_item_id",
           "type": "uuid",
@@ -4105,6 +4111,27 @@
           "method": "btree",
           "with": {}
         },
+        "dispute_item_allocations_gross_set_item_unique": {
+          "name": "dispute_item_allocations_gross_set_item_unique",
+          "columns": [
+            {
+              "expression": "gross_allocation_set_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "order_item_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "dispute_item_allocations_dispute_item_idx": {
           "name": "dispute_item_allocations_dispute_item_idx",
           "columns": [
@@ -4143,6 +4170,21 @@
           ],
           "columnsTo": [
             "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "dispute_item_allocations_gross_set_graph_fk": {
+          "name": "dispute_item_allocations_gross_set_graph_fk",
+          "tableFrom": "dispute_item_allocations",
+          "tableTo": "financial_allocation_sets",
+          "columnsFrom": [
+            "gross_allocation_set_id",
+            "dispute_id"
+          ],
+          "columnsTo": [
+            "id",
+            "source_internal_id"
           ],
           "onDelete": "restrict",
           "onUpdate": "no action"
@@ -4563,6 +4605,14 @@
             "source_internal_id",
             "basis",
             "currency"
+          ]
+        },
+        "financial_allocation_sets_source_identity_unique": {
+          "name": "financial_allocation_sets_source_identity_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "id",
+            "source_internal_id"
           ]
         }
       },

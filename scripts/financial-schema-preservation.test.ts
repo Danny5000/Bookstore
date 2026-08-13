@@ -272,4 +272,18 @@ describe('Plan 6B financial schema preservation', () => {
     expect(migration).toContain("set_config('pale_orbit.financial_issue_resolution', p_issue_id::text, true)");
     expect(migration).toContain("current_setting('pale_orbit.financial_issue_resolution', true) IS DISTINCT FROM OLD.id::text");
   });
+
+  it('binds every dispute presentment row to its exact dispute gross allocation set', () => {
+    const migration = source('../drizzle/0007_plan6b_financial_reconciliation.sql');
+
+    expect(migration).toContain('financial_allocation_sets_source_identity_unique');
+    expect(migration).toContain('dispute_item_allocations_gross_set_graph_fk');
+    expect(migration).toContain('CREATE FUNCTION "public"."plan6b_validate_dispute_gross_allocation_set"');
+    expect(migration).toMatch(
+      /source_kind[\s\S]+?=\s*'dispute'[\s\S]+?basis[\s\S]+?=\s*'gross_amount'/iu
+    );
+    expect(migration).toMatch(
+      /create\s+trigger\s+"dispute_item_allocations_validate_gross_set"\s+before\s+insert\s+on\s+"dispute_item_allocations"/iu
+    );
+  });
 });

@@ -583,6 +583,47 @@ async function migrationCount(pool: Pool): Promise<number> {
 }
 
 async function assertValidBackfill(pool: Pool, fixture: LegacyFixture): Promise<void> {
+  const disputeAllocationColumn = await one<{
+    is_nullable: string;
+  }>(
+    pool,
+    `select is_nullable
+     from information_schema.columns
+     where table_schema = 'public' and table_name = 'dispute_item_allocations'
+       and column_name = 'gross_allocation_set_id'`
+  );
+  equal(
+    disputeAllocationColumn.is_nullable,
+    'NO',
+    '0006-to-0007 upgrade creates a non-null dispute gross-set identity'
+  );
+  const disputeAllocationConstraints = await pool.query<{ definition: string }>(
+    `select pg_get_constraintdef(oid) as definition
+     from pg_constraint
+     where conrelid = 'public.dispute_item_allocations'::regclass`
+  );
+  assert(
+    disputeAllocationConstraints.rows.some((row) =>
+      /foreign key \(gross_allocation_set_id, dispute_id\) references financial_allocation_sets\(id, source_internal_id\)/iu
+        .test(row.definition)
+    ),
+    '0006-to-0007 upgrade installs the dispute/source-identity graph foreign key'
+  );
+  const disputeAllocationTrigger = await one<{ function_name: string }>(
+    pool,
+    `select procedure.proname as function_name
+     from pg_trigger trigger
+     join pg_proc procedure on procedure.oid = trigger.tgfoid
+     where trigger.tgrelid = 'public.dispute_item_allocations'::regclass
+       and trigger.tgname = 'dispute_item_allocations_validate_gross_set'
+       and not trigger.tgisinternal`
+  );
+  equal(
+    disputeAllocationTrigger.function_name,
+    'plan6b_validate_dispute_gross_allocation_set',
+    '0006-to-0007 upgrade installs the dispute gross-set validation trigger'
+  );
+
   const paymentRows = await pool.query<{
     id: string;
     financial_evidence_status: string;
@@ -773,6 +814,25 @@ async function expectMutationRejected(
   throw new Error(`[financial-migration-test] ${label} unexpectedly succeeded`);
 }
 
+async function expectConstraintRejected(
+  pool: Pool,
+  statement: string,
+  values: unknown[],
+  label: string
+): Promise<void> {
+  try {
+    await pool.query(statement, values);
+  } catch (error) {
+    const code = (error as { code?: string }).code;
+    assert(
+      code === '23503' || code === '23514',
+      `${label} must fail with a foreign-key or check violation, got ${code ?? '<missing>'}`
+    );
+    return;
+  }
+  throw new Error(`[financial-migration-test] ${label} unexpectedly succeeded`);
+}
+
 async function seedGuardRows(pool: Pool, fixture: LegacyFixture): Promise<Record<string, string>> {
   const ids: Record<string, string> = {};
   const transaction = await one<{ id: string }>(
@@ -832,6 +892,87 @@ async function seedGuardRows(pool: Pool, fixture: LegacyFixture): Promise<Record
       [ids.allocationSet, fixture.orderItemIds[0], `tie_${randomUUID()}`]
     )
   ).id;
+  ids.disputeTransaction = (
+    await one<{ id: string }>(
+      pool,
+      `insert into stripe_balance_transactions
+         (provider_id, live_mode, source_family, source_id, raw_type, reporting_category,
+          balance_type, amount_minor, fee_minor, net_minor, currency, status,
+          provider_created_at, available_at, fingerprint_sha256)
+       values ($1, false, 'dispute', $2, 'adjustment', 'dispute', 'payments', -100, 10,
+               -110, 'USD', 'available', clock_timestamp(), clock_timestamp(), repeat('f', 64))
+       returning id`,
+      [`txn_${randomUUID()}`, `dp_${randomUUID()}`]
+    )
+  ).id;
+  ids.disputeGrossAllocationSet = (
+    await one<{ id: string }>(
+      pool,
+      `insert into financial_allocation_sets
+         (allocation_identity, balance_transaction_id, source_kind, source_internal_id,
+          basis, scope, expected_effect_minor, currency, algorithm_version,
+          classifier_version, source_fingerprint_sha256)
+       values ($1, $2, 'dispute', $3, 'gross_amount', 'title', -100, 'USD', 1, 1,
+               repeat('f', 64))
+       returning id`,
+      [`allocation_${randomUUID()}`, ids.disputeTransaction, fixture.disputeIds.reconciled]
+    )
+  ).id;
+  ids.disputeFeeAllocationSet = (
+    await one<{ id: string }>(
+      pool,
+      `insert into financial_allocation_sets
+         (allocation_identity, balance_transaction_id, source_kind, source_internal_id,
+          basis, scope, expected_effect_minor, currency, algorithm_version,
+          classifier_version, source_fingerprint_sha256)
+       values ($1, $2, 'dispute', $3, 'fee', 'title', -10, 'USD', 1, 1,
+               repeat('f', 64))
+       returning id`,
+      [`allocation_${randomUUID()}`, ids.disputeTransaction, fixture.disputeIds.reconciled]
+    )
+  ).id;
+  ids.wrongKindTransaction = (
+    await one<{ id: string }>(
+      pool,
+      `insert into stripe_balance_transactions
+         (provider_id, live_mode, source_family, source_id, raw_type, reporting_category,
+          balance_type, amount_minor, fee_minor, net_minor, currency, status,
+          provider_created_at, available_at, fingerprint_sha256)
+       values ($1, false, 'dispute', $2, 'adjustment', 'dispute', 'payments', -100, 0,
+               -100, 'USD', 'available', clock_timestamp(), clock_timestamp(), repeat('0', 64))
+       returning id`,
+      [`txn_${randomUUID()}`, `dp_${randomUUID()}`]
+    )
+  ).id;
+  ids.wrongKindGrossAllocationSet = (
+    await one<{ id: string }>(
+      pool,
+      `insert into financial_allocation_sets
+         (allocation_identity, balance_transaction_id, source_kind, source_internal_id,
+          basis, scope, expected_effect_minor, currency, algorithm_version,
+          classifier_version, source_fingerprint_sha256)
+       values ($1, $2, 'payment', $3, 'gross_amount', 'title', -100, 'USD', 1, 1,
+               repeat('0', 64))
+       returning id`,
+      [`allocation_${randomUUID()}`, ids.wrongKindTransaction, fixture.disputeIds.reconciled]
+    )
+  ).id;
+  ids.disputeItemAllocation = (
+    await one<{ id: string }>(
+      pool,
+      `insert into dispute_item_allocations
+         (allocation_identity, dispute_id, gross_allocation_set_id, order_item_id,
+          effect, subtotal_effect_minor, tax_effect_minor, total_effect_minor, currency)
+       values ($1, $2, $3, $4, 'withdrawal', -100, 0, -100, 'USD')
+       returning id`,
+      [
+        `dispute_allocation_${randomUUID()}`,
+        fixture.disputeIds.reconciled,
+        ids.disputeGrossAllocationSet,
+        fixture.orderItemIds[0]
+      ]
+    )
+  ).id;
   ids.issue = (
     await one<{ id: string }>(
       pool,
@@ -869,6 +1010,36 @@ async function seedGuardRows(pool: Pool, fixture: LegacyFixture): Promise<Record
 
 async function assertHistoryGuards(pool: Pool, fixture: LegacyFixture): Promise<void> {
   const ids = await seedGuardRows(pool, fixture);
+  const invalidDisputeSetLinks = [
+    {
+      label: 'a dispute presentment row cannot reference another source identity',
+      allocationSetId: ids.allocationSet
+    },
+    {
+      label: 'a dispute presentment row cannot reference a fee allocation set',
+      allocationSetId: ids.disputeFeeAllocationSet
+    },
+    {
+      label: 'a dispute presentment row cannot reference a non-dispute allocation set',
+      allocationSetId: ids.wrongKindGrossAllocationSet
+    }
+  ];
+  for (const invalid of invalidDisputeSetLinks) {
+    await expectConstraintRejected(
+      pool,
+      `insert into dispute_item_allocations
+         (allocation_identity, dispute_id, gross_allocation_set_id, order_item_id,
+          effect, subtotal_effect_minor, tax_effect_minor, total_effect_minor, currency)
+       values ($1, $2, $3, $4, 'withdrawal', -1, 0, -1, 'USD')`,
+      [
+        `invalid_dispute_allocation_${randomUUID()}`,
+        fixture.disputeIds.reconciled,
+        invalid.allocationSetId,
+        fixture.orderItemIds[0]
+      ],
+      invalid.label
+    );
+  }
   const forbiddenMutations = [
     {
       label: 'fee details are append-only',
@@ -889,6 +1060,11 @@ async function assertHistoryGuards(pool: Pool, fixture: LegacyFixture): Promise<
       label: 'allocation items are append-only',
       statement: `delete from financial_item_allocations where id = $1`,
       id: ids.allocationItem
+    },
+    {
+      label: 'versioned dispute presentment rows preserve their gross-set identity',
+      statement: `update dispute_item_allocations set subtotal_effect_minor = -99 where id = $1`,
+      id: ids.disputeItemAllocation
     },
     {
       label: 'backfilled refund components are append-only',

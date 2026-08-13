@@ -34,6 +34,7 @@ CREATE TABLE "dispute_item_allocations" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
 	"allocation_identity" varchar(255) NOT NULL,
 	"dispute_id" uuid NOT NULL,
+	"gross_allocation_set_id" uuid NOT NULL,
 	"order_item_id" uuid NOT NULL,
 	"effect" "dispute_allocation_effect" NOT NULL,
 	"reverses_allocation_id" uuid,
@@ -66,6 +67,7 @@ CREATE TABLE "financial_allocation_sets" (
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	CONSTRAINT "financial_allocation_sets_supersession_identity_unique" UNIQUE("id","balance_transaction_id","source_kind","source_internal_id","basis","currency","expected_effect_minor","source_fingerprint_sha256"),
 	CONSTRAINT "financial_allocation_sets_reversal_identity_unique" UNIQUE("id","source_kind","source_internal_id","basis","currency"),
+	CONSTRAINT "financial_allocation_sets_source_identity_unique" UNIQUE("id","source_internal_id"),
 	CONSTRAINT "financial_allocation_sets_effect_bounded" CHECK ("financial_allocation_sets"."expected_effect_minor" between -99999999 and 99999999),
 	CONSTRAINT "financial_allocation_sets_currency_iso" CHECK ("financial_allocation_sets"."currency" ~ '^[A-Z]{3}$'),
 	CONSTRAINT "financial_allocation_sets_versions_positive" CHECK ("financial_allocation_sets"."algorithm_version" > 0 and "financial_allocation_sets"."classifier_version" > 0),
@@ -535,6 +537,7 @@ SET
 ALTER TABLE "entitlement_grants" ADD CONSTRAINT "entitlement_grants_purchase_provenance_unique" UNIQUE("id","order_item_id");--> statement-breakpoint
 ALTER TABLE "refund_allocations" ADD CONSTRAINT "refund_allocations_provenance_unique" UNIQUE("id","refund_id","order_item_id");--> statement-breakpoint
 ALTER TABLE "dispute_item_allocations" ADD CONSTRAINT "dispute_item_allocations_dispute_id_disputes_id_fk" FOREIGN KEY ("dispute_id") REFERENCES "public"."disputes"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "dispute_item_allocations" ADD CONSTRAINT "dispute_item_allocations_gross_set_graph_fk" FOREIGN KEY ("gross_allocation_set_id","dispute_id") REFERENCES "public"."financial_allocation_sets"("id","source_internal_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "dispute_item_allocations" ADD CONSTRAINT "dispute_item_allocations_order_item_id_order_items_id_fk" FOREIGN KEY ("order_item_id") REFERENCES "public"."order_items"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "dispute_item_allocations" ADD CONSTRAINT "dispute_item_allocations_reverses_allocation_id_dispute_item_allocations_id_fk" FOREIGN KEY ("reverses_allocation_id") REFERENCES "public"."dispute_item_allocations"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "financial_allocation_sets" ADD CONSTRAINT "financial_allocation_sets_balance_transaction_id_stripe_balance_transactions_id_fk" FOREIGN KEY ("balance_transaction_id") REFERENCES "public"."stripe_balance_transactions"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
@@ -573,6 +576,7 @@ ALTER TABLE "stripe_payout_balance_transactions" ADD CONSTRAINT "stripe_payout_b
 ALTER TABLE "stripe_payouts" ADD CONSTRAINT "stripe_payouts_balance_transaction_id_stripe_balance_transactions_id_fk" FOREIGN KEY ("balance_transaction_id") REFERENCES "public"."stripe_balance_transactions"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "stripe_payouts" ADD CONSTRAINT "stripe_payouts_failure_balance_transaction_id_stripe_balance_transactions_id_fk" FOREIGN KEY ("failure_balance_transaction_id") REFERENCES "public"."stripe_balance_transactions"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 CREATE UNIQUE INDEX "dispute_item_allocations_identity_unique" ON "dispute_item_allocations" USING btree ("allocation_identity");--> statement-breakpoint
+CREATE UNIQUE INDEX "dispute_item_allocations_gross_set_item_unique" ON "dispute_item_allocations" USING btree ("gross_allocation_set_id","order_item_id");--> statement-breakpoint
 CREATE INDEX "dispute_item_allocations_dispute_item_idx" ON "dispute_item_allocations" USING btree ("dispute_id","order_item_id","created_at");--> statement-breakpoint
 CREATE UNIQUE INDEX "financial_allocation_sets_identity_unique" ON "financial_allocation_sets" USING btree ("allocation_identity");--> statement-breakpoint
 CREATE UNIQUE INDEX "financial_allocation_sets_root_unique" ON "financial_allocation_sets" USING btree ("balance_transaction_id","basis","source_fingerprint_sha256") WHERE "financial_allocation_sets"."supersedes_set_id" is null;--> statement-breakpoint
@@ -1306,6 +1310,25 @@ CREATE VIEW "public"."current_financial_projection_items" AS (
     and head.scope = 'title'
 
 );--> statement-breakpoint
+CREATE FUNCTION "public"."plan6b_validate_dispute_gross_allocation_set"() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM "public"."financial_allocation_sets" allocation_set
+    WHERE allocation_set.id = NEW.gross_allocation_set_id
+      AND allocation_set.source_kind = 'dispute'
+      AND allocation_set.source_internal_id = NEW.dispute_id
+      AND allocation_set.basis = 'gross_amount'
+  ) THEN
+    RAISE EXCEPTION USING
+      ERRCODE = '23514',
+      MESSAGE = 'invalid dispute gross allocation set linkage';
+  END IF;
+  RETURN NEW;
+END;
+$$;--> statement-breakpoint
+CREATE TRIGGER "dispute_item_allocations_validate_gross_set" BEFORE INSERT ON "dispute_item_allocations" FOR EACH ROW EXECUTE FUNCTION "public"."plan6b_validate_dispute_gross_allocation_set"();--> statement-breakpoint
 CREATE FUNCTION "public"."plan6b_reject_history_mutation"() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
