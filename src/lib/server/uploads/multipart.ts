@@ -140,7 +140,7 @@ export async function parseSingleFileMultipart<TFields>(
   const ready = deferred<ParsedSingleFileMultipart<TFields>>();
   const completed = deferred<void>();
   void completed.promise.catch(() => undefined);
-  const rawFields: Record<string, string> = {};
+  const rawFields = Object.create(null) as Record<string, string>;
   let parsedFields: TFields | undefined;
   let activeFile: BusboyFileStream | undefined;
   let fileCount = 0;
@@ -160,7 +160,9 @@ export async function parseSingleFileMultipart<TFields>(
   };
 
   parser.on('field', (name, value, nameTruncated, valueTruncated) => {
-    if (nameTruncated || valueTruncated || Object.hasOwn(rawFields, name)) {
+    if (nameTruncated || valueTruncated ||
+      ['__proto__', 'constructor', 'prototype'].includes(name) ||
+      Object.hasOwn(rawFields, name)) {
       recordFailure(new UploadError('invalid_fields', 'Upload fields are invalid'));
       return;
     }

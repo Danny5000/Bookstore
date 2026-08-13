@@ -261,6 +261,20 @@ describe('parsePublicationUpload', () => {
     }
   });
 
+  it.each(['__proto__', 'constructor'])(
+    'rejects the prototype-special form field %s as an unknown field',
+    async (fieldName) => {
+      const form = new FormData();
+      form.append('changeSummary', 'Safe summary');
+      form.append(fieldName, 'hostile');
+      form.append('original', new Blob(['x']), 'book.epub');
+
+      const parsed = await parsePublicationUpload(formRequest(form), 10);
+      await collect(parsed.file);
+      await expect(parsed.completion).rejects.toMatchObject({ code: 'invalid_fields' });
+    }
+  );
+
   it('rejects a truncated multipart body and client abort', async () => {
     const boundary = 'pale-orbit-boundary';
     const truncated = new Request('http://localhost/upload', {
