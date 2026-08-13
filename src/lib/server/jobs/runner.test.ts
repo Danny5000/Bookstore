@@ -44,6 +44,107 @@ function controlledSleep() {
 }
 
 describe('runWorker', () => {
+  it('runs the poll hook before each claim cycle and stops before claiming after abort', async () => {
+    const controller = new AbortController();
+    const trace: string[] = [];
+    let hookCount = 0;
+    const repository = repositoryReturning(job);
+    vi.mocked(repository.claimNext).mockReset().mockImplementation(async () => {
+      trace.push('claim');
+      return null;
+    });
+
+    await runWorker({
+      repository,
+      handlers: new Map(),
+      workerId: 'worker-hook-order',
+      concurrency: 1,
+      pollIntervalMs: 1,
+      heartbeatIntervalMs: 1,
+      signal: controller.signal,
+      beforePoll: async ({ now, signal }) => {
+        trace.push('hook');
+        expect(now).toBeInstanceOf(Date);
+        expect(signal).toBe(controller.signal);
+        hookCount += 1;
+        if (hookCount === 2) controller.abort();
+      },
+      sleep: async () => { if (hookCount === 0) controller.abort(); }
+    });
+
+    expect(trace).toEqual(['hook', 'claim', 'hook']);
+  });
+
+  it('logs a bounded poll-hook failure and continues to a later poll', async () => {
+    const controller = new AbortController();
+    const privateFailure = new Error('private scheduler payload');
+    Object.defineProperty(privateFailure, 'cause', { value: { secret: true } });
+    let hookCount = 0;
+    const repository = repositoryReturning(job);
+    vi.mocked(repository.claimNext).mockReset().mockResolvedValue(null);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    await runWorker({
+      repository,
+      handlers: new Map(),
+      workerId: 'worker-hook-failure',
+      concurrency: 1,
+      pollIntervalMs: 1,
+      heartbeatIntervalMs: 1,
+      signal: controller.signal,
+      beforePoll: async () => {
+        hookCount += 1;
+        if (hookCount === 1) throw privateFailure;
+        controller.abort();
+      },
+      sleep: async () => { if (hookCount === 0) controller.abort(); }
+    });
+
+    expect(hookCount).toBe(2);
+    expect(repository.claimNext).toHaveBeenCalledOnce();
+    expect(log).toHaveBeenCalledWith('[jobs] worker poll hook failed');
+    expect(JSON.stringify(log.mock.calls)).not.toContain('private');
+    log.mockRestore();
+  });
+
+  it('serializes one poll hook across concurrent worker slots', async () => {
+    const controller = new AbortController();
+    const repository = repositoryReturning(job);
+    vi.mocked(repository.claimNext).mockReset().mockResolvedValue(null);
+    let releaseFirst!: () => void;
+    const firstHeld = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let calls = 0;
+    let active = 0;
+    let maximumActive = 0;
+    const beforePoll = vi.fn(async () => {
+      calls += 1;
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      if (calls === 1) await firstHeld;
+      else controller.abort();
+      active -= 1;
+    });
+
+    const running = runWorker({
+      repository,
+      handlers: new Map(),
+      workerId: 'worker-hook-concurrent',
+      concurrency: 2,
+      pollIntervalMs: 1,
+      heartbeatIntervalMs: 1,
+      signal: controller.signal,
+      beforePoll,
+      sleep: async () => controller.abort()
+    });
+    await vi.waitFor(() => expect(beforePoll).toHaveBeenCalledOnce());
+    expect(maximumActive).toBe(1);
+    releaseFirst();
+    await running;
+
+    expect(beforePoll).toHaveBeenCalledTimes(2);
+    expect(maximumActive).toBe(1);
+  });
+
   it('completes a successfully handled job', async () => {
     const controller = new AbortController();
     const repository = repositoryReturning(job);

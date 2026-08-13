@@ -17,7 +17,12 @@ export class JobLeaseLostError extends Error {
 
 type WorkerSleep = (milliseconds: number, signal: AbortSignal) => Promise<void>;
 
-interface RunWorkerOptions {
+export type WorkerPollHook = (input: {
+  now: Date;
+  signal: AbortSignal;
+}) => Promise<void>;
+
+export interface RunWorkerOptions {
   repository: JobRepository;
   handlers: ReadonlyMap<string, JobHandler>;
   workerId: string;
@@ -25,9 +30,13 @@ interface RunWorkerOptions {
   pollIntervalMs: number;
   heartbeatIntervalMs: number;
   signal: AbortSignal;
+  beforePoll?: WorkerPollHook;
   sleep?: WorkerSleep;
   heartbeatSleep?: WorkerSleep;
 }
+
+type WorkerJobOptions = Omit<RunWorkerOptions, 'concurrency' | 'beforePoll'>;
+type WorkerLoopOptions = WorkerJobOptions & { runBeforePoll?: () => Promise<void> };
 
 async function abortableSleep(milliseconds: number, signal: AbortSignal): Promise<void> {
   try {
@@ -68,7 +77,7 @@ async function heartbeatLease(options: HeartbeatOptions): Promise<void> {
 }
 
 async function runClaimedJob(
-  options: Omit<RunWorkerOptions, 'concurrency'>,
+  options: WorkerJobOptions,
   job: JobRecord
 ): Promise<void> {
   const handler = options.handlers.get(job.type);
@@ -151,10 +160,12 @@ async function runClaimedJob(
   }
 }
 
-async function runWorkerLoop(options: Omit<RunWorkerOptions, 'concurrency'>): Promise<void> {
+async function runWorkerLoop(options: WorkerLoopOptions): Promise<void> {
   const sleep = options.sleep ?? abortableSleep;
 
   while (!options.signal.aborted) {
+    await options.runBeforePoll?.();
+    if (options.signal.aborted) return;
     const job = await options.repository.claimNext(options.workerId);
     if (!job) {
       await sleep(options.pollIntervalMs, options.signal);
@@ -172,6 +183,24 @@ export async function runWorker(options: RunWorkerOptions): Promise<void> {
   if (!Number.isSafeInteger(options.heartbeatIntervalMs) || options.heartbeatIntervalMs < 1) {
     throw new RangeError('Worker heartbeat interval must be a positive integer');
   }
+  let hookTail = Promise.resolve();
+  const runBeforePoll = options.beforePoll
+    ? async () => {
+        const previous = hookTail;
+        let release!: () => void;
+        hookTail = new Promise<void>((resolve) => { release = resolve; });
+        await previous;
+        try {
+          if (!options.signal.aborted) {
+            await options.beforePoll!({ now: new Date(), signal: options.signal });
+          }
+        } catch {
+          if (!options.signal.aborted) console.error('[jobs] worker poll hook failed');
+        } finally {
+          release();
+        }
+      }
+    : undefined;
   await Promise.all(
     Array.from({ length: options.concurrency }, (_, slot) =>
       runWorkerLoop({
@@ -181,6 +210,7 @@ export async function runWorker(options: RunWorkerOptions): Promise<void> {
         pollIntervalMs: options.pollIntervalMs,
         heartbeatIntervalMs: options.heartbeatIntervalMs,
         signal: options.signal,
+        ...(runBeforePoll ? { runBeforePoll } : {}),
         ...(options.sleep ? { sleep: options.sleep } : {}),
         ...(options.heartbeatSleep ? { heartbeatSleep: options.heartbeatSleep } : {})
       })
