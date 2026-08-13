@@ -1,6 +1,7 @@
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import type { Database } from '$lib/server/db/client';
 import { stripeEvents, type StripeEventRow } from '$lib/server/db/schema';
+import type { DatabaseTransaction } from '$lib/server/db/transaction';
 import { PermanentJobError } from '$lib/server/jobs/runner';
 import type { JobHandler } from '$lib/server/jobs/types';
 import { PermanentCommerceError, RetryableProviderError } from './errors';
@@ -14,6 +15,7 @@ import type {
   VerifiedStripeEvent
 } from './stripe/types';
 import { describeSupportedStripeEvent } from './webhooks';
+import { queueFinancialPayoutFromEvent } from './financial/event-handoff';
 
 export interface CheckoutFulfillmentInput {
   stripeEventId: string;
@@ -33,6 +35,20 @@ export interface DisputeFulfillmentInput {
   payment: PaymentSnapshot;
 }
 
+export interface PayoutFulfillmentInput {
+  stripeEventId: string;
+  providerPayoutId: string;
+  providerEventId: string;
+}
+
+export interface PayoutFulfillmentDependencies {
+  queueFinancialPayout(
+    transaction: DatabaseTransaction,
+    input: { providerPayoutId: string; providerEventId: string }
+  ): Promise<void>;
+  now(): Date;
+}
+
 export interface FulfillmentExceptionInput {
   stripeEventId: string;
   orderId: string | null;
@@ -43,7 +59,84 @@ export interface StripeEventHandlerDependencies {
   fulfillCheckout(database: Database, input: CheckoutFulfillmentInput): Promise<void>;
   fulfillRefund(database: Database, input: RefundFulfillmentInput): Promise<void>;
   fulfillDispute(database: Database, input: DisputeFulfillmentInput): Promise<void>;
+  fulfillPayout(database: Database, input: PayoutFulfillmentInput): Promise<void>;
   recordException(database: Database, input: FulfillmentExceptionInput): Promise<void>;
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
+function exactPayoutInput(value: unknown): value is PayoutFulfillmentInput {
+  if (value === null || typeof value !== 'object' || Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype) return false;
+  const keys = ['providerEventId', 'providerPayoutId', 'stripeEventId'];
+  const own = Reflect.ownKeys(value);
+  if (own.length !== keys.length || !keys.every((key) => Object.hasOwn(value, key)) ||
+    !own.every((key) => typeof key === 'string' && keys.includes(key))) return false;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  return keys.every((key) => descriptors[key] !== undefined &&
+    Object.hasOwn(descriptors[key]!, 'value'));
+}
+
+function invalidPayout(): never {
+  throw new PermanentCommerceError();
+}
+
+export async function fulfillPayoutEvent(
+  database: Database,
+  input: PayoutFulfillmentInput,
+  dependencyOverrides: Partial<PayoutFulfillmentDependencies> = {}
+): Promise<void> {
+  let canonical: PayoutFulfillmentInput;
+  try {
+    if (!exactPayoutInput(input) || typeof input.stripeEventId !== 'string' ||
+      !UUID_PATTERN.test(input.stripeEventId.toLowerCase()) ||
+      typeof input.providerPayoutId !== 'string' ||
+      !/^po_[A-Za-z0-9_-]{1,252}$/u.test(input.providerPayoutId) ||
+      typeof input.providerEventId !== 'string' ||
+      input.providerEventId.length < 4 || input.providerEventId.length > 255 ||
+      !/^evt_[A-Za-z0-9_-]+$/u.test(input.providerEventId)) invalidPayout();
+    canonical = {
+      stripeEventId: input.stripeEventId.toLowerCase(),
+      providerPayoutId: input.providerPayoutId,
+      providerEventId: input.providerEventId
+    };
+  } catch {
+    return invalidPayout();
+  }
+  const dependencies: PayoutFulfillmentDependencies = {
+    queueFinancialPayout: dependencyOverrides.queueFinancialPayout ??
+      queueFinancialPayoutFromEvent,
+    now: dependencyOverrides.now ?? (() => new Date())
+  };
+  await database.transaction(async (transaction) => {
+    const [event] = await transaction
+      .select()
+      .from(stripeEvents)
+      .where(eq(stripeEvents.id, canonical.stripeEventId))
+      .limit(1)
+      .for('update');
+    if (!event) invalidPayout();
+    if (event.status !== 'pending') return;
+    const descriptor = describeSupportedStripeEvent(verifiedEvent(event));
+    if (!descriptor || descriptor.objectFamily !== 'payout' ||
+      event.objectId !== canonical.providerPayoutId ||
+      event.providerEventId !== canonical.providerEventId) invalidPayout();
+    const now = dependencies.now();
+    if (!(now instanceof Date) || !Number.isFinite(now.getTime())) invalidPayout();
+    await dependencies.queueFinancialPayout(transaction, {
+      providerPayoutId: canonical.providerPayoutId,
+      providerEventId: canonical.providerEventId
+    });
+    const [completed] = await transaction
+      .update(stripeEvents)
+      .set({ status: 'processed', processedAt: now, updatedAt: now })
+      .where(and(
+        eq(stripeEvents.id, event.id),
+        eq(stripeEvents.status, 'pending')
+      ))
+      .returning({ id: stripeEvents.id });
+    if (!completed) invalidPayout();
+  });
 }
 
 async function loadStripeEvent(
@@ -128,6 +221,14 @@ export function createStripeEventHandler(
         const payment = await gateway.retrievePayment(refund.paymentIntentId);
         throwIfAborted(signal);
         await dependencies.fulfillRefund(database, { stripeEventId, refund, payment });
+        return;
+      }
+      if (descriptor.objectFamily === 'payout') {
+        await dependencies.fulfillPayout(database, {
+          stripeEventId,
+          providerPayoutId: row.objectId,
+          providerEventId: row.providerEventId
+        });
         return;
       }
       const dispute = await gateway.retrieveDispute(row.objectId);

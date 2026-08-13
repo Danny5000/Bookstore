@@ -6,6 +6,7 @@ const job: JobRecord = {
   id: 'f1f46ee7-3170-40ea-bfad-d55a734bf37d',
   type: 'test.handle',
   payload: { value: 1 },
+  deduplicationKey: null,
   attempts: 1,
   maxAttempts: 5,
   lockedBy: 'worker-test'

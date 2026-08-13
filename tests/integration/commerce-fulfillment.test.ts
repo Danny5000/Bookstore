@@ -6,6 +6,7 @@ import {
   entitlementGrants,
   entitlements,
   guestIdentities,
+  jobs,
   orderItems,
   orders,
   payments,
@@ -28,6 +29,7 @@ interface Fixture {
   titleId: string;
   userId: string | null;
   stripeEventId: string;
+  providerEventId: string;
   session: CheckoutSnapshot;
   payment: PaymentSnapshot;
 }
@@ -118,8 +120,9 @@ async function createFixture(options: {
       paidAt
     });
   }
+  const providerEventId = `evt_test_${suffix}`;
   const [event] = await databaseClient.db.insert(stripeEvents).values({
-    providerEventId: `evt_test_${suffix}`,
+    providerEventId,
     eventType,
     objectId: sessionId,
     liveMode: false,
@@ -136,6 +139,7 @@ async function createFixture(options: {
     titleId,
     userId,
     stripeEventId: event.id,
+    providerEventId,
     session: {
       providerSessionId: sessionId,
       clientReferenceId: orderId,
@@ -199,6 +203,157 @@ async function fulfill(fixture: Fixture, deps = dependencies()): Promise<void> {
 }
 
 describe('canonical Stripe checkout fulfillment', () => {
+  it.each([
+    {
+      label: 'pending',
+      eventType: 'checkout.session.completed',
+      session: { paymentStatus: 'unpaid' as const, latestChargeId: null },
+      payment: {
+        state: 'pending' as const,
+        latestChargeId: null,
+        paidAt: null,
+        paymentMethodCategory: null
+      },
+      expectedPaymentStatus: 'pending'
+    },
+    {
+      label: 'paid',
+      eventType: 'checkout.session.async_payment_succeeded',
+      session: {},
+      payment: {},
+      expectedPaymentStatus: 'succeeded'
+    },
+    {
+      label: 'failed',
+      eventType: 'checkout.session.async_payment_failed',
+      session: { paymentStatus: 'unpaid' as const, latestChargeId: null },
+      payment: { state: 'failed' as const, latestChargeId: null, paidAt: null },
+      expectedPaymentStatus: 'failed'
+    }
+  ])('queues one event-keyed financial source job for $label payment evidence', async ({
+    eventType,
+    session,
+    payment,
+    expectedPaymentStatus
+  }) => {
+    const fixture = await createFixture({ eventType });
+    await fulfillCheckoutEvent(databaseClient.db, {
+      stripeEventId: fixture.stripeEventId,
+      session: { ...fixture.session, ...session },
+      payment: { ...fixture.payment, ...payment }
+    }, dependencies());
+
+    const [storedPayment] = await databaseClient.db.select().from(payments)
+      .where(eq(payments.orderId, fixture.orderId));
+    expect(storedPayment?.status).toBe(expectedPaymentStatus);
+    expect(await databaseClient.db.select().from(jobs)
+      .where(eq(jobs.type, 'commerce.financial-source'))).toEqual([
+      expect.objectContaining({
+        type: 'commerce.financial-source',
+        deduplicationKey: `stripe:financial-source:event:${fixture.providerEventId}`,
+        status: 'pending',
+        payload: {
+          sourceKind: 'payment',
+          sourceId: storedPayment?.id,
+          trigger: { kind: 'event', providerEventId: fixture.providerEventId }
+        }
+      })
+    ]);
+  });
+
+  it('queues the existing payment for an already-paid canonical replay', async () => {
+    const fixture = await createFixture({ orderStatus: 'paid' });
+    const [existingPayment] = await databaseClient.db.select().from(payments)
+      .where(eq(payments.orderId, fixture.orderId));
+
+    await fulfill(fixture);
+
+    expect(await databaseClient.db.select().from(jobs)
+      .where(eq(jobs.type, 'commerce.financial-source'))).toEqual([
+      expect.objectContaining({
+        deduplicationKey: `stripe:financial-source:event:${fixture.providerEventId}`,
+        payload: {
+          sourceKind: 'payment',
+          sourceId: existingPayment?.id,
+          trigger: { kind: 'event', providerEventId: fixture.providerEventId }
+        }
+      })
+    ]);
+  });
+
+  it('does not queue a financial source when the signed event has no payment fact', async () => {
+    const fixture = await createFixture({
+      orderStatus: 'failed',
+      eventType: 'checkout.session.expired'
+    });
+
+    await fulfillCheckoutEvent(databaseClient.db, {
+      stripeEventId: fixture.stripeEventId,
+      session: {
+        ...fixture.session,
+        status: 'expired',
+        paymentStatus: 'unpaid',
+        paymentIntentId: null,
+        latestChargeId: null
+      },
+      payment: null
+    }, dependencies());
+
+    expect(await databaseClient.db.select().from(jobs)
+      .where(eq(jobs.type, 'commerce.financial-source'))).toHaveLength(0);
+  });
+
+  it('rolls back payment, event, and queued work when the financial handoff fails', async () => {
+    const fixture = await createFixture();
+    const queueFinancialSourceFromEvent = async (
+      transaction: Parameters<NonNullable<CheckoutFulfillmentDependencies[
+        'queueFinancialSourceFromEvent'
+      ]>>[0]
+    ): Promise<void> => {
+      await transaction.insert(jobs).values({
+        type: 'test.checkout-financial-handoff',
+        payload: {},
+        deduplicationKey: `test:checkout-financial-handoff:${fixture.stripeEventId}`
+      });
+      throw new Error('forced financial handoff failure');
+    };
+
+    await expect(fulfill(fixture, dependencies({
+      queueFinancialSourceFromEvent
+    }))).rejects.toThrow('forced financial handoff failure');
+
+    expect((await databaseClient.db.select().from(orders)
+      .where(eq(orders.id, fixture.orderId)))[0]?.status).toBe('checkout_open');
+    expect(await databaseClient.db.select().from(payments)
+      .where(eq(payments.orderId, fixture.orderId))).toHaveLength(0);
+    expect((await databaseClient.db.select().from(stripeEvents)
+      .where(eq(stripeEvents.id, fixture.stripeEventId)))[0]?.status).toBe('pending');
+    expect(await databaseClient.db.select().from(jobs)).toHaveLength(0);
+  });
+
+  it('keeps a terminal event-keyed financial job unchanged on reducer replay', async () => {
+    const fixture = await createFixture();
+    await fulfill(fixture);
+    const [queued] = await databaseClient.db.select().from(jobs)
+      .where(eq(jobs.deduplicationKey,
+        `stripe:financial-source:event:${fixture.providerEventId}`));
+    if (!queued) throw new Error('Expected financial source job');
+    const completedAt = new Date('2026-08-10T12:10:00.000Z');
+    await databaseClient.db.update(jobs).set({
+      status: 'succeeded',
+      completedAt,
+      updatedAt: completedAt
+    }).where(eq(jobs.id, queued.id));
+
+    await fulfill(fixture);
+
+    expect(await databaseClient.db.select().from(jobs)
+      .where(eq(jobs.deduplicationKey,
+        `stripe:financial-source:event:${fixture.providerEventId}`))).toEqual([
+      expect.objectContaining({ id: queued.id, status: 'succeeded', completedAt })
+    ]);
+  });
+
   it('records completed-unpaid payment evidence without granting access or email', async () => {
     const fixture = await createFixture({ eventType: 'checkout.session.completed' });
     const deps = dependencies();

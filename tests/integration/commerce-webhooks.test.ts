@@ -2,6 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { and, eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import { STRIPE_EVENT_JOB } from '$lib/server/commerce/job';
+import { fulfillPayoutEvent } from '$lib/server/commerce/handler';
+import { queueFinancialPayoutFromEvent } from '$lib/server/commerce/financial/event-handoff';
+import { FINANCIAL_PAYOUT_JOB } from '$lib/server/commerce/financial/jobs';
 import { acceptStripeEvent } from '$lib/server/commerce/webhooks';
 import type { VerifiedStripeEvent } from '$lib/server/commerce/stripe/types';
 import { auditEvents, jobs, stripeEvents } from '$lib/server/db/schema';
@@ -64,6 +67,96 @@ async function exhaustEventJob(providerEventId: string) {
 }
 
 describe('atomic Stripe event acceptance', () => {
+  it('completes a payout event and enqueues its financial root atomically without retrieval', async () => {
+    const source = event({
+      type: 'payout.reconciliation_completed',
+      objectId: `po_test_${randomUUID().replaceAll('-', '')}`
+    });
+    const accepted = await acceptStripeEvent(databaseClient.db, source);
+
+    await fulfillPayoutEvent(databaseClient.db, {
+      stripeEventId: accepted.stripeEventId,
+      providerPayoutId: source.objectId,
+      providerEventId: source.providerEventId
+    });
+
+    const [stored] = await databaseClient.db.select().from(stripeEvents)
+      .where(eq(stripeEvents.id, accepted.stripeEventId));
+    expect(stored).toMatchObject({ status: 'processed', processedAt: expect.any(Date) });
+    const financial = await databaseClient.db.select().from(jobs)
+      .where(eq(jobs.deduplicationKey,
+        `stripe:financial-payout:event:${source.providerEventId}`));
+    expect(financial).toHaveLength(1);
+    expect(financial[0]).toMatchObject({
+      type: FINANCIAL_PAYOUT_JOB,
+      payload: {
+        providerPayoutId: source.objectId,
+        trigger: { kind: 'event', providerEventId: source.providerEventId }
+      },
+      status: 'pending'
+    });
+  });
+
+  it('rolls payout completion and its financial job back when queueing fails', async () => {
+    const source = event({
+      type: 'payout.updated',
+      objectId: `po_test_${randomUUID().replaceAll('-', '')}`
+    });
+    const accepted = await acceptStripeEvent(databaseClient.db, source);
+
+    await expect(fulfillPayoutEvent(databaseClient.db, {
+      stripeEventId: accepted.stripeEventId,
+      providerPayoutId: source.objectId,
+      providerEventId: source.providerEventId
+    }, {
+      queueFinancialPayout: async (transaction, input) => {
+        await queueFinancialPayoutFromEvent(transaction, input);
+        throw new Error('forced payout handoff rollback');
+      }
+    })).rejects.toThrow('forced payout handoff rollback');
+
+    const [stored] = await databaseClient.db.select().from(stripeEvents)
+      .where(eq(stripeEvents.id, accepted.stripeEventId));
+    expect(stored).toMatchObject({ status: 'pending', processedAt: null });
+    expect(await databaseClient.db.select().from(jobs)
+      .where(eq(jobs.deduplicationKey,
+        `stripe:financial-payout:event:${source.providerEventId}`))).toHaveLength(0);
+  });
+
+  it('keeps the same terminal financial root on payout event replay', async () => {
+    const source = event({
+      type: 'payout.paid',
+      objectId: `po_test_${randomUUID().replaceAll('-', '')}`
+    });
+    const accepted = await acceptStripeEvent(databaseClient.db, source);
+    const input = {
+      stripeEventId: accepted.stripeEventId,
+      providerPayoutId: source.objectId,
+      providerEventId: source.providerEventId
+    };
+    await fulfillPayoutEvent(databaseClient.db, input);
+    const key = `stripe:financial-payout:event:${source.providerEventId}`;
+    const [financial] = await databaseClient.db.select().from(jobs)
+      .where(eq(jobs.deduplicationKey, key));
+    if (!financial) throw new Error('Expected financial payout job');
+    const completedAt = new Date('2099-01-02T00:00:00.000Z');
+    await databaseClient.db.update(jobs)
+      .set({ status: 'succeeded', completedAt })
+      .where(eq(jobs.id, financial.id));
+
+    await fulfillPayoutEvent(databaseClient.db, input);
+    await expect(acceptStripeEvent(databaseClient.db, source)).resolves.toEqual({
+      status: 'duplicate', stripeEventId: accepted.stripeEventId
+    });
+
+    expect(await databaseClient.db.select().from(jobs)
+      .where(eq(jobs.deduplicationKey, key))).toEqual([{
+        ...financial,
+        status: 'succeeded',
+        completedAt
+      }]);
+  });
+
   it('persists one minimized event and one deduplicated job in one transaction', async () => {
     const source = event();
     const result = await acceptStripeEvent(databaseClient.db, source);

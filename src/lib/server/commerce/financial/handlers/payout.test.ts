@@ -4,7 +4,7 @@ import type { StripeCommerceGateway } from '$lib/server/commerce/stripe/types';
 import type { Database } from '$lib/server/db/client';
 import { PermanentJobError } from '$lib/server/jobs/runner';
 import { PermanentFinancialError } from '../errors';
-import { FINANCIAL_PAYOUT_JOB } from '../jobs';
+import { FINANCIAL_PAYOUT_JOB, createFinancialPayoutEventJob } from '../jobs';
 import { createFinancialPayoutHandler } from './payout';
 
 const service = vi.hoisted(() => vi.fn());
@@ -26,6 +26,7 @@ describe('financial payout handler', () => {
         providerPayoutId: 'po_handler_red_101',
         trigger: { kind: 'event', providerEventId: 'evt_handler_red_101' }
       },
+      deduplicationKey: 'stripe:financial-payout:event:evt_handler_red_101',
       attempts: 1,
       maxAttempts: 12,
       lockedBy: 'test-worker'
@@ -45,7 +46,7 @@ describe('financial payout handler', () => {
     const handler = createFinancialPayoutHandler({ database: {} as Database, gateway: {} as StripeCommerceGateway });
     const job = {
       id: randomUUID(), type: 'commerce.financial-source', payload: {}, attempts: 1,
-      maxAttempts: 12, lockedBy: 'test-worker'
+      deduplicationKey: null, maxAttempts: 12, lockedBy: 'test-worker'
     };
     await expect(handler(job, new AbortController().signal)).rejects.toBeInstanceOf(PermanentJobError);
     const controller = new AbortController();
@@ -63,7 +64,30 @@ describe('financial payout handler', () => {
       payload: {
         providerPayoutId: 'po_handler_red_101',
         trigger: { kind: 'event', providerEventId: 'evt_handler_red_101' }
-      }, attempts: 1, maxAttempts: 12, lockedBy: 'test-worker'
+      }, deduplicationKey: 'stripe:financial-payout:event:evt_handler_red_101',
+      attempts: 1, maxAttempts: 12, lockedBy: 'test-worker'
     }, new AbortController().signal)).rejects.toBeInstanceOf(PermanentJobError);
+  });
+
+  it('rejects tampered permanent identity before payout work', async () => {
+    const handler = createFinancialPayoutHandler({
+      database: {} as Database, gateway: {} as StripeCommerceGateway
+    });
+    const definition = createFinancialPayoutEventJob({
+      providerPayoutId: 'po_handler_identity', providerEventId: 'evt_handler_identity'
+    });
+    const base = { id: randomUUID(), ...definition, attempts: 0, lockedBy: 'worker-identity' };
+    for (const job of [
+      { ...base, deduplicationKey: 'private-key' },
+      { ...base, deduplicationKey: null },
+      { ...base, maxAttempts: definition.maxAttempts - 1 },
+      { ...base, payload: { ...definition.payload, privateField: true } }
+    ]) {
+      const failure = await handler(job as never, new AbortController().signal)
+        .catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(PermanentJobError);
+      expect(failure).not.toHaveProperty('cause');
+    }
+    expect(service).not.toHaveBeenCalled();
   });
 });

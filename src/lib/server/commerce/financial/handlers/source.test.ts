@@ -4,7 +4,11 @@ import type { StripeCommerceGateway } from '$lib/server/commerce/stripe/types';
 import type { Database } from '$lib/server/db/client';
 import { PermanentJobError } from '$lib/server/jobs/runner';
 import { PermanentFinancialError, RetryableFinancialError } from '../errors';
-import { FINANCIAL_SOURCE_JOB } from '../jobs';
+import {
+  FINANCIAL_PAYOUT_JOB,
+  FINANCIAL_SOURCE_JOB,
+  createFinancialSourceEventJob
+} from '../jobs';
 import { createFinancialSourceHandler } from './source';
 
 const reconcilers = vi.hoisted(() => ({
@@ -26,7 +30,7 @@ describe('createFinancialSourceHandler', () => {
 
     await expect(handler({
       id: randomUUID(), type: 'commerce.financial-payout', payload: {}, attempts: 0,
-      maxAttempts: 12, lockedBy: 'worker-red'
+      deduplicationKey: null, maxAttempts: 12, lockedBy: 'worker-red'
     }, new AbortController().signal)).rejects.toBeInstanceOf(PermanentJobError);
     expect(dependencies.database.transaction).not.toHaveBeenCalled();
     expect(dependencies.gateway.retrievePayment).not.toHaveBeenCalled();
@@ -44,9 +48,35 @@ describe('createFinancialSourceHandler', () => {
       payload: {
         sourceKind: 'payment', sourceId: randomUUID(), privateText: 'must-not-pass',
         trigger: { kind: 'event', providerEventId: 'evt_handler_red' }
-      }, attempts: 0, maxAttempts: 12, lockedBy: 'worker-red'
+      }, deduplicationKey: 'stripe:financial-source:event:evt_handler_red',
+      attempts: 0, maxAttempts: 12, lockedBy: 'worker-red'
     }, new AbortController().signal)).rejects.toBeInstanceOf(PermanentJobError);
     expect(dependencies.gateway.retrievePayment).not.toHaveBeenCalled();
+  });
+
+  it('rejects tampered permanent identity before dispatch', async () => {
+    const handler = createFinancialSourceHandler({
+      database: {} as Database,
+      gateway: {} as StripeCommerceGateway
+    });
+    const definition = createFinancialSourceEventJob({
+      sourceKind: 'payment', sourceId: randomUUID(), providerEventId: 'evt_source_identity'
+    });
+    const base = {
+      id: randomUUID(), ...definition, attempts: 0, lockedBy: 'worker-identity'
+    };
+    for (const job of [
+      { ...base, deduplicationKey: 'private-key' },
+      { ...base, deduplicationKey: null },
+      { ...base, maxAttempts: definition.maxAttempts - 1 },
+      { ...base, type: FINANCIAL_PAYOUT_JOB }
+    ]) {
+      const failure = await handler(job as never, new AbortController().signal)
+        .catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(PermanentJobError);
+      expect(failure).not.toHaveProperty('cause');
+    }
+    expect(reconcilers.payment).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -64,10 +94,16 @@ describe('createFinancialSourceHandler', () => {
         ? { kind: 'scan' as const, scanRunId: randomUUID(), scanGenerationHour: '2026-08-12T12:00:00.000Z' }
         : { kind: 'payout_impact' as const, payoutId: randomUUID(), payoutGeneration: 1 };
     const signal = new AbortController().signal;
+    const deduplicationKey = trigger.kind === 'event'
+      ? `stripe:financial-source:event:${trigger.providerEventId}`
+      : trigger.kind === 'scan'
+        ? `financial:source:scan:${sourceKind}:${sourceId}:${trigger.scanGenerationHour}`
+        : `financial:source:payout-impact:${trigger.payoutId}:${trigger.payoutGeneration}:` +
+          `${sourceKind}:${sourceId}`;
 
     await createFinancialSourceHandler({ database, gateway })({
       id: jobId, type: FINANCIAL_SOURCE_JOB, payload: { sourceKind, sourceId, trigger },
-      attempts: 0, maxAttempts: 12, lockedBy: 'worker-green'
+      deduplicationKey, attempts: 0, maxAttempts: 12, lockedBy: 'worker-green'
     }, signal);
 
     expect(reconcile).toHaveBeenCalledOnce();
@@ -85,7 +121,8 @@ describe('createFinancialSourceHandler', () => {
       payload: {
         sourceKind: 'payment', sourceId: randomUUID(),
         trigger: { kind: 'event', providerEventId: 'evt_handler_aborted' }
-      }, attempts: 0, maxAttempts: 12, lockedBy: 'worker-aborted'
+      }, deduplicationKey: 'stripe:financial-source:event:evt_handler_aborted',
+      attempts: 0, maxAttempts: 12, lockedBy: 'worker-aborted'
     }, controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
     expect(reconcilers.payment).not.toHaveBeenCalled();
     expect(reconcilers.refund).not.toHaveBeenCalled();
@@ -104,7 +141,9 @@ describe('createFinancialSourceHandler', () => {
       payload: {
         sourceKind: 'refund', sourceId: randomUUID(),
         trigger: { kind: 'event', providerEventId: 'evt_private_provider_text_must_not_escape' }
-      }, attempts: 0, maxAttempts: 12, lockedBy: 'worker-permanent'
+      }, deduplicationKey:
+        'stripe:financial-source:event:evt_private_provider_text_must_not_escape',
+      attempts: 0, maxAttempts: 12, lockedBy: 'worker-permanent'
     }, new AbortController().signal).catch((error: unknown) => error);
 
     expect(failure).toBeInstanceOf(PermanentJobError);
@@ -121,12 +160,16 @@ describe('createFinancialSourceHandler', () => {
       gateway: {} as StripeCommerceGateway
     });
 
+    const sourceId = randomUUID();
+    const scanRunId = randomUUID();
     await expect(handler({
       id: randomUUID(), type: FINANCIAL_SOURCE_JOB,
       payload: {
-        sourceKind: 'dispute', sourceId: randomUUID(),
-        trigger: { kind: 'scan', scanRunId: randomUUID(), scanGenerationHour: '2026-08-12T12:00:00.000Z' }
-      }, attempts: 0, maxAttempts: 12, lockedBy: 'worker-retryable'
+        sourceKind: 'dispute', sourceId,
+        trigger: { kind: 'scan', scanRunId, scanGenerationHour: '2026-08-12T12:00:00.000Z' }
+      }, deduplicationKey:
+        `financial:source:scan:dispute:${sourceId}:2026-08-12T12:00:00.000Z`,
+      attempts: 0, maxAttempts: 12, lockedBy: 'worker-retryable'
     }, new AbortController().signal)).rejects.toBe(retryable);
   });
 });

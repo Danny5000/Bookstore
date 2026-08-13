@@ -24,12 +24,32 @@ import {
 } from '$lib/server/commerce/fulfillment';
 import {
   createStripeEventHandler,
-  defaultLoadStripeEvent
+  defaultLoadStripeEvent,
+  fulfillPayoutEvent
 } from '$lib/server/commerce/handler';
 import { STRIPE_EVENT_JOB } from '$lib/server/commerce/job';
 import { fulfillDisputeEvent } from '$lib/server/commerce/disputes';
 import { fulfillRefundEvent } from '$lib/server/commerce/refunds';
 import { createStripeCommerceRuntime } from '$lib/server/commerce/stripe/runtime-core';
+import {
+  FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+  FINANCIAL_CLASSIFIER_VERSION
+} from '$lib/server/commerce/financial/constants';
+import {
+  FINANCIAL_CLASSIFICATION_JOB,
+  FINANCIAL_PAYOUT_JOB,
+  FINANCIAL_SCAN_JOB,
+  FINANCIAL_SOURCE_JOB
+} from '$lib/server/commerce/financial/jobs';
+import { createFinancialSourceHandler } from '$lib/server/commerce/financial/handlers/source';
+import { createFinancialPayoutHandler } from '$lib/server/commerce/financial/handlers/payout';
+import { createFinancialScanHandler } from '$lib/server/commerce/financial/handlers/scan';
+import {
+  createFinancialClassificationHandler
+} from '$lib/server/commerce/financial/handlers/classification';
+import {
+  createFinancialScheduleEnsurer
+} from '$lib/server/commerce/financial/scans/scheduler';
 import { createDatabaseClient } from '$lib/server/db/client';
 import { probeDatabase } from '$lib/server/db/health';
 import { AUTH_EMAIL_TOPIC, queueAuthEmail } from '$lib/server/email/enqueue';
@@ -98,9 +118,28 @@ const stripeEventHandler: JobHandler = createStripeEventHandler(
     fulfillDispute: (database, input) => fulfillDisputeEvent(database, input, {
       messages: commerceMessages
     }),
+    fulfillPayout: fulfillPayoutEvent,
     recordException: (database, input) => recordFulfillmentException(database, input)
   }
 );
+const financialSourceHandler = createFinancialSourceHandler({
+  database: databaseClient.db,
+  gateway: stripeRuntime.gateway
+});
+const financialPayoutHandler = createFinancialPayoutHandler({
+  database: databaseClient.db,
+  gateway: stripeRuntime.gateway
+});
+const financialScanHandler = createFinancialScanHandler({
+  database: databaseClient.db,
+  gateway: stripeRuntime.gateway,
+  runtimeMode: stripeRuntime.mode
+});
+const financialClassificationHandler = createFinancialClassificationHandler({
+  database: databaseClient.db,
+  targetClassifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+  targetAllocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
+});
 const handlers = new Map<string, JobHandler>([
   [OUTBOX_DISPATCH_JOB, createOutboxDispatchHandler(databaseClient.db, topicHandlers)],
   [
@@ -122,6 +161,10 @@ const handlers = new Map<string, JobHandler>([
     ), { allowExistingReceipt: true })
   ],
   [STRIPE_EVENT_JOB, stripeEventHandler],
+  [FINANCIAL_SOURCE_JOB, financialSourceHandler],
+  [FINANCIAL_PAYOUT_JOB, financialPayoutHandler],
+  [FINANCIAL_SCAN_JOB, financialScanHandler],
+  [FINANCIAL_CLASSIFICATION_JOB, financialClassificationHandler],
   [
     INGEST_REVISION_JOB,
     createRevisionIngestionHandler(
@@ -132,6 +175,12 @@ const handlers = new Map<string, JobHandler>([
   ]
 ]);
 const repository = createPostgresJobRepository(databaseClient.db, config.jobs);
+const ensureFinancialSchedule = createFinancialScheduleEnsurer({
+  database: databaseClient.db,
+  runtimeMode: stripeRuntime.mode,
+  classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+  allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
+});
 
 function requestShutdown(): void {
   controller.abort();
@@ -152,6 +201,7 @@ try {
     concurrency: config.jobs.concurrency,
     pollIntervalMs: config.jobs.pollIntervalMs,
     heartbeatIntervalMs: Math.max(1, Math.floor(config.jobs.leaseMs / 3)),
+    beforePoll: ensureFinancialSchedule,
     signal: controller.signal
   });
 } catch (error: unknown) {

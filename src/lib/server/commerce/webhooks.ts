@@ -28,15 +28,22 @@ export const SUPPORTED_STRIPE_EVENT_TYPES = Object.freeze([
   'charge.dispute.updated',
   'charge.dispute.closed',
   'charge.dispute.funds_withdrawn',
-  'charge.dispute.funds_reinstated'
+  'charge.dispute.funds_reinstated',
+  'payout.created',
+  'payout.updated',
+  'payout.paid',
+  'payout.failed',
+  'payout.canceled',
+  'payout.reconciliation_completed'
 ] as const);
 
 export type SupportedStripeEventType = typeof SUPPORTED_STRIPE_EVENT_TYPES[number];
-export type StripeObjectFamily = 'checkout_session' | 'refund' | 'dispute';
+export type StripeObjectFamily = 'checkout_session' | 'refund' | 'dispute' | 'payout';
 export type StripeRetrievalMethod =
   | 'retrieveCheckoutSession'
   | 'retrieveRefund'
-  | 'retrieveDispute';
+  | 'retrieveDispute'
+  | 'retrievePayout';
 
 export interface SupportedStripeEventDescriptor {
   event: VerifiedStripeEvent;
@@ -61,7 +68,10 @@ function familyForType(type: SupportedStripeEventType): {
   if (type.startsWith('refund.')) {
     return { objectFamily: 'refund', retrievalMethod: 'retrieveRefund', objectPrefix: 're_' };
   }
-  return { objectFamily: 'dispute', retrievalMethod: 'retrieveDispute', objectPrefix: 'dp_' };
+  if (type.startsWith('charge.dispute.')) {
+    return { objectFamily: 'dispute', retrievalMethod: 'retrieveDispute', objectPrefix: 'dp_' };
+  }
+  return { objectFamily: 'payout', retrievalMethod: 'retrievePayout', objectPrefix: 'po_' };
 }
 
 function isSupportedType(type: string): type is SupportedStripeEventType {

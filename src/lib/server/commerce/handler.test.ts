@@ -55,6 +55,7 @@ function job(stripeEventId: string): JobRecord {
     id: randomUUID(),
     type: STRIPE_EVENT_JOB,
     payload: { stripeEventId },
+    deduplicationKey: `stripe:event:${stripeEventId}`,
     attempts: 1,
     maxAttempts: 8,
     lockedBy: 'test-worker'
@@ -87,6 +88,7 @@ function harness(row = event()) {
     fulfillCheckout: vi.fn(() => mutation.promise),
     fulfillRefund: vi.fn(),
     fulfillDispute: vi.fn(),
+    fulfillPayout: vi.fn(),
     recordException: vi.fn()
   };
   const handler = createStripeEventHandler({} as never, gateway, dependencies);
@@ -206,6 +208,36 @@ describe('Stripe event handler provider ordering', () => {
       expect.anything(),
       { stripeEventId: disputeRow.id, dispute: disputeSnapshot, payment: disputePayment }
     );
+  });
+
+  it('dispatches a minimized payout event without any provider retrieval', async () => {
+    const payoutRow = event({
+      eventType: 'payout.reconciliation_completed',
+      objectId: 'po_test_fixture_101'
+    });
+    const test = harness(payoutRow);
+    test.dependencies.fulfillPayout.mockResolvedValueOnce(undefined);
+    const running = test.handler(job(payoutRow.id), new AbortController().signal);
+    test.load.resolve(payoutRow);
+
+    await expect(running).resolves.toBeUndefined();
+    expect(test.dependencies.fulfillPayout).toHaveBeenCalledWith(expect.anything(), {
+      stripeEventId: payoutRow.id,
+      providerPayoutId: payoutRow.objectId,
+      providerEventId: payoutRow.providerEventId
+    });
+    for (const method of [
+      test.gateway.retrieveCheckoutSession,
+      test.gateway.retrievePayment,
+      test.gateway.retrieveRefund,
+      test.gateway.retrieveDispute,
+      test.gateway.retrieveCharge,
+      test.gateway.retrieveBalanceTransaction,
+      test.gateway.retrievePayout,
+      test.gateway.listBalanceTransactionsForSource,
+      test.gateway.listBalanceTransactionsForPayout,
+      test.gateway.listPayouts
+    ]) expect(method).not.toHaveBeenCalled();
   });
 
   it('retrieves a dispute and its linked payment before starting local mutation', async () => {

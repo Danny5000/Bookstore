@@ -3,7 +3,7 @@ import { sql, type SQL } from 'drizzle-orm';
 import type { Database } from '$lib/server/db/client';
 import type { FinancialScanRunRow, JsonObject } from '$lib/server/db/schema';
 import type { DatabaseExecutor } from '$lib/server/db/transaction';
-import { enqueueJob } from '$lib/server/jobs/repository';
+import { enqueueActiveEntityJob, enqueueJob } from '$lib/server/jobs/repository';
 import { PermanentFinancialError, RetryableFinancialError } from '../errors';
 import {
   createFinancialCompositeReplayScanJob,
@@ -11,9 +11,12 @@ import {
   createFinancialInitialScanJob,
   createFinancialPayoutImpactScanJob,
   createFinancialScanContinuationJob,
+  FINANCIAL_PAYOUT_JOB,
+  FINANCIAL_SOURCE_JOB,
   parseFinancialJobIdentity,
   parseFinancialScanContinuationJobPayload,
   type FinancialJobSpec,
+  type FinancialJobIdentity,
   type FinancialScanJobPayload
 } from '../jobs';
 
@@ -210,6 +213,47 @@ function cursorDigest(phaseValue: string, checkpointValue: string | null): strin
   return createHash('sha256').update(phaseValue).update('\0').update(checkpointValue ?? '').digest('hex');
 }
 
+function activeEntityKey(identity: FinancialJobIdentity): string | null {
+  if (identity.type === FINANCIAL_SOURCE_JOB) {
+    return `${identity.type}:${JSON.stringify({
+      sourceId: identity.payload.sourceId,
+      sourceKind: identity.payload.sourceKind
+    })}`;
+  }
+  if (identity.type === FINANCIAL_PAYOUT_JOB &&
+    identity.payload.trigger.kind !== 'continuation') {
+    return `${identity.type}:${JSON.stringify({
+      providerPayoutId: identity.payload.providerPayoutId
+    })}`;
+  }
+  return null;
+}
+
+async function enqueueActiveScanChild(
+  transaction: Parameters<typeof enqueueActiveEntityJob>[0],
+  identity: FinancialJobIdentity
+): Promise<boolean> {
+  if (identity.type === FINANCIAL_SOURCE_JOB) {
+    await enqueueActiveEntityJob(transaction, {
+      ...identity,
+      activeEntity: {
+        sourceKind: identity.payload.sourceKind,
+        sourceId: identity.payload.sourceId
+      }
+    });
+    return true;
+  }
+  if (identity.type === FINANCIAL_PAYOUT_JOB &&
+    identity.payload.trigger.kind !== 'continuation') {
+    await enqueueActiveEntityJob(transaction, {
+      ...identity,
+      activeEntity: { providerPayoutId: identity.payload.providerPayoutId }
+    });
+    return true;
+  }
+  return false;
+}
+
 export async function resumeFinancialScanContinuation(
   database: Database,
   untrustedPayload: Extract<FinancialScanJobPayload, { readonly kind: 'continuation' }>
@@ -374,6 +418,11 @@ export async function commitFinancialScanPage(
 ): Promise<FinancialScanRunRow> {
   assertCommit(input);
   const identities = input.children.map((child) => parseFinancialJobIdentity(child));
+  const activeIdentities = identities
+    .map((identity) => ({ identity, key: activeEntityKey(identity) }))
+    .filter((entry): entry is { identity: FinancialJobIdentity; key: string } => entry.key !== null)
+    .sort((left, right) => left.key < right.key ? -1 : left.key > right.key ? 1 : 0);
+  const genericIdentities = identities.filter((identity) => activeEntityKey(identity) === null);
   return database.transaction(async (transaction) => {
     await rows(transaction, sql`
       select pg_advisory_xact_lock(hashtextextended(${`pale-orbit:financial:scan-run:${input.runId}`}, 0))
@@ -386,7 +435,10 @@ export async function commitFinancialScanPage(
     if (current.processedCount + input.processedCount > 2_147_483_647 ||
       current.enqueuedCount + identities.length > 2_147_483_647 ||
       current.pageCount === 2_147_483_647) invalid();
-    for (const identity of identities) {
+    for (const { identity } of activeIdentities) {
+      await enqueueActiveScanChild(transaction, identity);
+    }
+    for (const identity of genericIdentities) {
       await enqueueJob(transaction, {
         type: identity.type,
         payload: identity.payload as JsonObject,

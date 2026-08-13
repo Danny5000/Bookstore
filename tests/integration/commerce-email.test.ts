@@ -140,6 +140,7 @@ function claimJob(orderId: string, type: string = COMMERCE_CLAIM_EMAIL_JOB): Job
     id: randomUUID(),
     type,
     payload: { orderId },
+    deduplicationKey: `commerce:claim-email:order:${orderId}:v1`,
     attempts: 1,
     maxAttempts: 8,
     lockedBy: 'commerce-email-integration'

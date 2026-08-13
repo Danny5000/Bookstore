@@ -18,6 +18,9 @@ import {
 } from '$lib/server/db/schema';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
 import { PermanentCommerceError } from './errors';
+import {
+  queueFinancialSourceFromEvent as defaultQueueFinancialSourceFromEvent
+} from './financial/event-handoff';
 import { projectEffectiveEntitlement as defaultProjectEffectiveEntitlement } from './grants';
 import { lockEntitlementScopes, lockOrder } from './lock';
 import {
@@ -205,6 +208,7 @@ export interface FulfillmentExceptionInput {
 
 type AppendAuditEvent = typeof defaultAppendAuditEvent;
 type ProjectEntitlement = typeof defaultProjectEffectiveEntitlement;
+type QueueFinancialSourceFromEvent = typeof defaultQueueFinancialSourceFromEvent;
 
 export interface CheckoutFulfillmentDependencies {
   purchaseMessages: PurchaseMessageEnqueuer;
@@ -214,6 +218,7 @@ export interface CheckoutFulfillmentDependencies {
   ) => Promise<void>;
   projectEntitlement?: ProjectEntitlement;
   appendAuditEvent?: AppendAuditEvent;
+  queueFinancialSourceFromEvent?: QueueFinancialSourceFromEvent;
   completeStripeEvent?: (
     transaction: DatabaseTransaction,
     stripeEventId: string,
@@ -476,6 +481,8 @@ export async function fulfillCheckoutEvent(
     projectEntitlement:
       dependencyOverrides.projectEntitlement ?? defaultProjectEffectiveEntitlement,
     appendAuditEvent: dependencyOverrides.appendAuditEvent ?? defaultAppendAuditEvent,
+    queueFinancialSourceFromEvent:
+      dependencyOverrides.queueFinancialSourceFromEvent ?? defaultQueueFinancialSourceFromEvent,
     completeStripeEvent: dependencyOverrides.completeStripeEvent ?? completeStripeEvent,
     now: dependencyOverrides.now ?? (() => new Date())
   };
@@ -545,6 +552,13 @@ export async function fulfillCheckoutEvent(
         if (!existingPayment) permanent();
         assertSucceededPayment(existingPayment, command);
       }
+      if (existingPayment) {
+        await dependencies.queueFinancialSourceFromEvent(transaction, {
+          sourceKind: 'payment',
+          sourceId: existingPayment.id,
+          providerEventId: event.providerEventId
+        });
+      }
       await dependencies.completeStripeEvent(transaction, event.id, now);
       return;
     }
@@ -555,8 +569,9 @@ export async function fulfillCheckoutEvent(
     }
     if (order.status === 'exception') permanent();
 
+    let paymentFact: typeof payments.$inferSelect | undefined;
     if (command.state === 'pending') {
-      await storePaymentEvidence(transaction, existingPayment, command, now);
+      paymentFact = await storePaymentEvidence(transaction, existingPayment, command, now);
       if (order.status === 'checkout_pending' || order.status === 'checkout_open') {
         await transaction.update(orders).set({
           status: 'payment_pending',
@@ -566,10 +581,10 @@ export async function fulfillCheckoutEvent(
         }).where(eq(orders.id, order.id));
       }
     } else if (command.state === 'paid') {
-      await storePaymentEvidence(transaction, existingPayment, command, now);
+      paymentFact = await storePaymentEvidence(transaction, existingPayment, command, now);
       await finalizePaidOrder(transaction, order, items, command, dependencies, now);
     } else if (command.state === 'failed') {
-      await storePaymentEvidence(transaction, existingPayment, command, now);
+      paymentFact = await storePaymentEvidence(transaction, existingPayment, command, now);
       if (['checkout_pending', 'checkout_open', 'payment_pending'].includes(order.status)) {
         await transaction.update(orders).set({
           status: 'failed',
@@ -587,6 +602,13 @@ export async function fulfillCheckoutEvent(
         checkoutExpiresAt: command.session.expiresAt,
         updatedAt: now
       }).where(eq(orders.id, order.id));
+    }
+    if (paymentFact) {
+      await dependencies.queueFinancialSourceFromEvent(transaction, {
+        sourceKind: 'payment',
+        sourceId: paymentFact.id,
+        providerEventId: event.providerEventId
+      });
     }
     await dependencies.completeStripeEvent(transaction, event.id, now);
   });

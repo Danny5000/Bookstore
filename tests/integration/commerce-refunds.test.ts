@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { createCommerceMessageEnqueuer } from '$lib/server/commerce/email/enqueue';
 import { parseCommerceEmailPayload } from '$lib/server/commerce/email/payload';
 import { PermanentCommerceError } from '$lib/server/commerce/errors';
+import { FINANCIAL_SOURCE_JOB, parseFinancialJobIdentity } from '$lib/server/commerce/financial/jobs';
 import { projectEffectiveEntitlement } from '$lib/server/commerce/grants';
 import {
   fulfillRefundEvent,
@@ -14,6 +15,7 @@ import {
   entitlementGrants,
   entitlements,
   guestIdentities,
+  jobs,
   orderItems,
   orders,
   outboxMessages,
@@ -203,6 +205,42 @@ function dependencies(
 }
 
 describe('canonical refund fulfillment', () => {
+  it('atomically hands one canonical terminal refund to financial reconciliation', async () => {
+    const fixture = await createPurchase([1403]);
+    const event = await createRefundEvent(`re_test_${randomUUID()}`);
+    await fulfillRefundEvent(
+      databaseClient.db,
+      snapshots(fixture, event, 500),
+      dependencies()
+    );
+
+    const [refund] = await databaseClient.db.select().from(refunds);
+    const queued = await databaseClient.db.select().from(jobs).where(eq(
+      jobs.type,
+      FINANCIAL_SOURCE_JOB
+    ));
+    expect(refund).toMatchObject({ status: 'succeeded', financialEvidenceStatus: 'pending' });
+    expect((await databaseClient.db.select().from(stripeEvents))[0]).toMatchObject({
+      status: 'processed',
+      processedAt: expect.any(Date)
+    });
+    expect(queued).toEqual([expect.objectContaining({
+      payload: {
+        sourceKind: 'refund',
+        sourceId: refund!.id,
+        trigger: { kind: 'event', providerEventId: event.providerEventId }
+      },
+      deduplicationKey: `stripe:financial-source:event:${event.providerEventId}`,
+      status: 'pending'
+    })]);
+    expect(() => parseFinancialJobIdentity({
+      type: queued[0]!.type,
+      payload: queued[0]!.payload,
+      deduplicationKey: queued[0]!.deduplicationKey,
+      maxAttempts: queued[0]!.maxAttempts
+    })).not.toThrow();
+  });
+
   it('allocates cumulative single-title refunds and revokes only at the full paid total', async () => {
     const fixture = await createPurchase([1403]);
     const first = await createRefundEvent(`re_test_${randomUUID()}`, 1);
@@ -278,6 +316,18 @@ describe('canonical refund fulfillment', () => {
       status: 'exception',
       processedAt: expect.any(Date)
     });
+    const [refund] = await databaseClient.db.select().from(refunds);
+    expect(await databaseClient.db.select().from(jobs).where(eq(
+      jobs.type,
+      FINANCIAL_SOURCE_JOB
+    ))).toEqual([expect.objectContaining({
+      payload: {
+        sourceKind: 'refund',
+        sourceId: refund!.id,
+        trigger: { kind: 'event', providerEventId: event.providerEventId }
+      },
+      deduplicationKey: `stripe:financial-source:event:${event.providerEventId}`
+    })]);
     expect((await databaseClient.db.select().from(entitlementGrants))
       .every((grant) => grant.state === 'active')).toBe(true);
     expect(await databaseClient.db.select().from(outboxMessages)).toHaveLength(0);
@@ -534,7 +584,7 @@ describe('canonical refund fulfillment', () => {
     expect((await databaseClient.db.select().from(stripeEvents))[0]?.status).toBe('pending');
   });
 
-  it.each(['allocation', 'projection', 'email', 'audit', 'event'] as const)(
+  it.each(['allocation', 'projection', 'email', 'audit', 'handoff', 'event'] as const)(
     'rolls every refund write back when %s persistence fails',
     async (failure) => {
       const fixture = await createPurchase([1403]);
@@ -558,6 +608,9 @@ describe('canonical refund fulfillment', () => {
         ...(failure === 'audit'
           ? { appendAuditEvent: async () => { throw new Error('forced audit failure'); } }
           : {}),
+        ...(failure === 'handoff'
+          ? { queueFinancialSource: async () => { throw new Error('forced handoff failure'); } }
+          : {}),
         ...(failure === 'event'
           ? { completeEvent: async () => { throw new Error('forced event failure'); } }
           : {})
@@ -574,6 +627,50 @@ describe('canonical refund fulfillment', () => {
       expect((await databaseClient.db.select().from(stripeEvents))[0]?.status).toBe('pending');
       expect(await databaseClient.db.select().from(auditEvents)).toHaveLength(0);
       expect(await databaseClient.db.select().from(outboxMessages)).toHaveLength(0);
+      expect(await databaseClient.db.select().from(jobs).where(eq(
+        jobs.type,
+        FINANCIAL_SOURCE_JOB
+      ))).toHaveLength(0);
+    }
+  );
+
+  it.each(['running', 'succeeded'] as const)(
+    'does not rearm a %s financial refund job on duplicate reducer replay',
+    async (status) => {
+      const fixture = await createPurchase([1403]);
+      const event = await createRefundEvent(`re_test_${randomUUID()}`);
+      const input = snapshots(fixture, event, 500);
+      await fulfillRefundEvent(databaseClient.db, input, dependencies());
+      const [queued] = await databaseClient.db.select().from(jobs).where(eq(
+        jobs.type,
+        FINANCIAL_SOURCE_JOB
+      ));
+      if (!queued) throw new Error('Expected financial refund job');
+      await databaseClient.db.update(jobs).set(status === 'running'
+        ? {
+            status,
+            attempts: 1,
+            lockedAt: now,
+            lockedBy: 'refund-replay-worker',
+            completedAt: null,
+            updatedAt: now
+          }
+        : {
+            status,
+            attempts: 1,
+            lockedAt: null,
+            lockedBy: null,
+            completedAt: now,
+            updatedAt: now
+          }).where(eq(jobs.id, queued.id));
+      const [before] = await databaseClient.db.select().from(jobs).where(eq(jobs.id, queued.id));
+
+      await fulfillRefundEvent(databaseClient.db, input, dependencies());
+
+      expect(await databaseClient.db.select().from(jobs).where(eq(
+        jobs.type,
+        FINANCIAL_SOURCE_JOB
+      ))).toEqual([before]);
     }
   );
 

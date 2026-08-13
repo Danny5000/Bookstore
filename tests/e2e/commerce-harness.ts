@@ -15,7 +15,11 @@ import {
 import { fulfillDisputeEvent } from '$lib/server/commerce/disputes';
 import { createCommerceMessageEnqueuer } from '$lib/server/commerce/email/enqueue';
 import { fulfillCheckoutEvent, recordFulfillmentException } from '$lib/server/commerce/fulfillment';
-import { createStripeEventHandler, defaultLoadStripeEvent } from '$lib/server/commerce/handler';
+import {
+  createStripeEventHandler,
+  defaultLoadStripeEvent,
+  fulfillPayoutEvent
+} from '$lib/server/commerce/handler';
 import { STRIPE_EVENT_JOB, createStripeEventJobPayload } from '$lib/server/commerce/job';
 import { fulfillRefundEvent } from '$lib/server/commerce/refunds';
 import { createFixtureStripeGateway } from '$lib/server/commerce/stripe/fixture-gateway';
@@ -69,6 +73,7 @@ function eventJob(stripeEventId: string): JobRecord {
     id: randomUUID(),
     type: STRIPE_EVENT_JOB,
     payload: createStripeEventJobPayload(stripeEventId),
+    deduplicationKey: `stripe:event:${stripeEventId}`,
     attempts: 1,
     maxAttempts: 8,
     lockedBy: 'playwright-fixture'
@@ -96,6 +101,7 @@ export function createCommerceHarness(database: E2EDatabase, applicationOrigin: 
     fulfillDispute: (selectedDatabase, input) => fulfillDisputeEvent(selectedDatabase, input, {
       messages
     }),
+    fulfillPayout: fulfillPayoutEvent,
     recordException: (selectedDatabase, input) =>
       recordFulfillmentException(selectedDatabase, input)
   });

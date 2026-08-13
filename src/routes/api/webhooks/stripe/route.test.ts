@@ -148,6 +148,19 @@ describe('POST /api/webhooks/stripe', () => {
     expect(dependencies.acceptStripeEvent).not.toHaveBeenCalled();
   });
 
+  it('accepts a minimized payout webhook without any provider retrieval', async () => {
+    const payout = verified({
+      type: 'payout.reconciliation_completed',
+      objectId: 'po_test_route_101'
+    });
+    dependencies.verifyWebhook.mockReturnValueOnce(payout);
+
+    const response = await POST(event() as never);
+
+    expect(response.status).toBe(200);
+    expect(dependencies.acceptStripeEvent).toHaveBeenCalledWith(dependencies.database, payout);
+  });
+
   it('rejects live-mode mismatch and retries persistence failures', async () => {
     dependencies.verifyWebhook.mockReturnValueOnce(verified({ liveMode: true }));
     expect((await POST(event() as never)).status).toBe(400);

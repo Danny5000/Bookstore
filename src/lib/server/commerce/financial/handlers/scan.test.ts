@@ -3,11 +3,25 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { StripeCommerceGateway } from '$lib/server/commerce/stripe/types';
 import type { Database } from '$lib/server/db/client';
 import { PermanentFinancialError, RetryableFinancialError } from '../errors';
-import { FINANCIAL_SCAN_JOB } from '../jobs';
+import { FINANCIAL_SCAN_JOB, createFinancialInitialScanJob } from '../jobs';
 import { createFinancialScanHandler } from './scan';
 
 const service = vi.hoisted(() => vi.fn());
 vi.mock('../scans/service', () => ({ processFinancialScanJob: service }));
+
+function scanKey(payload: Record<string, unknown>): string {
+  if (payload.kind === 'initial') return 'commerce.financial-scan:initial:v1';
+  if (payload.kind === 'hourly') return `commerce.financial-scan:${payload.scanGenerationHour}`;
+  if (payload.kind === 'payout_impact') {
+    return `financial:payout-impact:${payload.payoutId}:${payload.payoutGeneration}`;
+  }
+  if (payload.kind === 'composite_replay') {
+    return `commerce.financial-classification:scan:${payload.classifierVersion}:` +
+      String(payload.allocationAlgorithmVersion);
+  }
+  return `commerce.financial-scan:${payload.scanRunId}:${payload.phase}:` +
+    String(payload.cursorDigestSha256);
+}
 
 describe('financial scan handler', () => {
   beforeEach(() => vi.clearAllMocks());
@@ -29,7 +43,7 @@ describe('financial scan handler', () => {
       const id = randomUUID();
       const signal = new AbortController().signal;
       await handler({ id, type: FINANCIAL_SCAN_JOB, payload, attempts: 1,
-        maxAttempts: 8, lockedBy: 'scan-worker' }, signal);
+        deduplicationKey: scanKey(payload), maxAttempts: 8, lockedBy: 'scan-worker' }, signal);
       expect(service).toHaveBeenLastCalledWith(dependencies, {
         payload, correlationId: `financial-scan-${id}`, signal
       });
@@ -41,6 +55,7 @@ describe('financial scan handler', () => {
       database: {} as Database, gateway: {} as StripeCommerceGateway, runtimeMode: 'stripe'
     });
     const base = { id: randomUUID(), type: FINANCIAL_SCAN_JOB, attempts: 1,
+      deduplicationKey: 'commerce.financial-scan:initial:v1',
       maxAttempts: 8, lockedBy: 'scan-worker' };
     await expect(handler({ ...base, payload: { kind: 'initial', version: 1, secret: true } },
       new AbortController().signal)).rejects.toMatchObject({ name: 'PermanentJobError' });
@@ -57,12 +72,32 @@ describe('financial scan handler', () => {
     });
     const job = { id: randomUUID(), type: FINANCIAL_SCAN_JOB,
       payload: { kind: 'initial', version: 1 }, attempts: 1, maxAttempts: 8,
-      lockedBy: 'scan-worker' };
+      deduplicationKey: 'commerce.financial-scan:initial:v1', lockedBy: 'scan-worker' };
     service.mockRejectedValueOnce(new PermanentFinancialError('source_linkage_mismatch'));
     await expect(handler(job, new AbortController().signal))
       .rejects.toMatchObject({ name: 'PermanentJobError' });
     service.mockRejectedValueOnce(new RetryableFinancialError('state_changed'));
     await expect(handler(job, new AbortController().signal))
       .rejects.toMatchObject({ name: 'RetryableFinancialError', safeCode: 'state_changed' });
+  });
+
+  it('rejects tampered permanent identity before scan work', async () => {
+    const handler = createFinancialScanHandler({
+      database: {} as Database, gateway: {} as StripeCommerceGateway, runtimeMode: 'stripe'
+    });
+    const definition = createFinancialInitialScanJob();
+    const base = { id: randomUUID(), ...definition, attempts: 0, lockedBy: 'scan-identity' };
+    for (const job of [
+      { ...base, deduplicationKey: 'private-key' },
+      { ...base, deduplicationKey: null },
+      { ...base, maxAttempts: definition.maxAttempts - 1 },
+      { ...base, payload: { ...definition.payload, privateField: true } }
+    ]) {
+      const failure = await handler(job as never, new AbortController().signal)
+        .catch((error: unknown) => error);
+      expect(failure).toMatchObject({ name: 'PermanentJobError' });
+      expect(failure).not.toHaveProperty('cause');
+    }
+    expect(service).not.toHaveBeenCalled();
   });
 });

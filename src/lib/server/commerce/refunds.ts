@@ -14,6 +14,7 @@ import {
 } from '$lib/server/db/schema';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
 import type { RefundFulfillmentInput } from './handler';
+import { queueFinancialSourceFromEvent } from './financial/event-handoff';
 import {
   assertGrantTransitionAllowed,
   projectEffectiveEntitlement as defaultProjectEffectiveEntitlement
@@ -236,6 +237,7 @@ export interface RefundAccessMessageEnqueuer {
 
 type ProjectEntitlement = typeof defaultProjectEffectiveEntitlement;
 type AppendAuditEvent = typeof defaultAppendAuditEvent;
+type QueueFinancialSource = typeof queueFinancialSourceFromEvent;
 
 export interface RefundFulfillmentDependencies {
   messages: RefundAccessMessageEnqueuer;
@@ -245,6 +247,7 @@ export interface RefundFulfillmentDependencies {
   ) => Promise<void>;
   projectEntitlement?: ProjectEntitlement;
   appendAuditEvent?: AppendAuditEvent;
+  queueFinancialSource?: QueueFinancialSource;
   completeEvent?: (
     transaction: DatabaseTransaction,
     stripeEventId: string,
@@ -349,6 +352,8 @@ export async function fulfillRefundEvent(
     projectEntitlement:
       dependencyOverrides.projectEntitlement ?? defaultProjectEffectiveEntitlement,
     appendAuditEvent: dependencyOverrides.appendAuditEvent ?? defaultAppendAuditEvent,
+    queueFinancialSource:
+      dependencyOverrides.queueFinancialSource ?? queueFinancialSourceFromEvent,
     completeEvent: dependencyOverrides.completeEvent ?? completeCommerceEvent,
     now: dependencyOverrides.now ?? (() => new Date())
   };
@@ -394,7 +399,7 @@ export async function fulfillRefundEvent(
     const existing = lockedRefunds.find(
       (refund) => refund.stripeRefundId === canonicalRefund.providerRefundId
     );
-    await storeCanonicalRefund(
+    const canonicalRefundRow = await storeCanonicalRefund(
       transaction,
       existing,
       payment.id,
@@ -547,6 +552,11 @@ export async function fulfillRefundEvent(
         allocationState: allocation.state,
         affectedTitleCount
       }
+    });
+    await dependencies.queueFinancialSource(transaction, {
+      sourceKind: 'refund',
+      sourceId: canonicalRefundRow.id,
+      providerEventId: event.providerEventId
     });
     await dependencies.completeEvent(transaction, event.id, eventStatus, now);
   });

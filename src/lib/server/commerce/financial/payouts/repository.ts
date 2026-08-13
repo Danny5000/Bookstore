@@ -5,7 +5,7 @@ import { parsePayoutSnapshot } from '$lib/server/commerce/stripe/financial-schem
 import type { Database } from '$lib/server/db/client';
 import type { PayoutImportRunRow } from '$lib/server/db/schema';
 import type { DatabaseExecutor, DatabaseTransaction } from '$lib/server/db/transaction';
-import { enqueueJob } from '$lib/server/jobs/repository';
+import { enqueueActiveEntityJob, enqueueJob } from '$lib/server/jobs/repository';
 import { FINANCIAL_GENERATION_MAX } from '../constants';
 import { PermanentFinancialError, RetryableFinancialError } from '../errors';
 import {
@@ -144,6 +144,21 @@ async function enqueueSpec(
   });
 }
 
+async function enqueueRelatedPayoutRoot(
+  tx: DatabaseTransaction,
+  spec: ReturnType<typeof createFinancialPayoutRelatedJob>
+): Promise<void> {
+  await enqueueActiveEntityJob(tx, {
+    ...spec,
+    activeEntity: { providerPayoutId: spec.payload.providerPayoutId }
+  });
+}
+
+function sortedRelatedPayoutIds(values: Iterable<string | null>): string[] {
+  return [...new Set([...values].filter((value): value is string => value !== null))]
+    .sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+}
+
 async function payoutAudit(
   tx: DatabaseTransaction,
   payoutId: string,
@@ -210,14 +225,15 @@ export async function stagePayoutSnapshot(
       await payoutAudit(tx, inserted[0]!.id, 'financial.payout.imported', context.correlationId, {
         generation: 0, status: snapshot.status, reconciliationStatus: snapshot.reconciliationStatus
       });
-      for (const relatedId of [snapshot.originalPayoutId, snapshot.reversedByPayoutId]) {
-        if (relatedId !== null) {
-          await enqueueSpec(tx, createFinancialPayoutRelatedJob({
-            providerPayoutId: relatedId,
-            sourcePayoutId: snapshot.id,
-            sourceFingerprintSha256: fingerprint
-          }));
-        }
+      for (const relatedId of sortedRelatedPayoutIds([
+        snapshot.originalPayoutId,
+        snapshot.reversedByPayoutId
+      ])) {
+        await enqueueRelatedPayoutRoot(tx, createFinancialPayoutRelatedJob({
+          providerPayoutId: relatedId,
+          sourcePayoutId: snapshot.id,
+          sourceFingerprintSha256: fingerprint
+        }));
       }
       return { payoutId: inserted[0]!.id, generation: 0, changed: true };
     }
@@ -298,8 +314,8 @@ export async function stagePayoutSnapshot(
       snapshot.reversedByPayoutId !== current.reversedByProviderPayoutId) {
       newlyObservedRelatedIds.add(snapshot.reversedByPayoutId);
     }
-    for (const relatedId of newlyObservedRelatedIds) {
-      await enqueueSpec(tx, createFinancialPayoutRelatedJob({
+    for (const relatedId of sortedRelatedPayoutIds(newlyObservedRelatedIds)) {
+      await enqueueRelatedPayoutRoot(tx, createFinancialPayoutRelatedJob({
         providerPayoutId: relatedId,
         sourcePayoutId: snapshot.id,
         sourceFingerprintSha256: fingerprint

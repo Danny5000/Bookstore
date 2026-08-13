@@ -4,6 +4,7 @@ export interface JobRecord {
   id: string;
   type: string;
   payload: JsonObject;
+  deduplicationKey: string | null;
   attempts: number;
   maxAttempts: number;
   lockedBy: string;

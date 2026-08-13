@@ -112,6 +112,7 @@ describe('transactional outbox', () => {
       id: message.dispatchJobId,
       type: 'outbox.dispatch',
       payload: { outboxId: message.id },
+      deduplicationKey: null,
       attempts: 1,
       maxAttempts: 5,
       lockedBy: 'worker-test'

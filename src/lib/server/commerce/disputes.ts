@@ -17,6 +17,7 @@ import {
   projectEffectiveEntitlement as defaultProjectEffectiveEntitlement
 } from './grants';
 import type { DisputeFulfillmentInput } from './handler';
+import { queueFinancialSourceFromEvent } from './financial/event-handoff';
 import {
   completeCommerceEvent,
   lockCanonicalPaymentOrder,
@@ -101,6 +102,7 @@ export interface DisputeAccessMessageEnqueuer {
 
 type ProjectEntitlement = typeof defaultProjectEffectiveEntitlement;
 type AppendAuditEvent = typeof defaultAppendAuditEvent;
+type QueueFinancialSource = typeof queueFinancialSourceFromEvent;
 
 export interface DisputeFulfillmentDependencies {
   messages: DisputeAccessMessageEnqueuer;
@@ -112,6 +114,7 @@ export interface DisputeFulfillmentDependencies {
   ) => Promise<DisputeRow>;
   projectEntitlement?: ProjectEntitlement;
   appendAuditEvent?: AppendAuditEvent;
+  queueFinancialSource?: QueueFinancialSource;
   completeEvent?: (
     transaction: DatabaseTransaction,
     stripeEventId: string,
@@ -218,6 +221,8 @@ export async function fulfillDisputeEvent(
     projectEntitlement:
       dependencyOverrides.projectEntitlement ?? defaultProjectEffectiveEntitlement,
     appendAuditEvent: dependencyOverrides.appendAuditEvent ?? defaultAppendAuditEvent,
+    queueFinancialSource:
+      dependencyOverrides.queueFinancialSource ?? queueFinancialSourceFromEvent,
     completeEvent: dependencyOverrides.completeEvent ?? completeCommerceEvent,
     now: dependencyOverrides.now ?? (() => new Date())
   };
@@ -381,6 +386,11 @@ export async function fulfillDisputeEvent(
       resourceId: event.id,
       correlationId: `commerce-dispute-${event.id}`,
       after: { disputeState, affectedTitleCount }
+    });
+    await dependencies.queueFinancialSource(transaction, {
+      sourceKind: 'dispute',
+      sourceId: canonicalDisputeRow.id,
+      providerEventId: event.providerEventId
     });
     await dependencies.completeEvent(transaction, event.id, 'processed', now);
   });

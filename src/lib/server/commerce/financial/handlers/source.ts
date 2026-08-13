@@ -8,10 +8,7 @@ import { reconcileRefundFinancialSource } from '../sources/refund';
 import { reconcileDisputeFinancialSource } from '../sources/dispute';
 import {
   FINANCIAL_SOURCE_JOB,
-  parseFinancialSourceEventJobPayload,
-  parseFinancialSourcePayoutImpactJobPayload,
-  parseFinancialSourceScanJobPayload,
-  type FinancialSourceJobPayload
+  parseFinancialJobIdentity
 } from '../jobs';
 
 export interface FinancialSourceHandlerDependencies {
@@ -26,21 +23,18 @@ export function createFinancialSourceHandler(
     if (signal.aborted) {
       throw new DOMException('Financial source reconciliation was aborted.', 'AbortError');
     }
-    if (job.type !== FINANCIAL_SOURCE_JOB) {
-      throw new PermanentJobError('Invalid financial source job type.');
-    }
-    let payload: FinancialSourceJobPayload;
+    let payload;
     try {
-      const value = job.payload as { trigger?: { kind?: unknown } };
-      if (value.trigger?.kind === 'event') payload = parseFinancialSourceEventJobPayload(job.payload);
-      else if (value.trigger?.kind === 'scan') payload = parseFinancialSourceScanJobPayload(job.payload);
-      else if (value.trigger?.kind === 'payout_impact') {
-        payload = parseFinancialSourcePayoutImpactJobPayload(job.payload);
-      } else {
-        throw new Error('unknown trigger');
-      }
+      const identity = parseFinancialJobIdentity({
+        type: job.type,
+        payload: job.payload,
+        deduplicationKey: job.deduplicationKey,
+        maxAttempts: job.maxAttempts
+      });
+      if (identity.type !== FINANCIAL_SOURCE_JOB) throw new Error('wrong family');
+      payload = identity.payload;
     } catch {
-      throw new PermanentJobError('Invalid financial source job payload.');
+      throw new PermanentJobError('Invalid financial source job identity.');
     }
     const input = { correlationId: `financial-source-${job.id}` };
     try {

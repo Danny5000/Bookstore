@@ -14,6 +14,7 @@ function job(orderId = randomUUID()): JobRecord {
     id: randomUUID(),
     type: COMMERCE_CLAIM_EMAIL_JOB,
     payload: { orderId },
+    deduplicationKey: `commerce:claim-email:order:${orderId}:v1`,
     attempts: 1,
     maxAttempts: 8,
     lockedBy: 'claim-test'

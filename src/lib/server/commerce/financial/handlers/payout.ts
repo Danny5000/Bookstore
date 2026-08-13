@@ -3,7 +3,7 @@ import type { Database } from '$lib/server/db/client';
 import type { JobHandler } from '$lib/server/jobs/types';
 import { PermanentJobError } from '$lib/server/jobs/runner';
 import { PermanentFinancialError } from '../errors';
-import { FINANCIAL_PAYOUT_JOB } from '../jobs';
+import { FINANCIAL_PAYOUT_JOB, parseFinancialJobIdentity } from '../jobs';
 import { reconcileFinancialPayout } from '../payouts/service';
 
 export interface FinancialPayoutHandlerDependencies {
@@ -16,12 +16,22 @@ export function createFinancialPayoutHandler(
 ): JobHandler {
   return async (job, signal) => {
     if (signal.aborted) throw new DOMException('Financial payout job was aborted.', 'AbortError');
-    if (job.type !== FINANCIAL_PAYOUT_JOB) {
-      throw new PermanentJobError('Invalid financial payout job type.');
+    let payload;
+    try {
+      const identity = parseFinancialJobIdentity({
+        type: job.type,
+        payload: job.payload,
+        deduplicationKey: job.deduplicationKey,
+        maxAttempts: job.maxAttempts
+      });
+      if (identity.type !== FINANCIAL_PAYOUT_JOB) throw new Error('wrong family');
+      payload = identity.payload;
+    } catch {
+      throw new PermanentJobError('Invalid financial payout job identity.');
     }
     try {
       await reconcileFinancialPayout(dependencies, {
-        payload: job.payload as never,
+        payload,
         correlationId: `financial-payout-${job.id}`,
         signal
       });

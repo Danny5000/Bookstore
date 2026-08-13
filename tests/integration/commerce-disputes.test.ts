@@ -8,6 +8,7 @@ import {
 import { createCommerceMessageEnqueuer } from '$lib/server/commerce/email/enqueue';
 import { parseCommerceEmailPayload } from '$lib/server/commerce/email/payload';
 import { PermanentCommerceError } from '$lib/server/commerce/errors';
+import { FINANCIAL_SOURCE_JOB, parseFinancialJobIdentity } from '$lib/server/commerce/financial/jobs';
 import { projectEffectiveEntitlement } from '$lib/server/commerce/grants';
 import {
   auditEvents,
@@ -15,6 +16,7 @@ import {
   entitlementGrants,
   entitlements,
   guestIdentities,
+  jobs,
   orderItems,
   orders,
   outboxMessages,
@@ -209,6 +211,42 @@ async function accessMessages() {
 }
 
 describe('canonical dispute fulfillment', () => {
+  it('atomically hands one canonical dispute to financial reconciliation', async () => {
+    const fixture = await createPurchase();
+    const event = await createDisputeEvent(`dp_test_${randomUUID()}`, 1);
+    await fulfillDisputeEvent(
+      databaseClient.db,
+      command(fixture, event, 'open', 1),
+      dependencies()
+    );
+
+    const [dispute] = await databaseClient.db.select().from(disputes);
+    const queued = await databaseClient.db.select().from(jobs).where(eq(
+      jobs.type,
+      FINANCIAL_SOURCE_JOB
+    ));
+    expect(dispute).toMatchObject({ status: 'open', financialEvidenceStatus: 'pending' });
+    expect((await databaseClient.db.select().from(stripeEvents))[0]).toMatchObject({
+      status: 'processed',
+      processedAt: expect.any(Date)
+    });
+    expect(queued).toEqual([expect.objectContaining({
+      payload: {
+        sourceKind: 'dispute',
+        sourceId: dispute!.id,
+        trigger: { kind: 'event', providerEventId: event.providerEventId }
+      },
+      deduplicationKey: `stripe:financial-source:event:${event.providerEventId}`,
+      status: 'pending'
+    })]);
+    expect(() => parseFinancialJobIdentity({
+      type: queued[0]!.type,
+      payload: queued[0]!.payload,
+      deduplicationKey: queued[0]!.deduplicationKey,
+      maxAttempts: queued[0]!.maxAttempts
+    })).not.toThrow();
+  });
+
   it('suspends every otherwise-active payment grant and sends one aggregate opened message', async () => {
     const fixture = await createPurchase([1000, 1500]);
     const event = await createDisputeEvent(`dp_test_${randomUUID()}`, 1);
@@ -447,7 +485,7 @@ describe('canonical dispute fulfillment', () => {
     expect((await databaseClient.db.select().from(outboxMessages))).toHaveLength(1);
   });
 
-  it.each(['store', 'projection', 'email', 'audit', 'event'] as const)(
+  it.each(['store', 'projection', 'email', 'audit', 'handoff', 'event'] as const)(
     'rolls the entire dispute transition back when %s persistence fails',
     async (failure) => {
       const fixture = await createPurchase();
@@ -471,6 +509,9 @@ describe('canonical dispute fulfillment', () => {
         ...(failure === 'audit'
           ? { appendAuditEvent: async () => { throw new Error('forced audit failure'); } }
           : {}),
+        ...(failure === 'handoff'
+          ? { queueFinancialSource: async () => { throw new Error('forced handoff failure'); } }
+          : {}),
         ...(failure === 'event'
           ? { completeEvent: async () => { throw new Error('forced event failure'); } }
           : {})
@@ -486,6 +527,50 @@ describe('canonical dispute fulfillment', () => {
       expect((await databaseClient.db.select().from(stripeEvents))[0]?.status).toBe('pending');
       expect(await databaseClient.db.select().from(outboxMessages)).toHaveLength(0);
       expect(await databaseClient.db.select().from(auditEvents)).toHaveLength(0);
+      expect(await databaseClient.db.select().from(jobs).where(eq(
+        jobs.type,
+        FINANCIAL_SOURCE_JOB
+      ))).toHaveLength(0);
+    }
+  );
+
+  it.each(['running', 'succeeded'] as const)(
+    'does not rearm a %s financial dispute job on duplicate reducer replay',
+    async (status) => {
+      const fixture = await createPurchase();
+      const event = await createDisputeEvent(`dp_test_${randomUUID()}`, 1);
+      const input = command(fixture, event, 'open', 1);
+      await fulfillDisputeEvent(databaseClient.db, input, dependencies());
+      const [queued] = await databaseClient.db.select().from(jobs).where(eq(
+        jobs.type,
+        FINANCIAL_SOURCE_JOB
+      ));
+      if (!queued) throw new Error('Expected financial dispute job');
+      await databaseClient.db.update(jobs).set(status === 'running'
+        ? {
+            status,
+            attempts: 1,
+            lockedAt: fixedNow,
+            lockedBy: 'dispute-replay-worker',
+            completedAt: null,
+            updatedAt: fixedNow
+          }
+        : {
+            status,
+            attempts: 1,
+            lockedAt: null,
+            lockedBy: null,
+            completedAt: fixedNow,
+            updatedAt: fixedNow
+          }).where(eq(jobs.id, queued.id));
+      const [before] = await databaseClient.db.select().from(jobs).where(eq(jobs.id, queued.id));
+
+      await fulfillDisputeEvent(databaseClient.db, input, dependencies());
+
+      expect(await databaseClient.db.select().from(jobs).where(eq(
+        jobs.type,
+        FINANCIAL_SOURCE_JOB
+      ))).toEqual([before]);
     }
   );
 

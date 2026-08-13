@@ -32,23 +32,44 @@ describe('supported Stripe event minimization', () => {
       'charge.dispute.updated',
       'charge.dispute.closed',
       'charge.dispute.funds_withdrawn',
-      'charge.dispute.funds_reinstated'
+      'charge.dispute.funds_reinstated',
+      'payout.created',
+      'payout.updated',
+      'payout.paid',
+      'payout.failed',
+      'payout.canceled',
+      'payout.reconciliation_completed'
     ]);
     expect(Object.isFrozen(SUPPORTED_STRIPE_EVENT_TYPES)).toBe(true);
     for (const type of SUPPORTED_STRIPE_EVENT_TYPES) {
       const isCheckout = type.startsWith('checkout.');
       const isRefund = type.startsWith('refund.');
+      const isPayout = type.startsWith('payout.');
       const descriptor = describeSupportedStripeEvent(event(
         type,
-        isCheckout ? 'cs_test_101' : isRefund ? 're_test_101' : 'dp_test_101'
+        isCheckout
+          ? 'cs_test_101'
+          : isRefund
+            ? 're_test_101'
+            : isPayout
+              ? 'po_test_101'
+              : 'dp_test_101'
       ));
       expect(descriptor).toMatchObject({
-        objectFamily: isCheckout ? 'checkout_session' : isRefund ? 'refund' : 'dispute',
+        objectFamily: isCheckout
+          ? 'checkout_session'
+          : isRefund
+            ? 'refund'
+            : isPayout
+              ? 'payout'
+              : 'dispute',
         retrievalMethod: isCheckout
           ? 'retrieveCheckoutSession'
           : isRefund
             ? 'retrieveRefund'
-            : 'retrieveDispute'
+            : isPayout
+              ? 'retrievePayout'
+              : 'retrieveDispute'
       });
     }
   });

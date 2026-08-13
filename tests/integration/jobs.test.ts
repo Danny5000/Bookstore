@@ -46,6 +46,23 @@ describe('PostgreSQL jobs', () => {
     expect(first?.id).not.toBe(second?.id);
   });
 
+  it('returns the exact permanent key on claims and null for unkeyed work', async () => {
+    const due = new Date(0);
+    await enqueueJob(databaseClient.db, {
+      type: 'test.keyed-claim', payload: {}, runAt: due,
+      deduplicationKey: 'test:keyed-claim:one'
+    });
+    await enqueueJob(databaseClient.db, {
+      type: 'test.unkeyed-claim', payload: {}, runAt: new Date(1)
+    });
+    const repository = createPostgresJobRepository(databaseClient.db, applicationConfig.jobs);
+    const keyed = await repository.claimNext('worker-keyed');
+    expect(keyed?.deduplicationKey).toBe('test:keyed-claim:one');
+    expect(await repository.complete(keyed!.id, 'worker-keyed')).toBe(true);
+    const unkeyed = await repository.claimNext('worker-unkeyed');
+    expect(unkeyed?.deduplicationKey).toBeNull();
+  });
+
   it('reschedules a retry and eventually marks an exhausted job failed', async () => {
     let currentTime = new Date('2026-08-08T12:00:00.000Z');
     const repository = createPostgresJobRepository(

@@ -108,6 +108,7 @@ async function stageAcceptedRevision(
     id: queued.id,
     type: queued.type,
     payload: queued.payload,
+    deduplicationKey: queued.deduplicationKey,
     attempts: 1,
     maxAttempts: queued.maxAttempts,
     lockedBy: 'integration-worker:0'

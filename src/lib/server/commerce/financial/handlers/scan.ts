@@ -5,12 +5,7 @@ import { PermanentJobError } from '$lib/server/jobs/runner';
 import { PermanentFinancialError } from '../errors';
 import {
   FINANCIAL_SCAN_JOB,
-  parseFinancialCompositeReplayScanJobPayload,
-  parseFinancialHourlyScanJobPayload,
-  parseFinancialInitialScanJobPayload,
-  parseFinancialPayoutImpactScanJobPayload,
-  parseFinancialScanContinuationJobPayload,
-  type FinancialScanJobPayload
+  parseFinancialJobIdentity
 } from '../jobs';
 
 export type FinancialScanHandlerDependencies = FinancialScanServiceDependencies;
@@ -20,25 +15,18 @@ export function createFinancialScanHandler(
 ): JobHandler {
   return async (job, signal) => {
     if (signal.aborted) throw new DOMException('Financial scan job was aborted.', 'AbortError');
-    if (job.type !== FINANCIAL_SCAN_JOB) {
-      throw new PermanentJobError('Invalid financial scan job type.');
-    }
-    let payload: FinancialScanJobPayload;
+    let payload;
     try {
-      const kind = (job.payload as { kind?: unknown }).kind;
-      if (kind === 'initial') payload = parseFinancialInitialScanJobPayload(job.payload);
-      else if (kind === 'hourly') payload = parseFinancialHourlyScanJobPayload(job.payload);
-      else if (kind === 'payout_impact') {
-        payload = parseFinancialPayoutImpactScanJobPayload(job.payload);
-      } else if (kind === 'composite_replay') {
-        payload = parseFinancialCompositeReplayScanJobPayload(job.payload);
-      } else if (kind === 'continuation') {
-        payload = parseFinancialScanContinuationJobPayload(job.payload);
-      } else {
-        throw new PermanentFinancialError('invalid_job_payload');
-      }
+      const identity = parseFinancialJobIdentity({
+        type: job.type,
+        payload: job.payload,
+        deduplicationKey: job.deduplicationKey,
+        maxAttempts: job.maxAttempts
+      });
+      if (identity.type !== FINANCIAL_SCAN_JOB) throw new Error('wrong family');
+      payload = identity.payload;
     } catch {
-      throw new PermanentJobError('Invalid financial scan job payload.');
+      throw new PermanentJobError('Invalid financial scan job identity.');
     }
     try {
       await processFinancialScanJob(dependencies, {
