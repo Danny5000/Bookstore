@@ -119,6 +119,37 @@ describe('financial scan page service', () => {
       .toBe(`financial:payout:scan:${payout.id}:2026-08-12T19:00:00.000Z`);
   });
 
+  it('uses the persisted initial-backfill run kind for the seven-day payout lookback', async () => {
+    const earliestPaidAt = new Date('2026-07-01T12:00:00.000Z');
+    const database = {
+      execute: vi.fn(async () => ({
+        rows: [{ createdGte: Math.floor((earliestPaidAt.getTime() - 7 * 86_400_000) / 1000) }]
+      }))
+    } as unknown as Database;
+    repository.resume.mockResolvedValue(run({
+      rootKey: 'commerce.financial-scan:initial:v1',
+      kind: 'initial_backfill',
+      phase: 'payout_discovery_page'
+    }));
+    const gateway = {
+      listPayouts: vi.fn(async () => ({ data: [], hasMore: false, nextStartingAfter: null }))
+    } as unknown as StripeCommerceGateway;
+
+    await processFinancialScanJob({ database, gateway, runtimeMode: 'stripe' }, {
+      payload: {
+        kind: 'continuation', scanRunId: runId, phase: 'payout_discovery_page',
+        cursorDigestSha256: 'a'.repeat(64), limit: 100
+      }, correlationId: 'scan-initial-backfill', signal: new AbortController().signal
+    });
+
+    expect(database.execute).toHaveBeenCalledOnce();
+    expect(gateway.listPayouts).toHaveBeenCalledWith({
+      limit: 100,
+      createdGte: Math.floor((earliestPaidAt.getTime() - 7 * 86_400_000) / 1000),
+      createdLt: Math.floor(new Date('2026-08-12T20:00:00.000Z').getTime() / 1000)
+    });
+  });
+
   it('rejects a malformed provider page before staging or committing it', async () => {
     repository.resume.mockResolvedValue(run({ phase: 'payout_discovery_page' }));
     const gateway = {

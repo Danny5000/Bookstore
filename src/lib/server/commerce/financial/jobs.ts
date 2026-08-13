@@ -23,6 +23,7 @@ const nonnegativeInt32Schema = z.number().int().min(0).max(FINANCIAL_GENERATION_
 const pageLimitSchema = z.number().int().min(1).max(100);
 const utcHourSchema = z.string().regex(/^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):00:00\.000Z$/u)
   .refine((value) => {
+    if (value.startsWith('0000-')) return false;
     const parsed = new Date(value);
     return Number.isFinite(parsed.getTime()) && parsed.toISOString() === value;
   });

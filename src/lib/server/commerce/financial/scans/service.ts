@@ -236,7 +236,7 @@ async function payoutDiscoveryRange(
 ): Promise<{ createdGte: number; createdLt: number }> {
   const hourStart = new Date(hour);
   const createdLt = Math.floor((hourStart.getTime() + 3_600_000) / 1000);
-  if (run.kind !== 'initial') {
+  if (run.kind !== 'initial_backfill') {
     return { createdGte: Math.floor((hourStart.getTime() - 72 * 3_600_000) / 1000), createdLt };
   }
   const result = await database.execute<{ createdGte: number | string | null }>(sql`

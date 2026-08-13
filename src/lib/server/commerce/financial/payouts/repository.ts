@@ -587,15 +587,16 @@ export async function loadCurrentPayoutEvidence(
       (select count(distinct balance_transaction_id)::int from membership) as "authoritativeMembershipCount",
       (select count(distinct m.balance_transaction_id)::int from membership m join stripe_payouts p on p.id = m.payout_id
         where p.automatic and p.method = 'standard' and p.status = 'paid'
-          and p.reconciliation_status = 'completed') as "paidAutomaticStandardCompletedCount",
+          and p.reconciliation_status = 'completed'
+          and p.reversed_by_provider_payout_id is null) as "paidAutomaticStandardCompletedCount",
       (select count(*)::int from payout_counts where count > 1) as "conflictingMembershipCount",
       exists(select 1 from membership m join financial_reconciliation_issues i
         on i.resource_type = 'payout' and i.resource_id = m.payout_id
         where i.state = 'open' and i.impact = 'exception') as "hasOpenExceptionIssue",
       exists(select 1 from membership m join stripe_payouts p on p.id = m.payout_id
-        where p.status in ('failed', 'canceled')
-          and p.failure_balance_transaction_id is null
-          and (p.reversed_by_provider_payout_id is null or not exists (
+        where (p.status in ('failed', 'canceled') and p.failure_balance_transaction_id is null
+          and p.reversed_by_provider_payout_id is null)
+          or (p.reversed_by_provider_payout_id is not null and not exists (
             select 1 from stripe_payouts reversal
             where reversal.provider_id = p.reversed_by_provider_payout_id
           ))) as "hasMissingPayoutReversal"

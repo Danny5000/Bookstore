@@ -10,6 +10,7 @@ import {
   startOrResumePayoutImport
 } from '$lib/server/commerce/financial/payouts/repository';
 import { reconcileFinancialPayout } from '$lib/server/commerce/financial/payouts/service';
+import { derivePublicFinancialState } from '$lib/server/commerce/financial/state';
 import { createFixtureStripeGateway } from '$lib/server/commerce/stripe/fixture-gateway';
 import {
   auditEvents,
@@ -251,6 +252,55 @@ it('persists bounded pages provisionally and publishes one authoritative members
   }), { correlationId: `payout-membership-failed-${suffix}` });
   expect(await loadCurrentPayoutEvidence(databaseClient.db, [first.balanceTransactionId]))
     .toMatchObject({ hasMissingPayoutReversal: true });
+});
+
+it('reopens a paid payout when reversal linkage appears and never treats it as current paid evidence again', async () => {
+  const suffix = randomUUID();
+  const published = await createPublishableRun(suffix);
+  await publishPayoutMembership(databaseClient.db, {
+    payoutId: published.payout.payoutId,
+    runId: published.run.id,
+    expectedGeneration: 0,
+    correlationId: `payout-reversal-publish-${suffix}`
+  });
+  const reversingProviderPayoutId = `po_financial_reversing_${suffix}`;
+
+  await stagePayoutSnapshot(databaseClient.db, {
+    ...published.payoutSnapshot,
+    reversedByPayoutId: reversingProviderPayoutId
+  }, { correlationId: `payout-reversal-link-${suffix}` });
+
+  const missing = await loadCurrentPayoutEvidence(databaseClient.db, [
+    published.balanceTransactionId
+  ]);
+  expect(missing).toMatchObject({
+    authoritativeMembershipCount: 1,
+    paidAutomaticStandardCompletedCount: 0,
+    hasMissingPayoutReversal: true
+  });
+  expect(derivePublicFinancialState({
+    financialEvidenceStatus: 'fee_reconciled',
+    payoutEvidence: missing
+  })).toBe('exception');
+
+  await stagePayoutSnapshot(databaseClient.db, payoutSnapshotFixture({
+    id: reversingProviderPayoutId,
+    balanceTransactionId: null,
+    originalPayoutId: published.payoutSnapshot.id
+  }), { correlationId: `payout-reversal-import-${suffix}` });
+
+  const complete = await loadCurrentPayoutEvidence(databaseClient.db, [
+    published.balanceTransactionId
+  ]);
+  expect(complete).toMatchObject({
+    authoritativeMembershipCount: 1,
+    paidAutomaticStandardCompletedCount: 0,
+    hasMissingPayoutReversal: false
+  });
+  expect(derivePublicFinancialState({
+    financialEvidenceStatus: 'fee_reconciled',
+    payoutEvidence: complete
+  })).toBe('fee_reconciled');
 });
 
 it('runs one bounded provider page through staging and publication, then replays without a new run', async () => {
