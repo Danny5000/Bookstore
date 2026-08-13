@@ -12,12 +12,23 @@ const forbiddenKeys = new Set([
   'last4',
   'brand',
   'billingdetails',
+  'email',
+  'customer',
+  'card',
+  'paymentmethod',
+  'address',
+  'receipturl',
+  'description',
+  'destination',
+  'metadata',
   'paymentmethoddetails',
-  'clientsecret'
+  'clientsecret',
+  'rawobject',
+  'providermessage'
 ]);
 
-const forbiddenTextKey = /(?:^|[\s,{])(?:["']|\\")?(?:secret|signature|stripeSignature|rawBody|rawEvent|billingAddress|shippingAddress|cardNumber|cardLast4|cardBrand|last4|brand|billing_details|payment_method_details|client_secret)(?:["']|\\")?\s*:/iu;
-const providerSecret = /sk_(?:test|live)_[a-z0-9_-]+|whsec_[a-z0-9_-]+|\b4242\b/iu;
+const forbiddenTextKey = /(?:^|[\s,{])(?:["']|\\")?(?:secret|signature|stripeSignature|rawBody|rawEvent|billingAddress|shippingAddress|cardNumber|cardLast4|cardBrand|last4|brand|email|customer|card|payment_method|billing_details|address|receipt_url|description|destination|metadata|payment_method_details|client_secret|raw_object|provider_message)(?:["']|\\")?\s*:/iu;
+const providerSecret = /(?:sk|rk)_(?:test|live)_[a-z0-9_-]+|whsec_[a-z0-9_-]+|BEGIN PRIVATE KEY|\b4242\b/iu;
 
 export type CommercePrivacySurface =
   | 'account browser'

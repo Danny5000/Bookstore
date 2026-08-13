@@ -27,6 +27,8 @@
     "storage:cleanup:raw": "tsx src/cleanup-storage.ts",
     "storage:cleanup": "node --env-file-if-exists=.env --import tsx src/cleanup-storage.ts",
     "stripe:preflight": "node scripts/stripe-secret-preflight.mjs",
+    "smoke:plan6b-i": "node --import tsx scripts/plan6b-production-smoke.ts",
+    "smoke:plan6b-fixture": "node --import tsx scripts/plan6b-fixture-runtime-probe.ts",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "lint": "eslint .",
     "test": "vitest run",

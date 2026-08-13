@@ -24,8 +24,19 @@ describe('commerce privacy evidence helper', () => {
     'last4',
     'brand',
     'billing_details',
+    'email',
+    'customer',
+    'card',
+    'payment_method',
+    'address',
+    'receipt_url',
+    'description',
+    'destination',
+    'metadata',
     'payment_method_details',
-    'client_secret'
+    'client_secret',
+    'raw_object',
+    'provider_message'
   ])('rejects the sensitive key %s', (key) => {
     expect(() => assertCommercePrivacy('guest browser', { [key]: 'private-value' }))
       .toThrow('Sensitive commerce data detected on guest browser');
@@ -35,7 +46,10 @@ describe('commerce privacy evidence helper', () => {
     for (const value of [
       'sk_test_private',
       'sk_live_private',
+      'rk_test_private',
+      'rk_live_private',
       'whsec_private',
+      '-----BEGIN PRIVATE KEY-----',
       '4242',
       'customer-private@example.com'
     ]) {

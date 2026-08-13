@@ -31,6 +31,7 @@ import type { DatabaseTransaction } from '$lib/server/db/transaction';
 import { databaseClient } from './database';
 
 const fixtureTime = new Date('2026-08-01T00:00:00.000Z');
+const LOCK_PROBE_REPETITIONS = [1, 2, 3] as const;
 
 interface Deferred<T> {
   readonly promise: Promise<T>;
@@ -468,7 +469,14 @@ async function mutateEntitlement(
   });
 }
 
-describe('financial lock ordering', () => {
+describe('financial lock repetition contract', () => {
+  it('runs each deterministic topology repeatedly within a small fixed bound', () => {
+    expect(LOCK_PROBE_REPETITIONS.length).toBeGreaterThan(1);
+    expect(LOCK_PROBE_REPETITIONS.length).toBeLessThanOrEqual(3);
+  });
+});
+
+describe.each(LOCK_PROBE_REPETITIONS)('financial lock ordering (repetition %i)', () => {
   it('keeps payout-impact source work behind the payment purchase graph before payout locks', async () => {
     const source = snapshot({});
     const purchase = await createPurchaseFixture(source.sourceId);
