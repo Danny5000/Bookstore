@@ -26,13 +26,13 @@ import { allocateFeeDetails, basePlan } from '../allocations/common';
 import { buildFailedRefundAllocationPlan, buildRefundAllocationPlan } from '../allocations/refund';
 import {
   loadCurrentEffectiveAllocationProjection,
-  persistFinancialAllocationPlanLocked,
   persistFinancialAllocationReplayPlanLocked
 } from '../allocations/repository';
 import type { ClassifiedFeeDetail, EarlierFinalizedRefundComponent } from '../allocations/types';
 import {
   FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
-  FINANCIAL_CLASSIFIER_VERSION
+  FINANCIAL_CLASSIFIER_VERSION,
+  FINANCIAL_REPLAY_ID
 } from '../constants';
 import { PermanentFinancialError, RetryableFinancialError } from '../errors';
 import { observeFinancialIssue, resolveFinancialIssueAfterRecompute } from '../issues';
@@ -135,7 +135,8 @@ export type LockedRefundProjectionReplayResult =
 interface RefundProjectionVersionTarget {
   readonly classifierVersion: number;
   readonly allocationAlgorithmVersion: number;
-  readonly replayId: string | null;
+  readonly replayId: string;
+  readonly mode: 'ordinary' | 'replay';
 }
 
 interface PersistedRefundProjectionPlan {
@@ -737,7 +738,7 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
         );
         const primaryCurrent = await loadCurrentStoredPlans(projectionTx, input.refundId, primary.id);
         const primaryMode = hasFinalizedAttribution ? 'finalized' : failure ? 'account' : 'unresolved';
-        const replaySuffix = target.replayId === null ? '' : `:replay:${target.replayId}`;
+        const replaySuffix = `:replay:${target.replayId}`;
         const primaryPrefix = `refund:${input.refundId}:${primary.id}:${primaryMode}${replaySuffix}`;
         const metadata = {
           sourceKind: 'refund' as const,
@@ -839,12 +840,14 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
             classificationVersion: target.classifierVersion,
             correlationId: input.correlationId
           } as const;
-          const stored = target.replayId === null
-            ? await persistFinancialAllocationPlanLocked(projectionTx, persistInput)
-            : await persistFinancialAllocationReplayPlanLocked(projectionTx, persistInput, {
-                classifierVersion: target.classifierVersion,
-                allocationAlgorithmVersion: target.allocationAlgorithmVersion
-              });
+          const stored = await persistFinancialAllocationReplayPlanLocked(
+            projectionTx,
+            persistInput,
+            {
+              classifierVersion: target.classifierVersion,
+              allocationAlgorithmVersion: target.allocationAlgorithmVersion
+            }
+          );
           persisted.push({ ...stored, plan });
         }
         if (failure) {
@@ -882,17 +885,19 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
               classificationVersion: target.classifierVersion,
               correlationId: input.correlationId
             } as const;
-            const stored = target.replayId === null
-              ? await persistFinancialAllocationPlanLocked(projectionTx, persistInput)
-              : await persistFinancialAllocationReplayPlanLocked(projectionTx, persistInput, {
-                  classifierVersion: target.classifierVersion,
-                  allocationAlgorithmVersion: target.allocationAlgorithmVersion
-                });
+            const stored = await persistFinancialAllocationReplayPlanLocked(
+              projectionTx,
+              persistInput,
+              {
+                classifierVersion: target.classifierVersion,
+                allocationAlgorithmVersion: target.allocationAlgorithmVersion
+              }
+            );
             persisted.push({ ...stored, plan });
           }
         }
 
-        if (target.replayId !== null) {
+        if (target.mode === 'replay') {
           return { kind: 'replay' as const, persisted };
         }
 
@@ -938,7 +943,7 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
   })();
 
   if (outcome.kind === 'replay') {
-    if (target.replayId === null) {
+    if (target.mode !== 'replay') {
       throw new PermanentFinancialError('source_linkage_mismatch');
     }
     return {
@@ -956,7 +961,7 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
       }))
     };
   }
-  if (target.replayId !== null) {
+  if (target.mode === 'replay') {
     if (outcome.kind === 'pending') {
       return {
         status: 'exception', refundId: input.refundId,
@@ -1033,7 +1038,8 @@ export async function recomputeLockedRefundFinancialProjection(
   return recomputeLockedRefundFinancialProjectionAtVersion(transaction, input, {
     classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
     allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
-    replayId: null
+    replayId: FINANCIAL_REPLAY_ID,
+    mode: 'ordinary'
   }) as Promise<RefundFinancialRecomputeResult>;
 }
 
@@ -1048,7 +1054,10 @@ export async function recomputeLockedRefundFinancialProjectionForVersion(
   target: LockedRefundProjectionReplayVersion
 ): Promise<LockedRefundProjectionReplayResult> {
   assertLockedRefundProjectionReplayVersion(target);
-  return recomputeLockedRefundFinancialProjectionAtVersion(transaction, input, target) as
+  return recomputeLockedRefundFinancialProjectionAtVersion(transaction, input, {
+    ...target,
+    mode: 'replay'
+  }) as
     Promise<LockedRefundProjectionReplayResult>;
 }
 

@@ -17,11 +17,12 @@ import type { DatabaseTransaction } from '$lib/server/db/transaction';
 import { buildChargeAllocationPlan } from '../allocations/charge';
 import {
   loadCurrentEffectiveAllocationProjection,
-  persistFinancialAllocationPlanLocked
+  persistFinancialAllocationReplayPlanLocked
 } from '../allocations/repository';
 import {
   FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
-  FINANCIAL_CLASSIFIER_VERSION
+  FINANCIAL_CLASSIFIER_VERSION,
+  FINANCIAL_REPLAY_ID
 } from '../constants';
 import { PermanentFinancialError, RetryableFinancialError } from '../errors';
 import { observeFinancialIssue, resolveFinancialIssueAfterRecompute } from '../issues';
@@ -103,6 +104,15 @@ export interface CanonicalPaymentPurchaseLockInput {
 
 type QueryResult = { rows?: unknown[] };
 
+interface CurrentPaymentAllocationTip {
+  readonly id: string;
+  readonly allocationIdentity: string;
+  readonly sourceKind: string;
+  readonly sourceId: string;
+  readonly basis: 'gross_amount' | 'fee';
+  readonly supersedesSetId: string | null;
+}
+
 async function rows(tx: DatabaseTransaction, query: SQL): Promise<unknown[]> {
   return ((await tx.execute(query)) as QueryResult).rows ?? [];
 }
@@ -113,6 +123,16 @@ function invalidPayload(): never {
 
 function stateChanged(): never {
   throw new RetryableFinancialError('state_changed');
+}
+
+function predecessorForCurrentVersion(
+  current: CurrentPaymentAllocationTip | undefined,
+  desiredIdentity: string
+): string | null {
+  if (!current) return null;
+  return current.allocationIdentity === desiredIdentity
+    ? current.supersedesSetId
+    : current.id;
 }
 
 function throwIfAborted(signal: AbortSignal): void {
@@ -550,22 +570,56 @@ export async function reconcilePaymentFinancialSource(
             if (!component) throw new PermanentFinancialError('unsupported_provider_evidence');
             return { amountMinor: -row.amountMinor, component };
           });
+          const allocationIdentityPrefix =
+            `payment:${routing.id}:${staged.balanceTransactionId}:replay:${FINANCIAL_REPLAY_ID}`;
+          const currentRows = await rows(projectionTx, sql`
+            select current.id, current.allocation_identity as "allocationIdentity",
+              current.source_kind as "sourceKind", current.source_internal_id as "sourceId",
+              current.basis, current.supersedes_set_id as "supersedesSetId"
+            from financial_allocation_sets current
+            where current.balance_transaction_id = ${staged.balanceTransactionId}
+              and not exists (
+                select 1 from financial_allocation_sets successor
+                where successor.supersedes_set_id = current.id
+              )
+            order by current.basis, current.id
+          `) as CurrentPaymentAllocationTip[];
+          if (currentRows.length > 2 || currentRows.some((row) =>
+            row.sourceKind !== 'payment' || row.sourceId !== routing.id ||
+            !['gross_amount', 'fee'].includes(row.basis)) ||
+            new Set(currentRows.map((row) => row.basis)).size !== currentRows.length) {
+            throw new PermanentFinancialError('source_linkage_mismatch');
+          }
+          const currentByBasis = new Map(currentRows.map((row) => [row.basis, row]));
           const { plans } = buildChargeAllocationPlan({
             sourceKind: 'payment', sourceId: routing.id, balanceTransactionId: staged.balanceTransactionId,
-            allocationIdentityPrefix: `payment:${routing.id}:${staged.balanceTransactionId}`,
+            allocationIdentityPrefix,
             settlementCurrency: balance.currency, amountMinor: balance.amountMinor, feeMinor: balance.feeMinor,
             netMinor: balance.netMinor, sourceFingerprint: lockedBalance.fingerprintSha256,
             algorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
-            supersedesGrossSetId: null, supersedesFeeSetId: null,
+            supersedesGrossSetId: predecessorForCurrentVersion(
+              currentByBasis.get('gross_amount'), `${allocationIdentityPrefix}:gross`
+            ),
+            supersedesFeeSetId: predecessorForCurrentVersion(
+              currentByBasis.get('fee'), `${allocationIdentityPrefix}:fee`
+            ),
             items: facts.orderItems.map((item) => ({ orderItemId: item.id,
               subtotalMinor: item.unitSubtotalMinor, taxMinor: item.taxMinor!, presentmentCurrency: item.currency })),
             feeDetails
           });
           const persisted = [] as Array<{ setId: string; disposition: 'inserted' | 'unchanged' }>;
-          for (const plan of plans) persisted.push(await persistFinancialAllocationPlanLocked(projectionTx, {
-            plan, sourceKind: 'payment', sourceId: routing.id,
-            classificationVersion: FINANCIAL_CLASSIFIER_VERSION, correlationId: input.correlationId
-          }));
+          for (const plan of plans) persisted.push(await persistFinancialAllocationReplayPlanLocked(
+            projectionTx,
+            {
+              plan, sourceKind: 'payment', sourceId: routing.id,
+              classificationVersion: FINANCIAL_CLASSIFIER_VERSION,
+              correlationId: input.correlationId
+            },
+            {
+              classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+              allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
+            }
+          ));
           const projections = await loadCurrentEffectiveAllocationProjection(projectionTx, {
             balanceTransactionIds: [staged.balanceTransactionId]
           });

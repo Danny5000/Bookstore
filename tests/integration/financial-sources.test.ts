@@ -119,6 +119,10 @@ describe('payment financial source', () => {
 
     const sets = await databaseClient.db.select().from(financialAllocationSets)
       .where(eq(financialAllocationSets.sourceInternalId, fixture.payment.id));
+    expect(sets.map((set) => set.allocationIdentity).sort()).toEqual([
+      `payment:${fixture.payment.id}:${sets[0]!.balanceTransactionId}:replay:c1-a1:fee`,
+      `payment:${fixture.payment.id}:${sets[0]!.balanceTransactionId}:replay:c1-a1:gross`
+    ].sort());
     const allocations = await databaseClient.db.select({ effectMinor: financialItemAllocations.effectMinor })
       .from(financialItemAllocations).innerJoin(financialAllocationSets, eq(
         financialAllocationSets.id, financialItemAllocations.allocationSetId

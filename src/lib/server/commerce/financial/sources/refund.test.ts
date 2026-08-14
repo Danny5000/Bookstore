@@ -188,7 +188,11 @@ function projectionTransaction(input: {
 }
 
 function persistedPlans(): FinancialAllocationPlan[] {
-  return vi.mocked(persistFinancialAllocationPlanLocked).mock.calls.map((call) => call[1].plan);
+  const replayCalls = vi.mocked(persistFinancialAllocationReplayPlanLocked).mock.calls;
+  const calls = replayCalls.length > 0
+    ? replayCalls.map((call) => call[1])
+    : vi.mocked(persistFinancialAllocationPlanLocked).mock.calls.map((call) => call[1]);
+  return calls.map((call) => call.plan);
 }
 
 function routingDatabase(trace: string[]): Database {
@@ -665,6 +669,13 @@ describe('recomputeLockedRefundFinancialProjection', () => {
     expect(fee?.items).toEqual([expect.objectContaining({
       orderItemId: itemId, component: 'refund_fee', effectMinor: -10
     })]);
+    expect(persistFinancialAllocationPlanLocked).not.toHaveBeenCalled();
+    expect(persistFinancialAllocationReplayPlanLocked).toHaveBeenCalledTimes(2);
+    for (const [, persistInput, authorized] of
+      vi.mocked(persistFinancialAllocationReplayPlanLocked).mock.calls) {
+      expect(authorized).toEqual({ classifierVersion: 1, allocationAlgorithmVersion: 1 });
+      expect(persistInput.plan.allocationIdentity).toContain(':replay:c1-a1:');
+    }
     expect(observeFinancialIssue).not.toHaveBeenCalled();
   });
 
@@ -746,7 +757,7 @@ describe('recomputeLockedRefundFinancialProjection', () => {
     expect(reversalGross).toMatchObject({
       balanceTransactionId: failureBalanceId, basis: 'gross_amount', scope: 'account',
       expectedEffectMinor: 500,
-      reversalOfSetId: '00000000-0000-4000-8000-000000000400',
+      reversalOfSetId: '00000000-0000-4000-8000-000000000500',
       items: []
     });
     expect(reversalFee).toMatchObject({
@@ -820,7 +831,7 @@ describe('recomputeLockedRefundFinancialProjection', () => {
       basis: 'gross_amount',
       scope: 'title',
       expectedEffectMinor: 400,
-      reversalOfSetId: '00000000-0000-4000-8000-000000000400',
+      reversalOfSetId: '00000000-0000-4000-8000-000000000500',
       items: [
         expect.objectContaining({
           orderItemId: itemId,
