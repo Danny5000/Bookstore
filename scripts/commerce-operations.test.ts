@@ -15,6 +15,7 @@ const stripePreflightPath = fileURLToPath(
 const restoreVerifierWitnessPath = fileURLToPath(
   new URL('./execute-financial-restore-verifier.ts', import.meta.url)
 );
+const withTestDatabasePath = fileURLToPath(new URL('./with-test-database.ts', import.meta.url));
 
 function runStripePreflight(overrides: NodeJS.ProcessEnv = {}) {
   const environment = { ...process.env };
@@ -717,7 +718,14 @@ describe('commerce operations contract', () => {
       'credential_authority_invalid_pending_reset',
       'financial_projection_singleton',
       'financial_projection_tip_ambiguity',
-      'financial_classification_decision_ambiguity'
+      'financial_classification_decision_ambiguity',
+      'pending_replay_child_count_mismatch',
+      'pending_replay_child_version_mismatch',
+      'pending_replay_child_incomplete',
+      'pending_replay_child_retry_exhausted',
+      'pending_replay_child_permanent',
+      'refund_component_chronology_capacity',
+      'refund_component_deterministic_split'
     ]) {
       expect(financialVerifier).toContain(`'${checkName}'`);
     }
@@ -870,6 +878,32 @@ describe('commerce operations contract', () => {
     expect(malformedPort.stderr).toContain('[restore-verifier] DATABASE_PORT is invalid');
     expect(malformedPort.stderr).not.toContain('ECONNREFUSED');
   }, 20_000);
+
+  it('executes payout, replay-child, and refund-component verifier witnesses in PostgreSQL', () => {
+    const result = spawnSync(
+      process.execPath,
+      [
+        '--import',
+        'tsx',
+        withTestDatabasePath,
+        process.execPath,
+        '--import',
+        'tsx',
+        restoreVerifierWitnessPath,
+        '--exercise-financial-invariant-witnesses'
+      ],
+      {
+        cwd: new URL('.', root),
+        encoding: 'utf8',
+        env: process.env,
+        timeout: 120_000
+      }
+    );
+    expect(`${result.stdout}${result.stderr}`).toContain(
+      '[restore-verifier] payout, replay-child, and refund-component witnesses passed'
+    );
+    expect(result.status).toBe(0);
+  }, 130_000);
 
   it('allows only inert fail-closed psql meta-commands in executable restore SQL', async () => {
     const scripts = await Promise.all([

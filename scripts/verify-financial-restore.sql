@@ -394,6 +394,86 @@ with fee_sums as (
     sum(delta_minor)::bigint as delta_minor
   from refund_reporting_correction_items
   group by correction_set_id, domain, source_allocation_set_id, currency
+), refund_component_sequence as (
+  select c.id as component_id, ra.id as allocation_id,
+    ra.amount_minor::bigint as allocation_minor,
+    r.id as refund_id, r.status as refund_status, r.currency as refund_currency,
+    r.provider_created_at, r.stripe_refund_id, p.order_id as payment_order_id,
+    oi.id as order_item_id, oi.order_id as item_order_id,
+    oi.unit_subtotal_minor::bigint as item_subtotal_minor,
+    oi.tax_minor::bigint as item_tax_minor, oi.total_minor::bigint as item_total_minor,
+    oi.currency as item_currency, c.subtotal_minor::bigint as stored_subtotal_minor,
+    c.tax_minor::bigint as stored_tax_minor, c.total_minor::bigint as stored_total_minor,
+    c.currency as component_currency,
+    coalesce(sum(c.subtotal_minor::bigint) over (
+      partition by ra.order_item_id
+      order by r.provider_created_at, r.stripe_refund_id collate "C", r.id, ra.id
+      rows between unbounded preceding and 1 preceding
+    ), 0::bigint) as prior_subtotal_minor,
+    coalesce(sum(c.tax_minor::bigint) over (
+      partition by ra.order_item_id
+      order by r.provider_created_at, r.stripe_refund_id collate "C", r.id, ra.id
+      rows between unbounded preceding and 1 preceding
+    ), 0::bigint) as prior_tax_minor
+  from refund_allocation_components c
+  join refund_allocations ra on ra.id = c.refund_allocation_id
+  join refunds r on r.id = ra.refund_id
+  join payments p on p.id = r.payment_id
+  join order_items oi on oi.id = ra.order_item_id
+), refund_component_capacity as (
+  select *, item_subtotal_minor - prior_subtotal_minor as remaining_subtotal_minor,
+    item_tax_minor - prior_tax_minor as remaining_tax_minor
+  from refund_component_sequence
+), refund_component_ratios as (
+  select *, remaining_subtotal_minor + remaining_tax_minor as remaining_total_minor,
+    (allocation_minor >= 0 and remaining_subtotal_minor >= 0 and remaining_tax_minor >= 0
+      and allocation_minor <= remaining_subtotal_minor + remaining_tax_minor
+      and (allocation_minor = 0 or remaining_subtotal_minor + remaining_tax_minor > 0)
+    ) as capacity_valid
+  from refund_component_capacity
+), refund_component_bases as (
+  select *,
+    case when capacity_valid and allocation_minor = 0 then 0::bigint
+      when capacity_valid then div(
+        allocation_minor * remaining_subtotal_minor, remaining_total_minor
+      )::bigint
+    end as base_subtotal_minor,
+    case when capacity_valid and allocation_minor = 0 then 0::bigint
+      when capacity_valid then div(
+        allocation_minor * remaining_tax_minor, remaining_total_minor
+      )::bigint
+    end as base_tax_minor,
+    case when capacity_valid and allocation_minor = 0 then 0::bigint
+      when capacity_valid then mod(
+        allocation_minor * remaining_subtotal_minor, remaining_total_minor
+      )
+    end as subtotal_remainder,
+    case when capacity_valid and allocation_minor = 0 then 0::bigint
+      when capacity_valid then mod(
+        allocation_minor * remaining_tax_minor, remaining_total_minor
+      )
+    end as tax_remainder
+  from refund_component_ratios
+), refund_component_expected as (
+  select *, allocation_minor - base_subtotal_minor - base_tax_minor as leftover_minor,
+    base_subtotal_minor + case
+      when allocation_minor - base_subtotal_minor - base_tax_minor = 1 and (
+        subtotal_remainder > tax_remainder or (
+          subtotal_remainder = tax_remainder and
+          (order_item_id::text || ':subtotal') collate "C" <
+            (order_item_id::text || ':tax') collate "C"
+        )
+      ) then 1 else 0 end as expected_subtotal_minor,
+    base_tax_minor + case
+      when allocation_minor - base_subtotal_minor - base_tax_minor = 1 and not (
+        subtotal_remainder > tax_remainder or (
+          subtotal_remainder = tax_remainder and
+          (order_item_id::text || ':subtotal') collate "C" <
+            (order_item_id::text || ':tax') collate "C"
+        )
+      ) then 1 else 0 end as expected_tax_minor
+  from refund_component_bases
+  where capacity_valid
 ), conservation_counts as (
   select 'balance_transaction_net_equation' as check_name, count(*)::bigint as violation_count
   from stripe_balance_transactions
@@ -428,6 +508,26 @@ with fee_sums as (
   where c.total_minor <> c.subtotal_minor + c.tax_minor
      or c.total_minor <> ra.amount_minor
      or c.currency <> r.currency
+
+  union all
+  select 'refund_component_chronology_capacity', count(*)::bigint
+  from refund_component_ratios
+  where refund_status <> 'succeeded'
+     or item_tax_minor is null or item_total_minor is null
+     or item_total_minor <> item_subtotal_minor + item_tax_minor
+     or payment_order_id <> item_order_id
+     or refund_currency <> item_currency
+     or refund_currency <> component_currency
+     or stored_subtotal_minor > remaining_subtotal_minor
+     or stored_tax_minor > remaining_tax_minor
+     or capacity_valid is distinct from true
+
+  union all
+  select 'refund_component_deterministic_split', count(*)::bigint
+  from refund_component_expected
+  where leftover_minor not between 0 and 1
+     or stored_subtotal_minor is distinct from expected_subtotal_minor
+     or stored_tax_minor is distinct from expected_tax_minor
 
   union all
   select 'finalized_refund_allocation_shape', count(*)::bigint
@@ -484,7 +584,14 @@ with entry_counts as (
   join stripe_payouts p on p.id = r.payout_id
   where r.generation > p.financial_generation
      or (r.state in ('collecting', 'publishable') and r.generation <> p.financial_generation)
-     or (r.state = 'published' and r.generation >= p.financial_generation)
+     or (r.state = 'published' and r.generation = p.financial_generation and not exists (
+       select 1
+       from payout_import_runs history
+       where history.payout_id = r.payout_id
+         and history.id <> r.id
+         and history.state = 'published'
+         and history.generation::bigint + 1 < r.generation::bigint
+     ))
 
   union all
   select 'published_membership_count', count(*)::bigint
@@ -550,7 +657,36 @@ from payout_checks
 order by check_name;
 
 insert into restore_financial_checks (check_name, violation_count)
-with scan_checks as (
+with pending_replay_children as (
+  select version.pending_scan_run_id, version.pending_classifier_version,
+    version.pending_allocation_algorithm_version, version.pending_replay_id,
+    replay.id as replay_run_id, replay.enqueued_count,
+    children.child_count, children.invalid_count, children.incomplete_count,
+    children.exhausted_count, children.permanent_count
+  from financial_projection_versions version
+  left join financial_scan_runs replay on replay.id = version.pending_scan_run_id
+  left join lateral (
+    select count(*)::bigint as child_count,
+      count(*) filter (where
+        child.payload ->> 'classifierVersion' is distinct from
+          version.pending_classifier_version::text
+        or child.payload ->> 'allocationAlgorithmVersion' is distinct from
+          version.pending_allocation_algorithm_version::text
+        or child.payload ->> 'replayId' is distinct from version.pending_replay_id
+      )::bigint as invalid_count,
+      count(*) filter (where child.status <> 'succeeded')::bigint as incomplete_count,
+      count(*) filter (where
+        child.status = 'failed' and child.attempts >= child.max_attempts
+      )::bigint as exhausted_count,
+      count(*) filter (where
+        child.status = 'failed' and child.attempts < child.max_attempts
+      )::bigint as permanent_count
+    from jobs child
+    where child.type = 'commerce.financial-classification'
+      and child.payload ->> 'scanRunId' = version.pending_scan_run_id::text
+  ) children on true
+  where version.singleton = true and version.pending_scan_run_id is not null
+), scan_checks as (
   select 'scan_root_job_missing' as check_name, count(*)::bigint as violation_count
   from financial_scan_runs r
   where not exists (
@@ -744,6 +880,32 @@ with scan_checks as (
       or replay.replay_id is distinct from version.pending_replay_id)
 
   union all
+  select 'pending_replay_child_count_mismatch', count(*)::bigint
+  from pending_replay_children pending
+  where pending.replay_run_id is not null
+    and pending.child_count < pending.enqueued_count
+
+  union all
+  select 'pending_replay_child_version_mismatch',
+    coalesce(sum(invalid_count), 0)::bigint
+  from pending_replay_children
+
+  union all
+  select 'pending_replay_child_incomplete',
+    coalesce(sum(incomplete_count), 0)::bigint
+  from pending_replay_children
+
+  union all
+  select 'pending_replay_child_retry_exhausted',
+    coalesce(sum(exhausted_count), 0)::bigint
+  from pending_replay_children
+
+  union all
+  select 'pending_replay_child_permanent',
+    coalesce(sum(permanent_count), 0)::bigint
+  from pending_replay_children
+
+  union all
   select 'failed_running_scan_retry_exhausted', count(*)::bigint
   from financial_scan_runs r
   join jobs j on j.deduplication_key = (case
@@ -776,6 +938,18 @@ where replay.kind = 'classification_replay'
     or replay.cursor_digest_sha256 is not null
   );
 
+select check_name, violation_count
+from restore_financial_checks
+where violation_count <> 0
+  and check_name in (
+    'failed_running_scan_retry_exhausted',
+    'failed_running_scan_permanent',
+    'pending_replay_child_incomplete',
+    'pending_replay_child_retry_exhausted',
+    'pending_replay_child_permanent'
+  )
+order by check_name collate "C";
+
 do $restore_verifier$
 declare
   total_violations bigint;
@@ -788,7 +962,10 @@ begin
   where violation_count <> 0
     and check_name not in (
       'failed_running_scan_retry_exhausted',
-      'failed_running_scan_permanent'
+      'failed_running_scan_permanent',
+      'pending_replay_child_incomplete',
+      'pending_replay_child_retry_exhausted',
+      'pending_replay_child_permanent'
     );
 
   if total_violations <> 0 then
