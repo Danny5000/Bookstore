@@ -2,7 +2,10 @@ import type { SQL } from 'drizzle-orm';
 import { describe, expect, it, vi } from 'vitest';
 import type { JobRow } from '$lib/server/db/schema';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
-import { createFinancialSourceScanJob } from '$lib/server/commerce/financial/jobs';
+import {
+  createFinancialPayoutContinuationJob,
+  createFinancialSourceScanJob
+} from '$lib/server/commerce/financial/jobs';
 import { enqueueActiveEntityJob } from './repository';
 
 const SOURCE_ID = '00000000-0000-4000-8000-000000001611';
@@ -24,6 +27,7 @@ function jobRow(overrides: Partial<JobRow> = {}): JobRow {
     lockedAt: null,
     lockedBy: null,
     lastError: null,
+    rerunRequestedAt: null,
     completedAt: null,
     createdAt: NOW,
     updatedAt: NOW,
@@ -121,9 +125,10 @@ describe('active entity jobs', () => {
     expect(database.calls).toHaveLength(2);
   });
 
-  it('uses a JSON subset to return the existing pending or running entity job', async () => {
+  it('uses a JSON subset and marks a running entity for one durable rerun', async () => {
     const active = jobRow({ status: 'running', attempts: 1, lockedAt: NOW, lockedBy: 'worker-a' });
-    const database = transaction([[], [], [active]]);
+    const marked = { ...active, rerunRequestedAt: NOW };
+    const database = transaction([[], [], [active], [marked]]);
     const scan = createFinancialSourceScanJob({
       sourceKind: 'refund',
       sourceId: SOURCE_ID,
@@ -134,13 +139,17 @@ describe('active entity jobs', () => {
     await expect(enqueueActiveEntityJob(database.transaction, {
       ...scan,
       activeEntity: { sourceKind: scan.payload.sourceKind, sourceId: scan.payload.sourceId }
-    })).resolves.toEqual(active);
+    })).resolves.toEqual(marked);
 
     const activeQuery = rendered(database.calls[2]!);
     expect(activeQuery.sql).toContain("status in ('pending', 'running')");
     expect(activeQuery.sql).toContain('payload @>');
+    expect(activeQuery.sql).toContain(
+      "payload -> 'trigger' ->> 'kind' is distinct from 'continuation'"
+    );
     expect(activeQuery.sql).toContain('order by created_at, id');
     expect(activeQuery.params).toContain(JSON.stringify({ sourceId: SOURCE_ID, sourceKind: 'refund' }));
+    expect(rendered(database.calls[3]!).sql).toContain('rerun_requested_at');
   });
 
   it('derives one code-point-canonical advisory identity independent of object insertion order', async () => {
@@ -213,6 +222,20 @@ describe('active entity jobs', () => {
       { ...sourceInput(), privateField: 'private-canary' }
     ];
     for (const input of cases) await expectSafeInvalid(input);
+  });
+
+  it('rejects immutable-cursor payout continuations from the active-root API', async () => {
+    const continuation = createFinancialPayoutContinuationJob({
+      providerPayoutId: 'po_repository_continuation_1611',
+      payoutId: '00000000-0000-4000-8000-000000001614',
+      runId: '00000000-0000-4000-8000-000000001615',
+      payoutGeneration: 0,
+      cursorDigestSha256: 'b'.repeat(64)
+    });
+    await expectSafeInvalid({
+      ...continuation,
+      activeEntity: { providerPayoutId: continuation.payload.providerPayoutId }
+    });
   });
 
   it('accepts every canonical UUID version accepted by Task 7', async () => {

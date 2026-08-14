@@ -2,6 +2,7 @@ import { eq, sql } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import { jobs } from '$lib/server/db/schema';
 import {
+  createFinancialPayoutContinuationJob,
   createFinancialPayoutEventJob,
   createFinancialPayoutScanJob,
   createFinancialSourceEventJob,
@@ -83,6 +84,21 @@ describe('PostgreSQL active financial entity jobs', () => {
     );
     expect(whileRunning.id).toBe(claimed?.id);
     expect(await databaseClient.db.select().from(jobs)).toHaveLength(1);
+    expect((await databaseClient.db.select().from(jobs))[0]).toMatchObject({
+      status: 'running', rerunRequestedAt: expect.any(Date)
+    });
+
+    await expect(repository.complete(claimed!.id, 'worker-a')).resolves.toBe(true);
+    expect((await databaseClient.db.select().from(jobs))[0]).toMatchObject({
+      status: 'pending', attempts: 0, rerunRequestedAt: null, completedAt: null
+    });
+    const rerun = await repository.claimNext('worker-b');
+    expect(rerun?.id).toBe(claimed?.id);
+    await expect(repository.complete(rerun!.id, 'worker-b')).resolves.toBe(true);
+    expect((await databaseClient.db.select().from(jobs))[0]).toMatchObject({
+      status: 'succeeded', attempts: 1, rerunRequestedAt: null,
+      completedAt: expect.any(Date)
+    });
   });
 
   it('keeps exact terminal replay permanent but permits a distinct later generation', async () => {
@@ -116,6 +132,81 @@ describe('PostgreSQL active financial entity jobs', () => {
     expect(await databaseClient.db.select().from(jobs)).toHaveLength(2);
   });
 
+  it('turns a distinct trigger arriving before failure into one fresh attempt', async () => {
+    const event = sourceInput(createFinancialSourceEventJob({
+      sourceKind: 'dispute', sourceId: SOURCE_ID,
+      providerEventId: 'evt_active_failure_1621'
+    }));
+    const queued = await databaseClient.db.transaction((transaction) =>
+      enqueueActiveEntityJob(transaction, event)
+    );
+    const repository = createPostgresJobRepository(databaseClient.db, applicationConfig.jobs);
+    expect((await repository.claimNext('worker-failure-a'))?.id).toBe(queued.id);
+
+    await databaseClient.db.transaction((transaction) =>
+      enqueueActiveEntityJob(transaction, sourceInput(createFinancialSourceScanJob({
+        sourceKind: 'dispute', sourceId: SOURCE_ID,
+        scanRunId: SCAN_RUN_ID, scanGenerationHour: HOUR
+      })))
+    );
+    await expect(repository.fail(
+      queued.id,
+      'worker-failure-a',
+      'safe current-attempt failure',
+      false
+    )).resolves.toBe(true);
+
+    expect((await databaseClient.db.select().from(jobs))[0]).toMatchObject({
+      status: 'pending', attempts: 0, rerunRequestedAt: null,
+      completedAt: null, lastError: null
+    });
+    const rerun = await repository.claimNext('worker-failure-b');
+    expect(rerun?.id).toBe(queued.id);
+    await expect(repository.complete(rerun!.id, 'worker-failure-b')).resolves.toBe(true);
+  });
+
+  it('gives a dirty rerun a fresh retry budget when reclaiming an expired lease', async () => {
+    let currentTime = new Date('2026-08-14T12:00:00.000Z');
+    const event = sourceInput(createFinancialSourceEventJob({
+      sourceKind: 'payment', sourceId: SOURCE_ID,
+      providerEventId: 'evt_active_expired_1621'
+    }));
+    const queued = await databaseClient.db.transaction((transaction) =>
+      enqueueActiveEntityJob(transaction, event)
+    );
+    const repository = createPostgresJobRepository(
+      databaseClient.db,
+      applicationConfig.jobs,
+      () => currentTime
+    );
+    expect((await repository.claimNext('worker-expired-a'))?.id).toBe(queued.id);
+    await databaseClient.db.update(jobs)
+      .set({ attempts: event.maxAttempts - 1, lastError: 'old attempt history' })
+      .where(eq(jobs.id, queued.id));
+    await databaseClient.db.transaction((transaction) =>
+      enqueueActiveEntityJob(transaction, sourceInput(createFinancialSourceScanJob({
+        sourceKind: 'payment', sourceId: SOURCE_ID,
+        scanRunId: SCAN_RUN_ID, scanGenerationHour: HOUR
+      })))
+    );
+
+    currentTime = new Date(currentTime.getTime() + applicationConfig.jobs.leaseMs + 1);
+    const rerun = await repository.claimNext('worker-expired-b');
+    expect(rerun).toMatchObject({ id: queued.id, attempts: 1 });
+    expect((await databaseClient.db.select().from(jobs))[0]).toMatchObject({
+      status: 'running', attempts: 1, lastError: null, rerunRequestedAt: null
+    });
+    await expect(repository.fail(
+      queued.id,
+      'worker-expired-b',
+      'fresh transient failure',
+      true
+    )).resolves.toBe(true);
+    expect((await databaseClient.db.select().from(jobs))[0]).toMatchObject({
+      status: 'pending', attempts: 1, lastError: 'fresh transient failure'
+    });
+  });
+
   it('guards payout entities by provider ID across distinct event and scan keys', async () => {
     const event = payoutInput(createFinancialPayoutEventJob({
       providerPayoutId: 'po_active_1621', providerEventId: 'evt_active_payout_1621'
@@ -130,6 +221,28 @@ describe('PostgreSQL active financial entity jobs', () => {
     ]);
     expect(second.id).toBe(first.id);
     expect(await databaseClient.db.select().from(jobs)).toHaveLength(1);
+  });
+
+  it('keeps a later payout root distinct from an immutable-cursor continuation', async () => {
+    const providerPayoutId = 'po_active_continuation_1621';
+    const continuation = createFinancialPayoutContinuationJob({
+      providerPayoutId,
+      payoutId: '00000000-0000-4000-8000-000000001623',
+      runId: '00000000-0000-4000-8000-000000001624',
+      payoutGeneration: 0,
+      cursorDigestSha256: 'a'.repeat(64)
+    });
+    const continuationRow = await enqueueJob(databaseClient.db, continuation);
+
+    const root = await databaseClient.db.transaction((transaction) =>
+      enqueueActiveEntityJob(transaction, payoutInput(createFinancialPayoutEventJob({
+        providerPayoutId,
+        providerEventId: 'evt_active_continuation_1621'
+      })))
+    );
+
+    expect(root.id).not.toBe(continuationRow.id);
+    expect(await databaseClient.db.select().from(jobs)).toHaveLength(2);
   });
 
   it('does not change permanent dedupe or parallel behavior for nonfinancial jobs', async () => {

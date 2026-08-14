@@ -7,7 +7,8 @@ import { processFinancialScanJob } from './service';
 
 const repository = vi.hoisted(() => ({
   start: vi.fn(), resume: vi.fn(), sources: vi.fn(), payouts: vi.fn(),
-  impact: vi.fn(), classifications: vi.fn(), commit: vi.fn()
+  impact: vi.fn(), classifications: vi.fn(), freezePayoutWindow: vi.fn(),
+  completeEmptyReplay: vi.fn(), commit: vi.fn()
 }));
 const payoutRepository = vi.hoisted(() => ({ stage: vi.fn() }));
 vi.mock('./repository', () => ({
@@ -17,6 +18,8 @@ vi.mock('./repository', () => ({
   loadIncompletePayoutRunPage: repository.payouts,
   loadPayoutImpactSourcePage: repository.impact,
   loadClassificationReplayPage: repository.classifications,
+  freezePayoutDiscoveryWindow: repository.freezePayoutWindow,
+  completeEmptyFinancialReplay: repository.completeEmptyReplay,
   commitFinancialScanPage: repository.commit
 }));
 vi.mock('../payouts/repository', () => ({ stagePayoutSnapshot: payoutRepository.stage }));
@@ -31,6 +34,7 @@ function run(overrides: Partial<FinancialScanRunRow> = {}): FinancialScanRunRow 
     rootKey: 'commerce.financial-scan:2026-08-12T19:00:00.000Z',
     kind: 'hourly', phase: 'source_page', state: 'running',
     classifierVersion: null, allocationAlgorithmVersion: null, replayId: null,
+    payoutDiscoveryCreatedGte: null, payoutDiscoveryCreatedLt: null,
     checkpoint: null, cursorDigestSha256: null,
     processedCount: 0, enqueuedCount: 0, pageCount: 0, safeOutcome: null,
     startedAt: new Date('2026-08-12T19:00:00.000Z'),
@@ -42,12 +46,21 @@ function run(overrides: Partial<FinancialScanRunRow> = {}): FinancialScanRunRow 
 describe('financial scan page service', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    repository.freezePayoutWindow.mockResolvedValue({
+      createdGte: Math.floor(new Date('2026-08-09T19:00:00.000Z').getTime() / 1000),
+      createdLt: Math.floor(new Date('2026-08-12T20:00:00.000Z').getTime() / 1000)
+    });
     repository.commit.mockImplementation(async (_database, input) => run({
       phase: input.nextPhase,
       checkpoint: input.nextCheckpoint,
       pageCount: input.expectedPageCount + 1,
       state: input.complete ? 'completed' : 'running',
       completedAt: input.complete ? new Date() : null
+    }));
+    repository.completeEmptyReplay.mockResolvedValue(run({
+      kind: 'classification_replay', phase: 'classification_replay_page', state: 'completed',
+      classifierVersion: 2, allocationAlgorithmVersion: 4, replayId: 'c2-a4',
+      pageCount: 1, safeOutcome: 'completed', completedAt: new Date()
     }));
     payoutRepository.stage.mockResolvedValue({ payoutId, generation: 0, changed: true });
   });
@@ -103,6 +116,11 @@ describe('financial scan page service', () => {
     });
     expect(trace).toEqual(['provider', 'commit']);
     expect(payoutRepository.stage).not.toHaveBeenCalled();
+    expect(repository.freezePayoutWindow).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ id: runId, phase: 'payout_discovery_page' }),
+      '2026-08-12T19:00:00.000Z'
+    );
     expect(gateway.listPayouts).toHaveBeenCalledWith({
       limit: 100,
       createdGte: Math.floor(new Date('2026-08-09T19:00:00.000Z').getTime() / 1000),
@@ -118,11 +136,11 @@ describe('financial scan page service', () => {
 
   it('uses the persisted initial-backfill run kind for the seven-day payout lookback', async () => {
     const earliestPaidAt = new Date('2026-07-01T12:00:00.000Z');
-    const database = {
-      execute: vi.fn(async () => ({
-        rows: [{ createdGte: Math.floor((earliestPaidAt.getTime() - 7 * 86_400_000) / 1000) }]
-      }))
-    } as unknown as Database;
+    const database = {} as Database;
+    repository.freezePayoutWindow.mockResolvedValue({
+      createdGte: Math.floor((earliestPaidAt.getTime() - 7 * 86_400_000) / 1000),
+      createdLt: Math.floor(new Date('2026-08-12T20:00:00.000Z').getTime() / 1000)
+    });
     repository.resume.mockResolvedValue(run({
       rootKey: 'commerce.financial-scan:initial:v1',
       kind: 'initial_backfill',
@@ -139,7 +157,11 @@ describe('financial scan page service', () => {
       }, correlationId: 'scan-initial-backfill', signal: new AbortController().signal
     });
 
-    expect(database.execute).toHaveBeenCalledOnce();
+    expect(repository.freezePayoutWindow).toHaveBeenCalledWith(
+      database,
+      expect.objectContaining({ kind: 'initial_backfill' }),
+      '2026-08-12T19:00:00.000Z'
+    );
     expect(gateway.listPayouts).toHaveBeenCalledWith({
       limit: 100,
       createdGte: Math.floor((earliestPaidAt.getTime() - 7 * 86_400_000) / 1000),
@@ -225,6 +247,30 @@ describe('financial scan page service', () => {
     expect(repository.resume).toHaveBeenCalledOnce();
     expect(repository.classifications).toHaveBeenCalledOnce();
     expect(repository.commit).toHaveBeenCalledOnce();
+  });
+
+  it('atomically activates and completes an empty composite replay', async () => {
+    repository.start.mockResolvedValue(run({
+      rootKey: 'commerce.financial-classification:scan:2:4', kind: 'classification_replay',
+      phase: 'classification_replay_page', classifierVersion: 2,
+      allocationAlgorithmVersion: 4, replayId: 'c2-a4'
+    }));
+    repository.classifications.mockResolvedValue({ data: [], hasMore: false, checkpoint: null });
+
+    await expect(processFinancialScanJob({
+      database: {} as Database, gateway: {} as StripeCommerceGateway, runtimeMode: 'disabled'
+    }, {
+      payload: { kind: 'composite_replay', classifierVersion: 2,
+        allocationAlgorithmVersion: 4, replayId: 'c2-a4' },
+      correlationId: 'scan-empty-replay', signal: new AbortController().signal
+    })).resolves.toEqual({ status: 'completed', runId });
+
+    expect(repository.completeEmptyReplay).toHaveBeenCalledWith(expect.anything(), {
+      runId, expectedCheckpoint: null, expectedPageCount: 0,
+      classifierVersion: 2, allocationAlgorithmVersion: 4,
+      correlationId: 'scan-empty-replay'
+    });
+    expect(repository.commit).not.toHaveBeenCalled();
   });
 
   it('rechecks abort immediately before committing a loaded page', async () => {

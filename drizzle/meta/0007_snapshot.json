@@ -6283,6 +6283,44 @@
       },
       "isRLSEnabled": false
     },
+    "public.financial_payout_discovery_state": {
+      "name": "financial_payout_discovery_state",
+      "schema": "",
+      "columns": {
+        "singleton": {
+          "name": "singleton",
+          "type": "boolean",
+          "primaryKey": true,
+          "notNull": true,
+          "default": true
+        },
+        "covered_through": {
+          "name": "covered_through",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "financial_payout_discovery_state_singleton_true": {
+          "name": "financial_payout_discovery_state_singleton_true",
+          "value": "\"financial_payout_discovery_state\".\"singleton\" = true"
+        }
+      },
+      "isRLSEnabled": false
+    },
     "public.financial_scan_runs": {
       "name": "financial_scan_runs",
       "schema": "",
@@ -6335,6 +6373,18 @@
         "replay_id": {
           "name": "replay_id",
           "type": "varchar(50)",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "payout_discovery_created_gte": {
+          "name": "payout_discovery_created_gte",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "payout_discovery_created_lt": {
+          "name": "payout_discovery_created_lt",
+          "type": "timestamp with time zone",
           "primaryKey": false,
           "notNull": false
         },
@@ -6499,6 +6549,10 @@
         "financial_scan_runs_replay_consistent": {
           "name": "financial_scan_runs_replay_consistent",
           "value": "(\n        \"financial_scan_runs\".\"classifier_version\" is null and \"financial_scan_runs\".\"allocation_algorithm_version\" is null and \"financial_scan_runs\".\"replay_id\" is null\n      ) or (\n        \"financial_scan_runs\".\"classifier_version\" is not null and\n        \"financial_scan_runs\".\"allocation_algorithm_version\" is not null and\n        \"financial_scan_runs\".\"replay_id\" is not null and\n        \"financial_scan_runs\".\"classifier_version\" > 0 and \"financial_scan_runs\".\"allocation_algorithm_version\" > 0 and\n        \"financial_scan_runs\".\"replay_id\" = 'c' || \"financial_scan_runs\".\"classifier_version\"::text || '-a' || \"financial_scan_runs\".\"allocation_algorithm_version\"::text\n      )"
+        },
+        "financial_scan_runs_payout_discovery_window_consistent": {
+          "name": "financial_scan_runs_payout_discovery_window_consistent",
+          "value": "(\n        \"financial_scan_runs\".\"payout_discovery_created_gte\" is null and \"financial_scan_runs\".\"payout_discovery_created_lt\" is null\n      ) or (\n        \"financial_scan_runs\".\"payout_discovery_created_gte\" is not null and\n        \"financial_scan_runs\".\"payout_discovery_created_lt\" is not null and\n        \"financial_scan_runs\".\"payout_discovery_created_gte\" < \"financial_scan_runs\".\"payout_discovery_created_lt\" and\n        \"financial_scan_runs\".\"kind\" in ('initial_backfill', 'hourly')\n      )"
         },
         "financial_scan_runs_lifecycle_consistent": {
           "name": "financial_scan_runs_lifecycle_consistent",
@@ -9210,6 +9264,12 @@
           "primaryKey": false,
           "notNull": false
         },
+        "rerun_requested_at": {
+          "name": "rerun_requested_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
         "completed_at": {
           "name": "completed_at",
           "type": "timestamp with time zone",
@@ -9322,6 +9382,10 @@
         "jobs_terminal_has_completion": {
           "name": "jobs_terminal_has_completion",
           "value": "(\"jobs\".\"status\" in ('succeeded', 'failed')) = (\"jobs\".\"completed_at\" is not null)"
+        },
+        "jobs_rerun_requires_running": {
+          "name": "jobs_rerun_requires_running",
+          "value": "\"jobs\".\"rerun_requested_at\" is null or \"jobs\".\"status\" = 'running'"
         }
       },
       "isRLSEnabled": false

@@ -14,7 +14,8 @@ import {
   createFinancialPayoutRelatedJob
 } from '../jobs';
 import { lockPayoutImportRows } from '../locks';
-import { observeFinancialIssue } from '../issues';
+import { observeFinancialIssue, resolveFinancialIssueAfterRecompute } from '../issues';
+import { enqueueCurrentAccountProjectionsForPayout } from '../ledger';
 import type { CurrentPayoutEvidence } from '../types';
 
 export interface StartPayoutImportInput {
@@ -159,6 +160,43 @@ function sortedRelatedPayoutIds(values: Iterable<string | null>): string[] {
     .sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
 }
 
+function sameSortedIds(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((id, index) => id === right[index]);
+}
+
+async function rejectMembershipConflict(
+  tx: DatabaseTransaction,
+  input: PublishPayoutMembershipInput
+): Promise<{ error: 'payout_membership_conflict'; issueId: string }> {
+  const issue = await observeFinancialIssue(tx, {
+    resourceType: 'payout', resourceId: input.payoutId, safeCode: 'payout_membership_conflict',
+    impact: 'exception', actor: { type: 'system', id: 'financial-worker' },
+    correlationId: input.correlationId
+  });
+  await rows(tx, sql`
+    update payout_import_runs set state = 'exception', safe_outcome = 'payout_membership_conflict',
+      completed_at = now(), updated_at = now() where id = ${input.runId}
+  `);
+  return { error: 'payout_membership_conflict', issueId: issue.id };
+}
+
+async function resolveMembershipConflict(
+  tx: DatabaseTransaction,
+  input: PublishPayoutMembershipInput
+): Promise<void> {
+  const identity = {
+    resourceType: 'payout' as const,
+    resourceId: input.payoutId,
+    safeCode: 'payout_membership_conflict' as const
+  };
+  await resolveFinancialIssueAfterRecompute(tx, {
+    ...identity,
+    proof: { status: 'resolved', ...identity },
+    actor: { type: 'system', id: 'financial-worker' },
+    correlationId: input.correlationId
+  });
+}
+
 async function payoutAudit(
   tx: DatabaseTransaction,
   payoutId: string,
@@ -174,6 +212,71 @@ async function payoutAudit(
       ${correlationId}, ${JSON.stringify(after)}::jsonb
     )
   `);
+}
+
+async function reconcilePayoutReversalIssue(
+  tx: DatabaseTransaction,
+  payoutId: string,
+  snapshot: PayoutSnapshot,
+  failureBalanceTransactionId: string | null,
+  correlationId: string
+): Promise<void> {
+  const referencedReversalExists = snapshot.reversedByPayoutId === null ||
+    (await rows(tx, sql`
+      select 1 from stripe_payouts
+      where provider_id = ${snapshot.reversedByPayoutId}
+        and original_provider_payout_id = ${snapshot.id}
+    `)).length === 1;
+  const incomplete = (['failed', 'canceled'].includes(snapshot.status) &&
+      failureBalanceTransactionId === null && snapshot.reversedByPayoutId === null) ||
+    !referencedReversalExists;
+  const identity = {
+    resourceType: 'payout' as const,
+    resourceId: payoutId,
+    safeCode: 'payout_reversal_incomplete' as const
+  };
+  if (incomplete) {
+    await observeFinancialIssue(tx, {
+      ...identity,
+      impact: 'exception',
+      actor: { type: 'system', id: 'financial-worker' },
+      correlationId
+    });
+    return;
+  }
+  await resolveFinancialIssueAfterRecompute(tx, {
+    ...identity,
+    proof: { status: 'resolved', ...identity },
+    actor: { type: 'system', id: 'financial-worker' },
+    correlationId
+  });
+}
+
+async function resolveReferencedPayoutIssues(
+  tx: DatabaseTransaction,
+  snapshot: PayoutSnapshot,
+  correlationId: string
+): Promise<void> {
+  if (snapshot.originalPayoutId === null) return;
+  const referenced = await rows(tx, sql`
+    select id from stripe_payouts
+    where provider_id = ${snapshot.originalPayoutId}
+      and reversed_by_provider_payout_id = ${snapshot.id}
+    order by id
+  `) as Array<{ id: string }>;
+  for (const payout of referenced) {
+    const identity = {
+      resourceType: 'payout' as const,
+      resourceId: payout.id,
+      safeCode: 'payout_reversal_incomplete' as const
+    };
+    await resolveFinancialIssueAfterRecompute(tx, {
+      ...identity,
+      proof: { status: 'resolved', ...identity },
+      actor: { type: 'system', id: 'financial-worker' },
+      correlationId
+    });
+  }
 }
 
 export async function stagePayoutSnapshot(
@@ -225,6 +328,11 @@ export async function stagePayoutSnapshot(
       await payoutAudit(tx, inserted[0]!.id, 'financial.payout.imported', context.correlationId, {
         generation: 0, status: snapshot.status, reconciliationStatus: snapshot.reconciliationStatus
       });
+      await reconcilePayoutReversalIssue(
+        tx, inserted[0]!.id, snapshot, failureBalanceTransactionId, context.correlationId
+      );
+      await resolveReferencedPayoutIssues(tx, snapshot, context.correlationId);
+      await enqueueCurrentAccountProjectionsForPayout(tx, snapshot.id);
       for (const relatedId of sortedRelatedPayoutIds([
         snapshot.originalPayoutId,
         snapshot.reversedByPayoutId
@@ -263,6 +371,11 @@ export async function stagePayoutSnapshot(
       current.safeFailureCode === snapshot.safeFailureCode;
     if (reportingMatches) {
       await rows(tx, sql`update stripe_payouts set retrieved_at = now() where id = ${payoutId}`);
+      await reconcilePayoutReversalIssue(
+        tx, payoutId, snapshot, failureBalanceTransactionId, context.correlationId
+      );
+      await resolveReferencedPayoutIssues(tx, snapshot, context.correlationId);
+      await enqueueCurrentAccountProjectionsForPayout(tx, snapshot.id);
       return { payoutId, generation: current.financialGeneration, changed: false };
     }
     if (!validStatusTransition(String(current.status), snapshot.status) ||
@@ -305,6 +418,11 @@ export async function stagePayoutSnapshot(
       generation: nextGeneration, status: snapshot.status,
       reconciliationStatus: snapshot.reconciliationStatus
     });
+    await reconcilePayoutReversalIssue(
+      tx, payoutId, snapshot, failureBalanceTransactionId, context.correlationId
+    );
+    await resolveReferencedPayoutIssues(tx, snapshot, context.correlationId);
+    await enqueueCurrentAccountProjectionsForPayout(tx, snapshot.id);
     const newlyObservedRelatedIds = new Set<string>();
     if (snapshot.originalPayoutId !== null &&
       snapshot.originalPayoutId !== current.originalProviderPayoutId) {
@@ -498,6 +616,23 @@ export async function publishPayoutMembership(
       `);
       return { retry: true as const };
     }
+    const ids = [...locked.balanceTransactionIds].sort();
+    const hasPublishedMembership = locked.hasPublishedHistory ||
+      locked.existingMembershipIds.length > 0;
+    if (hasPublishedMembership) {
+      if (!sameSortedIds(ids, locked.existingMembershipIds)) {
+        return rejectMembershipConflict(tx, input);
+      }
+      await resolveMembershipConflict(tx, input);
+      await rows(tx, sql`
+        update payout_import_runs set state = 'published', safe_outcome = 'published',
+          completed_at = now(), updated_at = now() where id = ${input.runId}
+      `);
+      return {
+        generation: payout.financialGeneration,
+        membershipCount: locked.existingMembershipIds.length
+      };
+    }
     if (payout.financialGeneration === FINANCIAL_GENERATION_MAX) {
       const issue = await observeFinancialIssue(tx, {
         resourceType: 'payout', resourceId: input.payoutId, safeCode: 'generation_exhausted',
@@ -510,24 +645,15 @@ export async function publishPayoutMembership(
       `);
       return { error: 'generation_exhausted' as const, issueId: issue.id };
     }
-    const ids = [...locked.balanceTransactionIds].sort();
     const conflicts = ids.length === 0 ? [] : await rows(tx, sql`
       select balance_transaction_id as "balanceTransactionId" from stripe_payout_balance_transactions
       where balance_transaction_id in (${sql.join(ids.map((id) => sql`${id}::uuid`), sql`, `)})
         and payout_id <> ${input.payoutId}
     `);
     if (conflicts.length > 0) {
-      const issue = await observeFinancialIssue(tx, {
-        resourceType: 'payout', resourceId: input.payoutId, safeCode: 'payout_membership_conflict',
-        impact: 'exception', actor: { type: 'system', id: 'financial-worker' },
-        correlationId: input.correlationId
-      });
-      await rows(tx, sql`
-        update payout_import_runs set state = 'exception', safe_outcome = 'payout_membership_conflict',
-          completed_at = now(), updated_at = now() where id = ${input.runId}
-      `);
-      return { error: 'payout_membership_conflict' as const, issueId: issue.id };
+      return rejectMembershipConflict(tx, input);
     }
+    await resolveMembershipConflict(tx, input);
     for (const id of ids) {
       await rows(tx, sql`
         insert into stripe_payout_balance_transactions
@@ -599,6 +725,7 @@ export async function loadCurrentPayoutEvidence(
           or (p.reversed_by_provider_payout_id is not null and not exists (
             select 1 from stripe_payouts reversal
             where reversal.provider_id = p.reversed_by_provider_payout_id
+              and reversal.original_provider_payout_id = p.provider_id
           ))) as "hasMissingPayoutReversal"
   `);
   const result = evidence[0] as CurrentPayoutEvidence | undefined;

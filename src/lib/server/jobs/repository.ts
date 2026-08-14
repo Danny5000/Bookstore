@@ -45,6 +45,7 @@ const ACTIVE_JOB_COLUMNS = sql`
   id, type, payload, deduplication_key as "deduplicationKey", status,
   run_at as "runAt", attempts, max_attempts as "maxAttempts",
   locked_at as "lockedAt", locked_by as "lockedBy", last_error as "lastError",
+  rerun_requested_at as "rerunRequestedAt",
   completed_at as "completedAt", created_at as "createdAt", updated_at as "updatedAt"
 `;
 
@@ -184,6 +185,7 @@ function validateActiveJobInput(input: EnqueueActiveEntityJobInput): ValidatedAc
       };
     }
     const entity: unknown = input.activeEntity;
+    if (identity.payload.trigger.kind === 'continuation') invalidActiveEntityJob();
     if (!exactObject(entity, ['providerPayoutId']) ||
       entity.providerPayoutId !== identity.payload.providerPayoutId) {
       return invalidActiveEntityJob();
@@ -244,11 +246,27 @@ export async function enqueueActiveEntityJob(
     where type = ${validated.identity.type}
       and status in ('pending', 'running')
       and payload @> ${canonicalSubset}::jsonb
+      and (
+        type <> ${FINANCIAL_PAYOUT_JOB}
+        or payload -> 'trigger' ->> 'kind' is distinct from 'continuation'
+      )
     order by created_at, id
     limit 1 for update
   `);
   if (active[0]) {
     if (!sameActiveEntity(active[0], validated.identity)) invalidActiveEntityJob();
+    if (active[0].status === 'running') {
+      const marked = await executeJobRows(transaction, sql`
+        update jobs set rerun_requested_at = coalesce(rerun_requested_at, now()),
+          updated_at = now()
+        where id = ${active[0].id} and status = 'running'
+        returning ${ACTIVE_JOB_COLUMNS}
+      `);
+      if (!marked[0] || !sameActiveEntity(marked[0], validated.identity)) {
+        invalidActiveEntityJob();
+      }
+      return marked[0];
+    }
     return active[0];
   }
 
@@ -374,11 +392,17 @@ export function createPostgresJobRepository(
       const result = await database.execute<ClaimedJobRow>(sql`
         with exhausted as (
           update jobs
-          set status = 'failed',
+          set status = case when rerun_requested_at is null then 'failed'::job_status
+                            else 'pending'::job_status end,
+              run_at = case when rerun_requested_at is null then run_at else ${claimedAt} end,
+              attempts = case when rerun_requested_at is null then attempts else 0 end,
               locked_at = null,
               locked_by = null,
-              last_error = coalesce(last_error, 'Job lease expired after final attempt'),
-              completed_at = ${claimedAt},
+              last_error = case when rerun_requested_at is null
+                then coalesce(last_error, 'Job lease expired after final attempt') else null end,
+              rerun_requested_at = null,
+              completed_at = case when rerun_requested_at is null
+                then ${claimedAt}::timestamptz else null::timestamptz end,
               updated_at = ${claimedAt}
           where status = 'running'
             and locked_at <= ${expiredBefore}
@@ -386,7 +410,8 @@ export function createPostgresJobRepository(
             and (${claimableJob})
           returning id
         ), candidate as (
-          select id
+          select id, status as prior_status,
+            rerun_requested_at is not null as had_rerun_request
           from jobs
           where (
             (
@@ -405,9 +430,18 @@ export function createPostgresJobRepository(
         )
         update jobs
         set status = 'running',
-            attempts = jobs.attempts + 1,
+            attempts = case
+              when candidate.prior_status = 'running' and candidate.had_rerun_request then 1
+              else jobs.attempts + 1
+            end,
             locked_at = ${claimedAt},
             locked_by = ${workerId},
+            rerun_requested_at = case when candidate.prior_status = 'running'
+              then null else jobs.rerun_requested_at end,
+            last_error = case
+              when candidate.prior_status = 'running' and candidate.had_rerun_request then null
+              else jobs.last_error
+            end,
             updated_at = ${claimedAt}
         from candidate
         where jobs.id = candidate.id
@@ -439,26 +473,44 @@ export function createPostgresJobRepository(
     },
 
     async complete(jobId, workerId): Promise<boolean> {
-      const completedAt = now();
-      const [completed] = await database
-        .update(jobs)
-        .set({
-          status: 'succeeded',
-          completedAt,
-          lockedAt: null,
-          lockedBy: null,
-          lastError: null,
-          updatedAt: completedAt
-        })
-        .where(
-          and(
-            eq(jobs.id, jobId),
-            eq(jobs.status, 'running'),
-            eq(jobs.lockedBy, workerId)
+      return withTransaction(database, async (transaction) => {
+        const [job] = await transaction
+          .select()
+          .from(jobs)
+          .where(
+            and(
+              eq(jobs.id, jobId),
+              eq(jobs.status, 'running'),
+              eq(jobs.lockedBy, workerId)
+            )
           )
-        )
-        .returning({ id: jobs.id });
-      return completed !== undefined;
+          .for('update')
+          .limit(1);
+        if (!job) return false;
+        const completedAt = now();
+        await transaction
+          .update(jobs)
+          .set(job.rerunRequestedAt === null ? {
+            status: 'succeeded',
+            completedAt,
+            lockedAt: null,
+            lockedBy: null,
+            lastError: null,
+            updatedAt: completedAt
+          } : {
+            status: 'pending',
+            runAt: completedAt,
+            attempts: 0,
+            completedAt: null,
+            lockedAt: null,
+            lockedBy: null,
+            lastError: null,
+            rerunRequestedAt: null,
+            updatedAt: completedAt
+          })
+          .where(eq(jobs.id, job.id));
+        return true;
+      });
     },
 
     async fail(jobId, workerId, safeError, retryable): Promise<boolean> {
@@ -478,6 +530,23 @@ export function createPostgresJobRepository(
         if (!job) return false;
 
         const failedAt = now();
+        if (job.rerunRequestedAt !== null) {
+          await transaction
+            .update(jobs)
+            .set({
+              status: 'pending',
+              runAt: failedAt,
+              attempts: 0,
+              lockedAt: null,
+              lockedBy: null,
+              lastError: null,
+              rerunRequestedAt: null,
+              completedAt: null,
+              updatedAt: failedAt
+            })
+            .where(eq(jobs.id, job.id));
+          return true;
+        }
         const exhausted = !retryable || job.attempts >= job.maxAttempts;
         const retryDelay = computeRetryDelayMs(
           job.attempts,

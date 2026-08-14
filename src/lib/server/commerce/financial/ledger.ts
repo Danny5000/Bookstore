@@ -8,6 +8,8 @@ import { sql, type SQL } from 'drizzle-orm';
 import { appendClassificationDecisionLocked, classifyBalanceTransaction, classifyFeeDetail } from './classification';
 import { observeFinancialIssue } from './issues';
 import { FINANCIAL_CLASSIFIER_VERSION } from './constants';
+import { enqueueJob } from '$lib/server/jobs/repository';
+import { createFinancialClassificationSubjectJob } from './jobs';
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 const SAFE_MONEY_MAX = 99_999_999;
@@ -281,6 +283,76 @@ async function ensureClassifications(
   }
 }
 
+async function activeProjectionVersion(
+  tx: DatabaseTransaction
+): Promise<{ classifierVersion: number; allocationAlgorithmVersion: number }> {
+  const active = await rows(tx, sql`
+    select classifier_version as "classifierVersion",
+      allocation_algorithm_version as "allocationAlgorithmVersion"
+    from financial_projection_versions where singleton = true
+  `) as Array<{ classifierVersion: number; allocationAlgorithmVersion: number }>;
+  const version = active[0];
+  if (!version || active.length !== 1 || !Number.isSafeInteger(version.classifierVersion) ||
+    version.classifierVersion < 1 || !Number.isSafeInteger(version.allocationAlgorithmVersion) ||
+    version.allocationAlgorithmVersion < 1) unsupportedEvidence();
+  return version;
+}
+
+async function enqueueAccountProjection(
+  tx: DatabaseTransaction,
+  subject: { id: string; fingerprintSha256: string }
+): Promise<void> {
+  const version = await activeProjectionVersion(tx);
+  const spec = createFinancialClassificationSubjectJob({
+    subjectType: 'balance_transaction',
+    subjectId: subject.id,
+    sourceFingerprintSha256: subject.fingerprintSha256,
+    classifierVersion: version.classifierVersion,
+    allocationAlgorithmVersion: version.allocationAlgorithmVersion
+  });
+  await enqueueJob(tx, {
+    type: spec.type,
+    payload: spec.payload,
+    deduplicationKey: spec.deduplicationKey,
+    maxAttempts: spec.maxAttempts
+  });
+}
+
+async function enqueueAccountProjectionIfReady(
+  tx: DatabaseTransaction,
+  balanceTransactionId: string
+): Promise<void> {
+  const candidates = await rows(tx, sql`
+    select balance.id, balance.fingerprint_sha256 as "fingerprintSha256"
+    from stripe_balance_transactions balance
+    where balance.id = ${balanceTransactionId}
+      and (
+        balance.source_family in ('adjustment', 'unknown')
+        or balance.source_family is null
+        or (
+          balance.source_family = 'payout'
+          and exists (
+            select 1 from stripe_payouts payout where payout.provider_id = balance.source_id
+          )
+        )
+      )
+  `) as Array<{ id: string; fingerprintSha256: string }>;
+  if (candidates[0]) await enqueueAccountProjection(tx, candidates[0]);
+}
+
+export async function enqueueCurrentAccountProjectionsForPayout(
+  tx: DatabaseTransaction,
+  providerPayoutId: string
+): Promise<void> {
+  const candidates = await rows(tx, sql`
+    select id, fingerprint_sha256 as "fingerprintSha256"
+    from stripe_balance_transactions
+    where source_family = 'payout' and source_id = ${providerPayoutId}
+    order by id
+  `) as Array<{ id: string; fingerprintSha256: string }>;
+  for (const candidate of candidates) await enqueueAccountProjection(tx, candidate);
+}
+
 export async function stageBalanceTransaction(
   database: Database,
   untrustedSnapshot: BalanceTransactionSnapshot,
@@ -329,6 +401,7 @@ export async function stageBalanceTransaction(
       }
       await ensureClassifications(tx, inserted.id, detailIds, evidence, context.correlationId);
       await appendImportAudit(tx, inserted.id, 'inserted', snapshot, context.correlationId);
+      await enqueueAccountProjectionIfReady(tx, inserted.id);
       return { balanceTransactionId: inserted.id, disposition: 'inserted' as const };
     }
 
@@ -349,11 +422,13 @@ export async function stageBalanceTransaction(
     if (existing.status === 'pending' && snapshot.status === 'available') {
       await rows(tx, sql`update stripe_balance_transactions set status = 'available', last_imported_at = now() where id = ${existing.id}`);
       await appendImportAudit(tx, existing.id, 'advanced', snapshot, context.correlationId);
+      await enqueueAccountProjectionIfReady(tx, existing.id);
       return { balanceTransactionId: existing.id, disposition: 'advanced' as const };
     }
     if (existing.status === 'pending' && snapshot.status === 'pending') {
       await rows(tx, sql`update stripe_balance_transactions set last_imported_at = now() where id = ${existing.id}`);
     }
+    await enqueueAccountProjectionIfReady(tx, existing.id);
     return { balanceTransactionId: existing.id, disposition: 'unchanged' as const };
   });
   if ('collision' in result) throw new PermanentFinancialError('immutable_mismatch');

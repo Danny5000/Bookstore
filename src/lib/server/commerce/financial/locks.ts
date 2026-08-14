@@ -40,6 +40,8 @@ export interface PayoutImportLockRows {
   readonly runGeneration: number;
   readonly runState: 'collecting' | 'publishable' | 'published' | 'abandoned' | 'exception';
   readonly balanceTransactionIds: readonly string[];
+  readonly existingMembershipIds: readonly string[];
+  readonly hasPublishedHistory: boolean;
   readonly issueIds: readonly string[];
 }
 
@@ -276,7 +278,8 @@ export async function lockPayoutImportRows(
   const canonicalRunState = runState as PayoutImportLockRows['runState'];
   const disposition: PayoutImportLockRows['disposition'] =
     canonicalRunState === 'published' && runGeneration === input.expectedGeneration &&
-      payoutFinancialGeneration === runGeneration + 1
+      (payoutFinancialGeneration === runGeneration + 1 ||
+        payoutFinancialGeneration === runGeneration)
       ? 'published_replay'
       : (canonicalRunState === 'collecting' || canonicalRunState === 'publishable') &&
           runGeneration === input.expectedGeneration &&
@@ -292,6 +295,8 @@ export async function lockPayoutImportRows(
       runGeneration,
       runState: canonicalRunState,
       balanceTransactionIds: [],
+      existingMembershipIds: [],
+      hasPublishedHistory: false,
       issueIds: []
     };
   }
@@ -306,20 +311,31 @@ export async function lockPayoutImportRows(
     select id from stripe_balance_transactions where id in (${uuidIn(balanceTransactionIds)}) order by id for update
   `) as Array<{ id: string }>;
   if (balanceRows.length !== balanceTransactionIds.length) stateChanged();
+  let membershipRows: Array<{ payoutId: string; balanceTransactionId: string }>;
   if (balanceTransactionIds.length === 0) {
-    await rows(tx, sql`
+    membershipRows = await rows(tx, sql`
       select payout_id as "payoutId", balance_transaction_id as "balanceTransactionId"
       from stripe_payout_balance_transactions where payout_id = ${input.payoutId}
       order by payout_id, balance_transaction_id for update
-    `);
+    `) as Array<{ payoutId: string; balanceTransactionId: string }>;
   } else {
-    await rows(tx, sql`
+    membershipRows = await rows(tx, sql`
       select payout_id as "payoutId", balance_transaction_id as "balanceTransactionId"
       from stripe_payout_balance_transactions where payout_id = ${input.payoutId}
         or balance_transaction_id in (${uuidIn(balanceTransactionIds)})
       order by payout_id, balance_transaction_id for update
-    `);
+    `) as Array<{ payoutId: string; balanceTransactionId: string }>;
   }
+  const existingMembershipIds = sortedUuids(membershipRows
+    .filter((row) => row.payoutId === input.payoutId)
+    .map((row) => row.balanceTransactionId));
+  const publishedHistoryRows = await rows(tx, sql`
+    select exists (
+      select 1 from payout_import_runs
+      where payout_id = ${input.payoutId} and state = 'published' and id <> ${input.runId}
+    ) as "exists"
+  `) as Array<{ exists: boolean }>;
+  if (typeof publishedHistoryRows[0]?.exists !== 'boolean') stateChanged();
   for (const safeCode of FINANCIAL_ISSUE_CODES) await issueAdvisory(tx, `pale-orbit:financial:issue:payout:${input.payoutId}:${safeCode}`);
   const issues = await rows(tx, sql`
     select id from financial_reconciliation_issues
@@ -334,6 +350,8 @@ export async function lockPayoutImportRows(
     runGeneration,
     runState: canonicalRunState,
     balanceTransactionIds,
+    existingMembershipIds,
+    hasPublishedHistory: publishedHistoryRows[0]!.exists,
     issueIds: issues.map((row) => row.id)
   };
 }

@@ -37,6 +37,7 @@ export const jobs = pgTable(
     lockedAt: timestamp('locked_at', { withTimezone: true }),
     lockedBy: text('locked_by'),
     lastError: text('last_error'),
+    rerunRequestedAt: timestamp('rerun_requested_at', { withTimezone: true }),
     completedAt: timestamp('completed_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull()
@@ -54,6 +55,10 @@ export const jobs = pgTable(
     check(
       'jobs_terminal_has_completion',
       sql`(${table.status} in ('succeeded', 'failed')) = (${table.completedAt} is not null)`
+    ),
+    check(
+      'jobs_rerun_requires_running',
+      sql`${table.rerunRequestedAt} is null or ${table.status} = 'running'`
     )
   ]
 );

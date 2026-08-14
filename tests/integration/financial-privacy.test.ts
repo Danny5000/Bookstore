@@ -55,6 +55,7 @@ const FINANCIAL_TABLES = [
   'stripe_balance_transaction_fee_details',
   'financial_classification_versions',
   'financial_projection_versions',
+  'financial_payout_discovery_state',
   'stripe_payouts',
   'payout_import_runs',
   'payout_import_run_entries',

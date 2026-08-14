@@ -57,7 +57,7 @@ Manual payouts and instant payouts have no Stripe-determined exact transaction m
 
 When Stripe runtime is enabled, every worker polling loop safely ensures one provider-recovery root for the current UTC hour. Its permanent key includes the hour, so multiple workers converge on one row while the next hour can recover work that an earlier terminal key cannot suppress. Each scan transaction handles at most 100 local resources or one provider page of at most 100 records, commits its phase/checkpoint, and enqueues a distinct continuation.
 
-The initial payout discovery lower bound is seven days before the earliest local paid order, or seven days before the current scan hour when no paid order exists. It is not an unrestricted Stripe-account backfill and not merely "the last seven days." Subsequent hourly discovery overlaps the preceding 72 hours so delayed or reordered payout lifecycle evidence is seen again. Local source scans also cover pending/retryable payments, refunds, and disputes plus incomplete payout import runs.
+The initial payout discovery lower bound is seven days before the earliest local paid order, or seven days before the current scan hour when no paid order exists. It is not an unrestricted Stripe-account backfill and not merely "the last seven days." Each run freezes its provider time window before the first request. The singleton durable coverage high-water advances only with the terminal discovery page; subsequent hourly discovery starts with a 72-hour overlap from the older of that high-water and the scan hour, so delayed evidence and outages longer than 72 hours cannot create an unscanned gap. Local source scans also cover pending/retryable payments, refunds, and disputes plus incomplete payout import runs and open payout-reversal issues.
 
 Each deployed classifier/allocation pair has a separate composite replay root such as `commerce.financial-classification:scan:1:1`. It processes local immutable evidence only. Unsupported classifications are not retried every hour; deploying a newer supported classifier or allocation-algorithm version creates a new version-keyed replay that appends decisions and successor allocation tips without editing history.
 
@@ -159,29 +159,30 @@ Use the full logical database backup and private-storage procedure in [storage, 
 
 A Plan 6B-only table dump is not a valid bookstore backup. The checkpoint also adds state to `payments`, `refunds`, `disputes`, and `entitlement_grants`, and its rows depend on users, orders/items, refund allocations, jobs, and audit history. The full custom archive must retain schemas, enums, functions, views, restrictive foreign keys, immutable triggers, `drizzle.__drizzle_migrations`, and all application tables.
 
-The archive contains these 19 Plan 6B tables. This is their parent-first logical data order after pre-existing users, commerce/order, refund-allocation, entitlement-grant, job, and audit tables. `pg_restore` manages archive object order and installs constraints appropriately; do not reproduce this list with ad hoc `INSERT`, disable triggers, or restore child tables separately.
+The archive contains these 20 Plan 6B tables. This is their parent-first logical data order after pre-existing users, commerce/order, refund-allocation, entitlement-grant, job, and audit tables. `pg_restore` manages archive object order and installs constraints appropriately; do not reproduce this list with ad hoc `INSERT`, disable triggers, or restore child tables separately.
 
 | Order | Plan 6B table | Dependency |
 | ---: | --- | --- |
 | 1 | `financial_projection_versions` | Singleton active classifier/allocation version. |
-| 2 | `stripe_balance_transactions` | Parent ledger facts. |
-| 3 | `stripe_balance_transaction_fee_details` | Balance Transaction. |
-| 4 | `financial_classification_versions` | Semantic subject is a Balance Transaction or fee detail. |
-| 5 | `stripe_payouts` | Optional payout/failure Balance Transactions. |
-| 6 | `payout_import_runs` | Payout. |
-| 7 | `payout_import_run_entries` | Import run and Balance Transaction. |
-| 8 | `stripe_payout_balance_transactions` | Payout, published import run, and Balance Transaction. |
-| 9 | `financial_scan_runs` | Independent durable checkpoints. |
-| 10 | `financial_allocation_sets` | Balance Transaction plus self-referenced predecessor/reversal chains. |
-| 11 | `financial_item_allocations` | Allocation set and existing order item. |
-| 12 | `refund_allocation_components` | Existing refund allocation/refund/order-item graph. |
-| 13 | `dispute_item_allocations` | Existing dispute/order item, allocation set, and optional earlier dispute allocation. |
-| 14 | `refund_allocation_drafts` | Existing refund and administrator users. |
-| 15 | `refund_allocation_draft_items` | Draft and existing order item. |
-| 16 | `refund_reporting_correction_sets` | Existing refund, allocation set, administrators, and optional predecessor correction. |
-| 17 | `refund_reporting_correction_items` | Correction set, optional source allocation set, and order item. |
-| 18 | `financial_reconciliation_issues` | Optional existing administrator plus a semantic internal resource restored above. |
-| 19 | `refund_allocation_finalization_effects` | Existing refund allocation, draft/version/item, order item, and purchase grant. |
+| 2 | `financial_payout_discovery_state` | Singleton provider-discovery coverage high-water. |
+| 3 | `stripe_balance_transactions` | Parent ledger facts. |
+| 4 | `stripe_balance_transaction_fee_details` | Balance Transaction. |
+| 5 | `financial_classification_versions` | Semantic subject is a Balance Transaction or fee detail. |
+| 6 | `stripe_payouts` | Optional payout/failure Balance Transactions. |
+| 7 | `payout_import_runs` | Payout. |
+| 8 | `payout_import_run_entries` | Import run and Balance Transaction. |
+| 9 | `stripe_payout_balance_transactions` | Payout, published import run, and Balance Transaction. |
+| 10 | `financial_scan_runs` | Independent durable checkpoints. |
+| 11 | `financial_allocation_sets` | Balance Transaction plus self-referenced predecessor/reversal chains. |
+| 12 | `financial_item_allocations` | Allocation set and existing order item. |
+| 13 | `refund_allocation_components` | Existing refund allocation/refund/order-item graph. |
+| 14 | `dispute_item_allocations` | Existing dispute/order item, allocation set, and optional earlier dispute allocation. |
+| 15 | `refund_allocation_drafts` | Existing refund and administrator users. |
+| 16 | `refund_allocation_draft_items` | Draft and existing order item. |
+| 17 | `refund_reporting_correction_sets` | Existing refund, allocation set, administrators, and optional predecessor correction. |
+| 18 | `refund_reporting_correction_items` | Correction set, optional source allocation set, and order item. |
+| 19 | `financial_reconciliation_issues` | Optional existing administrator plus a semantic internal resource restored above. |
+| 20 | `refund_allocation_finalization_effects` | Existing refund allocation, draft/version/item, order item, and purchase grant. |
 
 Restore first into a uniquely named isolated Compose project with no public application ports. Restore the full database and storage archive, run committed migrations, compare the migration journal and aggregate row counts, and execute every read-only check below while app and worker remain stopped. A structural count other than zero blocks acceptance. Missing/pending classification rows and incomplete projection rows are operational evidence rather than permission to edit; reconcile them with durable jobs/issues as described with each query. Start only the isolated maintenance-mode app after the checks pass; keep the worker stopped until the provider-runtime conditions below are satisfied, then follow a separately approved production replacement/rollback procedure.
 

@@ -42,6 +42,8 @@ interface LegacyFixture {
 const repositoryRoot = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const expectedMigrationPath = resolve(repositoryRoot, 'drizzle', '0007_plan6b_financial_reconciliation.sql');
 const PLAN6B_TABLES = [
+  'financial_projection_versions',
+  'financial_payout_discovery_state',
   'stripe_balance_transactions',
   'stripe_balance_transaction_fee_details',
   'financial_classification_versions',

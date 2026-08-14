@@ -3,7 +3,6 @@ import type { StripeCommerceGateway } from '$lib/server/commerce/stripe/types';
 import { parsePayoutSnapshot, parseStripeListPage } from '$lib/server/commerce/stripe/financial-schemas';
 import { PermanentCommerceError, RetryableProviderError } from '$lib/server/commerce/errors';
 import type { Database } from '$lib/server/db/client';
-import { sql } from 'drizzle-orm';
 import {
   createFinancialClassificationSubjectJob,
   createFinancialPayoutScanJob,
@@ -20,6 +19,8 @@ import {
 import { PermanentFinancialError, RetryableFinancialError } from '../errors';
 import {
   commitFinancialScanPage,
+  completeEmptyFinancialReplay,
+  freezePayoutDiscoveryWindow,
   loadClassificationReplayPage,
   loadFinancialSourceScanPage,
   loadIncompletePayoutRunPage,
@@ -76,7 +77,7 @@ export async function processFinancialScanJob(
   if (run.phase === 'payout_discovery_page') {
     if (dependencies.runtimeMode === 'disabled') return { status: 'unchanged', runId: run.id };
     const hour = scanHour(run);
-    const range = await payoutDiscoveryRange(dependencies.database, run, hour);
+    const range = await freezePayoutDiscoveryWindow(dependencies.database, run, hour);
     const request = {
       limit,
       ...(run.checkpoint === null ? {} : { startingAfter: run.checkpoint }),
@@ -128,6 +129,18 @@ export async function processFinancialScanJob(
       throw new PermanentFinancialError('source_linkage_mismatch');
     }
     const page = await loadClassificationReplayPage(dependencies.database, run, limit);
+    if (!page.hasMore && page.data.length === 0 && run.processedCount === 0) {
+      abortIfNeeded(input.signal);
+      const completed = await completeEmptyFinancialReplay(dependencies.database, {
+        runId: run.id,
+        expectedCheckpoint: run.checkpoint,
+        expectedPageCount: run.pageCount,
+        classifierVersion: run.classifierVersion,
+        allocationAlgorithmVersion: run.allocationAlgorithmVersion,
+        correlationId: input.correlationId
+      });
+      return { status: 'completed', runId: completed.id };
+    }
     return finishPage(dependencies.database, input.signal, run, page, page.data.map((subject) =>
       createFinancialClassificationSubjectJob({
         ...subject,
@@ -223,30 +236,6 @@ function payoutImpactIdentity(run: FinancialScanRunRow): {
     throw new PermanentFinancialError('source_linkage_mismatch');
   }
   return { payoutId: match[1]!, payoutGeneration };
-}
-
-async function payoutDiscoveryRange(
-  database: Database,
-  run: FinancialScanRunRow,
-  hour: string
-): Promise<{ createdGte: number; createdLt: number }> {
-  const hourStart = new Date(hour);
-  const createdLt = Math.floor((hourStart.getTime() + 3_600_000) / 1000);
-  if (run.kind !== 'initial_backfill') {
-    return { createdGte: Math.floor((hourStart.getTime() - 72 * 3_600_000) / 1000), createdLt };
-  }
-  const result = await database.execute<{ createdGte: number | string | null }>(sql`
-    select extract(epoch from (min(paid_at) - interval '7 days'))::bigint as "createdGte"
-    from orders where status = 'paid' and paid_at is not null
-  `);
-  const raw = result.rows[0]?.createdGte;
-  const createdGte = raw === null || raw === undefined
-    ? Math.floor((hourStart.getTime() - 7 * 86_400_000) / 1000)
-    : Number(raw);
-  if (!Number.isSafeInteger(createdGte) || createdGte >= createdLt) {
-    throw new PermanentFinancialError('source_linkage_mismatch');
-  }
-  return { createdGte, createdLt };
 }
 
 async function finishPage(

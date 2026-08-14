@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { PgDialect } from 'drizzle-orm/pg-core';
 import type { Database } from '$lib/server/db/client';
+import type { FinancialScanRunRow } from '$lib/server/db/schema';
 import {
   createFinancialClassificationSubjectJob,
   createFinancialPayoutScanJob,
@@ -13,17 +15,27 @@ const jobMocks = vi.hoisted(() => ({
 
 vi.mock('$lib/server/jobs/repository', () => jobMocks);
 
-import { commitFinancialScanPage } from './repository';
+import {
+  commitFinancialScanPage,
+  completeEmptyFinancialReplay,
+  freezePayoutDiscoveryWindow
+} from './repository';
 
 const RUN_ID = '00000000-0000-4000-8000-000000001701';
 const SCAN_HOUR = '2026-08-12T22:00:00.000Z';
+const dialect = new PgDialect();
 
-function runRow(overrides: Record<string, unknown> = {}) {
+function rendered(query: unknown): { sql: string; params: unknown[] } {
+  return dialect.sqlToQuery(query as Parameters<typeof dialect.sqlToQuery>[0]);
+}
+
+function runRow(overrides: Partial<FinancialScanRunRow> = {}): FinancialScanRunRow {
   return {
     id: RUN_ID,
     rootKey: 'commerce.financial-scan:2026-08-12T22:00:00.000Z',
     kind: 'hourly', phase: 'source_page', state: 'running',
     classifierVersion: null, allocationAlgorithmVersion: null, replayId: null,
+    payoutDiscoveryCreatedGte: null, payoutDiscoveryCreatedLt: null,
     checkpoint: null, cursorDigestSha256: null,
     processedCount: 0, enqueuedCount: 0, pageCount: 0, safeOutcome: null,
     startedAt: new Date('2026-08-12T22:00:00.000Z'),
@@ -94,5 +106,118 @@ describe('financial scan page job handoff', () => {
       type: 'commerce.financial-scan',
       payload: { kind: 'continuation' }
     });
+  });
+
+  it('freezes an outage-recovery payout window from the durable high-water with 72-hour overlap', async () => {
+    const execute = vi.fn()
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [runRow({ phase: 'payout_discovery_page' })] })
+      .mockResolvedValueOnce({ rows: [{ coveredThrough: new Date('2026-08-01T00:00:00.000Z') }] })
+      .mockImplementationOnce(async () => {
+        return { rows: [runRow({
+          phase: 'payout_discovery_page',
+          payoutDiscoveryCreatedGte: new Date('2026-07-29T00:00:00.000Z'),
+          payoutDiscoveryCreatedLt: new Date('2026-08-12T23:00:00.000Z')
+        })] };
+      });
+    const mocked = {
+      transaction: vi.fn(async (work) => work({ execute, rollback: vi.fn() }))
+    } as unknown as Database;
+
+    await expect(freezePayoutDiscoveryWindow(
+      mocked,
+      runRow({ phase: 'payout_discovery_page' }),
+      SCAN_HOUR
+    )).resolves.toEqual({
+      createdGte: Math.floor(new Date('2026-07-29T00:00:00.000Z').getTime() / 1000),
+      createdLt: Math.floor(new Date('2026-08-12T23:00:00.000Z').getTime() / 1000)
+    });
+    expect(rendered(execute.mock.calls[3]![0]).params).toEqual(expect.arrayContaining([
+      new Date('2026-07-29T00:00:00.000Z'),
+      new Date('2026-08-12T23:00:00.000Z')
+    ]));
+  });
+
+  it('locks the projection version before completing a zero-subject composite replay', async () => {
+    const replay = runRow({
+      rootKey: 'commerce.financial-classification:scan:2:3',
+      kind: 'classification_replay', phase: 'classification_replay_page',
+      classifierVersion: 2, allocationAlgorithmVersion: 3, replayId: 'c2-a3'
+    });
+    const execute = vi.fn()
+      .mockResolvedValueOnce({ rows: [{ classifierVersion: 1, allocationAlgorithmVersion: 1 }] })
+      .mockResolvedValueOnce({ rows: [{ classifierVersion: 2, allocationAlgorithmVersion: 3 }] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [replay] })
+      .mockResolvedValueOnce({ rows: [runRow({
+        ...replay, state: 'completed', pageCount: 1, safeOutcome: 'completed',
+        completedAt: new Date('2026-08-12T22:01:00.000Z')
+      })] });
+    const mocked = {
+      transaction: vi.fn(async (work) => work({ execute, rollback: vi.fn() }))
+    } as unknown as Database;
+
+    await completeEmptyFinancialReplay(mocked, {
+      runId: RUN_ID, expectedCheckpoint: null, expectedPageCount: 0,
+      classifierVersion: 2, allocationAlgorithmVersion: 3,
+      correlationId: 'empty-replay-c2-a3'
+    });
+
+    expect(rendered(execute.mock.calls[0]![0]).sql).toContain('financial_projection_versions');
+    expect(rendered(execute.mock.calls[3]![0]).sql).toContain('pg_advisory_xact_lock');
+  });
+
+  it('atomically advances contiguous payout coverage on the terminal discovery page', async () => {
+    const discovery = runRow({
+      phase: 'payout_discovery_page',
+      payoutDiscoveryCreatedGte: new Date('2026-08-01T00:00:00.000Z'),
+      payoutDiscoveryCreatedLt: new Date('2026-08-12T23:00:00.000Z')
+    });
+    const execute = vi.fn()
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [discovery] })
+      .mockResolvedValueOnce({ rows: [{ coveredThrough: new Date('2026-08-10T00:00:00.000Z') }] })
+      .mockResolvedValueOnce({ rows: [{ coveredThrough: new Date('2026-08-12T23:00:00.000Z') }] })
+      .mockResolvedValueOnce({ rows: [runRow({
+        ...discovery, phase: 'incomplete_payout_run_page', pageCount: 1
+      })] });
+    const mocked = {
+      transaction: vi.fn(async (work) => work({ execute, rollback: vi.fn() }))
+    } as unknown as Database;
+
+    await commitFinancialScanPage(mocked, {
+      runId: RUN_ID, expectedPhase: 'payout_discovery_page', expectedCheckpoint: null,
+      expectedPageCount: 0, nextPhase: 'incomplete_payout_run_page', nextCheckpoint: null,
+      processedCount: 0, children: [], complete: false
+    });
+
+    expect(rendered(execute.mock.calls[2]![0]).sql).toContain('financial_payout_discovery_state');
+    expect(rendered(execute.mock.calls[3]![0]).sql).toContain('update financial_payout_discovery_state');
+    expect(jobMocks.enqueueJob).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      type: 'commerce.financial-scan', payload: expect.objectContaining({ kind: 'continuation' })
+    }));
+  });
+
+  it('rejects a terminal discovery window that would skip beyond the durable high-water', async () => {
+    const discovery = runRow({
+      phase: 'payout_discovery_page',
+      payoutDiscoveryCreatedGte: new Date('2026-08-11T00:00:00.000Z'),
+      payoutDiscoveryCreatedLt: new Date('2026-08-12T23:00:00.000Z')
+    });
+    const execute = vi.fn()
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [discovery] })
+      .mockResolvedValueOnce({ rows: [{ coveredThrough: new Date('2026-08-10T00:00:00.000Z') }] });
+    const mocked = {
+      transaction: vi.fn(async (work) => work({ execute, rollback: vi.fn() }))
+    } as unknown as Database;
+
+    await expect(commitFinancialScanPage(mocked, {
+      runId: RUN_ID, expectedPhase: 'payout_discovery_page', expectedCheckpoint: null,
+      expectedPageCount: 0, nextPhase: 'incomplete_payout_run_page', nextCheckpoint: null,
+      processedCount: 0, children: [], complete: false
+    })).rejects.toMatchObject({ name: 'RetryableFinancialError', safeCode: 'state_changed' });
+    expect(jobMocks.enqueueJob).not.toHaveBeenCalled();
   });
 });

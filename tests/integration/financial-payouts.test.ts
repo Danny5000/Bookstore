@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, like } from 'drizzle-orm';
 import { expect, it } from 'vitest';
 import { stageBalanceTransaction } from '$lib/server/commerce/financial/ledger';
 import {
@@ -60,6 +60,31 @@ async function createPublishableRun(suffix: string, balanceTransactionId?: strin
     correlationId: `payout-publish-page-${suffix}`
   });
   return { payout, payoutSnapshot, run, balanceTransactionId: balance.balanceTransactionId };
+}
+
+async function createPublishableGeneration(
+  payoutId: string,
+  generation: number,
+  balanceTransactionIds: readonly string[],
+  suffix: string
+) {
+  const run = await startOrResumePayoutImport(databaseClient.db, {
+    payoutId,
+    expectedGeneration: generation,
+    correlationId: `payout-generation-run-${suffix}`
+  });
+  await persistPayoutImportPage(databaseClient.db, {
+    payoutId,
+    runId: run.id,
+    expectedGeneration: generation,
+    expectedPageCount: 0,
+    expectedStartingAfter: null,
+    balanceTransactionIds,
+    hasMore: false,
+    nextStartingAfter: null,
+    correlationId: `payout-generation-page-${suffix}`
+  });
+  return run;
 }
 
 it('stages and exactly replays a canonical payout', async () => {
@@ -254,6 +279,209 @@ it('persists bounded pages provisionally and publishes one authoritative members
     .toMatchObject({ hasMissingPayoutReversal: true });
 });
 
+it('terminates an exact later membership replay without generation, impact, or publication audit churn', async () => {
+  const suffix = randomUUID();
+  const fixture = await createPublishableRun(suffix);
+  await publishPayoutMembership(databaseClient.db, {
+    payoutId: fixture.payout.payoutId,
+    runId: fixture.run.id,
+    expectedGeneration: 0,
+    correlationId: `payout-later-exact-first-${suffix}`
+  });
+  const advanced = await stagePayoutSnapshot(databaseClient.db, {
+    ...fixture.payoutSnapshot,
+    arrivalAt: new Date(fixture.payoutSnapshot.arrivalAt.getTime() + 60_000)
+  }, { correlationId: `payout-later-exact-advance-${suffix}` });
+  expect(advanced.generation).toBe(2);
+  const later = await createPublishableGeneration(
+    fixture.payout.payoutId,
+    advanced.generation,
+    [fixture.balanceTransactionId],
+    `${suffix}-later`
+  );
+  const auditsBefore = await databaseClient.db.select().from(auditEvents).where(and(
+    eq(auditEvents.resourceId, fixture.payout.payoutId),
+    eq(auditEvents.action, 'financial.payout.membership_published')
+  ));
+  const jobsBefore = await databaseClient.db.select().from(jobs).where(
+    eq(jobs.deduplicationKey, `financial:payout-impact:${fixture.payout.payoutId}:3`)
+  );
+
+  await expect(publishPayoutMembership(databaseClient.db, {
+    payoutId: fixture.payout.payoutId,
+    runId: later.id,
+    expectedGeneration: advanced.generation,
+    correlationId: `payout-later-exact-publish-${suffix}`
+  })).resolves.toEqual({ generation: 2, membershipCount: 1 });
+  await expect(publishPayoutMembership(databaseClient.db, {
+    payoutId: fixture.payout.payoutId,
+    runId: later.id,
+    expectedGeneration: advanced.generation,
+    correlationId: `payout-later-exact-replay-${suffix}`
+  })).resolves.toEqual({ generation: 2, membershipCount: 1 });
+
+  expect(await databaseClient.db.select().from(stripePayouts).where(
+    eq(stripePayouts.id, fixture.payout.payoutId)
+  )).toEqual([expect.objectContaining({ financialGeneration: 2 })]);
+  expect(await databaseClient.db.select().from(payoutImportRuns).where(
+    eq(payoutImportRuns.id, later.id)
+  )).toEqual([expect.objectContaining({ state: 'published', safeOutcome: 'published' })]);
+  expect(await databaseClient.db.select().from(auditEvents).where(and(
+    eq(auditEvents.resourceId, fixture.payout.payoutId),
+    eq(auditEvents.action, 'financial.payout.membership_published')
+  ))).toHaveLength(auditsBefore.length);
+  expect(jobsBefore).toHaveLength(0);
+  expect(await databaseClient.db.select().from(jobs).where(
+    eq(jobs.deduplicationKey, `financial:payout-impact:${fixture.payout.payoutId}:3`)
+  )).toHaveLength(0);
+});
+
+it('publishes the first empty membership but treats a later empty publication as exact history', async () => {
+  const suffix = randomUUID();
+  const snapshot = payoutSnapshotFixture({
+    id: `po_financial_empty_history_${suffix}`,
+    balanceTransactionId: null
+  });
+  const payout = await stagePayoutSnapshot(databaseClient.db, snapshot, {
+    correlationId: `payout-empty-history-stage-${suffix}`
+  });
+  const first = await createPublishableGeneration(payout.payoutId, 0, [], `${suffix}-first`);
+  await expect(publishPayoutMembership(databaseClient.db, {
+    payoutId: payout.payoutId,
+    runId: first.id,
+    expectedGeneration: 0,
+    correlationId: `payout-empty-history-publish-${suffix}`
+  })).resolves.toEqual({ generation: 1, membershipCount: 0 });
+  const advanced = await stagePayoutSnapshot(databaseClient.db, {
+    ...snapshot,
+    arrivalAt: new Date(snapshot.arrivalAt.getTime() + 60_000)
+  }, { correlationId: `payout-empty-history-advance-${suffix}` });
+  const later = await createPublishableGeneration(payout.payoutId, advanced.generation, [], `${suffix}-later`);
+
+  await expect(publishPayoutMembership(databaseClient.db, {
+    payoutId: payout.payoutId,
+    runId: later.id,
+    expectedGeneration: advanced.generation,
+    correlationId: `payout-empty-history-replay-${suffix}`
+  })).resolves.toEqual({ generation: 2, membershipCount: 0 });
+  expect(await databaseClient.db.select().from(auditEvents).where(and(
+    eq(auditEvents.resourceId, payout.payoutId),
+    eq(auditEvents.action, 'financial.payout.membership_published')
+  ))).toHaveLength(1);
+});
+
+it.each([
+  ['reduced', false, false],
+  ['expanded', true, true],
+  ['substituted', false, true]
+] as const)('rejects a %s later membership candidate without mutating authoritative membership', async (
+  _label,
+  includeExisting,
+  includeAdditional
+) => {
+  const suffix = randomUUID();
+  const fixture = await createPublishableRun(`${suffix}-existing`);
+  await publishPayoutMembership(databaseClient.db, {
+    payoutId: fixture.payout.payoutId,
+    runId: fixture.run.id,
+    expectedGeneration: 0,
+    correlationId: `payout-later-conflict-first-${suffix}`
+  });
+  const additional = includeAdditional
+    ? await stageBalanceTransaction(databaseClient.db, balanceTransactionSnapshotFixture({
+        id: `txn_financial_later_conflict_${suffix}`,
+        sourceId: null,
+        sourceFamily: 'unknown',
+        rawType: 'adjustment',
+        reportingCategory: 'other_adjustment'
+      }), { correlationId: `payout-later-conflict-balance-${suffix}` })
+    : null;
+  const advanced = await stagePayoutSnapshot(databaseClient.db, {
+    ...fixture.payoutSnapshot,
+    arrivalAt: new Date(fixture.payoutSnapshot.arrivalAt.getTime() + 60_000)
+  }, { correlationId: `payout-later-conflict-advance-${suffix}` });
+  const candidates = [
+    ...(includeExisting ? [fixture.balanceTransactionId] : []),
+    ...(additional ? [additional.balanceTransactionId] : [])
+  ];
+  const later = await createPublishableGeneration(
+    fixture.payout.payoutId,
+    advanced.generation,
+    candidates,
+    `${suffix}-later`
+  );
+
+  await expect(publishPayoutMembership(databaseClient.db, {
+    payoutId: fixture.payout.payoutId,
+    runId: later.id,
+    expectedGeneration: advanced.generation,
+    correlationId: `payout-later-conflict-publish-${suffix}`
+  })).rejects.toMatchObject({ safeCode: 'payout_membership_conflict' });
+  expect(await databaseClient.db.select().from(stripePayoutBalanceTransactions).where(
+    eq(stripePayoutBalanceTransactions.payoutId, fixture.payout.payoutId)
+  )).toEqual([expect.objectContaining({ balanceTransactionId: fixture.balanceTransactionId })]);
+  expect(await databaseClient.db.select().from(stripePayouts).where(
+    eq(stripePayouts.id, fixture.payout.payoutId)
+  )).toEqual([expect.objectContaining({ financialGeneration: 2 })]);
+  expect(await databaseClient.db.select().from(payoutImportRuns).where(
+    eq(payoutImportRuns.id, later.id)
+  )).toEqual([expect.objectContaining({
+    state: 'exception', safeOutcome: 'payout_membership_conflict'
+  })]);
+});
+
+it('resolves a prior membership conflict only after a later complete set matches history', async () => {
+  const suffix = randomUUID();
+  const fixture = await createPublishableRun(`${suffix}-recovery`);
+  await publishPayoutMembership(databaseClient.db, {
+    payoutId: fixture.payout.payoutId,
+    runId: fixture.run.id,
+    expectedGeneration: 0,
+    correlationId: `payout-conflict-recovery-first-${suffix}`
+  });
+  const conflictedGeneration = await stagePayoutSnapshot(databaseClient.db, {
+    ...fixture.payoutSnapshot,
+    arrivalAt: new Date(fixture.payoutSnapshot.arrivalAt.getTime() + 60_000)
+  }, { correlationId: `payout-conflict-recovery-advance-${suffix}` });
+  const conflicting = await createPublishableGeneration(
+    fixture.payout.payoutId,
+    conflictedGeneration.generation,
+    [],
+    `${suffix}-conflict`
+  );
+  await expect(publishPayoutMembership(databaseClient.db, {
+    payoutId: fixture.payout.payoutId,
+    runId: conflicting.id,
+    expectedGeneration: conflictedGeneration.generation,
+    correlationId: `payout-conflict-recovery-conflict-${suffix}`
+  })).rejects.toMatchObject({ safeCode: 'payout_membership_conflict' });
+
+  const recoveredGeneration = await stagePayoutSnapshot(databaseClient.db, {
+    ...fixture.payoutSnapshot,
+    arrivalAt: new Date(fixture.payoutSnapshot.arrivalAt.getTime() + 120_000)
+  }, { correlationId: `payout-conflict-recovery-refresh-${suffix}` });
+  const recovered = await createPublishableGeneration(
+    fixture.payout.payoutId,
+    recoveredGeneration.generation,
+    [fixture.balanceTransactionId],
+    `${suffix}-exact`
+  );
+  await expect(publishPayoutMembership(databaseClient.db, {
+    payoutId: fixture.payout.payoutId,
+    runId: recovered.id,
+    expectedGeneration: recoveredGeneration.generation,
+    correlationId: `payout-conflict-recovery-exact-${suffix}`
+  })).resolves.toEqual({
+    generation: recoveredGeneration.generation,
+    membershipCount: 1
+  });
+
+  expect(await databaseClient.db.select().from(financialReconciliationIssues).where(and(
+    eq(financialReconciliationIssues.resourceId, fixture.payout.payoutId),
+    eq(financialReconciliationIssues.safeCode, 'payout_membership_conflict')
+  ))).toEqual([expect.objectContaining({ state: 'resolved' })]);
+});
+
 it('reopens a paid payout when reversal linkage appears and never treats it as current paid evidence again', async () => {
   const suffix = randomUUID();
   const published = await createPublishableRun(suffix);
@@ -282,12 +510,30 @@ it('reopens a paid payout when reversal linkage appears and never treats it as c
     financialEvidenceStatus: 'fee_reconciled',
     payoutEvidence: missing
   })).toBe('exception');
+  expect(await databaseClient.db.select().from(financialReconciliationIssues).where(and(
+    eq(financialReconciliationIssues.resourceId, published.payout.payoutId),
+    eq(financialReconciliationIssues.safeCode, 'payout_reversal_incomplete')
+  ))).toEqual([expect.objectContaining({ state: 'open', impact: 'exception' })]);
 
-  await stagePayoutSnapshot(databaseClient.db, payoutSnapshotFixture({
+  const unrelatedReversal = payoutSnapshotFixture({
     id: reversingProviderPayoutId,
-    balanceTransactionId: null,
+    balanceTransactionId: null
+  });
+  await stagePayoutSnapshot(databaseClient.db, unrelatedReversal, {
+    correlationId: `payout-reversal-unlinked-${suffix}`
+  });
+  expect(await loadCurrentPayoutEvidence(databaseClient.db, [
+    published.balanceTransactionId
+  ])).toMatchObject({ hasMissingPayoutReversal: true });
+  expect(await databaseClient.db.select().from(financialReconciliationIssues).where(and(
+    eq(financialReconciliationIssues.resourceId, published.payout.payoutId),
+    eq(financialReconciliationIssues.safeCode, 'payout_reversal_incomplete')
+  ))).toEqual([expect.objectContaining({ state: 'open' })]);
+
+  await stagePayoutSnapshot(databaseClient.db, {
+    ...unrelatedReversal,
     originalPayoutId: published.payoutSnapshot.id
-  }), { correlationId: `payout-reversal-import-${suffix}` });
+  }, { correlationId: `payout-reversal-import-${suffix}` });
 
   const complete = await loadCurrentPayoutEvidence(databaseClient.db, [
     published.balanceTransactionId
@@ -301,6 +547,96 @@ it('reopens a paid payout when reversal linkage appears and never treats it as c
     financialEvidenceStatus: 'fee_reconciled',
     payoutEvidence: complete
   })).toBe('fee_reconciled');
+  expect(await databaseClient.db.select().from(financialReconciliationIssues).where(and(
+    eq(financialReconciliationIssues.resourceId, published.payout.payoutId),
+    eq(financialReconciliationIssues.safeCode, 'payout_reversal_incomplete')
+  ))).toEqual([expect.objectContaining({ state: 'resolved' })]);
+});
+
+it('observes a failed payout without failure evidence and resolves it when the evidence arrives', async () => {
+  const suffix = randomUUID();
+  const providerPayoutId = `po_financial_failure_evidence_${suffix}`;
+  const snapshot = payoutSnapshotFixture({
+    id: providerPayoutId,
+    balanceTransactionId: null,
+    failureBalanceTransactionId: null,
+    status: 'failed',
+    safeFailureCode: 'provider_failed'
+  });
+  const payout = await stagePayoutSnapshot(databaseClient.db, snapshot, {
+    correlationId: `payout-failure-evidence-missing-${suffix}`
+  });
+  expect(await databaseClient.db.select().from(financialReconciliationIssues).where(and(
+    eq(financialReconciliationIssues.resourceId, payout.payoutId),
+    eq(financialReconciliationIssues.safeCode, 'payout_reversal_incomplete')
+  ))).toEqual([expect.objectContaining({ state: 'open', impact: 'exception' })]);
+
+  const failureProviderId = `txn_financial_failure_evidence_${suffix}`;
+  await stageBalanceTransaction(databaseClient.db, balanceTransactionSnapshotFixture({
+    id: failureProviderId,
+    sourceFamily: 'payout',
+    sourceId: providerPayoutId,
+    rawType: 'payout_failure',
+    reportingCategory: 'payout'
+  }), { correlationId: `payout-failure-evidence-balance-${suffix}` });
+  await stagePayoutSnapshot(databaseClient.db, {
+    ...snapshot,
+    failureBalanceTransactionId: failureProviderId
+  }, { correlationId: `payout-failure-evidence-complete-${suffix}` });
+
+  expect(await databaseClient.db.select().from(financialReconciliationIssues).where(and(
+    eq(financialReconciliationIssues.resourceId, payout.payoutId),
+    eq(financialReconciliationIssues.safeCode, 'payout_reversal_incomplete')
+  ))).toEqual([expect.objectContaining({ state: 'resolved' })]);
+});
+
+it('enqueues current-version account projections for late adjustment and payout evidence', async () => {
+  const suffix = randomUUID();
+  const adjustment = await stageBalanceTransaction(databaseClient.db, balanceTransactionSnapshotFixture({
+    id: `txn_financial_late_adjustment_${suffix}`,
+    sourceFamily: 'unknown',
+    sourceId: null,
+    rawType: 'adjustment',
+    reportingCategory: 'other_adjustment'
+  }), { correlationId: `late-adjustment-${suffix}` });
+  expect(await databaseClient.db.select().from(jobs).where(
+    like(jobs.deduplicationKey, `financial:classification:%:balance_transaction:${adjustment.balanceTransactionId}:%`)
+  )).toHaveLength(1);
+
+  const providerPayoutId = `po_financial_late_balance_${suffix}`;
+  await stagePayoutSnapshot(databaseClient.db, payoutSnapshotFixture({
+    id: providerPayoutId,
+    balanceTransactionId: null
+  }), { correlationId: `late-payout-first-${suffix}` });
+  const latePayoutBalance = await stageBalanceTransaction(databaseClient.db, balanceTransactionSnapshotFixture({
+    id: `txn_financial_late_payout_${suffix}`,
+    sourceFamily: 'payout',
+    sourceId: providerPayoutId,
+    rawType: 'payout',
+    reportingCategory: 'payout'
+  }), { correlationId: `late-payout-balance-${suffix}` });
+  expect(await databaseClient.db.select().from(jobs).where(
+    like(jobs.deduplicationKey, `financial:classification:%:balance_transaction:${latePayoutBalance.balanceTransactionId}:%`)
+  )).toHaveLength(1);
+
+  const earlyProviderPayoutId = `po_financial_early_balance_${suffix}`;
+  const earlyPayoutBalance = await stageBalanceTransaction(databaseClient.db, balanceTransactionSnapshotFixture({
+    id: `txn_financial_early_payout_${suffix}`,
+    sourceFamily: 'payout',
+    sourceId: earlyProviderPayoutId,
+    rawType: 'payout',
+    reportingCategory: 'payout'
+  }), { correlationId: `early-payout-balance-${suffix}` });
+  expect(await databaseClient.db.select().from(jobs).where(
+    like(jobs.deduplicationKey, `financial:classification:%:balance_transaction:${earlyPayoutBalance.balanceTransactionId}:%`)
+  )).toHaveLength(0);
+  await stagePayoutSnapshot(databaseClient.db, payoutSnapshotFixture({
+    id: earlyProviderPayoutId,
+    balanceTransactionId: `txn_financial_early_payout_${suffix}`
+  }), { correlationId: `early-payout-arrives-${suffix}` });
+  expect(await databaseClient.db.select().from(jobs).where(
+    like(jobs.deduplicationKey, `financial:classification:%:balance_transaction:${earlyPayoutBalance.balanceTransactionId}:%`)
+  )).toHaveLength(1);
 });
 
 it('runs one bounded provider page through staging and publication, then replays without a new run', async () => {
@@ -354,7 +690,7 @@ it('runs one bounded provider page through staging and publication, then replays
   )).toHaveLength(1);
 });
 
-it('fails a competing payout publication atomically with a durable membership-conflict issue', async () => {
+it('fails a competing publication atomically and resolves it on a corrected first set', async () => {
   const first = await createPublishableRun(randomUUID());
   await publishPayoutMembership(databaseClient.db, {
     payoutId: first.payout.payoutId,
@@ -385,6 +721,30 @@ it('fails a competing payout publication atomically with a durable membership-co
     eq(financialReconciliationIssues.resourceId, second.payout.payoutId),
     eq(financialReconciliationIssues.safeCode, 'payout_membership_conflict')
   ))).toEqual([expect.objectContaining({ state: 'open', impact: 'exception' })]);
+
+  const correctedGeneration = await stagePayoutSnapshot(databaseClient.db, {
+    ...second.payoutSnapshot,
+    arrivalAt: new Date(second.payoutSnapshot.arrivalAt.getTime() + 60_000)
+  }, { correlationId: `payout-conflict-corrected-refresh-${second.run.id}` });
+  const corrected = await createPublishableGeneration(
+    second.payout.payoutId,
+    correctedGeneration.generation,
+    [],
+    `${second.run.id}-corrected`
+  );
+  await expect(publishPayoutMembership(databaseClient.db, {
+    payoutId: second.payout.payoutId,
+    runId: corrected.id,
+    expectedGeneration: correctedGeneration.generation,
+    correlationId: `payout-conflict-corrected-publish-${second.run.id}`
+  })).resolves.toEqual({
+    generation: correctedGeneration.generation + 1,
+    membershipCount: 0
+  });
+  expect(await databaseClient.db.select().from(financialReconciliationIssues).where(and(
+    eq(financialReconciliationIssues.resourceId, second.payout.payoutId),
+    eq(financialReconciliationIssues.safeCode, 'payout_membership_conflict')
+  ))).toEqual([expect.objectContaining({ state: 'resolved' })]);
 });
 
 it('converges concurrent publishers on one membership generation and one audit', async () => {

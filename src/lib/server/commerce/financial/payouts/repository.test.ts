@@ -7,9 +7,14 @@ const jobMocks = vi.hoisted(() => ({
   enqueueJob: vi.fn()
 }));
 const lockMocks = vi.hoisted(() => ({ lockPayoutImportRows: vi.fn() }));
+const issueMocks = vi.hoisted(() => ({
+  observeFinancialIssue: vi.fn(),
+  resolveFinancialIssueAfterRecompute: vi.fn()
+}));
 
 vi.mock('$lib/server/jobs/repository', () => jobMocks);
 vi.mock('../locks', () => lockMocks);
+vi.mock('../issues', () => issueMocks);
 
 import { persistPayoutImportPage, stagePayoutSnapshot } from './repository';
 
@@ -35,6 +40,7 @@ describe('payout repository', () => {
   it('sorts and guards related payout roots by their target provider ID', async () => {
     const payoutId = '00000000-0000-4000-8000-000000000102';
     const execute = vi.fn()
+      .mockResolvedValue({ rows: [] })
       .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [{ id: payoutId }] })

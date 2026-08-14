@@ -197,7 +197,7 @@ describe('financial lock ordering', () => {
     const database = executor([
       [], [{ id: PAYOUT_ID, financialGeneration: 3 }], [],
       [{ id: RUN_ID, generation: 3, state: 'publishable' }],
-      [{ balanceTransactionId: BT_A }], [], [{ id: BT_A }], [],
+      [{ balanceTransactionId: BT_A }], [], [{ id: BT_A }], [], [{ exists: false }],
       ...ALL_FINANCIAL_ISSUE_CODES.map(() => []), [{ id: FEE_A }]
     ]);
     const locked = await lockPayoutImportRows(database.tx, { payoutId: PAYOUT_ID, runId: RUN_ID, expectedGeneration: 3 });
@@ -246,6 +246,8 @@ describe('financial lock ordering', () => {
         runGeneration: 2,
         runState: 'publishable',
         balanceTransactionIds: [],
+        existingMembershipIds: [],
+        hasPublishedHistory: false,
         issueIds: []
       });
     expect(database.calls).toHaveLength(4);

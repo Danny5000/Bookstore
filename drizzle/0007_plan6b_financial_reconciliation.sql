@@ -30,6 +30,8 @@ ALTER TABLE "public"."entitlement_grants"
 	USING "source"::text::"public"."entitlement_grant_source";--> statement-breakpoint
 CREATE UNIQUE INDEX "entitlement_grants_purchase_item_unique" ON "entitlement_grants" USING btree ("order_item_id") WHERE "entitlement_grants"."source" = 'purchase';--> statement-breakpoint
 CREATE UNIQUE INDEX "entitlement_grants_preserved_user_title_unique" ON "entitlement_grants" USING btree ("user_id","title_id") WHERE "entitlement_grants"."source" = 'preserved';--> statement-breakpoint
+ALTER TABLE "public"."jobs" ADD COLUMN "rerun_requested_at" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "public"."jobs" ADD CONSTRAINT "jobs_rerun_requires_running" CHECK ("jobs"."rerun_requested_at" is null or "jobs"."status" = 'running');--> statement-breakpoint
 CREATE TABLE "dispute_item_allocations" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
 	"allocation_identity" varchar(255) NOT NULL,
@@ -258,6 +260,16 @@ INSERT INTO "financial_projection_versions"
     "activation_correlation_id")
 VALUES (true, 1, 1, 'migration-c1-a1');
 --> statement-breakpoint
+CREATE TABLE "financial_payout_discovery_state" (
+	"singleton" boolean PRIMARY KEY DEFAULT true NOT NULL,
+	"covered_through" timestamp with time zone,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL,
+	CONSTRAINT "financial_payout_discovery_state_singleton_true" CHECK ("financial_payout_discovery_state"."singleton" = true)
+);
+--> statement-breakpoint
+INSERT INTO "financial_payout_discovery_state" ("singleton", "covered_through")
+VALUES (true, null);
+--> statement-breakpoint
 CREATE TABLE "financial_scan_runs" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
 	"root_key" varchar(512) NOT NULL,
@@ -267,6 +279,8 @@ CREATE TABLE "financial_scan_runs" (
 	"classifier_version" integer,
 	"allocation_algorithm_version" integer,
 	"replay_id" varchar(50),
+	"payout_discovery_created_gte" timestamp with time zone,
+	"payout_discovery_created_lt" timestamp with time zone,
 	"checkpoint" varchar(255),
 	"cursor_digest_sha256" varchar(64),
 	"processed_count" integer DEFAULT 0 NOT NULL,
@@ -288,6 +302,14 @@ CREATE TABLE "financial_scan_runs" (
         "financial_scan_runs"."replay_id" is not null and
         "financial_scan_runs"."classifier_version" > 0 and "financial_scan_runs"."allocation_algorithm_version" > 0 and
         "financial_scan_runs"."replay_id" = 'c' || "financial_scan_runs"."classifier_version"::text || '-a' || "financial_scan_runs"."allocation_algorithm_version"::text
+      )),
+	CONSTRAINT "financial_scan_runs_payout_discovery_window_consistent" CHECK ((
+        "financial_scan_runs"."payout_discovery_created_gte" is null and "financial_scan_runs"."payout_discovery_created_lt" is null
+      ) or (
+        "financial_scan_runs"."payout_discovery_created_gte" is not null and
+        "financial_scan_runs"."payout_discovery_created_lt" is not null and
+        "financial_scan_runs"."payout_discovery_created_gte" < "financial_scan_runs"."payout_discovery_created_lt" and
+        "financial_scan_runs"."kind" in ('initial_backfill', 'hourly')
       )),
 	CONSTRAINT "financial_scan_runs_lifecycle_consistent" CHECK (("financial_scan_runs"."state" in ('completed', 'exception')) = ("financial_scan_runs"."completed_at" is not null))
 );

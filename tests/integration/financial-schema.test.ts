@@ -4,6 +4,8 @@ import { describe, expect, it } from 'vitest';
 import { databaseClient } from './database';
 
 const FINANCIAL_TABLES = [
+  'financial_projection_versions',
+  'financial_payout_discovery_state',
   'stripe_balance_transactions',
   'stripe_balance_transaction_fee_details',
   'financial_classification_versions',
@@ -413,6 +415,8 @@ describe('Plan 6B financial schema', () => {
       where n.nspname = 'public'
         and c.relname in (
           'stripe_balance_transactions',
+          'financial_projection_versions',
+          'financial_payout_discovery_state',
           'stripe_balance_transaction_fee_details',
           'financial_classification_versions',
           'stripe_payouts',
@@ -796,6 +800,38 @@ describe('Plan 6B financial schema', () => {
         invalid.label
       );
     }
+
+    await expectSingleRow(
+      databaseClient.pool.query<{ id: string }>(
+        `insert into financial_scan_runs
+           (root_key, kind, phase, payout_discovery_created_gte,
+            payout_discovery_created_lt)
+         values ($1, 'hourly', 'payout_discovery_page',
+                 '2026-08-01T00:00:00.000Z', '2026-08-02T00:00:00.000Z')
+         returning id`,
+        [nextToken('payout_window')]
+      ),
+      'payout discovery scans freeze one ordered provider window'
+    );
+    await expectConstraint(
+      databaseClient.pool.query(
+        `insert into financial_scan_runs
+           (root_key, kind, phase, payout_discovery_created_gte)
+         values ($1, 'hourly', 'payout_discovery_page', clock_timestamp())`,
+        [nextToken('partial_payout_window')]
+      ),
+      '23514',
+      'payout discovery bounds are all-or-none'
+    );
+    await expectConstraint(
+      databaseClient.pool.query(
+        `insert into financial_payout_discovery_state (singleton)
+         values (false)`,
+        []
+      ),
+      '23514',
+      'payout discovery coverage has one canonical singleton identity'
+    );
 
     const insertPayout = (label: string) =>
       databaseClient.pool.query<{ id: string }>(

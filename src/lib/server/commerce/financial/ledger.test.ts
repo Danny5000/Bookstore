@@ -176,7 +176,7 @@ describe('stageBalanceTransaction orchestration', () => {
     const exact = database([[], [stored], [{ ordinal: 0, rawType: 'stripe_fee', amountMinor: 70, currency: 'USD', fingerprintSha256: fingerprintBalanceTransactionFeeDetail(stored.fingerprintSha256, snapshot().feeDetails[1]!) }, { ordinal: 1, rawType: 'tax', amountMinor: 1, currency: 'USD', fingerprintSha256: fingerprintBalanceTransactionFeeDetail(stored.fingerprintSha256, snapshot().feeDetails[0]!) }]]);
     await expect(stageBalanceTransaction(exact.database, snapshot(), { correlationId: 'ledger-replay' }))
       .resolves.toEqual({ balanceTransactionId: PARENT_ID, disposition: 'unchanged' });
-    expect(exact.calls).toHaveLength(4);
+    expect(exact.calls).toHaveLength(5);
 
     const available = database([[], [stored], [{ ordinal: 0, rawType: 'stripe_fee', amountMinor: 70, currency: 'USD', fingerprintSha256: fingerprintBalanceTransactionFeeDetail(stored.fingerprintSha256, snapshot().feeDetails[1]!) }, { ordinal: 1, rawType: 'tax', amountMinor: 1, currency: 'USD', fingerprintSha256: fingerprintBalanceTransactionFeeDetail(stored.fingerprintSha256, snapshot().feeDetails[0]!) }], [{ id: PARENT_ID }], []]);
     await expect(stageBalanceTransaction(available.database, snapshot({ status: 'available' }), { correlationId: 'ledger-available' }))

@@ -187,6 +187,7 @@ it('pages incomplete payout runs in the same exact order as its run-id checkpoin
     id: randomUUID(), rootKey: 'commerce.financial-scan:2026-08-12T21:00:00.000Z',
     kind: 'hourly', phase: 'incomplete_payout_run_page', state: 'running',
     classifierVersion: null, allocationAlgorithmVersion: null, replayId: null,
+    payoutDiscoveryCreatedGte: null, payoutDiscoveryCreatedLt: null,
     checkpoint: null, cursorDigestSha256: null, processedCount: 0, enqueuedCount: 0,
     pageCount: 0, safeOutcome: null, startedAt: now, updatedAt: now, completedAt: null
   };
@@ -202,6 +203,96 @@ it('pages incomplete payout runs in the same exact order as its run-id checkpoin
   }, 1);
   expect(second).toEqual({
     data: [{ providerPayoutId: 'po_scan_order_a', runId: laterRunId }],
+    hasMore: false,
+    checkpoint: null
+  });
+});
+
+it('pages open payout-reversal issues through the local incomplete phase', async () => {
+  const now = new Date('2026-08-12T21:00:00.000Z');
+  const payoutAId = randomUUID();
+  const payoutBId = randomUUID();
+  const earlierIssueId = '00000000-0000-4000-8000-000000000071';
+  const laterIssueId = '00000000-0000-4000-8000-000000000072';
+  await databaseClient.db.insert(stripePayouts).values([
+    {
+      id: payoutAId, providerId: `po_scan_reversal_a_${payoutAId}`, liveMode: false,
+      amountMinor: 1000, currency: 'USD', automatic: true, method: 'standard', status: 'failed',
+      reconciliationStatus: 'completed', providerCreatedAt: now, arrivalAt: now,
+      retrievedAt: now, fingerprintSha256: 'd'.repeat(64)
+    },
+    {
+      id: payoutBId, providerId: `po_scan_reversal_b_${payoutBId}`, liveMode: false,
+      amountMinor: 1000, currency: 'USD', automatic: true, method: 'standard', status: 'failed',
+      reconciliationStatus: 'completed', providerCreatedAt: now, arrivalAt: now,
+      retrievedAt: now, fingerprintSha256: 'e'.repeat(64)
+    }
+  ]);
+  await databaseClient.db.insert(financialReconciliationIssues).values([
+    {
+      id: laterIssueId, resourceType: 'payout', resourceId: payoutAId,
+      safeCode: 'payout_reversal_incomplete', state: 'open', impact: 'exception',
+      occurrenceCount: 1, correlationId: 'scan-reversal-a'
+    },
+    {
+      id: earlierIssueId, resourceType: 'payout', resourceId: payoutBId,
+      safeCode: 'payout_reversal_incomplete', state: 'open', impact: 'exception',
+      occurrenceCount: 1, correlationId: 'scan-reversal-b'
+    }
+  ]);
+  const run: FinancialScanRunRow = {
+    id: randomUUID(), rootKey: 'commerce.financial-scan:2026-08-12T21:00:00.000Z',
+    kind: 'hourly', phase: 'incomplete_payout_run_page', state: 'running',
+    classifierVersion: null, allocationAlgorithmVersion: null, replayId: null,
+    payoutDiscoveryCreatedGte: null, payoutDiscoveryCreatedLt: null,
+    checkpoint: null, cursorDigestSha256: null, processedCount: 0, enqueuedCount: 0,
+    pageCount: 0, safeOutcome: null, startedAt: now, updatedAt: now, completedAt: null
+  };
+
+  const first = await loadIncompletePayoutRunPage(databaseClient.db, run, 1);
+  expect(first).toEqual({
+    data: [{ providerPayoutId: `po_scan_reversal_b_${payoutBId}`, runId: earlierIssueId }],
+    hasMore: true,
+    checkpoint: earlierIssueId
+  });
+  const second = await loadIncompletePayoutRunPage(databaseClient.db, {
+    ...run, checkpoint: first.checkpoint
+  }, 1);
+  expect(second).toEqual({
+    data: [{ providerPayoutId: `po_scan_reversal_a_${payoutAId}`, runId: laterIssueId }],
+    hasMore: false,
+    checkpoint: null
+  });
+});
+
+it('targets a missing referenced reversal payout from its durable local issue', async () => {
+  const now = new Date('2026-08-12T21:00:00.000Z');
+  const payoutId = randomUUID();
+  const issueId = randomUUID();
+  const missingProviderPayoutId = `po_scan_missing_reversal_${payoutId}`;
+  await databaseClient.db.insert(stripePayouts).values({
+    id: payoutId, providerId: `po_scan_reversed_source_${payoutId}`, liveMode: false,
+    amountMinor: 1000, currency: 'USD', automatic: true, method: 'standard', status: 'paid',
+    reconciliationStatus: 'completed', providerCreatedAt: now, arrivalAt: now,
+    retrievedAt: now, reversedByProviderPayoutId: missingProviderPayoutId,
+    fingerprintSha256: 'f'.repeat(64)
+  });
+  await databaseClient.db.insert(financialReconciliationIssues).values({
+    id: issueId, resourceType: 'payout', resourceId: payoutId,
+    safeCode: 'payout_reversal_incomplete', state: 'open', impact: 'exception',
+    occurrenceCount: 1, correlationId: 'scan-missing-reversal'
+  });
+  const run: FinancialScanRunRow = {
+    id: randomUUID(), rootKey: 'commerce.financial-scan:2026-08-12T21:00:00.000Z',
+    kind: 'hourly', phase: 'incomplete_payout_run_page', state: 'running',
+    classifierVersion: null, allocationAlgorithmVersion: null, replayId: null,
+    payoutDiscoveryCreatedGte: null, payoutDiscoveryCreatedLt: null,
+    checkpoint: null, cursorDigestSha256: null, processedCount: 0, enqueuedCount: 0,
+    pageCount: 0, safeOutcome: null, startedAt: now, updatedAt: now, completedAt: null
+  };
+
+  await expect(loadIncompletePayoutRunPage(databaseClient.db, run, 1)).resolves.toEqual({
+    data: [{ providerPayoutId: missingProviderPayoutId, runId: issueId }],
     hasMore: false,
     checkpoint: null
   });
@@ -286,7 +377,8 @@ it('scans pending and retryable exceptions but excludes durable exception-impact
   const run: FinancialScanRunRow = {
     id: randomUUID(), rootKey: 'commerce.financial-scan:2026-08-12T21:00:00.000Z',
     kind: 'hourly', phase: 'source_page', state: 'running', classifierVersion: null,
-    allocationAlgorithmVersion: null, replayId: null, checkpoint: null,
+    allocationAlgorithmVersion: null, replayId: null,
+    payoutDiscoveryCreatedGte: null, payoutDiscoveryCreatedLt: null, checkpoint: null,
     cursorDigestSha256: null, processedCount: 0, enqueuedCount: 0, pageCount: 0,
     safeOutcome: null, startedAt: now, updatedAt: now, completedAt: null
   };

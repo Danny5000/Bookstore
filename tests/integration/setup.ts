@@ -15,6 +15,7 @@ beforeEach(async () => {
       stripe_payouts, stripe_balance_transactions,
       financial_projection_versions, financial_classification_versions,
       financial_reconciliation_issues,
+      financial_payout_discovery_state,
       financial_scan_runs,
       entitlement_grants, refund_allocations, disputes, refunds,
       payments, order_items, orders, stripe_events, application_rate_limits,
@@ -31,6 +32,10 @@ beforeEach(async () => {
     insert into financial_projection_versions
       (singleton, classifier_version, allocation_algorithm_version, activation_correlation_id)
     values (true, 1, 1, 'integration-reset-c1-a1')
+  `);
+  await databaseClient.db.execute(sql`
+    insert into financial_payout_discovery_state (singleton, covered_through)
+    values (true, null)
   `);
 });
 

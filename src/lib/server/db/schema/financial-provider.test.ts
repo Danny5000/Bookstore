@@ -7,6 +7,7 @@ import {
   financialClassificationSubjectTypeEnum,
   financialClassificationVersions,
   financialProjectionVersions,
+  financialPayoutDiscoveryState,
   financialScanRuns,
   financialScanStateEnum,
   payoutImportRunEntries,
@@ -23,6 +24,7 @@ import {
 
 const TABLES = [
   financialProjectionVersions,
+  financialPayoutDiscoveryState,
   stripeBalanceTransactions,
   stripeBalanceTransactionFeeDetails,
   financialClassificationVersions,
@@ -49,6 +51,7 @@ describe('financial provider schema declarations', () => {
   it('declares the exact provider table and enum vocabulary', () => {
     expect(TABLES.map((table) => configFor(table).name)).toEqual([
       'financial_projection_versions',
+      'financial_payout_discovery_state',
       'stripe_balance_transactions',
       'stripe_balance_transaction_fee_details',
       'financial_classification_versions',
@@ -122,6 +125,7 @@ describe('financial provider schema declarations', () => {
         'singleton', 'classifier_version', 'allocation_algorithm_version', 'activated_at',
         'activation_correlation_id'
       ],
+      financial_payout_discovery_state: ['singleton', 'covered_through', 'updated_at'],
       stripe_balance_transactions: [
         'id', 'provider_id', 'live_mode', 'source_family', 'source_id', 'raw_type',
         'reporting_category', 'balance_type', 'amount_minor', 'fee_minor', 'net_minor',
@@ -156,7 +160,8 @@ describe('financial provider schema declarations', () => {
       ],
       financial_scan_runs: [
         'id', 'root_key', 'kind', 'phase', 'state', 'classifier_version',
-        'allocation_algorithm_version', 'replay_id', 'checkpoint', 'cursor_digest_sha256',
+        'allocation_algorithm_version', 'replay_id', 'payout_discovery_created_gte',
+        'payout_discovery_created_lt', 'checkpoint', 'cursor_digest_sha256',
         'processed_count', 'enqueued_count', 'page_count', 'safe_outcome', 'started_at',
         'updated_at', 'completed_at'
       ]
@@ -226,8 +231,12 @@ describe('financial provider schema declarations', () => {
     expect(checkNames(financialScanRuns)).toEqual(
       expect.arrayContaining([
         'financial_scan_runs_counts_nonnegative',
-        'financial_scan_runs_checkpoint_bounded'
+        'financial_scan_runs_checkpoint_bounded',
+        'financial_scan_runs_payout_discovery_window_consistent'
       ])
+    );
+    expect(checkNames(financialPayoutDiscoveryState)).toContain(
+      'financial_payout_discovery_state_singleton_true'
     );
   });
 
@@ -251,6 +260,10 @@ describe('financial provider schema declarations', () => {
           'financial_projection_versions_singleton_true',
           'financial_projection_versions_versions_positive'
         ]
+      },
+      financial_payout_discovery_state: {
+        indexes: [], unique: [],
+        checks: ['financial_payout_discovery_state_singleton_true']
       },
       stripe_balance_transactions: {
         indexes: ['stripe_balance_transactions_currency_created_idx', 'stripe_balance_transactions_provider_unique', 'stripe_balance_transactions_source_idx', 'stripe_balance_transactions_status_available_idx'],
@@ -277,7 +290,7 @@ describe('financial provider schema declarations', () => {
       stripe_payout_balance_transactions: { indexes: ['stripe_payout_balance_transactions_pair_unique', 'stripe_payout_balance_transactions_payout_idx', 'stripe_payout_balance_transactions_transaction_unique'], unique: [], checks: [] },
       financial_scan_runs: {
         indexes: ['financial_scan_runs_kind_completed_idx', 'financial_scan_runs_root_key_unique', 'financial_scan_runs_state_phase_updated_idx'], unique: [],
-        checks: ['financial_scan_runs_checkpoint_bounded', 'financial_scan_runs_counts_nonnegative', 'financial_scan_runs_cursor_digest_sha256', 'financial_scan_runs_lifecycle_consistent', 'financial_scan_runs_replay_consistent', 'financial_scan_runs_vocabulary_safe']
+        checks: ['financial_scan_runs_checkpoint_bounded', 'financial_scan_runs_counts_nonnegative', 'financial_scan_runs_cursor_digest_sha256', 'financial_scan_runs_lifecycle_consistent', 'financial_scan_runs_payout_discovery_window_consistent', 'financial_scan_runs_replay_consistent', 'financial_scan_runs_vocabulary_safe']
       }
     });
   });

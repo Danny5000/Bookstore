@@ -14,6 +14,7 @@ function source(relativePath: string): string {
 
 const PROVIDER_TABLES = [
   'financial_projection_versions',
+  'financial_payout_discovery_state',
   'stripe_balance_transactions',
   'stripe_balance_transaction_fee_details',
   'financial_classification_versions',
@@ -39,6 +40,7 @@ const ALLOCATION_TABLES = [
 
 const ROW_ALIASES = [
   'FinancialProjectionVersionRow',
+  'FinancialPayoutDiscoveryStateRow',
   'StripeBalanceTransactionRow',
   'StripeBalanceTransactionFeeDetailRow',
   'FinancialClassificationVersionRow',

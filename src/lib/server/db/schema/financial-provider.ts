@@ -118,6 +118,18 @@ export const financialProjectionVersions = pgTable(
   ]
 );
 
+export const financialPayoutDiscoveryState = pgTable(
+  'financial_payout_discovery_state',
+  {
+    singleton: boolean('singleton').default(true).primaryKey(),
+    coveredThrough: timestamp('covered_through', { withTimezone: true }),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull()
+  },
+  (table) => [
+    check('financial_payout_discovery_state_singleton_true', sql`${table.singleton} = true`)
+  ]
+);
+
 export const stripeBalanceTransactions = pgTable(
   'stripe_balance_transactions',
   {
@@ -450,6 +462,8 @@ export const financialScanRuns = pgTable(
     classifierVersion: integer('classifier_version'),
     allocationAlgorithmVersion: integer('allocation_algorithm_version'),
     replayId: varchar('replay_id', { length: 50 }),
+    payoutDiscoveryCreatedGte: timestamp('payout_discovery_created_gte', { withTimezone: true }),
+    payoutDiscoveryCreatedLt: timestamp('payout_discovery_created_lt', { withTimezone: true }),
     checkpoint: varchar('checkpoint', { length: 255 }),
     cursorDigestSha256: varchar('cursor_digest_sha256', { length: 64 }),
     processedCount: integer('processed_count').default(0).notNull(),
@@ -498,6 +512,17 @@ export const financialScanRuns = pgTable(
       )`
     ),
     check(
+      'financial_scan_runs_payout_discovery_window_consistent',
+      sql`(
+        ${table.payoutDiscoveryCreatedGte} is null and ${table.payoutDiscoveryCreatedLt} is null
+      ) or (
+        ${table.payoutDiscoveryCreatedGte} is not null and
+        ${table.payoutDiscoveryCreatedLt} is not null and
+        ${table.payoutDiscoveryCreatedGte} < ${table.payoutDiscoveryCreatedLt} and
+        ${table.kind} in ('initial_backfill', 'hourly')
+      )`
+    ),
+    check(
       'financial_scan_runs_lifecycle_consistent',
       sql`(${table.state} in ('completed', 'exception')) = (${table.completedAt} is not null)`
     )
@@ -506,6 +531,8 @@ export const financialScanRuns = pgTable(
 
 export type FinancialProjectionVersionRow = typeof financialProjectionVersions.$inferSelect;
 export type NewFinancialProjectionVersionRow = typeof financialProjectionVersions.$inferInsert;
+export type FinancialPayoutDiscoveryStateRow = typeof financialPayoutDiscoveryState.$inferSelect;
+export type NewFinancialPayoutDiscoveryStateRow = typeof financialPayoutDiscoveryState.$inferInsert;
 export type StripeBalanceTransactionRow = typeof stripeBalanceTransactions.$inferSelect;
 export type NewStripeBalanceTransactionRow = typeof stripeBalanceTransactions.$inferInsert;
 export type StripeBalanceTransactionFeeDetailRow =

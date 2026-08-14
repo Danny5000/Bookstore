@@ -220,11 +220,11 @@ If and only if Step 1 justified and implemented a compatible dependency update, 
 
 - [ ] **Step 1: Write RED schema-contract tests before changing production schema**
 
-Test all names, enum values, foreign-key actions, unique/index identities, and check constraints through Drizzle metadata plus real PostgreSQL. The schema tests must assert this exact 19-table ownership. The provider module owns the singleton projection-version authority so classifier and allocation versions can be activated atomically only after their replay converges:
+Test all names, enum values, foreign-key actions, unique/index identities, and check constraints through Drizzle metadata plus real PostgreSQL. The schema tests must assert this exact 20-table ownership. The provider module owns both the singleton projection-version authority, so classifier and allocation versions activate atomically only after replay convergence, and the singleton payout-discovery high-water, so outages longer than the ordinary overlap cannot create a permanent gap:
 
 | File | Tables |
 | --- | --- |
-| `financial-provider.ts` | `financial_projection_versions`, `stripe_balance_transactions`, `stripe_balance_transaction_fee_details`, `financial_classification_versions`, `stripe_payouts`, `payout_import_runs`, `payout_import_run_entries`, `stripe_payout_balance_transactions`, `financial_scan_runs` |
+| `financial-provider.ts` | `financial_projection_versions`, `financial_payout_discovery_state`, `stripe_balance_transactions`, `stripe_balance_transaction_fee_details`, `financial_classification_versions`, `stripe_payouts`, `payout_import_runs`, `payout_import_run_entries`, `stripe_payout_balance_transactions`, `financial_scan_runs` |
 | `financial-allocation.ts` | `financial_allocation_sets`, `financial_item_allocations`, `financial_reconciliation_issues`, `refund_allocation_components`, `dispute_item_allocations`, `refund_allocation_drafts`, `refund_allocation_draft_items`, `refund_reporting_correction_sets`, `refund_reporting_correction_items`, `refund_allocation_finalization_effects` |
 
 The commerce schema tests must require:
@@ -283,7 +283,9 @@ Use UUID primary keys for internal relations and bounded unique provider IDs. De
 
 `payout_import_runs` stores payout, generation, state, cursor, bounded counts, start/completion timestamps, and safe outcome. `payout_import_run_entries` stores candidate balance-transaction identity scoped to a run. `stripe_payout_balance_transactions` is the published immutable association and must enforce at most one supported payout for each balance transaction.
 
-`financial_scan_runs` stores unique root key, kind/phase, bounded cursor digest/checkpoint, counts, safe outcome, and start/completion timestamps. No column may contain a provider cursor without a configured maximum length.
+`financial_payout_discovery_state` is a singleton durable coverage high-water. Each initial/hourly scan freezes its bounded payout `created_gte`/`created_lt` window on `financial_scan_runs`; the high-water advances only in the same transaction that commits the terminal discovery page, with overlap and no-gap validation.
+
+`financial_scan_runs` stores unique root key, kind/phase, bounded cursor digest/checkpoint, frozen payout-discovery bounds, counts, safe outcome, and start/completion timestamps. No column may contain a provider cursor without a configured maximum length.
 
 - [ ] **Step 4: Implement allocation, issue, draft, correction, and provenance tables**
 

@@ -336,13 +336,13 @@ For a payout event, the existing Stripe-event handler validates the descriptor a
 
 When Stripe is enabled, each worker polling loop safely ensures that one root scan job exists for the current UTC hour. The key is `commerce.financial-scan:<UTC-hour>`, so the repository's permanent unique deduplication constraint becomes an asset instead of stopping recurrence. Concurrent workers converge on the same row through the existing unique constraint.
 
-`financial_scan_runs` stores phase, bounded cursor/checkpoint, counts, start/completion timestamps, and safe outcome. Each job processes at most 100 local resources or one provider page before committing progress and enqueueing a continuation. No loop holds a worker lease or database transaction across unbounded work.
+`financial_scan_runs` stores phase, bounded cursor/checkpoint, frozen payout-discovery time bounds, counts, start/completion timestamps, and safe outcome. A singleton `financial_payout_discovery_state` stores the completed coverage high-water. Each job processes at most 100 local resources or one provider page before committing progress and enqueueing a continuation. No loop holds a worker lease or database transaction across unbounded work.
 
 The hourly scan covers:
 
 - Pending and retryable-exception payments, refunds, and disputes.
 - Incomplete payout import runs.
-- Recent payout lifecycle using a durable payout cursor plus a 72-hour overlap for delayed or reordered provider data.
+- Payout lifecycle using a frozen provider window and a 72-hour overlap from the durable completed-coverage high-water; the high-water advances only with the terminal page, so an outage longer than 72 hours cannot create a permanent gap.
 - Initially, payouts from seven days before the earliest local paid order; the application does not import unrelated pre-store account history.
 
 If a bounded job exhausts transient retries, the durable resource remains pending and the next hourly generation can try again. Permanent evidence conflicts remain exceptions until evidence changes or an authorized workflow resolves them.
