@@ -397,7 +397,8 @@ with fee_sums as (
 ), refund_component_sequence as (
   select c.id as component_id, ra.id as allocation_id,
     ra.amount_minor::bigint as allocation_minor,
-    r.id as refund_id, r.status as refund_status, r.currency as refund_currency,
+    r.id as refund_id, r.status as refund_status,
+    r.allocation_status as refund_allocation_status, r.currency as refund_currency,
     r.provider_created_at, r.stripe_refund_id, p.order_id as payment_order_id,
     oi.id as order_item_id, oi.order_id as item_order_id,
     oi.unit_subtotal_minor::bigint as item_subtotal_minor,
@@ -513,6 +514,7 @@ with fee_sums as (
   select 'refund_component_chronology_capacity', count(*)::bigint
   from refund_component_ratios
   where refund_status <> 'succeeded'
+     or refund_allocation_status not in ('finalized', 'exception')
      or item_tax_minor is null or item_total_minor is null
      or item_total_minor <> item_subtotal_minor + item_tax_minor
      or payment_order_id <> item_order_id
@@ -938,18 +940,6 @@ where replay.kind = 'classification_replay'
     or replay.cursor_digest_sha256 is not null
   );
 
-select check_name, violation_count
-from restore_financial_checks
-where violation_count <> 0
-  and check_name in (
-    'failed_running_scan_retry_exhausted',
-    'failed_running_scan_permanent',
-    'pending_replay_child_incomplete',
-    'pending_replay_child_retry_exhausted',
-    'pending_replay_child_permanent'
-  )
-order by check_name collate "C";
-
 do $restore_verifier$
 declare
   total_violations bigint;
@@ -973,5 +963,16 @@ begin
   end if;
 end
 $restore_verifier$;
+
+select check_name, violation_count
+from restore_financial_checks
+where check_name in (
+  'failed_running_scan_permanent',
+  'failed_running_scan_retry_exhausted',
+  'pending_replay_child_incomplete',
+  'pending_replay_child_permanent',
+  'pending_replay_child_retry_exhausted'
+)
+order by check_name collate "C";
 
 rollback;

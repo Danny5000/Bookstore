@@ -115,6 +115,32 @@ function fencedCodeBlocks(section: string, language: 'powershell' | 'sh'): strin
   );
 }
 
+function documentedPowerShellFunction(script: string, name: string): string {
+  const start = script.indexOf(`function ${name} {`);
+  if (start === -1) throw new Error(`Documented PowerShell function not found: ${name}`);
+  let depth = 0;
+  let opened = false;
+  for (let index = start; index < script.length; index += 1) {
+    if (script[index] === '{') {
+      depth += 1;
+      opened = true;
+    } else if (script[index] === '}') {
+      depth -= 1;
+      if (opened && depth === 0) return script.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Documented PowerShell function is unterminated: ${name}`);
+}
+
+function documentedFinancialPosixFunctions(script: string, nextFunction: string): string {
+  const start = script.indexOf('canonicalize_financial_operational_diagnostics() {');
+  const end = script.indexOf(`${nextFunction}() {`, start);
+  if (start === -1 || end === -1) {
+    throw new Error('Documented POSIX financial diagnostic functions were not found');
+  }
+  return script.slice(start, end);
+}
+
 function expectNativeCommandsFailClosed(script: string): void {
   const lines = script.split(/\r?\n/u);
   for (const [index, line] of lines.entries()) {
@@ -795,6 +821,7 @@ describe('commerce operations contract', () => {
       'restore-row-counts.csv',
       'storage-samples.csv',
       'source-docker-engine.json',
+      'financial-operational-diagnostics.csv',
       'verify-financial-restore.sql'
     ];
 
@@ -802,6 +829,8 @@ describe('commerce operations contract', () => {
       expect(backupSection, requiredFile).toContain(requiredFile);
       expect(integritySection, requiredFile).toContain(requiredFile);
     }
+    expect(backupSection).toContain('exactly nine required plaintext files');
+    expect(integritySection).toContain('containing the nine required files');
     for (const script of [backupPowerShell, backupShell]) {
       const stopIndex = script.indexOf('stop app worker');
       const verifierIndex = script.lastIndexOf('verify-financial-restore.sql');
@@ -1259,6 +1288,410 @@ describe('commerce operations contract', () => {
     }
   });
 
+  it('persists and blocks on strictly parsed financial operational diagnostics', async () => {
+    const storageRunbook = await source('docs/storage-ingestion-and-publication.md');
+    const backupSection = markdownSection(storageRunbook, 'Coordinated backup');
+    const restoreSection = markdownSection(storageRunbook, 'Isolated restore rehearsal');
+    const sourcePowerShell = fencedCodeBlocks(backupSection, 'powershell').join('\n');
+    const restorePowerShell = fencedCodeBlocks(restoreSection, 'powershell').join('\n');
+    const sourceShell = fencedCodeBlocks(backupSection, 'sh').join('\n');
+    const restoreShell = fencedCodeBlocks(restoreSection, 'sh').join('\n');
+    const financialVerifier = await source('scripts/verify-financial-restore.sql');
+
+    for (const script of [sourcePowerShell, restorePowerShell]) {
+      expect(script).toContain('function ConvertTo-FinancialOperationalDiagnostics');
+      expect(script).toContain('function Write-FinancialOperationalDisposition');
+      expect(script).toContain('financial-operational-diagnostics.csv');
+      expect(script).toContain('OPERATIONAL_BLOCKER ');
+      expect(script).toContain('PRODUCTION_REPLACEMENT_DISPOSITION=');
+      expect(script).toContain('--csv');
+    }
+    const restorePowerShellVerifier = restorePowerShell.indexOf(
+      '$productionReplacementBlocked = Invoke-FinancialRestoreVerifier'
+    );
+    const restorePowerShellApp = restorePowerShell.indexOf('up --detach --wait app');
+    const restorePowerShellHealth = restorePowerShell.indexOf(
+      "Promise.all(['/health/live','/health/ready']"
+    );
+    const restorePowerShellStopped = restorePowerShell.indexOf(
+      'Assert-RestoreWorkerStopped',
+      restorePowerShellHealth
+    );
+    const restorePowerShellGate = restorePowerShell.lastIndexOf(
+      'if ($productionReplacementBlocked)'
+    );
+    const restorePowerShellSucceeded = restorePowerShell.indexOf(
+      '$rehearsalSucceeded = $true'
+    );
+    for (const anchor of [
+      restorePowerShellVerifier,
+      restorePowerShellApp,
+      restorePowerShellHealth,
+      restorePowerShellStopped,
+      restorePowerShellGate,
+      restorePowerShellSucceeded
+    ]) {
+      expect(anchor).toBeGreaterThan(-1);
+    }
+    expect(restorePowerShellVerifier).toBeLessThan(restorePowerShellApp);
+    expect(restorePowerShellHealth).toBeLessThan(restorePowerShellStopped);
+    expect(restorePowerShellStopped).toBeLessThan(restorePowerShellGate);
+    expect(restorePowerShellGate).toBeLessThan(restorePowerShellSucceeded);
+
+    const restoreShellVerifier = restoreShell.indexOf(
+      'run_financial_restore_verifier || exit 1'
+    );
+    const restoreShellApp = restoreShell.indexOf('up --detach --wait app');
+    const restoreShellHealth = restoreShell.indexOf(
+      "Promise.all(['/health/live','/health/ready']"
+    );
+    const restoreShellStopped = restoreShell.indexOf(
+      'assert_restore_worker_stopped || exit 1',
+      restoreShellHealth
+    );
+    const restoreShellGate = restoreShell.lastIndexOf(
+      'if [ "$production_replacement_blocked" -eq 1 ]'
+    );
+    const restoreShellTeardown = restoreShell.indexOf('pre_teardown_inventory=');
+    for (const anchor of [
+      restoreShellVerifier,
+      restoreShellApp,
+      restoreShellHealth,
+      restoreShellStopped,
+      restoreShellGate,
+      restoreShellTeardown
+    ]) {
+      expect(anchor).toBeGreaterThan(-1);
+    }
+    expect(restoreShellVerifier).toBeLessThan(restoreShellApp);
+    expect(restoreShellHealth).toBeLessThan(restoreShellStopped);
+    expect(restoreShellStopped).toBeLessThan(restoreShellGate);
+    expect(restoreShellGate).toBeLessThan(restoreShellTeardown);
+    const sourcePowerShellBlocked = sourcePowerShell.indexOf(
+      'if ($sourceProductionReplacementBlocked)'
+    );
+    const sourcePowerShellContinues = sourcePowerShell.indexOf(
+      'Assert-SourceDockerEngineBinding',
+      sourcePowerShellBlocked
+    );
+    expect(sourcePowerShellBlocked).toBeGreaterThan(-1);
+    expect(sourcePowerShellContinues).toBeGreaterThan(-1);
+    expect(sourcePowerShellBlocked).toBeLessThan(sourcePowerShellContinues);
+    expect(sourcePowerShell.slice(
+      sourcePowerShellBlocked,
+      sourcePowerShellContinues
+    )).not.toContain('throw');
+    const sourceShellBlocked = sourceShell.indexOf('source_production_replacement_blocked=1');
+    const sourceShellContinues = sourceShell.indexOf(
+      'source_docker run --rm',
+      sourceShellBlocked
+    );
+    expect(sourceShellBlocked).toBeGreaterThan(-1);
+    expect(sourceShellContinues).toBeGreaterThan(-1);
+    expect(sourceShellBlocked).toBeLessThan(sourceShellContinues);
+    for (const script of [sourceShell, restoreShell]) {
+      expect(script).toContain('canonicalize_financial_operational_diagnostics');
+      expect(script).toContain('report_financial_operational_disposition');
+      expect(script).toContain('financial-operational-diagnostics.csv');
+      expect(script).toContain('OPERATIONAL_BLOCKER ');
+      expect(script).toContain('PRODUCTION_REPLACEMENT_DISPOSITION=');
+      expect(script).toContain('--csv');
+    }
+    const structuralDo = financialVerifier.lastIndexOf('do $restore_verifier$');
+    const operationalSelect = financialVerifier.lastIndexOf(
+      'select check_name, violation_count'
+    );
+    const verifierRollback = financialVerifier.lastIndexOf('rollback;');
+    expect(structuralDo).toBeGreaterThan(-1);
+    expect(operationalSelect).toBeGreaterThan(-1);
+    expect(verifierRollback).toBeGreaterThan(-1);
+    expect(structuralDo).toBeLessThan(operationalSelect);
+    expect(operationalSelect).toBeLessThan(verifierRollback);
+    const operationalOutput = financialVerifier.slice(
+      operationalSelect,
+      verifierRollback
+    );
+    expect(operationalOutput).not.toContain('violation_count <> 0');
+    let previousCheckIndex = -1;
+    for (const checkName of [
+      'failed_running_scan_permanent',
+      'failed_running_scan_retry_exhausted',
+      'pending_replay_child_incomplete',
+      'pending_replay_child_permanent',
+      'pending_replay_child_retry_exhausted'
+    ]) {
+      const checkIndex = operationalOutput.indexOf(`'${checkName}'`);
+      expect(checkIndex).toBeGreaterThan(previousCheckIndex);
+      previousCheckIndex = checkIndex;
+    }
+
+    const nonzeroDiagnostics = [
+      'check_name,violation_count',
+      'failed_running_scan_permanent,0',
+      'failed_running_scan_retry_exhausted,0',
+      'pending_replay_child_incomplete,2',
+      'pending_replay_child_permanent,0',
+      'pending_replay_child_retry_exhausted,1'
+    ].join('\n');
+    const zeroDiagnostics = nonzeroDiagnostics
+      .replace('pending_replay_child_incomplete,2', 'pending_replay_child_incomplete,0')
+      .replace('pending_replay_child_retry_exhausted,1', 'pending_replay_child_retry_exhausted,0');
+    const reorderedLines = nonzeroDiagnostics.split('\n');
+    [reorderedLines[3], reorderedLines[4]] = [reorderedLines[4]!, reorderedLines[3]!];
+    const invalidDiagnostics = [
+      nonzeroDiagnostics.split('\n').slice(0, -1).join('\n'),
+      nonzeroDiagnostics.replace(
+        'pending_replay_child_retry_exhausted,1',
+        'pending_replay_child_permanent,0'
+      ),
+      `${nonzeroDiagnostics}\npending_replay_child_retry_exhausted,1`,
+      reorderedLines.join('\n'),
+      nonzeroDiagnostics.replace('pending_replay_child_incomplete,2', 'pending_replay_child_incomplete,-1'),
+      nonzeroDiagnostics.replace('pending_replay_child_incomplete,2', 'pending_replay_child_incomplete,02'),
+      nonzeroDiagnostics.replace(
+        'pending_replay_child_incomplete,2',
+        'pending_replay_child_incomplete,9223372036854775808'
+      ),
+      nonzeroDiagnostics.replace(
+        'pending_replay_child_incomplete,2',
+        '"pending_replay_child_incomplete",2'
+      ),
+      nonzeroDiagnostics.replace(
+        'pending_replay_child_incomplete,2',
+        'pending_replay_child_incomplete,2,SECRET_SENTINEL'
+      ),
+      nonzeroDiagnostics.replace('check_name,violation_count', 'Check_Name,violation_count'),
+      nonzeroDiagnostics.replace(
+        'pending_replay_child_incomplete,2',
+        'Pending_replay_child_incomplete,2'
+      )
+    ];
+    for (const [script, nextFunction] of [
+      [sourceShell, 'cleanup_container_dump'],
+      [restoreShell, 'verify_restored_storage_samples']
+    ] as const) {
+      const functions = documentedFinancialPosixFunctions(script, nextFunction);
+      const runParser = (input: string, commands: readonly string[]) => spawnSync(
+        posixShellPath(),
+        ['-s'],
+        {
+          encoding: 'utf8',
+          env: { ...process.env, FINANCIAL_DIAGNOSTICS_TEST_INPUT: input },
+          input: ['set -eu', functions, ...commands].join('\n')
+        }
+      );
+      const nonzeroResult = runParser(nonzeroDiagnostics, [
+        'canonical="$(canonicalize_financial_operational_diagnostics "$FINANCIAL_DIAGNOSTICS_TEST_INPUT")"',
+        'if report_financial_operational_disposition "$canonical"; then blocked=0; else status=$?; [ "$status" -eq 2 ] || exit 4; blocked=1; fi',
+        'printf "BLOCKED_SCALAR_VALUE=%s\\n" "$blocked"',
+        '[ "$blocked" -eq 1 ]'
+      ]);
+      expect(nonzeroResult.status).toBe(0);
+      expect(nonzeroResult.stdout).toContain(
+        'OPERATIONAL_BLOCKER pending_replay_child_incomplete=2'
+      );
+      expect(nonzeroResult.stdout).toContain(
+        'OPERATIONAL_BLOCKER pending_replay_child_retry_exhausted=1'
+      );
+      expect(nonzeroResult.stdout).toContain('FINANCIAL_OPERATIONAL_DISPOSITION=blocked');
+      expect(nonzeroResult.stdout).toContain('BLOCKED_SCALAR_VALUE=1');
+      expect(nonzeroResult.stderr).toBe('');
+
+      const zeroResult = runParser(zeroDiagnostics, [
+        'canonical="$(canonicalize_financial_operational_diagnostics "$FINANCIAL_DIAGNOSTICS_TEST_INPUT")"',
+        'if report_financial_operational_disposition "$canonical"; then blocked=0; else status=$?; [ "$status" -eq 2 ] || exit 4; blocked=1; fi',
+        'printf "BLOCKED_SCALAR_VALUE=%s\\n" "$blocked"',
+        '[ "$blocked" -eq 0 ]'
+      ]);
+      expect(zeroResult.status).toBe(0);
+      expect(zeroResult.stdout).toContain('FINANCIAL_OPERATIONAL_DISPOSITION=clear');
+      expect(zeroResult.stdout).toContain('BLOCKED_SCALAR_VALUE=0');
+      expect(zeroResult.stdout).not.toContain('OPERATIONAL_BLOCKER ');
+      expect(zeroResult.stderr).toBe('');
+
+      for (const invalidInput of invalidDiagnostics) {
+        const invalidResult = runParser(invalidInput, [
+          'if canonicalize_financial_operational_diagnostics "$FINANCIAL_DIAGNOSTICS_TEST_INPUT" >/dev/null; then exit 3; fi',
+          "printf '%s\\n' GENERIC_FINANCIAL_DIAGNOSTIC_REJECTION"
+        ]);
+        expect(invalidResult.status).toBe(0);
+        expect(invalidResult.stdout.trim()).toBe('GENERIC_FINANCIAL_DIAGNOSTIC_REJECTION');
+        expect(invalidResult.stdout).not.toContain('SECRET_SENTINEL');
+        expect(invalidResult.stderr).toBe('');
+      }
+
+      const directSinkResult = runParser(
+        nonzeroDiagnostics.replace(
+          'pending_replay_child_incomplete,2',
+          'pending_replay_child_incomplete,2,SECRET_SENTINEL'
+        ),
+        [
+          'if report_financial_operational_disposition "$FINANCIAL_DIAGNOSTICS_TEST_INPUT"; then exit 3; else status=$?; [ "$status" -eq 1 ] || exit 4; fi',
+          "printf '%s\\n' GENERIC_FINANCIAL_DISPOSITION_REJECTION"
+        ]
+      );
+      expect(directSinkResult.status).toBe(0);
+      expect(directSinkResult.stdout.trim()).toBe('GENERIC_FINANCIAL_DISPOSITION_REJECTION');
+      expect(directSinkResult.stdout).not.toContain('SECRET_SENTINEL');
+      expect(directSinkResult.stderr).toBe('');
+
+      const outputFailure = runParser(zeroDiagnostics, [
+        'canonical="$(canonicalize_financial_operational_diagnostics "$FINANCIAL_DIAGNOSTICS_TEST_INPUT")"',
+        "printf() { if [ \"${2-}\" = 'FINANCIAL_OPERATIONAL_DISPOSITION=clear' ]; then return 7; fi; command printf \"$@\"; }",
+        'if report_financial_operational_disposition "$canonical"; then exit 3; else status=$?; [ "$status" -eq 1 ] || exit 4; fi'
+      ]);
+      expect(outputFailure.status).toBe(0);
+      expect(outputFailure.stdout).toBe('');
+    }
+
+    if (process.platform !== 'win32') return;
+    for (const script of [sourcePowerShell, restorePowerShell]) {
+      const functions = [
+        "$ErrorActionPreference = 'Stop'",
+        documentedPowerShellFunction(script, 'ConvertTo-FinancialOperationalDiagnostics'),
+        documentedPowerShellFunction(script, 'Write-FinancialOperationalDisposition')
+      ].join('\n');
+      const runParser = (input: string, commands: readonly string[]) => spawnSync(
+        'powershell.exe',
+        [
+          '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+          [functions, ...commands].join('\n')
+        ],
+        {
+          encoding: 'utf8',
+          env: { ...process.env, FINANCIAL_DIAGNOSTICS_TEST_INPUT: input }
+        }
+      );
+      const nonzeroResult = runParser(nonzeroDiagnostics, [
+        '$lines = @($env:FINANCIAL_DIAGNOSTICS_TEST_INPUT -split "`n")',
+        '$canonical = ConvertTo-FinancialOperationalDiagnostics -Lines $lines',
+        '$blocked = Write-FinancialOperationalDisposition -CanonicalDiagnostics $canonical',
+        '[Console]::Out.WriteLine("BLOCKED_SCALAR_TYPE=$($blocked.GetType().FullName)")',
+        '[Console]::Out.WriteLine("BLOCKED_SCALAR_VALUE=$blocked")',
+        '[Console]::Out.Write($canonical)',
+        'if (-not $blocked) { exit 3 }'
+      ]);
+      expect(nonzeroResult.status).toBe(0);
+      expect(nonzeroResult.stdout).toContain(
+        'OPERATIONAL_BLOCKER pending_replay_child_incomplete=2'
+      );
+      expect(nonzeroResult.stdout).toContain(
+        'OPERATIONAL_BLOCKER pending_replay_child_retry_exhausted=1'
+      );
+      expect(nonzeroResult.stdout).toContain('FINANCIAL_OPERATIONAL_DISPOSITION=blocked');
+      expect(nonzeroResult.stdout).toContain('BLOCKED_SCALAR_TYPE=System.Boolean');
+      expect(nonzeroResult.stdout).toContain('BLOCKED_SCALAR_VALUE=True');
+      expect(nonzeroResult.stdout).toContain(`${nonzeroDiagnostics}\n`);
+      expect(nonzeroResult.stderr).toBe('');
+
+      const zeroResult = runParser(zeroDiagnostics, [
+        '$lines = @($env:FINANCIAL_DIAGNOSTICS_TEST_INPUT -split "`n")',
+        '$canonical = ConvertTo-FinancialOperationalDiagnostics -Lines $lines',
+        '$blocked = Write-FinancialOperationalDisposition -CanonicalDiagnostics $canonical',
+        '[Console]::Out.WriteLine("BLOCKED_SCALAR_TYPE=$($blocked.GetType().FullName)")',
+        '[Console]::Out.WriteLine("BLOCKED_SCALAR_VALUE=$blocked")',
+        'if ($blocked) { exit 3 }'
+      ]);
+      expect(zeroResult.status).toBe(0);
+      expect(zeroResult.stdout).toContain('FINANCIAL_OPERATIONAL_DISPOSITION=clear');
+      expect(zeroResult.stdout).toContain('BLOCKED_SCALAR_TYPE=System.Boolean');
+      expect(zeroResult.stdout).toContain('BLOCKED_SCALAR_VALUE=False');
+      expect(zeroResult.stdout).not.toContain('OPERATIONAL_BLOCKER ');
+      expect(zeroResult.stderr).toBe('');
+
+      for (const invalidInput of invalidDiagnostics) {
+        const invalidResult = runParser(invalidInput, [
+          'try {',
+          '  $lines = @($env:FINANCIAL_DIAGNOSTICS_TEST_INPUT -split "`n")',
+          '  $null = ConvertTo-FinancialOperationalDiagnostics -Lines $lines',
+          '  exit 3',
+          '} catch {',
+          "  [Console]::Out.WriteLine('GENERIC_FINANCIAL_DIAGNOSTIC_REJECTION')",
+          '}'
+        ]);
+        expect(invalidResult.status).toBe(0);
+        expect(invalidResult.stdout.trim()).toBe('GENERIC_FINANCIAL_DIAGNOSTIC_REJECTION');
+        expect(invalidResult.stdout).not.toContain('SECRET_SENTINEL');
+        expect(invalidResult.stderr).toBe('');
+      }
+
+      const directSinkResult = runParser(
+        nonzeroDiagnostics.replace(
+          'pending_replay_child_incomplete,2',
+          'pending_replay_child_incomplete,2,SECRET_SENTINEL'
+        ),
+        [
+          'try {',
+          '  $null = Write-FinancialOperationalDisposition -CanonicalDiagnostics $env:FINANCIAL_DIAGNOSTICS_TEST_INPUT',
+          '  exit 3',
+          '} catch {',
+          "  [Console]::Out.WriteLine('GENERIC_FINANCIAL_DISPOSITION_REJECTION')",
+          '}'
+        ]
+      );
+      expect(directSinkResult.status).toBe(0);
+      expect(directSinkResult.stdout.trim()).toBe('GENERIC_FINANCIAL_DISPOSITION_REJECTION');
+      expect(directSinkResult.stdout).not.toContain('SECRET_SENTINEL');
+      expect(directSinkResult.stderr).toBe('');
+    }
+
+    expect(restorePowerShell).toContain('function Read-FinancialOperationalDiagnostics');
+    const readerFunctions = [
+      "$ErrorActionPreference = 'Stop'",
+      documentedPowerShellFunction(
+        restorePowerShell,
+        'ConvertTo-FinancialOperationalDiagnostics'
+      ),
+      documentedPowerShellFunction(restorePowerShell, 'Read-FinancialOperationalDiagnostics')
+    ].join('\n');
+    const readerRoot = mkdtempSync(join(tmpdir(), 'pale-orbit-financial-diagnostics-'));
+    const readerPath = join(readerRoot, 'financial-operational-diagnostics.csv');
+    const runReader = (bytes: Buffer) => spawnSync(
+      'powershell.exe',
+      [
+        '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+        [
+          readerFunctions,
+          '[System.IO.File]::WriteAllBytes($env:FINANCIAL_DIAGNOSTICS_TEST_PATH, [Convert]::FromBase64String($env:FINANCIAL_DIAGNOSTICS_TEST_BASE64))',
+          'try {',
+          '  $canonical = Read-FinancialOperationalDiagnostics -Path $env:FINANCIAL_DIAGNOSTICS_TEST_PATH',
+          "  [Console]::Out.WriteLine('CANONICAL_FINANCIAL_DIAGNOSTICS')",
+          '} catch {',
+          "  [Console]::Out.WriteLine('GENERIC_FINANCIAL_BYTE_REJECTION')",
+          '}'
+        ].join('\n')
+      ],
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          FINANCIAL_DIAGNOSTICS_TEST_PATH: readerPath,
+          FINANCIAL_DIAGNOSTICS_TEST_BASE64: bytes.toString('base64')
+        }
+      }
+    );
+    try {
+      const canonicalBytes = Buffer.from(`${zeroDiagnostics}\n`, 'utf8');
+      const validBytes = runReader(canonicalBytes);
+      expect(validBytes.status).toBe(0);
+      expect(validBytes.stdout.trim()).toBe('CANONICAL_FINANCIAL_DIAGNOSTICS');
+      for (const bytes of [
+        Buffer.from(`${zeroDiagnostics.replaceAll('\n', '\r\n')}\r\n`, 'utf8'),
+        Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), canonicalBytes]),
+        Buffer.from(zeroDiagnostics, 'utf8'),
+        Buffer.from(`${zeroDiagnostics}\n\n`, 'utf8'),
+        Buffer.from([0xff])
+      ]) {
+        const invalidBytes = runReader(bytes);
+        expect(invalidBytes.status).toBe(0);
+        expect(invalidBytes.stdout.trim()).toBe('GENERIC_FINANCIAL_BYTE_REJECTION');
+        expect(invalidBytes.stderr).toBe('');
+      }
+    } finally {
+      rmSync(readerRoot, { force: true, recursive: true });
+    }
+  }, 40_000);
+
   it('rejects non-regular restored storage entries before verification or startup', async () => {
     const storageRunbook = await source('docs/storage-ingestion-and-publication.md');
     const restoreSection = markdownSection(storageRunbook, 'Isolated restore rehearsal');
@@ -1406,7 +1839,7 @@ function Mock-Decrypt {
   $required = @(
     'database.dump', 'storage.tar.gz', 'migration-journal.csv', 'application-image.json',
     'restore-row-counts.csv', 'storage-samples.csv', 'source-docker-engine.json',
-    'verify-financial-restore.sql'
+    'financial-operational-diagnostics.csv', 'verify-financial-restore.sql'
   )
   $manifest = foreach ($name in $required) {
     $path = Join-Path $Workspace $name

@@ -153,6 +153,59 @@ function ConvertTo-CanonicalBackupText {
   }
   return ($normalizedLines -join [char]10) + [char]10
 }
+function ConvertTo-FinancialOperationalDiagnostics {
+  param([Parameter(Mandatory)][object[]]$Lines)
+  $expectedNames = @(
+    'failed_running_scan_permanent'
+    'failed_running_scan_retry_exhausted'
+    'pending_replay_child_incomplete'
+    'pending_replay_child_permanent'
+    'pending_replay_child_retry_exhausted'
+  )
+  $observedLines = @($Lines | ForEach-Object { [string]$_ })
+  if ($observedLines.Count -ne 6 -or
+      $observedLines[0] -cne 'check_name,violation_count') {
+    throw 'Financial operational diagnostics are malformed'
+  }
+  $canonicalLines = @('check_name,violation_count')
+  for ($index = 0; $index -lt $expectedNames.Count; $index += 1) {
+    $line = $observedLines[$index + 1]
+    if ($line.Contains([char]13) -or $line.Contains([char]10)) {
+      throw 'Financial operational diagnostics are malformed'
+    }
+    $fields = @($line.Split([char]','))
+    $count = 0L
+    if ($fields.Count -ne 2 -or $fields[0] -cne $expectedNames[$index] -or
+        $fields[1] -notmatch '^(0|[1-9][0-9]*)$' -or
+        -not [long]::TryParse(
+          $fields[1], [System.Globalization.NumberStyles]::None,
+          [System.Globalization.CultureInfo]::InvariantCulture, [ref]$count
+        )) {
+      throw 'Financial operational diagnostics are malformed'
+    }
+    $canonicalLines += "$($expectedNames[$index]),$($fields[1])"
+  }
+  return ($canonicalLines -join [char]10) + [char]10
+}
+function Write-FinancialOperationalDisposition {
+  param([Parameter(Mandatory)][string]$CanonicalDiagnostics)
+  $lines = @($CanonicalDiagnostics.TrimEnd([char]10) -split [char]10)
+  $validatedDiagnostics = ConvertTo-FinancialOperationalDiagnostics -Lines $lines
+  if ($validatedDiagnostics -cne $CanonicalDiagnostics) {
+    throw 'Canonical financial operational diagnostics are invalid'
+  }
+  $blocked = $false
+  foreach ($line in $lines[1..5]) {
+    $fields = @($line.Split([char]','))
+    if ($fields[1] -cne '0') {
+      [Console]::Out.WriteLine("OPERATIONAL_BLOCKER $($fields[0])=$($fields[1])")
+      $blocked = $true
+    }
+  }
+  $disposition = if ($blocked) { 'blocked' } else { 'clear' }
+  [Console]::Out.WriteLine("FINANCIAL_OPERATIONAL_DISPOSITION=$disposition")
+  return $blocked
+}
 function Assert-SourceDockerEngineBinding {
   $observedEngine = @(& docker --context $sourceDockerContext info --format '{{.ID}}')
   Assert-NativeSuccess 'read approved source Docker engine ID'
@@ -320,8 +373,18 @@ try {
 
   Copy-Item -LiteralPath 'scripts/verify-financial-restore.sql' -Destination (Join-Path $backup 'verify-financial-restore.sql') -ErrorAction Stop
   $sourceVerifierSql = Get-Content -LiteralPath (Join-Path $backup 'verify-financial-restore.sql') -Raw -ErrorAction Stop # psql ON_ERROR_STOP source verifier
-  $sourceVerifierOutput = @($sourceVerifierSql | & docker --context $sourceDockerContext compose --project-name $project --file compose.prod.yaml exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet -U $env:DATABASE_USER -d $env:DATABASE_NAME)
+  $sourceVerifierOutput = @($sourceVerifierSql | & docker --context $sourceDockerContext compose --project-name $project --file compose.prod.yaml exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet --csv -U $env:DATABASE_USER -d $env:DATABASE_NAME)
   Assert-NativeSuccess 'verify source credential and financial invariants'
+  $sourceFinancialDiagnostics = ConvertTo-FinancialOperationalDiagnostics -Lines $sourceVerifierOutput
+  [System.IO.File]::WriteAllText(
+    (Join-Path $backup 'financial-operational-diagnostics.csv'),
+    $sourceFinancialDiagnostics,
+    $utf8NoBom
+  )
+  $sourceProductionReplacementBlocked = Write-FinancialOperationalDisposition -CanonicalDiagnostics $sourceFinancialDiagnostics
+  if ($sourceProductionReplacementBlocked) {
+    [Console]::Out.WriteLine('PRODUCTION_REPLACEMENT_DISPOSITION=blocked')
+  }
 
   Assert-SourceDockerEngineBinding
   $storageArchive = Join-Path $backup 'storage.tar.gz'
@@ -371,6 +434,7 @@ try {
     'restore-row-counts.csv'
     'storage-samples.csv'
     'source-docker-engine.json'
+    'financial-operational-diagnostics.csv'
     'verify-financial-restore.sql'
   )
   $sourceEntries = @(Get-ChildItem -LiteralPath $backup -Force -ErrorAction Stop)
@@ -492,6 +556,65 @@ canonicalize_backup_output() {
   [ "$first_line" = "$expected_header" ] || return 1
   printf '%s\n' "$normalized_output"
 }
+canonicalize_financial_operational_diagnostics() {
+  [ "$#" -eq 1 ] || return 1
+  printf '%s\n' "$1" | awk -F, '
+    BEGIN {
+      expected[1] = "failed_running_scan_permanent"
+      expected[2] = "failed_running_scan_retry_exhausted"
+      expected[3] = "pending_replay_child_incomplete"
+      expected[4] = "pending_replay_child_permanent"
+      expected[5] = "pending_replay_child_retry_exhausted"
+      maximum = "9223372036854775807"
+    }
+    {
+      if (index($0, "\r") != 0) { invalid = 1; exit }
+      if (NR == 1) {
+        if ($0 != "check_name,violation_count") { invalid = 1; exit }
+        next
+      }
+      position = NR - 1
+      if (position > 5 || NF != 2 || $1 != expected[position] ||
+          $2 !~ /^(0|[1-9][0-9]*)$/ || length($2) > 19 ||
+          (length($2) == 19 && ("x" $2) > ("x" maximum))) {
+        invalid = 1
+        exit
+      }
+      count[position] = $2
+    }
+    END {
+      if (invalid || NR != 6) exit 1
+      print "check_name,violation_count"
+      for (position = 1; position <= 5; position += 1) {
+        print expected[position] "," count[position]
+      }
+    }
+  '
+}
+report_financial_operational_disposition() {
+  [ "$#" -eq 1 ] || return 1
+  validated_disposition_input="$(canonicalize_financial_operational_diagnostics "$1")" || return 1
+  [ "$validated_disposition_input" = "$1" ] || return 1
+  disposition_blocked=0
+  line_number=0
+  while IFS=, read -r check_name violation_count extra_field; do
+    line_number=$((line_number + 1))
+    [ "$line_number" -eq 1 ] && continue
+    [ -z "$extra_field" ] || return 1
+    if [ "$violation_count" != 0 ]; then
+      printf 'OPERATIONAL_BLOCKER %s=%s\n' "$check_name" "$violation_count" || return 1
+      disposition_blocked=1
+    fi
+  done <<EOF
+$1
+EOF
+  if [ "$disposition_blocked" -eq 1 ]; then
+    printf '%s\n' 'FINANCIAL_OPERATIONAL_DISPOSITION=blocked' || return 1
+    return 2
+  fi
+  printf '%s\n' 'FINANCIAL_OPERATIONAL_DISPOSITION=clear' || return 1
+  return 0
+}
 cleanup_container_dump() {
   [ "$container_dump_created" -eq 0 ] && return 0
   assert_source_engine_binding || return 1
@@ -582,7 +705,17 @@ canonicalize_backup_output 'sample_kind,storage_key,checksum_sha256' "$storage_s
 
 cp -- scripts/verify-financial-restore.sql "$backup/verify-financial-restore.sql" || exit 1
 # verify-financial-restore.sql is executed by psql with ON_ERROR_STOP from the authenticated backup copy.
-compose_prod exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet -U "$DATABASE_USER" -d "$DATABASE_NAME" < "$backup/verify-financial-restore.sql" || exit 1
+source_verifier_output="$(compose_prod exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet --csv -U "$DATABASE_USER" -d "$DATABASE_NAME" < "$backup/verify-financial-restore.sql")" || exit 1
+source_financial_diagnostics="$(canonicalize_financial_operational_diagnostics "$source_verifier_output")" || exit 1
+printf '%s\n' "$source_financial_diagnostics" > "$backup/financial-operational-diagnostics.csv" || exit 1
+if report_financial_operational_disposition "$source_financial_diagnostics"; then
+  source_production_replacement_blocked=0
+else
+  disposition_status=$?
+  [ "$disposition_status" -eq 2 ] || exit 1
+  source_production_replacement_blocked=1
+  printf '%s\n' 'PRODUCTION_REPLACEMENT_DISPOSITION=blocked' || exit 1
+fi
 assert_source_engine_binding || exit 1
 : > "$backup/storage.tar.gz" || exit 1
 source_docker run --rm --pull never --network none --read-only --cap-drop ALL --cap-add DAC_OVERRIDE --security-opt no-new-privileges -v "${project}_book_storage:/source:ro" -v "${backup}/storage.tar.gz:/output/storage.tar.gz" "$BACKUP_HELPER_IMAGE" tar -C /source -czf /output/storage.tar.gz . || exit 1
@@ -619,6 +752,7 @@ application-image.json
 restore-row-counts.csv
 storage-samples.csv
 source-docker-engine.json
+financial-operational-diagnostics.csv
 verify-financial-restore.sql'
 source_entries="$(find "$backup" -mindepth 1 -maxdepth 1 -printf '%f\n')" || exit 1
 [ "$(printf '%s\n' "$source_entries" | sort)" = "$(printf '%s\n' "$required_backup_files" | sort)" ] || exit 1
@@ -642,11 +776,11 @@ printf 'BACKUP_SOURCE_CIPHERTEXT_SHA256=%s\n' "$source_ciphertext_sha256"
 exit 0
 ```
 
-The two platform blocks are alternatives. They authenticate exactly eight required plaintext files plus `backup-file-manifest.sha256`. `restore-row-counts.csv` is a complete C-ordered inventory of every ordinary or partitioned base table in `public` and `drizzle`; it is not a handpicked table list. `storage-samples.csv` is deterministic and contains only storage keys and SHA-256 checksums. Both source verifiers run while app and worker are stopped and print neither credential hashes nor reset epochs. The source session deliberately provides no restart command.
+The two platform blocks are alternatives. They authenticate exactly nine required plaintext files plus `backup-file-manifest.sha256`. `restore-row-counts.csv` is a complete C-ordered inventory of every ordinary or partitioned base table in `public` and `drizzle`; it is not a handpicked table list. `storage-samples.csv` is deterministic and contains only storage keys and SHA-256 checksums. `financial-operational-diagnostics.csv` is the canonical five-row operational blocker report; a nonzero row permits faithful backup creation but records that production replacement remains blocked. Both source verifiers run while app and worker are stopped and print neither credential hashes nor reset epochs. The source session deliberately provides no restart command.
 
 ## Integrity sampling
 
-Use approved authenticated-encryption tooling to produce one authenticated encrypted artifact containing the eight required files and their manifest. On the isolated restore host, retrieve the exact transferred ciphertext, hash the retrieved destination file, and test-decrypt that destination file into a new restricted workspace. Reuse the exact `New-RestrictedWorkspace`/`Invoke-PlaintextDisposition` definitions above on Windows and the exact `new_restricted_workspace`/`dispose_plaintext_workspace` definitions above on GNU/Linux. The retrieval and test-decrypt wrappers are deployment-audited commands; their interfaces are shown below.
+Use approved authenticated-encryption tooling to produce one authenticated encrypted artifact containing the nine required files and their manifest. On the isolated restore host, retrieve the exact transferred ciphertext, hash the retrieved destination file, and test-decrypt that destination file into a new restricted workspace. Reuse the exact `New-RestrictedWorkspace`/`Invoke-PlaintextDisposition` definitions above on Windows and the exact `new_restricted_workspace`/`dispose_plaintext_workspace` definitions above on GNU/Linux. The retrieval and test-decrypt wrappers are deployment-audited commands; their interfaces are shown below.
 
 ```powershell
 $ErrorActionPreference = 'Stop'
@@ -732,6 +866,7 @@ try {
     'restore-row-counts.csv'
     'storage-samples.csv'
     'source-docker-engine.json'
+    'financial-operational-diagnostics.csv'
     'verify-financial-restore.sql'
   )
   $manifestName = 'backup-file-manifest.sha256'
@@ -849,25 +984,26 @@ application-image.json
 restore-row-counts.csv
 storage-samples.csv
 source-docker-engine.json
+financial-operational-diagnostics.csv
 verify-financial-restore.sql'
   verified_entries="$(find "$plaintext_workspace" -mindepth 1 -maxdepth 1 -printf '%f\n')" || return 1
   entry_count=0
   while IFS= read -r entry; do
     [ -n "$entry" ] || continue
     case "$entry" in
-      database.dump|storage.tar.gz|migration-journal.csv|application-image.json|restore-row-counts.csv|storage-samples.csv|source-docker-engine.json|verify-financial-restore.sql|backup-file-manifest.sha256) ;;
+      database.dump|storage.tar.gz|migration-journal.csv|application-image.json|restore-row-counts.csv|storage-samples.csv|source-docker-engine.json|financial-operational-diagnostics.csv|verify-financial-restore.sql|backup-file-manifest.sha256) ;;
       *) return 1 ;;
     esac
     entry_count=$((entry_count + 1))
   done <<EOF
 $verified_entries
 EOF
-  [ "$entry_count" -eq 9 ] || return 1
+  [ "$entry_count" -eq 10 ] || return 1
 
   manifest="$plaintext_workspace/backup-file-manifest.sha256"
   [ -f "$manifest" ] && [ ! -L "$manifest" ] && [ -s "$manifest" ] || return 1
   recorded_manifest="$(tr -d '\r' < "$manifest")" || return 1
-  [ "$(printf '%s\n' "$recorded_manifest" | awk 'NF { count++ } END { print count + 0 }')" -eq 8 ] || return 1
+  [ "$(printf '%s\n' "$recorded_manifest" | awk 'NF { count++ } END { print count + 0 }')" -eq 9 ] || return 1
   verified_manifest=
   for name in $required_backup_files; do
     path="$plaintext_workspace/$name"
@@ -900,6 +1036,7 @@ $ErrorActionPreference = 'Stop'
 $restoreProjectStarted = $false
 $restoreDumpPresent = $false
 $rehearsalSucceeded = $false
+$productionReplacementBlocked = $false
 $cleanupErrors = [System.Collections.Generic.List[System.Exception]]::new()
 try {
 foreach ($requiredVariable in @(
@@ -994,6 +1131,83 @@ function ConvertTo-CanonicalBackupText {
     throw "Canonical restore output has the wrong header: $Header"
   }
   return ($normalizedLines -join [char]10) + [char]10
+}
+function ConvertTo-FinancialOperationalDiagnostics {
+  param([Parameter(Mandatory)][object[]]$Lines)
+  $expectedNames = @(
+    'failed_running_scan_permanent'
+    'failed_running_scan_retry_exhausted'
+    'pending_replay_child_incomplete'
+    'pending_replay_child_permanent'
+    'pending_replay_child_retry_exhausted'
+  )
+  $observedLines = @($Lines | ForEach-Object { [string]$_ })
+  if ($observedLines.Count -ne 6 -or
+      $observedLines[0] -cne 'check_name,violation_count') {
+    throw 'Financial operational diagnostics are malformed'
+  }
+  $canonicalLines = @('check_name,violation_count')
+  for ($index = 0; $index -lt $expectedNames.Count; $index += 1) {
+    $line = $observedLines[$index + 1]
+    if ($line.Contains([char]13) -or $line.Contains([char]10)) {
+      throw 'Financial operational diagnostics are malformed'
+    }
+    $fields = @($line.Split([char]','))
+    $count = 0L
+    if ($fields.Count -ne 2 -or $fields[0] -cne $expectedNames[$index] -or
+        $fields[1] -notmatch '^(0|[1-9][0-9]*)$' -or
+        -not [long]::TryParse(
+          $fields[1], [System.Globalization.NumberStyles]::None,
+          [System.Globalization.CultureInfo]::InvariantCulture, [ref]$count
+        )) {
+      throw 'Financial operational diagnostics are malformed'
+    }
+    $canonicalLines += "$($expectedNames[$index]),$($fields[1])"
+  }
+  return ($canonicalLines -join [char]10) + [char]10
+}
+function Write-FinancialOperationalDisposition {
+  param([Parameter(Mandatory)][string]$CanonicalDiagnostics)
+  $lines = @($CanonicalDiagnostics.TrimEnd([char]10) -split [char]10)
+  $validatedDiagnostics = ConvertTo-FinancialOperationalDiagnostics -Lines $lines
+  if ($validatedDiagnostics -cne $CanonicalDiagnostics) {
+    throw 'Canonical financial operational diagnostics are invalid'
+  }
+  $blocked = $false
+  foreach ($line in $lines[1..5]) {
+    $fields = @($line.Split([char]','))
+    if ($fields[1] -cne '0') {
+      [Console]::Out.WriteLine("OPERATIONAL_BLOCKER $($fields[0])=$($fields[1])")
+      $blocked = $true
+    }
+  }
+  $disposition = if ($blocked) { 'blocked' } else { 'clear' }
+  [Console]::Out.WriteLine("FINANCIAL_OPERATIONAL_DISPOSITION=$disposition")
+  return $blocked
+}
+function Read-FinancialOperationalDiagnostics {
+  param([Parameter(Mandatory)][string]$Path)
+  $diagnosticBytes = [System.IO.File]::ReadAllBytes($Path)
+  try {
+    $diagnosticText = [System.Text.UTF8Encoding]::new($false, $true).GetString(
+      $diagnosticBytes
+    )
+  } catch {
+    throw 'Authenticated financial operational diagnostics are not canonical UTF-8'
+  }
+  if (-not $diagnosticText.EndsWith([char]10)) {
+    throw 'Authenticated financial operational diagnostics are not canonical UTF-8'
+  }
+  $diagnosticLines = @(
+    $diagnosticText.Substring(0, $diagnosticText.Length - 1) -split [char]10
+  )
+  $canonicalDiagnostics = ConvertTo-FinancialOperationalDiagnostics -Lines $diagnosticLines
+  $canonicalBytes = [System.Text.UTF8Encoding]::new($false).GetBytes($canonicalDiagnostics)
+  if ([Convert]::ToBase64String($diagnosticBytes) -cne
+      [Convert]::ToBase64String($canonicalBytes)) {
+    throw 'Authenticated financial operational diagnostics are not canonical UTF-8'
+  }
+  return $canonicalDiagnostics
 }
 function Assert-RestoreDockerEngineBinding {
   $observedRestoreEngine = @(& docker --context $restoreDockerContext info --format '{{.ID}}')
@@ -1107,7 +1321,16 @@ function Assert-RestoredStorageSamples {
 function Invoke-FinancialRestoreVerifier {
   $verifiedSqlPath = Join-Path $verifiedRestore 'verify-financial-restore.sql'
   $verifiedSql = Get-Content -LiteralPath $verifiedSqlPath -Raw -ErrorAction Stop
-  $null = Invoke-RestoreSql $verifiedSql
+  $verifierOutput = @($verifiedSql | & docker --context $restoreDockerContext compose --project-name $restoreProject --file compose.prod.yaml exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet --csv -U $env:DATABASE_USER -d $env:DATABASE_NAME)
+  Assert-NativeSuccess 'verify restored credential and financial invariants'
+  $actualDiagnostics = ConvertTo-FinancialOperationalDiagnostics -Lines $verifierOutput
+  $expectedDiagnosticPath = Join-Path $verifiedRestore 'financial-operational-diagnostics.csv'
+  $expectedDiagnostics = Read-FinancialOperationalDiagnostics -Path $expectedDiagnosticPath
+  if ($actualDiagnostics -cne $expectedDiagnostics) {
+    throw 'Restored financial operational diagnostics differ from authenticated source'
+  }
+  $blocked = Write-FinancialOperationalDisposition -CanonicalDiagnostics $actualDiagnostics
+  return [bool]$blocked
 }
 
 Assert-RestoreDockerEngineBinding
@@ -1169,7 +1392,7 @@ $projectNameFilter = "name=${restoreProject}_"
   Assert-RestoreMigrationJournal
   Assert-RestoreRowCounts
   Assert-RestoredStorageSamples
-  Invoke-FinancialRestoreVerifier
+  $productionReplacementBlocked = Invoke-FinancialRestoreVerifier
   Assert-RestoreWorkerStopped
   Assert-RestoreDockerEngineBinding
   & docker --context $restoreDockerContext compose --project-name $restoreProject --file compose.prod.yaml --profile tools run --rm storage-cleanup
@@ -1186,6 +1409,10 @@ $projectNameFilter = "name=${restoreProject}_"
   & docker --context $restoreDockerContext compose --project-name $restoreProject --file compose.prod.yaml exec -T app node -e "Promise.all(['/health/live','/health/ready'].map((path)=>fetch('http://127.0.0.1:3000'+path).then((response)=>{if(!response.ok)throw new Error(path)}))).catch(()=>process.exit(1))"
   Assert-NativeSuccess 'probe isolated maintenance health endpoints'
   Assert-RestoreWorkerStopped
+  if ($productionReplacementBlocked) {
+    [Console]::Out.WriteLine('PRODUCTION_REPLACEMENT_DISPOSITION=blocked')
+    throw 'Production replacement is blocked by financial operational diagnostics'
+  }
   $rehearsalSucceeded = $true
 } finally {
   if ($restoreProjectStarted) {
@@ -1354,6 +1581,65 @@ compare_restore_row_counts() {
   expected_counts="$(tr -d '\r' < "$verified_restore/restore-row-counts.csv")" || return 1
   [ "$(printf '%s\n' "$restored_counts" | tr -d '\r')" = "$expected_counts" ] || return 1
 }
+canonicalize_financial_operational_diagnostics() {
+  [ "$#" -eq 1 ] || return 1
+  printf '%s\n' "$1" | awk -F, '
+    BEGIN {
+      expected[1] = "failed_running_scan_permanent"
+      expected[2] = "failed_running_scan_retry_exhausted"
+      expected[3] = "pending_replay_child_incomplete"
+      expected[4] = "pending_replay_child_permanent"
+      expected[5] = "pending_replay_child_retry_exhausted"
+      maximum = "9223372036854775807"
+    }
+    {
+      if (index($0, "\r") != 0) { invalid = 1; exit }
+      if (NR == 1) {
+        if ($0 != "check_name,violation_count") { invalid = 1; exit }
+        next
+      }
+      position = NR - 1
+      if (position > 5 || NF != 2 || $1 != expected[position] ||
+          $2 !~ /^(0|[1-9][0-9]*)$/ || length($2) > 19 ||
+          (length($2) == 19 && ("x" $2) > ("x" maximum))) {
+        invalid = 1
+        exit
+      }
+      count[position] = $2
+    }
+    END {
+      if (invalid || NR != 6) exit 1
+      print "check_name,violation_count"
+      for (position = 1; position <= 5; position += 1) {
+        print expected[position] "," count[position]
+      }
+    }
+  '
+}
+report_financial_operational_disposition() {
+  [ "$#" -eq 1 ] || return 1
+  validated_disposition_input="$(canonicalize_financial_operational_diagnostics "$1")" || return 1
+  [ "$validated_disposition_input" = "$1" ] || return 1
+  disposition_blocked=0
+  line_number=0
+  while IFS=, read -r check_name violation_count extra_field; do
+    line_number=$((line_number + 1))
+    [ "$line_number" -eq 1 ] && continue
+    [ -z "$extra_field" ] || return 1
+    if [ "$violation_count" != 0 ]; then
+      printf 'OPERATIONAL_BLOCKER %s=%s\n' "$check_name" "$violation_count" || return 1
+      disposition_blocked=1
+    fi
+  done <<EOF
+$1
+EOF
+  if [ "$disposition_blocked" -eq 1 ]; then
+    printf '%s\n' 'FINANCIAL_OPERATIONAL_DISPOSITION=blocked' || return 1
+    return 2
+  fi
+  printf '%s\n' 'FINANCIAL_OPERATIONAL_DISPOSITION=clear' || return 1
+  return 0
+}
 verify_restored_storage_samples() {
   {
     IFS= read -r sample_header || return 1
@@ -1371,7 +1657,26 @@ verify_restored_storage_samples() {
   } < "$verified_restore/storage-samples.csv" || return 1
 }
 run_financial_restore_verifier() {
-  compose_restore exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet -U "$DATABASE_USER" -d "$DATABASE_NAME" < "$verified_restore/verify-financial-restore.sql" || return 1
+  restore_verifier_output="$(compose_restore exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet --csv -U "$DATABASE_USER" -d "$DATABASE_NAME" < "$verified_restore/verify-financial-restore.sql")" || return 1
+  actual_financial_diagnostics="$(canonicalize_financial_operational_diagnostics "$restore_verifier_output")" || return 1
+  authenticated_financial_output="$(cat -- "$verified_restore/financial-operational-diagnostics.csv")" || return 1
+  expected_financial_diagnostics="$(canonicalize_financial_operational_diagnostics "$authenticated_financial_output")" || return 1
+  authenticated_financial_digest_line="$(sha256sum -- "$verified_restore/financial-operational-diagnostics.csv")" || return 1
+  authenticated_financial_digest=${authenticated_financial_digest_line%% *}
+  printf '%s\n' "$authenticated_financial_digest" | grep -Eq '^[0-9a-f]{64}$' || return 1
+  canonical_financial_digest_line="$(printf '%s\n' "$expected_financial_diagnostics" | sha256sum)" || return 1
+  canonical_financial_digest=${canonical_financial_digest_line%% *}
+  printf '%s\n' "$canonical_financial_digest" | grep -Eq '^[0-9a-f]{64}$' || return 1
+  [ "$authenticated_financial_digest" = "$canonical_financial_digest" ] || return 1
+  [ "$actual_financial_diagnostics" = "$expected_financial_diagnostics" ] || return 1
+  if report_financial_operational_disposition "$actual_financial_diagnostics"; then
+    production_replacement_blocked=0
+  else
+    disposition_status=$?
+    [ "$disposition_status" -eq 2 ] || return 1
+    production_replacement_blocked=1
+  fi
+  return 0
 }
 cleanup_restore_dump() {
   [ "$restore_dump_present" -eq 0 ] && return 0
@@ -1419,6 +1724,7 @@ project_label="label=com.docker.compose.project=$restore_project"
 project_name_filter="name=${restore_project}_"
 restore_project_started=0
 restore_dump_present=0
+production_replacement_blocked=0
 
 preflight_inventory="$(get_restore_project_inventory)" || exit 1
 assert_restore_project_absent "$preflight_inventory" || exit 1
@@ -1468,6 +1774,11 @@ assert_restore_worker_stopped || exit 1
 assert_restore_engine_binding || exit 1
 compose_restore exec -T app node -e "Promise.all(['/health/live','/health/ready'].map((path)=>fetch('http://127.0.0.1:3000'+path).then((response)=>{if(!response.ok)throw new Error(path)}))).catch(()=>process.exit(1))" || exit 1
 assert_restore_worker_stopped || exit 1
+if [ "$production_replacement_blocked" -eq 1 ]; then
+  printf '%s\n' 'PRODUCTION_REPLACEMENT_DISPOSITION=blocked' || exit 1
+  printf '%s\n' 'Production replacement is blocked by financial operational diagnostics' >&2 || exit 1
+  exit 1
+fi
 
 pre_teardown_inventory="$(get_restore_project_inventory)" || exit 1
 [ -n "$pre_teardown_inventory" ] || exit 1
@@ -1485,7 +1796,9 @@ trap - EXIT HUP INT TERM
 
 Keep the general worker stopped for the entire isolated restore rehearsal. Provider absence is not sufficient isolation: the same general worker can claim local-only claim-email and SMTP outbox jobs, including `commerce.claim-email` and `commerce.claim-email-request`. Maintenance mode admits only `/health/live` and `/health/ready`; UI authentication, administrator pages, and reader rendering are unavailable and are not rehearsal evidence. Do not exercise mail-producing workflows. No production SMTP or provider credential may be present in the restore-host session: start from a sanitized session, do not import the production `.env`, retain the synthetic values above, and treat any environment assertion failure as a failed rehearsal.
 
-Before teardown, inventory the generated project's containers, network, and database/storage volumes. The verification plaintext inventory is exactly `database.dump`, `storage.tar.gz`, `migration-journal.csv`, `application-image.json`, `restore-row-counts.csv`, `storage-samples.csv`, `source-docker-engine.json`, `verify-financial-restore.sql`, and `backup-file-manifest.sha256` under `$verifiedRestore`/`$verified_restore`, plus the temporary container copy `/tmp/database.dump`. Every verification artifact is covered: every file under `$verifiedRestore` and every file under `$verified_restore` is subject to the same policy. The finally/trap path revalidates the approved restore engine before mutation, uses `down --volumes` only for the generated project, proves post-teardown absence, and applies the approved secure-deletion or access-controlled-retention policy to every file. Copy-on-write filesystems, SSDs, snapshots, and Docker storage can make overwriting unreliable; securely delete through encrypted-volume/key-destruction policy where required.
+The authenticated financial operational report is evidence, not a repair instruction. Structural verification, strict parsing, and source/restore equality must succeed before the maintenance app starts. Matching nonzero operational rows remain a faithful restore: the bounded maintenance health probe may finish with the worker stopped, but the rehearsal then records `PRODUCTION_REPLACEMENT_DISPOSITION=blocked`, exits nonzero, and cannot authorize production replacement. Only the approved production worker or Plan 7 may converge or resolve that work; this rehearsal performs no reset, retry, or worker start.
+
+Before teardown, inventory the generated project's containers, network, and database/storage volumes. The verification plaintext inventory is exactly `database.dump`, `storage.tar.gz`, `migration-journal.csv`, `application-image.json`, `restore-row-counts.csv`, `storage-samples.csv`, `source-docker-engine.json`, `financial-operational-diagnostics.csv`, `verify-financial-restore.sql`, and `backup-file-manifest.sha256` under `$verifiedRestore`/`$verified_restore`, plus the temporary container copy `/tmp/database.dump`. Every verification artifact is covered: every file under `$verifiedRestore` and every file under `$verified_restore` is subject to the same policy. The finally/trap path revalidates the approved restore engine before mutation, uses `down --volumes` only for the generated project, proves post-teardown absence, and applies the approved secure-deletion or access-controlled-retention policy to every file. Copy-on-write filesystems, SSDs, snapshots, and Docker storage can make overwriting unreliable; securely delete through encrypted-volume/key-destruction policy where required.
 
 Starting a worker belongs only to a separately approved production replacement after destination verification. A future rehearsal could include a worker only with an explicitly implemented and approved no-egress rehearsal runtime, synthetic SMTP, and job-family allowlist; this repository does not currently supply that runtime. This runbook intentionally provides no production restart command and never reuses the isolated restore Docker session.
 

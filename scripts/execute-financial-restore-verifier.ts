@@ -105,9 +105,40 @@ async function verifierOutcome(): Promise<VerifierOutcome> {
 
 async function exerciseInvariantWitnesses(): Promise<void> {
   const failures: string[] = [];
-  const expectPass = async (name: string) => {
-    const { error } = await verifierOutcome();
-    if (error) failures.push(`${name} unexpectedly failed: ${error.message}`);
+  const operationalCheckNames = [
+    'failed_running_scan_permanent',
+    'failed_running_scan_retry_exhausted',
+    'pending_replay_child_incomplete',
+    'pending_replay_child_permanent',
+    'pending_replay_child_retry_exhausted'
+  ] as const;
+  const validateOperationalShape = (name: string, outcome: VerifierOutcome): boolean => {
+    if (outcome.rows.length !== operationalCheckNames.length) {
+      failures.push(`${name} returned an invalid operational diagnostic row count`);
+      return false;
+    }
+    for (const [index, checkName] of operationalCheckNames.entries()) {
+      const row = outcome.rows[index];
+      if (
+        row?.check_name !== checkName ||
+        !/^(?:0|[1-9][0-9]*)$/u.test(String(row.violation_count))
+      ) {
+        failures.push(`${name} returned an invalid operational diagnostic contract`);
+        return false;
+      }
+    }
+    return true;
+  };
+  const expectPass = async (name: string, expectAllZero = false) => {
+    const outcome = await verifierOutcome();
+    if (outcome.error) {
+      failures.push(`${name} unexpectedly failed: ${outcome.error.message}`);
+      return;
+    }
+    if (!validateOperationalShape(name, outcome)) return;
+    if (expectAllZero && outcome.rows.some((row) => row.violation_count !== '0')) {
+      failures.push(`${name} returned a nonzero operational diagnostic`);
+    }
   };
   const expectRejection = async (name: string, checkName: string) => {
     const { error } = await verifierOutcome();
@@ -122,6 +153,7 @@ async function exerciseInvariantWitnesses(): Promise<void> {
       failures.push(`${name} unexpectedly failed: ${outcome.error.message}`);
       return;
     }
+    if (!validateOperationalShape(name, outcome)) return;
     for (const checkName of checkNames) {
       const diagnostic = outcome.rows.find((row) =>
         row.check_name === checkName && Number(row.violation_count) > 0
@@ -160,7 +192,7 @@ async function exerciseInvariantWitnesses(): Promise<void> {
       'financial:payout-impact:' || $1::text || ':2', 8
     )
   `, [payoutId]);
-  await expectPass('published payout replay at the current generation');
+  await expectPass('published payout replay at the current generation', true);
 
   await pool.query(`
     insert into payout_import_runs (
@@ -350,6 +382,21 @@ async function exerciseInvariantWitnesses(): Promise<void> {
   } finally {
     await pool.query('set session_replication_role = origin');
   }
+
+  await pool.query(`
+    update refunds set allocation_status = 'exception' where id = $1
+  `, [capacityRefundTwoId]);
+  await expectPass('component-backed refund preserved in exception allocation state', true);
+  await pool.query(`
+    update refunds set allocation_status = 'needs_review' where id = $1
+  `, [capacityRefundTwoId]);
+  await expectRejection(
+    'component-backed refund in a mutable allocation state',
+    'refund_component_chronology_capacity=1'
+  );
+  await pool.query(`
+    update refunds set allocation_status = 'exception' where id = $1
+  `, [capacityRefundTwoId]);
 
   await pool.query(`
     insert into refunds (
