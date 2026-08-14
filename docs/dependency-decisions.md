@@ -72,7 +72,8 @@ reported zero high or critical findings because the npm audit feed had not yet
 surfaced these new advisories. The manifest and lockfile are now pinned to exact
 3.2.1. The upload boundary rejects RFC-oversized boundary parameters before body
 consumption, the test suite verifies the manifest/lock/runtime version together,
-and an isolated subprocess regression covers prototype-named part headers. A clean
+and isolated subprocess regressions cover the patched 256-byte boundary-search path
+and prototype-named part headers. A clean
 audit feed is not treated as a substitute for reviewing primary security releases.
 
 ## Accepted audit findings

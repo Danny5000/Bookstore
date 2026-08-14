@@ -87,6 +87,33 @@ describe('parsePublicationUpload', () => {
     }
   );
 
+  it('advances through the patched 256-byte boundary search path in isolation', () => {
+    const boundary = 'a'.repeat(252);
+    const script = `
+      import Busboy from '@fastify/busboy';
+      const boundary = ${JSON.stringify(boundary)};
+      const parser = new Busboy({
+        headers: { 'content-type': 'multipart/form-data; boundary=' + boundary }
+      });
+      const complete = () => process.exit(0);
+      parser.once('error', complete);
+      parser.once('finish', complete);
+      parser.end(Buffer.alloc(512, 0x78));
+    `;
+    const child = spawnSync(process.execPath, ['--input-type=module', '--eval', script], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      timeout: 5_000,
+      windowsHide: true
+    });
+
+    expect(child.error).toBeUndefined();
+    expect({ status: child.status, signal: child.signal }).toEqual({
+      status: 0,
+      signal: null
+    });
+  });
+
   it.each([
     ['unquoted', `multipart/form-data; boundary=${'a'.repeat(71)}`],
     ['quoted', `multipart/form-data; boundary="${'a'.repeat(71)}"`]
