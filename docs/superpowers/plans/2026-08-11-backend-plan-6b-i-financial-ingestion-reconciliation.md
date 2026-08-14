@@ -220,11 +220,11 @@ If and only if Step 1 justified and implemented a compatible dependency update, 
 
 - [ ] **Step 1: Write RED schema-contract tests before changing production schema**
 
-Test all names, enum values, foreign-key actions, unique/index identities, and check constraints through Drizzle metadata plus real PostgreSQL. The schema tests must assert this exact table ownership:
+Test all names, enum values, foreign-key actions, unique/index identities, and check constraints through Drizzle metadata plus real PostgreSQL. The schema tests must assert this exact 19-table ownership. The provider module owns the singleton projection-version authority so classifier and allocation versions can be activated atomically only after their replay converges:
 
 | File | Tables |
 | --- | --- |
-| `financial-provider.ts` | `stripe_balance_transactions`, `stripe_balance_transaction_fee_details`, `financial_classification_versions`, `stripe_payouts`, `payout_import_runs`, `payout_import_run_entries`, `stripe_payout_balance_transactions`, `financial_scan_runs` |
+| `financial-provider.ts` | `financial_projection_versions`, `stripe_balance_transactions`, `stripe_balance_transaction_fee_details`, `financial_classification_versions`, `stripe_payouts`, `payout_import_runs`, `payout_import_run_entries`, `stripe_payout_balance_transactions`, `financial_scan_runs` |
 | `financial-allocation.ts` | `financial_allocation_sets`, `financial_item_allocations`, `financial_reconciliation_issues`, `refund_allocation_components`, `dispute_item_allocations`, `refund_allocation_drafts`, `refund_allocation_draft_items`, `refund_reporting_correction_sets`, `refund_reporting_correction_items`, `refund_allocation_finalization_effects` |
 
 The commerce schema tests must require:
