@@ -743,6 +743,7 @@ describe('commerce operations contract', () => {
       'credential_authority_orphan_hash',
       'credential_authority_invalid_pending_reset',
       'financial_projection_singleton',
+      'financial_payout_discovery_singleton',
       'financial_projection_tip_ambiguity',
       'financial_classification_decision_ambiguity',
       'pending_replay_child_count_mismatch',
@@ -750,11 +751,72 @@ describe('commerce operations contract', () => {
       'pending_replay_child_incomplete',
       'pending_replay_child_retry_exhausted',
       'pending_replay_child_permanent',
+      'combined_refund_dispute_chronology_capacity',
       'refund_component_chronology_capacity',
       'refund_component_deterministic_split'
     ]) {
       expect(financialVerifier).toContain(`'${checkName}'`);
     }
+    expect(restoreChecks).toContain("'financial_payout_discovery_singleton'");
+    expect(restoreChecks).toContain("'combined_refund_dispute_chronology_capacity'");
+    const verifierConservationSql = financialVerifier.match(
+      /with fee_sums as \([\s\S]*?from conservation_counts\norder by check_name;/u
+    )?.[0];
+    const documentedConservationSql = fencedCodeBlocks(
+      markdownSection(financialRunbook, 'Post-restore signed-conservation check'),
+      'sql'
+    )[0];
+    expect(verifierConservationSql).toBeDefined();
+    expect(documentedConservationSql?.trim()).toBe(verifierConservationSql?.trim());
+    expect(financialVerifier).toMatch(
+      /combined_refund_events[\s\S]*r\.status = 'succeeded'[\s\S]*r\.allocation_status in \('finalized', 'exception'\)/u
+    );
+    expect(financialVerifier).toContain(
+      'r.id as source_internal_id, ra.id as local_event_id'
+    );
+    expect(financialVerifier).not.toContain(
+      'r.id as source_internal_id, c.id as local_event_id'
+    );
+    expect(financialVerifier).toContain(
+      'bt.provider_created_at, bt.provider_id, d.id as source_internal_id,'
+    );
+    expect(financialVerifier).toContain(
+      'a.id as local_event_id, a.effect, a.reverses_allocation_id'
+    );
+    expect(financialVerifier).toMatch(
+      /combined_current_dispute_events[\s\S]*s\.classifier_version = active\.classifier_version[\s\S]*s\.algorithm_version = active\.allocation_algorithm_version[\s\S]*successor\.supersedes_set_id = s\.id[\s\S]*successor\.classifier_version = s\.classifier_version[\s\S]*successor\.algorithm_version = s\.algorithm_version/u
+    );
+    expect(financialVerifier).toContain(
+      'order by event.provider_created_at, event.provider_id collate "C",'
+    );
+    expect(financialVerifier).toContain(
+      'event.source_internal_id, event.local_event_id'
+    );
+    expect(financialVerifier).toContain(
+      'reinstatement.reversal_of_set_id <> withdrawal.allocation_set_id'
+    );
+    expect(financialVerifier).toContain(
+      'reinstatement.order_item_id <> withdrawal.order_item_id'
+    );
+    expect(financialVerifier).toContain(
+      'reinstatement.presentment_currency <> withdrawal.presentment_currency'
+    );
+    expect(financialVerifier).toContain('reinstatement.current_reversal_count <> 1');
+    expect(financialVerifier).toContain(
+      'reinstatement.subtotal_delta_minor > -withdrawal.subtotal_delta_minor'
+    );
+    expect(financialVerifier).toContain(
+      'reinstatement.tax_delta_minor > -withdrawal.tax_delta_minor'
+    );
+    expect(financialVerifier).toMatch(
+      /combined_duplicate_chronology[\s\S]*group by payment_id, order_item_id, presentment_currency, provider_created_at,[\s\S]*provider_id, source_internal_id, local_event_id[\s\S]*having count\(\*\) > 1/u
+    );
+    expect(financialVerifier).toContain(
+      'remaining_subtotal_minor not between 0 and original_subtotal_minor'
+    );
+    expect(financialVerifier).toContain(
+      'remaining_tax_minor not between 0 and original_tax_minor'
+    );
     expect(financialVerifier).toContain("'allocation_set_parent_or_chain'");
     expect(financialVerifier).toContain('not coalesce((');
     expect(financialVerifier).toContain('parent_classification.id is not null');
@@ -908,7 +970,7 @@ describe('commerce operations contract', () => {
     expect(malformedPort.stderr).not.toContain('ECONNREFUSED');
   }, 20_000);
 
-  it('executes payout, replay-child, and refund-component verifier witnesses in PostgreSQL', () => {
+  it('executes payout, replay-child, refund-component, and combined-chronology verifier witnesses in PostgreSQL', () => {
     const result = spawnSync(
       process.execPath,
       [
@@ -929,7 +991,7 @@ describe('commerce operations contract', () => {
       }
     );
     expect(`${result.stdout}${result.stderr}`).toContain(
-      '[restore-verifier] payout, replay-child, and refund-component witnesses passed'
+      '[restore-verifier] payout, replay-child, refund-component, and combined-chronology witnesses passed'
     );
     expect(result.status).toBe(0);
   }, 130_000);

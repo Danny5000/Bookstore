@@ -60,6 +60,12 @@ select 'financial_projection_singleton',
 from financial_projection_versions;
 
 insert into restore_financial_checks (check_name, violation_count)
+select 'financial_payout_discovery_singleton',
+  (abs(count(*) filter (where singleton is true) - 1)
+    + count(*) filter (where singleton is distinct from true))::bigint
+from financial_payout_discovery_state;
+
+insert into restore_financial_checks (check_name, violation_count)
 with active as (
   select classifier_version, allocation_algorithm_version
   from financial_projection_versions
@@ -475,6 +481,168 @@ with fee_sums as (
       ) then 1 else 0 end as expected_tax_minor
   from refund_component_bases
   where capacity_valid
+), combined_active_projection as (
+  select classifier_version, allocation_algorithm_version
+  from financial_projection_versions
+  where singleton = true
+), combined_capacity_seeds as (
+  select p.id as payment_id, oi.id as order_item_id, oi.currency as presentment_currency,
+    oi.unit_subtotal_minor::bigint as original_subtotal_minor,
+    oi.tax_minor::bigint as original_tax_minor
+  from payments p
+  join order_items oi on oi.order_id = p.order_id
+), combined_refund_events as (
+  select r.payment_id, c.order_item_id, c.currency as presentment_currency,
+    r.provider_created_at, r.stripe_refund_id as provider_id,
+    r.id as source_internal_id, ra.id as local_event_id,
+    -c.subtotal_minor::bigint as subtotal_delta_minor,
+    -c.tax_minor::bigint as tax_delta_minor
+  from refund_allocation_components c
+  join refund_allocations ra
+    on ra.id = c.refund_allocation_id
+   and ra.refund_id = c.refund_id
+   and ra.order_item_id = c.order_item_id
+  join refunds r on r.id = c.refund_id
+  where r.status = 'succeeded'
+    and r.allocation_status in ('finalized', 'exception')
+), combined_current_dispute_events as (
+  select d.payment_id, a.order_item_id, a.currency as presentment_currency,
+    bt.provider_created_at, bt.provider_id, d.id as source_internal_id,
+    a.id as local_event_id, a.effect, a.reverses_allocation_id,
+    a.subtotal_effect_minor::bigint as subtotal_delta_minor,
+    a.tax_effect_minor::bigint as tax_delta_minor,
+    a.total_effect_minor::bigint as total_delta_minor,
+    s.id as allocation_set_id, s.reversal_of_set_id, s.scope,
+    d.currency as dispute_currency, p.currency as payment_currency,
+    p.order_id as payment_order_id, oi.order_id as item_order_id,
+    oi.currency as item_currency,
+    oi.unit_subtotal_minor::bigint as item_subtotal_minor,
+    oi.tax_minor::bigint as item_tax_minor, oi.total_minor::bigint as item_total_minor
+  from combined_active_projection active
+  join financial_allocation_sets s
+    on s.classifier_version = active.classifier_version
+   and s.algorithm_version = active.allocation_algorithm_version
+   and s.source_kind = 'dispute'
+   and s.basis = 'gross_amount'
+  join stripe_balance_transactions bt on bt.id = s.balance_transaction_id
+  join disputes d on d.id = s.source_internal_id
+  join dispute_item_allocations a
+    on a.gross_allocation_set_id = s.id
+   and a.dispute_id = d.id
+  left join payments p on p.id = d.payment_id
+  left join order_items oi on oi.id = a.order_item_id
+  where not exists (
+    select 1
+    from financial_allocation_sets successor
+    where successor.supersedes_set_id = s.id
+      and successor.classifier_version = s.classifier_version
+      and successor.algorithm_version = s.algorithm_version
+  )
+), combined_dispute_events as (
+  select *, count(*) filter (where effect = 'reinstatement') over (
+    partition by reverses_allocation_id
+  )::bigint as current_reversal_count
+  from combined_current_dispute_events
+), combined_events as (
+  select payment_id, order_item_id, presentment_currency, provider_created_at,
+    provider_id, source_internal_id, local_event_id,
+    subtotal_delta_minor, tax_delta_minor
+  from combined_refund_events
+  union all
+  select payment_id, order_item_id, presentment_currency, provider_created_at,
+    provider_id, source_internal_id, local_event_id,
+    subtotal_delta_minor, tax_delta_minor
+  from combined_dispute_events
+), combined_duplicate_chronology as (
+  select payment_id, order_item_id, presentment_currency, provider_created_at,
+    provider_id, source_internal_id, local_event_id
+  from combined_events
+  group by payment_id, order_item_id, presentment_currency, provider_created_at,
+    provider_id, source_internal_id, local_event_id
+  having count(*) > 1
+), combined_ordered_events as (
+  select event.*, seed.original_subtotal_minor, seed.original_tax_minor,
+    seed.original_subtotal_minor + sum(event.subtotal_delta_minor) over (
+      partition by event.payment_id, event.order_item_id, event.presentment_currency
+      order by event.provider_created_at, event.provider_id collate "C",
+        event.source_internal_id, event.local_event_id
+      rows between unbounded preceding and current row
+    ) as remaining_subtotal_minor,
+    seed.original_tax_minor + sum(event.tax_delta_minor) over (
+      partition by event.payment_id, event.order_item_id, event.presentment_currency
+      order by event.provider_created_at, event.provider_id collate "C",
+        event.source_internal_id, event.local_event_id
+      rows between unbounded preceding and current row
+    ) as remaining_tax_minor
+  from combined_events event
+  join combined_capacity_seeds seed
+    on seed.payment_id = event.payment_id
+   and seed.order_item_id = event.order_item_id
+   and seed.presentment_currency = event.presentment_currency
+), combined_refund_dispute_violations as (
+  select 1 as violation
+  from combined_dispute_events event
+  where event.scope <> 'title'
+     or event.payment_order_id is distinct from event.item_order_id
+     or event.presentment_currency is distinct from event.item_currency
+     or event.presentment_currency is distinct from event.dispute_currency
+     or event.presentment_currency is distinct from event.payment_currency
+     or event.item_tax_minor is null or event.item_total_minor is null
+     or event.item_total_minor <> event.item_subtotal_minor + event.item_tax_minor
+     or event.total_delta_minor <> event.subtotal_delta_minor + event.tax_delta_minor
+     or (event.effect = 'withdrawal' and (
+       event.reverses_allocation_id is not null
+       or event.reversal_of_set_id is not null
+       or event.subtotal_delta_minor > 0 or event.tax_delta_minor > 0
+       or event.total_delta_minor >= 0
+     ))
+     or (event.effect = 'reinstatement' and (
+       event.reverses_allocation_id is null
+       or event.reversal_of_set_id is null
+       or event.subtotal_delta_minor < 0 or event.tax_delta_minor < 0
+       or event.total_delta_minor <= 0
+     ))
+
+  union all
+  select 1
+  from combined_dispute_events reinstatement
+  left join combined_dispute_events withdrawal
+    on withdrawal.local_event_id = reinstatement.reverses_allocation_id
+  where reinstatement.effect = 'reinstatement'
+    and (
+      withdrawal.local_event_id is null
+      or withdrawal.effect <> 'withdrawal'
+      or withdrawal.reverses_allocation_id is not null
+      or withdrawal.reversal_of_set_id is not null
+      or reinstatement.source_internal_id <> withdrawal.source_internal_id
+      or reinstatement.reversal_of_set_id <> withdrawal.allocation_set_id
+      or reinstatement.order_item_id <> withdrawal.order_item_id
+      or reinstatement.presentment_currency <> withdrawal.presentment_currency
+      or reinstatement.subtotal_delta_minor > -withdrawal.subtotal_delta_minor
+      or reinstatement.tax_delta_minor > -withdrawal.tax_delta_minor
+      or reinstatement.current_reversal_count <> 1
+      or row(
+        withdrawal.provider_created_at,
+        withdrawal.provider_id collate "C",
+        withdrawal.source_internal_id,
+        withdrawal.local_event_id
+      ) >= row(
+        reinstatement.provider_created_at,
+        reinstatement.provider_id collate "C",
+        reinstatement.source_internal_id,
+        reinstatement.local_event_id
+      )
+    )
+
+  union all
+  select 1
+  from combined_duplicate_chronology
+
+  union all
+  select 1
+  from combined_ordered_events
+  where remaining_subtotal_minor not between 0 and original_subtotal_minor
+     or remaining_tax_minor not between 0 and original_tax_minor
 ), conservation_counts as (
   select 'balance_transaction_net_equation' as check_name, count(*)::bigint as violation_count
   from stripe_balance_transactions
@@ -530,6 +698,10 @@ with fee_sums as (
   where leftover_minor not between 0 and 1
      or stored_subtotal_minor is distinct from expected_subtotal_minor
      or stored_tax_minor is distinct from expected_tax_minor
+
+  union all
+  select 'combined_refund_dispute_chronology_capacity', count(*)::bigint
+  from combined_refund_dispute_violations
 
   union all
   select 'finalized_refund_allocation_shape', count(*)::bigint

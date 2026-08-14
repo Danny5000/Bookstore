@@ -161,6 +161,112 @@ async function exerciseInvariantWitnesses(): Promise<void> {
       if (!diagnostic) failures.push(`${name} did not surface ${checkName}`);
     }
   };
+  const insertDisputeEffect = async (input: {
+    readonly allocationId: string;
+    readonly disputeId: string;
+    readonly effect: 'withdrawal' | 'reinstatement';
+    readonly financialItemId: string;
+    readonly fingerprintCharacter: string;
+    readonly orderItemId: string;
+    readonly providerCreatedAt: string;
+    readonly providerId: string;
+    readonly reversalOfSetId: string | null;
+    readonly reversesAllocationId: string | null;
+    readonly setId: string;
+    readonly signedSubtotalMinor: number;
+    readonly stripeDisputeId: string;
+    readonly transactionId: string;
+  }) => {
+    const fingerprint = input.fingerprintCharacter.repeat(64);
+    const classification = input.effect === 'withdrawal'
+      ? 'dispute_withdrawal'
+      : 'dispute_reinstatement';
+    const component = input.effect === 'withdrawal'
+      ? 'dispute_subtotal'
+      : 'dispute_reinstatement';
+    await pool.query(`
+      insert into stripe_balance_transactions (
+        id, provider_id, live_mode, source_family, source_id, raw_type,
+        reporting_category, balance_type, amount_minor, fee_minor, net_minor,
+        currency, status, provider_created_at, available_at, fingerprint_sha256
+      ) values (
+        $1, $2, false, 'dispute', $3, 'adjustment', $4, 'payments', $5, 0, $5,
+        'USD', 'available', $6, $6, $7
+      )
+    `, [
+      input.transactionId,
+      input.providerId,
+      input.stripeDisputeId,
+      input.effect === 'withdrawal' ? 'dispute' : 'dispute_reversal',
+      input.signedSubtotalMinor,
+      input.providerCreatedAt,
+      fingerprint
+    ]);
+    await pool.query(`
+      insert into financial_classification_versions (
+        subject_type, subject_id, classifier_version, classification,
+        source_fingerprint_sha256
+      ) values ('balance_transaction', $1, 1, $2, $3)
+    `, [input.transactionId, classification, fingerprint]);
+    await pool.query(`
+      insert into financial_allocation_sets (
+        id, allocation_identity, balance_transaction_id, source_kind,
+        source_internal_id, basis, scope, expected_effect_minor, currency,
+        algorithm_version, classifier_version, source_fingerprint_sha256,
+        reversal_of_set_id
+      ) values (
+        $1, $2, $3, 'dispute', $4, 'gross_amount', 'title', $5, 'USD',
+        1, 1, $6, $7
+      )
+    `, [
+      input.setId,
+      `restore:${input.setId}`,
+      input.transactionId,
+      input.disputeId,
+      input.signedSubtotalMinor,
+      fingerprint,
+      input.reversalOfSetId
+    ]);
+    await pool.query(`
+      insert into financial_item_allocations (
+        id, allocation_set_id, order_item_id, component, effect_minor, currency,
+        tie_break_key
+      ) values ($1, $2, $3, $4, $5, 'USD', $6)
+    `, [
+      input.financialItemId,
+      input.setId,
+      input.orderItemId,
+      component,
+      input.signedSubtotalMinor,
+      `${input.allocationId}:settlement`
+    ]);
+    await pool.query(`
+      insert into dispute_item_allocations (
+        id, allocation_identity, dispute_id, gross_allocation_set_id, order_item_id,
+        effect, reverses_allocation_id, subtotal_effect_minor, tax_effect_minor,
+        total_effect_minor, currency
+      ) values ($1, $2, $3, $4, $5, $6, $7, $8, 0, $8, 'USD')
+    `, [
+      input.allocationId,
+      `restore:${input.allocationId}`,
+      input.disputeId,
+      input.setId,
+      input.orderItemId,
+      input.effect,
+      input.reversesAllocationId,
+      input.signedSubtotalMinor
+    ]);
+  };
+
+  await pool.query('delete from financial_payout_discovery_state');
+  await expectRejection(
+    'missing payout discovery singleton',
+    'financial_payout_discovery_singleton=1'
+  );
+  await pool.query(`
+    insert into financial_payout_discovery_state (singleton, covered_through)
+    values (true, null)
+  `);
 
   const payoutId = '10000000-0000-4000-8000-000000000001';
   const priorPayoutRunId = '10000000-0000-4000-8000-000000000002';
@@ -398,6 +504,365 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     update refunds set allocation_status = 'exception' where id = $1
   `, [capacityRefundTwoId]);
 
+  const combinedOrderId = '40000000-0000-4000-8000-000000000001';
+  const combinedFirstTitleId = '40000000-0000-4000-8000-000000000002';
+  const combinedSecondTitleId = '40000000-0000-4000-8000-000000000003';
+  const combinedFirstItemId = '40000000-0000-4000-8000-000000000004';
+  const combinedSecondItemId = '40000000-0000-4000-8000-000000000005';
+  const combinedPaymentId = '40000000-0000-4000-8000-000000000006';
+  const combinedDisputeId = '40000000-0000-4000-8000-0000000000f0';
+  const combinedRefundId = '40000000-0000-4000-8000-000000000014';
+  const combinedRefundAllocationId = '40000000-0000-4000-8000-000000000015';
+  const combinedRefundComponentId = '40000000-0000-4000-8000-000000000016';
+  const combinedStripeDisputeId = 'dp_restore_combined_valid';
+  await pool.query(`
+    insert into titles (id, slug, title, description, creator_name, format, price_minor, currency)
+    values
+      ($1, 'restore-combined-first', 'Restore combined first', 'Witness', 'Witness',
+        'prose', 100, 'USD'),
+      ($2, 'restore-combined-second', 'Restore combined second', 'Witness', 'Witness',
+        'prose', 100, 'USD')
+  `, [combinedFirstTitleId, combinedSecondTitleId]);
+  await pool.query(`
+    insert into orders (
+      id, status, currency, subtotal_minor, tax_minor, total_minor,
+      client_checkout_attempt_id, quote_fingerprint_sha256, status_token_sha256
+    ) values ($1, 'checkout_pending', 'USD', 200, 0, 200,
+      '40000000-0000-4000-8000-000000000027', repeat('4', 64), repeat('5', 64))
+  `, [combinedOrderId]);
+  await pool.query(`
+    insert into order_items (
+      id, order_id, title_id, title_snapshot, creator_name_snapshot, format,
+      currency, unit_subtotal_minor, tax_minor, total_minor
+    ) values
+      ($1, $3, $4, 'Restore combined first', 'Witness', 'prose', 'USD', 100, 0, 100),
+      ($2, $3, $5, 'Restore combined second', 'Witness', 'prose', 'USD', 100, 0, 100)
+  `, [
+    combinedFirstItemId,
+    combinedSecondItemId,
+    combinedOrderId,
+    combinedFirstTitleId,
+    combinedSecondTitleId
+  ]);
+  await pool.query(`
+    insert into payments (
+      id, order_id, stripe_payment_intent_id, status, amount_minor, currency, paid_at
+    ) values ($1, $2, 'pi_restore_combined_chronology', 'succeeded', 200, 'USD',
+      '2026-08-05T00:00:00.000Z')
+  `, [combinedPaymentId, combinedOrderId]);
+  await pool.query(`
+    insert into disputes (
+      id, payment_id, stripe_dispute_id, status, amount_minor, currency,
+      provider_created_at, provider_updated_at
+    ) values ($1, $2, $3, 'open', 100, 'USD',
+      '2026-08-06T00:00:00.000Z', '2026-08-08T00:00:00.000Z')
+  `, [combinedDisputeId, combinedPaymentId, combinedStripeDisputeId]);
+
+  const firstWithdrawalAllocationId = '40000000-0000-4000-8000-000000000011';
+  const firstWithdrawalSetId = '40000000-0000-4000-8000-00000000000b';
+  await insertDisputeEffect({
+    allocationId: firstWithdrawalAllocationId,
+    disputeId: combinedDisputeId,
+    effect: 'withdrawal',
+    financialItemId: '40000000-0000-4000-8000-00000000000e',
+    fingerprintCharacter: '6',
+    orderItemId: combinedFirstItemId,
+    providerCreatedAt: '2026-08-06T00:00:00.000Z',
+    providerId: 'bt_restore_combined_withdraw_1',
+    reversalOfSetId: null,
+    reversesAllocationId: null,
+    setId: firstWithdrawalSetId,
+    signedSubtotalMinor: -100,
+    stripeDisputeId: combinedStripeDisputeId,
+    transactionId: '40000000-0000-4000-8000-000000000008'
+  });
+  await insertDisputeEffect({
+    allocationId: '40000000-0000-4000-8000-000000000012',
+    disputeId: combinedDisputeId,
+    effect: 'reinstatement',
+    financialItemId: '40000000-0000-4000-8000-00000000000f',
+    fingerprintCharacter: '7',
+    orderItemId: combinedFirstItemId,
+    providerCreatedAt: '2026-08-07T00:00:00.000Z',
+    providerId: 'bt_restore_a_reinstate',
+    reversalOfSetId: firstWithdrawalSetId,
+    reversesAllocationId: firstWithdrawalAllocationId,
+    setId: '40000000-0000-4000-8000-00000000000c',
+    signedSubtotalMinor: 100,
+    stripeDisputeId: combinedStripeDisputeId,
+    transactionId: '40000000-0000-4000-8000-000000000009'
+  });
+  await pool.query(`
+    insert into refunds (
+      id, payment_id, stripe_refund_id, status, amount_minor, currency,
+      provider_created_at, allocation_status
+    ) values ($1, $2, 're_restore_z_refund', 'succeeded', 50, 'USD',
+      '2026-08-07T00:00:00.000Z', 'finalized')
+  `, [combinedRefundId, combinedPaymentId]);
+  await pool.query(`
+    insert into refund_allocations (id, refund_id, order_item_id, amount_minor, source)
+    values ($1, $2, $3, 50, 'automatic')
+  `, [combinedRefundAllocationId, combinedRefundId, combinedFirstItemId]);
+  await pool.query(`
+    insert into refund_allocation_components (
+      id, refund_allocation_id, refund_id, order_item_id,
+      subtotal_minor, tax_minor, total_minor, currency
+    ) values ($1, $2, $3, $4, 50, 0, 50, 'USD')
+  `, [
+    combinedRefundComponentId,
+    combinedRefundAllocationId,
+    combinedRefundId,
+    combinedFirstItemId
+  ]);
+  const secondWithdrawalTransactionId = '40000000-0000-4000-8000-00000000000a';
+  const secondWithdrawalSetId = '40000000-0000-4000-8000-00000000000d';
+  const secondWithdrawalAllocationId = '40000000-0000-4000-8000-000000000013';
+  await insertDisputeEffect({
+    allocationId: secondWithdrawalAllocationId,
+    disputeId: combinedDisputeId,
+    effect: 'withdrawal',
+    financialItemId: '40000000-0000-4000-8000-000000000010',
+    fingerprintCharacter: '8',
+    orderItemId: combinedFirstItemId,
+    providerCreatedAt: '2026-08-08T00:00:00.000Z',
+    providerId: 'bt_restore_combined_withdraw_2',
+    reversalOfSetId: null,
+    reversesAllocationId: null,
+    setId: secondWithdrawalSetId,
+    signedSubtotalMinor: -50,
+    stripeDisputeId: combinedStripeDisputeId,
+    transactionId: secondWithdrawalTransactionId
+  });
+  await expectPass(
+    'withdrawal, reinstatement, equal-time refund, and second withdrawal chronology',
+    true
+  );
+
+  const duplicateChronologyRefundComponentId =
+    '40000000-0000-4000-8000-0000000000e0';
+  await pool.query(`
+    insert into refunds (
+      id, payment_id, stripe_refund_id, status, amount_minor, currency,
+      provider_created_at, allocation_status
+    ) values ($1, $2, 'bt_restore_combined_withdraw_1', 'succeeded', 0, 'USD',
+      '2026-08-06T00:00:00.000Z', 'finalized')
+  `, [combinedDisputeId, combinedPaymentId]);
+  await pool.query(`
+    insert into refund_allocations (id, refund_id, order_item_id, amount_minor, source)
+    values ($1, $2, $3, 0, 'automatic')
+  `, [
+    firstWithdrawalAllocationId,
+    combinedDisputeId,
+    combinedFirstItemId
+  ]);
+  await pool.query(`
+    insert into refund_allocation_components (
+      id, refund_allocation_id, refund_id, order_item_id,
+      subtotal_minor, tax_minor, total_minor, currency
+    ) values ($1, $2, $3, $4, 0, 0, 0, 'USD')
+  `, [
+    duplicateChronologyRefundComponentId,
+    firstWithdrawalAllocationId,
+    combinedDisputeId,
+    combinedFirstItemId
+  ]);
+  await expectRejection(
+    'refund and dispute events duplicate the full durable chronology tuple',
+    'combined_refund_dispute_chronology_capacity=1'
+  );
+  await pool.query('set session_replication_role = replica');
+  try {
+    await pool.query('delete from refund_allocation_components where id = $1', [
+      duplicateChronologyRefundComponentId
+    ]);
+    await pool.query('delete from refund_allocations where id = $1', [
+      firstWithdrawalAllocationId
+    ]);
+    await pool.query('delete from refunds where id = $1', [combinedDisputeId]);
+  } finally {
+    await pool.query('set session_replication_role = origin');
+  }
+  await expectPass('duplicate durable chronology witness cleanup', true);
+
+  const pendingWithdrawalSetId = '40000000-0000-4000-8000-0000000000d1';
+  await pool.query(`
+    insert into financial_classification_versions (
+      subject_type, subject_id, classifier_version, classification,
+      source_fingerprint_sha256
+    ) values ('balance_transaction', $1, 2, 'dispute_withdrawal', repeat('8', 64))
+  `, [secondWithdrawalTransactionId]);
+  await pool.query(`
+    insert into financial_allocation_sets (
+      id, allocation_identity, balance_transaction_id, source_kind,
+      source_internal_id, basis, scope, expected_effect_minor, currency,
+      algorithm_version, classifier_version, source_fingerprint_sha256,
+      supersedes_set_id
+    ) values (
+      $1, 'restore:pending-withdrawal-tip', $2, 'dispute', $3,
+      'gross_amount', 'title', -50, 'USD', 2, 2, repeat('8', 64), $4
+    )
+  `, [
+    pendingWithdrawalSetId,
+    secondWithdrawalTransactionId,
+    combinedDisputeId,
+    secondWithdrawalSetId
+  ]);
+  await pool.query(`
+    insert into financial_item_allocations (
+      id, allocation_set_id, order_item_id, component, effect_minor, currency,
+      tie_break_key
+    ) values (
+      '40000000-0000-4000-8000-0000000000d2', $1, $2,
+      'dispute_subtotal', -50, 'USD', 'pending-withdrawal:settlement'
+    )
+  `, [pendingWithdrawalSetId, combinedFirstItemId]);
+  await pool.query(`
+    insert into dispute_item_allocations (
+      id, allocation_identity, dispute_id, gross_allocation_set_id, order_item_id,
+      effect, subtotal_effect_minor, tax_effect_minor, total_effect_minor, currency
+    ) values (
+      '40000000-0000-4000-8000-0000000000d3', 'restore:pending-withdrawal-tip',
+      $1, $2, $3, 'withdrawal', -100, 0, -100, 'USD'
+    )
+  `, [combinedDisputeId, pendingWithdrawalSetId, combinedFirstItemId]);
+  await insertDisputeEffect({
+    allocationId: '40000000-0000-4000-8000-0000000000d7',
+    disputeId: combinedDisputeId,
+    effect: 'reinstatement',
+    financialItemId: '40000000-0000-4000-8000-0000000000d6',
+    fingerprintCharacter: 'c',
+    orderItemId: combinedFirstItemId,
+    providerCreatedAt: '2026-08-08T00:00:00.000Z',
+    providerId: 'zz_restore_active_reinstatement',
+    reversalOfSetId: secondWithdrawalSetId,
+    reversesAllocationId: secondWithdrawalAllocationId,
+    setId: '40000000-0000-4000-8000-0000000000d5',
+    signedSubtotalMinor: 50,
+    stripeDisputeId: combinedStripeDisputeId,
+    transactionId: '40000000-0000-4000-8000-0000000000d4'
+  });
+  await expectPass(
+    'pending-version successor neither leaks into nor displaces active chronology',
+    true
+  );
+
+  const crossWithdrawalTransactionId = '40000000-0000-4000-8000-000000000017';
+  const crossReinstatementTransactionId = '40000000-0000-4000-8000-000000000018';
+  const crossWithdrawalSetId = '40000000-0000-4000-8000-000000000019';
+  const crossReinstatementSetId = '40000000-0000-4000-8000-00000000001a';
+  const crossWithdrawalFinancialItemId = '40000000-0000-4000-8000-00000000001b';
+  const crossReinstatementFinancialItemId = '40000000-0000-4000-8000-00000000001c';
+  const crossWithdrawalAllocationId = '40000000-0000-4000-8000-00000000001d';
+  const crossReinstatementAllocationId = '40000000-0000-4000-8000-00000000001e';
+  await insertDisputeEffect({
+    allocationId: crossWithdrawalAllocationId,
+    disputeId: combinedDisputeId,
+    effect: 'withdrawal',
+    financialItemId: crossWithdrawalFinancialItemId,
+    fingerprintCharacter: '9',
+    orderItemId: combinedSecondItemId,
+    providerCreatedAt: '2026-08-09T00:00:00.000Z',
+    providerId: 'bt_restore_cross_withdrawal',
+    reversalOfSetId: null,
+    reversesAllocationId: null,
+    setId: crossWithdrawalSetId,
+    signedSubtotalMinor: -50,
+    stripeDisputeId: combinedStripeDisputeId,
+    transactionId: crossWithdrawalTransactionId
+  });
+  await insertDisputeEffect({
+    allocationId: crossReinstatementAllocationId,
+    disputeId: combinedDisputeId,
+    effect: 'reinstatement',
+    financialItemId: crossReinstatementFinancialItemId,
+    fingerprintCharacter: 'a',
+    orderItemId: combinedFirstItemId,
+    providerCreatedAt: '2026-08-10T00:00:00.000Z',
+    providerId: 'bt_restore_cross_reinstatement',
+    reversalOfSetId: crossWithdrawalSetId,
+    reversesAllocationId: crossWithdrawalAllocationId,
+    setId: crossReinstatementSetId,
+    signedSubtotalMinor: 50,
+    stripeDisputeId: combinedStripeDisputeId,
+    transactionId: crossReinstatementTransactionId
+  });
+  await expectRejection(
+    'reinstatement crosses its withdrawal order item',
+    'combined_refund_dispute_chronology_capacity=1'
+  );
+  await pool.query('set session_replication_role = replica');
+  try {
+    await pool.query(`
+      delete from dispute_item_allocations where id in ($1, $2)
+    `, [crossWithdrawalAllocationId, crossReinstatementAllocationId]);
+    await pool.query(`
+      delete from financial_item_allocations where id in ($1, $2)
+    `, [crossWithdrawalFinancialItemId, crossReinstatementFinancialItemId]);
+    await pool.query(`
+      delete from financial_allocation_sets where id in ($1, $2)
+    `, [crossWithdrawalSetId, crossReinstatementSetId]);
+    await pool.query(`
+      delete from financial_classification_versions where subject_id in ($1, $2)
+    `, [crossWithdrawalTransactionId, crossReinstatementTransactionId]);
+    await pool.query(`
+      delete from stripe_balance_transactions where id in ($1, $2)
+    `, [crossWithdrawalTransactionId, crossReinstatementTransactionId]);
+  } finally {
+    await pool.query('set session_replication_role = origin');
+  }
+  await expectPass('cross-item reversal witness cleanup', true);
+
+  const negativeDisputeId = '40000000-0000-4000-8000-00000000001f';
+  const negativeStripeDisputeId = 'dp_restore_combined_negative';
+  await pool.query(`
+    insert into disputes (
+      id, payment_id, stripe_dispute_id, status, amount_minor, currency,
+      provider_created_at, provider_updated_at
+    ) values ($1, $2, $3, 'open', 100, 'USD',
+      '2026-08-11T00:00:00.000Z', '2026-08-11T00:00:00.000Z')
+  `, [negativeDisputeId, combinedPaymentId, negativeStripeDisputeId]);
+  await insertDisputeEffect({
+    allocationId: '40000000-0000-4000-8000-000000000023',
+    disputeId: negativeDisputeId,
+    effect: 'withdrawal',
+    financialItemId: '40000000-0000-4000-8000-000000000022',
+    fingerprintCharacter: 'b',
+    orderItemId: combinedSecondItemId,
+    providerCreatedAt: '2026-08-11T00:00:00.000Z',
+    providerId: 'bt_restore_negative_withdrawal',
+    reversalOfSetId: null,
+    reversesAllocationId: null,
+    setId: '40000000-0000-4000-8000-000000000021',
+    signedSubtotalMinor: -100,
+    stripeDisputeId: negativeStripeDisputeId,
+    transactionId: '40000000-0000-4000-8000-000000000020'
+  });
+  const negativeRefundId = '40000000-0000-4000-8000-000000000024';
+  const negativeRefundAllocationId = '40000000-0000-4000-8000-000000000025';
+  await pool.query(`
+    insert into refunds (
+      id, payment_id, stripe_refund_id, status, amount_minor, currency,
+      provider_created_at, allocation_status
+    ) values ($1, $2, 're_restore_combined_negative', 'succeeded', 100, 'USD',
+      '2026-08-12T00:00:00.000Z', 'finalized')
+  `, [negativeRefundId, combinedPaymentId]);
+  await pool.query(`
+    insert into refund_allocations (id, refund_id, order_item_id, amount_minor, source)
+    values ($1, $2, $3, 100, 'automatic')
+  `, [negativeRefundAllocationId, negativeRefundId, combinedSecondItemId]);
+  await pool.query(`
+    insert into refund_allocation_components (
+      id, refund_allocation_id, refund_id, order_item_id,
+      subtotal_minor, tax_minor, total_minor, currency
+    ) values (
+      '40000000-0000-4000-8000-000000000026', $1, $2, $3, 100, 0, 100, 'USD'
+    )
+  `, [negativeRefundAllocationId, negativeRefundId, combinedSecondItemId]);
+  await expectRejection(
+    'outstanding withdrawal plus refund exceeds immutable payment item capacity',
+    'combined_refund_dispute_chronology_capacity=1'
+  );
+
   await pool.query(`
     insert into refunds (
       id, payment_id, stripe_refund_id, status, amount_minor, currency,
@@ -423,7 +888,9 @@ async function exerciseInvariantWitnesses(): Promise<void> {
   if (failures.length > 0) {
     throw new Error(`[restore-verifier] invariant witness failures: ${failures.join('; ')}`);
   }
-  console.info('[restore-verifier] payout, replay-child, and refund-component witnesses passed');
+  console.info(
+    '[restore-verifier] payout, replay-child, refund-component, and combined-chronology witnesses passed'
+  );
 }
 
 try {
