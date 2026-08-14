@@ -24,6 +24,7 @@ import {
 } from '$lib/server/commerce/refunds';
 import {
   auditEvents,
+  disputes,
   entitlementGrants,
   entitlements,
   guestIdentities,
@@ -1216,6 +1217,49 @@ describe('canonical refund fulfillment', () => {
       ))).toEqual([before]);
     }
   );
+
+  it('publishes every same-payment dispute graph edge only when refund exposure changes', async () => {
+    const fixture = await createPurchase([1403]);
+    const disputeIds = (await databaseClient.db.insert(disputes).values(
+      Array.from({ length: 101 }, (_, index) => ({
+        paymentId: fixture.paymentId,
+        stripeDisputeId: `dp_refund_cross_family_${index}_${randomUUID()}`,
+        status: 'open' as const,
+        amountMinor: 1,
+        currency: 'USD',
+        reason: 'fraudulent',
+        providerCreatedAt: new Date('2026-08-10T12:30:00.000Z'),
+        providerUpdatedAt: new Date('2026-08-10T12:30:00.000Z')
+      }))
+    ).returning({ id: disputes.id })).map((row) => row.id).sort();
+    const event = await createRefundEvent(`re_test_${randomUUID()}`);
+    const input = snapshots(fixture, event, 500);
+    const queueFinancialSource = vi.fn(async () => undefined);
+
+    await fulfillRefundEvent(
+      databaseClient.db,
+      input,
+      dependencies({ queueFinancialSource })
+    );
+
+    expect(queueFinancialSource).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        sourceKind: 'refund',
+        crossFamilyProjectionSources: disputeIds.map((sourceId) => ({
+          sourceKind: 'dispute', sourceId
+        }))
+      })
+    );
+
+    queueFinancialSource.mockClear();
+    await fulfillRefundEvent(
+      databaseClient.db,
+      input,
+      dependencies({ queueFinancialSource })
+    );
+    expect(queueFinancialSource).not.toHaveBeenCalled();
+  });
 
   it('keeps refund audit data aggregate and free of email, provider IDs, titles, and amounts', async () => {
     const fixture = await createPurchase([1403]);

@@ -9,22 +9,15 @@ import {
   basePlan,
   planWeights
 } from './common';
+import { replayFinancialExposure } from './exposure';
 import type {
   BoundDisputePresentmentEffect,
   DisputeAllocationInput,
   DisputeAllocationPlanBundle,
-  DisputePaymentItem,
-  FinalizedDisputeRefund,
   UnboundDisputePresentmentEffect
 } from './types';
 
-type Capacity = { subtotalMinor: number; taxMinor: number };
 type ComponentWeight = { orderItemId: string; component: 'dispute_subtotal' | 'dispute_tax'; weightMinor: number; tieBreakKey: string };
-type ChronologyKey = {
-  readonly providerCreatedAtMs: number;
-  readonly providerTransactionId: string;
-  readonly allocationId: string;
-};
 
 function mismatch(): never {
   throw new PermanentFinancialError('allocation_mismatch');
@@ -43,28 +36,6 @@ function parseChronologyInstant(value: string): number {
   const instant = Date.parse(value);
   if (Number.isNaN(instant)) linkageMismatch();
   return instant;
-}
-
-function compareCodePoints(left: string, right: string): number {
-  const leftPoints = Array.from(left);
-  const rightPoints = Array.from(right);
-  const length = Math.min(leftPoints.length, rightPoints.length);
-  for (let index = 0; index < length; index += 1) {
-    const leftPoint = leftPoints[index]!.codePointAt(0)!;
-    const rightPoint = rightPoints[index]!.codePointAt(0)!;
-    if (leftPoint !== rightPoint) return leftPoint < rightPoint ? -1 : 1;
-  }
-  return leftPoints.length - rightPoints.length;
-}
-
-function compareChronology(left: ChronologyKey, right: ChronologyKey): number {
-  if (left.providerCreatedAtMs !== right.providerCreatedAtMs) {
-    return left.providerCreatedAtMs < right.providerCreatedAtMs ? -1 : 1;
-  }
-  const transactionOrder = compareCodePoints(left.providerTransactionId, right.providerTransactionId);
-  return transactionOrder === 0
-    ? compareCodePoints(left.allocationId, right.allocationId)
-    : transactionOrder;
 }
 
 function assertBoundary(input: DisputeAllocationInput): number {
@@ -93,141 +64,9 @@ function assertBoundary(input: DisputeAllocationInput): number {
   return providerCreatedAtMs;
 }
 
-function capacityFromPayment(input: DisputeAllocationInput): Map<string, Capacity> {
-  const capacity = new Map<string, Capacity>();
-  for (const item of input.paymentItems) assertPaymentItem(item, input.presentmentCurrency, capacity);
-  if (capacity.size === 0) mismatch();
-  return capacity;
-}
-
-function assertPaymentItem(item: DisputePaymentItem, currency: string, capacity: Map<string, Capacity>): void {
-  assertId(item.orderItemId);
-  assertCurrency(item.presentmentCurrency);
-  assertSafeMoney(item.subtotalMinor);
-  assertSafeMoney(item.taxMinor);
-  if (
-    item.presentmentCurrency !== currency || item.subtotalMinor < 0 || item.taxMinor < 0 ||
-    capacity.has(item.orderItemId)
-  ) mismatch();
-  capacity.set(item.orderItemId, { subtotalMinor: item.subtotalMinor, taxMinor: item.taxMinor });
-}
-
-function applyRefunds(
-  input: DisputeAllocationInput,
-  capacity: Map<string, Capacity>,
-  currentProviderCreatedAtMs: number
-): void {
-  const seen = new Set<string>();
-  const current = {
-    providerCreatedAtMs: currentProviderCreatedAtMs,
-    providerTransactionId: input.providerTransactionId,
-    allocationId: ''
-  };
-  const refunds = input.finalizedRefunds.map((refund) => ({
-    refund,
-    chronology: {
-      providerCreatedAtMs: assertRefund(refund, input.presentmentCurrency),
-      providerTransactionId: refund.refundId,
-      allocationId: ''
-    }
-  })).sort((left, right) => compareChronology(left.chronology, right.chronology));
-  for (const { refund, chronology } of refunds) {
-    const key = `${refund.refundId}\u0000${chronology.providerCreatedAtMs}\u0000${refund.orderItemId}`;
-    if (seen.has(key) || compareChronology(chronology, current) >= 0) mismatch();
-    seen.add(key);
-    const remaining = capacity.get(refund.orderItemId);
-    if (!remaining || refund.subtotalMinor > remaining.subtotalMinor || refund.taxMinor > remaining.taxMinor) mismatch();
-    remaining.subtotalMinor -= refund.subtotalMinor;
-    remaining.taxMinor -= refund.taxMinor;
-  }
-}
-
-function assertRefund(refund: FinalizedDisputeRefund, currency: string): number {
-  assertId(refund.refundId);
-  assertId(refund.orderItemId);
-  const providerCreatedAtMs = parseChronologyInstant(refund.providerCreatedAt);
-  assertCurrency(refund.presentmentCurrency);
-  assertSafeMoney(refund.subtotalMinor);
-  assertSafeMoney(refund.taxMinor);
-  if (refund.presentmentCurrency !== currency || refund.subtotalMinor < 0 || refund.taxMinor < 0) mismatch();
-  return providerCreatedAtMs;
-}
-
-function validatePresentmentEffect(effect: BoundDisputePresentmentEffect, currency: string): number {
-  assertId(effect.allocationId);
-  assertId(effect.withdrawalSetId);
-  assertId(effect.disputeId);
-  assertId(effect.providerTransactionId);
-  assertId(effect.orderItemId);
-  const providerCreatedAtMs = parseChronologyInstant(effect.providerCreatedAt);
-  assertCurrency(effect.presentmentCurrency);
-  assertSafeMoney(effect.subtotalMinor);
-  assertSafeMoney(effect.taxMinor);
-  if (
-    effect.presentmentCurrency !== currency ||
-    !['withdrawal', 'reinstatement'].includes(effect.effect) ||
-    (effect.effect === 'withdrawal' && (effect.subtotalMinor > 0 || effect.taxMinor > 0 || effect.reversalOfAllocationId !== null)) ||
-    (effect.effect === 'reinstatement' && (effect.subtotalMinor < 0 || effect.taxMinor < 0 || !effect.reversalOfAllocationId)) ||
-    effect.subtotalMinor + effect.taxMinor === 0
-  ) mismatch();
-  return providerCreatedAtMs;
-}
-
-function replayPriorEffects(
-  input: DisputeAllocationInput,
-  capacity: Map<string, Capacity>,
-  currentProviderCreatedAtMs: number
-): {
-  readonly withdrawals: Map<string, BoundDisputePresentmentEffect>;
-  readonly reversedWithdrawalIds: ReadonlySet<string>;
-} {
-  const effects = input.priorPresentmentEffects.map((effect) => ({
-    effect,
-    chronology: {
-      providerCreatedAtMs: validatePresentmentEffect(effect, input.presentmentCurrency),
-      providerTransactionId: effect.providerTransactionId,
-      allocationId: effect.allocationId
-    }
-  })).sort((left, right) => compareChronology(left.chronology, right.chronology));
-  const seenIds = new Set<string>();
-  const reversed = new Set<string>();
-  const withdrawals = new Map<string, BoundDisputePresentmentEffect>();
-  const current = {
-    providerCreatedAtMs: currentProviderCreatedAtMs,
-    providerTransactionId: input.providerTransactionId,
-    allocationId: ''
-  };
-  const transactionKinds = new Map<string, string>();
-  for (const { effect, chronology } of effects) {
-    if (seenIds.has(effect.allocationId) || compareChronology(chronology, current) >= 0) linkageMismatch();
-    seenIds.add(effect.allocationId);
-    const transactionKey = `${effect.disputeId}\u0000${chronology.providerCreatedAtMs}\u0000${effect.providerTransactionId}`;
-    const kind = transactionKinds.get(transactionKey);
-    if (kind && kind !== effect.effect) linkageMismatch();
-    transactionKinds.set(transactionKey, effect.effect);
-    const remaining = capacity.get(effect.orderItemId);
-    if (!remaining) linkageMismatch();
-    if (effect.effect === 'withdrawal') {
-      if (effect.subtotalMinor < -remaining.subtotalMinor || effect.taxMinor < -remaining.taxMinor) mismatch();
-      remaining.subtotalMinor += effect.subtotalMinor;
-      remaining.taxMinor += effect.taxMinor;
-      withdrawals.set(effect.allocationId, effect);
-      continue;
-    }
-    const original = withdrawals.get(effect.reversalOfAllocationId!);
-    if (
-      !original || reversed.has(original.allocationId) ||
-      original.disputeId !== effect.disputeId || original.withdrawalSetId !== effect.withdrawalSetId ||
-      effect.subtotalMinor > -original.subtotalMinor || effect.taxMinor > -original.taxMinor
-    ) linkageMismatch();
-    reversed.add(original.allocationId);
-    remaining.subtotalMinor += effect.subtotalMinor;
-    remaining.taxMinor += effect.taxMinor;
-  }
-  return { withdrawals, reversedWithdrawalIds: reversed };
-}
-
-function remainingWeights(capacity: Map<string, Capacity>): ComponentWeight[] {
+function remainingWeights(
+  capacity: ReadonlyMap<string, { subtotalMinor: number; taxMinor: number }>
+): ComponentWeight[] {
   return [...capacity.entries()].flatMap(([orderItemId, item]) => [
     ...(item.subtotalMinor === 0 ? [] : [{ orderItemId, component: 'dispute_subtotal' as const, weightMinor: item.subtotalMinor, tieBreakKey: `${orderItemId}:subtotal` }]),
     ...(item.taxMinor === 0 ? [] : [{ orderItemId, component: 'dispute_tax' as const, weightMinor: item.taxMinor, tieBreakKey: `${orderItemId}:tax` }])
@@ -263,7 +102,7 @@ function assertWithdrawalShape(input: DisputeAllocationInput): void {
 
 function assertReinstatementShape(
   input: DisputeAllocationInput,
-  withdrawals: Map<string, BoundDisputePresentmentEffect>,
+  withdrawals: ReadonlyMap<string, BoundDisputePresentmentEffect>,
   reversedWithdrawalIds: ReadonlySet<string>
 ): readonly BoundDisputePresentmentEffect[] {
   if (
@@ -350,7 +189,7 @@ function feeCreditItems(input: DisputeAllocationInput): readonly FinancialAlloca
 }
 
 export function buildDisputeAllocationPlan(input: DisputeAllocationInput): DisputeAllocationPlanBundle {
-  const currentProviderCreatedAtMs = assertBoundary(input);
+  assertBoundary(input);
   if (input.effect === 'fee_credit') {
     const grossItems = feeCreditItems(input);
     return { plans: [
@@ -359,9 +198,18 @@ export function buildDisputeAllocationPlan(input: DisputeAllocationInput): Dispu
     ], presentmentEffects: [] };
   }
 
-  const capacity = capacityFromPayment(input);
-  applyRefunds(input, capacity, currentProviderCreatedAtMs);
-  const replayed = replayPriorEffects(input, capacity, currentProviderCreatedAtMs);
+  const replayed = replayFinancialExposure({
+    presentmentCurrency: input.presentmentCurrency,
+    current: {
+      providerCreatedAt: input.providerCreatedAt,
+      providerId: input.providerTransactionId,
+      sourceId: input.disputeId
+    },
+    paymentItems: input.paymentItems,
+    finalizedRefunds: input.finalizedRefunds,
+    priorPresentmentEffects: input.priorPresentmentEffects
+  });
+  const capacity = replayed.capacity;
 
   if (input.effect === 'withdrawal') {
     assertWithdrawalShape(input);

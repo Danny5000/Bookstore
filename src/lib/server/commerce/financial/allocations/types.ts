@@ -68,8 +68,10 @@ export interface RefundPaymentCapacity {
 }
 
 export interface EarlierFinalizedRefundComponent {
+  readonly refundId: string;
   readonly providerRefundId: string;
   readonly providerCreatedAt: string;
+  readonly componentId: string;
   readonly orderItemId: string;
   readonly subtotalMinor: number;
   readonly taxMinor: number;
@@ -90,6 +92,7 @@ export interface RefundAllocationInput extends FinancialAllocationMetadata {
   /** Optional while historical callers migrate; when supplied it supersedes caller remaining capacity. */
   readonly paymentItemCapacities?: readonly RefundPaymentCapacity[];
   readonly earlierFinalized?: readonly EarlierFinalizedRefundComponent[];
+  readonly priorPresentmentEffects?: readonly BoundDisputePresentmentEffect[];
   readonly feeDetails: readonly ClassifiedFeeDetail[];
 }
 
@@ -119,7 +122,9 @@ export interface DisputePaymentItem {
 
 export interface FinalizedDisputeRefund {
   readonly refundId: string;
+  readonly providerRefundId: string;
   readonly providerCreatedAt: string;
+  readonly componentId: string;
   readonly orderItemId: string;
   readonly subtotalMinor: number;
   readonly taxMinor: number;

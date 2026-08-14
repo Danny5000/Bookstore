@@ -41,13 +41,16 @@ function refundWithChronology(input: {
       { orderItemId: 'item-a', subtotalMinor: 500, taxMinor: 0, presentmentCurrency: 'USD' }
     ],
     earlierFinalized: [{
+      refundId: input.earlierProviderRefundId,
       providerRefundId: input.earlierProviderRefundId,
       providerCreatedAt: input.earlierProviderCreatedAt,
+      componentId: `${input.earlierProviderRefundId}:item-a`,
       orderItemId: 'item-a',
       subtotalMinor: 100,
       taxMinor: 0,
       presentmentCurrency: 'USD'
     }],
+    priorPresentmentEffects: [],
     attribution: { kind: 'finalized', components: [{
       orderItemId: 'item-a',
       subtotalMinor: 100,
@@ -159,14 +162,48 @@ describe('refund allocation plans', () => {
         { orderItemId: 'item-b', subtotalMinor: 300, taxMinor: 0, presentmentCurrency: 'USD' }
       ],
       earlierFinalized: [
-        { providerRefundId: 'refund-1', providerCreatedAt: '2026-08-11T00:00:00.000Z', orderItemId: 'item-a', subtotalMinor: 500, taxMinor: 0, presentmentCurrency: 'USD' }
+        { refundId: 'refund-1', providerRefundId: 'refund-1', componentId: 'refund-1:item-a', providerCreatedAt: '2026-08-11T00:00:00.000Z', orderItemId: 'item-a', subtotalMinor: 500, taxMinor: 0, presentmentCurrency: 'USD' }
       ],
+      priorPresentmentEffects: [],
       attribution: { kind: 'finalized' as const, components: [
         { orderItemId: 'item-a', subtotalMinor: 201, taxMinor: 0, remainingSubtotalCapacityMinor: 700, remainingTaxCapacityMinor: 100, presentmentCurrency: 'USD' },
         { orderItemId: 'item-b', subtotalMinor: 99, taxMinor: 0, remainingSubtotalCapacityMinor: 300, remainingTaxCapacityMinor: 0, presentmentCurrency: 'USD' }
       ] }
     } as unknown as RefundAllocationInput;
     expect(() => buildRefundAllocationPlan(withHistory)).toThrow(/financial reconciliation/i);
+  });
+
+  it('rejects a refund that would consume exposure still held by an earlier dispute', () => {
+    const input = {
+      ...base,
+      sourceId: 'refund-after-dispute',
+      providerRefundId: 'refund-after-dispute',
+      providerCreatedAt: '2026-08-02T00:00:00.000Z',
+      presentmentAmountMinor: 100,
+      amountMinor: -100,
+      feeMinor: 0,
+      netMinor: -100,
+      feeDetails: [],
+      paymentItemCapacities: [{
+        orderItemId: 'item-a', subtotalMinor: 100, taxMinor: 0,
+        presentmentCurrency: 'USD'
+      }],
+      earlierFinalized: [],
+      priorPresentmentEffects: [{
+        allocationId: 'withdrawal-full', withdrawalSetId: 'set-withdrawal-full',
+        disputeId: 'dispute-prior', providerCreatedAt: '2026-08-01T00:00:00.000Z',
+        providerTransactionId: 'txn-withdrawal-full', orderItemId: 'item-a',
+        subtotalMinor: -100, taxMinor: 0, presentmentCurrency: 'USD',
+        effect: 'withdrawal', reversalOfAllocationId: null
+      }],
+      attribution: { kind: 'finalized' as const, components: [{
+        orderItemId: 'item-a', subtotalMinor: 100, taxMinor: 0,
+        remainingSubtotalCapacityMinor: 100, remainingTaxCapacityMinor: 0,
+        presentmentCurrency: 'USD'
+      }] }
+    } as unknown as RefundAllocationInput;
+
+    expect(() => buildRefundAllocationPlan(input)).toThrow(/financial reconciliation/i);
   });
 
   it('accepts an earlier instant even when its offset timestamp sorts later as text', () => {

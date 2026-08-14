@@ -19,14 +19,22 @@ import {
   lockFinancialProjectionRows,
   type FinancialProjectionLockRows
 } from '../locks';
-import { stageBalanceTransaction } from '../ledger';
+import {
+  rearmCurrentProjectionSubjectsForFinancialSources,
+  stageBalanceTransaction
+} from '../ledger';
+import { lockFinancialProjectionEnrollment } from '../rebase';
 import { PermanentFinancialError } from '../errors';
 import {
   recomputeLockedDisputeFinancialProjectionForVersion,
   reconcileDisputeFinancialSource
 } from './dispute';
 
-vi.mock('../ledger', () => ({ stageBalanceTransaction: vi.fn() }));
+vi.mock('../ledger', () => ({
+  rearmCurrentProjectionSubjectsForFinancialSources: vi.fn(),
+  stageBalanceTransaction: vi.fn()
+}));
+vi.mock('../rebase', () => ({ lockFinancialProjectionEnrollment: vi.fn() }));
 vi.mock('./payment', () => ({ lockCanonicalPaymentPurchaseFacts: vi.fn() }));
 vi.mock('$lib/server/commerce/lock', () => ({ lockOrder: vi.fn() }));
 vi.mock('$lib/server/commerce/reconciliation', () => ({ lockPaymentPurchaseFacts: vi.fn() }));
@@ -58,6 +66,7 @@ const allocationId = '00000000-0000-4000-8000-000000000309';
 const grossSetId = '00000000-0000-4000-8000-000000000310';
 const feeSetId = '00000000-0000-4000-8000-000000000311';
 const issueId = '00000000-0000-4000-8000-000000000312';
+const refundId = '00000000-0000-4000-8000-000000000313';
 const createdAt = new Date('2026-08-10T00:00:00.000Z');
 
 function render(query: unknown): { sql: string; params: unknown[] } {
@@ -306,8 +315,9 @@ function gateway(trace: string[]): StripeCommerceGateway {
 describe('versioned locked dispute projection replay', () => {
   beforeEach(() => vi.resetAllMocks());
 
-  it('reconstructs a withdrawal from locked local facts at the explicit pair', async () => {
+  it('rearms refunds when an identical withdrawal first joins the target replay pair', async () => {
     const fingerprint = 'a'.repeat(64);
+    const oldGross = '00000000-0000-4000-8000-000000000319';
     const insertedGross = '00000000-0000-4000-8000-000000000320';
     const insertedFee = '00000000-0000-4000-8000-000000000321';
     const plans = [
@@ -322,7 +332,19 @@ describe('versioned locked dispute projection replay', () => {
         supersedesSetId: null, reversalOfSetId: null, items: [] }
     ] as never;
     vi.mocked(buildDisputeAllocationPlan).mockReturnValue({ plans,
-      presentmentEffects: [] } as never);
+      presentmentEffects: [{
+        allocationId: `dispute:${disputeId}:${balanceId}:presentment:${orderItemId}`,
+        withdrawalSetId: null,
+        disputeId,
+        providerCreatedAt: createdAt.toISOString(),
+        providerTransactionId: 'txn_dispute',
+        orderItemId,
+        subtotalMinor: -90,
+        taxMinor: -10,
+        presentmentCurrency: 'USD',
+        effect: 'withdrawal',
+        reversalOfAllocationId: null
+      }] } as never);
     vi.mocked(persistFinancialAllocationReplayPlanLocked)
       .mockResolvedValueOnce({ setId: insertedGross, disposition: 'inserted' })
       .mockResolvedValueOnce({ setId: insertedFee, disposition: 'inserted' });
@@ -331,11 +353,49 @@ describe('versioned locked dispute projection replay', () => {
         sourceId: 'dp_dispute_trace', amountMinor: -100, feeMinor: 0,
         netMinor: -100, currency: 'USD', fingerprintSha256: fingerprint,
         providerCreatedAt: createdAt, classification: 'dispute_withdrawal' }] })
+      .mockResolvedValueOnce({ rows: [{ id: oldGross, balanceTransactionId: balanceId,
+        basis: 'gross_amount', allocationIdentity: 'dispute:old-v1:gross',
+        supersedesSetId: null, classifierVersion: 1, algorithmVersion: 1 }] })
+      .mockResolvedValueOnce({ rows: [{ id: oldGross, balanceTransactionId: balanceId,
+        allocationIdentity: 'dispute:old-v1:gross', expectedEffectMinor: -100,
+        currency: 'USD', algorithmVersion: 1, sourceFingerprint: fingerprint,
+        supersedesSetId: null, reversalOfSetId: null, scope: 'title' }] })
       .mockResolvedValueOnce({ rows: [] })
-      .mockResolvedValueOnce({ rows: [] });
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ id: allocationId }] });
     const tx = { execute, transaction: vi.fn() } as unknown as DatabaseTransaction;
     vi.mocked(tx.transaction).mockImplementation(async (work) => work(tx));
-    const facts = { ...lockedFacts(), payment: { id: paymentId, orderId } } as never;
+    const facts = {
+      ...lockedFacts({
+        disputeItemAllocations: [{
+          id: allocationId,
+          disputeId,
+          grossAllocationSetId: oldGross,
+          orderItemId,
+          effect: 'withdrawal',
+          reversesAllocationId: null,
+          subtotalEffectMinor: -90,
+          taxEffectMinor: -10,
+          totalEffectMinor: -100,
+          currency: 'USD'
+        }]
+      }),
+      payment: { id: paymentId, orderId },
+      refunds: [{
+        id: refundId,
+        status: 'succeeded',
+        stripeRefundId: 're_after_dispute',
+        providerCreatedAt: new Date(createdAt.getTime() + 1000)
+      }],
+      refundComponents: [{
+        refundId,
+        refundAllocationId: '00000000-0000-4000-8000-000000000314',
+        orderItemId,
+        subtotalMinor: 9,
+        taxMinor: 1,
+        currency: 'USD'
+      }]
+    } as never;
     const projectionLocks = projectionLockRows({
       balanceTransactions: [{ id: balanceId, fingerprintSha256: fingerprint }]
     });
@@ -357,6 +417,12 @@ describe('versioned locked dispute projection replay', () => {
       algorithmVersion: 3, effect: 'withdrawal', sourceFingerprint: fingerprint
     }));
     expect(persistFinancialAllocationReplayPlanLocked).toHaveBeenCalledTimes(2);
+    expect(rearmCurrentProjectionSubjectsForFinancialSources).toHaveBeenCalledWith(tx, {
+      sourceKind: 'refund', sourceIds: [refundId]
+    });
+    expect(render(execute.mock.calls[0]?.[0]).sql).toMatch(
+      /order by balance\.provider_created_at, balance\.provider_id collate "C", balance\.id/iu
+    );
     expect(tx.transaction).toHaveBeenCalledOnce();
     for (const [, persistInput, version] of
       vi.mocked(persistFinancialAllocationReplayPlanLocked).mock.calls) {
@@ -657,7 +723,18 @@ describe('reconcileDisputeFinancialSource', () => {
     });
     const tx = { execute: vi.fn(), ...updateChain() } as unknown as DatabaseTransaction;
     vi.mocked(database.transaction).mockImplementation(async (work) => work(tx));
-    vi.mocked(lockCanonicalPaymentPurchaseFacts).mockResolvedValue(lockedFacts() as never);
+    vi.mocked(lockCanonicalPaymentPurchaseFacts).mockResolvedValue({
+      ...lockedFacts(),
+      refunds: [{ id: refundId, status: 'succeeded' }],
+      refundComponents: [{
+        refundId,
+        refundAllocationId: '00000000-0000-4000-8000-000000000314',
+        orderItemId,
+        subtotalMinor: 9,
+        taxMinor: 1,
+        currency: 'USD'
+      }]
+    } as never);
     const marker = new Error('stop-after-closure-lock');
     vi.mocked(lockFinancialProjectionRows).mockRejectedValue(marker);
 
@@ -686,6 +763,11 @@ describe('reconcileDisputeFinancialSource', () => {
     });
     expect(vi.mocked(lockActiveFinancialProjectionImplementation).mock.invocationCallOrder[0])
       .toBeLessThan(vi.mocked(lockCanonicalPaymentPurchaseFacts).mock.invocationCallOrder[0]!);
+    expect(lockFinancialProjectionEnrollment).toHaveBeenCalledWith(tx);
+    expect(vi.mocked(lockCanonicalPaymentPurchaseFacts).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(lockFinancialProjectionEnrollment).mock.invocationCallOrder[0]!);
+    expect(vi.mocked(lockFinancialProjectionEnrollment).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(lockFinancialProjectionRows).mock.invocationCallOrder[0]!);
   });
 
   it('replays an already persisted transaction without treating its own presentment rows as prior chronology', async () => {
@@ -866,6 +948,7 @@ describe('reconcileDisputeFinancialSource', () => {
       })
     );
     expect(appendAuditEvent).not.toHaveBeenCalled();
+    expect(rearmCurrentProjectionSubjectsForFinancialSources).not.toHaveBeenCalled();
   });
 
   it('binds a classified dispute fee credit to the exact outstanding withdrawal fee set', async () => {

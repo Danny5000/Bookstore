@@ -888,6 +888,12 @@ function predecessorForReplay(
     : current.id;
 }
 
+function hasComponentBackedSucceededRefund(facts: PaymentPurchaseFacts): boolean {
+  const componentRefundIds = new Set(facts.refundComponents.map((row) => row.refundId));
+  return facts.refunds.some((row) =>
+    row.status === 'succeeded' && componentRefundIds.has(row.id));
+}
+
 export async function replayFinancialClassificationLocked(
   transaction: DatabaseTransaction,
   input: ClassificationReplayLockedInput,
@@ -909,6 +915,10 @@ export async function replayFinancialClassificationLocked(
     reportingCategory: discovered.reportingCategory, amountMinor: discovered.amountMinor
   });
   const graph = await lockReplayGraph(transaction, discovered);
+  if (graph.sourceKind === 'dispute' &&
+    hasComponentBackedSucceededRefund(graph.purchaseFacts)) {
+    await lockFinancialProjectionEnrollment(transaction);
+  }
   const sourceBalances = await discoverReplaySourceBalances(transaction, discovered, graph);
   const sourceBalanceIds = sourceBalances.map((row) => row.id).sort();
   const payoutClosure = await rows(transaction, sql`

@@ -4,9 +4,9 @@ import type {
   FailedRefundAllocationInput,
   FinancialAllocationPlanBundle,
   RefundAllocationComponent,
-  RefundAllocationInput,
-  RefundPaymentCapacity
+  RefundAllocationInput
 } from './types';
+import { replayFinancialExposure } from './exposure';
 import {
   allocateComponents,
   allocateFeeDetails,
@@ -23,30 +23,6 @@ function mismatch(): never {
 
 function linkageMismatch(): never {
   throw new PermanentFinancialError('source_linkage_mismatch');
-}
-
-function compareCodePoints(left: string, right: string): number {
-  const leftCodePoints = Array.from(left, (value) => value.codePointAt(0)!);
-  const rightCodePoints = Array.from(right, (value) => value.codePointAt(0)!);
-  const sharedLength = Math.min(leftCodePoints.length, rightCodePoints.length);
-  for (let index = 0; index < sharedLength; index += 1) {
-    if (leftCodePoints[index] !== rightCodePoints[index]) {
-      return leftCodePoints[index]! < rightCodePoints[index]! ? -1 : 1;
-    }
-  }
-  return leftCodePoints.length < rightCodePoints.length
-    ? -1
-    : leftCodePoints.length > rightCodePoints.length ? 1 : 0;
-}
-
-function compareChronology(
-  left: { providerCreatedAtEpochMs: number; providerRefundId: string },
-  right: { providerCreatedAtEpochMs: number; providerRefundId: string }
-): number {
-  if (left.providerCreatedAtEpochMs !== right.providerCreatedAtEpochMs) {
-    return left.providerCreatedAtEpochMs < right.providerCreatedAtEpochMs ? -1 : 1;
-  }
-  return compareCodePoints(left.providerRefundId, right.providerRefundId);
 }
 
 function assertNonEmptyId(value: string): void {
@@ -109,67 +85,31 @@ function computedCapacity(
 ): ReadonlyMap<string, { subtotalMinor: number; taxMinor: number }> | null {
   const hasAnyChronology = input.providerRefundId !== undefined ||
     input.providerCreatedAt !== undefined ||
-    input.paymentItemCapacities !== undefined || input.earlierFinalized !== undefined;
+    input.paymentItemCapacities !== undefined || input.earlierFinalized !== undefined ||
+    input.priorPresentmentEffects !== undefined;
   if (!hasAnyChronology) return null;
   if (!input.providerRefundId || !input.providerCreatedAt ||
-    !input.paymentItemCapacities || !input.earlierFinalized) {
+    !input.paymentItemCapacities || !input.earlierFinalized ||
+    !input.priorPresentmentEffects) {
     linkageMismatch();
   }
   assertNonEmptyId(input.providerRefundId);
-  const currentProviderCreatedAtEpochMs = Date.parse(input.providerCreatedAt);
-  if (Number.isNaN(currentProviderCreatedAtEpochMs)) linkageMismatch();
-
-  const capacity = new Map<string, { subtotalMinor: number; taxMinor: number }>();
-  for (const item of input.paymentItemCapacities) {
-    assertCapacityItem(item, input.presentmentCurrency);
-    if (capacity.has(item.orderItemId)) mismatch();
-    capacity.set(item.orderItemId, { subtotalMinor: item.subtotalMinor, taxMinor: item.taxMinor });
-  }
-  const current = {
-    providerRefundId: input.providerRefundId,
-    providerCreatedAtEpochMs: currentProviderCreatedAtEpochMs
-  };
-  const earlier = input.earlierFinalized.map((fact) => {
-    const providerCreatedAtEpochMs = Date.parse(fact.providerCreatedAt);
-    if (Number.isNaN(providerCreatedAtEpochMs)) mismatch();
-    return { fact, providerRefundId: fact.providerRefundId, providerCreatedAtEpochMs };
-  }).sort(compareChronology);
-  const factKeys = new Set<string>();
-  for (const { fact, providerCreatedAtEpochMs } of earlier) {
-    assertNonEmptyId(fact.providerRefundId);
-    assertNonEmptyId(fact.orderItemId);
-    assertCurrency(fact.presentmentCurrency);
-    assertSafeMoney(fact.subtotalMinor);
-    assertSafeMoney(fact.taxMinor);
-    if (
-      fact.presentmentCurrency !== input.presentmentCurrency ||
-      fact.subtotalMinor < 0 || fact.taxMinor < 0 ||
-      compareChronology({
-        providerRefundId: fact.providerRefundId,
-        providerCreatedAtEpochMs
-      }, current) >= 0
-    ) mismatch();
-    const factKey = `${fact.providerRefundId}\u0000${providerCreatedAtEpochMs}\u0000${fact.orderItemId}`;
-    if (factKeys.has(factKey)) mismatch();
-    factKeys.add(factKey);
-    const remaining = capacity.get(fact.orderItemId);
-    if (!remaining || fact.subtotalMinor > remaining.subtotalMinor || fact.taxMinor > remaining.taxMinor) mismatch();
-    remaining.subtotalMinor -= fact.subtotalMinor;
-    remaining.taxMinor -= fact.taxMinor;
-  }
+  const replayed = replayFinancialExposure({
+    presentmentCurrency: input.presentmentCurrency,
+    current: {
+      providerCreatedAt: input.providerCreatedAt,
+      providerId: input.providerRefundId,
+      sourceId: input.sourceId
+    },
+    paymentItems: input.paymentItemCapacities,
+    finalizedRefunds: input.earlierFinalized,
+    priorPresentmentEffects: input.priorPresentmentEffects
+  });
   for (const component of components) {
-    const remaining = capacity.get(component.orderItemId);
+    const remaining = replayed.capacity.get(component.orderItemId);
     if (!remaining || component.subtotalMinor > remaining.subtotalMinor || component.taxMinor > remaining.taxMinor) mismatch();
   }
-  return capacity;
-}
-
-function assertCapacityItem(item: RefundPaymentCapacity, presentmentCurrency: string): void {
-  assertNonEmptyId(item.orderItemId);
-  assertCurrency(item.presentmentCurrency);
-  assertSafeMoney(item.subtotalMinor);
-  assertSafeMoney(item.taxMinor);
-  if (item.presentmentCurrency !== presentmentCurrency || item.subtotalMinor < 0 || item.taxMinor < 0) mismatch();
+  return replayed.capacity;
 }
 
 function validateFeeEffects(input: RefundAllocationInput, weights: RefundAllocationInput['paymentItems']): void {

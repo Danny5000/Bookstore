@@ -15,6 +15,7 @@ import type { Database } from '$lib/server/db/client';
 import { disputes, orders, payments } from '$lib/server/db/schema';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
 import { buildDisputeAllocationPlan } from '../allocations/dispute';
+import { compareFinancialExposureChronology } from '../allocations/exposure';
 import {
   loadCurrentEffectiveAllocationProjection,
   persistFinancialAllocationPlanLocked,
@@ -41,7 +42,11 @@ import type {
   FinancialIssueImpact,
   FinancialSourceResult
 } from '../types';
-import { stageBalanceTransaction } from '../ledger';
+import {
+  rearmCurrentProjectionSubjectsForFinancialSources,
+  stageBalanceTransaction
+} from '../ledger';
+import { lockFinancialProjectionEnrollment } from '../rebase';
 import {
   assertFinancialSourceInput,
   financialProviderCall,
@@ -387,6 +392,15 @@ function samePresentmentProjection(
   ));
 }
 
+function componentBackedSucceededRefundIds(
+  facts: Pick<PaymentPurchaseFacts, 'refunds' | 'refundComponents'>
+): readonly string[] {
+  const componentBacked = new Set(facts.refundComponents.map((row) => row.refundId));
+  return [...new Set(facts.refunds
+    .filter((row) => row.status === 'succeeded' && componentBacked.has(row.id))
+    .map((row) => row.id))].sort();
+}
+
 function storedEffectsForCurrentSet(
   facts: Awaited<ReturnType<typeof lockCanonicalPaymentPurchaseFacts>>,
   balance: LockedBalance,
@@ -498,6 +512,8 @@ interface ReplayStoredTip {
   readonly basis: 'gross_amount' | 'fee';
   readonly allocationIdentity: string;
   readonly supersedesSetId: string | null;
+  readonly classifierVersion: number;
+  readonly algorithmVersion: number;
 }
 
 interface ReplayDisputeBalance extends LockedBalance {
@@ -573,7 +589,7 @@ async function recomputeLockedDisputeFinancialProjectionForVersionInSavepoint(
     where balance.id in (${sql.join(
       input.balanceTransactionIds.map((id) => sql`${id}::uuid`), sql`, `
     )}) and balance.source_family = 'dispute'
-    order by balance.provider_created_at, balance.provider_id, balance.id
+    order by balance.provider_created_at, balance.provider_id collate "C", balance.id
     for update of balance
   `) as ReplayDisputeBalance[];
   if (balances.length !== input.balanceTransactionIds.length ||
@@ -593,7 +609,9 @@ async function recomputeLockedDisputeFinancialProjectionForVersionInSavepoint(
   const tips = await rows(tx, sql`
     select allocation.id, allocation.balance_transaction_id as "balanceTransactionId",
       allocation.basis, allocation.allocation_identity as "allocationIdentity",
-      allocation.supersedes_set_id as "supersedesSetId"
+      allocation.supersedes_set_id as "supersedesSetId",
+      allocation.classifier_version as "classifierVersion",
+      allocation.algorithm_version as "algorithmVersion"
     from financial_allocation_sets allocation
     where allocation.balance_transaction_id in (${sql.join(
       input.balanceTransactionIds.map((id) => sql`${id}::uuid`), sql`, `
@@ -605,7 +623,9 @@ async function recomputeLockedDisputeFinancialProjectionForVersionInSavepoint(
     for update
   `) as ReplayStoredTip[];
   if (tips.some((tip) => !UUID.test(tip.id) ||
-    !input.balanceTransactionIds.includes(tip.balanceTransactionId)) ||
+    !input.balanceTransactionIds.includes(tip.balanceTransactionId) ||
+    !Number.isSafeInteger(tip.classifierVersion) || tip.classifierVersion < 1 ||
+    !Number.isSafeInteger(tip.algorithmVersion) || tip.algorithmVersion < 1) ||
     input.balanceTransactionIds.some((id) =>
       tips.filter((tip) => tip.balanceTransactionId === id && tip.basis === 'gross_amount').length > 1 ||
       tips.filter((tip) => tip.balanceTransactionId === id && tip.basis === 'fee').length > 1)) {
@@ -627,6 +647,7 @@ async function recomputeLockedDisputeFinancialProjectionForVersionInSavepoint(
 
   const priorEffects: BoundDisputePresentmentEffect[] = [];
   const replacements: LockedDisputeProjectionReplayReplacement[] = [];
+  let exposureChanged = false;
   for (const balance of balances) {
     const sourceDispute = input.purchaseFacts.disputes.find((candidate) =>
       candidate.stripeDisputeId === balance.sourceId);
@@ -700,8 +721,19 @@ async function recomputeLockedDisputeFinancialProjectionForVersionInSavepoint(
         const refund = input.purchaseFacts.refunds.find((candidate) =>
           candidate.id === component.refundId);
         return !refund || refund.status !== 'succeeded' ||
-          refund.providerCreatedAt.getTime() >= new Date(balance.providerCreatedAt).getTime()
-          ? [] : [{ refundId: refund.id,
+          compareFinancialExposureChronology({
+            providerCreatedAtMs: refund.providerCreatedAt.getTime(),
+            providerId: refund.stripeRefundId,
+            sourceId: refund.id,
+            rowId: component.refundAllocationId
+          }, {
+            providerCreatedAtMs: new Date(balance.providerCreatedAt).getTime(),
+            providerId: balance.providerId,
+            sourceId: sourceDispute.id,
+            rowId: ''
+          }) >= 0
+          ? [] : [{ refundId: refund.id, providerRefundId: refund.stripeRefundId,
+              componentId: component.refundAllocationId,
               providerCreatedAt: refund.providerCreatedAt.toISOString(),
               orderItemId: component.orderItemId, subtotalMinor: component.subtotalMinor,
               taxMinor: component.taxMinor, presentmentCurrency: component.currency }];
@@ -748,6 +780,13 @@ async function recomputeLockedDisputeFinancialProjectionForVersionInSavepoint(
       withdrawalGrossPlan: effectKind === 'reinstatement' ? currentWithdrawalGrossPlan : null,
       withdrawalFeePlan, feeDetails
     });
+    const currentTargetPresentmentEffects = grossTip === undefined ||
+      grossTip.classifierVersion !== target.classifierVersion ||
+      grossTip.algorithmVersion !== target.allocationAlgorithmVersion
+      ? []
+      : storedEffectsForCurrentSet(
+          input.purchaseFacts, balance, grossTip.id, planBySetId
+        );
     const pair: Array<{ setId: string; disposition: 'inserted' | 'unchanged';
       plan: FinancialAllocationPlan }> = [];
     for (const plan of bundle.plans) {
@@ -768,11 +807,26 @@ async function recomputeLockedDisputeFinancialProjectionForVersionInSavepoint(
         causalRootByGrossSet.set(saved.setId, saved.setId);
       }
     }
+    const savedGross = pair.find((row) => row.plan.basis === 'gross_amount');
+    if (savedGross?.disposition === 'inserted' &&
+      !samePresentmentProjection(
+        currentTargetPresentmentEffects, bundle.presentmentEffects
+      )) {
+      exposureChanged = true;
+    }
     if (bundle.presentmentEffects.length > 0) {
       priorEffects.push(...await persistPresentmentEffects(tx, sourceDispute.id,
         pair[0]!.setId, pair[0]!.setId,
         bundle.presentmentEffects));
     }
+  }
+  const affectedRefundIds = exposureChanged
+    ? componentBackedSucceededRefundIds(input.purchaseFacts)
+    : [];
+  if (affectedRefundIds.length > 0) {
+    await rearmCurrentProjectionSubjectsForFinancialSources(tx, {
+      sourceKind: 'refund', sourceIds: affectedRefundIds
+    });
   }
   return replacements.some((row) => row.disposition === 'inserted')
     ? { status: 'replayed', replacements }
@@ -979,6 +1033,10 @@ export async function reconcileDisputeFinancialSource(
       !sameInstant(current.providerCreatedAt, canonicalDispute.providerCreatedAt)
     )
       stateChanged();
+    const affectedRefundIds = componentBackedSucceededRefundIds(facts);
+    if (affectedRefundIds.length > 0) {
+      await lockFinancialProjectionEnrollment(tx);
+    }
     const lockRows = await lockFinancialProjectionRows(tx, {
       payoutGenerations,
       balanceTransactionIds: lockBalanceIds,
@@ -1014,6 +1072,7 @@ export async function reconcileDisputeFinancialSource(
           const planBySetId = new Map<string, FinancialAllocationPlan>();
           const causalRootByGrossSet = new Map<string, string>();
           const activeSetByBalanceBasis = new Map<string, string>();
+          let exposureChanged = false;
           const stagedByBalanceId = new Map(
             staged.map((value) => [value.internalId, value.snapshot])
           );
@@ -1212,14 +1271,24 @@ export async function reconcileDisputeFinancialSource(
                 const refund = facts.refunds.find(
                   (candidate) => candidate.id === component.refundId
                 );
-                return !refund ||
-                  refund.status !== 'succeeded' ||
-                  refund.providerCreatedAt.getTime() >=
-                    new Date(balance.providerCreatedAt).getTime()
+                return !refund || refund.status !== 'succeeded' ||
+                  compareFinancialExposureChronology({
+                    providerCreatedAtMs: refund.providerCreatedAt.getTime(),
+                    providerId: refund.stripeRefundId,
+                    sourceId: refund.id,
+                    rowId: component.refundAllocationId
+                  }, {
+                    providerCreatedAtMs: new Date(balance.providerCreatedAt).getTime(),
+                    providerId: balance.providerId,
+                    sourceId: sourceDispute.id,
+                    rowId: ''
+                  }) >= 0
                   ? []
                   : [
                       {
                         refundId: refund.id,
+                        providerRefundId: refund.stripeRefundId,
+                        componentId: component.refundAllocationId,
                         providerCreatedAt: refund.providerCreatedAt.toISOString(),
                         orderItemId: component.orderItemId,
                         subtotalMinor: component.subtotalMinor,
@@ -1293,6 +1362,11 @@ export async function reconcileDisputeFinancialSource(
               withdrawalFeePlan,
               feeDetails
             });
+            const currentPresentmentEffects = currentGrossSetId === null
+              ? []
+              : storedEffectsForCurrentSet(
+                  facts, balance, currentGrossSetId, planBySetId
+                );
             const pair: Array<{
               setId: string;
               disposition: 'inserted' | 'unchanged';
@@ -1305,9 +1379,7 @@ export async function reconcileDisputeFinancialSource(
               const currentEffects =
                 plan.basis !== 'gross_amount' || currentSetId === null
                   ? []
-                  : storedEffectsForCurrentSet(
-                      facts, balance, currentSetId, planBySetId
-                    );
+                  : currentPresentmentEffects;
               const unchanged =
                 currentPlan !== null &&
                 sameProjection(currentPlan, plan) &&
@@ -1328,6 +1400,13 @@ export async function reconcileDisputeFinancialSource(
                 causalRootByGrossSet.set(saved.setId, saved.setId);
               }
               activeSetByBalanceBasis.set(`${balance.id}:${plan.basis}`, saved.setId);
+            }
+            const savedGross = pair[0];
+            if (savedGross?.disposition === 'inserted' &&
+              !samePresentmentProjection(
+                currentPresentmentEffects, bundle.presentmentEffects
+              )) {
+              exposureChanged = true;
             }
             persisted.push(
               ...pair.map((value) => ({ ...value, sourceDisputeId: sourceDispute.id }))
@@ -1386,7 +1465,8 @@ export async function reconcileDisputeFinancialSource(
                 sourceDisputeIdByBalance.get(projection.balanceTransactionId) ?? routing.id,
               allocationItemCount:
                 projection.status === 'complete' ? projection.items.length : 0
-            }))
+            })),
+            exposureChanged
           };
         });
         return { kind: 'complete' as const, value };
@@ -1496,6 +1576,13 @@ export async function reconcileDisputeFinancialSource(
           settlementCurrencies: [...new Set(sourceBalances.map((value) => value.currency))].sort()
         }
       });
+    }
+    if (outcome.value.exposureChanged) {
+      if (affectedRefundIds.length > 0) {
+        await rearmCurrentProjectionSubjectsForFinancialSources(tx, {
+          sourceKind: 'refund', sourceIds: affectedRefundIds
+        });
+      }
     }
     if (!changed) {
       throwIfFinancialSourceAborted(signal);

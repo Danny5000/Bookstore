@@ -26,7 +26,8 @@ function baseInput(overrides: Record<string, unknown> = {}): Record<string, unkn
       { orderItemId: 'item-b', subtotalMinor: 300, taxMinor: 30, presentmentCurrency: 'USD' }
     ],
     finalizedRefunds: [{
-      refundId: 'refund-1', providerCreatedAt: '2026-07-01T00:00:00.000Z',
+      refundId: 'refund-1', providerRefundId: 're-refund-1', componentId: 'component-refund-1',
+      providerCreatedAt: '2026-07-01T00:00:00.000Z',
       orderItemId: 'item-a', subtotalMinor: 100, taxMinor: 10, presentmentCurrency: 'USD'
     }],
     priorPresentmentEffects: [],
@@ -150,6 +151,50 @@ describe('buildDisputeAllocationPlan', () => {
     expect(result.plans[0].expectedEffectMinor).toBe(-430);
   });
 
+  it('merges refunds and dispute effects in one provider chronology', () => {
+    const withdrawal: PresentmentEffect = {
+      allocationId: 'withdrawal-full', withdrawalSetId: 'set-withdrawal-full',
+      disputeId: 'dispute-prior', providerCreatedAt: '2026-08-01T00:00:00.000Z',
+      providerTransactionId: 'txn-withdrawal-full', orderItemId: 'item-a',
+      subtotalMinor: -100, taxMinor: 0, presentmentCurrency: 'USD',
+      effect: 'withdrawal', reversalOfAllocationId: null
+    };
+    const reinstatement: PresentmentEffect = {
+      allocationId: 'reinstatement-full', withdrawalSetId: 'set-withdrawal-full',
+      disputeId: 'dispute-prior', providerCreatedAt: '2026-08-02T00:00:00.000Z',
+      providerTransactionId: 'txn-reinstatement-full', orderItemId: 'item-a',
+      subtotalMinor: 100, taxMinor: 0, presentmentCurrency: 'USD',
+      effect: 'reinstatement', reversalOfAllocationId: withdrawal.allocationId
+    };
+
+    const result = build(baseInput({
+      balanceTransactionId: 'bt-withdrawal-after-refund',
+      providerTransactionId: 'txn-withdrawal-after-refund',
+      providerCreatedAt: '2026-08-04T00:00:00.000Z',
+      allocationIdentityPrefix: 'dispute:after-refund', withdrawalSetId: null,
+      amountMinor: -50, feeMinor: 0, netMinor: -50,
+      disputeAmountMinor: 50, presentmentAmountMinor: 50, feeDetails: [],
+      paymentItems: [{
+        orderItemId: 'item-a', subtotalMinor: 100, taxMinor: 0,
+        presentmentCurrency: 'USD'
+      }],
+      priorPresentmentEffects: [withdrawal, reinstatement],
+      finalizedRefunds: [{
+        refundId: 'refund-after-reinstatement',
+        providerRefundId: 're-refund-after-reinstatement',
+        componentId: 'component-refund-after-reinstatement',
+        providerCreatedAt: '2026-08-03T00:00:00.000Z',
+        orderItemId: 'item-a', subtotalMinor: 50, taxMinor: 0,
+        presentmentCurrency: 'USD'
+      }]
+    }));
+
+    expect(result.plans[0].expectedEffectMinor).toBe(-50);
+    expect(result.presentmentEffects).toEqual([
+      expect.objectContaining({ orderItemId: 'item-a', subtotalMinor: -50, taxMinor: 0 })
+    ]);
+  });
+
   it('orders a valid offset timestamp by its instant instead of its raw text', () => {
     const result = build(baseInput({
       balanceTransactionId: 'bt-after-offset', providerTransactionId: 'txn-after-offset',
@@ -168,7 +213,9 @@ describe('buildDisputeAllocationPlan', () => {
 
   it('rejects a duplicate finalized refund fact written with an equivalent offset timestamp', () => {
     const refund = {
-      refundId: 'refund-equivalent', providerCreatedAt: '2026-07-01T00:00:00.000Z',
+      refundId: 'refund-equivalent', providerRefundId: 're-refund-equivalent',
+      componentId: 'component-refund-equivalent',
+      providerCreatedAt: '2026-07-01T00:00:00.000Z',
       orderItemId: 'item-a', subtotalMinor: 100, taxMinor: 10,
       presentmentCurrency: 'USD'
     };
@@ -260,6 +307,36 @@ describe('buildDisputeAllocationPlan', () => {
           ...withdrawal, allocationId: 'allocation-b',
           providerCreatedAt: '2026-07-31T20:00:00.000-04:00', subtotalMinor: 100,
           effect: 'reinstatement', reversalOfAllocationId: 'allocation-a'
+        }
+      ]
+    })), 'source_linkage_mismatch');
+  });
+
+  it('rejects a reinstatement that restores a different item than its withdrawal', () => {
+    const withdrawal: PresentmentEffect = {
+      allocationId: 'allocation-item-a', withdrawalSetId: 'set-prior',
+      disputeId: 'dispute-prior', providerCreatedAt: '2026-08-01T00:00:00.000Z',
+      providerTransactionId: 'txn-withdraw-item-a', orderItemId: 'item-a',
+      subtotalMinor: -100, taxMinor: 0, presentmentCurrency: 'USD',
+      effect: 'withdrawal', reversalOfAllocationId: null
+    };
+    expectSafeFailure(() => build(baseInput({
+      balanceTransactionId: 'bt-after-cross-item-restore',
+      providerTransactionId: 'txn-after-cross-item-restore',
+      providerCreatedAt: '2026-08-03T00:00:00.000Z',
+      allocationIdentityPrefix: 'dispute:after-cross-item-restore',
+      withdrawalSetId: null,
+      priorPresentmentEffects: [
+        withdrawal,
+        {
+          ...withdrawal,
+          allocationId: 'allocation-item-b-restore',
+          providerCreatedAt: '2026-08-02T00:00:00.000Z',
+          providerTransactionId: 'txn-restore-item-b',
+          orderItemId: 'item-b',
+          subtotalMinor: 100,
+          effect: 'reinstatement',
+          reversalOfAllocationId: withdrawal.allocationId
         }
       ]
     })), 'source_linkage_mismatch');
@@ -429,8 +506,8 @@ describe('buildDisputeAllocationPlan', () => {
       amountMinor: -100, feeMinor: 7, netMinor: -107,
       disputeAmountMinor: 100, presentmentAmountMinor: 100,
       finalizedRefunds: [
-        { refundId: 'refund-subtotal', providerCreatedAt: '2026-07-01T00:00:00.000Z', orderItemId: 'item-a', subtotalMinor: 700, taxMinor: 0, presentmentCurrency: 'USD' },
-        { refundId: 'refund-subtotal', providerCreatedAt: '2026-07-01T00:00:00.000Z', orderItemId: 'item-b', subtotalMinor: 300, taxMinor: 0, presentmentCurrency: 'USD' }
+        { refundId: 'refund-subtotal', providerRefundId: 're-refund-subtotal', componentId: 'component-subtotal-a', providerCreatedAt: '2026-07-01T00:00:00.000Z', orderItemId: 'item-a', subtotalMinor: 700, taxMinor: 0, presentmentCurrency: 'USD' },
+        { refundId: 'refund-subtotal', providerRefundId: 're-refund-subtotal', componentId: 'component-subtotal-b', providerCreatedAt: '2026-07-01T00:00:00.000Z', orderItemId: 'item-b', subtotalMinor: 300, taxMinor: 0, presentmentCurrency: 'USD' }
       ],
       feeDetails: [{ component: 'dispute_fee', amountMinor: -7 }]
     })), 'allocation_mismatch');
@@ -441,8 +518,8 @@ describe('buildDisputeAllocationPlan', () => {
       amountMinor: -70, feeMinor: 7, netMinor: -77,
       disputeAmountMinor: 70, presentmentAmountMinor: 70,
       finalizedRefunds: [
-        { refundId: 'refund-subtotal', providerCreatedAt: '2026-07-01T00:00:00.000Z', orderItemId: 'item-a', subtotalMinor: 700, taxMinor: 0, presentmentCurrency: 'USD' },
-        { refundId: 'refund-other-item', providerCreatedAt: '2026-07-02T00:00:00.000Z', orderItemId: 'item-b', subtotalMinor: 300, taxMinor: 30, presentmentCurrency: 'USD' }
+        { refundId: 'refund-subtotal', providerRefundId: 're-refund-subtotal', componentId: 'component-subtotal-a', providerCreatedAt: '2026-07-01T00:00:00.000Z', orderItemId: 'item-a', subtotalMinor: 700, taxMinor: 0, presentmentCurrency: 'USD' },
+        { refundId: 'refund-other-item', providerRefundId: 're-refund-other-item', componentId: 'component-other-b', providerCreatedAt: '2026-07-02T00:00:00.000Z', orderItemId: 'item-b', subtotalMinor: 300, taxMinor: 30, presentmentCurrency: 'USD' }
       ],
       feeDetails: [{ component: 'dispute_fee', amountMinor: -7 }]
     }));
@@ -472,7 +549,7 @@ describe('buildDisputeAllocationPlan', () => {
         { orderItemId: 'item-a', subtotalMinor: 700, taxMinor: 70, presentmentCurrency: 'BHD' },
         { orderItemId: 'item-b', subtotalMinor: 300, taxMinor: 30, presentmentCurrency: 'BHD' }
       ],
-      finalizedRefunds: [{ refundId: 'refund-1', providerCreatedAt: '2026-07-01T00:00:00.000Z', orderItemId: 'item-a', subtotalMinor: 100, taxMinor: 10, presentmentCurrency: 'BHD' }]
+      finalizedRefunds: [{ refundId: 'refund-1', providerRefundId: 're-refund-1', componentId: 'component-refund-1', providerCreatedAt: '2026-07-01T00:00:00.000Z', orderItemId: 'item-a', subtotalMinor: 100, taxMinor: 10, presentmentCurrency: 'BHD' }]
     });
     const before = structuredClone(input);
     expect(build(input).plans[0].currency).toBe('BHD');

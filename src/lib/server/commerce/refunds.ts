@@ -645,6 +645,15 @@ export async function fulfillRefundEvent(
           createdAt: now
         })
       : [];
+    const componentBackedRefundIds = new Set(
+      facts.refundComponents.map((component) => component.refundId)
+    );
+    const succeededExposureMembershipChanged = existing !== undefined &&
+      existing.status !== canonicalRefundRow.status &&
+      (existing.status === 'succeeded' || canonicalRefundRow.status === 'succeeded') &&
+      componentBackedRefundIds.has(canonicalRefundRow.id);
+    const refundExposureChanged = componentWrites.length > 0 ||
+      succeededExposureMembershipChanged;
     const allAllocations = [...lockedAllocations, ...allocation.allocations];
     for (const created of allocation.allocations) {
       projectionGraphSourceIds.add(created.refundId);
@@ -780,7 +789,14 @@ export async function fulfillRefundEvent(
       sourceKind: 'refund',
       sourceId: canonicalRefundRow.id,
       providerEventId: event.providerEventId,
-      projectionGraphSourceIds: [...projectionGraphSourceIds].sort()
+      projectionGraphSourceIds: [...projectionGraphSourceIds].sort(),
+      ...(refundExposureChanged
+        ? {
+            crossFamilyProjectionSources: [...new Set(facts.disputes.map((row) => row.id))]
+              .sort()
+              .map((sourceId) => ({ sourceKind: 'dispute' as const, sourceId }))
+          }
+        : {})
     });
     await dependencies.completeEvent(transaction, event.id, eventStatus, now);
   });

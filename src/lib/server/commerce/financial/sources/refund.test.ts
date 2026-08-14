@@ -603,6 +603,60 @@ describe('recomputeLockedRefundFinancialProjection', () => {
     }
     expect(loadCurrentEffectiveAllocationProjection).not.toHaveBeenCalled();
     expect(transaction.update).not.toHaveBeenCalled();
+    const disputeHistoryQuery = vi.mocked(transaction.execute).mock.calls
+      .map(([query]) => dialect.sqlToQuery(query as Parameters<typeof dialect.sqlToQuery>[0]))
+      .find((query) => query.sql.includes('from dispute_item_allocations allocation'));
+    expect(disputeHistoryQuery?.sql).toMatch(
+      /allocation_set\.classifier_version\s*=\s*\$\d+[\s\S]*allocation_set\.algorithm_version\s*=\s*\$\d+/u
+    );
+    expect(disputeHistoryQuery?.sql).toMatch(
+      /successor\.classifier_version\s*=\s*allocation_set\.classifier_version[\s\S]*successor\.algorithm_version\s*=\s*allocation_set\.algorithm_version/u
+    );
+    expect(disputeHistoryQuery?.params).toEqual(expect.arrayContaining([2, 3]));
+  });
+
+  it('keeps immutable component-backed exception refunds in later refund capacity', async () => {
+    const priorRefundId = '00000000-0000-4000-8000-000000000212';
+    const priorAllocationId = '00000000-0000-4000-8000-000000000213';
+    const balance = canonicalBalance();
+    const transaction = projectionTransaction({
+      balances: [balance],
+      history: [
+        {
+          refundId: priorRefundId,
+          providerRefundId: 're_prior_exception',
+          providerCreatedAt: new Date(createdAt.getTime() - 1000),
+          refundStatus: 'succeeded',
+          allocationStatus: 'exception',
+          refundAllocationId: priorAllocationId,
+          orderItemId: itemId,
+          subtotalMinor: 80,
+          taxMinor: 20,
+          currency: 'USD'
+        },
+        {
+          refundId,
+          providerRefundId: 're_refund_trace',
+          providerCreatedAt: createdAt,
+          refundStatus: 'succeeded',
+          allocationStatus: 'finalized',
+          refundAllocationId: allocationId,
+          orderItemId: itemId,
+          subtotalMinor: 400,
+          taxMinor: 100,
+          currency: 'USD'
+        }
+      ],
+      feeDetails: { [balanceId]: [{ amountMinor: 10, classification: 'refund_fee' }] }
+    });
+
+    await expect(recomputeLockedRefundFinancialProjectionForVersion(
+      transaction,
+      lockedInput(),
+      { classifierVersion: 2, allocationAlgorithmVersion: 3, replayId: 'c2-a3' }
+    )).resolves.toMatchObject({
+      status: 'exception', refundId, safeCode: 'allocation_mismatch'
+    });
   });
 
   it('supersedes balance-owned account tips after the refund becomes locally linked', async () => {

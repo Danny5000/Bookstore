@@ -107,6 +107,38 @@ describe('financial event handoff', () => {
     });
   });
 
+  it('queues and rearms local cross-family graph sources under the same event publication', async () => {
+    const disputeSource = '00000000-0000-4000-8000-000000001603';
+    await queueFinancialSourceFromEvent(transaction, {
+      sourceKind: 'refund', sourceId: SOURCE_ID,
+      providerEventId: 'evt_handoff_cross_family_1601',
+      projectionGraphSourceIds: [SOURCE_ID],
+      crossFamilyProjectionSources: [
+        { sourceKind: 'dispute', sourceId: disputeSource },
+        { sourceKind: 'dispute', sourceId: disputeSource.toUpperCase() }
+      ]
+    } as never);
+
+    expect(repositoryMocks.enqueueActiveEntityJob).toHaveBeenCalledTimes(2);
+    expect(repositoryMocks.enqueueActiveEntityJob).toHaveBeenLastCalledWith(transaction, {
+      type: FINANCIAL_SOURCE_JOB,
+      payload: {
+        sourceKind: 'dispute',
+        sourceId: disputeSource,
+        trigger: { kind: 'graph', providerEventId: 'evt_handoff_cross_family_1601' }
+      },
+      deduplicationKey:
+        `financial:source:graph:evt_handoff_cross_family_1601:dispute:${disputeSource}`,
+      maxAttempts: 12,
+      activeEntity: { sourceKind: 'dispute', sourceId: disputeSource }
+    });
+    expect(repositoryMocks.rearmCurrentProjectionSubjectsForFinancialSources.mock.calls)
+      .toEqual([
+        [transaction, { sourceKind: 'dispute', sourceIds: [disputeSource] }],
+        [transaction, { sourceKind: 'refund', sourceIds: [SOURCE_ID] }]
+      ]);
+  });
+
   it('accepts an internally generated graph publication affecting more than one scan page', async () => {
     const sourceIds = Array.from({ length: 101 }, (_, index) =>
       `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`
@@ -114,11 +146,16 @@ describe('financial event handoff', () => {
     await expect(queueFinancialSourceFromEvent(transaction, {
       sourceKind: 'refund', sourceId: SOURCE_ID,
       providerEventId: 'evt_handoff_source_large_graph_1601',
-      projectionGraphSourceIds: sourceIds
+      projectionGraphSourceIds: sourceIds,
+      crossFamilyProjectionSources: sourceIds.map((sourceId) => ({
+        sourceKind: 'dispute' as const, sourceId
+      }))
     })).resolves.toBeUndefined();
 
     expect(repositoryMocks.rearmCurrentProjectionSubjectsForFinancialSources)
       .toHaveBeenCalledWith(transaction, { sourceKind: 'refund', sourceIds });
+    expect(repositoryMocks.rearmCurrentProjectionSubjectsForFinancialSources)
+      .toHaveBeenCalledWith(transaction, { sourceKind: 'dispute', sourceIds });
   });
 
   it('queues one canonical event-keyed payout job inside the supplied transaction', async () => {

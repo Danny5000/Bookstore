@@ -24,11 +24,16 @@ import { disputes, orders, payments, refunds } from '$lib/server/db/schema';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
 import { allocateFeeDetails, basePlan } from '../allocations/common';
 import { buildFailedRefundAllocationPlan, buildRefundAllocationPlan } from '../allocations/refund';
+import { compareFinancialExposureChronology } from '../allocations/exposure';
 import {
   loadCurrentEffectiveAllocationProjection,
   persistFinancialAllocationReplayPlanLocked
 } from '../allocations/repository';
-import type { ClassifiedFeeDetail, EarlierFinalizedRefundComponent } from '../allocations/types';
+import type {
+  BoundDisputePresentmentEffect,
+  ClassifiedFeeDetail,
+  EarlierFinalizedRefundComponent
+} from '../allocations/types';
 import {
   FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
   FINANCIAL_CLASSIFIER_VERSION,
@@ -101,6 +106,20 @@ interface RefundHistoryRow {
   readonly subtotalMinor: number;
   readonly taxMinor: number;
   readonly currency: string;
+}
+
+interface DisputeExposureHistoryRow {
+  readonly allocationId: string;
+  readonly withdrawalSetId: string;
+  readonly disputeId: string;
+  readonly providerCreatedAt: Date;
+  readonly providerTransactionId: string;
+  readonly orderItemId: string;
+  readonly subtotalMinor: number;
+  readonly taxMinor: number;
+  readonly presentmentCurrency: string;
+  readonly effect: 'withdrawal' | 'reinstatement';
+  readonly reversalOfAllocationId: string | null;
 }
 
 interface StoredPlan {
@@ -678,6 +697,40 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
           order by refund.provider_created_at, refund.stripe_refund_id collate "C",
             refund.id, component.order_item_id
         `) as RefundHistoryRow[];
+        const disputeExposureHistory = await rows(projectionTx, sql`
+          select allocation.id as "allocationId",
+            coalesce(original.gross_allocation_set_id, allocation.gross_allocation_set_id)
+              as "withdrawalSetId",
+            allocation.dispute_id as "disputeId",
+            balance.provider_created_at as "providerCreatedAt",
+            balance.provider_id as "providerTransactionId",
+            allocation.order_item_id as "orderItemId",
+            allocation.subtotal_effect_minor as "subtotalMinor",
+            allocation.tax_effect_minor as "taxMinor",
+            allocation.currency as "presentmentCurrency",
+            allocation.effect,
+            allocation.reverses_allocation_id as "reversalOfAllocationId"
+          from dispute_item_allocations allocation
+          join disputes dispute on dispute.id = allocation.dispute_id
+          join financial_allocation_sets allocation_set
+            on allocation_set.id = allocation.gross_allocation_set_id
+          join stripe_balance_transactions balance
+            on balance.id = allocation_set.balance_transaction_id
+          left join dispute_item_allocations original
+            on original.id = allocation.reverses_allocation_id
+          where dispute.payment_id = ${input.paymentId}
+            and allocation_set.basis = 'gross_amount'
+            and allocation_set.classifier_version = ${target.classifierVersion}
+            and allocation_set.algorithm_version = ${target.allocationAlgorithmVersion}
+            and not exists (
+              select 1 from financial_allocation_sets successor
+              where successor.supersedes_set_id = allocation_set.id
+                and successor.classifier_version = allocation_set.classifier_version
+                and successor.algorithm_version = allocation_set.algorithm_version
+            )
+          order by balance.provider_created_at, balance.provider_id collate "C",
+            allocation.dispute_id, allocation.id
+        `) as DisputeExposureHistoryRow[];
         const currentHistory = history.filter((row) => row.refundId === input.refundId);
         const allocationById = new Map(input.finalizedAllocations.map((row) => [row.id, row]));
         if (currentHistory.length !== input.refundComponents.length ||
@@ -802,13 +855,48 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
               providerCreatedAt: new Date(row.providerCreatedAt)
             };
             return row.refundId === input.refundId || row.refundStatus !== 'succeeded' ||
-              row.allocationStatus !== 'finalized' || compareChronology(chronology, currentChronology) >= 0
+              !['finalized', 'exception'].includes(row.allocationStatus) ||
+              compareChronology(chronology, currentChronology) >= 0
               ? []
-              : [{ providerRefundId: row.providerRefundId,
+              : [{ refundId: row.refundId, providerRefundId: row.providerRefundId,
                   providerCreatedAt: chronology.providerCreatedAt.toISOString(),
+                  componentId: row.refundAllocationId,
                   orderItemId: row.orderItemId, subtotalMinor: row.subtotalMinor,
                   taxMinor: row.taxMinor, presentmentCurrency: row.currency }];
           });
+          const currentExposureChronology = {
+            providerCreatedAtMs: new Date(currentCreatedAt).getTime(),
+            providerId: currentProviderRefundId,
+            sourceId: input.refundId,
+            rowId: ''
+          };
+          const priorPresentmentEffects: BoundDisputePresentmentEffect[] =
+            disputeExposureHistory.flatMap((row) =>
+              compareFinancialExposureChronology({
+                providerCreatedAtMs: new Date(row.providerCreatedAt).getTime(),
+                providerId: row.providerTransactionId,
+                sourceId: row.disputeId,
+                rowId: row.allocationId
+              }, currentExposureChronology) >= 0
+                ? []
+                : [{
+                    allocationId: row.allocationId,
+                    withdrawalSetId: row.withdrawalSetId,
+                    disputeId: row.disputeId,
+                    providerCreatedAt: new Date(row.providerCreatedAt).toISOString(),
+                    providerTransactionId: row.providerTransactionId,
+                    orderItemId: row.orderItemId,
+                    subtotalMinor: row.subtotalMinor,
+                    taxMinor: row.taxMinor,
+                    presentmentCurrency: row.presentmentCurrency,
+                    ...(row.effect === 'withdrawal'
+                      ? { effect: 'withdrawal' as const, reversalOfAllocationId: null }
+                      : {
+                          effect: 'reinstatement' as const,
+                          reversalOfAllocationId: row.reversalOfAllocationId!
+                        })
+                  }]
+            );
           primaryPlans = buildRefundAllocationPlan({
             ...metadata,
             providerRefundId: currentProviderRefundId,
@@ -837,6 +925,7 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
               presentmentCurrency: item.currency
             })),
             earlierFinalized,
+            priorPresentmentEffects,
             feeDetails: primaryFeeDetails
           }).plans;
         } else if (!failure) {

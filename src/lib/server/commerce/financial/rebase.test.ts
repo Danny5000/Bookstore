@@ -773,6 +773,75 @@ describe('replayFinancialClassificationLocked', () => {
     });
   });
 
+  it('takes the replay enrollment fence before financial rows when a dispute can rearm refunds', async () => {
+    const disputeId = randomUUID();
+    const refundId = randomUUID();
+    const refundAllocationId = randomUUID();
+    const paymentId = randomUUID();
+    const orderId = randomUUID();
+    const itemId = randomUUID();
+    const marker = new Error('stop-at-financial-lock');
+    const sourceBalance = {
+      id: balanceTransactionId,
+      fingerprintSha256: 'c'.repeat(64),
+      sourceFamily: 'dispute' as const,
+      sourceId: 'dp_safe',
+      rawType: 'adjustment',
+      reportingCategory: 'dispute',
+      amountMinor: -100,
+      feeMinor: 0,
+      netMinor: -100,
+      currency: 'USD'
+    };
+    replaySeams.lockPurchase.mockResolvedValueOnce({
+      payment: { id: paymentId, orderId },
+      order: { id: orderId },
+      refunds: [{ id: refundId, status: 'succeeded' }],
+      refundDrafts: [],
+      refundDraftItems: [],
+      refundAllocations: [{ id: refundAllocationId, refundId, orderItemId: itemId,
+        amountMinor: 100 }],
+      refundComponents: [{ refundAllocationId, refundId, orderItemId: itemId,
+        subtotalMinor: 100, taxMinor: 0, totalMinor: 100, currency: 'USD' }],
+      correctionSets: [],
+      correctionItems: [],
+      disputes: [{ id: disputeId, stripeDisputeId: 'dp_safe' }],
+      disputeItemAllocations: [],
+      orderItems: [{ id: itemId, orderId, unitSubtotalMinor: 100, taxMinor: 0,
+        currency: 'USD' }]
+    });
+    replaySeams.lockProjection.mockRejectedValueOnce(marker);
+    const database = executor([
+      [sourceBalance],
+      [{ id: disputeId, paymentId, orderId }],
+      [],
+      [{ id: orderId }],
+      [{ id: paymentId, orderId }],
+      [],
+      [sourceBalance],
+      [],
+      []
+    ]);
+
+    await expect(replayFinancialClassificationLocked(database.tx, {
+      subjectType: 'balance_transaction',
+      subjectId: balanceTransactionId,
+      sourceFingerprintSha256: 'c'.repeat(64),
+      classifierVersion: 2,
+      allocationAlgorithmVersion: 3,
+      replayId: 'c2-a3',
+      correlationId: 'replay-dispute-enrollment-order'
+    })).rejects.toBe(marker);
+
+    const statements = database.calls.map(rendered);
+    const enrollmentIndex = statements.findIndex((query) =>
+      query.params.includes('pale-orbit:financial:replay-enrollment'));
+    const sourceBalanceIndex = statements.findIndex((query) =>
+      query.sql.includes('where balance.source_family ='));
+    expect(enrollmentIndex).toBeGreaterThan(0);
+    expect(enrollmentIndex).toBeLessThan(sourceBalanceIndex);
+  });
+
   it('rebuilds a refund chronology through the locked provider-free helper', async () => {
     const paymentId = randomUUID();
     const orderId = randomUUID();
