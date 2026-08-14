@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-11
 
-**Status:** 6B-I candidate — independent review pending; 6B-II pending
+**Status:** 6B-I complete; 6B-II pending
 
 **Depends on:** Plans 1-6A, `2026-08-08-bookstore-full-stack-design.md`, and `2026-08-10-stripe-commerce-guest-claims-design.md`
 
@@ -100,7 +100,7 @@ Plan 6B is one design with two implementation checkpoints:
 
 Each checkpoint receives an independent code review. The second checkpoint cannot treat the first as complete until ledger replay, concurrency, migration, and currency invariants have passed their focused gates.
 
-The checkpoint-I candidate implements the ingestion/reconciliation half above and is awaiting independent review. Sales navigation, administrator resolution/reporting routes, payout views, corrections, recovery grants, and CSV remain disabled until 6B-II. Production remains in maintenance mode and Plan 7 retains launch ownership. See the [Stripe financial reconciliation operations guide](../../stripe-financial-reconciliation.md) for the candidate runtime and recovery boundary.
+Checkpoint I implements the ingestion/reconciliation half above and has completed its independent review gate. Sales navigation, administrator resolution/reporting routes, payout views, corrections, recovery grants, and CSV remain disabled until 6B-II. Production remains in maintenance mode and Plan 7 retains launch ownership. See the [Stripe financial reconciliation operations guide](../../stripe-financial-reconciliation.md) for its runtime and recovery boundary.
 
 ## 5. Financial authority and currency model
 

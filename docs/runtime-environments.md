@@ -2,7 +2,7 @@
 
 ## Scope
 
-The repository supplies a development environment and a production infrastructure baseline. Authentication, administration, PostgreSQL catalog data, private publication storage, ingestion, Stripe commerce, guest claims, entitlement grants, customer libraries, reader state, entitled original downloads, and local financial reconciliation are durable. Stripe is disabled by default. The financial checkpoint status is **6B-I candidate — independent review pending; 6B-II pending**. Production intentionally remains in maintenance mode, Sales remains disabled, and Plan 7 owns the launch gate.
+The repository supplies a development environment and a production infrastructure baseline. Authentication, administration, PostgreSQL catalog data, private publication storage, ingestion, Stripe commerce, guest claims, entitlement grants, customer libraries, reader state, entitled original downloads, and local financial reconciliation are durable. Stripe is disabled by default. The financial checkpoint status is **6B-I complete; 6B-II pending**. Production intentionally remains in maintenance mode, Sales remains disabled, and Plan 7 owns the launch gate.
 
 ## Required toolchain
 
@@ -150,5 +150,5 @@ docker compose --file compose.prod.yaml --profile tools run --rm storage-cleanup
 - Plan 4 supplies private storage, bounded ingestion, revision publication, cleanup, and the current backup/restore procedure.
 - Plan 5 supplies server-owned customer libraries, full entitled reading, optimistic reader state, exact revision migration, and authenticated original downloads. See [customer library, reader state, and original downloads](customer-library-and-reader.md).
 - Plan 6A supplies Stripe Checkout/event reconciliation, guest claiming, purchase grants, and refund/dispute access changes.
-- Plan 6B status is **6B-I candidate — independent review pending; 6B-II pending**. Checkpoint I supplies local processing-fee, balance-transaction, payout, allocation, issue, scheduler, and replay boundaries; checkpoint II still owns administrator resolution and sales/estimated-payout reporting.
+- Plan 6B status is **6B-I complete; 6B-II pending**. Checkpoint I supplies local processing-fee, balance-transaction, payout, allocation, issue, scheduler, and replay boundaries; checkpoint II still owns administrator resolution and sales/estimated-payout reporting.
 - Plan 7 adds deployment automation, off-host backup scheduling, monitoring/alert delivery, final capacity tuning, and the read-only-rootfs review.

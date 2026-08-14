@@ -96,7 +96,7 @@ docker compose --file compose.prod.yaml ps
 docker compose --file compose.prod.yaml logs --tail 100 app worker postgres caddy
 ```
 
-`/health/live` proves only the web process responds. `/health/ready` performs bounded PostgreSQL and storage probes. Worker health proves the worker completed its initial dependency probes and entered the polling loop. The financial checkpoint status is **6B-I candidate — independent review pending; 6B-II pending**. Production storefront and API paths remain in maintenance mode, Sales remains disabled, and Plan 7 owns launch. The base production stack keeps Stripe disabled and requires no Stripe credential.
+`/health/live` proves only the web process responds. `/health/ready` performs bounded PostgreSQL and storage probes. Worker health proves the worker completed its initial dependency probes and entered the polling loop. The financial checkpoint status is **6B-I complete; 6B-II pending**. Production storefront and API paths remain in maintenance mode, Sales remains disabled, and Plan 7 owns launch. The base production stack keeps Stripe disabled and requires no Stripe credential.
 
 ## Job behavior
 
@@ -124,5 +124,5 @@ Safe operations may inspect IDs, types/topics, status, attempts, reconciliation 
 - Plan 4 added storage/ingestion jobs, revision lifecycle transitions, and bounded storage cleanup.
 - Plan 5 added the six entitlement/reader-state tables and semantic fingerprint columns. Reader migration is synchronous under ordered transaction locks; it is not a worker job.
 - Plan 6A added Stripe reconciliation, commerce email/claim jobs, purchase grants, and refund/dispute access reduction.
-- Plan 6B status is **6B-I candidate — independent review pending; 6B-II pending**. Checkpoint I supplies local financial ingestion/reconciliation jobs; checkpoint II still owns administrator resolution and reporting.
+- Plan 6B status is **6B-I complete; 6B-II pending**. Checkpoint I supplies local financial ingestion/reconciliation jobs; checkpoint II still owns administrator resolution and reporting.
 - Plan 7 adds failed-job administration, structured logging, queue-age monitoring, scheduled off-host backups, and final pool/capacity tuning.

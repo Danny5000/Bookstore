@@ -51,7 +51,7 @@ npm run build
 npm run verify
 ```
 
-Development uses the PostgreSQL catalog, private EPUB/CBZ storage, background ingestion, revision review/publication, public previews, server-owned commerce and entitlement grants, customer libraries and reader state, authenticated original downloads, and an audited admin dashboard. Stripe is disabled by default and production Compose remains fixed to maintenance mode. The financial checkpoint status is **6B-I candidate — independent review pending; 6B-II pending**; Sales navigation and administrator reporting remain disabled, and Plan 7 owns the production launch gate.
+Development uses the PostgreSQL catalog, private EPUB/CBZ storage, background ingestion, revision review/publication, public previews, server-owned commerce and entitlement grants, customer libraries and reader state, authenticated original downloads, and an audited admin dashboard. Stripe is disabled by default and production Compose remains fixed to maintenance mode. The financial checkpoint status is **6B-I complete; 6B-II pending**; Sales navigation and administrator reporting remain disabled, and Plan 7 owns the production launch gate.
 
 ## Routes
 
@@ -94,7 +94,7 @@ Public catalog, detail, and preview loaders read only active public revisions wi
 
 Plan 6A provides a bounded quantity-one multi-title cart, server-owned quotes, immutable order snapshots, Stripe-hosted Checkout, signed idempotent webhook processing, account and guest fulfillment, one-use guest claims, and refund/dispute-driven purchase grants. A redirect never creates access: canonical asynchronous Stripe processing is the only purchase fulfillment authority. Prices are tax-exclusive, mixed currencies are rejected, and Stripe remains disabled unless explicit validated test-mode configuration enables it.
 
-The Plan 6B-I candidate adds local canonical balance-transaction and payout ingestion, signed fee/net allocation, reconciliation issues, hourly recovery scans, and versioned classification replay. It does not expose administrator resolution or reporting. Exact automatic-standard payout association requires complete membership plus current paid status; manual and instant payouts remain fee-reconciled without invented membership. See the [commerce operations runbook](docs/commerce-and-guest-claims.md) and [financial reconciliation guide](docs/stripe-financial-reconciliation.md).
+Plan 6B-I adds local canonical balance-transaction and payout ingestion, signed fee/net allocation, reconciliation issues, hourly recovery scans, and versioned classification replay. It does not expose administrator resolution or reporting. Exact automatic-standard payout association requires complete membership plus current paid status; manual and instant payouts remain fee-reconciled without invented membership. See the [commerce operations runbook](docs/commerce-and-guest-claims.md) and [financial reconciliation guide](docs/stripe-financial-reconciliation.md).
 
 Production is still `APPLICATION_MODE=maintenance`. Stripe remains disabled in the base stack, the Sales navigation remains unavailable, and Plan 7—not the Stripe overlay—owns storefront launch.
 
