@@ -8,7 +8,7 @@ import { createFinancialPayoutHandler } from '$lib/server/commerce/financial/han
 import { createFinancialScanHandler } from '$lib/server/commerce/financial/handlers/scan';
 import { createFinancialSourceHandler } from '$lib/server/commerce/financial/handlers/source';
 import {
-  createFinancialClassificationSubjectJob,
+  createFinancialCompositeReplayScanJob,
   createFinancialPayoutEventJob,
   createFinancialSourceEventJob,
   createFinancialSourceScanJob,
@@ -263,12 +263,18 @@ function financialHandlers(
 
 async function drainFinancialJobs(
   handlers: ReadonlyMap<string, JobHandler>,
-  maximum = 24
+  maximum = 24,
+  classificationImplementation: {
+    readonly classifierVersion: number;
+    readonly allocationAlgorithmVersion: number;
+  } = { classifierVersion: 1, allocationAlgorithmVersion: 1 }
 ): Promise<readonly string[]> {
   const repository = createPostgresJobRepository(
     databaseClient.db,
     applicationConfig.jobs,
-    () => FAR_FUTURE
+    () => FAR_FUTURE,
+    'all',
+    classificationImplementation
   );
   const completed: string[] = [];
   for (let index = 0; index < maximum; index += 1) {
@@ -1658,26 +1664,26 @@ describe('financial reconciliation acceptance', () => {
       .where(inArray(financialAllocationSets.id, oldSets.map((row) => row.id)))
       .orderBy(asc(financialAllocationSets.id));
 
-    const replaySpec = createFinancialClassificationSubjectJob({
-      subjectType: 'balance_transaction',
-      subjectId: balance.id,
-      sourceFingerprintSha256: fingerprint,
+    const replayImplementation = {
       classifierVersion: 2,
       allocationAlgorithmVersion: 1
-    });
+    } as const;
+    const replaySpec = createFinancialCompositeReplayScanJob(replayImplementation);
     const queued = await enqueueJob(databaseClient.db, {
       type: replaySpec.type,
       payload: replaySpec.payload as JsonObject,
       deduplicationKey: replaySpec.deduplicationKey,
       maxAttempts: replaySpec.maxAttempts
     });
-    await drainFinancialJobs(financialHandlers({} as StripeCommerceGateway, {
-      classifierVersion: 2,
-      allocationAlgorithmVersion: 1
-    }));
+    const completedReplayJobs = await drainFinancialJobs(
+      financialHandlers({} as StripeCommerceGateway, replayImplementation),
+      24,
+      replayImplementation
+    );
 
     expect((await databaseClient.db.select().from(jobs)
       .where(eq(jobs.id, queued.id)))[0]).toMatchObject({ status: 'succeeded', attempts: 1 });
+    expect(completedReplayJobs).toHaveLength(3);
     expect(await databaseClient.db.select().from(financialProjectionVersions)).toEqual([
       expect.objectContaining({ classifierVersion: 2, allocationAlgorithmVersion: 1 })
     ]);
@@ -1738,10 +1744,11 @@ describe('financial reconciliation acceptance', () => {
       maxAttempts: replaySpec.maxAttempts
     });
     expect(replayedQueue.id).toBe(queued.id);
-    expect(await drainFinancialJobs(financialHandlers({} as StripeCommerceGateway, {
-      classifierVersion: 2,
-      allocationAlgorithmVersion: 1
-    }))).toEqual([]);
+    expect(await drainFinancialJobs(
+      financialHandlers({} as StripeCommerceGateway, replayImplementation),
+      24,
+      replayImplementation
+    )).toEqual([]);
     expect(await databaseClient.db.select().from(financialAllocationSets)
       .where(eq(financialAllocationSets.balanceTransactionId, balance.id))).toHaveLength(4);
   });

@@ -13,10 +13,12 @@ import {
   auditEvents,
   financialPayoutDiscoveryState,
   financialProjectionVersions,
-  financialScanRuns
+  financialScanRuns,
+  jobs
 } from '$lib/server/db/schema';
+import { createPostgresJobRepository } from '$lib/server/jobs/repository';
 import type { StripeCommerceGateway } from '$lib/server/commerce/stripe/types';
-import { databaseClient } from './database';
+import { applicationConfig, databaseClient } from './database';
 
 const HOUR = '2026-08-12T22:00:00.000Z';
 const HOUR_END = new Date('2026-08-12T23:00:00.000Z');
@@ -110,6 +112,44 @@ describe('durable payout discovery coverage', () => {
       signal: new AbortController().signal
     });
 
+    expect(await databaseClient.db.select().from(financialProjectionVersions)).toEqual([
+      expect.objectContaining({
+        classifierVersion: 1,
+        allocationAlgorithmVersion: 1,
+        pendingClassifierVersion: 2,
+        pendingAllocationAlgorithmVersion: 3
+      })
+    ]);
+    expect(await databaseClient.db.select().from(financialScanRuns)).toEqual([
+      expect.objectContaining({
+        kind: 'classification_replay', state: 'running',
+        phase: 'classification_replay_finalize', processedCount: 0, pageCount: 1
+      })
+    ]);
+
+    const repository = createPostgresJobRepository(
+      databaseClient.db,
+      applicationConfig.jobs,
+      () => new Date('2099-01-01T00:00:00.000Z'),
+      'local-only',
+      { classifierVersion: 2, allocationAlgorithmVersion: 3 }
+    );
+    const finalizer = await repository.claimNext('empty-replay-finalizer');
+    expect(finalizer).toMatchObject({
+      type: 'commerce.financial-scan',
+      payload: expect.objectContaining({ phase: 'classification_replay_finalize' })
+    });
+    await expect(processFinancialScanJob({
+      database: databaseClient.db,
+      gateway: {} as StripeCommerceGateway,
+      runtimeMode: 'disabled'
+    }, {
+      payload: finalizer!.payload as never,
+      correlationId: 'empty-composite-replay-c2-a3-finalize',
+      signal: new AbortController().signal
+    })).resolves.toEqual({ status: 'completed', runId: expect.any(String) });
+    await expect(repository.complete(finalizer!.id, 'empty-replay-finalizer')).resolves.toBe(true);
+
     expect(await databaseClient.db.select().from(financialProjectionVersions))
       .toEqual([expect.objectContaining({ classifierVersion: 2, allocationAlgorithmVersion: 3 })]);
     expect(await databaseClient.db.select().from(financialScanRuns))
@@ -117,6 +157,9 @@ describe('durable payout discovery coverage', () => {
         kind: 'classification_replay', state: 'completed', processedCount: 0,
         pageCount: 1, safeOutcome: 'completed'
       })]);
+    expect(await databaseClient.db.select().from(jobs)).toEqual([
+      expect.objectContaining({ id: finalizer!.id, status: 'succeeded', attempts: 1 })
+    ]);
     expect(await databaseClient.db.select().from(auditEvents)
       .where(eq(auditEvents.action, 'financial.projection_version.activated')))
       .toHaveLength(1);
