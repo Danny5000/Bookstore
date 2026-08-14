@@ -245,10 +245,13 @@ describe('PostgreSQL active financial entity jobs', () => {
 
   it('gives a dirty rerun a fresh retry budget when reclaiming an expired lease', async () => {
     let currentTime = new Date('2026-08-14T12:00:00.000Z');
-    const event = sourceInput(createFinancialSourceEventJob({
-      sourceKind: 'payment', sourceId: SOURCE_ID,
-      providerEventId: 'evt_active_expired_1621'
-    }));
+    const event = {
+      ...sourceInput(createFinancialSourceEventJob({
+        sourceKind: 'payment', sourceId: SOURCE_ID,
+        providerEventId: 'evt_active_expired_1621'
+      })),
+      runAt: currentTime
+    };
     const queued = await databaseClient.db.transaction((transaction) =>
       enqueueActiveEntityJob(transaction, event)
     );
