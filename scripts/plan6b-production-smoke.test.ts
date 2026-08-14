@@ -51,6 +51,12 @@ const safeRuntime = (): DisabledRuntimeEvidence => ({
   classificationRootCount: 1,
   classificationRootCompletedCount: 1,
   classificationRootUnsafeCount: 0,
+  classificationContinuationCount: 1,
+  classificationContinuationCompletedCount: 1,
+  classificationContinuationUnsafeCount: 0,
+  classificationRunCount: 1,
+  classificationRunCompletedCount: 1,
+  pendingProjectionVersionCount: 0,
   providerLedgerSubjectCount: 0
 });
 
@@ -226,6 +232,11 @@ describe('Plan 6B production smoke ownership', () => {
       { appStripeEnabled: true }, { workerFixtureMode: true }, { appHasStripeSecret: true },
       { postgresHostPublished: true }, { workerReady: false }, { providerBackedJobCount: 1 },
       { classificationRootCount: 2 }, { classificationRootUnsafeCount: 1 },
+      { classificationContinuationCount: 0 },
+      { classificationContinuationCompletedCount: 0 },
+      { classificationContinuationUnsafeCount: 1 },
+      { classificationRunCount: 0 }, { classificationRunCompletedCount: 0 },
+      { pendingProjectionVersionCount: 1 },
       { storefrontStatus: 200 }, { commerceStatus: 200 }
     ]) {
       const calls: string[] = [];
@@ -259,6 +270,9 @@ describe('Plan 6B production smoke ownership', () => {
   it('requires the sole local replay root to complete against an empty provider ledger', async () => {
     for (const unsafe of [
       { classificationRootCompletedCount: 0, providerLedgerSubjectCount: 0 },
+      { classificationContinuationCompletedCount: 0, providerLedgerSubjectCount: 0 },
+      { classificationRunCompletedCount: 0, providerLedgerSubjectCount: 0 },
+      { pendingProjectionVersionCount: 1, providerLedgerSubjectCount: 0 },
       { classificationRootCompletedCount: 1, providerLedgerSubjectCount: 1 }
     ]) {
       const trace: string[] = [];
@@ -292,7 +306,12 @@ describe('Plan 6B production smoke ownership', () => {
       'utf8'
     );
     expect(source).toContain("payload->>'kind' = 'composite_replay'");
-    expect(source).toContain("coalesce(payload->>'kind', '') <> 'composite_replay'");
+    expect(source).toContain("payload->>'kind' = 'continuation'");
+    expect(source).toContain("'classification_replay_page', 'classification_replay_finalize'");
+    expect(source).toContain("'classificationContinuationCompletedCount'");
+    expect(source).toContain('from financial_scan_runs');
+    expect(source).toContain("'pendingProjectionVersionCount'");
+    expect(source).not.toContain("coalesce(payload->>'kind', '') <> 'composite_replay'");
     expect(source).not.toContain("payload->>'kind' = 'classification_replay'");
     expect(source).not.toContain("coalesce(payload->>'kind', '') <> 'classification_replay'");
   });
@@ -533,6 +552,12 @@ describe('Plan 6B production smoke ownership', () => {
               classificationRootCount: 1,
               classificationRootCompletedCount: 1,
               classificationRootUnsafeCount: 0,
+              classificationContinuationCount: 1,
+              classificationContinuationCompletedCount: 1,
+              classificationContinuationUnsafeCount: 0,
+              classificationRunCount: 1,
+              classificationRunCompletedCount: 1,
+              pendingProjectionVersionCount: 0,
               providerLedgerSubjectCount: 0
             })
           };
@@ -588,6 +613,12 @@ describe('Plan 6B production smoke ownership', () => {
               classificationRootCount: 1,
               classificationRootCompletedCount: 1,
               classificationRootUnsafeCount: 0,
+              classificationContinuationCount: 1,
+              classificationContinuationCompletedCount: 1,
+              classificationContinuationUnsafeCount: 0,
+              classificationRunCount: 1,
+              classificationRunCompletedCount: 1,
+              pendingProjectionVersionCount: 0,
               providerLedgerSubjectCount: 0
             })
           };
@@ -606,7 +637,7 @@ describe('Plan 6B production smoke ownership', () => {
     await expect(docker.inspectDisabledRuntime(owned)).rejects.toThrow(/port.*evidence/iu);
   });
 
-  it('waits a bounded interval for the disabled composite replay root to complete', async () => {
+  it('waits a bounded interval for the disabled composite replay finalizer to complete', async () => {
     const appId = 'a'.repeat(64);
     const workerId = 'b'.repeat(64);
     const postgresId = 'c'.repeat(64);
@@ -638,6 +669,12 @@ describe('Plan 6B production smoke ownership', () => {
               classificationRootCount: 1,
               classificationRootCompletedCount: jobSnapshot === 1 ? 0 : 1,
               classificationRootUnsafeCount: 0,
+              classificationContinuationCount: jobSnapshot === 1 ? 0 : 1,
+              classificationContinuationCompletedCount: jobSnapshot === 1 ? 0 : 1,
+              classificationContinuationUnsafeCount: 0,
+              classificationRunCount: 1,
+              classificationRunCompletedCount: jobSnapshot === 1 ? 0 : 1,
+              pendingProjectionVersionCount: 0,
               providerLedgerSubjectCount: 0
             })
           };
@@ -654,7 +691,10 @@ describe('Plan 6B production smoke ownership', () => {
     });
 
     await expect(docker.inspectDisabledRuntime(owned)).resolves.toMatchObject({
-      classificationRootCompletedCount: 1
+      classificationRootCompletedCount: 1,
+      classificationContinuationCompletedCount: 1,
+      classificationRunCompletedCount: 1,
+      pendingProjectionVersionCount: 0
     });
     expect(jobSnapshot).toBe(2);
     expect(wait).toHaveBeenCalledTimes(1);

@@ -37,6 +37,12 @@ export interface DisabledRuntimeEvidence {
   readonly classificationRootCount: number;
   readonly classificationRootCompletedCount: number;
   readonly classificationRootUnsafeCount: number;
+  readonly classificationContinuationCount: number;
+  readonly classificationContinuationCompletedCount: number;
+  readonly classificationContinuationUnsafeCount: number;
+  readonly classificationRunCount: number;
+  readonly classificationRunCompletedCount: number;
+  readonly pendingProjectionVersionCount: number;
   readonly providerLedgerSubjectCount: number;
 }
 
@@ -696,7 +702,13 @@ export function createProductionSmokeDockerOperations(
           'providerBackedJobCount', count(*) filter (
             where type in ('commerce.financial-source', 'commerce.financial-payout')
               or (type = 'commerce.financial-scan'
-                and coalesce(payload->>'kind', '') <> 'composite_replay')
+                and not coalesce(
+                  payload->>'kind' = 'composite_replay'
+                  or (payload->>'kind' = 'continuation'
+                    and payload->>'phase' in
+                      ('classification_replay_page', 'classification_replay_finalize')),
+                  false
+                ))
           ),
           'classificationRootCount', count(*) filter (
             where type = 'commerce.financial-scan'
@@ -715,6 +727,65 @@ export function createProductionSmokeDockerOperations(
                   select 1 from jsonb_object_keys(payload) key
                   where key not in ('kind','classifierVersion','allocationAlgorithmVersion','replayId')
                 ))
+          ),
+          'classificationContinuationCount', count(*) filter (
+            where type = 'commerce.financial-scan'
+              and payload->>'kind' = 'continuation'
+              and payload->>'phase' in
+                ('classification_replay_page', 'classification_replay_finalize')
+          ),
+          'classificationContinuationCompletedCount', count(*) filter (
+            where type = 'commerce.financial-scan'
+              and payload->>'kind' = 'continuation'
+              and payload->>'phase' in
+                ('classification_replay_page', 'classification_replay_finalize')
+              and status = 'succeeded'
+          ),
+          'classificationContinuationUnsafeCount', count(*) filter (
+            where type = 'commerce.financial-scan'
+              and payload->>'kind' = 'continuation'
+              and payload->>'phase' in
+                ('classification_replay_page', 'classification_replay_finalize')
+              and (
+                not payload ?& array['scanRunId','phase','cursorDigestSha256','limit']
+                or exists (
+                  select 1 from jsonb_object_keys(payload) key
+                  where key not in ('kind','scanRunId','phase','cursorDigestSha256','limit')
+                )
+                or coalesce(payload->>'scanRunId', '') !~
+                  '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+                or coalesce(payload->>'cursorDigestSha256', '') !~ '^[a-f0-9]{64}$'
+                or coalesce(payload->>'limit', '') <> '100'
+                or not exists (
+                  select 1 from financial_scan_runs replay_run
+                  where replay_run.id::text = payload->>'scanRunId'
+                    and replay_run.kind = 'classification_replay'
+                )
+              )
+          ),
+          'classificationRunCount', (
+            select count(*) from financial_scan_runs
+            where kind = 'classification_replay'
+          ),
+          'classificationRunCompletedCount', (
+            select count(*) from financial_scan_runs
+            where kind = 'classification_replay'
+              and state = 'completed'
+              and phase = 'classification_replay_finalize'
+              and classifier_version = 1
+              and allocation_algorithm_version = 1
+              and replay_id = 'c1-a1'
+              and checkpoint is null
+              and cursor_digest_sha256 is null
+              and safe_outcome = 'completed'
+              and completed_at is not null
+          ),
+          'pendingProjectionVersionCount', (
+            select count(*) from financial_projection_versions
+            where pending_classifier_version is not null
+              or pending_allocation_algorithm_version is not null
+              or pending_replay_id is not null
+              or pending_scan_run_id is not null
           ),
           'providerLedgerSubjectCount',
             (select count(*) from stripe_balance_transactions) +
@@ -737,14 +808,30 @@ export function createProductionSmokeDockerOperations(
         const classificationRootCount = numeric('classificationRootCount');
         const classificationRootCompletedCount = numeric('classificationRootCompletedCount');
         const classificationRootUnsafeCount = numeric('classificationRootUnsafeCount');
+        const classificationContinuationCount = numeric('classificationContinuationCount');
+        const classificationContinuationCompletedCount =
+          numeric('classificationContinuationCompletedCount');
+        const classificationContinuationUnsafeCount =
+          numeric('classificationContinuationUnsafeCount');
+        const classificationRunCount = numeric('classificationRunCount');
+        const classificationRunCompletedCount = numeric('classificationRunCompletedCount');
+        const pendingProjectionVersionCount = numeric('pendingProjectionVersionCount');
         const providerLedgerSubjectCount = numeric('providerLedgerSubjectCount');
         assert(
           providerBackedJobCount === 0 && classificationRootCount <= 1 &&
             classificationRootCompletedCount <= classificationRootCount &&
-            classificationRootUnsafeCount === 0 && providerLedgerSubjectCount === 0,
+            classificationRootUnsafeCount === 0 && classificationContinuationCount <= 1 &&
+            classificationContinuationCompletedCount <= classificationContinuationCount &&
+            classificationContinuationUnsafeCount === 0 && classificationRunCount <= 1 &&
+            classificationRunCompletedCount <= classificationRunCount &&
+            pendingProjectionVersionCount <= 1 && providerLedgerSubjectCount === 0,
           'job evidence is invalid'
         );
-        if (classificationRootCount === 1 && classificationRootCompletedCount === 1) {
+        if (classificationRootCount === 1 && classificationRootCompletedCount === 1 &&
+          classificationContinuationCount === 1 &&
+          classificationContinuationCompletedCount === 1 &&
+          classificationRunCount === 1 && classificationRunCompletedCount === 1 &&
+          pendingProjectionVersionCount === 0) {
           jobs = candidate;
           break;
         }
@@ -773,6 +860,13 @@ export function createProductionSmokeDockerOperations(
         classificationRootCount: numeric('classificationRootCount'),
         classificationRootCompletedCount: numeric('classificationRootCompletedCount'),
         classificationRootUnsafeCount: numeric('classificationRootUnsafeCount'),
+        classificationContinuationCount: numeric('classificationContinuationCount'),
+        classificationContinuationCompletedCount:
+          numeric('classificationContinuationCompletedCount'),
+        classificationContinuationUnsafeCount: numeric('classificationContinuationUnsafeCount'),
+        classificationRunCount: numeric('classificationRunCount'),
+        classificationRunCompletedCount: numeric('classificationRunCompletedCount'),
+        pendingProjectionVersionCount: numeric('pendingProjectionVersionCount'),
         providerLedgerSubjectCount: numeric('providerLedgerSubjectCount')
       };
     },
@@ -860,6 +954,23 @@ function validateDisabledRuntime(evidence: DisabledRuntimeEvidence): void {
   assert(
     evidence.classificationRootUnsafeCount === 0,
     'runtime classification root contains unsafe work'
+  );
+  assert(
+    evidence.classificationContinuationCount === 1 &&
+      evidence.classificationContinuationCompletedCount === 1,
+    'runtime classification finalizer did not complete'
+  );
+  assert(
+    evidence.classificationContinuationUnsafeCount === 0,
+    'runtime classification continuation contains unsafe work'
+  );
+  assert(
+    evidence.classificationRunCount === 1 && evidence.classificationRunCompletedCount === 1,
+    'runtime classification scan did not complete'
+  );
+  assert(
+    evidence.pendingProjectionVersionCount === 0,
+    'runtime projection authority is still pending'
   );
   assert(evidence.providerLedgerSubjectCount === 0, 'runtime provider ledger is not empty');
 }
