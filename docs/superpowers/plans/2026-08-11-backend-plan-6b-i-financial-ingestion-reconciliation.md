@@ -103,7 +103,7 @@ export async function rebaseApprovedCorrectionDistributionLocked(
 - Create: `src/lib/server/commerce/financial/types.ts`
 - Modify: `docs/dependency-decisions.md`
 
-- [ ] **Step 1: Capture current registry, runtime, peer-range, and audit evidence**
+- [x] **Step 1: Capture current registry, runtime, peer-range, and audit evidence**
 
 Run each command separately so nonzero `npm outdated --json` can be recorded without hiding later checks:
 
@@ -121,7 +121,7 @@ npm ls --depth=0
 
 Expected: Node/npm satisfy `package.json`; Stripe and peer data are recorded with the current date; no unexplained high/critical advisory; no new runtime package is required. Do not update a package merely because it is newer: inspect its changelog/API/peer compatibility first.
 
-- [ ] **Step 2: Write the failing constants and safe-error tests**
+- [x] **Step 2: Write the failing constants and safe-error tests**
 
 ```ts
 import { describe, expect, it } from 'vitest';
@@ -152,7 +152,7 @@ describe('financial constants and errors', () => {
 });
 ```
 
-- [ ] **Step 3: Run the focused test and verify the RED state**
+- [x] **Step 3: Run the focused test and verify the RED state**
 
 ```powershell
 npx vitest run src/lib/server/commerce/financial/constants.test.ts src/lib/server/commerce/financial/errors.test.ts
@@ -160,7 +160,7 @@ npx vitest run src/lib/server/commerce/financial/constants.test.ts src/lib/serve
 
 Expected: FAIL because the new modules do not exist.
 
-- [ ] **Step 4: Implement the exact constants, type vocabulary, and safe errors**
+- [x] **Step 4: Implement the exact constants, type vocabulary, and safe errors**
 
 ```ts
 export const FINANCIAL_CLASSIFIER_VERSION = 1;
@@ -181,7 +181,7 @@ export const FINANCIAL_GENERATION_MAX = 2_147_483_647;
 
 `types.ts` defines the stable contracts above plus `FinancialComponent`, `FinancialIssueCode`, `FinancialIssueImpact`, `FinancialAllocationPlan`, `PersistFinancialAllocationPlanInput`, `CurrentEffectiveAllocationProjection`, `PublicFinancialStateInput`, `FinancialSourceResult`, `CurrentPayoutEvidence`, `LockedRefundProjectionInput`, `RefundFinancialRecomputeResult`, `CorrectionRebaseInput`, classification inputs/decisions, and payout/import result unions. Every result union uses bounded `status`/`safeCode` values and internal IDs; no type carries a provider SDK object or arbitrary error message. `errors.ts` exposes only bounded safe-code unions; it must not retain a provider error object or message. Define `FINANCIAL_REPLAY_ID` canonically from both classifier and allocation-algorithm versions (for example `c1-a1`); no replay key may use only one version.
 
-- [ ] **Step 5: Run focused and static verification**
+- [x] **Step 5: Run focused and static verification**
 
 ```powershell
 npx vitest run src/lib/server/commerce/financial/constants.test.ts src/lib/server/commerce/financial/errors.test.ts
@@ -192,7 +192,7 @@ git diff --check
 
 Expected: all commands exit zero; the only dependency-file change is an explicitly reviewed compatible update, if one was justified in Step 1.
 
-- [ ] **Step 6: Commit Task 1**
+- [x] **Step 6: Commit Task 1**
 
 ```powershell
 git add src/lib/server/commerce/financial docs/dependency-decisions.md
@@ -218,7 +218,7 @@ If and only if Step 1 justified and implemented a compatible dependency update, 
 - Create: `drizzle/meta/0007_snapshot.json`
 - Modify: `drizzle/meta/_journal.json`
 
-- [ ] **Step 1: Write RED schema-contract tests before changing production schema**
+- [x] **Step 1: Write RED schema-contract tests before changing production schema**
 
 Test all names, enum values, foreign-key actions, unique/index identities, and check constraints through Drizzle metadata plus real PostgreSQL. The schema tests must assert this exact 20-table ownership. The provider module owns both the singleton projection-version authority, so classifier and allocation versions activate atomically only after replay convergence, and the singleton payout-discovery high-water, so outages longer than the ordinary overlap cannot create a permanent gap:
 
@@ -253,7 +253,7 @@ They must also require `administrative` in the entitlement-grant source enum, bo
 
 Add every new table to `tests/integration/setup.ts` in child-before-parent truncation order. The integration schema test must prove restrictive history foreign keys rather than cascading deletion.
 
-- [ ] **Step 2: Run the schema tests and verify the RED state**
+- [x] **Step 2: Run the schema tests and verify the RED state**
 
 ```powershell
 npx vitest run src/lib/server/db/schema/commerce.test.ts src/lib/server/db/schema/financial-provider.test.ts src/lib/server/db/schema/financial-allocation.test.ts scripts/financial-schema-preservation.test.ts
@@ -262,7 +262,7 @@ npm run test:integration -- tests/integration/financial-schema.test.ts
 
 Expected: FAIL because the modules, enums, columns, tables, and migration do not exist.
 
-- [ ] **Step 3: Implement provider-ledger tables with exact invariants**
+- [x] **Step 3: Implement provider-ledger tables with exact invariants**
 
 Use UUID primary keys for internal relations and bounded unique provider IDs. Define the following required columns and constraints; every persisted instant uses Drizzle `timestamp(columnName, { withTimezone: true })`, currencies use uppercase three-letter checks, and money uses the existing JavaScript-safe bounds.
 
@@ -287,7 +287,7 @@ Use UUID primary keys for internal relations and bounded unique provider IDs. De
 
 `financial_scan_runs` stores unique root key, kind/phase, bounded cursor digest/checkpoint, frozen payout-discovery bounds, counts, safe outcome, and start/completion timestamps. No column may contain a provider cursor without a configured maximum length.
 
-- [ ] **Step 4: Implement allocation, issue, draft, correction, and provenance tables**
+- [x] **Step 4: Implement allocation, issue, draft, correction, and provenance tables**
 
 `financial_allocation_sets` must persist balance transaction, basis `gross_amount | fee`, scope `title | account | unresolved`, expected signed effect, currency, algorithm/classifier versions, source fingerprint, stable identity, nullable predecessor set, and nullable `reversalOfSetId`. The self-reference identifies the exact original principal/fee allocation set reversed by a failed-refund reversal or dispute reinstatement; constraints and service validation require matching basis/currency/source family and forbid ambiguous or chained reversal references. Its identity and predecessor constraints must prevent two current tips for the same unchanged source/basis.
 
@@ -312,11 +312,11 @@ Declare two read-only Drizzle/PostgreSQL views as the single composable current-
 
 Require a unique causal identity so replay cannot manufacture a second provenance row. This table is immutable and is the only admissible causal evidence for 6B-II recovery; audit JSON and current grant state are not substitutes.
 
-- [ ] **Step 5: Export both schema modules and complete static preservation checks**
+- [x] **Step 5: Export both schema modules and complete static preservation checks**
 
 Update `src/lib/server/db/schema/index.ts` to export both modules and both current-projection views. Export `$inferSelect` and `$inferInsert` aliases for every new table, using stable names such as `PayoutImportRunRow`, `RefundAllocationDraftRow`, `RefundAllocationComponentRow`, `RefundReportingCorrectionSetRow`, `DisputeItemAllocationRow`, `FinancialAllocationSetRow`, `FinancialIssueRow`, and their `New...Row` counterparts; later service signatures import these aliases rather than recreating structural types. In this schema phase, `scripts/financial-schema-preservation.test.ts` parses source/migration text and fails on forbidden sensitive columns, missing table/type/view exports, missing enum values, or missing declared guard-target tables. Task 3 deliberately extends it to require the actual trigger functions/attachments after those guards exist. It supplements but does not replace the real PostgreSQL test.
 
-- [ ] **Step 6: Generate the single forward migration**
+- [x] **Step 6: Generate the single forward migration**
 
 ```powershell
 npm run db:generate -- --name plan6b_financial_reconciliation
@@ -324,7 +324,7 @@ npm run db:generate -- --name plan6b_financial_reconciliation
 
 Expected: Drizzle creates exactly `drizzle/0007_plan6b_financial_reconciliation.sql`, `drizzle/meta/0007_snapshot.json`, and one journal entry. If the next available number is not `0007`, stop and reconcile migration history before proceeding; do not rename a generated migration blindly.
 
-- [ ] **Step 7: Run focused verification**
+- [x] **Step 7: Run focused verification**
 
 ```powershell
 npx vitest run src/lib/server/db/schema/commerce.test.ts src/lib/server/db/schema/financial-provider.test.ts src/lib/server/db/schema/financial-allocation.test.ts scripts/financial-schema-preservation.test.ts
@@ -335,7 +335,7 @@ git diff --check
 
 Expected: focused commands exit zero, the snapshot parses, all schema objects are exported, and integration cleanup succeeds with the new tables. The full type check waits for Task 4's caller migration.
 
-- [ ] **Step 8: Inspect the generated boundary and continue directly to Task 3**
+- [x] **Step 8: Inspect the generated boundary and continue directly to Task 3**
 
 ```powershell
 git status --short
@@ -355,7 +355,7 @@ Expected: only the declared schema/migration/test files changed. Do **not** comm
 - Modify: `tests/integration/financial-schema.test.ts`
 - Modify: `package.json`
 
-- [ ] **Step 1: Add RED actual-upgrade and direct-SQL guard tests**
+- [x] **Step 1: Add RED actual-upgrade and direct-SQL guard tests**
 
 The upgrade harness must create its own isolated, uniquely named Compose PostgreSQL service with a cryptographically random project/database/user/password and loopback-only ephemeral port, apply migrations `0000` through `0006`, seed valid legacy commerce history, run `0007`, execute the assertions, and destroy only that validated owned project/database in `finally`. It never accepts an ambient `DATABASE_URL` or nonloopback server for destructive setup. Before any `DROP DATABASE` or Compose cleanup it validates the project, container ID/labels, loopback endpoint, generated database/user identity, and owned-run manifest together; a database-name prefix alone is insufficient. Do not use a temporary schema: project migrations address `public` explicitly.
 
@@ -384,7 +384,7 @@ Assert after migration:
 
 Add invalid legacy cases for over-allocation, conflicting item currency, and partial facts. Each must abort the migration transaction without advancing the journal or leaving any Plan 6B table behind.
 
-- [ ] **Step 2: Run the migration tests and verify the RED state**
+- [x] **Step 2: Run the migration tests and verify the RED state**
 
 ```powershell
 npx vitest run scripts/with-plan6b-upgrade-database.test.ts scripts/financial-schema-preservation.test.ts
@@ -393,13 +393,13 @@ npm run test:integration -- tests/integration/financial-migration.test.ts tests/
 
 Expected: FAIL because `0007` has neither the exact backfill nor history triggers and the upgrade harness script is missing.
 
-- [ ] **Step 3: Implement deterministic local-only backfill inside `0007`**
+- [x] **Step 3: Implement deterministic local-only backfill inside `0007`**
 
 The SQL must perform no network access and must lock/reject inconsistent legacy graphs rather than guess. Map legacy state with explicit fact-derived `CASE` expressions; never map `reconciled` to `fee_reconciled` and never inherit `exception` solely because the legacy enum says so. For payments and disputes, retain exception only when the complete local order/payment/dispute graph proves an immutable amount, currency, or linkage conflict; otherwise map to pending for canonical provider backfill. For refunds, convert only the provable expected-ambiguity shape to `needs_review + pending`, retain exception only for a locally proven conflict, and abort on a corrupt/over-capacity/cross-currency graph that cannot be migrated safely. Upgrade tests must include valid/pending and locally conflicting exception cases for all three source families.
 
 For each finalized legacy refund allocation, derive component rows in provider-created/refund-ID order. Within an order item, split total including tax over the remaining subtotal/tax capacity using integer largest remainder with the unique stable tie keys `<orderItemId>:subtotal` and `<orderItemId>:tax` (never the duplicated bare item ID). Verify per-refund totals and cumulative per-item capacity before inserting. Leave ambiguous succeeded refunds unallocated and open the local `allocation_incomplete` pending issue only after the issue table exists.
 
-- [ ] **Step 4: Add database-enforced immutable-history guards**
+- [x] **Step 4: Add database-enforced immutable-history guards**
 
 Use explicit trigger functions comparable to the existing append-only audit protection. Reject update/delete for:
 
@@ -420,11 +420,11 @@ Permit only these narrow transitions:
 
 Reject payout-generation wrap, correction/classification fork, draft mutation after finalization, and deleting any durable history.
 
-- [ ] **Step 5: Expose a dedicated upgrade-test script**
+- [x] **Step 5: Expose a dedicated upgrade-test script**
 
 Add an npm script named `test:plan6b-upgrade` that invokes the isolated disposable-Compose harness. It must perform the full owned-run identity validation from Step 1 before destructive cleanup and use native PowerShell/Node/PostgreSQL operations end-to-end.
 
-- [ ] **Step 6: Run GREEN migration and guard verification**
+- [x] **Step 6: Run GREEN migration and guard verification**
 
 ```powershell
 npm run test:plan6b-upgrade
@@ -436,7 +436,7 @@ git diff --check
 
 Expected: migration/schema commands exit zero; both valid upgrade and rollback fixtures use real migration SQL; every direct forbidden mutation fails with a PostgreSQL constraint/trigger error; allowed transitions remain green. The full application type/lint gate is deferred until Task 4 migrates every production caller from the legacy property/state names.
 
-- [ ] **Step 7: Inspect the safe migration and continue directly to Task 4**
+- [x] **Step 7: Inspect the safe migration and continue directly to Task 4**
 
 ```powershell
 git status --short
@@ -462,7 +462,7 @@ Expected: the migration is upgrade-safe but the application refactor is still pe
 - Modify: `tests/integration/commerce-reconciliation-readiness.test.ts`
 - Modify: `tests/e2e/commerce-lifecycle.spec.ts`
 
-- [ ] **Step 1: Add RED seam and state-transition tests**
+- [x] **Step 1: Add RED seam and state-transition tests**
 
 Require these exact exports:
 
@@ -499,7 +499,7 @@ Add reducer cases proving:
 - failed/canceled refund uses `not_applicable`;
 - payment/refund/dispute financial evidence starts `pending` and no Plan 6A reducer can write `fee_reconciled`.
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 ```powershell
 npx vitest run src/lib/server/commerce/refunds.test.ts src/lib/server/commerce/disputes.test.ts src/lib/server/commerce/fulfillment.test.ts
@@ -509,13 +509,13 @@ npm run test:e2e -- tests/e2e/commerce-lifecycle.spec.ts
 
 Expected: FAIL on the missing seam and legacy reconciliation-state assumptions.
 
-- [ ] **Step 3: Implement the thin lock seam and state renames**
+- [x] **Step 3: Implement the thin lock seam and state renames**
 
 Keep provider calls out of these functions. Use the existing order advisory lock and row-lock helpers. Move only the reusable purchase-fact acquisition into `lockPaymentPurchaseFacts`; do not duplicate the access projection/reducer. Update payment/refund/dispute writes to the new evidence column and allocation-state truth table.
 
 Do not enqueue financial work yet. The handler registration and event handoff land together in Task 16 so no intermediate commit can create an orphan job type.
 
-- [ ] **Step 4: Add deterministic deadlock probes**
+- [x] **Step 4: Add deterministic deadlock probes**
 
 Extend the real PostgreSQL lock-order suite with barriers for:
 
@@ -525,7 +525,7 @@ Extend the real PostgreSQL lock-order suite with barriers for:
 
 The probe must use explicit barriers, bounded `lock_timeout`, `Promise.allSettled`, rollback/release in `finally`, and exact rejection diagnostics. A timing-only sleep assertion is not sufficient.
 
-- [ ] **Step 5: Run GREEN regression gates**
+- [x] **Step 5: Run GREEN regression gates**
 
 ```powershell
 npx vitest run src/lib/server/commerce/refunds.test.ts src/lib/server/commerce/disputes.test.ts src/lib/server/commerce/fulfillment.test.ts
@@ -538,7 +538,7 @@ git diff --check
 
 Expected: all commands exit zero, existing access outcomes are unchanged, and the lock probes complete without PostgreSQL `40P01`.
 
-- [ ] **Step 6: Commit Task 4**
+- [x] **Step 6: Commit Task 4**
 
 ```powershell
 git add src/lib/server/db/schema src/lib/server/commerce/reconciliation.ts src/lib/server/commerce/refunds.ts src/lib/server/commerce/refunds.test.ts src/lib/server/commerce/disputes.ts src/lib/server/commerce/disputes.test.ts src/lib/server/commerce/fulfillment.ts src/lib/server/commerce/fulfillment.test.ts tests/integration/setup.ts tests/integration/financial-schema.test.ts tests/integration/financial-migration.test.ts tests/integration/commerce-refunds.test.ts tests/integration/commerce-disputes.test.ts tests/integration/commerce-fulfillment.test.ts tests/integration/commerce-lock-order.test.ts tests/integration/commerce-reconciliation-readiness.test.ts tests/e2e/commerce-lifecycle.spec.ts scripts/financial-schema-preservation.test.ts scripts/with-plan6b-upgrade-database.ts scripts/with-plan6b-upgrade-database.test.ts drizzle/0007_plan6b_financial_reconciliation.sql drizzle/meta/0007_snapshot.json drizzle/meta/_journal.json package.json
@@ -568,7 +568,7 @@ git commit -m "feat: add financial persistence and purchase seams"
 - Modify: `tests/fixtures/stripe/refund.ts`
 - Modify: `tests/fixtures/stripe/dispute.ts`
 
-- [ ] **Step 1: Write RED parser, gateway-interface, and clone-isolation tests**
+- [x] **Step 1: Write RED parser, gateway-interface, and clone-isolation tests**
 
 The tests must require these provider-neutral snapshots:
 
@@ -651,7 +651,7 @@ export interface StripeListPage<T> {
 
 Require gateway methods `retrieveCharge`, `retrieveBalanceTransaction`, `retrievePayout`, `listBalanceTransactionsForSource`, `listBalanceTransactionsForPayout`, and `listPayouts`. Tests must reject malformed IDs, livemode mismatch, unknown currency, unsafe money, `net !== amount - fee`, duplicate fee ordinals, a third Dispute balance-transaction reference, bad timestamps, zero/noncanonical exchange rate, invalid FX currency pair, oversized cursor, and a page whose `hasMore` result lacks a next ID.
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 ```powershell
 npx vitest run src/lib/server/commerce/stripe/financial-schemas.test.ts src/lib/server/commerce/stripe/fixture-financial.test.ts src/lib/server/commerce/stripe/schemas.test.ts src/lib/server/commerce/stripe/fixture-gateway.test.ts src/lib/server/commerce/stripe/runtime.test.ts src/routes/api/webhooks/stripe/route.test.ts
@@ -659,19 +659,19 @@ npx vitest run src/lib/server/commerce/stripe/financial-schemas.test.ts src/lib/
 
 Expected: FAIL because the snapshots, parsers, fixture controls, and gateway methods do not exist.
 
-- [ ] **Step 3: Implement strict provider-neutral parsers**
+- [x] **Step 3: Implement strict provider-neutral parsers**
 
 Export `parseChargeSnapshot`, `parseBalanceTransactionSnapshot`, and `parsePayoutSnapshot` from `financial-schemas.ts`. Reuse canonical currency/ID/date helpers from existing Stripe schemas. Parse exact-decimal FX as a validated canonical string; never convert it to a JavaScript float.
 
 No financial snapshot may include `description`, `destination`, metadata, customer, payment method, card/billing, receipt, provider failure message, or raw object. Add negative structural tests that enumerate allowed DTO keys.
 
-- [ ] **Step 4: Extend the fixture gateway deterministically**
+- [x] **Step 4: Extend the fixture gateway deterministically**
 
 Keep fixture mode limited to `APP_ENV=test`, `STRIPE_TEST_FIXTURE_MODE=true`, and `STRIPE_ENABLED=false`. Add setter/reset APIs in `fixture-financial.ts`, clone every input/output, use stable cursor ordering, and support deterministic one-page and multi-page sequences plus injected retryable/permanent failures. Unconfigured list methods return a validated empty terminal page so the real worker can complete a test fixture scan; point retrieval still fails safely when its ID was not registered. Do not create an impossible Stripe-enabled fixture configuration.
 
 The disabled gateway must implement every new method by throwing the existing safe unavailable error without inspecting credentials.
 
-- [ ] **Step 5: Run GREEN provider-contract verification**
+- [x] **Step 5: Run GREEN provider-contract verification**
 
 ```powershell
 npx vitest run src/lib/server/commerce/stripe/financial-schemas.test.ts src/lib/server/commerce/stripe/fixture-financial.test.ts src/lib/server/commerce/stripe/schemas.test.ts src/lib/server/commerce/stripe/fixture-gateway.test.ts src/lib/server/commerce/stripe/runtime.test.ts src/routes/api/webhooks/stripe/route.test.ts
@@ -680,7 +680,7 @@ git diff --check
 
 Expected: focused behavior passes; fixture snapshots cannot be mutated by callers; the disabled runtime remains credential-free. A full TypeScript check is intentionally deferred until Task 6 implements the newly required SDK methods.
 
-- [ ] **Step 6: Inspect the adapter boundary and continue directly to Task 6**
+- [x] **Step 6: Inspect the adapter boundary and continue directly to Task 6**
 
 ```powershell
 git status --short
@@ -695,7 +695,7 @@ Expected: only the declared adapter/fixture files changed. Do **not** commit an 
 - Modify: `src/lib/server/commerce/stripe/sdk-gateway.ts`
 - Modify: `src/lib/server/commerce/stripe/sdk-gateway.test.ts`
 
-- [ ] **Step 1: Write RED SDK-mapping and pagination tests**
+- [x] **Step 1: Write RED SDK-mapping and pagination tests**
 
 Mock the installed Stripe 22.5.0 SDK at the network boundary and assert:
 
@@ -708,7 +708,7 @@ Mock the installed Stripe 22.5.0 SDK at the network boundary and assert:
 - `has_more=true` derives `nextStartingAfter` from the last validated row and an empty/invalid continuation fails permanently.
 - Stripe timeout, connection, and rate-limit failures map retryably; malformed canonical evidence maps permanently with safe codes.
 
-- [ ] **Step 2: Run the SDK tests and verify RED**
+- [x] **Step 2: Run the SDK tests and verify RED**
 
 ```powershell
 npx vitest run src/lib/server/commerce/stripe/sdk-gateway.test.ts
@@ -716,13 +716,13 @@ npx vitest run src/lib/server/commerce/stripe/sdk-gateway.test.ts
 
 Expected: FAIL because the methods and mappings do not exist.
 
-- [ ] **Step 3: Implement thin mappings in the existing SDK gateway**
+- [x] **Step 3: Implement thin mappings in the existing SDK gateway**
 
 Keep the sole `stripe` package import in `sdk-gateway.ts`. Pass mapped literals through the strict parsers before returning. Establish source family from the retrieved canonical object relationship; never infer authority from an ID prefix. Preserve the explicit API-version pin `2026-07-29.dahlia`.
 
 One list call returns one page. Higher layers own continuation jobs; this adapter must not loop, open transactions, log response bodies, or retain SDK objects.
 
-- [ ] **Step 4: Run GREEN SDK verification**
+- [x] **Step 4: Run GREEN SDK verification**
 
 ```powershell
 npx vitest run src/lib/server/commerce/stripe/sdk-gateway.test.ts
@@ -733,7 +733,7 @@ git diff --check
 
 Expected: all commands exit zero and no new source file imports the Stripe SDK.
 
-- [ ] **Step 5: Commit Task 6**
+- [x] **Step 5: Commit Task 6**
 
 ```powershell
 git add src/lib/server/commerce/stripe tests/fixtures/stripe src/routes/api/webhooks/stripe/route.test.ts
@@ -747,7 +747,7 @@ git commit -m "feat: add canonical stripe financial evidence"
 - Create: `src/lib/server/commerce/financial/jobs.ts`
 - Create: `src/lib/server/commerce/financial/jobs.test.ts`
 
-- [ ] **Step 1: Write RED job parser and deduplication-key tests**
+- [x] **Step 1: Write RED job parser and deduplication-key tests**
 
 Require exactly four job families:
 
@@ -786,7 +786,7 @@ financial:classification:<classifier-version>:<allocation-algorithm-version>:<su
 
 Every classification root/subject payload carries both `classifierVersion` and `allocationAlgorithmVersion`; creators derive the canonical `FINANCIAL_REPLAY_ID` and reject a key/payload mismatch. A payout-impact source payload uses `{ kind: 'payout_impact'; payoutId; payoutGeneration }` and its generation-specific key above, never the ordinary UTC-hour source key. Reject unknown fields, malformed UUID/provider IDs, out-of-range limits/generations/versions, unsafe cursors, and mismatched key/payload identity.
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 ```powershell
 npx vitest run src/lib/server/commerce/financial/jobs.test.ts
@@ -794,11 +794,11 @@ npx vitest run src/lib/server/commerce/financial/jobs.test.ts
 
 Expected: FAIL because `jobs.ts` does not exist.
 
-- [ ] **Step 3: Implement Zod payload parsers and key creators**
+- [x] **Step 3: Implement Zod payload parsers and key creators**
 
 Export one creator and one parser for each payload variant. Cursor payloads may retain only bounded provider cursors or SHA-256 digests, never raw provider responses. All job data must be JSON-serializable and contain no email, user identity, provider messages, or secret.
 
-- [ ] **Step 4: Run GREEN job-contract verification**
+- [x] **Step 4: Run GREEN job-contract verification**
 
 ```powershell
 npx vitest run src/lib/server/commerce/financial/jobs.test.ts
@@ -809,7 +809,7 @@ git diff --check
 
 Expected: all commands exit zero.
 
-- [ ] **Step 5: Commit Task 7**
+- [x] **Step 5: Commit Task 7**
 
 ```powershell
 git add src/lib/server/commerce/financial/jobs.ts src/lib/server/commerce/financial/jobs.test.ts
@@ -829,7 +829,7 @@ git commit -m "feat: define financial reconciliation jobs"
 - Create: `src/lib/server/commerce/financial/allocations/dispute.ts`
 - Create: `src/lib/server/commerce/financial/allocations/dispute.test.ts`
 
-- [ ] **Step 1: Write table-driven RED tests for signed largest remainder**
+- [x] **Step 1: Write table-driven RED tests for signed largest remainder**
 
 Require this public kernel:
 
@@ -842,7 +842,7 @@ export function allocateSignedLargestRemainder(input: {
 
 Test positive, negative, zero, one-item, stable equal-remainder UUID ordering, zero-weight exclusion, nonzero/no-weight rejection, unsafe input rejection, and `Number.MIN_SAFE_INTEGER`/`MAX_SAFE_INTEGER` boundaries. Every intermediate multiplication/division uses `BigInt`; conversion back occurs only after a safe-range check. The output sum must equal the input exactly.
 
-- [ ] **Step 2: Write RED source-plan tests**
+- [x] **Step 2: Write RED source-plan tests**
 
 Require:
 
@@ -864,7 +864,7 @@ Cover:
 - multiple disputes in provider-created/ID order, cumulative remaining exposure, explicit withdrawal-set reference for reinstatement, fee and fee-credit effects;
 - zero- and three-decimal presentment/settlement currencies and FX kept as separate integer domains.
 
-- [ ] **Step 3: Run all allocator tests and verify RED**
+- [x] **Step 3: Run all allocator tests and verify RED**
 
 ```powershell
 npx vitest run src/lib/server/commerce/financial/allocations/largest-remainder.test.ts src/lib/server/commerce/financial/allocations/charge.test.ts src/lib/server/commerce/financial/allocations/refund.test.ts src/lib/server/commerce/financial/allocations/dispute.test.ts
@@ -872,13 +872,13 @@ npx vitest run src/lib/server/commerce/financial/allocations/largest-remainder.t
 
 Expected: FAIL because the allocator modules do not exist.
 
-- [ ] **Step 4: Implement the pure allocation kernel**
+- [x] **Step 4: Implement the pure allocation kernel**
 
 All functions are deterministic, side-effect free, provider-neutral, and return the shared `FinancialAllocationPlan` from `../types.ts` with explicit basis/scope/currency/expected effect/component rows. `allocations/types.ts` defines only algorithm-specific charge/refund/dispute input and weighted-target shapes; it imports and does not redeclare the shared component/plan/result unions. Reject duplicate tie keys, cross-currency inputs, capacity overrun, ambiguous withdrawal reference, and any nonconserving result. Do not round through floating point and do not interpret FX rates as money.
 
 Fee-detail classifications may change component labels, but the complete fee basis still conserves `-feeMinor`. Every fee detail on a canonically Charge-linked Balance Transaction—including a novel detail classified as `other`—is allocated to titles with the approved charge fee weights. Only a Balance Transaction with no proven bookstore source may remain account-scoped; no novel/other fee cent may disappear or be moved out of an otherwise title-linked fee set.
 
-- [ ] **Step 5: Run GREEN allocator verification**
+- [x] **Step 5: Run GREEN allocator verification**
 
 ```powershell
 npx vitest run src/lib/server/commerce/financial/allocations/largest-remainder.test.ts src/lib/server/commerce/financial/allocations/charge.test.ts src/lib/server/commerce/financial/allocations/refund.test.ts src/lib/server/commerce/financial/allocations/dispute.test.ts
@@ -889,7 +889,7 @@ git diff --check
 
 Expected: all tests pass and every test vector proves exact conservation.
 
-- [ ] **Step 6: Commit Task 8**
+- [x] **Step 6: Commit Task 8**
 
 ```powershell
 git add src/lib/server/commerce/financial/allocations
@@ -907,7 +907,7 @@ git commit -m "feat: add signed financial allocation engine"
 - Create: `src/lib/server/commerce/financial/issues.test.ts`
 - Create: `tests/integration/financial-ledger.test.ts`
 
-- [ ] **Step 1: Write RED unit contracts for fingerprints, classification, and issues**
+- [x] **Step 1: Write RED unit contracts for fingerprints, classification, and issues**
 
 Require these service boundaries:
 
@@ -941,7 +941,7 @@ Fingerprint tests must be deterministic under property-order changes and must in
 
 Issue tests require bounded codes and scopes, repeat observation increment/clamp behavior, resolution only after a caller supplies a successful recomputation proof, and reopen-on-new-evidence. Inputs cannot contain message/evidence blobs.
 
-- [ ] **Step 2: Write RED real-PostgreSQL ledger tests**
+- [x] **Step 2: Write RED real-PostgreSQL ledger tests**
 
 Prove:
 
@@ -954,7 +954,7 @@ Prove:
 - direct update/delete fails;
 - safe audit rows contain aggregate IDs/status/amount/currency/count only and use the exact actions `financial.balance_transaction.imported`, `financial.classification.appended`, `financial.issue.opened`, and `financial.issue.resolved` for the applicable committed transitions.
 
-- [ ] **Step 3: Run unit and integration tests and verify RED**
+- [x] **Step 3: Run unit and integration tests and verify RED**
 
 ```powershell
 npx vitest run src/lib/server/commerce/financial/ledger.test.ts src/lib/server/commerce/financial/classification.test.ts src/lib/server/commerce/financial/issues.test.ts
@@ -963,19 +963,19 @@ npm run test:integration -- tests/integration/financial-ledger.test.ts
 
 Expected: FAIL because the services do not exist.
 
-- [ ] **Step 4: Implement independent immutable staging**
+- [x] **Step 4: Implement independent immutable staging**
 
 `stageBalanceTransaction` owns a short transaction independent of any purchase/order transaction. It verifies the canonical fingerprint, writes all fee-detail rows, appends current classifier decisions, and records only safe aggregate audit evidence. A committed insert or mutable-status advance audits `financial.balance_transaction.imported`; an exact no-op replay does not append a duplicate outcome. Exact replay is idempotent. A mutable-status advance revalidates all immutable fields before update.
 
 Never pass a Drizzle transaction from a purchase reducer into provider staging; this separation is what lets provider calls and immutable writes complete before the order graph locks.
 
-- [ ] **Step 5: Implement append-only classification and issue services**
+- [x] **Step 5: Implement append-only classification and issue services**
 
 Lock classifications by subject stable ID before reading/appending. Unique identity is `(subject type, subject ID, classifier version, source fingerprint)`. A current supported version may supersede `unknown` without editing it. Classification decisions and any allocation replay enqueue/audit are atomic at the service layer.
 
 Issue resolution checks resource/code identity, current open row, and an explicit caller recomputation result. Opening and canonical resolution audit `financial.issue.opened` and `financial.issue.resolved` atomically with their transitions; repeat observation without a lifecycle transition does not manufacture another audit outcome. There is no generic resolve function that accepts an administrator acknowledgment.
 
-- [ ] **Step 6: Run GREEN ledger verification**
+- [x] **Step 6: Run GREEN ledger verification**
 
 ```powershell
 npx vitest run src/lib/server/commerce/financial/ledger.test.ts src/lib/server/commerce/financial/classification.test.ts src/lib/server/commerce/financial/issues.test.ts
@@ -987,7 +987,7 @@ git diff --check
 
 Expected: all commands exit zero and no test fixture, job, audit row, or captured log contains a raw provider object/message.
 
-- [ ] **Step 7: Commit Task 9**
+- [x] **Step 7: Commit Task 9**
 
 ```powershell
 git add src/lib/server/commerce/financial/ledger.ts src/lib/server/commerce/financial/ledger.test.ts src/lib/server/commerce/financial/classification.ts src/lib/server/commerce/financial/classification.test.ts src/lib/server/commerce/financial/issues.ts src/lib/server/commerce/financial/issues.test.ts tests/integration/financial-ledger.test.ts
@@ -1006,7 +1006,7 @@ git commit -m "feat: persist immutable stripe financial ledger"
 - Create: `tests/integration/financial-lock-order.test.ts`
 - Create: `tests/integration/financial-allocation-repository.test.ts`
 
-- [ ] **Step 1: Write RED state-table tests**
+- [x] **Step 1: Write RED state-table tests**
 
 Test every row in design §6.4 through `derivePublicFinancialState`. The function may return `payout_reconciled` only when:
 
@@ -1017,7 +1017,7 @@ Test every row in design §6.4 through `derivePublicFinancialState`. The functio
 
 Manual/instant payouts remain `fee_reconciled`. Failed/canceled/reversed payouts reopen current public state without deleting historical membership. Expected ambiguous refund is `needs_review + pending`, not a financial exception.
 
-- [ ] **Step 2: Write RED allocation repository tests**
+- [x] **Step 2: Write RED allocation repository tests**
 
 Require:
 
@@ -1035,7 +1035,7 @@ export async function loadCurrentEffectiveAllocationProjection(
 
 The repository must verify source/basis/currency/expected total, stable row sum, exact predecessor tip, reversal reference, and correction compatibility. It returns exactly one current base-plus-compatible-correction projection **for each requested `(balanceTransactionId, basis)`**, in deterministic transaction/basis order; a single Balance Transaction normally yields separate gross and fee projections. Implement it by querying the exported `currentFinancialProjectionHeads`/`currentFinancialProjectionItems` views—the exact same chain-selection relation used by checkpoint-II aggregates. The loader is strictly read-only: a fork, stale predecessor, missing classification, nonconserving rows, ambiguous reversal reference, or incompatible correction returns an explicit incomplete/exception entry with a bounded proposed issue code for that key; it never writes, collapses multiple transactions/bases, or double-counts both tips. Reconciliation/rebase callers that already hold the published mutation locks pass those results to `observeFinancialIssue` in their transaction. Reporting and 6B-II detail/query callers surface incomplete entries without causing a GET-side write.
 
-- [ ] **Step 3: Write RED deterministic lock-order probes**
+- [x] **Step 3: Write RED deterministic lock-order probes**
 
 Require helpers that acquire sorted payout, balance-transaction, classification, allocation-set/item, and issue locks after the purchase graph and before entitlement scopes. Payout-only helpers acquire payout/run/entries/transactions/membership/issues and never accept an order transaction callback.
 
@@ -1046,7 +1046,7 @@ Use real PostgreSQL barriers to construct the historical reverse edges and prove
 - payout publication versus two sorted balance transactions;
 - refund projection versus entitlement mutation.
 
-- [ ] **Step 4: Run focused tests and verify RED**
+- [x] **Step 4: Run focused tests and verify RED**
 
 ```powershell
 npx vitest run src/lib/server/commerce/financial/state.test.ts src/lib/server/commerce/financial/locks.test.ts src/lib/server/commerce/financial/allocations/repository.test.ts
@@ -1055,13 +1055,13 @@ npm run test:integration -- tests/integration/financial-lock-order.test.ts tests
 
 Expected: FAIL because the state, repository, and lock helpers do not exist.
 
-- [ ] **Step 5: Implement the lock and projection contracts**
+- [x] **Step 5: Implement the lock and projection contracts**
 
 Sort every multi-row lock by canonical UUID/provider stable ID. Source transactions may lock a current payout generation before their balance transactions, but payout import never waits for an order. Re-read generation, membership, classifier fingerprint, and predecessor tips under lock immediately before writes.
 
 `financialEvidenceStatus` is payout-independent. Never persist `payout_reconciled` into a payment/refund/dispute row. The read model calls `derivePublicFinancialState` with current joined evidence.
 
-- [ ] **Step 6: Run GREEN lock/state verification**
+- [x] **Step 6: Run GREEN lock/state verification**
 
 ```powershell
 npx vitest run src/lib/server/commerce/financial/state.test.ts src/lib/server/commerce/financial/locks.test.ts src/lib/server/commerce/financial/allocations/repository.test.ts
@@ -1073,7 +1073,7 @@ git diff --check
 
 Expected: all commands exit zero; repeated probes produce no PostgreSQL `40P01`, and payout failure is visible from current joins without waiting for a source-row update.
 
-- [ ] **Step 7: Commit Task 10**
+- [x] **Step 7: Commit Task 10**
 
 ```powershell
 git add src/lib/server/commerce/financial/locks.ts src/lib/server/commerce/financial/locks.test.ts src/lib/server/commerce/financial/state.ts src/lib/server/commerce/financial/state.test.ts src/lib/server/commerce/financial/allocations/repository.ts src/lib/server/commerce/financial/allocations/repository.test.ts tests/integration/financial-lock-order.test.ts tests/integration/financial-allocation-repository.test.ts
@@ -1087,7 +1087,7 @@ git commit -m "feat: project financial allocation evidence"
 - Create: `src/lib/server/commerce/financial/sources/payment.test.ts`
 - Create: `tests/integration/financial-sources.test.ts`
 
-- [ ] **Step 1: Write RED service tests around a call/transaction trace**
+- [x] **Step 1: Write RED service tests around a call/transaction trace**
 
 Require:
 
@@ -1111,7 +1111,7 @@ Assert the trace is exactly:
 
 Test retryable missing charge/BT, provider outage, abort signal, foreign/mutated metadata, wrong amount/currency/livemode, immutable collision, exact replay, later `pending -> available`, and order changing between provider retrieval and lock acquisition.
 
-- [ ] **Step 2: Run payment source tests and verify RED**
+- [x] **Step 2: Run payment source tests and verify RED**
 
 ```powershell
 npx vitest run src/lib/server/commerce/financial/sources/payment.test.ts
@@ -1120,13 +1120,13 @@ npm run test:integration -- tests/integration/financial-sources.test.ts
 
 Expected: FAIL because the source service does not exist.
 
-- [ ] **Step 3: Implement canonical payment reconciliation**
+- [x] **Step 3: Implement canonical payment reconciliation**
 
 Reuse the Plan 6A canonical linkage checks rather than creating a weaker financial version. A retryable provider gap leaves the local source `pending` and open `missing_source` issue for hourly recovery. A permanent mismatch opens an exception-impact issue and sets evidence `exception`. Do not alter order/payment lifecycle, grants, entitlements, or email.
 
 Audit action `financial.payment_reconciled` contains internal payment/order IDs, safe status, settlement currency, signed amount/fee/net, allocation counts, and correlation ID only.
 
-- [ ] **Step 4: Run GREEN payment reconciliation verification**
+- [x] **Step 4: Run GREEN payment reconciliation verification**
 
 ```powershell
 npx vitest run src/lib/server/commerce/financial/sources/payment.test.ts
@@ -1138,7 +1138,7 @@ git diff --check
 
 Expected: all commands exit zero; no Stripe method appears between transaction begin/commit in the call trace.
 
-- [ ] **Step 5: Commit Task 11**
+- [x] **Step 5: Commit Task 11**
 
 ```powershell
 git add src/lib/server/commerce/financial/sources/payment.ts src/lib/server/commerce/financial/sources/payment.test.ts tests/integration/financial-sources.test.ts
@@ -1156,7 +1156,7 @@ git commit -m "feat: reconcile charge financial evidence"
 - Create: `src/lib/server/commerce/financial/handlers/source.test.ts`
 - Modify: `tests/integration/financial-sources.test.ts`
 
-- [ ] **Step 1: Write RED refund, dispute, and handler tests**
+- [x] **Step 1: Write RED refund, dispute, and handler tests**
 
 Require:
 
@@ -1189,7 +1189,7 @@ Dispute tests cover zero, one, and two transactions plus rejection of a third; s
 
 Handler tests parse strict job payloads, dispatch only payment/refund/dispute, honor abort/lease loss, retry safe gaps, and convert permanent evidence conflicts to durable exception outcomes without provider text.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 ```powershell
 npx vitest run src/lib/server/commerce/financial/sources/refund.test.ts src/lib/server/commerce/financial/sources/dispute.test.ts src/lib/server/commerce/financial/handlers/source.test.ts
@@ -1198,17 +1198,17 @@ npm run test:integration -- tests/integration/financial-sources.test.ts
 
 Expected: FAIL because the services and handler do not exist.
 
-- [ ] **Step 3: Implement refund recomputation as the shared 6B-II seam**
+- [x] **Step 3: Implement refund recomputation as the shared 6B-II seam**
 
 Provider retrieval and independent ledger staging complete first. Under the published purchase lock order, recompute from the complete refund graph, finalized allocations/components, current classification, and current correction tip. The provider-free `recomputeLockedRefundFinancialProjection` is the only function 6B-II finalization calls after it writes an administrative allocation; it must not fetch Stripe data or acquire an outer order lock itself.
 
 Expected ambiguity observes `allocation_incomplete` with impact `pending`; corrupt totals/currency/capacity use impact `exception`. Only canonical recomputation resolves the issue.
 
-- [ ] **Step 4: Implement dispute reconciliation and the source handler**
+- [x] **Step 4: Implement dispute reconciliation and the source handler**
 
 Stage every canonical dispute balance transaction independently before entering the order graph. Allocate all observed transactions in stable chronology against cumulative remaining exposure. A reinstatement identifies the exact withdrawal set it reverses. Unknown/missing evidence stays pending or exception; it is never guessed from webhook deltas.
 
-- [ ] **Step 5: Run GREEN source verification**
+- [x] **Step 5: Run GREEN source verification**
 
 ```powershell
 npx vitest run src/lib/server/commerce/financial/sources/refund.test.ts src/lib/server/commerce/financial/sources/dispute.test.ts src/lib/server/commerce/financial/handlers/source.test.ts
@@ -1220,7 +1220,7 @@ git diff --check
 
 Expected: all commands exit zero; provider calls are transaction-free, replays converge, and access/grants/outbox are byte-for-byte unchanged by financial imports.
 
-- [ ] **Step 6: Commit Task 12**
+- [x] **Step 6: Commit Task 12**
 
 ```powershell
 git add src/lib/server/commerce/financial/sources/refund.ts src/lib/server/commerce/financial/sources/refund.test.ts src/lib/server/commerce/financial/sources/dispute.ts src/lib/server/commerce/financial/sources/dispute.test.ts src/lib/server/commerce/financial/handlers/source.ts src/lib/server/commerce/financial/handlers/source.test.ts tests/integration/financial-sources.test.ts
@@ -1238,7 +1238,7 @@ git commit -m "feat: reconcile refund and dispute finances"
 - Create: `src/lib/server/commerce/financial/handlers/payout.test.ts`
 - Create: `tests/integration/financial-payouts.test.ts`
 
-- [ ] **Step 1: Write RED payout lifecycle and import-run tests**
+- [x] **Step 1: Write RED payout lifecycle and import-run tests**
 
 Require:
 
@@ -1276,7 +1276,7 @@ Cover canonical insert/replay/change, paid-to-failed and canceled/reversal histo
 
 Import-run tests cover multiple pages, crash after a page, replay, changed payout generation abandoning the old run, duplicate candidates, source collision, final empty page, and two concurrent publishers. Before publication, candidate entries must be invisible to `loadCurrentPayoutEvidence`.
 
-- [ ] **Step 2: Write RED provider-call/transaction and atomic-handoff tests**
+- [x] **Step 2: Write RED provider-call/transaction and atomic-handoff tests**
 
 Assert every provider call finishes before its corresponding database transaction. The handler flow is:
 
@@ -1291,7 +1291,7 @@ Publication must lock `payout -> run -> sorted run entries -> sorted balance tra
 
 Immediately before membership insertion, the locked publication transaction must re-read and require the payout is still automatic, standard, `reconciliationStatus='completed'`, currently `paid`, and at the exact generation captured by the run. If any predicate changed after the final provider page, mark/leave the run abandoned or stale and publish nothing. A deterministic barrier test changes paid to failed/canceled (and separately advances generation) between final-page persistence and publication; no membership, generation increment, impact job, or publication audit may commit from the stale run.
 
-- [ ] **Step 3: Run focused tests and verify RED**
+- [x] **Step 3: Run focused tests and verify RED**
 
 ```powershell
 npx vitest run src/lib/server/commerce/financial/payouts/repository.test.ts src/lib/server/commerce/financial/payouts/service.test.ts src/lib/server/commerce/financial/handlers/payout.test.ts
@@ -1300,7 +1300,7 @@ npm run test:integration -- tests/integration/financial-payouts.test.ts
 
 Expected: FAIL because payout services and handler do not exist.
 
-- [ ] **Step 4: Implement payout staging, collection, and publication**
+- [x] **Step 4: Implement payout staging, collection, and publication**
 
 Lifecycle validation permits canonical late change while keeping identity/original facts immutable. Historical published membership is never deleted when a payout fails. Current report state uses payout status/reconciliation and any reversal evidence, so failure reopens immediately.
 
@@ -1308,7 +1308,7 @@ Manual/instant payouts stage their canonical row and direct payout/failure Balan
 
 `enqueuePayoutImpactLocked` is an internal repository function called only inside the payout mutation/publication transaction. It pages memberships later and enqueues independent source-refresh jobs; it never enters a purchase graph while holding payout locks.
 
-- [ ] **Step 5: Run GREEN payout verification**
+- [x] **Step 5: Run GREEN payout verification**
 
 ```powershell
 npx vitest run src/lib/server/commerce/financial/payouts/repository.test.ts src/lib/server/commerce/financial/payouts/service.test.ts src/lib/server/commerce/financial/handlers/payout.test.ts
@@ -1320,7 +1320,7 @@ git diff --check
 
 Expected: all commands exit zero; incomplete pages never become authoritative; a crash cannot occur between generation change and the durable impact job.
 
-- [ ] **Step 6: Commit Task 13**
+- [x] **Step 6: Commit Task 13**
 
 ```powershell
 git add src/lib/server/commerce/financial/payouts src/lib/server/commerce/financial/handlers/payout.ts src/lib/server/commerce/financial/handlers/payout.test.ts tests/integration/financial-payouts.test.ts
@@ -1340,7 +1340,7 @@ git commit -m "feat: import stripe payout membership"
 - Create: `src/lib/server/commerce/financial/handlers/scan.test.ts`
 - Create: `tests/integration/financial-scheduler.test.ts`
 
-- [ ] **Step 1: Write RED generic worker-hook tests**
+- [x] **Step 1: Write RED generic worker-hook tests**
 
 Add this backward-compatible runner seam:
 
@@ -1357,7 +1357,7 @@ export interface RunWorkerOptions {
 
 Tests must prove `beforePoll` runs before each claim cycle, respects abort, cannot overlap itself within one runner, maps failure to a bounded worker log without killing later polls, and leaves existing lease heartbeat/lost-lease behavior unchanged. The hook only ensures local jobs; it performs no Stripe call or scan body.
 
-- [ ] **Step 2: Write RED scheduler and scan tests**
+- [x] **Step 2: Write RED scheduler and scan tests**
 
 Require:
 
@@ -1387,7 +1387,7 @@ A process-local current-hour/replay-ID cache reduces inserts but is never the co
 
 Scan tests cover at most 100 local pending/retryable payment/refund/dispute sources, incomplete payout runs, payout-impact memberships, and one provider payout-discovery page. For each local source page, the scan enqueues the scan-triggered `commerce.financial-source` payload/key defined in Task 7; for each known/incomplete payout it enqueues the scan-triggered `commerce.financial-payout` payload/key. These hour-generation keys are distinct from terminal event keys. A payout-impact page enqueues the payout/generation-specific child source key—not the ordinary hourly key—so a source already reconciled earlier in the same hour is refreshed after payout publication/failure. Test that exact ordering and idempotent replay. Continuations contain run/phase/cursor digest. Discovery uses a 72-hour overlap; initial lower bound is earliest paid order minus seven days. Exhausted transient source jobs remain durable for the next hourly scan.
 
-- [ ] **Step 3: Run focused tests and verify RED**
+- [x] **Step 3: Run focused tests and verify RED**
 
 ```powershell
 npx vitest run src/lib/server/jobs/runner.test.ts src/lib/server/commerce/financial/scans/scheduler.test.ts src/lib/server/commerce/financial/scans/service.test.ts src/lib/server/commerce/financial/handlers/scan.test.ts
@@ -1396,17 +1396,17 @@ npm run test:integration -- tests/integration/financial-scheduler.test.ts
 
 Expected: FAIL because the hook, scheduler, scans, and handler do not exist.
 
-- [ ] **Step 4: Implement the scheduler without fixed-key self-rescheduling**
+- [x] **Step 4: Implement the scheduler without fixed-key self-rescheduling**
 
 Use UTC-hour/composite-replay/generation keys; never enqueue the same fixed terminal key as its own continuation. Each scan job processes one bounded local page or one provider page, commits checkpoint/count/outcome, then inserts a generation-specific continuation. Database state—not process memory—is recovery authority.
 
 Provider payout discovery happens in the handler outside transactions. It stages results, then commits the bounded cursor/checkpoint and continuation. No transaction or worker lease spans an unbounded loop.
 
-- [ ] **Step 5: Add real concurrent-worker and crash recovery tests**
+- [x] **Step 5: Add real concurrent-worker and crash recovery tests**
 
 Use two worker loops against the same PostgreSQL database. Prove one initial/hour/composite-replay root, hour rollover, continuation resume after simulated crash, disabled runtime creates only the composite replay-ID local classification root/work and makes no provider call, incomplete payout-run recovery, permanent-job retry exhaustion followed by next-hour rediscovery, and no connection/lease leak.
 
-- [ ] **Step 6: Run GREEN scheduler verification**
+- [x] **Step 6: Run GREEN scheduler verification**
 
 ```powershell
 npx vitest run src/lib/server/jobs/runner.test.ts src/lib/server/commerce/financial/scans/scheduler.test.ts src/lib/server/commerce/financial/scans/service.test.ts src/lib/server/commerce/financial/handlers/scan.test.ts
@@ -1418,7 +1418,7 @@ git diff --check
 
 Expected: all commands exit zero; disabled Stripe creates no provider/source/payout scan work or provider call, while the one local composite replay-ID root safely converges existing ledger evidence.
 
-- [ ] **Step 7: Commit Task 14**
+- [x] **Step 7: Commit Task 14**
 
 ```powershell
 git add src/lib/server/jobs/runner.ts src/lib/server/jobs/runner.test.ts src/lib/server/commerce/financial/scans src/lib/server/commerce/financial/handlers/scan.ts src/lib/server/commerce/financial/handlers/scan.test.ts tests/integration/financial-scheduler.test.ts
@@ -1436,7 +1436,7 @@ git commit -m "feat: schedule financial reconciliation recovery"
 - Modify: `src/lib/server/commerce/financial/issues.ts`
 - Create: `tests/integration/financial-reclassification.test.ts`
 
-- [ ] **Step 1: Write RED classifier replay and rebase tests**
+- [x] **Step 1: Write RED classifier replay and rebase tests**
 
 Require:
 
@@ -1466,7 +1466,7 @@ Cover:
 - subtotal/tax/settlement/refund-fee zero sums and capacities remain exact after rebase;
 - an incompatible capacity/currency/source change opens `correction_rebase_required`, leaves old history intact, yields incomplete metrics, and disables recovery-grant eligibility.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 ```powershell
 npx vitest run src/lib/server/commerce/financial/rebase.test.ts src/lib/server/commerce/financial/handlers/classification.test.ts
@@ -1475,13 +1475,13 @@ npm run test:integration -- tests/integration/financial-reclassification.test.ts
 
 Expected: FAIL because rebase/handler services do not exist.
 
-- [ ] **Step 3: Implement append-only replay in the published lock order**
+- [x] **Step 3: Implement append-only replay in the published lock order**
 
 Perform a nonlocking discovery read, then acquire the **exact published order**: order advisory -> order -> payment -> refunds -> drafts/items -> finalized refund allocations/components -> correction sets/items -> disputes/item rows -> order items -> applicable payouts -> balance transactions -> classification versions -> financial allocation sets/items -> issues. Re-read every discovered correction/base/classification ID and fingerprint under those locks before deriving the old approved absolute distribution. Never lock an allocation set and then reach backward to a correction row, never copy the old delta blindly, and never select an old correction against a new incompatible base. Add a deterministic real-PostgreSQL correction/finalization-versus-rebase barrier that would produce `40P01` under the old allocation-before-correction order and proves convergence under the published order.
 
 Audit safe classifier-decision and allocation-supersession outcomes even when a supported-to-supported change resolves no issue. Use exact actions `financial.classification.appended` and `financial.allocation.superseded`; a compatible correction rebase also emits `financial.correction.rebased`, while a failed rebase that opens `correction_rebase_required` emits `financial.correction.rebase_failed`. Audit, issue, allocation, correction, and history writes commit atomically.
 
-- [ ] **Step 4: Run GREEN replay verification**
+- [x] **Step 4: Run GREEN replay verification**
 
 ```powershell
 npx vitest run src/lib/server/commerce/financial/rebase.test.ts src/lib/server/commerce/financial/handlers/classification.test.ts
@@ -1493,7 +1493,7 @@ git diff --check
 
 Expected: all commands exit zero; no update/delete touches old provider, classification, allocation, or correction rows.
 
-- [ ] **Step 5: Commit Task 15**
+- [x] **Step 5: Commit Task 15**
 
 ```powershell
 git add src/lib/server/commerce/financial/rebase.ts src/lib/server/commerce/financial/rebase.test.ts src/lib/server/commerce/financial/handlers/classification.ts src/lib/server/commerce/financial/handlers/classification.test.ts src/lib/server/commerce/financial/allocations/repository.ts src/lib/server/commerce/financial/issues.ts tests/integration/financial-reclassification.test.ts
@@ -1523,7 +1523,7 @@ git commit -m "feat: replay financial classifications safely"
 - Modify: `tests/integration/commerce-refunds.test.ts`
 - Modify: `tests/integration/commerce-disputes.test.ts`
 
-- [ ] **Step 1: Write RED webhook allowlist and dispatch tests**
+- [x] **Step 1: Write RED webhook allowlist and dispatch tests**
 
 Add exactly these events, never a wildcard:
 
@@ -1540,7 +1540,7 @@ Webhook acceptance still verifies raw signature/API/livemode, minimizes the desc
 
 Handler tests require a payout family with bounded `po_` ID and provider-event ID. It atomically completes the Stripe event and enqueues `FINANCIAL_PAYOUT_JOB`; canonical retrieval occurs later in the payout job.
 
-- [ ] **Step 2: Write RED Plan 6A reducer-handoff tests**
+- [x] **Step 2: Write RED Plan 6A reducer-handoff tests**
 
 Require:
 
@@ -1565,7 +1565,7 @@ Checkout/refund/dispute reducers must commit local canonical fact, their existin
 - a locally committed source fact whose prior event job exhausted retry attempts can be safely rearmed by a later hourly scan's distinct generation key without creating a parallel active source job;
 - financial handler cannot run before the local fact is committed.
 
-- [ ] **Step 3: Run focused tests and verify RED**
+- [x] **Step 3: Run focused tests and verify RED**
 
 ```powershell
 npx vitest run src/lib/server/commerce/financial/event-handoff.test.ts src/lib/server/commerce/webhooks.test.ts src/lib/server/commerce/handler.test.ts src/lib/server/commerce/fulfillment.test.ts src/lib/server/commerce/refunds.test.ts src/lib/server/commerce/disputes.test.ts
@@ -1574,17 +1574,17 @@ npm run test:integration -- tests/integration/commerce-webhooks.test.ts tests/in
 
 Expected: FAIL because payout routing and atomic handoff do not exist.
 
-- [ ] **Step 4: Implement atomic handoff without changing reducer semantics**
+- [x] **Step 4: Implement atomic handoff without changing reducer semantics**
 
 Call the handoff helper inside the same reducer transaction after durable local facts are known but before commit. Preserve exact Plan 6A exception/status behavior. Use distinct financial job namespaces so the existing `commerce.stripe-event` permanent dedupe key cannot suppress a financial job.
 
 Add the smallest repository-level active-entity guard needed for financial source/payout jobs: transactional enqueue/rearm locks the local resource's advisory/entity key, returns an existing queued/running job for the same resource instead of inserting parallel work, and permits a new event/hour/generation dedupe row only after the prior job is terminal. Do not weaken global permanent deduplication for other job families. Unit and real PostgreSQL tests cover event-versus-hour boundary races, exhausted-to-hourly recovery, exact replay, and two workers; handler logic still re-reads canonical complete facts, so a later trigger converges rather than applies a delta twice.
 
-- [ ] **Step 5: Register the complete checkpoint atomically in `src/worker.ts`**
+- [x] **Step 5: Register the complete checkpoint atomically in `src/worker.ts`**
 
 Create the source, payout, scan, and classification handlers with explicit dependencies; register all four names in the handler map; pass the result of `createFinancialScheduleEnsurer(dependencies)` as `beforePoll`. Register only now, after every handler exists. Disabled Stripe runtime creates no provider-backed initial/hourly/source/payout roots or calls; it still ensures the composite classifier+algorithm replay root and may process bounded local reclassification work.
 
-- [ ] **Step 6: Run GREEN handoff/worker verification**
+- [x] **Step 6: Run GREEN handoff/worker verification**
 
 ```powershell
 npx vitest run src/lib/server/commerce/financial/event-handoff.test.ts src/lib/server/commerce/webhooks.test.ts src/lib/server/commerce/handler.test.ts src/lib/server/commerce/fulfillment.test.ts src/lib/server/commerce/refunds.test.ts src/lib/server/commerce/disputes.test.ts src/lib/server/jobs/repository.test.ts src/lib/server/jobs/runner.test.ts
@@ -1596,7 +1596,7 @@ git diff --check
 
 Expected: all commands exit zero; the exact six payout events are accepted, all other event names remain rejected, and no intermediate orphan job type exists.
 
-- [ ] **Step 7: Commit Task 16**
+- [x] **Step 7: Commit Task 16**
 
 ```powershell
 git add src/lib/server/commerce/financial/event-handoff.ts src/lib/server/commerce/financial/event-handoff.test.ts src/lib/server/commerce/webhooks.ts src/lib/server/commerce/webhooks.test.ts src/lib/server/commerce/handler.ts src/lib/server/commerce/handler.test.ts src/lib/server/commerce/fulfillment.ts src/lib/server/commerce/fulfillment.test.ts src/lib/server/commerce/refunds.ts src/lib/server/commerce/refunds.test.ts src/lib/server/commerce/disputes.ts src/lib/server/commerce/disputes.test.ts src/lib/server/jobs/repository.ts src/lib/server/jobs/repository.test.ts src/worker.ts tests/integration/commerce-webhooks.test.ts tests/integration/commerce-fulfillment.test.ts tests/integration/commerce-refunds.test.ts tests/integration/commerce-disputes.test.ts
@@ -1620,7 +1620,7 @@ git commit -m "feat: hand off stripe events to financial reconciliation"
 - Create: `scripts/plan6b-fixture-runtime-probe.test.ts`
 - Modify: `package.json`
 
-- [ ] **Step 1: Add RED end-to-end PostgreSQL convergence tests**
+- [x] **Step 1: Add RED end-to-end PostgreSQL convergence tests**
 
 Use the fixture gateway and real worker/job repository to exercise complete local flows:
 
@@ -1639,7 +1639,7 @@ Use the fixture gateway and real worker/job repository to exercise complete loca
 
 Run the lock probes repeatedly with deterministic barriers. Tests must inspect exact state/row identities rather than merely assert that no exception was thrown.
 
-- [ ] **Step 2: Add RED privacy and forbidden-shape tests**
+- [x] **Step 2: Add RED privacy and forbidden-shape tests**
 
 Inspect schema columns, job payload JSON, audit before/after, issue rows, captured logs, fixture snapshots, and worker errors. Reject:
 
@@ -1651,11 +1651,11 @@ sk_test sk_live rk_test rk_live whsec_ BEGIN PRIVATE KEY
 
 Provider object IDs may exist only in the existing minimized server-only Plan 6A commerce source/event linkage rows (`orders`, `payments`, `refunds`, `disputes`, and `stripe_events`), new minimized provider-ledger rows, internal job routing, and the server-only canonical gateway fixtures/snapshot DTOs that prove those boundaries. Fixture/snapshot tests allow only their explicit minimized ID/linkage keys and still reject raw objects or forbidden fields. Provider IDs must not appear in browser/route output, email, CSV, general application logs, audit detail, or identity joins. Safe issue/audit rows use internal IDs and bounded codes.
 
-- [ ] **Step 3: Extend Compose/static operational tests**
+- [x] **Step 3: Extend Compose/static operational tests**
 
 Assert base production remains `APPLICATION_MODE=maintenance`, `STRIPE_ENABLED=false`, fixture mode false, and neither app nor worker receives Stripe secret environment variables/files. The Stripe overlay may provide secrets only to app/worker, and `stripe:preflight` must occur before container-creating commands. Adding the scheduler must not change migrate/bootstrap/Caddy secret scope.
 
-- [ ] **Step 4: Write a safe isolated production smoke driver**
+- [x] **Step 4: Write a safe isolated production smoke driver**
 
 `scripts/plan6b-production-smoke.ts` must:
 
@@ -1671,7 +1671,7 @@ The companion unit test mocks process execution and proves target/tag/loopback-p
 
 `scripts/plan6b-fixture-runtime-probe.ts` then uses the same freshly built image in a second isolated `pale-orbit-plan6b-fixture-<pid>` project on an internal no-egress Docker network. It starts PostgreSQL, Mailpit, the actual built web process, and the actual built worker with `APP_ENV=test`, `STRIPE_ENABLED=false`, and `STRIPE_TEST_FIXTURE_MODE=true`. This is the project's fixture-backed enabled runtime; the configuration deliberately forbids setting both Stripe flags true. The probe supplies no Stripe key or webhook secret, seeds a minimal published multi-item title/customer through the existing test helpers, exercises the real HTTP quote/checkout path (the fixture gateway can create a hosted-session snapshot without preloaded state), and waits for the worker scheduler plus empty bounded fixture payout scan to complete. Assert app/worker health, runtime mode `fixture`, one accepted local order/session, one completed financial scan checkpoint, no attempted/possible external Stripe request, and no Stripe secret env/file. Provider-object fulfillment remains covered by the focused fixture/integration suites where the harness and handler share a process. The probe's mocked unit test proves bounded waits, safe output, internal-network/no-egress configuration, exact project/path validation, and cleanup on web, worker, HTTP, or database assertion failure. Add npm script `smoke:plan6b-fixture` for this probe.
 
-- [ ] **Step 5: Run RED cross-cutting tests**
+- [x] **Step 5: Run RED cross-cutting tests**
 
 ```powershell
 npx vitest run scripts/commerce-privacy.test.ts scripts/commerce-operations.test.ts scripts/plan6b-production-smoke.test.ts scripts/plan6b-fixture-runtime-probe.test.ts
@@ -1680,7 +1680,7 @@ npm run test:integration -- tests/integration/financial-reconciliation.test.ts t
 
 Expected: new assertions fail before final privacy/operations/smoke implementation is complete.
 
-- [ ] **Step 6: Close only the proven gaps and rerun focused suites**
+- [x] **Step 6: Close only the proven gaps and rerun focused suites**
 
 ```powershell
 npx vitest run scripts/commerce-privacy.test.ts scripts/commerce-operations.test.ts scripts/plan6b-production-smoke.test.ts scripts/plan6b-fixture-runtime-probe.test.ts
@@ -1693,7 +1693,7 @@ git diff --check
 
 Expected: all commands exit zero.
 
-- [ ] **Step 7: Run the isolated production-image smoke**
+- [x] **Step 7: Run the isolated production-image smoke**
 
 ```powershell
 npm run smoke:plan6b-i
@@ -1702,7 +1702,7 @@ npm run smoke:plan6b-fixture
 
 Expected: image build, base production smoke, and fixture-runtime web/worker probe pass; both migrations are idempotent; maintenance and Stripe-disabled production boundaries hold; the fixture phase processes financial work without credentials or external Stripe traffic; cleanup leaves no `pale-orbit-plan6b-smoke-*` or `pale-orbit-plan6b-fixture-*` container, volume, network, image tag, temp file, or process.
 
-- [ ] **Step 8: Commit Task 17**
+- [x] **Step 8: Commit Task 17**
 
 ```powershell
 git add tests/integration/financial-reconciliation.test.ts tests/integration/financial-privacy.test.ts tests/integration/financial-migration.test.ts tests/integration/financial-lock-order.test.ts tests/integration/financial-sources.test.ts tests/integration/financial-payouts.test.ts scripts/commerce-privacy.test.ts scripts/commerce-operations.test.ts scripts/plan6b-production-smoke.ts scripts/plan6b-production-smoke.test.ts scripts/plan6b-fixture-runtime-probe.ts scripts/plan6b-fixture-runtime-probe.test.ts package.json
@@ -1721,7 +1721,7 @@ git commit -m "test: prove financial reconciliation recovery"
 - Modify: `docs/superpowers/specs/2026-08-08-bookstore-full-stack-design.md`
 - Modify: `docs/superpowers/specs/2026-08-11-stripe-financial-reconciliation-reporting-design.md`
 
-- [ ] **Step 1: Write the checkpoint-I operations guide**
+- [x] **Step 1: Write the checkpoint-I operations guide**
 
 Document:
 
@@ -1736,7 +1736,7 @@ Document:
 
 Keep the roadmap/design status at **6B-I candidate — independent review pending; 6B-II pending** through the first gate and candidate commit. Sales navigation remains disabled and full Plan 6B remains incomplete. The status advances to **6B-I complete; 6B-II pending** only in the final reviewed candidate described below.
 
-- [ ] **Step 2: Run a clean dependency and generated-schema gate**
+- [x] **Step 2: Run a clean dependency and generated-schema gate**
 
 ```powershell
 npm ci
@@ -1751,7 +1751,7 @@ npm audit --audit-level=high
 
 Expected: install/schema commands succeed; generated auth schema has no diff; dependency tree is valid; any nonzero outdated/audit output is recorded and dispositioned from primary advisories/changelogs rather than hidden.
 
-- [ ] **Step 3: Run the complete application gate without parallel wrappers**
+- [x] **Step 3: Run the complete application gate without parallel wrappers**
 
 Run each wrapper serially so they cannot race over Docker or `.svelte-kit`:
 
@@ -1772,7 +1772,7 @@ git status --short
 
 Expected: every applicable command exits zero; record actual file/test counts, audit dispositions, image digest/size, migration results, and smoke cleanup. Do not copy counts from Plan 6A.
 
-- [ ] **Step 4: Record truthful candidate evidence and commit the reviewable checkpoint**
+- [x] **Step 4: Record truthful candidate evidence and commit the reviewable checkpoint**
 
 Update the operations/dependency docs with the actual Step 2–3 results, including test/file counts, advisory dispositions, image digest/size, migration evidence, fixture-runtime evidence, and cleanup. Do not mark the checkpoint complete yet. Inspect and commit the bounded candidate so reviewers can examine the exact runtime, migration, scripts, docs, and evidence rather than an uncommitted worktree:
 
@@ -1787,7 +1787,7 @@ git status --short
 
 Expected: the implementation, smoke scripts, candidate documentation, and exact evidence are all committed; the worktree is clean; status still says independent review pending.
 
-- [ ] **Step 5: Request five independent read-only reviews of the committed candidate**
+- [x] **Step 5: Request five independent read-only reviews of the committed candidate**
 
 Ask reviewers to inspect the entire Plan 6B-I base-to-head diff, not only the last task:
 
@@ -1799,7 +1799,7 @@ Ask reviewers to inspect the entire Plan 6B-I base-to-head diff, not only the la
 
 Each reviewer must report ordered Critical/Important/Minor findings with exact file/line evidence or explicitly clear the diff. Give every reviewer the same implementation base commit and current candidate HEAD, and require inspection of that committed `BASE..HEAD` range. No reviewer edits files during this pass.
 
-- [ ] **Step 6: Apply review feedback, rerun the full gate, and commit final evidence**
+- [x] **Step 6: Apply review feedback, rerun the full gate, and commit final evidence**
 
 Use the receiving-code-review workflow. Reproduce every accepted behavior issue with a RED test before changing production behavior. Preserve unrelated work and reject suggestions that contradict the approved design with concrete evidence. For each bounded review-fix batch, inspect `git status --short`, stage only the literal file paths recorded in the review ledger (never `git add .`), run `git diff --cached --check`, inspect `git diff --cached`, and commit with `fix: harden financial reconciliation review findings` (or a more specific bounded message).
 
