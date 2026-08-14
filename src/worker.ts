@@ -174,7 +174,12 @@ const handlers = new Map<string, JobHandler>([
     )
   ]
 ]);
-const repository = createPostgresJobRepository(databaseClient.db, config.jobs);
+const repository = createPostgresJobRepository(
+  databaseClient.db,
+  config.jobs,
+  undefined,
+  stripeRuntime.mode === 'disabled' ? 'local-only' : 'all'
+);
 const ensureFinancialSchedule = createFinancialScheduleEnsurer({
   database: databaseClient.db,
   runtimeMode: stripeRuntime.mode,

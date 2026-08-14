@@ -63,6 +63,56 @@ describe('PostgreSQL jobs', () => {
     expect(unkeyed?.deduplicationKey).toBeNull();
   });
 
+  it('leaves provider-backed work pending in local-only mode while claiming local work', async () => {
+    const due = new Date('2026-08-12T12:00:00.000Z');
+    const providerJobs = [
+      { type: 'commerce.stripe-event', payload: { stripeEventId: crypto.randomUUID() } },
+      { type: 'commerce.financial-source', payload: { sourceKind: 'payment' } },
+      { type: 'commerce.financial-payout', payload: { providerPayoutId: 'po_disabled_claim' } },
+      { type: 'commerce.financial-scan', payload: { kind: 'hourly' } },
+      { type: 'commerce.financial-scan', payload: { kind: 'payout_impact' } },
+      { type: 'commerce.financial-scan', payload: {
+        kind: 'continuation', phase: 'payout_discovery_page'
+      } }
+    ] as const;
+    const localJobs = [
+      { type: 'test.local-only', payload: {} },
+      { type: 'commerce.financial-classification', payload: {} },
+      { type: 'commerce.financial-scan', payload: { kind: 'composite_replay' } },
+      { type: 'commerce.financial-scan', payload: {
+        kind: 'continuation', phase: 'classification_replay_page'
+      } }
+    ] as const;
+    for (const [index, job] of [...providerJobs, ...localJobs].entries()) {
+      await enqueueJob(databaseClient.db, {
+        ...job, runAt: due, deduplicationKey: `test:local-claim:${index}`
+      });
+    }
+
+    const repository = createPostgresJobRepository(
+      databaseClient.db,
+      applicationConfig.jobs,
+      () => new Date('2026-08-12T13:00:00.000Z'),
+      'local-only'
+    );
+    const claimedTypes: string[] = [];
+    for (;;) {
+      const claimed = await repository.claimNext('local-only-worker');
+      if (claimed === null) break;
+      claimedTypes.push(`${claimed.type}:${String(claimed.payload.kind ?? '')}:${String(claimed.payload.phase ?? '')}`);
+      await repository.complete(claimed.id, 'local-only-worker');
+    }
+
+    expect(claimedTypes).toEqual([
+      'test.local-only::',
+      'commerce.financial-classification::',
+      'commerce.financial-scan:composite_replay:',
+      'commerce.financial-scan:continuation:classification_replay_page'
+    ]);
+    expect(await databaseClient.db.select().from(jobs).where(eq(jobs.status, 'pending')))
+      .toHaveLength(providerJobs.length);
+  });
+
   it('reschedules a retry and eventually marks an exhausted job failed', async () => {
     let currentTime = new Date('2026-08-08T12:00:00.000Z');
     const repository = createPostgresJobRepository(

@@ -5,11 +5,14 @@ import { jobs, type JsonObject, type JsonValue, type JobRow } from '$lib/server/
 import type { DatabaseExecutor, DatabaseTransaction } from '$lib/server/db/transaction';
 import { withTransaction } from '$lib/server/db/transaction';
 import {
+  FINANCIAL_CLASSIFICATION_JOB,
   FINANCIAL_PAYOUT_JOB,
+  FINANCIAL_SCAN_JOB,
   FINANCIAL_SOURCE_JOB,
   parseFinancialJobIdentity,
   type FinancialJobIdentity
 } from '$lib/server/commerce/financial/jobs';
+import { STRIPE_EVENT_JOB } from '$lib/server/commerce/job';
 import { computeRetryDelayMs } from './backoff';
 import type { JobRecord, JobRepository } from './types';
 
@@ -296,6 +299,8 @@ export interface RearmExhaustedJobInput {
   maxAttempts: number;
 }
 
+export type JobClaimPolicy = 'all' | 'local-only';
+
 export async function rearmExhaustedJob(
   database: DatabaseExecutor,
   input: RearmExhaustedJobInput
@@ -337,8 +342,31 @@ interface ClaimedJobRow extends Record<string, unknown> {
 export function createPostgresJobRepository(
   database: Database,
   config: JobConfig,
-  now: () => Date = () => new Date()
+  now: () => Date = () => new Date(),
+  claimPolicy: JobClaimPolicy = 'all'
 ): JobRepository {
+  if (claimPolicy !== 'all' && claimPolicy !== 'local-only') {
+    throw new Error('Invalid job claim policy');
+  }
+  const claimProviderBackedJobs = claimPolicy === 'all';
+  const claimableJob = sql`
+    ${claimProviderBackedJobs}
+    or type not in (
+      ${STRIPE_EVENT_JOB}, ${FINANCIAL_SOURCE_JOB},
+      ${FINANCIAL_PAYOUT_JOB}, ${FINANCIAL_SCAN_JOB}
+    )
+    or type = ${FINANCIAL_CLASSIFICATION_JOB}
+    or (
+      type = ${FINANCIAL_SCAN_JOB}
+      and (
+        payload ->> 'kind' = 'composite_replay'
+        or (
+          payload ->> 'kind' = 'continuation'
+          and payload ->> 'phase' = 'classification_replay_page'
+        )
+      )
+    )
+  `;
   return {
     async claimNext(workerId): Promise<JobRecord | null> {
       const claimedAt = now();
@@ -355,11 +383,13 @@ export function createPostgresJobRepository(
           where status = 'running'
             and locked_at <= ${expiredBefore}
             and attempts >= max_attempts
+            and (${claimableJob})
           returning id
         ), candidate as (
           select id
           from jobs
           where (
+            (
               status = 'pending'
               and run_at <= ${claimedAt}
               and attempts < max_attempts
@@ -368,6 +398,7 @@ export function createPostgresJobRepository(
               and locked_at <= ${expiredBefore}
               and attempts < max_attempts
             )
+          ) and (${claimableJob})
           order by run_at asc, created_at asc
           for update skip locked
           limit 1
