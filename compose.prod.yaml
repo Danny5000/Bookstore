@@ -313,7 +313,7 @@ services:
     restart: "no"
 
   postgres:
-    image: postgres:18.4-alpine3.24
+    image: ${POSTGRES_IMAGE:-postgres:18.4-alpine3.24}
     environment:
       POSTGRES_DB: ${DATABASE_NAME:?DATABASE_NAME must be set}
       POSTGRES_USER: ${DATABASE_USER:?DATABASE_USER must be set}
@@ -375,6 +375,10 @@ secrets:
     environment: SMTP_PASSWORD
   bootstrap_admin_password:
     environment: BOOTSTRAP_ADMIN_PASSWORD
+
+networks:
+  default:
+    internal: ${COMPOSE_DEFAULT_NETWORK_INTERNAL:-false}
 
 volumes:
   postgres_data:
