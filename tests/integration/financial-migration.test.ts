@@ -811,7 +811,7 @@ async function assertValidBackfill(pool: Pool, fixture: LegacyFixture): Promise<
     fixture.sequentialRefundAllocationIds.map((id) => componentsByAllocationId[id]),
     [
       {
-        refund_allocation_id: fixture.sequentialRefundAllocationIds[0],
+        refund_allocation_id: fixture.sequentialRefundAllocationIds[0]!,
         order_item_id: fixture.sequentialRefundOrderItemId,
         subtotal_minor: 1,
         tax_minor: 0,
@@ -819,7 +819,7 @@ async function assertValidBackfill(pool: Pool, fixture: LegacyFixture): Promise<
         currency: 'USD'
       },
       {
-        refund_allocation_id: fixture.sequentialRefundAllocationIds[1],
+        refund_allocation_id: fixture.sequentialRefundAllocationIds[1]!,
         order_item_id: fixture.sequentialRefundOrderItemId,
         subtotal_minor: 1,
         tax_minor: 0,
@@ -827,7 +827,7 @@ async function assertValidBackfill(pool: Pool, fixture: LegacyFixture): Promise<
         currency: 'USD'
       },
       {
-        refund_allocation_id: fixture.sequentialRefundAllocationIds[2],
+        refund_allocation_id: fixture.sequentialRefundAllocationIds[2]!,
         order_item_id: fixture.sequentialRefundOrderItemId,
         subtotal_minor: 0,
         tax_minor: 1,
