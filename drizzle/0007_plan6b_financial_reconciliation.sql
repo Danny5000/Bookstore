@@ -642,97 +642,114 @@ CREATE INDEX "stripe_payouts_balance_transaction_idx" ON "stripe_payouts" USING 
 CREATE INDEX "stripe_payouts_failure_balance_transaction_idx" ON "stripe_payouts" USING btree ("failure_balance_transaction_id");--> statement-breakpoint
 ALTER TABLE "entitlement_grants" ADD CONSTRAINT "entitlement_grants_recovery_refund_allocation_id_refund_allocations_id_fk" FOREIGN KEY ("recovery_refund_allocation_id") REFERENCES "public"."refund_allocations"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 CREATE UNIQUE INDEX "entitlement_grants_administrative_recovery_unique" ON "entitlement_grants" USING btree ("recovery_refund_allocation_id") WHERE "entitlement_grants"."source" = 'administrative';--> statement-breakpoint
-WITH ordered_allocations AS (
-  SELECT
-    allocation.id AS refund_allocation_id,
-    allocation.refund_id,
-    allocation.order_item_id,
-    allocation.amount_minor,
-    allocation.created_at,
-    refund.currency,
-    item.unit_subtotal_minor,
-    item.tax_minor AS item_tax_minor,
-    item.total_minor,
-    item.id::text || ':subtotal' AS subtotal_tie_key,
-    item.id::text || ':tax' AS tax_tie_key,
-    sum(allocation.amount_minor) OVER (
-      PARTITION BY allocation.order_item_id
-      ORDER BY refund.provider_created_at, refund.id, allocation.id
-      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-    ) AS cumulative_allocated_minor,
-    coalesce(sum(allocation.amount_minor) OVER (
-      PARTITION BY allocation.order_item_id
-      ORDER BY refund.provider_created_at, refund.id, allocation.id
-      ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-    ), 0::bigint) AS previously_allocated_minor
-  FROM "refund_allocations" allocation
-  JOIN "refunds" refund ON refund.id = allocation.refund_id
-  JOIN "order_items" item ON item.id = allocation.order_item_id
-  WHERE refund.status = 'succeeded'
-    AND refund.allocation_status = 'finalized'
-), apportioned_totals AS (
-  SELECT
-    ordered.*,
-    CASE WHEN ordered.total_minor = 0 THEN 0::bigint ELSE
-      ordered.cumulative_allocated_minor * ordered.unit_subtotal_minor::bigint / ordered.total_minor::bigint +
-      CASE WHEN
-        ordered.cumulative_allocated_minor -
-          (ordered.cumulative_allocated_minor * ordered.unit_subtotal_minor::bigint / ordered.total_minor::bigint) -
-          (ordered.cumulative_allocated_minor * ordered.item_tax_minor::bigint / ordered.total_minor::bigint) > 0
-        AND (
-          mod(ordered.cumulative_allocated_minor * ordered.unit_subtotal_minor::bigint, ordered.total_minor::bigint) >
-            mod(ordered.cumulative_allocated_minor * ordered.item_tax_minor::bigint, ordered.total_minor::bigint)
+DO $$
+DECLARE
+  allocation_row record;
+  current_order_item_id uuid := NULL;
+  remaining_subtotal_minor bigint := 0;
+  remaining_tax_minor bigint := 0;
+  remaining_total_minor bigint;
+  base_subtotal_minor bigint;
+  base_tax_minor bigint;
+  subtotal_remainder bigint;
+  tax_remainder bigint;
+  leftover_minor bigint;
+  allocated_subtotal_minor bigint;
+  allocated_tax_minor bigint;
+BEGIN
+  FOR allocation_row IN
+    SELECT
+      allocation.id AS refund_allocation_id,
+      allocation.refund_id,
+      allocation.order_item_id,
+      allocation.amount_minor,
+      allocation.created_at,
+      refund.currency,
+      item.unit_subtotal_minor,
+      item.tax_minor AS item_tax_minor,
+      item.id::text || ':subtotal' AS subtotal_tie_key,
+      item.id::text || ':tax' AS tax_tie_key
+    FROM "refund_allocations" allocation
+    JOIN "refunds" refund ON refund.id = allocation.refund_id
+    JOIN "order_items" item ON item.id = allocation.order_item_id
+    WHERE refund.status = 'succeeded'
+      AND refund.allocation_status = 'finalized'
+    ORDER BY allocation.order_item_id, refund.provider_created_at, refund.id, allocation.id
+  LOOP
+    IF current_order_item_id IS DISTINCT FROM allocation_row.order_item_id THEN
+      current_order_item_id := allocation_row.order_item_id;
+      remaining_subtotal_minor := allocation_row.unit_subtotal_minor::bigint;
+      remaining_tax_minor := allocation_row.item_tax_minor::bigint;
+    END IF;
+
+    remaining_total_minor := remaining_subtotal_minor + remaining_tax_minor;
+    IF allocation_row.amount_minor < 0
+      OR allocation_row.amount_minor::bigint > remaining_total_minor
+      OR (allocation_row.amount_minor > 0 AND remaining_total_minor = 0)
+    THEN
+      RAISE EXCEPTION USING ERRCODE = '23514', MESSAGE = 'Plan 6B over-allocation/capacity prevented deterministic subtotal/tax component backfill';
+    END IF;
+
+    IF allocation_row.amount_minor = 0 THEN
+      allocated_subtotal_minor := 0;
+      allocated_tax_minor := 0;
+    ELSE
+      base_subtotal_minor := allocation_row.amount_minor::bigint * remaining_subtotal_minor / remaining_total_minor;
+      base_tax_minor := allocation_row.amount_minor::bigint * remaining_tax_minor / remaining_total_minor;
+      subtotal_remainder := mod(
+        allocation_row.amount_minor::bigint * remaining_subtotal_minor,
+        remaining_total_minor
+      );
+      tax_remainder := mod(
+        allocation_row.amount_minor::bigint * remaining_tax_minor,
+        remaining_total_minor
+      );
+      leftover_minor := allocation_row.amount_minor::bigint - base_subtotal_minor - base_tax_minor;
+      IF leftover_minor < 0 OR leftover_minor > 1 THEN
+        RAISE EXCEPTION USING ERRCODE = '23514', MESSAGE = 'Plan 6B over-allocation/capacity prevented deterministic subtotal/tax component backfill';
+      END IF;
+
+      allocated_subtotal_minor := base_subtotal_minor;
+      allocated_tax_minor := base_tax_minor;
+      IF leftover_minor = 1 THEN
+        IF subtotal_remainder > tax_remainder
           OR (
-            mod(ordered.cumulative_allocated_minor * ordered.unit_subtotal_minor::bigint, ordered.total_minor::bigint) =
-              mod(ordered.cumulative_allocated_minor * ordered.item_tax_minor::bigint, ordered.total_minor::bigint)
-            AND ordered.subtotal_tie_key < ordered.tax_tie_key
+            subtotal_remainder = tax_remainder
+            AND allocation_row.subtotal_tie_key COLLATE "C" < allocation_row.tax_tie_key COLLATE "C"
           )
-        ) THEN 1::bigint ELSE 0::bigint END
-    END AS cumulative_subtotal_minor,
-    CASE WHEN ordered.total_minor = 0 THEN 0::bigint ELSE
-      ordered.previously_allocated_minor * ordered.unit_subtotal_minor::bigint / ordered.total_minor::bigint +
-      CASE WHEN
-        ordered.previously_allocated_minor -
-          (ordered.previously_allocated_minor * ordered.unit_subtotal_minor::bigint / ordered.total_minor::bigint) -
-          (ordered.previously_allocated_minor * ordered.item_tax_minor::bigint / ordered.total_minor::bigint) > 0
-        AND (
-          mod(ordered.previously_allocated_minor * ordered.unit_subtotal_minor::bigint, ordered.total_minor::bigint) >
-            mod(ordered.previously_allocated_minor * ordered.item_tax_minor::bigint, ordered.total_minor::bigint)
-          OR (
-            mod(ordered.previously_allocated_minor * ordered.unit_subtotal_minor::bigint, ordered.total_minor::bigint) =
-              mod(ordered.previously_allocated_minor * ordered.item_tax_minor::bigint, ordered.total_minor::bigint)
-            AND ordered.subtotal_tie_key < ordered.tax_tie_key
-          )
-        ) THEN 1::bigint ELSE 0::bigint END
-    END AS previous_subtotal_minor
-  FROM ordered_allocations ordered
-), split_components AS (
-  SELECT
-    apportioned.*,
-    (apportioned.cumulative_subtotal_minor - apportioned.previous_subtotal_minor)::integer AS subtotal_minor,
-    (
-      apportioned.amount_minor::bigint -
-      (apportioned.cumulative_subtotal_minor - apportioned.previous_subtotal_minor)
-    )::integer AS tax_minor
-  FROM apportioned_totals apportioned
-)
-INSERT INTO "refund_allocation_components" (
-  "refund_allocation_id", "refund_id", "order_item_id", "subtotal_minor", "tax_minor", "total_minor", "currency", "created_at"
-)
-SELECT
-  component.refund_allocation_id,
-  component.refund_id,
-  component.order_item_id,
-  component.subtotal_minor,
-  component.tax_minor,
-  component.amount_minor,
-  component.currency,
-  component.created_at
-FROM split_components component
-WHERE component.subtotal_minor::bigint + component.tax_minor::bigint = component.amount_minor::bigint
-  AND component.subtotal_minor >= 0
-  AND component.tax_minor >= 0
-ORDER BY component.refund_id, component.order_item_id;--> statement-breakpoint
+        THEN
+          allocated_subtotal_minor := allocated_subtotal_minor + 1;
+        ELSE
+          allocated_tax_minor := allocated_tax_minor + 1;
+        END IF;
+      END IF;
+    END IF;
+
+    IF allocated_subtotal_minor > remaining_subtotal_minor
+      OR allocated_tax_minor > remaining_tax_minor
+      OR allocated_subtotal_minor + allocated_tax_minor <> allocation_row.amount_minor::bigint
+    THEN
+      RAISE EXCEPTION USING ERRCODE = '23514', MESSAGE = 'Plan 6B over-allocation/capacity prevented deterministic subtotal/tax component backfill';
+    END IF;
+
+    INSERT INTO "refund_allocation_components" (
+      "refund_allocation_id", "refund_id", "order_item_id", "subtotal_minor", "tax_minor", "total_minor", "currency", "created_at"
+    ) VALUES (
+      allocation_row.refund_allocation_id,
+      allocation_row.refund_id,
+      allocation_row.order_item_id,
+      allocated_subtotal_minor::integer,
+      allocated_tax_minor::integer,
+      allocation_row.amount_minor,
+      allocation_row.currency,
+      allocation_row.created_at
+    );
+
+    remaining_subtotal_minor := remaining_subtotal_minor - allocated_subtotal_minor;
+    remaining_tax_minor := remaining_tax_minor - allocated_tax_minor;
+  END LOOP;
+END;
+$$;--> statement-breakpoint
 DO $$
 BEGIN
   IF EXISTS (

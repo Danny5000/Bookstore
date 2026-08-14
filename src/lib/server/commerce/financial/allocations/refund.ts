@@ -200,10 +200,15 @@ export function buildRefundAllocationPlan(input: RefundAllocationInput): Financi
     subtotalMinor: component.subtotalMinor,
     currency: input.settlementCurrency
   }));
+  const feeWeights = currentSubtotalWeights.some((weight) => weight.subtotalMinor > 0)
+    ? currentSubtotalWeights
+    : currentSubtotalWeights.length === 1
+      ? [{ ...currentSubtotalWeights[0]!, subtotalMinor: 1 }]
+      : currentSubtotalWeights;
   const feeItems = allocateFeeDetails(
     input.feeMinor,
     input.settlementCurrency,
-    currentSubtotalWeights.some((weight) => weight.subtotalMinor > 0) ? currentSubtotalWeights : input.paymentItems,
+    feeWeights,
     input.feeDetails
   );
   return { plans: [

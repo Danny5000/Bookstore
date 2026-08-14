@@ -33,6 +33,8 @@ interface LegacyFixture {
   refundIds: Record<string, string>;
   disputeIds: Record<string, string>;
   refundAllocationIds: string[];
+  sequentialRefundAllocationIds: string[];
+  sequentialRefundOrderItemId: string;
   historyIds: Record<'stripeEvent' | 'job' | 'outbox' | 'audit', string>;
   countsBefore: Record<string, number>;
 }
@@ -224,6 +226,8 @@ async function insertOrderGraph(
     paymentAmount?: number;
     paymentCurrency?: string;
     paymentReconciliation?: 'pending' | 'reconciled' | 'exception';
+    itemSubtotals?: number[];
+    itemTaxes?: number[];
   }
 ): Promise<{ orderId: string; orderItemIds: string[]; paymentId: string }> {
   const orderId = randomUUID();
@@ -250,13 +254,24 @@ async function insertOrderGraph(
   const orderItemIds: string[] = [];
   for (const [index, titleId] of titleIds.entries()) {
     const itemId = randomUUID();
+    const itemSubtotal = options.itemSubtotals?.[index] ?? 1000;
+    const itemTax = options.itemTaxes?.[index] ?? 100;
     orderItemIds.push(itemId);
     await client.query(
       `insert into order_items
          (id, order_id, title_id, title_snapshot, creator_name_snapshot, format,
           currency, unit_subtotal_minor, tax_minor, total_minor)
-       values ($1, $2, $3, $4, 'Creator', 'prose', $5, 1000, 100, 1100)`,
-      [itemId, orderId, titleId, `Legacy ${options.key} ${index}`, options.itemCurrencies?.[index] ?? 'USD']
+       values ($1, $2, $3, $4, 'Creator', 'prose', $5, $6, $7, $8)`,
+      [
+        itemId,
+        orderId,
+        titleId,
+        `Legacy ${options.key} ${index}`,
+        options.itemCurrencies?.[index] ?? 'USD',
+        itemSubtotal,
+        itemTax,
+        itemSubtotal + itemTax
+      ]
     );
     await client.query(
       `insert into entitlement_grants
@@ -293,6 +308,7 @@ async function insertRefund(
     amountMinor: number;
     currency?: string;
     reconciliation: 'pending' | 'reconciled' | 'exception';
+    providerCreatedAt?: string;
   }
 ): Promise<string> {
   const refundId = randomUUID();
@@ -300,7 +316,7 @@ async function insertRefund(
     `insert into refunds
        (id, payment_id, stripe_refund_id, status, amount_minor, currency,
         provider_created_at, reconciliation_status)
-     values ($1, $2, $3, $4, $5, $6, clock_timestamp(), $7)`,
+     values ($1, $2, $3, $4, $5, $6, coalesce($7::timestamptz, clock_timestamp()), $8)`,
     [
       refundId,
       paymentId,
@@ -308,6 +324,7 @@ async function insertRefund(
       options.status,
       options.amountMinor,
       options.currency ?? 'USD',
+      options.providerCreatedAt ?? null,
       options.reconciliation
     ]
   );
@@ -353,13 +370,14 @@ async function tableCounts(client: Pool | PoolClient, tableNames: string[]): Pro
 }
 
 async function seedValidLegacyFixture(client: PoolClient): Promise<LegacyFixture> {
-  const { userId, titleIds } = await insertUserAndTitles(client, 10);
+  const { userId, titleIds } = await insertUserAndTitles(client, 11);
   const paymentIds: Record<string, string> = {};
   const refundIds: Record<string, string> = {};
   const disputeIds: Record<string, string> = {};
   const orderIds: string[] = [];
   const orderItemIds: string[] = [];
   const refundAllocationIds: string[] = [];
+  const sequentialRefundAllocationIds: string[] = [];
 
   const full = await insertOrderGraph(client, userId, [titleIds[0]!], {
     key: 'full',
@@ -476,6 +494,37 @@ async function seedValidLegacyFixture(client: PoolClient): Promise<LegacyFixture
     reconciliation: 'exception'
   });
 
+  const sequential = await insertOrderGraph(client, userId, [titleIds[10]!], {
+    key: 'sequential-partial',
+    orderSubtotal: 2,
+    orderTax: 1,
+    paymentAmount: 3,
+    paymentReconciliation: 'pending',
+    itemSubtotals: [2],
+    itemTaxes: [1]
+  });
+  orderIds.push(sequential.orderId);
+  orderItemIds.push(...sequential.orderItemIds);
+  paymentIds.sequential = sequential.paymentId;
+  for (const [index, key] of ['sequentialFirst', 'sequentialSecond', 'sequentialThird'].entries()) {
+    const refundId = await insertRefund(client, sequential.paymentId, {
+      key,
+      status: 'succeeded',
+      amountMinor: 1,
+      reconciliation: 'pending',
+      providerCreatedAt: `2026-08-01T00:00:0${index}.000Z`
+    });
+    refundIds[key] = refundId;
+    const sequentialAllocationId = randomUUID();
+    refundAllocationIds.push(sequentialAllocationId);
+    sequentialRefundAllocationIds.push(sequentialAllocationId);
+    await client.query(
+      `insert into refund_allocations (id, refund_id, order_item_id, amount_minor, source)
+       values ($1, $2, $3, 1, 'automatic')`,
+      [sequentialAllocationId, refundId, sequential.orderItemIds[0]]
+    );
+  }
+
   const historyIds = {
     stripeEvent: randomUUID(),
     job: randomUUID(),
@@ -529,6 +578,8 @@ async function seedValidLegacyFixture(client: PoolClient): Promise<LegacyFixture
     refundIds,
     disputeIds,
     refundAllocationIds,
+    sequentialRefundAllocationIds,
+    sequentialRefundOrderItemId: sequential.orderItemIds[0]!,
     historyIds,
     countsBefore: await tableCounts(client, preservedTables)
   };
@@ -741,19 +792,50 @@ async function assertValidBackfill(pool: Pool, fixture: LegacyFixture): Promise<
      from refund_allocation_components
      order by refund_allocation_id`
   );
+  const componentsByAllocationId = Object.fromEntries(
+    components.rows.map((component) => [component.refund_allocation_id, component])
+  );
   equal(
-    components.rows,
+    componentsByAllocationId[fixture.refundAllocationIds[0]!],
+    {
+      refund_allocation_id: fixture.refundAllocationIds[0],
+      order_item_id: fixture.orderItemIds[0],
+      subtotal_minor: 1000,
+      tax_minor: 100,
+      total_minor: 1100,
+      currency: 'USD'
+    },
+    'automatic full allocation receives exact deterministic subtotal/tax components'
+  );
+  equal(
+    fixture.sequentialRefundAllocationIds.map((id) => componentsByAllocationId[id]),
     [
       {
-        refund_allocation_id: fixture.refundAllocationIds[0],
-        order_item_id: fixture.orderItemIds[0],
-        subtotal_minor: 1000,
-        tax_minor: 100,
-        total_minor: 1100,
+        refund_allocation_id: fixture.sequentialRefundAllocationIds[0],
+        order_item_id: fixture.sequentialRefundOrderItemId,
+        subtotal_minor: 1,
+        tax_minor: 0,
+        total_minor: 1,
+        currency: 'USD'
+      },
+      {
+        refund_allocation_id: fixture.sequentialRefundAllocationIds[1],
+        order_item_id: fixture.sequentialRefundOrderItemId,
+        subtotal_minor: 1,
+        tax_minor: 0,
+        total_minor: 1,
+        currency: 'USD'
+      },
+      {
+        refund_allocation_id: fixture.sequentialRefundAllocationIds[2],
+        order_item_id: fixture.sequentialRefundOrderItemId,
+        subtotal_minor: 0,
+        tax_minor: 1,
+        total_minor: 1,
         currency: 'USD'
       }
     ],
-    'automatic full allocation receives exact deterministic subtotal/tax components'
+    'chronological partial allocations use LRM over remaining capacity through unequal, equal, and exhausted weights'
   );
 
   const issues = await pool.query<{

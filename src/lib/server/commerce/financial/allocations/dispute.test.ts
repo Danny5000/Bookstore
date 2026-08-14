@@ -424,8 +424,8 @@ describe('buildDisputeAllocationPlan', () => {
     }
   });
 
-  it('falls back to immutable payment subtotals for a tax-only multi-title dispute fee', () => {
-    const { plans: [gross, fee] } = build(baseInput({
+  it('fails closed instead of spreading a tax-only dispute fee across unrelated payment titles', () => {
+    expectSafeFailure(() => build(baseInput({
       amountMinor: -100, feeMinor: 7, netMinor: -107,
       disputeAmountMinor: 100, presentmentAmountMinor: 100,
       finalizedRefunds: [
@@ -433,15 +433,22 @@ describe('buildDisputeAllocationPlan', () => {
         { refundId: 'refund-subtotal', providerCreatedAt: '2026-07-01T00:00:00.000Z', orderItemId: 'item-b', subtotalMinor: 300, taxMinor: 0, presentmentCurrency: 'USD' }
       ],
       feeDetails: [{ component: 'dispute_fee', amountMinor: -7 }]
+    })), 'allocation_mismatch');
+  });
+
+  it('assigns a tax-only dispute fee only to the sole affected item', () => {
+    const { plans: [, fee] } = build(baseInput({
+      amountMinor: -70, feeMinor: 7, netMinor: -77,
+      disputeAmountMinor: 70, presentmentAmountMinor: 70,
+      finalizedRefunds: [
+        { refundId: 'refund-subtotal', providerCreatedAt: '2026-07-01T00:00:00.000Z', orderItemId: 'item-a', subtotalMinor: 700, taxMinor: 0, presentmentCurrency: 'USD' },
+        { refundId: 'refund-other-item', providerCreatedAt: '2026-07-02T00:00:00.000Z', orderItemId: 'item-b', subtotalMinor: 300, taxMinor: 30, presentmentCurrency: 'USD' }
+      ],
+      feeDetails: [{ component: 'dispute_fee', amountMinor: -7 }]
     }));
 
-    expect(gross.items.map(({ orderItemId, component, effectMinor }) => ({ orderItemId, component, effectMinor }))).toEqual([
-      { orderItemId: 'item-a', component: 'dispute_tax', effectMinor: -70 },
-      { orderItemId: 'item-b', component: 'dispute_tax', effectMinor: -30 }
-    ]);
     expect(fee.items.map(({ orderItemId, component, effectMinor }) => ({ orderItemId, component, effectMinor }))).toEqual([
-      { orderItemId: 'item-a', component: 'dispute_fee', effectMinor: -5 },
-      { orderItemId: 'item-b', component: 'dispute_fee', effectMinor: -2 }
+      { orderItemId: 'item-a', component: 'dispute_fee', effectMinor: -7 }
     ]);
   });
 

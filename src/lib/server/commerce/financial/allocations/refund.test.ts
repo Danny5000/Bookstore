@@ -286,7 +286,7 @@ describe('refund allocation plans', () => {
     }
   });
 
-  it('falls back to immutable payment subtotals for a tax-only refund fee', () => {
+  it('assigns a tax-only refund fee only to the sole affected item', () => {
     const { plans: [, fee] } = buildRefundAllocationPlan({
       ...base,
       presentmentAmountMinor: 100,
@@ -297,8 +297,27 @@ describe('refund allocation plans', () => {
       ] }
     });
     expect(fee.items.map((item) => [item.orderItemId, item.effectMinor])).toEqual([
-      ['item-a', -7], ['item-b', -3]
+      ['item-a', -10]
     ]);
+  });
+
+  it('fails closed instead of spreading a tax-only refund fee across unrelated payment titles', () => {
+    try {
+      buildRefundAllocationPlan({
+        ...base,
+        presentmentAmountMinor: 100,
+        amountMinor: -100,
+        netMinor: -110,
+        attribution: { kind: 'finalized', components: [
+          { orderItemId: 'item-a', subtotalMinor: 0, taxMinor: 70, remainingSubtotalCapacityMinor: 0, remainingTaxCapacityMinor: 70, presentmentCurrency: 'USD' },
+          { orderItemId: 'item-b', subtotalMinor: 0, taxMinor: 30, remainingSubtotalCapacityMinor: 0, remainingTaxCapacityMinor: 30, presentmentCurrency: 'USD' }
+        ] }
+      });
+      throw new Error('expected failure');
+    } catch (error) {
+      expect(error).toMatchObject({ name: 'PermanentFinancialError', safeCode: 'allocation_mismatch' });
+      expect((error as Error).cause).toBeUndefined();
+    }
   });
 
   it('keeps a zero fee explicit and empty', () => {

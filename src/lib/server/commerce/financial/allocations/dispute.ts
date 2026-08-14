@@ -380,13 +380,11 @@ export function buildDisputeAllocationPlan(input: DisputeAllocationInput): Dispu
       subtotalMinor: -effect.subtotalMinor,
       currency: input.settlementCurrency
     }));
-    const feeWeights = affectedFeeWeights.some((weight) => weight.subtotalMinor > 0) || affectedFeeWeights.length === 1
+    const feeWeights = affectedFeeWeights.some((weight) => weight.subtotalMinor > 0)
       ? affectedFeeWeights
-      : input.paymentItems.map((item) => ({
-          orderItemId: item.orderItemId,
-          subtotalMinor: item.subtotalMinor,
-          currency: input.settlementCurrency
-        }));
+      : affectedFeeWeights.length === 1
+        ? [{ ...affectedFeeWeights[0]!, subtotalMinor: 1 }]
+        : affectedFeeWeights;
     const feeItems = allocateFeeDetails(
       input.feeMinor,
       input.settlementCurrency,
