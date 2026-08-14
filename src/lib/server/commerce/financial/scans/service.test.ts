@@ -80,20 +80,16 @@ describe('financial scan page service', () => {
     expect(gateway.listPayouts).not.toHaveBeenCalled();
   });
 
-  it('retrieves and stages one canonical payout page before atomically checkpointing children', async () => {
+  it('validates one canonical payout page and atomically checkpoints children without staging it', async () => {
     repository.resume.mockResolvedValue(run({ phase: 'payout_discovery_page' }));
     const trace: string[] = [];
-    const payout = payoutSnapshotFixture({ id: 'po_scan_page_101', balanceTransactionId: null });
+    const payout = payoutSnapshotFixture({ id: 'po_scan_page_101' });
     const gateway = {
       listPayouts: vi.fn(async () => {
         trace.push('provider');
         return { data: [payout], hasMore: true, nextStartingAfter: payout.id };
       })
     } as unknown as StripeCommerceGateway;
-    payoutRepository.stage.mockImplementation(async () => {
-      trace.push('stage');
-      return { payoutId, generation: 0, changed: true };
-    });
     repository.commit.mockImplementation(async (_database, input) => {
       trace.push('commit');
       return run({ phase: input.nextPhase, checkpoint: input.nextCheckpoint, pageCount: 1 });
@@ -105,7 +101,8 @@ describe('financial scan page service', () => {
         cursorDigestSha256: 'a'.repeat(64), limit: 100
       }, correlationId: 'scan-payout-page', signal: new AbortController().signal
     });
-    expect(trace).toEqual(['provider', 'stage', 'commit']);
+    expect(trace).toEqual(['provider', 'commit']);
+    expect(payoutRepository.stage).not.toHaveBeenCalled();
     expect(gateway.listPayouts).toHaveBeenCalledWith({
       limit: 100,
       createdGte: Math.floor(new Date('2026-08-09T19:00:00.000Z').getTime() / 1000),

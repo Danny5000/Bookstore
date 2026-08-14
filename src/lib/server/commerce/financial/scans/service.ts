@@ -18,7 +18,6 @@ import {
   type FinancialScanJobPayload
 } from '../jobs';
 import { PermanentFinancialError, RetryableFinancialError } from '../errors';
-import { stagePayoutSnapshot } from '../payouts/repository';
 import {
   commitFinancialScanPage,
   loadClassificationReplayPage,
@@ -93,9 +92,6 @@ export async function processFinancialScanJob(
     ));
     const children: FinancialJobSpec<string, unknown>[] = [];
     for (const payout of page.data) {
-      await stagePayoutSnapshot(dependencies.database, payout, {
-        correlationId: input.correlationId
-      });
       abortIfNeeded(input.signal);
       children.push(createFinancialPayoutScanJob({
         providerPayoutId: payout.id,
