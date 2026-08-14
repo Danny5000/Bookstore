@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { SQL } from 'drizzle-orm';
-import { lockFinancialProjectionRows, lockPayoutImportRows } from './locks';
+import {
+  lockActiveFinancialProjectionImplementation,
+  lockFinancialProjectionRows,
+  lockPayoutImportRows
+} from './locks';
 import { PermanentFinancialError, RetryableFinancialError } from './errors';
 import type { FinancialIssueCode } from './types';
 
@@ -34,6 +38,38 @@ function executor(responses: Array<unknown[] | Error> = []) {
 }
 
 describe('financial lock ordering', () => {
+  it('rejects ordinary provider projection while any replay authority is pending', async () => {
+    const database = executor([[
+      {
+        classifierVersion: 1,
+        allocationAlgorithmVersion: 1,
+        pendingClassifierVersion: 2,
+        pendingAllocationAlgorithmVersion: 2,
+        pendingReplayId: 'c2-a2',
+        pendingScanRunId: RUN_ID
+      }
+    ]]);
+
+    await expect(lockActiveFinancialProjectionImplementation(database.tx, {
+      classifierVersion: 1,
+      allocationAlgorithmVersion: 1
+    })).rejects.toMatchObject({
+      name: 'RetryableFinancialError',
+      safeCode: 'state_changed'
+    });
+    expect(rendered(database.calls[0]!)).toContain(
+      'pending_classifier_version as "pendingClassifierVersion"'
+    );
+    expect(rendered(database.calls[0]!)).toContain(
+      'pending_allocation_algorithm_version as "pendingAllocationAlgorithmVersion"'
+    );
+    expect(rendered(database.calls[0]!)).toContain('pending_replay_id as "pendingReplayId"');
+    expect(rendered(database.calls[0]!)).toContain(
+      'pending_scan_run_id as "pendingScanRunId"'
+    );
+    expect(rendered(database.calls[0]!)).toContain('for update');
+  });
+
   it('rejects malformed lock identities before issuing any query', async () => {
     const database = executor();
     await expect(lockFinancialProjectionRows(database.tx, {

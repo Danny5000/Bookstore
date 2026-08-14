@@ -602,7 +602,8 @@ export function createPostgresJobRepository(
   )`;
   const providerImplementationSupported = sql`(
     not (
-      type in (${FINANCIAL_SOURCE_JOB}, ${FINANCIAL_PAYOUT_JOB})
+      type = ${STRIPE_EVENT_JOB}
+      or type in (${FINANCIAL_SOURCE_JOB}, ${FINANCIAL_PAYOUT_JOB})
       or (
         type = ${FINANCIAL_SCAN_JOB}
         and not coalesce(
@@ -624,6 +625,10 @@ export function createPostgresJobRepository(
           ${classificationImplementation.classifierVersion}
         and active_projection.allocation_algorithm_version =
           ${classificationImplementation.allocationAlgorithmVersion}
+        and active_projection.pending_classifier_version is null
+        and active_projection.pending_allocation_algorithm_version is null
+        and active_projection.pending_replay_id is null
+        and active_projection.pending_scan_run_id is null
     )
   )`;
   const claimableJob = sql`

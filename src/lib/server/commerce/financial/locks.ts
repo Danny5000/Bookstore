@@ -143,13 +143,21 @@ export async function lockActiveFinancialProjectionImplementation(
     !positiveInt32(input.allocationAlgorithmVersion)) invalid();
   const authorityRows = await rows(tx, sql`
     select classifier_version as "classifierVersion",
-      allocation_algorithm_version as "allocationAlgorithmVersion"
+      allocation_algorithm_version as "allocationAlgorithmVersion",
+      pending_classifier_version as "pendingClassifierVersion",
+      pending_allocation_algorithm_version as "pendingAllocationAlgorithmVersion",
+      pending_replay_id as "pendingReplayId",
+      pending_scan_run_id as "pendingScanRunId"
     from financial_projection_versions
     where singleton = true
     for update
   `) as Array<{
     classifierVersion: number;
     allocationAlgorithmVersion: number;
+    pendingClassifierVersion: number | null;
+    pendingAllocationAlgorithmVersion: number | null;
+    pendingReplayId: string | null;
+    pendingScanRunId: string | null;
   }>;
   const authority = authorityRows[0];
   if (!authority || authorityRows.length !== 1 ||
@@ -158,7 +166,10 @@ export async function lockActiveFinancialProjectionImplementation(
     throw new PermanentFinancialError('source_linkage_mismatch');
   }
   if (authority.classifierVersion !== input.classifierVersion ||
-    authority.allocationAlgorithmVersion !== input.allocationAlgorithmVersion) {
+    authority.allocationAlgorithmVersion !== input.allocationAlgorithmVersion ||
+    authority.pendingClassifierVersion !== null ||
+    authority.pendingAllocationAlgorithmVersion !== null ||
+    authority.pendingReplayId !== null || authority.pendingScanRunId !== null) {
     throw new RetryableFinancialError('state_changed');
   }
 }

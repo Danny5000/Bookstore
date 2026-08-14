@@ -162,7 +162,7 @@ describe('PostgreSQL jobs', () => {
       .toHaveLength(2);
   });
 
-  it('pins provider-backed financial claims to the active implementation until activation', async () => {
+  it('defers provider-backed financial claims for every worker until pending activation', async () => {
     const scanRunId = crypto.randomUUID();
     await databaseClient.db.update(financialProjectionVersions).set({
       pendingClassifierVersion: 2,
@@ -172,6 +172,11 @@ describe('PostgreSQL jobs', () => {
     });
     const due = new Date(0);
     const providerJobs = [
+      {
+        type: 'commerce.stripe-event',
+        payload: { stripeEventId: crypto.randomUUID() },
+        maxAttempts: 12
+      },
       {
         type: 'commerce.financial-source',
         payload: {
@@ -192,14 +197,47 @@ describe('PostgreSQL jobs', () => {
         type: 'commerce.financial-scan',
         payload: { kind: 'hourly', scanGenerationHour: '2026-08-12T12:00:00.000Z' },
         maxAttempts: 8
-      }
+      },
+      {
+        type: 'commerce.financial-scan',
+        payload: { kind: 'initial', version: 1 },
+        maxAttempts: 8
+      },
+      {
+        type: 'commerce.financial-scan',
+        payload: { kind: 'payout_impact', payoutId: crypto.randomUUID(), payoutGeneration: 1 },
+        maxAttempts: 8
+      },
+      ...([
+        'source_page',
+        'payout_discovery_page',
+        'incomplete_payout_run_page',
+        'payout_impact_page'
+      ] as const).map((phase, index) => ({
+        type: 'commerce.financial-scan' as const,
+        payload: {
+          kind: 'continuation' as const,
+          scanRunId: crypto.randomUUID(),
+          phase,
+          cursorDigestSha256: String(index + 1).repeat(64),
+          limit: 100
+        },
+        maxAttempts: 8
+      }))
     ] as const;
+    const ordinary = await enqueueJob(databaseClient.db, {
+      type: 'test.pending-provider-barrier-local',
+      payload: {},
+      runAt: due,
+      deduplicationKey: 'test:pending-provider-barrier-local'
+    });
+    const queuedProviderJobs: Awaited<ReturnType<typeof enqueueJob>>[] = [];
     for (const [index, job] of providerJobs.entries()) {
-      await enqueueJob(databaseClient.db, {
+      queuedProviderJobs.push(await enqueueJob(databaseClient.db, {
         ...job,
         runAt: due,
         deduplicationKey: `test:active-implementation-provider:${index}`
-      });
+      }));
     }
     const pendingWorker = createPostgresJobRepository(
       databaseClient.db, applicationConfig.jobs, () => new Date(1), 'all',
@@ -210,12 +248,19 @@ describe('PostgreSQL jobs', () => {
       { classifierVersion: 1, allocationAlgorithmVersion: 1 }
     );
 
+    await expect(activeWorker.claimNext('active-local-worker')).resolves.toMatchObject({
+      id: ordinary.id,
+      type: 'test.pending-provider-barrier-local'
+    });
+    await expect(activeWorker.complete(ordinary.id, 'active-local-worker')).resolves.toBe(true);
     await expect(pendingWorker.claimNext('pending-provider-worker')).resolves.toBeNull();
-    for (const expected of providerJobs) {
-      const claimed = await activeWorker.claimNext('active-provider-worker');
-      expect(claimed?.type).toBe(expected.type);
-      await expect(activeWorker.complete(claimed!.id, 'active-provider-worker')).resolves.toBe(true);
-    }
+    await expect(activeWorker.claimNext('active-provider-worker')).resolves.toBeNull();
+    await expect(databaseClient.db.select().from(jobs).where(eq(jobs.status, 'pending')))
+      .resolves.toEqual(providerJobs.map((_, index) => expect.objectContaining({
+        deduplicationKey: `test:active-implementation-provider:${index}`,
+        status: 'pending',
+        attempts: 0
+      })));
 
     await databaseClient.db.update(financialProjectionVersions).set({
       classifierVersion: 2,
@@ -228,14 +273,73 @@ describe('PostgreSQL jobs', () => {
       activationCorrelationId: 'test-provider-claim-activation'
     });
     const postActivation = await enqueueJob(databaseClient.db, {
-      ...providerJobs[0],
+      ...providerJobs[1],
       runAt: due,
       deduplicationKey: 'test:active-implementation-provider:after-activation'
     });
     await expect(activeWorker.claimNext('retired-provider-worker')).resolves.toBeNull();
-    await expect(pendingWorker.claimNext('activated-provider-worker')).resolves.toMatchObject({
-      id: postActivation.id,
-      type: 'commerce.financial-source'
+    for (const expected of [...queuedProviderJobs, postActivation]) {
+      const claimed = await pendingWorker.claimNext('activated-provider-worker');
+      expect(claimed).toMatchObject({ id: expected.id, type: expected.type });
+      await expect(pendingWorker.complete(claimed!.id, 'activated-provider-worker'))
+        .resolves.toBe(true);
+    }
+  });
+
+  it('holds an expired provider lease through pending replay and reclaims it after activation', async () => {
+    let currentTime = new Date('2099-08-14T12:00:00.000Z');
+    const queued = await enqueueJob(databaseClient.db, {
+      type: 'commerce.financial-source',
+      payload: {
+        sourceKind: 'payment', sourceId: crypto.randomUUID(),
+        trigger: { kind: 'event', providerEventId: 'evt_pending_crash_reclaim' }
+      },
+      runAt: currentTime,
+      deduplicationKey: 'test:pending-provider-crash-reclaim',
+      maxAttempts: 12
+    });
+    const activeWorker = createPostgresJobRepository(
+      databaseClient.db, applicationConfig.jobs, () => currentTime, 'all',
+      { classifierVersion: 1, allocationAlgorithmVersion: 1 }
+    );
+    const successorWorker = createPostgresJobRepository(
+      databaseClient.db, applicationConfig.jobs, () => currentTime, 'all',
+      { classifierVersion: 2, allocationAlgorithmVersion: 2 }
+    );
+    await expect(activeWorker.claimNext('provider-before-pending')).resolves.toMatchObject({
+      id: queued.id,
+      attempts: 1
+    });
+    await databaseClient.db.update(financialProjectionVersions).set({
+      pendingClassifierVersion: 2,
+      pendingAllocationAlgorithmVersion: 2,
+      pendingReplayId: 'c2-a2',
+      pendingScanRunId: crypto.randomUUID()
+    });
+    currentTime = new Date(currentTime.getTime() + applicationConfig.jobs.leaseMs + 1);
+
+    await expect(activeWorker.claimNext('provider-pending-reclaim-old')).resolves.toBeNull();
+    await expect(successorWorker.claimNext('provider-pending-reclaim-new')).resolves.toBeNull();
+    await expect(databaseClient.db.select().from(jobs).where(eq(jobs.id, queued.id)))
+      .resolves.toEqual([expect.objectContaining({
+        status: 'running', attempts: 1, lockedBy: 'provider-before-pending'
+      })]);
+
+    await databaseClient.db.update(financialProjectionVersions).set({
+      classifierVersion: 2,
+      allocationAlgorithmVersion: 2,
+      pendingClassifierVersion: null,
+      pendingAllocationAlgorithmVersion: null,
+      pendingReplayId: null,
+      pendingScanRunId: null,
+      activatedAt: currentTime,
+      activationCorrelationId: 'test-provider-crash-reclaim-activation'
+    });
+    await expect(activeWorker.claimNext('provider-retired-reclaim')).resolves.toBeNull();
+    await expect(successorWorker.claimNext('provider-activated-reclaim')).resolves.toMatchObject({
+      id: queued.id,
+      attempts: 2,
+      lockedBy: 'provider-activated-reclaim'
     });
   });
 

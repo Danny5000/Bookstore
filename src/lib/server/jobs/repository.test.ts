@@ -6,7 +6,7 @@ import {
   createFinancialPayoutContinuationJob,
   createFinancialSourceScanJob
 } from '$lib/server/commerce/financial/jobs';
-import { enqueueActiveEntityJob } from './repository';
+import { createPostgresJobRepository, enqueueActiveEntityJob } from './repository';
 
 const SOURCE_ID = '00000000-0000-4000-8000-000000001611';
 const NOW = new Date('2026-08-12T12:00:00.000Z');
@@ -282,5 +282,53 @@ describe('active entity jobs', () => {
     expect(failure).toBeInstanceOf(Error);
     expect(failure).not.toHaveProperty('cause');
     expect(String(failure)).not.toContain('private-canary');
+  });
+});
+
+describe('job claim policy', () => {
+  it('renders a pending-version barrier for every provider-backed financial family', async () => {
+    const claimQueries: SQL[] = [];
+    const execute = vi.fn(async (query: SQL) => {
+      claimQueries.push(query);
+      return { rows: [] };
+    });
+    const repository = createPostgresJobRepository(
+      { execute } as never,
+      {
+        pollIntervalMs: 1,
+        leaseMs: 1_000,
+        retryBaseMs: 1,
+        retryMaxMs: 1,
+        workerReadyFile: 'unused',
+        concurrency: 1
+      },
+      () => NOW,
+      'all',
+      { classifierVersion: 2, allocationAlgorithmVersion: 3 }
+    );
+
+    await expect(repository.claimNext('claim-policy-worker')).resolves.toBeNull();
+
+    expect(execute).toHaveBeenCalledOnce();
+    expect(claimQueries).toHaveLength(1);
+    const claim = rendered(claimQueries[0]!);
+    expect(claim.sql).toContain('pending_classifier_version is null');
+    expect(claim.sql).toContain('pending_allocation_algorithm_version is null');
+    expect(claim.sql).toContain('pending_replay_id is null');
+    expect(claim.sql).toContain('pending_scan_run_id is null');
+    expect(claim.params.filter((value) => value === 'commerce.stripe-event')).toHaveLength(4);
+    expect(claim.params.filter((value) => value === 'commerce.financial-source'))
+      .toHaveLength(4);
+    expect(claim.params.filter((value) => value === 'commerce.financial-payout'))
+      .toHaveLength(4);
+    expect(claim.params.filter((value) => value === 'commerce.financial-scan').length)
+      .toBeGreaterThanOrEqual(4);
+    expect(claim.sql).toContain("payload ->> 'kind' = 'composite_replay'");
+    expect(claim.sql).toContain("'classification_replay_page', 'classification_replay_finalize'");
+    expect(claim.params).toEqual(expect.arrayContaining([
+      'commerce.financial-classification',
+      '2',
+      '3'
+    ]));
   });
 });
