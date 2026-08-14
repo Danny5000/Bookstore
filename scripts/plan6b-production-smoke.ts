@@ -536,6 +536,48 @@ async function validateOwnedResources(
   }
 }
 
+async function assertNoOwnedResourcesRemain(
+  manifest: ProductionSmokeManifest,
+  dependencies: ProductionSmokeDockerDependencies
+): Promise<void> {
+  for (const [resource, argumentsToCapture] of [
+    [
+      'container',
+      ['ps', '--all', '--quiet', '--filter', `label=com.docker.compose.project=${manifest.project}`]
+    ],
+    [
+      'network',
+      ['network', 'ls', '--quiet', '--filter', `label=com.docker.compose.project=${manifest.project}`]
+    ],
+    [
+      'volume',
+      ['volume', 'ls', '--quiet', '--filter', `label=com.docker.compose.project=${manifest.project}`]
+    ]
+  ] as const) {
+    assert(
+      (await captureIdentifiers(dependencies, argumentsToCapture)).length === 0,
+      `owned ${resource} cleanup failed`
+    );
+  }
+  for (const [resource, name] of [
+    ...['postgres', 'app', 'worker', 'caddy'].map((service) => (
+      ['container', `${manifest.project}-${service}-1`] as const
+    )),
+    ['network', `${manifest.project}_default`] as const,
+    ...['postgres_data', 'book_storage', 'caddy_data', 'caddy_config'].map((volume) => (
+      ['volume', `${manifest.project}_${volume}`] as const
+    ))
+  ]) {
+    const argumentsToCapture = resource === 'container'
+      ? ['ps', '--all', '--filter', `name=${name}`, '--format', '{{.Names}}']
+      : [resource, 'ls', '--filter', `name=${name}`, '--format', '{{.Name}}'];
+    assert(
+      !(await captureIdentifiers(dependencies, argumentsToCapture)).includes(name),
+      `owned ${resource} cleanup failed`
+    );
+  }
+}
+
 export function createProductionSmokeDockerOperations(
   manifest: ProductionSmokeManifest,
   dependencies: ProductionSmokeDockerDependencies
@@ -766,6 +808,7 @@ export function createProductionSmokeDockerOperations(
         [...compose, 'down', '--volumes', '--remove-orphans'],
         environment
       );
+      await assertNoOwnedResourcesRemain(owned, { ...dependencies, environment });
       if (imageTagReservedByThisRun) {
         const imageIds = await exactImageIds(owned, { ...dependencies, environment });
         if (imageIds.length === 1) {

@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   cleanupOwnedDatabase,
+  createOwnedManifest,
   executeOwnedUpgradeRun,
   parseLoopbackPublishedEndpoint,
   renderOwnedCompose,
@@ -63,10 +64,12 @@ const observation = (owned = manifest()): OwnedRuntimeObservation => ({
 });
 
 interface FakeDockerState {
+  containerNamesAfterDown?: readonly string[];
   downCalled: boolean;
   downArguments: readonly string[] | null;
   networkNameFormatUsed: boolean;
   networks: Record<string, Record<string, string>>;
+  retainVolumeAfterDown?: boolean;
   startupAttempts: number;
   volumes: Record<string, Record<string, string>>;
 }
@@ -111,7 +114,7 @@ function partialStartupDocker(owned: OwnedRunManifest, state: FakeDockerState): 
         state.downCalled = true;
         state.downArguments = [...argumentsToRun];
         delete state.networks[expectedNetwork];
-        delete state.volumes[expectedVolume];
+        if (!state.retainVolumeAfterDown) delete state.volumes[expectedVolume];
         return;
       }
       throw new Error(`unexpected fake Docker run: ${argumentsToRun.join(' ')}`);
@@ -120,6 +123,12 @@ function partialStartupDocker(owned: OwnedRunManifest, state: FakeDockerState): 
       if (same(argumentsToCapture, [...composePrefix, 'ps', '--all', '--quiet', 'postgres'])) {
         return '';
       }
+      if (same(argumentsToCapture, [
+        'ps', '--all', '--quiet', '--filter', `label=com.docker.compose.project=${owned.project}`
+      ])) return '';
+      if (same(argumentsToCapture, [
+        'ps', '--all', '--filter', `name=${owned.project}-postgres-1`, '--format', '{{.Names}}'
+      ])) return state.downCalled ? (state.containerNamesAfterDown ?? []).join('\n') : '';
       if (same(argumentsToCapture, [
         'network', 'ls', '--filter', `label=com.docker.compose.project=${owned.project}`,
         '--format', '{{.Name}}'
@@ -285,6 +294,68 @@ describe('Plan 6B disposable upgrade database ownership', () => {
     expect((thrown as AggregateError).cause).toBe(cleanup);
   });
 
+  it.each([
+    ['ephemeral port selection', 'port'],
+    ['owned manifest write', 'write']
+  ] as const)('removes the exact materialized temp directory after %s fails', async (_label, failAt) => {
+    let tempDirectory = '';
+    let passwordBearingArtifact = '';
+    let passwordBearingContents = '';
+    const removeTempDirectory = vi.fn(async (path: string) => {
+      tempDirectory = path;
+      await rm(path, { recursive: true, force: false });
+    });
+
+    await expect(createOwnedManifest({
+      async selectPort() {
+        if (failAt === 'port') throw new Error('private injected port failure');
+        return 49152;
+      },
+      async writeTextFile(path, contents) {
+        if (path.endsWith('compose.plan6b.yaml')) {
+          passwordBearingArtifact = path;
+          passwordBearingContents = contents;
+          await writeFile(path, contents, 'utf8');
+          return;
+        }
+        if (failAt === 'write') throw new Error('private injected write failure');
+        await writeFile(path, contents, 'utf8');
+      },
+      removeTempDirectory
+    })).rejects.toThrow(/could not materialize/u);
+
+    expect(removeTempDirectory).toHaveBeenCalledExactlyOnceWith(tempDirectory);
+    if (passwordBearingArtifact) {
+      expect(passwordBearingContents).toMatch(/POSTGRES_PASSWORD: [a-f0-9]{48}/u);
+      expect(await readFile(passwordBearingArtifact, 'utf8').catch(() => null)).toBeNull();
+    }
+    await expect(stat(tempDirectory)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('does not allow injected setup to substitute a prefix-shaped sibling directory', async () => {
+    const suppliedDirectory = join(tmpdir(), 'pale-orbit-plan6b-upgrade-shared');
+    const createTempDirectory = vi.fn(async () => suppliedDirectory);
+    const removedPaths: string[] = [];
+    const dependencies = {
+      createTempDirectory,
+      selectPort: vi.fn(async () => {
+        throw new Error('private injected port failure');
+      }),
+      writeTextFile: vi.fn(async () => undefined),
+      async removeTempDirectory(path) {
+        removedPaths.push(path);
+        if (path !== suppliedDirectory) await rm(path, { recursive: true, force: false });
+      }
+    };
+
+    await expect(createOwnedManifest(dependencies)).rejects.toThrow(/materialize/u);
+
+    expect(createTempDirectory).not.toHaveBeenCalled();
+    expect(removedPaths).toHaveLength(1);
+    expect(removedPaths[0]).not.toBe(suppliedDirectory);
+    await expect(stat(removedPaths[0]!)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('cleans only exact owned Compose resources when startup fails before container creation', async () => {
     const tempDirectory = await mkdtemp(join(tmpdir(), 'pale-orbit-plan6b-upgrade-'));
     const owned: OwnedRunManifest = {
@@ -368,6 +439,70 @@ describe('Plan 6B disposable upgrade database ownership', () => {
       expect(state.volumes).toHaveProperty(expectedVolume);
       expect(state.volumes).toHaveProperty('unrelated-volume');
       expect(await readFile(owned.composeFile, 'utf8')).toContain('services:');
+      expect(await readFile(owned.manifestFile, 'utf8')).toContain(owned.project);
+    } finally {
+      await rm(tempDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it('fails cleanup when Compose down succeeds but an owned volume remains', async () => {
+    const tempDirectory = await mkdtemp(join(tmpdir(), 'pale-orbit-plan6b-upgrade-'));
+    const owned: OwnedRunManifest = {
+      ...manifest(),
+      containerId: '',
+      tempDirectory,
+      composeFile: join(tempDirectory, 'compose.plan6b.yaml'),
+      manifestFile: join(tempDirectory, 'owned-run.json')
+    };
+    const expectedVolume = `${owned.project}_postgres-data`;
+    const state: FakeDockerState = {
+      downCalled: false,
+      downArguments: null,
+      networkNameFormatUsed: false,
+      networks: {},
+      retainVolumeAfterDown: true,
+      startupAttempts: 0,
+      volumes: { [expectedVolume]: exactResourceLabels(owned) }
+    };
+    await writeFile(owned.composeFile, renderOwnedCompose(owned), 'utf8');
+    await writeFile(owned.manifestFile, `${JSON.stringify(owned, null, 2)}\n`, 'utf8');
+
+    try {
+      await expect(cleanupOwnedDatabase(owned, partialStartupDocker(owned, state)))
+        .rejects.toThrow(/resource|volume|cleanup/u);
+      expect(state.downCalled).toBe(true);
+      expect(state.volumes).toHaveProperty(expectedVolume);
+      expect(await readFile(owned.manifestFile, 'utf8')).toContain(owned.project);
+    } finally {
+      await rm(tempDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it('fails cleanup when an exact-name container remains without project labels', async () => {
+    const tempDirectory = await mkdtemp(join(tmpdir(), 'pale-orbit-plan6b-upgrade-'));
+    const owned: OwnedRunManifest = {
+      ...manifest(),
+      containerId: '',
+      tempDirectory,
+      composeFile: join(tempDirectory, 'compose.plan6b.yaml'),
+      manifestFile: join(tempDirectory, 'owned-run.json')
+    };
+    const state: FakeDockerState = {
+      containerNamesAfterDown: [`${owned.project}-postgres-1`],
+      downCalled: false,
+      downArguments: null,
+      networkNameFormatUsed: false,
+      networks: {},
+      startupAttempts: 0,
+      volumes: {}
+    };
+    await writeFile(owned.composeFile, renderOwnedCompose(owned), 'utf8');
+    await writeFile(owned.manifestFile, `${JSON.stringify(owned, null, 2)}\n`, 'utf8');
+
+    try {
+      await expect(cleanupOwnedDatabase(owned, partialStartupDocker(owned, state)))
+        .rejects.toThrow(/container|cleanup/u);
+      expect(state.downCalled).toBe(true);
       expect(await readFile(owned.manifestFile, 'utf8')).toContain(owned.project);
     } finally {
       await rm(tempDirectory, { recursive: true, force: true });

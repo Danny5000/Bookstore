@@ -684,6 +684,49 @@ async function validateOwnedResources(
   }
 }
 
+async function assertNoOwnedResourcesRemain(
+  manifest: FixtureProbeManifest,
+  dependencies: FixtureProbeDockerDependencies,
+  environment: NodeJS.ProcessEnv
+): Promise<void> {
+  for (const [resource, argumentsToCapture] of [
+    [
+      'container',
+      ['ps', '--all', '--quiet', '--filter', `label=com.docker.compose.project=${manifest.project}`]
+    ],
+    [
+      'network',
+      ['network', 'ls', '--quiet', '--filter', `label=com.docker.compose.project=${manifest.project}`]
+    ],
+    [
+      'volume',
+      ['volume', 'ls', '--quiet', '--filter', `label=com.docker.compose.project=${manifest.project}`]
+    ]
+  ] as const) {
+    assert(
+      (await captureIdentifiers(dependencies, environment, argumentsToCapture)).length === 0,
+      `owned ${resource} cleanup failed`
+    );
+  }
+  for (const [resource, name] of [
+    ...['postgres', 'mailpit', 'stripe_api_canary', 'app', 'worker'].map((service) => (
+      ['container', `${manifest.project}-${service}-1`] as const
+    )),
+    ['network', `${manifest.project}_default`] as const,
+    ...['stripe_attempts', 'book_storage'].map((volume) => (
+      ['volume', `${manifest.project}_${volume}`] as const
+    ))
+  ]) {
+    const argumentsToCapture = resource === 'container'
+      ? ['ps', '--all', '--filter', `name=${name}`, '--format', '{{.Names}}']
+      : [resource, 'ls', '--filter', `name=${name}`, '--format', '{{.Name}}'];
+    assert(
+      !(await captureIdentifiers(dependencies, environment, argumentsToCapture)).includes(name),
+      `owned ${resource} cleanup failed`
+    );
+  }
+}
+
 async function containerId(
   manifest: FixtureProbeManifest,
   dependencies: FixtureProbeDockerDependencies,
@@ -1101,6 +1144,7 @@ export function createFixtureProbeDockerOperations(
         '--volumes',
         '--remove-orphans'
       ], environment);
+      await assertNoOwnedResourcesRemain(owned, dependencies, environment);
       if (aliasCreated) {
         const image = await dependencies.command.capture([
           'image',

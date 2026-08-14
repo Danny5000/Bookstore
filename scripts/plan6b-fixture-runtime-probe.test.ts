@@ -1056,6 +1056,7 @@ describe('Plan 6B fixture runtime probe ownership', () => {
   it('removes only resources and the image matching the stored owned-run manifest', async () => {
     const owned = await createFixtureProbeManifest();
     let aliasCreated = false;
+    let resourcesPresent = false;
     const labels = {
       'com.docker.compose.project': owned.project,
       'com.paleorbit.plan6b-fixture.run': owned.runId,
@@ -1063,18 +1064,22 @@ describe('Plan 6B fixture runtime probe ownership', () => {
     };
     const command: FixtureProbeCommandRuntime = {
       run: vi.fn(async (args) => {
-        if (args[0] === 'image' && args[1] === 'tag') aliasCreated = true;
+        if (args[0] === 'image' && args[1] === 'tag') {
+          aliasCreated = true;
+          resourcesPresent = true;
+        }
+        if (args[0] === 'compose' && args.includes('down')) resourcesPresent = false;
         if (args[0] === 'image' && args[1] === 'rm') aliasCreated = false;
       }),
       capture: vi.fn(async (args, _environment, allowFailure) => {
         if (args[0] === 'ps') {
-          return { status: 0, stdout: aliasCreated ? `${'a'.repeat(64)}\n` : '' };
+          return { status: 0, stdout: resourcesPresent ? `${'a'.repeat(64)}\n` : '' };
         }
         if (args[0] === 'network' && args[1] === 'ls') {
-          return { status: 0, stdout: aliasCreated ? `${'b'.repeat(64)}\n` : '' };
+          return { status: 0, stdout: resourcesPresent ? `${'b'.repeat(64)}\n` : '' };
         }
         if (args[0] === 'volume' && args[1] === 'ls') {
-          return { status: 0, stdout: aliasCreated ? `${'c'.repeat(64)}\n` : '' };
+          return { status: 0, stdout: resourcesPresent ? `${'c'.repeat(64)}\n` : '' };
         }
         if (
           (args[0] === 'inspect' && args.includes('{{json .Config.Labels}}')) ||
@@ -1128,6 +1133,81 @@ describe('Plan 6B fixture runtime probe ownership', () => {
         ['image', 'rm', lease().sourceTag],
         expect.any(Object)
       );
+    } finally {
+      await rm(owned.tempDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it('fails cleanup when Compose down succeeds but an owned volume remains', async () => {
+    const owned = await createFixtureProbeManifest();
+    const volumeId = 'plan6b-owned-volume';
+    let downCalled = false;
+    const labels = {
+      'com.docker.compose.project': owned.project,
+      'com.paleorbit.plan6b-fixture.run': owned.runId,
+      'com.paleorbit.plan6b-fixture.owner': owned.ownershipToken
+    };
+    const command: FixtureProbeCommandRuntime = {
+      run: vi.fn(async (args) => {
+        if (args[0] === 'compose' && args.includes('down')) downCalled = true;
+      }),
+      capture: vi.fn(async (args) => {
+        if (args[0] === 'volume' && args[1] === 'ls') {
+          return { status: 0, stdout: `${volumeId}\n` };
+        }
+        if (args[0] === 'volume' && args[1] === 'inspect') {
+          return { status: 0, stdout: JSON.stringify(labels) };
+        }
+        return { status: 0, stdout: '' };
+      })
+    };
+    const docker = createFixtureProbeDockerOperations(owned, {
+      command,
+      environment: { PATH: 'safe-path' },
+      assertPortAvailable: vi.fn(async () => undefined),
+      postJson: vi.fn(),
+      wait: vi.fn(async () => undefined)
+    });
+
+    try {
+      await expect(docker.cleanup(owned, lease())).rejects.toThrow(/resource|volume|cleanup/u);
+      expect(downCalled).toBe(true);
+      expect(await readFile(owned.manifestFile, 'utf8')).toContain(owned.project);
+    } finally {
+      await rm(owned.tempDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it('fails cleanup when an exact-name volume remains without project labels', async () => {
+    const owned = await createFixtureProbeManifest();
+    const exactVolumeName = `${owned.project}_stripe_attempts`;
+    let downCalled = false;
+    const command: FixtureProbeCommandRuntime = {
+      run: vi.fn(async (args) => {
+        if (args[0] === 'compose' && args.includes('down')) downCalled = true;
+      }),
+      capture: vi.fn(async (args) => {
+        if (
+          downCalled &&
+          args[0] === 'volume' &&
+          args[1] === 'ls' &&
+          args.includes(`name=${exactVolumeName}`)
+        ) return { status: 0, stdout: `${exactVolumeName}\n` };
+        return { status: 0, stdout: '' };
+      })
+    };
+    const docker = createFixtureProbeDockerOperations(owned, {
+      command,
+      environment: { PATH: 'safe-path' },
+      assertPortAvailable: vi.fn(async () => undefined),
+      postJson: vi.fn(),
+      wait: vi.fn(async () => undefined)
+    });
+
+    try {
+      await expect(docker.cleanup(owned, lease())).rejects.toThrow(/volume|cleanup/u);
+      expect(downCalled).toBe(true);
+      expect(await readFile(owned.manifestFile, 'utf8')).toContain(owned.project);
     } finally {
       await rm(owned.tempDirectory, { recursive: true, force: true });
     }

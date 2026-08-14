@@ -65,6 +65,12 @@ export interface DockerCommandRuntime {
   capture(argumentsToCapture: readonly string[]): string;
 }
 
+export interface OwnedManifestDependencies {
+  readonly selectPort: () => Promise<number>;
+  readonly writeTextFile: (path: string, contents: string) => Promise<void>;
+  readonly removeTempDirectory: (path: string) => Promise<void>;
+}
+
 interface CommandInvocation {
   command: string;
   arguments: string[];
@@ -111,6 +117,17 @@ function exactGeneratedPath(path: string, expected: string, description: string)
   assert(resolve(path) === resolve(expected), `${description} does not match the owned-run manifest`);
 }
 
+function validateGeneratedTempDirectory(path: string): string {
+  const resolvedTempDirectory = resolve(path);
+  assert(
+    dirname(resolvedTempDirectory) === resolve(tmpdir()) &&
+      resolvedTempDirectory.startsWith(TEMP_PREFIX) &&
+      basename(resolvedTempDirectory).startsWith('pale-orbit-plan6b-upgrade-'),
+    'owned-run manifest temp directory is outside the generated prefix'
+  );
+  return resolvedTempDirectory;
+}
+
 function validateManifestIdentity(owned: OwnedRunManifest): void {
   assert(owned.version === 1, 'owned-run manifest version is invalid');
   assert(/^[a-f0-9]{16}$/u.test(owned.runId), 'owned-run manifest run ID is invalid');
@@ -129,12 +146,7 @@ function validateManifestIdentity(owned: OwnedRunManifest): void {
     'owned-run manifest ownership token is invalid'
   );
   assert(owned.host === '127.0.0.1', 'owned-run manifest endpoint is not loopback');
-  const resolvedTempDirectory = resolve(owned.tempDirectory);
-  assert(
-    resolvedTempDirectory.startsWith(TEMP_PREFIX) &&
-      basename(resolvedTempDirectory).startsWith('pale-orbit-plan6b-upgrade-'),
-    'owned-run manifest temp directory is outside the generated prefix'
-  );
+  const resolvedTempDirectory = validateGeneratedTempDirectory(owned.tempDirectory);
   exactGeneratedPath(
     owned.composeFile,
     join(resolvedTempDirectory, COMPOSE_FILE_NAME),
@@ -497,6 +509,56 @@ function validateOwnedContainerlessResources(
   }
 }
 
+function assertNoOwnedComposeResourcesRemain(
+  owned: OwnedRunManifest,
+  docker: DockerCommandRuntime
+): void {
+  assert(listOwnedContainerIds(owned, docker).length === 0, 'owned container cleanup failed');
+  const projectContainerIds = docker.capture([
+    'ps',
+    '--all',
+    '--quiet',
+    '--filter',
+    `label=com.docker.compose.project=${owned.project}`
+  ]).split(/\r?\n/u).filter(Boolean);
+  assert(projectContainerIds.length === 0, 'owned container cleanup failed');
+  const expectedContainerName = `${owned.project}-postgres-1`;
+  const exactContainerNames = docker.capture([
+    'ps',
+    '--all',
+    '--filter',
+    `name=${expectedContainerName}`,
+    '--format',
+    '{{.Names}}'
+  ]).split(/\r?\n/u).filter(Boolean);
+  assert(!exactContainerNames.includes(expectedContainerName), 'owned container cleanup failed');
+  for (const [kind, expectedName] of [
+    ['network', `${owned.project}_default`],
+    ['volume', `${owned.project}_postgres-data`]
+  ] as const) {
+    const projectNames = docker.capture([
+      kind,
+      'ls',
+      '--filter',
+      `label=com.docker.compose.project=${owned.project}`,
+      '--format',
+      '{{.Name}}'
+    ]).split(/\r?\n/u).filter(Boolean);
+    const exactNames = docker.capture([
+      kind,
+      'ls',
+      '--filter',
+      `name=${expectedName}`,
+      '--format',
+      '{{.Name}}'
+    ]).split(/\r?\n/u).filter(Boolean);
+    assert(
+      projectNames.length === 0 && !exactNames.includes(expectedName),
+      `owned ${kind} cleanup failed`
+    );
+  }
+}
+
 async function writeManifest(owned: OwnedRunManifest): Promise<void> {
   await writeFile(owned.manifestFile, `${JSON.stringify(owned, null, 2)}\n`, {
     encoding: 'utf8',
@@ -513,27 +575,55 @@ async function readManifest(path: string): Promise<OwnedRunManifest | undefined>
   }
 }
 
-async function createOwnedManifest(): Promise<OwnedRunManifest> {
+const defaultOwnedManifestDependencies: OwnedManifestDependencies = {
+  selectPort: selectEphemeralLoopbackPort,
+  writeTextFile: async (path, contents) => {
+    await writeFile(path, contents, { encoding: 'utf8', mode: 0o600 });
+  },
+  removeTempDirectory: async (path) => {
+    await rm(path, { recursive: true, force: false });
+  }
+};
+
+export async function createOwnedManifest(
+  dependencies: OwnedManifestDependencies = defaultOwnedManifestDependencies
+): Promise<OwnedRunManifest> {
   const runId = randomBytes(8).toString('hex');
-  const tempDirectory = await mkdtemp(TEMP_PREFIX);
-  const owned: OwnedRunManifest = {
-    version: 1,
-    runId,
-    project: `${RUN_PREFIX}${runId}`,
-    database: `${DATABASE_PREFIX}${runId}`,
-    user: `${DATABASE_PREFIX}${runId}`,
-    password: randomBytes(24).toString('hex'),
-    ownershipToken: randomBytes(16).toString('hex'),
-    host: '127.0.0.1',
-    port: await selectEphemeralLoopbackPort(),
-    containerId: '',
-    tempDirectory,
-    composeFile: join(tempDirectory, COMPOSE_FILE_NAME),
-    manifestFile: join(tempDirectory, MANIFEST_FILE_NAME)
-  };
-  await writeFile(owned.composeFile, renderOwnedCompose(owned), { encoding: 'utf8', mode: 0o600 });
-  await writeManifest(owned);
-  return owned;
+  let materializedDirectory: string | undefined;
+  try {
+    materializedDirectory = await mkdtemp(TEMP_PREFIX);
+    const tempDirectory = validateGeneratedTempDirectory(materializedDirectory);
+    const owned: OwnedRunManifest = {
+      version: 1,
+      runId,
+      project: `${RUN_PREFIX}${runId}`,
+      database: `${DATABASE_PREFIX}${runId}`,
+      user: `${DATABASE_PREFIX}${runId}`,
+      password: randomBytes(24).toString('hex'),
+      ownershipToken: randomBytes(16).toString('hex'),
+      host: '127.0.0.1',
+      port: await dependencies.selectPort(),
+      containerId: '',
+      tempDirectory,
+      composeFile: join(tempDirectory, COMPOSE_FILE_NAME),
+      manifestFile: join(tempDirectory, MANIFEST_FILE_NAME)
+    };
+    validateContainerlessManifest(owned);
+    await dependencies.writeTextFile(owned.composeFile, renderOwnedCompose(owned));
+    await dependencies.writeTextFile(owned.manifestFile, `${JSON.stringify(owned, null, 2)}\n`);
+    return owned;
+  } catch {
+    if (materializedDirectory !== undefined) {
+      try {
+        await dependencies.removeTempDirectory(
+          validateGeneratedTempDirectory(materializedDirectory)
+        );
+      } catch {
+        throw new Error('[plan6b-upgrade] owned setup cleanup failed');
+      }
+    }
+    throw new Error('[plan6b-upgrade] could not materialize the owned upgrade database');
+  }
 }
 
 async function selectEphemeralLoopbackPort(): Promise<number> {
@@ -689,6 +779,7 @@ export async function cleanupOwnedDatabase(
     'down',
     '--volumes'
   ]);
+  assertNoOwnedComposeResourcesRemain(owned, docker);
   await rm(owned.tempDirectory, { recursive: true, force: false });
 }
 

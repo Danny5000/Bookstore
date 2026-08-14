@@ -708,4 +708,79 @@ describe('Plan 6B production smoke ownership', () => {
       await rm(owned.tempDirectory, { recursive: true, force: true });
     }
   });
+
+  it('fails cleanup when Compose down succeeds but an owned volume remains', async () => {
+    const owned = await createProductionSmokeManifest();
+    const volumeId = 'plan6b-owned-volume';
+    let downCalled = false;
+    const labels = {
+      'com.docker.compose.project': owned.project,
+      'com.paleorbit.plan6b-smoke.run': owned.runId,
+      'com.paleorbit.plan6b-smoke.owner': owned.ownershipToken
+    };
+    const command: ProductionSmokeCommandRuntime = {
+      run: vi.fn(async (args) => {
+        if (args[0] === 'compose' && args.includes('down')) downCalled = true;
+      }),
+      capture: vi.fn(async (args) => {
+        if (args[0] === 'volume' && args[1] === 'ls') {
+          return { status: 0, stdout: `${volumeId}\n` };
+        }
+        if (args[0] === 'volume' && args[1] === 'inspect') {
+          return { status: 0, stdout: JSON.stringify(labels) };
+        }
+        return { status: 0, stdout: '' };
+      })
+    };
+    const docker = createProductionSmokeDockerOperations(owned, {
+      command,
+      environment: { PATH: 'safe-path' },
+      assertPortAvailable: vi.fn(async () => undefined),
+      requestStatus: vi.fn(async () => 503),
+      wait: vi.fn(async () => undefined)
+    });
+
+    try {
+      await expect(docker.cleanup(owned)).rejects.toThrow(/resource|volume|cleanup/u);
+      expect(downCalled).toBe(true);
+      expect(await readFile(owned.manifestFile, 'utf8')).toContain(owned.project);
+    } finally {
+      await rm(owned.tempDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it('fails cleanup when an exact-name volume remains without project labels', async () => {
+    const owned = await createProductionSmokeManifest();
+    const exactVolumeName = `${owned.project}_postgres_data`;
+    let downCalled = false;
+    const command: ProductionSmokeCommandRuntime = {
+      run: vi.fn(async (args) => {
+        if (args[0] === 'compose' && args.includes('down')) downCalled = true;
+      }),
+      capture: vi.fn(async (args) => {
+        if (
+          downCalled &&
+          args[0] === 'volume' &&
+          args[1] === 'ls' &&
+          args.includes(`name=${exactVolumeName}`)
+        ) return { status: 0, stdout: `${exactVolumeName}\n` };
+        return { status: 0, stdout: '' };
+      })
+    };
+    const docker = createProductionSmokeDockerOperations(owned, {
+      command,
+      environment: { PATH: 'safe-path' },
+      assertPortAvailable: vi.fn(async () => undefined),
+      requestStatus: vi.fn(async () => 503),
+      wait: vi.fn(async () => undefined)
+    });
+
+    try {
+      await expect(docker.cleanup(owned)).rejects.toThrow(/volume|cleanup/u);
+      expect(downCalled).toBe(true);
+      expect(await readFile(owned.manifestFile, 'utf8')).toContain(owned.project);
+    } finally {
+      await rm(owned.tempDirectory, { recursive: true, force: true });
+    }
+  });
 });
