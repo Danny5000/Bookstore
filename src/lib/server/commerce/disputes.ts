@@ -390,7 +390,8 @@ export async function fulfillDisputeEvent(
     await dependencies.queueFinancialSource(transaction, {
       sourceKind: 'dispute',
       sourceId: canonicalDisputeRow.id,
-      providerEventId: event.providerEventId
+      providerEventId: event.providerEventId,
+      projectionGraphSourceIds: existing === undefined ? [canonicalDisputeRow.id] : []
     });
     await dependencies.completeEvent(transaction, event.id, 'processed', now);
   });

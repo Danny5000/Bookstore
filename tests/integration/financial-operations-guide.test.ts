@@ -88,4 +88,235 @@ describe('financial reconciliation operations guide', () => {
     expect(createHash('sha256').update('source_page').update('\0').update(checkpoint).digest('hex'))
       .not.toBe(forgedDigest);
   });
+
+  it('accepts the terminal phase of a completed classification replay', async () => {
+    const blocks = await sqlBlocks();
+    const runId = randomUUID();
+    await databaseClient.db.execute(sql`
+      insert into financial_scan_runs (
+        id, root_key, kind, phase, state, classifier_version,
+        allocation_algorithm_version, replay_id, safe_outcome, completed_at
+      ) values (
+        ${runId}, 'commerce.financial-classification:scan:7:7',
+        'classification_replay', 'classification_replay_finalize', 'completed',
+        7, 7, 'c7-a7', 'completed', now()
+      )
+    `);
+
+    const result = await databaseClient.db.execute<{
+      check_name: string;
+      violation_count: number | string;
+    }>(sql.raw(blocks[6]!));
+    const counts = new Map(result.rows.map((row) => [row.check_name, Number(row.violation_count)]));
+
+    expect(counts.get('scan_phase_checkpoint_shape')).toBe(0);
+  });
+
+  it('reports multiple active allocation tips even when their fingerprints differ', async () => {
+    const blocks = await sqlBlocks();
+    const projectionBlock = blocks[4]!;
+    const tipQuery = projectionBlock
+      .split(/;\s*/u)
+      .find((statement) => statement.includes('tip_count'));
+    expect(tipQuery).toBeDefined();
+
+    const balanceTransactionId = randomUUID();
+    await databaseClient.db.execute(sql`
+      insert into stripe_balance_transactions (
+        id, provider_id, live_mode, source_family, source_id, raw_type,
+        reporting_category, balance_type, amount_minor, fee_minor, net_minor,
+        currency, status, provider_created_at, available_at, fingerprint_sha256
+      ) values (
+        ${balanceTransactionId}, ${`txn_restore_tip_${balanceTransactionId}`}, false,
+        'adjustment', null, 'adjustment', 'other_adjustment', 'adjustment',
+        100, 0, 100, 'USD', 'available', now(), now(), ${'a'.repeat(64)}
+      )
+    `);
+    await databaseClient.db.execute(sql`
+      insert into financial_allocation_sets (
+        allocation_identity, balance_transaction_id, source_kind, source_internal_id,
+        basis, scope, expected_effect_minor, currency, algorithm_version,
+        classifier_version, source_fingerprint_sha256
+      ) values
+        (${`adjustment:${balanceTransactionId}:restore-tip-a`}, ${balanceTransactionId},
+          'adjustment', ${balanceTransactionId}, 'gross_amount', 'account', 100, 'USD',
+          1, 1, ${'a'.repeat(64)}),
+        (${`adjustment:${balanceTransactionId}:restore-tip-b`}, ${balanceTransactionId},
+          'adjustment', ${balanceTransactionId}, 'gross_amount', 'account', 100, 'USD',
+          1, 1, ${'b'.repeat(64)})
+    `);
+
+    const result = await databaseClient.db.execute<{
+      balance_transaction_id: string;
+      basis: string;
+      tip_count: number | string;
+    }>(sql.raw(tipQuery!));
+
+    expect(result.rows).toEqual([expect.objectContaining({
+      balance_transaction_id: balanceTransactionId,
+      basis: 'gross_amount',
+      tip_count: '2'
+    })]);
+  });
+
+  it('reports a completed classification replay that never reached its finalizer phase', async () => {
+    const blocks = await sqlBlocks();
+    await databaseClient.db.execute(sql`
+      insert into financial_scan_runs (
+        id, root_key, kind, phase, state, classifier_version,
+        allocation_algorithm_version, replay_id, safe_outcome, completed_at
+      ) values (
+        ${randomUUID()}, 'commerce.financial-classification:scan:8:8',
+        'classification_replay', 'classification_replay_page', 'completed',
+        8, 8, 'c8-a8', 'completed', now()
+      )
+    `);
+
+    const result = await databaseClient.db.execute<{
+      check_name: string;
+      violation_count: number | string;
+    }>(sql.raw(blocks[6]!));
+    const counts = new Map(result.rows.map((row) => [row.check_name, Number(row.violation_count)]));
+
+    expect(counts.get('scan_phase_checkpoint_shape')).toBe(1);
+  });
+
+  it('reports projection authority that points at no resumable replay run', async () => {
+    const blocks = await sqlBlocks();
+    const missingRunId = randomUUID();
+    await databaseClient.db.execute(sql`
+      update financial_projection_versions set
+        pending_classifier_version = 7,
+        pending_allocation_algorithm_version = 7,
+        pending_replay_id = 'c7-a7',
+        pending_scan_run_id = ${missingRunId}
+      where singleton = true
+    `);
+
+    const result = await databaseClient.db.execute<{
+      check_name: string;
+      violation_count: number | string;
+    }>(sql.raw(blocks[6]!));
+    const counts = new Map(result.rows.map((row) => [row.check_name, Number(row.violation_count)]));
+
+    expect(counts.get('pending_replay_authority_mismatch')).toBe(1);
+  });
+
+  it('reports a supersession chain that violates immutable owner lineage', async () => {
+    const blocks = await sqlBlocks();
+    const balanceTransactionId = randomUUID();
+    const otherSourceId = randomUUID();
+    const predecessorId = randomUUID();
+    const fingerprint = 'd'.repeat(64);
+    await databaseClient.db.execute(sql`
+      insert into stripe_balance_transactions (
+        id, provider_id, live_mode, source_family, source_id, raw_type,
+        reporting_category, balance_type, amount_minor, fee_minor, net_minor,
+        currency, status, provider_created_at, available_at, fingerprint_sha256
+      ) values
+        (${balanceTransactionId}, ${`txn_restore_lineage_${balanceTransactionId}`}, false,
+          'adjustment', null, 'adjustment', 'other_adjustment', 'adjustment',
+          100, 0, 100, 'USD', 'available', now(), now(), ${fingerprint}),
+        (${otherSourceId}, ${`txn_restore_lineage_source_${otherSourceId}`}, false,
+          'adjustment', null, 'adjustment', 'other_adjustment', 'adjustment',
+          100, 0, 100, 'USD', 'available', now(), now(), ${'e'.repeat(64)})
+    `);
+    await databaseClient.db.execute(sql.raw(
+      'alter table financial_allocation_sets disable trigger ' +
+      'financial_allocation_sets_supersession_lineage_check'
+    ));
+    try {
+      await databaseClient.db.execute(sql`
+        insert into financial_allocation_sets (
+          id, allocation_identity, balance_transaction_id, source_kind,
+          source_internal_id, basis, scope, expected_effect_minor, currency,
+          algorithm_version, classifier_version, source_fingerprint_sha256,
+          supersedes_set_id
+        ) values
+          (${predecessorId}, ${`adjustment:${balanceTransactionId}:restore-root`},
+            ${balanceTransactionId}, 'adjustment', ${balanceTransactionId},
+            'gross_amount', 'account', 100, 'USD', 1, 1, ${fingerprint}, null),
+          (${randomUUID()}, ${`adjustment:${balanceTransactionId}:restore-invalid-successor`},
+            ${balanceTransactionId}, 'adjustment', ${otherSourceId},
+            'gross_amount', 'account', 100, 'USD', 1, 1, ${fingerprint}, ${predecessorId})
+      `);
+    } finally {
+      await databaseClient.db.execute(sql.raw(
+        'alter table financial_allocation_sets enable trigger ' +
+        'financial_allocation_sets_supersession_lineage_check'
+      ));
+    }
+
+    const result = await databaseClient.db.execute<{
+      check_name: string;
+      violation_count: number | string;
+    }>(sql.raw(blocks[2]!));
+    const counts = new Map(result.rows.map((row) => [row.check_name, Number(row.violation_count)]));
+    expect(counts.get('allocation_set_parent_or_chain')).toBe(1);
+    expect(counts.get('allocation_set_semantic_source')).toBeUndefined();
+  });
+
+  it('reports an adjustment takeover whose exact parent classification is missing', async () => {
+    const blocks = await sqlBlocks();
+    const balanceTransactionId = randomUUID();
+    const orderId = randomUUID();
+    const paymentId = randomUUID();
+    const predecessorId = randomUUID();
+    const fingerprint = 'f'.repeat(64);
+    await databaseClient.db.execute(sql`
+      insert into stripe_balance_transactions (
+        id, provider_id, live_mode, source_family, source_id, raw_type,
+        reporting_category, balance_type, amount_minor, fee_minor, net_minor,
+        currency, status, provider_created_at, available_at, fingerprint_sha256
+      ) values (${balanceTransactionId}, ${`txn_restore_missing_class_${balanceTransactionId}`},
+        false, 'adjustment', null, 'adjustment', 'other_adjustment', 'adjustment',
+        100, 0, 100, 'USD', 'available', now(), now(), ${fingerprint})
+    `);
+    await databaseClient.db.execute(sql`
+      insert into orders (
+        id, status, currency, subtotal_minor, client_checkout_attempt_id,
+        quote_fingerprint_sha256, status_token_sha256
+      ) values (${orderId}, 'checkout_open', 'USD', 100, ${randomUUID()},
+        ${'a'.repeat(64)}, ${'b'.repeat(64)})
+    `);
+    await databaseClient.db.execute(sql`
+      insert into payments (
+        id, order_id, stripe_payment_intent_id, status, amount_minor, currency
+      ) values (${paymentId}, ${orderId}, ${`pi_restore_missing_class_${paymentId}`},
+        'pending', 100, 'USD')
+    `);
+    await databaseClient.db.execute(sql.raw(
+      'alter table financial_allocation_sets disable trigger ' +
+      'financial_allocation_sets_supersession_lineage_check'
+    ));
+    try {
+      await databaseClient.db.execute(sql`
+        insert into financial_allocation_sets (
+          id, allocation_identity, balance_transaction_id, source_kind,
+          source_internal_id, basis, scope, expected_effect_minor, currency,
+          algorithm_version, classifier_version, source_fingerprint_sha256,
+          supersedes_set_id
+        ) values
+          (${predecessorId}, ${`adjustment:${balanceTransactionId}:missing-class-root`},
+            ${balanceTransactionId}, 'adjustment', ${balanceTransactionId},
+            'gross_amount', 'account', 100, 'USD', 1, 1, ${fingerprint}, null),
+          (${randomUUID()}, ${`payment:${paymentId}:missing-class-successor`},
+            ${balanceTransactionId}, 'payment', ${paymentId},
+            'gross_amount', 'title', 100, 'USD', 1, 1, ${fingerprint}, ${predecessorId})
+      `);
+    } finally {
+      await databaseClient.db.execute(sql.raw(
+        'alter table financial_allocation_sets enable trigger ' +
+        'financial_allocation_sets_supersession_lineage_check'
+      ));
+    }
+
+    const result = await databaseClient.db.execute<{
+      check_name: string;
+      violation_count: number | string;
+    }>(sql.raw(blocks[2]!));
+    const counts = new Map(result.rows.map((row) => [row.check_name, Number(row.violation_count)]));
+    expect(counts.get('allocation_set_parent_or_chain')).toBe(1);
+    expect(counts.get('allocation_set_semantic_source')).toBeUndefined();
+  });
 });

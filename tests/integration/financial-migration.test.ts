@@ -306,6 +306,8 @@ async function insertRefund(
   paymentId: string,
   options: {
     key: string;
+    refundId?: string;
+    providerRefundId?: string;
     status: 'pending' | 'succeeded' | 'failed' | 'canceled';
     amountMinor: number;
     currency?: string;
@@ -313,7 +315,7 @@ async function insertRefund(
     providerCreatedAt?: string;
   }
 ): Promise<string> {
-  const refundId = randomUUID();
+  const refundId = options.refundId ?? randomUUID();
   await client.query(
     `insert into refunds
        (id, payment_id, stripe_refund_id, status, amount_minor, currency,
@@ -322,7 +324,7 @@ async function insertRefund(
     [
       refundId,
       paymentId,
-      `re_${options.key}_${refundId}`,
+      options.providerRefundId ?? `re_${options.key}_${refundId}`,
       options.status,
       options.amountMinor,
       options.currency ?? 'USD',
@@ -508,15 +510,32 @@ async function seedValidLegacyFixture(client: PoolClient): Promise<LegacyFixture
   orderIds.push(sequential.orderId);
   orderItemIds.push(...sequential.orderItemIds);
   paymentIds.sequential = sequential.paymentId;
-  for (const [index, key] of ['sequentialFirst', 'sequentialSecond', 'sequentialThird'].entries()) {
+  const sequentialChronology = [
+    {
+      key: 'sequentialFirst',
+      refundId: 'ffffffff-ffff-4fff-bfff-fffffffffff4',
+      providerRefundId: 're_sequential_a'
+    },
+    {
+      key: 'sequentialSecond',
+      refundId: '00000000-0000-4000-8000-000000000004',
+      providerRefundId: 're_sequential_b'
+    },
+    {
+      key: 'sequentialThird',
+      refundId: '77777777-7777-4777-a777-777777777774',
+      providerRefundId: 're_sequential_c'
+    }
+  ] as const;
+  for (const chronology of sequentialChronology) {
     const refundId = await insertRefund(client, sequential.paymentId, {
-      key,
+      ...chronology,
       status: 'succeeded',
       amountMinor: 1,
       reconciliation: 'pending',
-      providerCreatedAt: `2026-08-01T00:00:0${index}.000Z`
+      providerCreatedAt: '2026-08-01T00:00:00.000Z'
     });
-    refundIds[key] = refundId;
+    refundIds[chronology.key] = refundId;
     const sequentialAllocationId = randomUUID();
     refundAllocationIds.push(sequentialAllocationId);
     sequentialRefundAllocationIds.push(sequentialAllocationId);

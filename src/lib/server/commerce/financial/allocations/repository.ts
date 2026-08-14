@@ -93,8 +93,9 @@ async function persistFinancialAllocationPlanForVersionLocked(
   if (!bt || bt.fingerprint!==p.sourceFingerprint) fail('source_linkage_mismatch');
   if (bt.currency!==p.currency) fail('currency_mismatch');
   if ((p.basis==='gross_amount'?bt.amountMinor:-bt.feeMinor)!==p.expectedEffectMinor) fail('allocation_mismatch');
-  const classifications=await rows(tx, sql`select id from financial_classification_versions where subject_type='balance_transaction' and subject_id=${p.balanceTransactionId} and classifier_version=${input.classificationVersion} and source_fingerprint_sha256=${p.sourceFingerprint} and classification <> 'unknown' for update`);
+  const classifications=await rows(tx, sql`select id, classification from financial_classification_versions where subject_type='balance_transaction' and subject_id=${p.balanceTransactionId} and classifier_version=${input.classificationVersion} and source_fingerprint_sha256=${p.sourceFingerprint} and classification <> 'unknown' for update`) as Array<{id:string;classification:string}>;
   if (classifications.length!==1) fail('source_linkage_mismatch');
+  const classification=classifications[0]!.classification;
   const detailClassification = (await rows(tx, sql`
     select count(distinct fd.id)::integer as "detailCount",
       count(cv.id) filter (where cv.classification <> 'unknown')::integer as "classifiedCount",
@@ -152,11 +153,44 @@ async function persistFinancialAllocationPlanForVersionLocked(
   `);
   if (currentTips.length > 1 || (p.supersedesSetId === null ? currentTips.length !== 0 :
       currentTips.length !== 1 || (currentTips[0] as {id?:unknown}).id !== p.supersedesSetId)) fail('source_linkage_mismatch');
-  if(p.supersedesSetId){ const tip=await rows(tx,sql`select id from financial_allocation_sets predecessor where id=${p.supersedesSetId} and balance_transaction_id=${p.balanceTransactionId} and basis=${p.basis} and source_kind=${input.sourceKind} and source_internal_id=${input.sourceId} and currency=${p.currency} and expected_effect_minor=${p.expectedEffectMinor} and source_fingerprint_sha256=${p.sourceFingerprint} and predecessor.reversal_of_set_id is not distinct from ${p.reversalOfSetId} and not exists(select 1 from financial_allocation_sets successor where successor.supersedes_set_id=predecessor.id) for update`); if(tip.length!==1) fail('source_linkage_mismatch'); }
+  let reversalTarget: {id:string;supersedesSetId:string|null}|undefined;
   if(p.reversalOfSetId){
     await rows(tx,sql`select pg_advisory_xact_lock(hashtextextended(${`pale-orbit:financial:allocation-reversal:${p.reversalOfSetId}`}, 0))`);
-    const reversal=await rows(tx,sql`select target.id, (select root.id from financial_allocation_sets root where root.reversal_of_set_id=target.id and root.supersedes_set_id is null order by root.id limit 1) as "existingRootId" from financial_allocation_sets target where target.id=${p.reversalOfSetId} and target.source_kind=${input.sourceKind} and target.source_internal_id=${input.sourceId} and target.basis=${p.basis} and target.currency=${p.currency} and target.reversal_of_set_id is null for update of target`);
+    const reversal=await rows(tx,sql`select target.id, target.supersedes_set_id as "supersedesSetId", (select root.id from financial_allocation_sets root where root.reversal_of_set_id=target.id and root.supersedes_set_id is null order by root.id limit 1) as "existingRootId" from financial_allocation_sets target where target.id=${p.reversalOfSetId} and target.source_kind=${input.sourceKind} and target.source_internal_id=${input.sourceId} and target.basis=${p.basis} and target.currency=${p.currency} and target.reversal_of_set_id is null and target.classifier_version=${input.classificationVersion} and target.algorithm_version=${p.algorithmVersion} for update of target`) as Array<{id:string;supersedesSetId:string|null;existingRootId:string|null}>;
     if(reversal.length!==1 || (p.supersedesSetId===null && (reversal[0] as {existingRootId?:unknown}).existingRootId != null)) fail('source_linkage_mismatch');
+    reversalTarget=reversal[0];
+  }
+  if(p.supersedesSetId){
+    const tips=await rows(tx,sql`select id, source_kind as "sourceKind", source_internal_id as "sourceId", scope, reversal_of_set_id as "reversalOfSetId", classifier_version as "classifierVersion", algorithm_version as "algorithmVersion" from financial_allocation_sets predecessor where id=${p.supersedesSetId} and balance_transaction_id=${p.balanceTransactionId} and basis=${p.basis} and currency=${p.currency} and expected_effect_minor=${p.expectedEffectMinor} and source_fingerprint_sha256=${p.sourceFingerprint} and not exists(select 1 from financial_allocation_sets successor where successor.supersedes_set_id=predecessor.id) for update`) as Array<{id:string;sourceKind:string;sourceId:string;scope:string;reversalOfSetId:string|null;classifierVersion:number;algorithmVersion:number}>;
+    const predecessor=tips[0];
+    if(tips.length!==1 || !predecessor || predecessor.classifierVersion>input.classificationVersion ||
+      predecessor.algorithmVersion>p.algorithmVersion) fail('source_linkage_mismatch');
+    const sameOwner=predecessor.sourceKind===input.sourceKind&&predecessor.sourceId===input.sourceId;
+    const sameReversal=predecessor.reversalOfSetId===p.reversalOfSetId;
+    const advancedReversal=sameOwner&&predecessor.reversalOfSetId!==null&&
+      p.reversalOfSetId!==null&&reversalTarget?.supersedesSetId===predecessor.reversalOfSetId;
+    const nullReversalTakeover=p.reversalOfSetId===null&&(
+      (input.sourceKind==='payment'&&classification==='charge'&&bt.amountMinor>0)||
+      (input.sourceKind==='refund'&&(
+        (classification==='refund'&&bt.amountMinor<0)||
+        (classification==='refund_failure'&&bt.amountMinor>0)
+      ))||
+      (input.sourceKind==='dispute'&&(
+        (classification==='dispute_withdrawal'&&bt.amountMinor<0)||
+        (['dispute_reinstatement','fee_credit'].includes(classification)&&bt.amountMinor>0)
+      ))
+    );
+    const positiveReversalTakeover=p.reversalOfSetId!==null&&p.basis==='gross_amount'&&
+      p.expectedEffectMinor>0&&bt.amountMinor>0&&(
+        (input.sourceKind==='refund'&&classification==='refund_failure')||
+        (input.sourceKind==='dispute'&&classification==='dispute_reinstatement')
+      );
+    const accountTakeover=predecessor.sourceKind==='adjustment'&&
+      predecessor.sourceId===p.balanceTransactionId&&predecessor.scope==='account'&&
+      predecessor.reversalOfSetId===null&&(nullReversalTakeover||positiveReversalTakeover);
+    if(!((sameOwner&&(sameReversal||advancedReversal))||accountTakeover)) {
+      fail('source_linkage_mismatch');
+    }
   }
   let inserted: {id:string}|undefined;
   try {

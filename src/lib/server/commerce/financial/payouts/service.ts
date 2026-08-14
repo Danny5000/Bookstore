@@ -18,6 +18,7 @@ import {
 import { stageBalanceTransaction } from '../ledger';
 import type { PayoutImportResult } from '../types';
 import {
+  loadPayoutGeneration,
   persistPayoutImportPage,
   publishPayoutMembership,
   stagePayoutSnapshot,
@@ -122,6 +123,11 @@ export async function reconcileFinancialPayout(
   };
   throwIfAborted(input.signal);
 
+  const expectedGeneration = await loadPayoutGeneration(
+    dependencies.database,
+    input.payload.providerPayoutId
+  );
+  throwIfAborted(input.signal);
   const payout = canonicalPayout(await providerCall(input.signal, () =>
     dependencies.gateway.retrievePayout(input.payload.providerPayoutId)
   ));
@@ -144,7 +150,8 @@ export async function reconcileFinancialPayout(
   }
 
   const staged = await stagePayoutSnapshot(dependencies.database, payout, {
-    correlationId: input.correlationId
+    correlationId: input.correlationId,
+    expectedGeneration
   });
   throwIfAborted(input.signal);
   if (!payout.automatic || payout.method !== 'standard' || payout.reconciliationStatus === 'not_applicable') {

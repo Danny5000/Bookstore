@@ -7,12 +7,21 @@ import {
 } from './jobs';
 
 const repositoryMocks = vi.hoisted(() => ({
-  enqueueActiveEntityJob: vi.fn()
+  enqueueActiveEntityJob: vi.fn(),
+  rearmCurrentProjectionSubjectsForFinancialSource: vi.fn(),
+  rearmCurrentProjectionSubjectsForFinancialSources: vi.fn()
 }));
 
 vi.mock('$lib/server/jobs/repository', async (importOriginal) => ({
   ...await importOriginal<typeof import('$lib/server/jobs/repository')>(),
   enqueueActiveEntityJob: repositoryMocks.enqueueActiveEntityJob
+}));
+
+vi.mock('./ledger', () => ({
+  rearmCurrentProjectionSubjectsForFinancialSource:
+    repositoryMocks.rearmCurrentProjectionSubjectsForFinancialSource,
+  rearmCurrentProjectionSubjectsForFinancialSources:
+    repositoryMocks.rearmCurrentProjectionSubjectsForFinancialSources
 }));
 
 import {
@@ -41,7 +50,8 @@ describe('financial event handoff', () => {
     await queueFinancialSourceFromEvent(transaction, {
       sourceKind: 'refund',
       sourceId: SOURCE_ID.toUpperCase(),
-      providerEventId: 'evt_handoff_source_1601'
+      providerEventId: 'evt_handoff_source_1601',
+      projectionGraphSourceIds: [SOURCE_ID.toUpperCase()]
     });
 
     expect(repositoryMocks.enqueueActiveEntityJob).toHaveBeenCalledWith(transaction, {
@@ -55,6 +65,60 @@ describe('financial event handoff', () => {
       maxAttempts: 12,
       activeEntity: { sourceKind: 'refund', sourceId: SOURCE_ID }
     });
+    expect(repositoryMocks.rearmCurrentProjectionSubjectsForFinancialSources)
+      .toHaveBeenCalledWith(transaction, { sourceKind: 'refund', sourceIds: [SOURCE_ID] });
+  });
+
+  it('always queues the provider event but rearms projection work only for graph publication', async () => {
+    await queueFinancialSourceFromEvent(transaction, {
+      sourceKind: 'payment', sourceId: SOURCE_ID,
+      providerEventId: 'evt_handoff_source_noop_1601', projectionGraphSourceIds: []
+    });
+
+    expect(repositoryMocks.enqueueActiveEntityJob).toHaveBeenCalledTimes(1);
+    expect(repositoryMocks.rearmCurrentProjectionSubjectsForFinancialSource).not.toHaveBeenCalled();
+    expect(repositoryMocks.rearmCurrentProjectionSubjectsForFinancialSources).not.toHaveBeenCalled();
+  });
+
+  it('rearms every canonical source affected by one graph publication', async () => {
+    const other = '00000000-0000-4000-8000-000000001602';
+    await queueFinancialSourceFromEvent(transaction, {
+      sourceKind: 'refund', sourceId: SOURCE_ID,
+      providerEventId: 'evt_handoff_source_multi_1601',
+      projectionGraphSourceIds: [other, SOURCE_ID, other]
+    });
+
+    expect(repositoryMocks.rearmCurrentProjectionSubjectsForFinancialSources)
+      .toHaveBeenCalledWith(transaction, {
+        sourceKind: 'refund', sourceIds: [SOURCE_ID, other]
+      });
+    expect(repositoryMocks.enqueueActiveEntityJob).toHaveBeenCalledTimes(2);
+    expect(repositoryMocks.enqueueActiveEntityJob).toHaveBeenLastCalledWith(transaction, {
+      type: FINANCIAL_SOURCE_JOB,
+      payload: {
+        sourceKind: 'refund',
+        sourceId: other,
+        trigger: { kind: 'graph', providerEventId: 'evt_handoff_source_multi_1601' }
+      },
+      deduplicationKey:
+        `financial:source:graph:evt_handoff_source_multi_1601:refund:${other}`,
+      maxAttempts: 12,
+      activeEntity: { sourceKind: 'refund', sourceId: other }
+    });
+  });
+
+  it('accepts an internally generated graph publication affecting more than one scan page', async () => {
+    const sourceIds = Array.from({ length: 101 }, (_, index) =>
+      `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`
+    );
+    await expect(queueFinancialSourceFromEvent(transaction, {
+      sourceKind: 'refund', sourceId: SOURCE_ID,
+      providerEventId: 'evt_handoff_source_large_graph_1601',
+      projectionGraphSourceIds: sourceIds
+    })).resolves.toBeUndefined();
+
+    expect(repositoryMocks.rearmCurrentProjectionSubjectsForFinancialSources)
+      .toHaveBeenCalledWith(transaction, { sourceKind: 'refund', sourceIds });
   });
 
   it('queues one canonical event-keyed payout job inside the supplied transaction', async () => {
@@ -95,7 +159,7 @@ describe('financial event handoff', () => {
     } as never));
     await expectInvalid(() => queueFinancialSourceFromEvent(transaction, {
       sourceKind: 'payment', sourceId: 'ch_not_a_local_uuid',
-      providerEventId: 'evt_handoff_invalid_1604'
+      providerEventId: 'evt_handoff_invalid_1604', projectionGraphSourceIds: []
     }));
     await expectInvalid(() => queueFinancialPayoutFromEvent(transaction, {
       providerPayoutId: 'tr_not_a_payout',

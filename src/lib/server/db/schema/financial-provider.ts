@@ -102,6 +102,10 @@ export const financialProjectionVersions = pgTable(
     singleton: boolean('singleton').default(true).primaryKey(),
     classifierVersion: integer('classifier_version').notNull(),
     allocationAlgorithmVersion: integer('allocation_algorithm_version').notNull(),
+    pendingClassifierVersion: integer('pending_classifier_version'),
+    pendingAllocationAlgorithmVersion: integer('pending_allocation_algorithm_version'),
+    pendingReplayId: varchar('pending_replay_id', { length: 50 }),
+    pendingScanRunId: uuid('pending_scan_run_id'),
     activatedAt: timestamp('activated_at', { withTimezone: true }).defaultNow().notNull(),
     activationCorrelationId: varchar('activation_correlation_id', { length: 100 }).notNull()
   },
@@ -114,6 +118,26 @@ export const financialProjectionVersions = pgTable(
     check(
       'financial_projection_versions_correlation_safe',
       sql`char_length(${table.activationCorrelationId}) between 1 and 100`
+    ),
+    check(
+      'financial_projection_versions_pending_consistent',
+      sql`(
+        ${table.pendingClassifierVersion} is null and
+        ${table.pendingAllocationAlgorithmVersion} is null and
+        ${table.pendingReplayId} is null and ${table.pendingScanRunId} is null
+      ) or (
+        ${table.pendingClassifierVersion} is not null and
+        ${table.pendingAllocationAlgorithmVersion} is not null and
+        ${table.pendingReplayId} is not null and ${table.pendingScanRunId} is not null and
+        ${table.pendingClassifierVersion} >= ${table.classifierVersion} and
+        ${table.pendingAllocationAlgorithmVersion} >= ${table.allocationAlgorithmVersion} and
+        (
+          ${table.pendingClassifierVersion} > ${table.classifierVersion} or
+          ${table.pendingAllocationAlgorithmVersion} > ${table.allocationAlgorithmVersion}
+        ) and
+        ${table.pendingReplayId} = 'c' || ${table.pendingClassifierVersion}::text ||
+          '-a' || ${table.pendingAllocationAlgorithmVersion}::text
+      )`
     )
   ]
 );

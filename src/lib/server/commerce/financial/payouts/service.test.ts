@@ -8,10 +8,11 @@ import { reconcileFinancialPayout } from './service';
 
 const ledger = vi.hoisted(() => ({ stage: vi.fn() }));
 const repository = vi.hoisted(() => ({
-  stage: vi.fn(), start: vi.fn(), persist: vi.fn(), publish: vi.fn()
+  loadGeneration: vi.fn(), stage: vi.fn(), start: vi.fn(), persist: vi.fn(), publish: vi.fn()
 }));
 vi.mock('../ledger', () => ({ stageBalanceTransaction: ledger.stage }));
 vi.mock('./repository', () => ({
+  loadPayoutGeneration: repository.loadGeneration,
   stagePayoutSnapshot: repository.stage,
   startOrResumePayoutImport: repository.start,
   persistPayoutImportPage: repository.persist,
@@ -32,6 +33,7 @@ function eventPayload() {
 describe('financial payout service', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    repository.loadGeneration.mockResolvedValue(null);
     repository.stage.mockResolvedValue({ payoutId, generation: 0, changed: true });
     repository.start.mockResolvedValue({
       id: runId, payoutId, generation: 0, state: 'collecting', nextStartingAfter: null,
@@ -49,6 +51,10 @@ describe('financial payout service', () => {
 
   it('keeps both provider pages outside repository transactions and publishes a terminal page', async () => {
     const trace: string[] = [];
+    repository.loadGeneration.mockImplementation(async () => {
+      trace.push('repository.load-generation');
+      return null;
+    });
     repository.stage.mockImplementation(async () => { trace.push('repository.stage-payout'); return { payoutId, generation: 0, changed: true }; });
     repository.start.mockImplementation(async () => { trace.push('repository.start-run'); return {
       id: runId, payoutId, generation: 0, state: 'collecting', nextStartingAfter: null,
@@ -72,7 +78,7 @@ describe('financial payout service', () => {
       status: 'published', payoutId, runId, generation: 1, membershipCount: 0
     });
     expect(trace).toEqual([
-      'provider.payout', 'repository.stage-payout', 'repository.start-run',
+      'repository.load-generation', 'provider.payout', 'repository.stage-payout', 'repository.start-run',
       'provider.page', 'repository.persist-page', 'repository.publish'
     ]);
   });

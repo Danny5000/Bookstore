@@ -12,7 +12,10 @@ import {
   persistFinancialAllocationReplayPlanLocked
 } from '../allocations/repository';
 import { observeFinancialIssue, resolveFinancialIssueAfterRecompute } from '../issues';
-import { lockFinancialProjectionRows } from '../locks';
+import {
+  lockActiveFinancialProjectionImplementation,
+  lockFinancialProjectionRows
+} from '../locks';
 import { stageBalanceTransaction } from '../ledger';
 import { PermanentFinancialError } from '../errors';
 import type {
@@ -31,7 +34,10 @@ vi.mock('../ledger', () => ({ stageBalanceTransaction: vi.fn() }));
 vi.mock('./payment', () => ({ lockCanonicalPaymentPurchaseFacts: vi.fn() }));
 vi.mock('$lib/server/commerce/lock', () => ({ lockOrder: vi.fn() }));
 vi.mock('$lib/server/commerce/reconciliation', () => ({ lockPaymentPurchaseFacts: vi.fn() }));
-vi.mock('../locks', () => ({ lockFinancialProjectionRows: vi.fn() }));
+vi.mock('../locks', () => ({
+  lockActiveFinancialProjectionImplementation: vi.fn(),
+  lockFinancialProjectionRows: vi.fn()
+}));
 vi.mock('../allocations/repository', () => ({
   loadCurrentEffectiveAllocationProjection: vi.fn(),
   persistFinancialAllocationPlanLocked: vi.fn(),
@@ -158,6 +164,7 @@ function projectionTransaction(input: {
   readonly balances: readonly CanonicalBalanceRow[];
   readonly history?: readonly Record<string, unknown>[];
   readonly feeDetails?: Readonly<Record<string, readonly Record<string, unknown>[]>>;
+  readonly currentSets?: readonly Record<string, unknown>[];
 }): DatabaseTransaction {
   const update = vi.fn(() => ({
     set: vi.fn(() => ({ where: vi.fn(async () => ({ rows: [] })) }))
@@ -177,6 +184,12 @@ function projectionTransaction(input: {
       }
       if (rendered.sql.includes('from refund_allocation_components')) {
         return { rows: input.history ?? [] };
+      }
+      if (rendered.sql.includes('from financial_allocation_sets allocation')) {
+        const currentSets = input.currentSets ?? [];
+        return { rows: rendered.sql.includes("allocation.source_kind = 'refund'")
+          ? currentSets.filter((set) => set.sourceKind === 'refund' && set.sourceId === refundId)
+          : currentSets };
       }
       return { rows: [] };
     }),
@@ -412,6 +425,7 @@ describe('reconcileRefundFinancialSource', () => {
       balances: [balance],
       history: [{
         refundId,
+        providerRefundId: 're_refund_trace',
         providerCreatedAt: createdAt,
         refundStatus: 'succeeded',
         allocationStatus: 'finalized',
@@ -495,11 +509,17 @@ describe('reconcileRefundFinancialSource', () => {
       financialEvidenceStatus: 'fee_reconciled'
     });
 
+    expect(lockActiveFinancialProjectionImplementation).toHaveBeenCalledWith(transaction, {
+      classifierVersion: 1,
+      allocationAlgorithmVersion: 1
+    });
     expect(lockCanonicalPaymentPurchaseFacts).toHaveBeenCalledWith(transaction, expect.objectContaining({
       paymentId, orderId,
       payment: expect.objectContaining({ paymentIntentId: 'pi_refund_trace' }),
       charge: expect.objectContaining({ id: 'ch_refund_trace' })
     }));
+    expect(vi.mocked(lockActiveFinancialProjectionImplementation).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(lockCanonicalPaymentPurchaseFacts).mock.invocationCallOrder[0]!);
     expect(lockFinancialProjectionRows).toHaveBeenCalledWith(transaction, {
       payoutGenerations: [{ payoutId, expectedGeneration: 7 }],
       balanceTransactionIds: [balanceId, closureMemberId].sort(),
@@ -532,6 +552,7 @@ describe('recomputeLockedRefundFinancialProjection', () => {
       balances: [balance],
       history: [{
         refundId,
+        providerRefundId: 're_refund_trace',
         providerCreatedAt: createdAt,
         refundStatus: 'succeeded',
         allocationStatus: 'finalized',
@@ -584,6 +605,54 @@ describe('recomputeLockedRefundFinancialProjection', () => {
     expect(transaction.update).not.toHaveBeenCalled();
   });
 
+  it('supersedes balance-owned account tips after the refund becomes locally linked', async () => {
+    const balance = canonicalBalance();
+    const currentSets = (['gross_amount', 'fee'] as const).map((basis, index) => ({
+      id: `00000000-0000-4000-8000-00000000060${index + 1}`,
+      allocationIdentity: `adjustment:${balanceId}:${balanceId}:replay:c1-a1:${basis}`,
+      balanceTransactionId: balanceId,
+      sourceKind: 'adjustment',
+      sourceId: balanceId,
+      basis,
+      scope: 'account',
+      currency: 'USD',
+      expectedEffectMinor: basis === 'gross_amount' ? -500 : -10,
+      algorithmVersion: 1,
+      sourceFingerprint: fingerprint,
+      supersedesSetId: null,
+      reversalOfSetId: null
+    }));
+    const transaction = projectionTransaction({
+      balances: [balance],
+      currentSets,
+      history: [{
+        refundId,
+        providerRefundId: 're_refund_trace',
+        providerCreatedAt: createdAt,
+        refundStatus: 'succeeded',
+        allocationStatus: 'finalized',
+        refundAllocationId: allocationId,
+        orderItemId: itemId,
+        subtotalMinor: 400,
+        taxMinor: 100,
+        currency: 'USD'
+      }],
+      feeDetails: { [balanceId]: [{ amountMinor: 10, classification: 'refund_fee' }] }
+    });
+
+    await recomputeLockedRefundFinancialProjectionForVersion(
+      transaction,
+      lockedInput(),
+      { classifierVersion: 1, allocationAlgorithmVersion: 1, replayId: 'c1-a1' }
+    );
+
+    const plans = persistedPlans();
+    expect(plans.find((plan) => plan.basis === 'gross_amount')?.supersedesSetId)
+      .toBe(currentSets[0]!.id);
+    expect(plans.find((plan) => plan.basis === 'fee')?.supersedesSetId)
+      .toBe(currentSets[1]!.id);
+  });
+
   it('rejects malformed locked facts before issuing projection queries', async () => {
     const transaction = { execute: vi.fn() } as unknown as import('$lib/server/db/transaction').DatabaseTransaction;
 
@@ -634,6 +703,7 @@ describe('recomputeLockedRefundFinancialProjection', () => {
       balances: [balance],
       history: [{
         refundId,
+        providerRefundId: 're_refund_trace',
         providerCreatedAt: createdAt,
         refundStatus: 'succeeded',
         allocationStatus: 'finalized',
@@ -677,6 +747,66 @@ describe('recomputeLockedRefundFinancialProjection', () => {
       expect(persistInput.plan.allocationIdentity).toContain(':replay:c1-a1:');
     }
     expect(observeFinancialIssue).not.toHaveBeenCalled();
+  });
+
+  it('uses provider refund identity for equal-time finalized-history capacity', async () => {
+    const balance = canonicalBalance();
+    const transaction = projectionTransaction({
+      balances: [balance],
+      history: [
+        {
+          refundId,
+          providerRefundId: 're_z_current',
+          providerCreatedAt: createdAt,
+          refundStatus: 'succeeded',
+          allocationStatus: 'finalized',
+          refundAllocationId: allocationId,
+          orderItemId: itemId,
+          subtotalMinor: 400,
+          taxMinor: 100,
+          currency: 'USD'
+        },
+        {
+          refundId: 'ffffffff-ffff-4fff-bfff-fffffffffff3',
+          providerRefundId: 're_a_earlier',
+          providerCreatedAt: createdAt,
+          refundStatus: 'succeeded',
+          allocationStatus: 'finalized',
+          refundAllocationId: '00000000-0000-4000-8000-000000000299',
+          orderItemId: itemId,
+          subtotalMinor: 1,
+          taxMinor: 0,
+          currency: 'USD'
+        }
+      ],
+      feeDetails: {
+        [balanceId]: [{ amountMinor: 10, classification: 'refund_fee' }]
+      }
+    });
+    vi.mocked(loadCurrentEffectiveAllocationProjection).mockResolvedValue(
+      completeProjections([balance])
+    );
+    vi.mocked(observeFinancialIssue).mockResolvedValue({
+      id: issueId
+    } as Awaited<ReturnType<typeof observeFinancialIssue>>);
+
+    await expect(recomputeLockedRefundFinancialProjection(
+      transaction,
+      lockedInput()
+    )).resolves.toMatchObject({
+      status: 'exception',
+      refundId,
+      financialEvidenceStatus: 'exception',
+      safeCode: 'allocation_mismatch',
+      issueId
+    });
+    expect(persistFinancialAllocationReplayPlanLocked).not.toHaveBeenCalled();
+    expect(observeFinancialIssue).toHaveBeenCalledWith(transaction, expect.objectContaining({
+      resourceType: 'refund',
+      resourceId: refundId,
+      safeCode: 'allocation_mismatch',
+      impact: 'exception'
+    }));
   });
 
   it('persists unresolved succeeded evidence and records expected ambiguity as pending', async () => {
@@ -781,6 +911,7 @@ describe('recomputeLockedRefundFinancialProjection', () => {
       balances: [original, reversal],
       history: [{
         refundId,
+        providerRefundId: 're_refund_trace',
         providerCreatedAt: createdAt,
         refundStatus: 'failed',
         allocationStatus: 'finalized',

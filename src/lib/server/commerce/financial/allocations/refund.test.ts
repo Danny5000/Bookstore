@@ -22,15 +22,15 @@ const base: RefundAllocationInput = {
 };
 
 function refundWithChronology(input: {
-  readonly refundId: string;
+  readonly providerRefundId: string;
   readonly providerCreatedAt: string;
-  readonly earlierRefundId: string;
+  readonly earlierProviderRefundId: string;
   readonly earlierProviderCreatedAt: string;
 }): RefundAllocationInput {
   return {
     ...base,
-    sourceId: input.refundId,
-    refundId: input.refundId,
+    sourceId: input.providerRefundId,
+    providerRefundId: input.providerRefundId,
     providerCreatedAt: input.providerCreatedAt,
     presentmentAmountMinor: 100,
     amountMinor: -100,
@@ -41,7 +41,7 @@ function refundWithChronology(input: {
       { orderItemId: 'item-a', subtotalMinor: 500, taxMinor: 0, presentmentCurrency: 'USD' }
     ],
     earlierFinalized: [{
-      refundId: input.earlierRefundId,
+      providerRefundId: input.earlierProviderRefundId,
       providerCreatedAt: input.earlierProviderCreatedAt,
       orderItemId: 'item-a',
       subtotalMinor: 100,
@@ -152,14 +152,14 @@ describe('refund allocation plans', () => {
       feeMinor: 0,
       netMinor: -300,
       feeDetails: [],
-      refundId: 'refund-2',
+      providerRefundId: 'refund-2',
       providerCreatedAt: '2026-08-12T00:00:00.000Z',
       paymentItemCapacities: [
         { orderItemId: 'item-a', subtotalMinor: 700, taxMinor: 100, presentmentCurrency: 'USD' },
         { orderItemId: 'item-b', subtotalMinor: 300, taxMinor: 0, presentmentCurrency: 'USD' }
       ],
       earlierFinalized: [
-        { refundId: 'refund-1', providerCreatedAt: '2026-08-11T00:00:00.000Z', orderItemId: 'item-a', subtotalMinor: 500, taxMinor: 0, presentmentCurrency: 'USD' }
+        { providerRefundId: 'refund-1', providerCreatedAt: '2026-08-11T00:00:00.000Z', orderItemId: 'item-a', subtotalMinor: 500, taxMinor: 0, presentmentCurrency: 'USD' }
       ],
       attribution: { kind: 'finalized' as const, components: [
         { orderItemId: 'item-a', subtotalMinor: 201, taxMinor: 0, remainingSubtotalCapacityMinor: 700, remainingTaxCapacityMinor: 100, presentmentCurrency: 'USD' },
@@ -171,9 +171,9 @@ describe('refund allocation plans', () => {
 
   it('accepts an earlier instant even when its offset timestamp sorts later as text', () => {
     const input = refundWithChronology({
-      refundId: 'refund-current',
+      providerRefundId: 'refund-current',
       providerCreatedAt: '2026-08-12T00:00:00.000Z',
-      earlierRefundId: 'refund-earlier',
+      earlierProviderRefundId: 'refund-earlier',
       earlierProviderCreatedAt: '2026-08-12T01:00:00+02:00'
     });
 
@@ -182,9 +182,9 @@ describe('refund allocation plans', () => {
 
   it('rejects a later instant even when its offset timestamp sorts earlier as text', () => {
     const input = refundWithChronology({
-      refundId: 'refund-current',
+      providerRefundId: 'refund-current',
       providerCreatedAt: '2026-08-12T00:00:00.000Z',
-      earlierRefundId: 'refund-not-earlier',
+      earlierProviderRefundId: 'refund-not-earlier',
       earlierProviderCreatedAt: '2026-08-11T23:30:00-02:00'
     });
 
@@ -193,9 +193,9 @@ describe('refund allocation plans', () => {
 
   it('breaks equivalent-instant ties by refund ID rather than timestamp representation', () => {
     const input = refundWithChronology({
-      refundId: 'z-refund',
+      providerRefundId: 'z-refund',
       providerCreatedAt: '2026-08-12T00:00:00.000Z',
-      earlierRefundId: 'a-refund',
+      earlierProviderRefundId: 'a-refund',
       earlierProviderCreatedAt: '2026-08-12T01:00:00+01:00'
     });
 
@@ -204,9 +204,9 @@ describe('refund allocation plans', () => {
 
   it('uses locale-independent codepoint order for equal-instant refund IDs', () => {
     const input = refundWithChronology({
-      refundId: '\u00e9-refund',
+      providerRefundId: '\u00e9-refund',
       providerCreatedAt: '2026-08-12T00:00:00.000Z',
-      earlierRefundId: 'e\u0301-refund',
+      earlierProviderRefundId: 'e\u0301-refund',
       earlierProviderCreatedAt: '2026-08-12T00:00:00.000Z'
     });
 
@@ -215,9 +215,9 @@ describe('refund allocation plans', () => {
 
   it('orders BMP and supplementary refund IDs by Unicode code point at equal instants', () => {
     const input = refundWithChronology({
-      refundId: '\u{10000}-refund',
+      providerRefundId: '\u{10000}-refund',
       providerCreatedAt: '2026-08-12T00:00:00.000Z',
-      earlierRefundId: '\uE000-refund',
+      earlierProviderRefundId: '\uE000-refund',
       earlierProviderCreatedAt: '2026-08-12T01:00:00+01:00'
     });
 
@@ -226,9 +226,9 @@ describe('refund allocation plans', () => {
 
   it('rejects duplicate chronology facts expressed with equivalent timestamps', () => {
     const input = refundWithChronology({
-      refundId: 'refund-current',
+      providerRefundId: 'refund-current',
       providerCreatedAt: '2026-08-13T00:00:00.000Z',
-      earlierRefundId: 'refund-duplicate',
+      earlierProviderRefundId: 'refund-duplicate',
       earlierProviderCreatedAt: '2026-08-12T00:00:00.000Z'
     });
     const earlier = input.earlierFinalized![0]!;

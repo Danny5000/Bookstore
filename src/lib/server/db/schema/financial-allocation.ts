@@ -136,8 +136,6 @@ export const financialAllocationSets = pgTable(
     unique('financial_allocation_sets_supersession_identity_unique').on(
       table.id,
       table.balanceTransactionId,
-      table.sourceKind,
-      table.sourceInternalId,
       table.basis,
       table.currency,
       table.expectedEffectMinor,
@@ -181,8 +179,6 @@ export const financialAllocationSets = pgTable(
       columns: [
         table.supersedesSetId,
         table.balanceTransactionId,
-        table.sourceKind,
-        table.sourceInternalId,
         table.basis,
         table.currency,
         table.expectedEffectMinor,
@@ -191,8 +187,6 @@ export const financialAllocationSets = pgTable(
       foreignColumns: [
         table.id,
         table.balanceTransactionId,
-        table.sourceKind,
-        table.sourceInternalId,
         table.basis,
         table.currency,
         table.expectedEffectMinor,
@@ -840,8 +834,15 @@ export const currentFinancialProjectionHeads = pgView('current_financial_project
   ), correction_tip_candidates as (
     select correction.*
     from ${refundReportingCorrectionSets} correction
-    where not exists (
-      select 1 from ${refundReportingCorrectionSets} successor
+    where exists (
+      select 1 from eligible_allocation_sets anchor
+      where anchor.id = correction.base_allocation_set_id
+    )
+    and not exists (
+      select 1
+      from ${refundReportingCorrectionSets} successor
+      join eligible_allocation_sets successor_anchor
+        on successor_anchor.id = successor.base_allocation_set_id
       where successor.predecessor_correction_set_id = correction.id
     )
   ), correction_prevalidation as (

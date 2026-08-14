@@ -93,6 +93,76 @@ describe('financial allocation repository', () => {
     await expect(databaseClient.db.transaction(async (tx) => [
       await persistFinancialAllocationPlanLocked(tx, gross), await persistFinancialAllocationPlanLocked(tx, fee)
     ])).resolves.toEqual(inserted.map((entry) => ({ ...entry, disposition: 'unchanged' })));
+    await expect(databaseClient.db.transaction((tx) => persistFinancialAllocationPlanLocked(tx, {
+      sourceKind: 'adjustment', sourceId: staged.balanceTransactionId,
+      classificationVersion: 1, correlationId: 'allocation-repository-owner-downgrade',
+      plan: {
+        ...common, allocationIdentity: `adjustment:${staged.balanceTransactionId}:wrong-owner`,
+        basis: 'gross_amount', scope: 'account', expectedEffectMinor: 100, items: [],
+        supersedesSetId: inserted[0]!.setId
+      }
+    }))).rejects.toMatchObject({
+      name: 'PermanentFinancialError', safeCode: 'source_linkage_mismatch'
+    });
+    const direct = await databaseClient.pool.connect();
+    try {
+      await direct.query('begin');
+      await expect(direct.query(
+        `insert into financial_allocation_sets
+           (allocation_identity, balance_transaction_id, source_kind, source_internal_id,
+            basis, scope, expected_effect_minor, currency, algorithm_version,
+            classifier_version, source_fingerprint_sha256, supersedes_set_id)
+         values ($1, $2, 'adjustment', $2, 'gross_amount', 'account', 100, 'USD',
+           1, 1, $3, $4)`,
+        [`adjustment:${staged.balanceTransactionId}:direct-wrong-owner`,
+          staged.balanceTransactionId, fingerprint, inserted[0]!.setId]
+      )).rejects.toMatchObject({ code: '23514' });
+    } finally {
+      await direct.query('rollback');
+      direct.release();
+    }
+    const missingBalanceId = randomUUID();
+    const missingFingerprint = 'f'.repeat(64);
+    await databaseClient.pool.query(
+      `insert into stripe_balance_transactions
+         (id, provider_id, live_mode, source_family, source_id, raw_type,
+          reporting_category, balance_type, amount_minor, fee_minor, net_minor,
+          currency, status, provider_created_at, available_at, fingerprint_sha256)
+       values ($1, $2, false, 'adjustment', null, 'adjustment', 'other_adjustment',
+         'adjustment', 100, 0, 100, 'USD', 'available', $3, $3, $4)`,
+      [missingBalanceId, `txn_allocation_missing_classification_${suffix}`,
+        new Date('2026-08-01T00:00:00.000Z'), missingFingerprint]
+    );
+    const missingPredecessorId = randomUUID();
+    const missingEvidence = await databaseClient.pool.connect();
+    try {
+      await missingEvidence.query('begin');
+      await missingEvidence.query(
+        `insert into financial_allocation_sets
+           (id, allocation_identity, balance_transaction_id, source_kind, source_internal_id,
+            basis, scope, expected_effect_minor, currency, algorithm_version,
+            classifier_version, source_fingerprint_sha256)
+         values ($1, $2, $3, 'adjustment', $3, 'gross_amount', 'account', 100,
+           'USD', 1, 1, $4)`,
+        [missingPredecessorId,
+          `adjustment:${missingBalanceId}:missing-classification-root`,
+          missingBalanceId, missingFingerprint]
+      );
+      await expect(missingEvidence.query(
+        `insert into financial_allocation_sets
+           (allocation_identity, balance_transaction_id, source_kind, source_internal_id,
+            basis, scope, expected_effect_minor, currency, algorithm_version,
+            classifier_version, source_fingerprint_sha256, supersedes_set_id)
+         values ($1, $2, 'payment', $3, 'gross_amount', 'title', 100, 'USD',
+           1, 1, $4, $5)`,
+        [`payment:${payment.id}:missing-classification-successor`,
+          missingBalanceId, payment.id, missingFingerprint,
+          missingPredecessorId]
+      )).rejects.toMatchObject({ code: '23514' });
+    } finally {
+      await missingEvidence.query('rollback');
+      missingEvidence.release();
+    }
     expect(await loadCurrentEffectiveAllocationProjection(databaseClient.db, { balanceTransactionIds: [staged.balanceTransactionId] }))
       .toEqual([{ status: 'complete', balanceTransactionId: staged.balanceTransactionId, basis: 'gross_amount',
         baseSetId: inserted[0]!.setId, compatibleCorrectionTipId: null, scope: 'title', currency: 'USD', expectedEffectMinor: 100,

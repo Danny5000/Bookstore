@@ -2,18 +2,43 @@ import { createHash } from 'node:crypto';
 import type { BalanceTransactionFeeDetailSnapshot, BalanceTransactionSnapshot } from '$lib/server/commerce/stripe/financial-types';
 import { parseBalanceTransactionSnapshot } from '$lib/server/commerce/stripe/financial-schemas';
 import type { Database } from '$lib/server/db/client';
+import type { JsonObject } from '$lib/server/db/schema';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
-import { PermanentFinancialError } from './errors';
+import { PermanentFinancialError, RetryableFinancialError } from './errors';
 import { sql, type SQL } from 'drizzle-orm';
 import { appendClassificationDecisionLocked, classifyBalanceTransaction, classifyFeeDetail } from './classification';
 import { observeFinancialIssue } from './issues';
-import { FINANCIAL_CLASSIFIER_VERSION } from './constants';
-import { enqueueJob } from '$lib/server/jobs/repository';
+import {
+  FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+  FINANCIAL_CLASSIFIER_VERSION
+} from './constants';
+import {
+  enqueueFinancialClassificationJob,
+  enqueueJob,
+  rearmFinancialClassificationJob
+} from '$lib/server/jobs/repository';
 import { createFinancialClassificationSubjectJob } from './jobs';
+import {
+  loadFinancialProjectionAuthority,
+  lockFinancialProjectionEnrollment,
+  lockFinancialProjectionAuthority,
+  type FinancialProjectionAuthority
+} from './rebase';
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const SAFE_MONEY_MAX = 99_999_999;
 const MAX_FEE_ORDINAL = 2_147_483_647;
+
+export interface FinancialProjectionImplementationVersion {
+  readonly classifierVersion: number;
+  readonly allocationAlgorithmVersion: number;
+}
+
+const DEPLOYED_PROJECTION_IMPLEMENTATION: FinancialProjectionImplementationVersion = {
+  classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+  allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
+};
 
 interface FeeDetailFingerprintInput {
   readonly balanceTransactionFingerprint: string;
@@ -25,6 +50,26 @@ interface FeeDetailFingerprintInput {
 
 function unsupportedEvidence(): never {
   throw new PermanentFinancialError('unsupported_provider_evidence');
+}
+
+function incompatibleProjectionVersion(): never {
+  throw new PermanentFinancialError('source_linkage_mismatch');
+}
+
+function projectionImplementationVersion(
+  value: FinancialProjectionImplementationVersion | undefined
+): FinancialProjectionImplementationVersion {
+  const implementation = value ?? DEPLOYED_PROJECTION_IMPLEMENTATION;
+  if (!implementation || typeof implementation !== 'object' ||
+    Reflect.ownKeys(implementation).length !== 2 ||
+    !Number.isSafeInteger(implementation.classifierVersion) ||
+    implementation.classifierVersion < 1 || implementation.classifierVersion > 2_147_483_647 ||
+    !Number.isSafeInteger(implementation.allocationAlgorithmVersion) ||
+    implementation.allocationAlgorithmVersion < 1 ||
+    implementation.allocationAlgorithmVersion > 2_147_483_647) {
+    incompatibleProjectionVersion();
+  }
+  return implementation;
 }
 
 function sha256(value: unknown): string {
@@ -256,10 +301,11 @@ async function ensureClassifications(
   balanceTransactionId: string,
   detailIds: readonly string[],
   evidence: CanonicalEvidence,
-  correlationId: string
+  correlationId: string,
+  classifierVersion: number
 ): Promise<void> {
   await appendClassificationDecisionLocked(tx, {
-    subjectType: 'balance_transaction', subjectId: balanceTransactionId, classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+    subjectType: 'balance_transaction', subjectId: balanceTransactionId, classifierVersion,
     sourceFingerprint: evidence.fingerprint, decision: evidence.parentDecision, correlationId
   });
   if (evidence.parentDecision.status === 'unknown') {
@@ -271,7 +317,7 @@ async function ensureClassifications(
   for (const [index, detailId] of detailIds.entries()) {
     const decision = evidence.detailDecisions[index]!;
     await appendClassificationDecisionLocked(tx, {
-      subjectType: 'fee_detail', subjectId: detailId, classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      subjectType: 'fee_detail', subjectId: detailId, classifierVersion,
       sourceFingerprint: evidence.detailFingerprints[index]!, decision, correlationId
     });
     if (decision.status === 'unknown') {
@@ -285,7 +331,7 @@ async function ensureClassifications(
 
 async function activeProjectionVersion(
   tx: DatabaseTransaction
-): Promise<{ classifierVersion: number; allocationAlgorithmVersion: number }> {
+): Promise<{ classifierVersion: number; allocationAlgorithmVersion: number } | null> {
   const active = await rows(tx, sql`
     select classifier_version as "classifierVersion",
       allocation_algorithm_version as "allocationAlgorithmVersion"
@@ -295,24 +341,29 @@ async function activeProjectionVersion(
   if (!version || active.length !== 1 || !Number.isSafeInteger(version.classifierVersion) ||
     version.classifierVersion < 1 || !Number.isSafeInteger(version.allocationAlgorithmVersion) ||
     version.allocationAlgorithmVersion < 1) unsupportedEvidence();
-  return version;
+  return version.classifierVersion === FINANCIAL_CLASSIFIER_VERSION &&
+    version.allocationAlgorithmVersion === FINANCIAL_ALLOCATION_ALGORITHM_VERSION
+    ? version
+    : null;
 }
 
 async function enqueueAccountProjection(
   tx: DatabaseTransaction,
-  subject: { id: string; fingerprintSha256: string }
+  subject: { id: string; fingerprintSha256: string },
+  version: { classifierVersion: number; allocationAlgorithmVersion: number } | null = null
 ): Promise<void> {
-  const version = await activeProjectionVersion(tx);
+  const target = version ?? await activeProjectionVersion(tx);
+  if (target === null) return;
   const spec = createFinancialClassificationSubjectJob({
     subjectType: 'balance_transaction',
     subjectId: subject.id,
     sourceFingerprintSha256: subject.fingerprintSha256,
-    classifierVersion: version.classifierVersion,
-    allocationAlgorithmVersion: version.allocationAlgorithmVersion
+    classifierVersion: target.classifierVersion,
+    allocationAlgorithmVersion: target.allocationAlgorithmVersion
   });
   await enqueueJob(tx, {
     type: spec.type,
-    payload: spec.payload,
+    payload: spec.payload as JsonObject,
     deduplicationKey: spec.deduplicationKey,
     maxAttempts: spec.maxAttempts
   });
@@ -320,7 +371,8 @@ async function enqueueAccountProjection(
 
 async function enqueueAccountProjectionIfReady(
   tx: DatabaseTransaction,
-  balanceTransactionId: string
+  balanceTransactionId: string,
+  version: { classifierVersion: number; allocationAlgorithmVersion: number } | null = null
 ): Promise<void> {
   const candidates = await rows(tx, sql`
     select balance.id, balance.fingerprint_sha256 as "fingerprintSha256"
@@ -337,31 +389,237 @@ async function enqueueAccountProjectionIfReady(
         )
       )
   `) as Array<{ id: string; fingerprintSha256: string }>;
-  if (candidates[0]) await enqueueAccountProjection(tx, candidates[0]);
+  if (candidates[0]) await enqueueAccountProjection(tx, candidates[0], version);
+}
+
+async function enqueuePendingReplaySubjects(
+  tx: DatabaseTransaction,
+  authority: FinancialProjectionAuthority,
+  parent: { id: string; fingerprintSha256: string },
+  details: readonly { id: string; fingerprintSha256: string }[]
+): Promise<void> {
+  if (authority.pendingClassifierVersion === null ||
+    authority.pendingAllocationAlgorithmVersion === null ||
+    authority.pendingScanRunId === null) return;
+  for (const subject of [
+    { subjectType: 'balance_transaction' as const, ...parent },
+    ...details.map((detail) => ({ subjectType: 'fee_detail' as const, ...detail }))
+  ]) {
+    const spec = createFinancialClassificationSubjectJob({
+      subjectType: subject.subjectType, subjectId: subject.id,
+      sourceFingerprintSha256: subject.fingerprintSha256,
+      classifierVersion: authority.pendingClassifierVersion,
+      allocationAlgorithmVersion: authority.pendingAllocationAlgorithmVersion,
+      scanRunId: authority.pendingScanRunId
+    });
+    await enqueueFinancialClassificationJob(tx, spec);
+  }
 }
 
 export async function enqueueCurrentAccountProjectionsForPayout(
   tx: DatabaseTransaction,
   providerPayoutId: string
 ): Promise<void> {
+  await lockFinancialProjectionEnrollment(tx);
   const candidates = await rows(tx, sql`
-    select id, fingerprint_sha256 as "fingerprintSha256"
-    from stripe_balance_transactions
-    where source_family = 'payout' and source_id = ${providerPayoutId}
-    order by id
-  `) as Array<{ id: string; fingerprintSha256: string }>;
-  for (const candidate of candidates) await enqueueAccountProjection(tx, candidate);
+    with candidate_balances as (
+      select balance.id, balance.fingerprint_sha256 as "fingerprintSha256"
+      from stripe_balance_transactions balance
+      where (balance.source_family = 'payout' and balance.source_id = ${providerPayoutId})
+        or (
+          exists (
+            select 1
+            from stripe_payout_balance_transactions membership
+            join stripe_payouts payout on payout.id = membership.payout_id
+            where membership.balance_transaction_id = balance.id
+              and payout.provider_id = ${providerPayoutId}
+          )
+          and (
+            (balance.source_family = 'charge' and not exists (
+              select 1 from payments payment
+              join orders purchase on purchase.id = payment.order_id
+              where payment.stripe_latest_charge_id = balance.source_id
+            ))
+            or (balance.source_family = 'refund' and not exists (
+              select 1 from refunds refund
+              join payments payment on payment.id = refund.payment_id
+              join orders purchase on purchase.id = payment.order_id
+              where refund.stripe_refund_id = balance.source_id
+            ))
+            or (balance.source_family = 'dispute' and not exists (
+              select 1 from disputes dispute
+              join payments payment on payment.id = dispute.payment_id
+              join orders purchase on purchase.id = payment.order_id
+              where dispute.stripe_dispute_id = balance.source_id
+            ))
+          )
+        )
+    )
+    select 'balance_transaction'::text as "subjectType", candidate.id,
+      candidate."fingerprintSha256"
+    from candidate_balances candidate
+    union all
+    select 'fee_detail'::text as "subjectType", detail.id,
+      detail.fingerprint_sha256 as "fingerprintSha256"
+    from stripe_balance_transaction_fee_details detail
+    join candidate_balances candidate on candidate.id = detail.balance_transaction_id
+    order by "subjectType", id
+  `) as Array<{
+    subjectType: 'balance_transaction' | 'fee_detail';
+    id: string;
+    fingerprintSha256: string;
+  }>;
+  await rearmProjectionSubjects(tx, candidates);
+}
+
+async function rearmProjectionSubjects(
+  tx: DatabaseTransaction,
+  subjects: readonly {
+    subjectType: 'balance_transaction' | 'fee_detail';
+    id: string;
+    fingerprintSha256: string;
+  }[]
+): Promise<void> {
+  if (subjects.length === 0) return;
+  const authority = await loadFinancialProjectionAuthority(tx);
+  const targets = [{
+    classifierVersion: authority.classifierVersion,
+    allocationAlgorithmVersion: authority.allocationAlgorithmVersion,
+    scanRunId: undefined as string | undefined
+  }];
+  if (authority.pendingClassifierVersion !== null &&
+    authority.pendingAllocationAlgorithmVersion !== null &&
+    authority.pendingScanRunId !== null) {
+    targets.push({
+      classifierVersion: authority.pendingClassifierVersion,
+      allocationAlgorithmVersion: authority.pendingAllocationAlgorithmVersion,
+      scanRunId: authority.pendingScanRunId
+    });
+  }
+  for (const candidate of subjects) {
+    for (const target of targets) {
+      const spec = createFinancialClassificationSubjectJob({
+        subjectType: candidate.subjectType, subjectId: candidate.id,
+        sourceFingerprintSha256: candidate.fingerprintSha256,
+        classifierVersion: target.classifierVersion,
+        allocationAlgorithmVersion: target.allocationAlgorithmVersion,
+        ...(target.scanRunId === undefined ? {} : { scanRunId: target.scanRunId })
+      });
+      await rearmFinancialClassificationJob(tx, spec);
+    }
+  }
+}
+
+export async function rearmCurrentProjectionSubjectsForFinancialSource(
+  tx: DatabaseTransaction,
+  input: { readonly sourceKind: 'payment' | 'refund' | 'dispute'; readonly sourceId: string }
+): Promise<void> {
+  if (!input || typeof input !== 'object' || Reflect.ownKeys(input).length !== 2 ||
+    !['payment', 'refund', 'dispute'].includes(input.sourceKind) ||
+    typeof input.sourceId !== 'string' || !UUID_PATTERN.test(input.sourceId)) {
+    incompatibleProjectionVersion();
+  }
+  await rearmCurrentProjectionSubjectsForFinancialSources(tx, {
+    sourceKind: input.sourceKind,
+    sourceIds: [input.sourceId]
+  });
+}
+
+export async function rearmCurrentProjectionSubjectsForFinancialSources(
+  tx: DatabaseTransaction,
+  input: {
+    readonly sourceKind: 'payment' | 'refund' | 'dispute';
+    readonly sourceIds: readonly string[];
+  }
+): Promise<void> {
+  if (!input || typeof input !== 'object' || Reflect.ownKeys(input).length !== 2 ||
+    !['payment', 'refund', 'dispute'].includes(input.sourceKind) ||
+    !Array.isArray(input.sourceIds) || input.sourceIds.some((sourceId) =>
+      typeof sourceId !== 'string' || !UUID_PATTERN.test(sourceId))) {
+    incompatibleProjectionVersion();
+  }
+  const sourceIds = [...new Set(input.sourceIds.map((sourceId) => sourceId.toLowerCase()))].sort();
+  await lockFinancialProjectionEnrollment(tx);
+  if (sourceIds.length === 0) return;
+  const sourceIdArray = `{${sourceIds.join(',')}}`;
+  const subjects = await rows(tx, sql`
+    with candidate_balances as (
+      select balance.id, balance.fingerprint_sha256 as "fingerprintSha256"
+      from stripe_balance_transactions balance
+      where (${input.sourceKind} = 'payment' and balance.source_family = 'charge' and exists (
+          select 1 from payments payment where payment.id = any(${sourceIdArray}::uuid[])
+            and payment.stripe_latest_charge_id = balance.source_id
+        ))
+        or (${input.sourceKind} = 'refund' and balance.source_family = 'refund' and exists (
+          select 1 from refunds refund where refund.id = any(${sourceIdArray}::uuid[])
+            and refund.stripe_refund_id = balance.source_id
+        ))
+        or (${input.sourceKind} = 'dispute' and balance.source_family = 'dispute' and exists (
+          select 1 from disputes dispute where dispute.id = any(${sourceIdArray}::uuid[])
+            and dispute.stripe_dispute_id = balance.source_id
+        ))
+    )
+    select 'balance_transaction'::text as "subjectType", candidate.id,
+      candidate."fingerprintSha256"
+    from candidate_balances candidate
+    union all
+    select 'fee_detail'::text as "subjectType", detail.id,
+      detail.fingerprint_sha256 as "fingerprintSha256"
+    from stripe_balance_transaction_fee_details detail
+    join candidate_balances candidate on candidate.id = detail.balance_transaction_id
+    order by "subjectType", id
+  `) as Array<{
+    subjectType: 'balance_transaction' | 'fee_detail';
+    id: string;
+    fingerprintSha256: string;
+  }>;
+  await rearmProjectionSubjects(tx, subjects);
 }
 
 export async function stageBalanceTransaction(
   database: Database,
   untrustedSnapshot: BalanceTransactionSnapshot,
-  context: { readonly correlationId: string }
+  context: { readonly correlationId: string },
+  untrustedImplementation?: FinancialProjectionImplementationVersion
 ): Promise<{ balanceTransactionId: string; disposition: 'inserted' | 'unchanged' | 'advanced' }> {
   if (!context || typeof context !== 'object' || Object.keys(context).length !== 1 ||
     typeof context.correlationId !== 'string' || context.correlationId.length < 1 || context.correlationId.length > 100) unsupportedEvidence();
   const evidence = canonicalEvidence(untrustedSnapshot);
+  const implementation = projectionImplementationVersion(untrustedImplementation);
   const result = await database.transaction(async (tx) => {
+    const projection = await lockFinancialProjectionAuthority(tx);
+    const activeImplementation = projection.classifierVersion ===
+      implementation.classifierVersion && projection.allocationAlgorithmVersion ===
+        implementation.allocationAlgorithmVersion;
+    const pendingImplementation = projection.pendingScanRunId !== null &&
+      projection.pendingClassifierVersion === implementation.classifierVersion &&
+      projection.pendingAllocationAlgorithmVersion ===
+        implementation.allocationAlgorithmVersion;
+    if (projection.pendingScanRunId !== null &&
+      !activeImplementation && !pendingImplementation) {
+      const atMostPending = projection.pendingClassifierVersion !== null &&
+        projection.pendingAllocationAlgorithmVersion !== null &&
+        implementation.classifierVersion <= projection.pendingClassifierVersion &&
+        implementation.allocationAlgorithmVersion <=
+          projection.pendingAllocationAlgorithmVersion;
+      const atLeastActive = implementation.classifierVersion >= projection.classifierVersion &&
+        implementation.allocationAlgorithmVersion >= projection.allocationAlgorithmVersion;
+      const atMostActive = implementation.classifierVersion <= projection.classifierVersion &&
+        implementation.allocationAlgorithmVersion <= projection.allocationAlgorithmVersion;
+      if (atMostPending && (atLeastActive || atMostActive)) {
+        throw new RetryableFinancialError('state_changed');
+      }
+      incompatibleProjectionVersion();
+    }
+    if (projection.pendingScanRunId === null && !activeImplementation) {
+      const hasOlderComponent = implementation.classifierVersion < projection.classifierVersion ||
+        implementation.allocationAlgorithmVersion < projection.allocationAlgorithmVersion;
+      const hasNewerComponent = implementation.classifierVersion > projection.classifierVersion ||
+        implementation.allocationAlgorithmVersion > projection.allocationAlgorithmVersion;
+      if (hasOlderComponent && hasNewerComponent) incompatibleProjectionVersion();
+      if (hasOlderComponent) throw new RetryableFinancialError('state_changed');
+    }
+    await lockFinancialProjectionEnrollment(tx);
     const snapshot = evidence.snapshot;
     await rows(tx, sql`select pg_advisory_xact_lock(hashtextextended(${`pale-orbit:financial:balance-transaction:${snapshot.id}`}, 0))`);
     const existingRows = await rows(tx, sql`
@@ -399,9 +657,17 @@ export async function stageBalanceTransaction(
         `);
         detailIds.push(parentRow(detailRows[0]).id);
       }
-      await ensureClassifications(tx, inserted.id, detailIds, evidence, context.correlationId);
+      await ensureClassifications(tx, inserted.id, detailIds, evidence, context.correlationId,
+        implementation.classifierVersion);
       await appendImportAudit(tx, inserted.id, 'inserted', snapshot, context.correlationId);
-      await enqueueAccountProjectionIfReady(tx, inserted.id);
+      if (activeImplementation) {
+        await enqueueAccountProjectionIfReady(tx, inserted.id, implementation);
+      }
+      await enqueuePendingReplaySubjects(tx, projection, {
+        id: inserted.id, fingerprintSha256: evidence.fingerprint
+      }, detailIds.map((id, index) => ({
+        id, fingerprintSha256: evidence.detailFingerprints[index]!
+      })));
       return { balanceTransactionId: inserted.id, disposition: 'inserted' as const };
     }
 
@@ -418,17 +684,32 @@ export async function stageBalanceTransaction(
       return { collision: true as const };
     }
     const detailIds = storedDetails.map((detail) => detail.id).filter((id): id is string => typeof id === 'string');
-    await ensureClassifications(tx, existing.id, detailIds, evidence, context.correlationId);
+    await ensureClassifications(tx, existing.id, detailIds, evidence, context.correlationId,
+      implementation.classifierVersion);
     if (existing.status === 'pending' && snapshot.status === 'available') {
       await rows(tx, sql`update stripe_balance_transactions set status = 'available', last_imported_at = now() where id = ${existing.id}`);
       await appendImportAudit(tx, existing.id, 'advanced', snapshot, context.correlationId);
-      await enqueueAccountProjectionIfReady(tx, existing.id);
+      if (activeImplementation) {
+        await enqueueAccountProjectionIfReady(tx, existing.id, implementation);
+      }
+      await enqueuePendingReplaySubjects(tx, projection, {
+        id: existing.id, fingerprintSha256: existing.fingerprintSha256
+      }, storedDetails.map((detail) => ({
+        id: detail.id!, fingerprintSha256: detail.fingerprintSha256
+      })));
       return { balanceTransactionId: existing.id, disposition: 'advanced' as const };
     }
     if (existing.status === 'pending' && snapshot.status === 'pending') {
       await rows(tx, sql`update stripe_balance_transactions set last_imported_at = now() where id = ${existing.id}`);
     }
-    await enqueueAccountProjectionIfReady(tx, existing.id);
+    if (activeImplementation) {
+      await enqueueAccountProjectionIfReady(tx, existing.id, implementation);
+    }
+    await enqueuePendingReplaySubjects(tx, projection, {
+      id: existing.id, fingerprintSha256: existing.fingerprintSha256
+    }, storedDetails.map((detail) => ({
+      id: detail.id!, fingerprintSha256: detail.fingerprintSha256
+    })));
     return { balanceTransactionId: existing.id, disposition: 'unchanged' as const };
   });
   if ('collision' in result) throw new PermanentFinancialError('immutable_mismatch');

@@ -8,7 +8,7 @@ import { processFinancialScanJob } from './service';
 const repository = vi.hoisted(() => ({
   start: vi.fn(), resume: vi.fn(), sources: vi.fn(), payouts: vi.fn(),
   impact: vi.fn(), classifications: vi.fn(), freezePayoutWindow: vi.fn(),
-  completeEmptyReplay: vi.fn(), commit: vi.fn()
+  finalizeReplay: vi.fn(), commit: vi.fn()
 }));
 const payoutRepository = vi.hoisted(() => ({ stage: vi.fn() }));
 vi.mock('./repository', () => ({
@@ -19,7 +19,7 @@ vi.mock('./repository', () => ({
   loadPayoutImpactSourcePage: repository.impact,
   loadClassificationReplayPage: repository.classifications,
   freezePayoutDiscoveryWindow: repository.freezePayoutWindow,
-  completeEmptyFinancialReplay: repository.completeEmptyReplay,
+  finalizeFinancialReplay: repository.finalizeReplay,
   commitFinancialScanPage: repository.commit
 }));
 vi.mock('../payouts/repository', () => ({ stagePayoutSnapshot: payoutRepository.stage }));
@@ -51,13 +51,19 @@ describe('financial scan page service', () => {
       createdLt: Math.floor(new Date('2026-08-12T20:00:00.000Z').getTime() / 1000)
     });
     repository.commit.mockImplementation(async (_database, input) => run({
-      phase: input.nextPhase,
+      phase: input.complete && input.expectedPhase === 'classification_replay_page'
+        ? 'classification_replay_finalize'
+        : input.nextPhase,
       checkpoint: input.nextCheckpoint,
       pageCount: input.expectedPageCount + 1,
-      state: input.complete ? 'completed' : 'running',
-      completedAt: input.complete ? new Date() : null
+      state: input.complete && input.expectedPhase !== 'classification_replay_page'
+        ? 'completed'
+        : 'running',
+      completedAt: input.complete && input.expectedPhase !== 'classification_replay_page'
+        ? new Date()
+        : null
     }));
-    repository.completeEmptyReplay.mockResolvedValue(run({
+    repository.finalizeReplay.mockResolvedValue(run({
       kind: 'classification_replay', phase: 'classification_replay_page', state: 'completed',
       classifierVersion: 2, allocationAlgorithmVersion: 4, replayId: 'c2-a4',
       pageCount: 1, safeOutcome: 'completed', completedAt: new Date()
@@ -222,6 +228,8 @@ describe('financial scan page service', () => {
     });
     expect(repository.commit.mock.calls[0]?.[1].children[0].deduplicationKey)
       .toBe(`financial:classification:2:4:balance_transaction:${sourceId}:${'b'.repeat(64)}`);
+    expect(repository.commit.mock.calls[0]?.[1].children[0].payload)
+      .toMatchObject({ scanRunId: runId });
   });
 
   it('continues a disabled-mode composite replay after its first bounded page', async () => {
@@ -242,14 +250,14 @@ describe('financial scan page service', () => {
       payload: { kind: 'continuation', scanRunId: runId,
         phase: 'classification_replay_page', cursorDigestSha256: 'a'.repeat(64), limit: 100 },
       correlationId: 'scan-disabled-continuation', signal: new AbortController().signal
-    })).resolves.toEqual({ status: 'completed', runId });
+    })).resolves.toEqual({ status: 'continued', runId });
 
     expect(repository.resume).toHaveBeenCalledOnce();
     expect(repository.classifications).toHaveBeenCalledOnce();
     expect(repository.commit).toHaveBeenCalledOnce();
   });
 
-  it('atomically activates and completes an empty composite replay', async () => {
+  it('routes an empty composite replay through the durable child barrier', async () => {
     repository.start.mockResolvedValue(run({
       rootKey: 'commerce.financial-classification:scan:2:4', kind: 'classification_replay',
       phase: 'classification_replay_page', classifierVersion: 2,
@@ -263,14 +271,44 @@ describe('financial scan page service', () => {
       payload: { kind: 'composite_replay', classifierVersion: 2,
         allocationAlgorithmVersion: 4, replayId: 'c2-a4' },
       correlationId: 'scan-empty-replay', signal: new AbortController().signal
+    })).resolves.toEqual({ status: 'continued', runId });
+
+    expect(repository.commit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      runId, expectedCheckpoint: null, expectedPageCount: 0,
+      expectedPhase: 'classification_replay_page', processedCount: 0,
+      children: [], complete: true
+    }));
+    expect(repository.finalizeReplay).not.toHaveBeenCalled();
+  });
+
+  it('delegates a sealed replay continuation to the atomic finalizer', async () => {
+    repository.resume.mockResolvedValue(run({
+      rootKey: 'commerce.financial-classification:scan:2:4',
+      kind: 'classification_replay', phase: 'classification_replay_finalize',
+      classifierVersion: 2, allocationAlgorithmVersion: 4, replayId: 'c2-a4',
+      cursorDigestSha256: 'a'.repeat(64), pageCount: 3
+    }));
+    repository.finalizeReplay.mockResolvedValue(run({
+      kind: 'classification_replay', phase: 'classification_replay_finalize',
+      state: 'completed', classifierVersion: 2, allocationAlgorithmVersion: 4,
+      replayId: 'c2-a4', pageCount: 3, safeOutcome: 'completed',
+      completedAt: new Date()
+    }));
+
+    await expect(processFinancialScanJob({
+      database: {} as Database, gateway: {} as StripeCommerceGateway, runtimeMode: 'disabled'
+    }, {
+      payload: { kind: 'continuation', scanRunId: runId,
+        phase: 'classification_replay_finalize', cursorDigestSha256: 'a'.repeat(64), limit: 100 },
+      correlationId: 'scan-finalize-replay', signal: new AbortController().signal
     })).resolves.toEqual({ status: 'completed', runId });
 
-    expect(repository.completeEmptyReplay).toHaveBeenCalledWith(expect.anything(), {
-      runId, expectedCheckpoint: null, expectedPageCount: 0,
+    expect(repository.finalizeReplay).toHaveBeenCalledWith(expect.anything(), {
+      runId, expectedCursorDigestSha256: 'a'.repeat(64), expectedPageCount: 3,
       classifierVersion: 2, allocationAlgorithmVersion: 4,
-      correlationId: 'scan-empty-replay'
+      correlationId: 'scan-finalize-replay'
     });
-    expect(repository.commit).not.toHaveBeenCalled();
+    expect(repository.classifications).not.toHaveBeenCalled();
   });
 
   it('rechecks abort immediately before committing a loaded page', async () => {

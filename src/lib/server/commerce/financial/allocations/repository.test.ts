@@ -167,15 +167,19 @@ describe('financial allocation repository', () => {
     const reversal = '44444444-4444-4444-8444-444444444444';
     const candidate = { ...input(), plan: { ...input().plan, supersedesSetId: predecessor, reversalOfSetId: reversal } };
     const db = executor([[], [{ amountMinor: 100, feeMinor: 0, currency: 'USD', fingerprint: FP,
-      providerSourceFamily: 'charge', providerSourceId: 'provider_source' }], [{ id: 'classification' }],
-      [{ detailCount: 0, classifiedCount: 0, unknownCount: 0, detailAmountSum: '0', currencyMismatchCount: 0 }], [{ id: ID, orderId: ORDER }], [{ id: ITEM }], [], [{ id: predecessor }], [{ id: predecessor }],
-      [], [{ id: reversal, existingRootId: null }], [{ id: '55555555-5555-4555-8555-555555555555' }], []]);
+      providerSourceFamily: 'charge', providerSourceId: 'provider_source' }], [{ id: 'classification', classification: 'charge' }],
+      [{ detailCount: 0, classifiedCount: 0, unknownCount: 0, detailAmountSum: '0', currencyMismatchCount: 0 }], [{ id: ID, orderId: ORDER }], [{ id: ITEM }], [], [{ id: predecessor }], [],
+      [{ id: reversal, supersedesSetId: null, existingRootId: null }],
+      [{ id: predecessor, sourceKind: 'payment', sourceId: ID, scope: 'title',
+        reversalOfSetId: reversal, classifierVersion: 1, algorithmVersion: 1 }],
+      [{ id: '55555555-5555-4555-8555-555555555555' }], []]);
     await expect(persistFinancialAllocationPlanLocked(db as never, candidate)).resolves.toMatchObject({ disposition: 'inserted' });
-    expect(rendered(db.calls[8]).sql).toContain('not exists');
+    expect(rendered(db.calls[7]).sql).toContain('not exists');
     expect(rendered(db.calls[7]).sql).not.toContain('classifier_version');
     expect(rendered(db.calls[7]).sql).not.toContain('algorithm_version');
-    expect(rendered(db.calls[9]).sql).toContain('pg_advisory_xact_lock');
-    expect(rendered(db.calls[10]).sql).toContain('existingRootId');
+    expect(rendered(db.calls[8]).sql).toContain('pg_advisory_xact_lock');
+    expect(rendered(db.calls[9]).sql).toContain('existingRootId');
+    expect(rendered(db.calls[10]).sql).toContain('reversal_of_set_id');
   });
 
   it('rejects a second independent reversal root for the same exact target before insert', async () => {
@@ -199,14 +203,18 @@ describe('financial allocation repository', () => {
     const reversal = '44444444-4444-4444-8444-444444444444';
     const candidate = { ...input(), plan: { ...input().plan, supersedesSetId: predecessor,
       reversalOfSetId: reversal } };
+    const differentTarget = '66666666-6666-4666-8666-666666666666';
     const db = executor([[], [{ amountMinor: 100, feeMinor: 0, currency: 'USD', fingerprint: FP,
-      providerSourceFamily: 'charge', providerSourceId: 'provider_source' }], [{ id: 'classification' }],
+      providerSourceFamily: 'charge', providerSourceId: 'provider_source' }], [{ id: 'classification', classification: 'charge' }],
       [{ detailCount: 0, classifiedCount: 0, unknownCount: 0, detailAmountSum: '0', currencyMismatchCount: 0 }],
-      [{ id: ID, orderId: ORDER }], [{ id: ITEM }], [], [{ id: predecessor }], []]);
+      [{ id: ID, orderId: ORDER }], [{ id: ITEM }], [], [{ id: predecessor }], [],
+      [{ id: reversal, supersedesSetId: null, existingRootId: null }],
+      [{ id: predecessor, sourceKind: 'payment', sourceId: ID, scope: 'title',
+        reversalOfSetId: differentTarget, classifierVersion: 1, algorithmVersion: 1 }]]);
     await expect(persistFinancialAllocationPlanLocked(db as never, candidate))
       .rejects.toMatchObject({ safeCode: 'source_linkage_mismatch' });
-    expect(rendered(db.calls[8]).sql).toContain('reversal_of_set_id');
-    expect(db.calls).toHaveLength(9);
+    expect(rendered(db.calls[10]).sql).toContain('reversal_of_set_id');
+    expect(db.calls).toHaveLength(11);
   });
 
   it('maps a concurrent reversal-root unique collision to the bounded service error', async () => {

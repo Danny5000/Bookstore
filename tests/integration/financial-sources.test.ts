@@ -9,11 +9,19 @@ import { reconcileRefundFinancialSource } from '$lib/server/commerce/financial/s
 import { reconcileDisputeFinancialSource } from '$lib/server/commerce/financial/sources/dispute';
 import { stageBalanceTransaction } from '$lib/server/commerce/financial/ledger';
 import { observeFinancialIssue } from '$lib/server/commerce/financial/issues';
+import { replayFinancialClassification } from '$lib/server/commerce/financial/rebase';
+import {
+  commitFinancialScanPage,
+  finalizeFinancialReplay,
+  loadClassificationReplayPage,
+  startOrResumeFinancialScan
+} from '$lib/server/commerce/financial/scans/repository';
+import { createFinancialClassificationSubjectJob } from '$lib/server/commerce/financial/jobs';
 import { auditEvents, financialAllocationSets, financialItemAllocations, guestIdentities,
   financialReconciliationIssues, entitlementGrants, entitlements, orderItems, orders, outboxMessages, payments,
   refundAllocations, refundAllocationComponents, refunds, disputeItemAllocations, disputes, user,
   payoutImportRunEntries, payoutImportRuns, stripeBalanceTransactions, stripePayoutBalanceTransactions,
-  stripePayouts, titles } from '$lib/server/db/schema';
+  stripePayouts, titles, jobs } from '$lib/server/db/schema';
 import { paymentSnapshotFixture } from '../fixtures/stripe/payment';
 import { chargeSnapshotFixture } from '../fixtures/stripe/charge';
 import { balanceTransactionSnapshotFixture } from '../fixtures/stripe/balance-transaction';
@@ -21,6 +29,12 @@ import { refundSnapshotFixture } from '../fixtures/stripe/refund';
 import { disputeSnapshotFixture } from '../fixtures/stripe/dispute';
 import { databaseClient } from './database';
 import type { Database } from '$lib/server/db/client';
+
+function deferred<Value>() {
+  let resolve!: (value: Value) => void;
+  const promise = new Promise<Value>((done) => { resolve = done; });
+  return { promise, resolve };
+}
 
 it('rejects invalid payment source work without reaching PostgreSQL or Stripe', async () => {
   const gateway = { retrievePayment: vi.fn() } as unknown as StripeCommerceGateway;
@@ -164,6 +178,158 @@ describe('payment financial source', () => {
     ), eq(financialReconciliationIssues.resourceId, fixture.payment.id))))
       .toEqual([expect.objectContaining({ resourceId: fixture.payment.id, state: 'open' })]);
   });
+
+  it('fails a staged active-version replay closed when the pending version activates before projection', async () => {
+    const fixture = await paidPurchase();
+    const stripe = createFixtureStripeGateway();
+    stripe.harness.setPayment(paymentSnapshotFixture({
+      paymentIntentId: fixture.provider.paymentIntentId,
+      metadataOrderId: fixture.orderId,
+      latestChargeId: fixture.provider.chargeId,
+      amountMinor: 1400,
+      currency: 'usd',
+      paidAt: fixture.paidAt
+    }));
+    stripe.harness.setCharge(chargeSnapshotFixture({
+      id: fixture.provider.chargeId,
+      paymentIntentId: fixture.provider.paymentIntentId,
+      amountMinor: 1400,
+      currency: 'USD',
+      balanceTransactionId: fixture.provider.transactionId,
+      createdAt: fixture.paidAt
+    }));
+    stripe.harness.setBalanceTransaction(balanceTransactionSnapshotFixture({
+      id: fixture.provider.transactionId,
+      sourceId: fixture.provider.chargeId,
+      amountMinor: 1400,
+      feeMinor: 50,
+      netMinor: 1350,
+      currency: 'USD',
+      status: 'available',
+      createdAt: fixture.paidAt,
+      feeDetails: [{
+        ordinal: 0,
+        rawType: 'stripe_fee',
+        amountMinor: 50,
+        currency: 'USD'
+      }]
+    }));
+    const signal = new AbortController().signal;
+    await expect(reconcilePaymentFinancialSource(databaseClient.db, stripe.gateway, {
+      paymentId: fixture.payment.id,
+      correlationId: `activation-race-seed-${fixture.suffix}`
+    }, signal)).resolves.toMatchObject({
+      status: 'reconciled',
+      financialEvidenceStatus: 'fee_reconciled'
+    });
+
+    const pending = await startOrResumeFinancialScan(databaseClient.db, {
+      kind: 'composite_replay',
+      classifierVersion: 2,
+      allocationAlgorithmVersion: 2,
+      replayId: 'c2-a2'
+    });
+    const page = await loadClassificationReplayPage(databaseClient.db, pending, 100);
+    expect(page.hasMore).toBe(false);
+    const children = page.data.map((subject) => createFinancialClassificationSubjectJob({
+      ...subject,
+      classifierVersion: 2,
+      allocationAlgorithmVersion: 2,
+      scanRunId: pending.id
+    }));
+    const sealed = await commitFinancialScanPage(databaseClient.db, {
+      runId: pending.id,
+      expectedPhase: 'classification_replay_page',
+      expectedCheckpoint: null,
+      expectedPageCount: 0,
+      nextPhase: 'classification_replay_page',
+      nextCheckpoint: null,
+      processedCount: page.data.length,
+      children,
+      complete: true
+    });
+    for (const child of children) {
+      await replayFinancialClassification({
+        database: databaseClient.db,
+        targetClassifierVersion: 2,
+        targetAllocationAlgorithmVersion: 2
+      }, {
+        payload: child.payload,
+        correlationId: `activation-race-child-${child.payload.subjectType}`,
+        signal
+      });
+      await databaseClient.db.update(jobs).set({
+        status: 'succeeded',
+        attempts: 1,
+        completedAt: new Date(),
+        lastError: null
+      }).where(eq(jobs.deduplicationKey, child.deduplicationKey));
+    }
+    await databaseClient.db.transaction(async (tx) => {
+      await tx.update(payments).set({ financialEvidenceStatus: 'pending' })
+        .where(eq(payments.id, fixture.payment.id));
+      await observeFinancialIssue(tx, {
+        resourceType: 'payment',
+        resourceId: fixture.payment.id,
+        safeCode: 'allocation_incomplete',
+        impact: 'pending',
+        actor: { type: 'system', id: 'activation-race-test' },
+        correlationId: `activation-race-open-${fixture.suffix}`
+      });
+    });
+    const issueBefore = (await databaseClient.db.select().from(financialReconciliationIssues)
+      .where(and(
+        eq(financialReconciliationIssues.resourceId, fixture.payment.id),
+        eq(financialReconciliationIssues.safeCode, 'allocation_incomplete')
+      )))[0]!;
+    const projectionEntered = deferred<void>();
+    const releaseProjection = deferred<void>();
+    let transactionCount = 0;
+    const racingDatabase = new Proxy(databaseClient.db, {
+      get(target, property) {
+        if (property === 'transaction') {
+          return async (work: (tx: never) => Promise<unknown>) => {
+            transactionCount += 1;
+            if (transactionCount === 2) {
+              projectionEntered.resolve();
+              await releaseProjection.promise;
+            }
+            return target.transaction((tx) => work(tx as never));
+          };
+        }
+        const value = Reflect.get(target, property, target) as unknown;
+        return typeof value === 'function' ? value.bind(target) : value;
+      }
+    }) as unknown as Database;
+    const staleProjection = reconcilePaymentFinancialSource(racingDatabase, stripe.gateway, {
+      paymentId: fixture.payment.id,
+      correlationId: `activation-race-stale-${fixture.suffix}`
+    }, signal);
+    await projectionEntered.promise;
+    try {
+      await expect(finalizeFinancialReplay(databaseClient.db, {
+        runId: pending.id,
+        expectedCursorDigestSha256: sealed.cursorDigestSha256!,
+        expectedPageCount: sealed.pageCount,
+        classifierVersion: 2,
+        allocationAlgorithmVersion: 2,
+        correlationId: `activation-race-finalize-${fixture.suffix}`
+      })).resolves.toMatchObject({ state: 'completed' });
+    } finally {
+      releaseProjection.resolve();
+    }
+    await expect(staleProjection).rejects.toMatchObject({
+      name: 'RetryableFinancialError',
+      safeCode: 'state_changed'
+    });
+
+    expect((await databaseClient.db.select().from(payments)
+      .where(eq(payments.id, fixture.payment.id)))[0])
+      .toMatchObject({ financialEvidenceStatus: 'pending' });
+    expect((await databaseClient.db.select().from(financialReconciliationIssues)
+      .where(eq(financialReconciliationIssues.id, issueBefore.id)))[0])
+      .toMatchObject({ state: 'open', occurrenceCount: issueBefore.occurrenceCount });
+  }, 15_000);
 
   it.each(['missing_charge', 'missing_balance_transaction'] as const)(
     'records %s as provider-not-ready with a durable missing_source issue', async (kind) => {

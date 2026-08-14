@@ -4,11 +4,16 @@ import { appendAuditEvent as defaultAppendAuditEvent } from '$lib/server/audit/s
 import type { Database } from '$lib/server/db/client';
 import {
   entitlementGrants,
+  refundAllocationComponents,
   refundAllocations,
   refunds,
   stripeEvents,
   user,
+  type NewRefundAllocationComponentRow,
   type NewRefundAllocationRow,
+  type OrderItemRow,
+  type RefundAllocationComponentRow,
+  type RefundAllocationRow,
   type RefundRow,
   type StripeEventRow
 } from '$lib/server/db/schema';
@@ -76,9 +81,27 @@ function compareRefunds(
   left: RefundAllocationRefundFact,
   right: RefundAllocationRefundFact
 ): number {
-  return left.providerCreatedAt.getTime() - right.providerCreatedAt.getTime() ||
-    left.providerRefundId.localeCompare(right.providerRefundId) ||
-    left.refundId.localeCompare(right.refundId);
+  return compareRefundChronology(
+    left.providerCreatedAt,
+    left.providerRefundId,
+    left.refundId,
+    right.providerCreatedAt,
+    right.providerRefundId,
+    right.refundId
+  );
+}
+
+function compareRefundChronology(
+  leftCreatedAt: Date,
+  leftProviderId: string,
+  leftInternalId: string,
+  rightCreatedAt: Date,
+  rightProviderId: string,
+  rightInternalId: string
+): number {
+  return leftCreatedAt.getTime() - rightCreatedAt.getTime() ||
+    compareC(leftProviderId, rightProviderId) ||
+    compareC(leftInternalId, rightInternalId);
 }
 
 export function allocateDeterministicRefunds(
@@ -243,7 +266,8 @@ export interface RefundFulfillmentDependencies {
   messages: RefundAccessMessageEnqueuer;
   createAllocation?: (
     transaction: DatabaseTransaction,
-    allocation: NewRefundAllocationRow
+    allocation: NewRefundAllocationRow,
+    component: Omit<NewRefundAllocationComponentRow, 'id' | 'refundAllocationId'>
   ) => Promise<void>;
   projectEntitlement?: ProjectEntitlement;
   appendAuditEvent?: AppendAuditEvent;
@@ -259,9 +283,152 @@ export interface RefundFulfillmentDependencies {
 
 async function createAllocation(
   transaction: DatabaseTransaction,
-  allocation: NewRefundAllocationRow
+  allocation: NewRefundAllocationRow,
+  component: Omit<NewRefundAllocationComponentRow, 'id' | 'refundAllocationId'>
 ): Promise<void> {
-  await transaction.insert(refundAllocations).values(allocation);
+  const [inserted] = await transaction
+    .insert(refundAllocations)
+    .values(allocation)
+    .returning({ id: refundAllocations.id });
+  if (!inserted) permanent();
+  await transaction.insert(refundAllocationComponents).values({
+    ...component,
+    refundAllocationId: inserted.id
+  });
+}
+
+type RefundComponentWrite = Omit<
+  NewRefundAllocationComponentRow,
+  'id' | 'refundAllocationId'
+>;
+
+function compareC(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function planRefundAllocationComponents(input: {
+  items: readonly OrderItemRow[];
+  refunds: readonly RefundRow[];
+  existingAllocations: readonly RefundAllocationRow[];
+  existingComponents: readonly RefundAllocationComponentRow[];
+  newAllocations: readonly NewRefundAllocation[];
+  createdAt: Date;
+}): ReadonlyArray<{ allocation: NewRefundAllocation; component: RefundComponentWrite }> {
+  const itemsById = new Map(input.items.map((item) => [item.id, item]));
+  const refundsById = new Map(input.refunds.map((refund) => [refund.id, refund]));
+  const remainingByItem = new Map<string, { subtotalMinor: bigint; taxMinor: bigint }>();
+  for (const item of input.items) {
+    if (
+      item.totalMinor === null ||
+      item.taxMinor === null ||
+      !Number.isSafeInteger(item.unitSubtotalMinor) ||
+      !Number.isSafeInteger(item.taxMinor) ||
+      !Number.isSafeInteger(item.totalMinor) ||
+      item.unitSubtotalMinor < 0 ||
+      item.taxMinor < 0 ||
+      item.unitSubtotalMinor + item.taxMinor !== item.totalMinor
+    ) permanent();
+    remainingByItem.set(item.id, {
+      subtotalMinor: BigInt(item.unitSubtotalMinor),
+      taxMinor: BigInt(item.taxMinor)
+    });
+  }
+
+  const componentByAllocationId = new Map<string, RefundAllocationComponentRow>();
+  for (const component of input.existingComponents) {
+    if (componentByAllocationId.has(component.refundAllocationId)) permanent();
+    componentByAllocationId.set(component.refundAllocationId, component);
+  }
+  if (componentByAllocationId.size !== input.existingAllocations.length) permanent();
+  for (const allocation of input.existingAllocations) {
+    const component = componentByAllocationId.get(allocation.id);
+    const item = itemsById.get(allocation.orderItemId);
+    const refund = refundsById.get(allocation.refundId);
+    const remaining = remainingByItem.get(allocation.orderItemId);
+    if (
+      !component ||
+      !item ||
+      !refund ||
+      !remaining ||
+      component.refundId !== allocation.refundId ||
+      component.orderItemId !== allocation.orderItemId ||
+      component.currency !== item.currency ||
+      component.currency !== refund.currency ||
+      component.totalMinor !== allocation.amountMinor ||
+      component.subtotalMinor + component.taxMinor !== component.totalMinor ||
+      component.subtotalMinor < 0 ||
+      component.taxMinor < 0 ||
+      BigInt(component.subtotalMinor) > remaining.subtotalMinor ||
+      BigInt(component.taxMinor) > remaining.taxMinor
+    ) permanent();
+    remaining.subtotalMinor -= BigInt(component.subtotalMinor);
+    remaining.taxMinor -= BigInt(component.taxMinor);
+  }
+
+  const sorted = [...input.newAllocations].sort((left, right) => {
+    const leftRefund = refundsById.get(left.refundId);
+    const rightRefund = refundsById.get(right.refundId);
+    if (!leftRefund || !rightRefund) permanent();
+    return compareC(left.orderItemId, right.orderItemId) ||
+      leftRefund.providerCreatedAt.getTime() - rightRefund.providerCreatedAt.getTime() ||
+      compareC(leftRefund.stripeRefundId, rightRefund.stripeRefundId) ||
+      compareC(leftRefund.id, rightRefund.id) ||
+      compareC(left.refundId, right.refundId);
+  });
+  const seen = new Set<string>();
+  return sorted.map((allocation) => {
+    const key = `${allocation.refundId}\0${allocation.orderItemId}`;
+    const item = itemsById.get(allocation.orderItemId);
+    const refund = refundsById.get(allocation.refundId);
+    const remaining = remainingByItem.get(allocation.orderItemId);
+    if (
+      seen.has(key) ||
+      !item ||
+      !refund ||
+      !remaining ||
+      refund.status !== 'succeeded' ||
+      refund.currency !== item.currency ||
+      !Number.isSafeInteger(allocation.amountMinor) ||
+      allocation.amountMinor < 1
+    ) permanent();
+    seen.add(key);
+
+    const amountMinor = BigInt(allocation.amountMinor);
+    const remainingTotal = remaining.subtotalMinor + remaining.taxMinor;
+    if (remainingTotal <= 0n || amountMinor > remainingTotal) permanent();
+    let subtotalMinor = amountMinor * remaining.subtotalMinor / remainingTotal;
+    let taxMinor = amountMinor * remaining.taxMinor / remainingTotal;
+    const subtotalRemainder = amountMinor * remaining.subtotalMinor % remainingTotal;
+    const taxRemainder = amountMinor * remaining.taxMinor % remainingTotal;
+    const leftover = amountMinor - subtotalMinor - taxMinor;
+    if (leftover < 0n || leftover > 1n) permanent();
+    if (leftover === 1n) {
+      const subtotalTieKey = `${item.id}:subtotal`;
+      const taxTieKey = `${item.id}:tax`;
+      if (
+        subtotalRemainder > taxRemainder ||
+        (subtotalRemainder === taxRemainder && compareC(subtotalTieKey, taxTieKey) < 0)
+      ) subtotalMinor += 1n;
+      else taxMinor += 1n;
+    }
+    if (
+      subtotalMinor > remaining.subtotalMinor ||
+      taxMinor > remaining.taxMinor ||
+      subtotalMinor + taxMinor !== amountMinor
+    ) permanent();
+    remaining.subtotalMinor -= subtotalMinor;
+    remaining.taxMinor -= taxMinor;
+    const component: RefundComponentWrite = {
+      refundId: allocation.refundId,
+      orderItemId: allocation.orderItemId,
+      subtotalMinor: Number(subtotalMinor),
+      taxMinor: Number(taxMinor),
+      totalMinor: allocation.amountMinor,
+      currency: item.currency,
+      createdAt: input.createdAt
+    };
+    return { allocation, component };
+  });
 }
 
 function permanent(): never {
@@ -322,15 +489,20 @@ async function storeCanonicalRefund(
     if (canonical.state === 'pending') return existing.status;
     return permanent();
   })();
+  const allocationStatus = status === 'succeeded'
+    ? existing.allocationStatus
+    : 'not_applicable';
+  const projectionChanged = status !== existing.status ||
+    allocationStatus !== existing.allocationStatus;
   const [updated] = await transaction
     .update(refunds)
     .set({
       status,
       reason: status === existing.status ? existing.reason : canonical.reason,
-      allocationStatus: status === 'succeeded'
-        ? existing.allocationStatus
-        : 'not_applicable',
-      financialEvidenceStatus: 'pending',
+      allocationStatus,
+      financialEvidenceStatus: projectionChanged
+        ? 'pending'
+        : existing.financialEvidenceStatus,
       updatedAt: now
     })
     .where(eq(refunds.id, existing.id))
@@ -406,13 +578,17 @@ export async function fulfillRefundEvent(
       canonicalRefund,
       now
     );
+    const projectionGraphSourceIds = new Set<string>();
+    if (existing === undefined || existing.status !== canonicalRefundRow.status) {
+      projectionGraphSourceIds.add(canonicalRefundRow.id);
+    }
     const facts = await lockPaymentAccessFacts(transaction, payment, order);
     const allRefunds = facts.refunds;
     const lockedAllocations = facts.refundAllocations;
     const items = facts.orderItems;
     const grants = facts.grants;
 
-    const allocation = allocateDeterministicRefunds({
+    let allocation = allocateDeterministicRefunds({
       items: items.map((item) => ({
         orderItemId: item.id,
         totalMinor: item.totalMinor!,
@@ -432,7 +608,47 @@ export async function fulfillRefundEvent(
         amountMinor: row.amountMinor
       }))
     });
+    if (allocation.state === 'allocated' && lockedAllocations.length > 0) {
+      const componentBackedAllocationIds = new Set(
+        facts.refundComponents.map((component) => component.refundAllocationId)
+      );
+      const refundById = new Map(allRefunds.map((refund) => [refund.id, refund]));
+      const hasOutOfOrderAllocation = allocation.allocations.some((candidate) => {
+        const candidateRefund = refundById.get(candidate.refundId);
+        if (!candidateRefund) permanent();
+        return lockedAllocations.some((existingAllocation) => {
+          if (
+            existingAllocation.orderItemId !== candidate.orderItemId ||
+            !componentBackedAllocationIds.has(existingAllocation.id)
+          ) return false;
+          const existingRefund = refundById.get(existingAllocation.refundId);
+          if (!existingRefund) permanent();
+          return compareRefundChronology(
+            candidateRefund.providerCreatedAt,
+            candidateRefund.stripeRefundId,
+            candidateRefund.id,
+            existingRefund.providerCreatedAt,
+            existingRefund.stripeRefundId,
+            existingRefund.id
+          ) < 0;
+        });
+      });
+      if (hasOutOfOrderAllocation) allocation = { state: 'exception', allocations: [] };
+    }
+    const componentWrites = allocation.state === 'allocated' || allocation.state === 'noop'
+      ? planRefundAllocationComponents({
+          items,
+          refunds: allRefunds,
+          existingAllocations: lockedAllocations,
+          existingComponents: facts.refundComponents,
+          newAllocations: allocation.allocations,
+          createdAt: now
+        })
+      : [];
     const allAllocations = [...lockedAllocations, ...allocation.allocations];
+    for (const created of allocation.allocations) {
+      projectionGraphSourceIds.add(created.refundId);
+    }
     const allocatedByRefund = new Map<string, number>();
     for (const row of allAllocations) {
       const total = (allocatedByRefund.get(row.refundId) ?? 0) + row.amountMinor;
@@ -451,11 +667,18 @@ export async function fulfillRefundEvent(
         }
         return 'exception' as const;
       })();
+      if (refund.allocationStatus !== allocationStatus) {
+        projectionGraphSourceIds.add(refund.id);
+      }
       await transaction
         .update(refunds)
         .set({
           allocationStatus,
-          financialEvidenceStatus: allocation.state === 'exception' ? 'exception' : 'pending',
+          financialEvidenceStatus: allocation.state === 'exception'
+            ? 'exception'
+            : projectionGraphSourceIds.has(refund.id)
+              ? 'pending'
+              : refund.financialEvidenceStatus,
           updatedAt: now
         })
         .where(eq(refunds.id, refund.id));
@@ -466,14 +689,14 @@ export async function fulfillRefundEvent(
       : 'processed';
     let affectedTitleCount = 0;
     if (allocation.state === 'allocated' || allocation.state === 'noop') {
-      for (const row of allocation.allocations) {
+      for (const { allocation: row, component } of componentWrites) {
         await dependencies.createAllocation(transaction, {
           refundId: row.refundId,
           orderItemId: row.orderItemId,
           amountMinor: row.amountMinor,
           source: 'automatic',
           createdAt: now
-        });
+        }, component);
       }
       const fullyAllocatedItems = new Set(items.filter((item) => {
         const total = allAllocations
@@ -556,7 +779,8 @@ export async function fulfillRefundEvent(
     await dependencies.queueFinancialSource(transaction, {
       sourceKind: 'refund',
       sourceId: canonicalRefundRow.id,
-      providerEventId: event.providerEventId
+      providerEventId: event.providerEventId,
+      projectionGraphSourceIds: [...projectionGraphSourceIds].sort()
     });
     await dependencies.completeEvent(transaction, event.id, eventStatus, now);
   });

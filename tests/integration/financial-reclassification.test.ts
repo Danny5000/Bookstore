@@ -3,17 +3,22 @@ import { eq, sql, type SQLWrapper } from 'drizzle-orm';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { describe, expect, it } from 'vitest';
 import type { Database } from '$lib/server/db/client';
+import type { DatabaseTransaction } from '$lib/server/db/transaction';
 import {
   fingerprintBalanceTransaction,
   stageBalanceTransaction
 } from '$lib/server/commerce/financial/ledger';
 import { appendClassificationDecisionLocked } from '$lib/server/commerce/financial/classification';
 import {
-  activateFinancialProjectionVersionLocked,
   rebaseApprovedCorrectionDistributionLocked,
   replayFinancialClassification,
   replayFinancialClassificationLocked
 } from '$lib/server/commerce/financial/rebase';
+import {
+  commitFinancialScanPage,
+  finalizeFinancialReplay,
+  startOrResumeFinancialScan
+} from '$lib/server/commerce/financial/scans/repository';
 import {
   loadCurrentEffectiveAllocationProjection,
   persistFinancialAllocationPlanLocked
@@ -34,6 +39,34 @@ const dialect = new PgDialect();
 
 function rendered(query: unknown): string {
   return dialect.sqlToQuery((query as SQLWrapper).getSQL()).sql;
+}
+
+async function activateProjectionVersionForFixture(
+  transaction: DatabaseTransaction,
+  input: {
+    classifierVersion: number;
+    allocationAlgorithmVersion: number;
+    correlationId: string;
+  }
+): Promise<void> {
+  const scanRunId = randomUUID();
+  await transaction.execute(sql`
+    update financial_projection_versions set
+      pending_classifier_version = ${input.classifierVersion},
+      pending_allocation_algorithm_version = ${input.allocationAlgorithmVersion},
+      pending_replay_id = ${`c${input.classifierVersion}-a${input.allocationAlgorithmVersion}`},
+      pending_scan_run_id = ${scanRunId}
+    where singleton = true
+  `);
+  await transaction.execute(sql`
+    update financial_projection_versions set
+      classifier_version = ${input.classifierVersion},
+      allocation_algorithm_version = ${input.allocationAlgorithmVersion},
+      pending_classifier_version = null, pending_allocation_algorithm_version = null,
+      pending_replay_id = null, pending_scan_run_id = null,
+      activated_at = now(), activation_correlation_id = ${input.correlationId}
+    where singleton = true
+  `);
 }
 
 function deferred<Value>() {
@@ -106,7 +139,12 @@ async function legacyUnknownAdjustmentFixture(label: string) {
   return { balanceTransactionId: balance.id, fingerprint };
 }
 
-async function chargeFixture(label: string, withRefund = false) {
+async function chargeFixture(
+  label: string,
+  withRefund = false,
+  seedVersionOne = true,
+  withFeeDetail = false
+) {
   const suffix = `${label}_${randomUUID().replaceAll('-', '')}`;
   const orderId = randomUUID();
   const itemId = randomUUID();
@@ -152,21 +190,32 @@ async function chargeFixture(label: string, withRefund = false) {
   const staged = await stageBalanceTransaction(databaseClient.db, {
     id: `txn_${suffix}`, livemode: false, sourceFamily: 'charge', sourceId: chargeId,
     rawType: 'charge', reportingCategory: 'charge', balanceType: 'payments',
-    amountMinor: 100, feeMinor: 0, netMinor: 100, currency: 'USD', status: 'available',
+    amountMinor: 100, feeMinor: withFeeDetail ? 10 : 0,
+    netMinor: withFeeDetail ? 90 : 100, currency: 'USD', status: 'available',
     createdAt: new Date('2026-08-12T00:00:00.000Z'),
     availableAt: new Date('2026-08-12T01:00:00.000Z'), exchangeRate: null,
-    exchangeSourceCurrency: null, exchangeTargetCurrency: null, feeDetails: []
+    exchangeSourceCurrency: null, exchangeTargetCurrency: null,
+    feeDetails: withFeeDetail
+      ? [{ ordinal: 0, rawType: 'stripe_fee', amountMinor: 10, currency: 'USD' }]
+      : []
   }, { correlationId: `${label}-stage` });
   const fingerprint = (await databaseClient.pool.query<{ fingerprint_sha256: string }>(
     'select fingerprint_sha256 from stripe_balance_transactions where id=$1',
     [staged.balanceTransactionId]
   )).rows[0]!.fingerprint_sha256;
+  const feeDetail = withFeeDetail
+    ? (await databaseClient.pool.query<{
+        id: string; fingerprint_sha256: string;
+      }>(`select id, fingerprint_sha256
+          from stripe_balance_transaction_fee_details
+          where balance_transaction_id=$1`, [staged.balanceTransactionId])).rows[0]
+    : undefined;
   const common = {
     balanceTransactionId: staged.balanceTransactionId, scope: 'title' as const,
     currency: 'USD', algorithmVersion: 1, sourceFingerprint: fingerprint,
     supersedesSetId: null, reversalOfSetId: null
   };
-  await databaseClient.db.transaction(async (tx) => {
+  if (seedVersionOne) await databaseClient.db.transaction(async (tx) => {
     await persistFinancialAllocationPlanLocked(tx, {
       sourceKind: 'payment', sourceId: payment.id, classificationVersion: 1,
       correlationId: `${label}-gross`, plan: {
@@ -185,7 +234,8 @@ async function chargeFixture(label: string, withRefund = false) {
     });
   });
   return { orderId, itemId, paymentId: payment.id, refundId: refund?.id,
-    balanceTransactionId: staged.balanceTransactionId, fingerprint };
+    balanceTransactionId: staged.balanceTransactionId, fingerprint,
+    feeDetailId: feeDetail?.id, feeDetailFingerprint: feeDetail?.fingerprint_sha256 };
 }
 
 async function correctionRebaseGraph(label: string) {
@@ -407,10 +457,110 @@ async function waitForBlockedPid(pid: number, queryFragment: string): Promise<nu
 }
 
 describe('financial classifier and allocation-version replay', () => {
+  it('defers c2 until late c1 preserves the active view, then converges on c2', async () => {
+    const pending = await startOrResumeFinancialScan(databaseClient.db, {
+      kind: 'composite_replay', classifierVersion: 2,
+      allocationAlgorithmVersion: 2, replayId: 'c2-a2'
+    });
+    const fixture = await chargeFixture('reclassification-c2-first', false, false);
+    const replay = (classifierVersion: number, allocationAlgorithmVersion: number,
+      correlationId: string, scanRunId?: string) => replayFinancialClassification({
+        database: databaseClient.db,
+        targetClassifierVersion: classifierVersion,
+        targetAllocationAlgorithmVersion: allocationAlgorithmVersion
+      }, {
+        payload: {
+        subjectType: 'balance_transaction', subjectId: fixture.balanceTransactionId,
+        sourceFingerprintSha256: fixture.fingerprint, classifierVersion,
+        allocationAlgorithmVersion,
+        replayId: `c${classifierVersion}-a${allocationAlgorithmVersion}`,
+          ...(scanRunId === undefined ? {} : { scanRunId })
+        },
+        correlationId, signal: new AbortController().signal
+      });
+
+    await expect(replay(2, 2, 'reclassification-c2-first-create', pending.id))
+      .rejects.toMatchObject({ safeCode: 'state_changed' });
+    await expect(replay(1, 1, 'reclassification-c1-late'))
+      .resolves.toBeUndefined();
+    const activeBeforeC2 = await loadCurrentEffectiveAllocationProjection(databaseClient.db, {
+      balanceTransactionIds: [fixture.balanceTransactionId]
+    });
+    expect(activeBeforeC2).toEqual([
+      expect.objectContaining({ status: 'complete', basis: 'gross_amount' }),
+      expect.objectContaining({ status: 'complete', basis: 'fee' })
+    ]);
+    await expect(replay(2, 2, 'reclassification-c2-after-c1', pending.id))
+      .resolves.toBeUndefined();
+    await expect(replay(2, 2, 'reclassification-c2-exact-retry', pending.id))
+      .resolves.toBeUndefined();
+
+    const sealed = await commitFinancialScanPage(databaseClient.db, {
+      runId: pending.id, expectedPhase: 'classification_replay_page',
+      expectedCheckpoint: null, expectedPageCount: 0,
+      nextPhase: 'classification_replay_page', nextCheckpoint: null,
+      processedCount: 0, children: [], complete: true
+    });
+    const failedSibling = await databaseClient.pool.query(
+      `insert into jobs
+         (type, payload, deduplication_key, status, attempts, max_attempts,
+          completed_at, last_error)
+       values ('commerce.financial-classification', $1::jsonb, $2, 'failed', 5, 5,
+         now(), 'bounded sibling failure') returning id`,
+      [JSON.stringify({
+        subjectType: 'balance_transaction', subjectId: randomUUID(),
+        sourceFingerprintSha256: 'f'.repeat(64), classifierVersion: 2,
+        allocationAlgorithmVersion: 2, replayId: 'c2-a2', scanRunId: pending.id
+      }), `reclassification-failed-sibling:${randomUUID()}`]
+    );
+    expect(failedSibling.rowCount).toBe(1);
+    await expect(finalizeFinancialReplay(databaseClient.db, {
+      runId: pending.id, expectedCursorDigestSha256: sealed.cursorDigestSha256!,
+      expectedPageCount: sealed.pageCount, classifierVersion: 2,
+      allocationAlgorithmVersion: 2,
+      correlationId: 'reclassification-c2-blocked-finalize'
+    })).rejects.toMatchObject({ safeCode: 'state_changed' });
+    const authority = await databaseClient.pool.query<{
+      classifier_version: number; allocation_algorithm_version: number;
+      pending_classifier_version: number | null;
+      pending_allocation_algorithm_version: number | null;
+    }>(`select classifier_version, allocation_algorithm_version,
+          pending_classifier_version, pending_allocation_algorithm_version
+        from financial_projection_versions where singleton=true`);
+    expect(authority.rows[0]).toEqual({
+      classifier_version: 1, allocation_algorithm_version: 1,
+      pending_classifier_version: 2, pending_allocation_algorithm_version: 2
+    });
+
+    const sets = await databaseClient.pool.query<{
+      id: string; classifier_version: number; algorithm_version: number;
+      allocation_identity: string;
+    }>(`select id, classifier_version, algorithm_version, allocation_identity
+      from financial_allocation_sets
+        where balance_transaction_id=$1 order by basis`, [fixture.balanceTransactionId]);
+    expect(sets.rows).toHaveLength(4);
+    expect(sets.rows.filter((set) => set.classifier_version === 2 &&
+      set.algorithm_version === 2 && set.allocation_identity.includes(':replay:c2-a2:')))
+      .toHaveLength(2);
+    const current = await loadCurrentEffectiveAllocationProjection(databaseClient.db, {
+      balanceTransactionIds: [fixture.balanceTransactionId]
+    });
+    expect(current).toEqual([
+      expect.objectContaining({ status: 'complete', basis: 'gross_amount',
+        baseSetId: expect.stringMatching(/^[0-9a-f-]{36}$/u) }),
+      expect.objectContaining({ status: 'complete', basis: 'fee',
+        baseSetId: expect.stringMatching(/^[0-9a-f-]{36}$/u) })
+    ]);
+    const activeIds = sets.rows.filter((set) => set.classifier_version === 1 &&
+      set.algorithm_version === 1).map((set) => set.id).sort();
+    expect(current.map((head) => 'baseSetId' in head ? head.baseSetId : null).sort())
+      .toEqual(activeIds);
+  });
+
   it('appends a target decision and successor sets without editing version-one history', async () => {
     const fixture = await adjustmentFixture('reclassification-append');
     const result = await databaseClient.db.transaction(async (tx) => {
-      await activateFinancialProjectionVersionLocked(tx, {
+      await activateProjectionVersionForFixture(tx, {
         classifierVersion: 2, allocationAlgorithmVersion: 3,
         correlationId: 'reclassification-activate-c2-a3'
       });
@@ -458,21 +608,29 @@ describe('financial classifier and allocation-version replay', () => {
 
   it('reclassifies historical unknown durable evidence as supported without mutating history', async () => {
     const fixture = await legacyUnknownAdjustmentFixture('reclassification-unknown');
-    const result = await databaseClient.db.transaction(async (tx) => {
-      await activateFinancialProjectionVersionLocked(tx, {
-        classifierVersion: 2, allocationAlgorithmVersion: 3,
-        correlationId: 'reclassification-unknown-activate'
-      });
-      return replayFinancialClassificationLocked(tx, {
+    const pending = await startOrResumeFinancialScan(databaseClient.db, {
+      kind: 'composite_replay', classifierVersion: 2,
+      allocationAlgorithmVersion: 3, replayId: 'c2-a3'
+    });
+    await expect(databaseClient.pool.query(
+      `select id from financial_allocation_sets where balance_transaction_id=$1`,
+      [fixture.balanceTransactionId]
+    )).resolves.toMatchObject({ rowCount: 0 });
+    await expect(replayFinancialClassification({
+      database: databaseClient.db,
+      targetClassifierVersion: 2,
+      targetAllocationAlgorithmVersion: 3
+    }, {
+      payload: {
         subjectType: 'balance_transaction', subjectId: fixture.balanceTransactionId,
         sourceFingerprintSha256: fixture.fingerprint, classifierVersion: 2,
         allocationAlgorithmVersion: 3, replayId: 'c2-a3',
-        correlationId: 'reclassification-unknown-replay'
-      });
-    });
+        scanRunId: pending.id
+      },
+      correlationId: 'reclassification-unknown-replay',
+      signal: new AbortController().signal
+    })).resolves.toBeUndefined();
 
-    expect(result).toMatchObject({ status: 'replayed',
-      subjectId: fixture.balanceTransactionId });
     const classifications = await databaseClient.pool.query<{
       classifier_version: number; classification: string;
     }>(`select classifier_version, classification
@@ -492,6 +650,15 @@ describe('financial classifier and allocation-version replay', () => {
       { classifier_version: 2, algorithm_version: 3, supersedes_set_id: null },
       { classifier_version: 2, algorithm_version: 3, supersedes_set_id: null }
     ]);
+    await databaseClient.db.execute(sql`
+      update financial_projection_versions set
+        classifier_version = 2, allocation_algorithm_version = 3,
+        pending_classifier_version = null, pending_allocation_algorithm_version = null,
+        pending_replay_id = null, pending_scan_run_id = null,
+        activated_at = now(),
+        activation_correlation_id = 'reclassification-unknown-activate'
+      where singleton = true and pending_scan_run_id = ${pending.id}
+    `);
     await expect(loadCurrentEffectiveAllocationProjection(databaseClient.db, {
       balanceTransactionIds: [fixture.balanceTransactionId]
     })).resolves.toEqual([
@@ -502,9 +669,88 @@ describe('financial classifier and allocation-version replay', () => {
     ]);
   });
 
+  it('lets c2 recover an exact active unknown fee-detail exception with no allocation tips', async () => {
+    const pending = await startOrResumeFinancialScan(databaseClient.db, {
+      kind: 'composite_replay', classifierVersion: 2,
+      allocationAlgorithmVersion: 2, replayId: 'c2-a2'
+    });
+    const fixture = await chargeFixture(
+      'reclassification-unknown-fee', false, false, true
+    );
+    if (!fixture.feeDetailId || !fixture.feeDetailFingerprint) {
+      throw new Error('Expected fee-detail replay fixture');
+    }
+    await databaseClient.pool.query(
+      'alter table financial_classification_versions disable trigger ' +
+      'financial_classification_versions_immutable'
+    );
+    try {
+      await databaseClient.pool.query(
+        `delete from financial_classification_versions
+          where subject_type='fee_detail' and subject_id=$1 and classifier_version=1`,
+        [fixture.feeDetailId]
+      );
+    } finally {
+      await databaseClient.pool.query(
+        'alter table financial_classification_versions enable trigger ' +
+        'financial_classification_versions_immutable'
+      );
+    }
+    await databaseClient.db.transaction(async (tx) => {
+      await appendClassificationDecisionLocked(tx, {
+        subjectType: 'balance_transaction', subjectId: fixture.balanceTransactionId,
+        classifierVersion: 1, sourceFingerprint: fixture.fingerprint,
+        decision: { status: 'classified', classification: 'charge',
+          impact: 'informational' },
+        correlationId: 'reclassification-active-charge'
+      });
+      await appendClassificationDecisionLocked(tx, {
+        subjectType: 'fee_detail', subjectId: fixture.feeDetailId!,
+        classifierVersion: 1, sourceFingerprint: fixture.feeDetailFingerprint!,
+        decision: { status: 'unknown', classification: 'unknown', impact: 'exception',
+          safeCode: 'unsupported_category' },
+        correlationId: 'reclassification-active-unknown-fee'
+      });
+    });
+    await expect(databaseClient.pool.query(
+      `select id from financial_allocation_sets where balance_transaction_id=$1`,
+      [fixture.balanceTransactionId]
+    )).resolves.toMatchObject({ rowCount: 0 });
+
+    await expect(replayFinancialClassification({
+      database: databaseClient.db,
+      targetClassifierVersion: 2,
+      targetAllocationAlgorithmVersion: 2
+    }, {
+      payload: {
+        subjectType: 'fee_detail', subjectId: fixture.feeDetailId,
+        sourceFingerprintSha256: fixture.feeDetailFingerprint,
+        classifierVersion: 2, allocationAlgorithmVersion: 2,
+        replayId: 'c2-a2', scanRunId: pending.id
+      },
+      correlationId: 'reclassification-unknown-fee-replay',
+      signal: new AbortController().signal
+    })).resolves.toBeUndefined();
+
+    const target = await databaseClient.pool.query<{
+      subject_type: string; classification: string;
+    }>(`select subject_type, classification from financial_classification_versions
+        where classifier_version=2 and subject_id in ($1, $2)
+        order by subject_type`, [fixture.balanceTransactionId, fixture.feeDetailId]);
+    expect(target.rows).toEqual([
+      { subject_type: 'balance_transaction', classification: 'charge' },
+      { subject_type: 'fee_detail', classification: 'processing_fee' }
+    ]);
+    await expect(databaseClient.pool.query(
+      `select id from financial_allocation_sets
+        where balance_transaction_id=$1 and classifier_version=2 and algorithm_version=2`,
+      [fixture.balanceTransactionId]
+    )).resolves.toMatchObject({ rowCount: 2 });
+  });
+
   it('converges two target jobs on one physical successor per basis', async () => {
     const fixture = await adjustmentFixture('reclassification-race');
-    await databaseClient.db.transaction((tx) => activateFinancialProjectionVersionLocked(tx, {
+    await databaseClient.db.transaction((tx) => activateProjectionVersionForFixture(tx, {
       classifierVersion: 2, allocationAlgorithmVersion: 3,
       correlationId: 'reclassification-race-activate'
     }));
@@ -628,7 +874,7 @@ describe('financial classifier and allocation-version replay', () => {
       decision: { status: 'classified', classification: 'fee_credit',
         impact: 'informational' }, correlationId: 'reclassification-seed-fork'
     }));
-    await databaseClient.db.transaction((tx) => activateFinancialProjectionVersionLocked(tx, {
+    await databaseClient.db.transaction((tx) => activateProjectionVersionForFixture(tx, {
       classifierVersion: 2, allocationAlgorithmVersion: 1,
       correlationId: 'reclassification-fork-activate'
     }));
@@ -731,7 +977,7 @@ describe('financial classifier and allocation-version replay', () => {
           approvedMinor: 0, deltaMinor: -30 }
       ]
     });
-    await databaseClient.db.transaction((tx) => activateFinancialProjectionVersionLocked(tx, {
+    await databaseClient.db.transaction((tx) => activateProjectionVersionForFixture(tx, {
       classifierVersion: 2, allocationAlgorithmVersion: 3,
       correlationId: 'reclassification-corrected-capacity-activate'
     }));
@@ -759,6 +1005,61 @@ describe('financial classifier and allocation-version replay', () => {
        where predecessor_correction_set_id=$1`, [targetCorrection]
     );
     expect(successors.rows).toEqual([{ count: '0' }]);
+  });
+
+  it('keeps the active correction tip visible while its target-version successor is pending', async () => {
+    const graph = await correctionRebaseGraph('reclassification-pending-correction');
+    const target = await finalizedRefundEvidence(graph, 'pending-correction-target', [50, 50]);
+    const oldGross = await insertRefundAllocationSet({
+      label: 'pending-correction-old', refundId: target.refundId,
+      balanceTransactionId: target.balanceTransactionId, fingerprint: target.fingerprint,
+      expectedEffectMinor: -100, classifierVersion: 1, algorithmVersion: 1,
+      items: [{ orderItemId: graph.itemA, effectMinor: -50 },
+        { orderItemId: graph.itemB, effectMinor: -50 }]
+    });
+    const newGross = await insertRefundAllocationSet({
+      label: 'pending-correction-new', refundId: target.refundId,
+      balanceTransactionId: target.balanceTransactionId, fingerprint: target.fingerprint,
+      expectedEffectMinor: -100, classifierVersion: 2, algorithmVersion: 3,
+      supersedesSetId: oldGross,
+      items: [{ orderItemId: graph.itemA, effectMinor: -50 },
+        { orderItemId: graph.itemB, effectMinor: -50 }]
+    });
+    const oldCorrection = await insertRefundCorrection({
+      label: 'pending-correction-approved', refundId: target.refundId,
+      baseSetId: oldGross, fingerprint: target.fingerprint, adminId: graph.adminId,
+      items: [
+        { domain: 'settlement', sourceSetId: oldGross, orderItemId: graph.itemA,
+          approvedMinor: -50, deltaMinor: 0 },
+        { domain: 'settlement', sourceSetId: oldGross, orderItemId: graph.itemB,
+          approvedMinor: -50, deltaMinor: 0 },
+        { domain: 'presentment', sourceSetId: null, orderItemId: graph.itemA,
+          approvedMinor: 50, deltaMinor: 0 },
+        { domain: 'presentment', sourceSetId: null, orderItemId: graph.itemB,
+          approvedMinor: 50, deltaMinor: 0 }
+      ]
+    });
+
+    await expect(databaseClient.db.transaction((tx) =>
+      rebaseApprovedCorrectionDistributionLocked(tx, {
+        balanceTransactionId: target.balanceTransactionId, basis: 'gross_amount',
+        previousAllocationSetId: oldGross, replacementAllocationSetId: newGross,
+        approvedCorrectionSetId: oldCorrection,
+        expectedSourceFingerprint: target.fingerprint,
+        correlationId: 'reclassification-pending-correction-rebase'
+      }))).resolves.toMatchObject({ status: 'rebased' });
+
+    const activeHead = await databaseClient.pool.query<{
+      base_set_id: string; compatible_correction_tip_id: string | null; is_complete: boolean;
+    }>(`select base_set_id, compatible_correction_tip_id, is_complete
+        from current_financial_projection_heads
+        where balance_transaction_id=$1 and basis='gross_amount'`,
+      [target.balanceTransactionId]);
+    expect(activeHead.rows).toEqual([{
+      base_set_id: oldGross,
+      compatible_correction_tip_id: oldCorrection,
+      is_complete: true
+    }]);
   });
 
   it('refuses to rebase a correction omitting a nonzero presentment component', async () => {
@@ -791,7 +1092,7 @@ describe('financial classifier and allocation-version replay', () => {
           approvedMinor: 50, deltaMinor: 0 }
       ]
     });
-    await databaseClient.db.transaction((tx) => activateFinancialProjectionVersionLocked(tx, {
+    await databaseClient.db.transaction((tx) => activateProjectionVersionForFixture(tx, {
       classifierVersion: 2, allocationAlgorithmVersion: 3,
       correlationId: 'reclassification-omitted-presentment-activate'
     }));
@@ -818,7 +1119,13 @@ describe('financial classifier and allocation-version replay', () => {
   });
 
   it('enforces singleton activation as componentwise-monotonic durable state', async () => {
-    await databaseClient.db.transaction((tx) => activateFinancialProjectionVersionLocked(tx, {
+    await expect(databaseClient.db.execute(sql`
+      update financial_projection_versions
+      set classifier_version = 2, allocation_algorithm_version = 3,
+        activated_at = now(), activation_correlation_id = 'barrier-free-forbidden'
+      where singleton = true
+    `)).rejects.toMatchObject({ cause: { code: '55000' } });
+    await databaseClient.db.transaction((tx) => activateProjectionVersionForFixture(tx, {
       classifierVersion: 2, allocationAlgorithmVersion: 3,
       correlationId: 'reclassification-monotonic'
     }));

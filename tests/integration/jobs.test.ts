@@ -1,7 +1,9 @@
 import { eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
-import { jobs } from '$lib/server/db/schema';
+import { financialProjectionVersions, financialScanRuns, jobs } from '$lib/server/db/schema';
 import { enqueueJob, createPostgresJobRepository } from '$lib/server/jobs/repository';
+import { processFinancialScanJob } from '$lib/server/commerce/financial/scans/service';
+import type { StripeCommerceGateway } from '$lib/server/commerce/stripe/types';
 import { applicationConfig, databaseClient } from './database';
 
 describe('PostgreSQL jobs', () => {
@@ -65,6 +67,14 @@ describe('PostgreSQL jobs', () => {
 
   it('leaves provider-backed work pending in local-only mode while claiming local work', async () => {
     const due = new Date('2026-08-12T12:00:00.000Z');
+    const replayRunId = crypto.randomUUID();
+    const replayDigest = 'b'.repeat(64);
+    await databaseClient.db.insert(financialScanRuns).values({
+      id: replayRunId, rootKey: 'commerce.financial-classification:scan:1:1',
+      kind: 'classification_replay', phase: 'classification_replay_page',
+      classifierVersion: 1, allocationAlgorithmVersion: 1, replayId: 'c1-a1',
+      cursorDigestSha256: replayDigest
+    });
     const providerJobs = [
       { type: 'commerce.stripe-event', payload: { stripeEventId: crypto.randomUUID() } },
       { type: 'commerce.financial-source', payload: { sourceKind: 'payment' } },
@@ -77,10 +87,18 @@ describe('PostgreSQL jobs', () => {
     ] as const;
     const localJobs = [
       { type: 'test.local-only', payload: {} },
-      { type: 'commerce.financial-classification', payload: {} },
-      { type: 'commerce.financial-scan', payload: { kind: 'composite_replay' } },
+      { type: 'commerce.financial-classification', payload: {
+        subjectType: 'balance_transaction', subjectId: crypto.randomUUID(),
+        sourceFingerprintSha256: 'a'.repeat(64), classifierVersion: 1,
+        allocationAlgorithmVersion: 1, replayId: 'c1-a1'
+      } },
       { type: 'commerce.financial-scan', payload: {
-        kind: 'continuation', phase: 'classification_replay_page'
+        kind: 'composite_replay', classifierVersion: 1,
+        allocationAlgorithmVersion: 1, replayId: 'c1-a1'
+      } },
+      { type: 'commerce.financial-scan', payload: {
+        kind: 'continuation', scanRunId: replayRunId,
+        phase: 'classification_replay_page', cursorDigestSha256: replayDigest, limit: 100
       } }
     ] as const;
     for (const [index, job] of [...providerJobs, ...localJobs].entries()) {
@@ -111,6 +129,303 @@ describe('PostgreSQL jobs', () => {
     ]);
     expect(await databaseClient.db.select().from(jobs).where(eq(jobs.status, 'pending')))
       .toHaveLength(providerJobs.length);
+  });
+
+  it('leaves predecessor classification work and replay roots for a retaining worker', async () => {
+    const due = new Date(0);
+    await enqueueJob(databaseClient.db, {
+      type: 'commerce.financial-classification',
+      payload: {
+        subjectType: 'balance_transaction', subjectId: crypto.randomUUID(),
+        sourceFingerprintSha256: 'a'.repeat(64), classifierVersion: 1,
+        allocationAlgorithmVersion: 1, replayId: 'c1-a1'
+      },
+      deduplicationKey: `test:predecessor-classification:${crypto.randomUUID()}`,
+      runAt: due, maxAttempts: 5
+    });
+    await enqueueJob(databaseClient.db, {
+      type: 'commerce.financial-scan',
+      payload: {
+        kind: 'composite_replay', classifierVersion: 1,
+        allocationAlgorithmVersion: 1, replayId: 'c1-a1'
+      },
+      deduplicationKey: `test:predecessor-replay-root:${crypto.randomUUID()}`,
+      runAt: due, maxAttempts: 8
+    });
+    const repository = createPostgresJobRepository(
+      databaseClient.db, applicationConfig.jobs, () => new Date(1), 'all',
+      { classifierVersion: 2, allocationAlgorithmVersion: 2 }
+    );
+
+    await expect(repository.claimNext('new-implementation-worker')).resolves.toBeNull();
+    expect(await databaseClient.db.select().from(jobs).where(eq(jobs.status, 'pending')))
+      .toHaveLength(2);
+  });
+
+  it('pins provider-backed financial claims to the active implementation until activation', async () => {
+    const scanRunId = crypto.randomUUID();
+    await databaseClient.db.update(financialProjectionVersions).set({
+      pendingClassifierVersion: 2,
+      pendingAllocationAlgorithmVersion: 2,
+      pendingReplayId: 'c2-a2',
+      pendingScanRunId: scanRunId
+    });
+    const due = new Date(0);
+    const providerJobs = [
+      {
+        type: 'commerce.financial-source',
+        payload: {
+          sourceKind: 'payment', sourceId: crypto.randomUUID(),
+          trigger: { kind: 'event', providerEventId: 'evt_active_claim_source' }
+        },
+        maxAttempts: 12
+      },
+      {
+        type: 'commerce.financial-payout',
+        payload: {
+          providerPayoutId: 'po_active_claim',
+          trigger: { kind: 'event', providerEventId: 'evt_active_claim_payout' }
+        },
+        maxAttempts: 12
+      },
+      {
+        type: 'commerce.financial-scan',
+        payload: { kind: 'hourly', scanGenerationHour: '2026-08-12T12:00:00.000Z' },
+        maxAttempts: 8
+      }
+    ] as const;
+    for (const [index, job] of providerJobs.entries()) {
+      await enqueueJob(databaseClient.db, {
+        ...job,
+        runAt: due,
+        deduplicationKey: `test:active-implementation-provider:${index}`
+      });
+    }
+    const pendingWorker = createPostgresJobRepository(
+      databaseClient.db, applicationConfig.jobs, () => new Date(1), 'all',
+      { classifierVersion: 2, allocationAlgorithmVersion: 2 }
+    );
+    const activeWorker = createPostgresJobRepository(
+      databaseClient.db, applicationConfig.jobs, () => new Date(1), 'all',
+      { classifierVersion: 1, allocationAlgorithmVersion: 1 }
+    );
+
+    await expect(pendingWorker.claimNext('pending-provider-worker')).resolves.toBeNull();
+    for (const expected of providerJobs) {
+      const claimed = await activeWorker.claimNext('active-provider-worker');
+      expect(claimed?.type).toBe(expected.type);
+      await expect(activeWorker.complete(claimed!.id, 'active-provider-worker')).resolves.toBe(true);
+    }
+
+    await databaseClient.db.update(financialProjectionVersions).set({
+      classifierVersion: 2,
+      allocationAlgorithmVersion: 2,
+      pendingClassifierVersion: null,
+      pendingAllocationAlgorithmVersion: null,
+      pendingReplayId: null,
+      pendingScanRunId: null,
+      activatedAt: new Date('2099-08-12T13:00:00.000Z'),
+      activationCorrelationId: 'test-provider-claim-activation'
+    });
+    const postActivation = await enqueueJob(databaseClient.db, {
+      ...providerJobs[0],
+      runAt: due,
+      deduplicationKey: 'test:active-implementation-provider:after-activation'
+    });
+    await expect(activeWorker.claimNext('retired-provider-worker')).resolves.toBeNull();
+    await expect(pendingWorker.claimNext('activated-provider-worker')).resolves.toMatchObject({
+      id: postActivation.id,
+      type: 'commerce.financial-source'
+    });
+  });
+
+  it('only lets the owning implementation claim replay page and finalizer continuations', async () => {
+    const scanRunId = crypto.randomUUID();
+    const pageDigest = 'c'.repeat(64);
+    const finalizeDigest = 'd'.repeat(64);
+    await databaseClient.db.insert(financialScanRuns).values({
+      id: scanRunId, rootKey: 'commerce.financial-classification:scan:2:2',
+      kind: 'classification_replay', phase: 'classification_replay_page',
+      classifierVersion: 2, allocationAlgorithmVersion: 2, replayId: 'c2-a2',
+      cursorDigestSha256: pageDigest
+    });
+    const page = await enqueueJob(databaseClient.db, {
+      type: 'commerce.financial-scan',
+      payload: {
+        kind: 'continuation', scanRunId, phase: 'classification_replay_page',
+        cursorDigestSha256: pageDigest, limit: 100
+      },
+      deduplicationKey: `test:replay-page:${scanRunId}`, runAt: new Date(0)
+    });
+    const oldWorker = createPostgresJobRepository(
+      databaseClient.db, applicationConfig.jobs, () => new Date(1), 'local-only',
+      { classifierVersion: 1, allocationAlgorithmVersion: 1 }
+    );
+    const owningWorker = createPostgresJobRepository(
+      databaseClient.db, applicationConfig.jobs, () => new Date(1), 'local-only',
+      { classifierVersion: 2, allocationAlgorithmVersion: 2 }
+    );
+
+    await expect(oldWorker.claimNext('old-page-worker')).resolves.toBeNull();
+    await expect(owningWorker.claimNext('owning-page-worker')).resolves.toMatchObject({
+      id: page.id, payload: expect.objectContaining({ phase: 'classification_replay_page' })
+    });
+    await expect(owningWorker.complete(page.id, 'owning-page-worker')).resolves.toBe(true);
+
+    await databaseClient.db.update(financialScanRuns).set({
+      phase: 'classification_replay_finalize', cursorDigestSha256: finalizeDigest
+    }).where(eq(financialScanRuns.id, scanRunId));
+    const finalizer = await enqueueJob(databaseClient.db, {
+      type: 'commerce.financial-scan',
+      payload: {
+        kind: 'continuation', scanRunId, phase: 'classification_replay_finalize',
+        cursorDigestSha256: finalizeDigest, limit: 100
+      },
+      deduplicationKey: `test:replay-finalizer-version:${scanRunId}`,
+      runAt: new Date(0)
+    });
+
+    await expect(oldWorker.claimNext('old-finalizer-worker')).resolves.toBeNull();
+    await expect(owningWorker.claimNext('owning-finalizer-worker')).resolves.toMatchObject({
+      id: finalizer.id,
+      payload: expect.objectContaining({ phase: 'classification_replay_finalize' })
+    });
+  });
+
+  it('reclaims owning replay continuations after their run transition committed', async () => {
+    const scanRunId = crypto.randomUUID();
+    const pageDigest = 'e'.repeat(64);
+    const finalizeDigest = 'f'.repeat(64);
+    let currentTime = new Date('2026-08-12T12:00:00.000Z');
+    await databaseClient.db.insert(financialScanRuns).values({
+      id: scanRunId, rootKey: 'commerce.financial-classification:scan:2:2',
+      kind: 'classification_replay', phase: 'classification_replay_page',
+      classifierVersion: 2, allocationAlgorithmVersion: 2, replayId: 'c2-a2',
+      cursorDigestSha256: pageDigest
+    });
+    const page = await enqueueJob(databaseClient.db, {
+      type: 'commerce.financial-scan',
+      payload: {
+        kind: 'continuation', scanRunId, phase: 'classification_replay_page',
+        cursorDigestSha256: pageDigest, limit: 100
+      },
+      deduplicationKey: `test:replay-page-crash:${scanRunId}`, runAt: new Date(0)
+    });
+    const owningWorker = createPostgresJobRepository(
+      databaseClient.db, applicationConfig.jobs, () => currentTime, 'local-only',
+      { classifierVersion: 2, allocationAlgorithmVersion: 2 }
+    );
+    const retiredWorker = createPostgresJobRepository(
+      databaseClient.db, applicationConfig.jobs, () => currentTime, 'local-only',
+      { classifierVersion: 1, allocationAlgorithmVersion: 1 }
+    );
+    const replayDependencies = {
+      database: databaseClient.db,
+      gateway: new Proxy({}, {
+        get: () => () => { throw new Error('stale replay continuation must not call Stripe'); }
+      }) as StripeCommerceGateway,
+      runtimeMode: 'disabled' as const
+    };
+
+    await expect(owningWorker.claimNext('page-crash-worker')).resolves.toMatchObject({ id: page.id });
+    await databaseClient.db.update(financialScanRuns).set({
+      phase: 'classification_replay_finalize', checkpoint: null,
+      cursorDigestSha256: finalizeDigest
+    }).where(eq(financialScanRuns.id, scanRunId));
+    currentTime = new Date(currentTime.getTime() + applicationConfig.jobs.leaseMs + 1);
+
+    await expect(retiredWorker.claimNext('retired-page-recovery')).resolves.toBeNull();
+    const recoveredPage = await owningWorker.claimNext('page-recovery-worker');
+    expect(recoveredPage).toMatchObject({
+      id: page.id,
+      payload: expect.objectContaining({ phase: 'classification_replay_page' })
+    });
+    await expect(processFinancialScanJob(replayDependencies, {
+      payload: recoveredPage!.payload as never,
+      correlationId: 'replay-page-crash-recovery', signal: new AbortController().signal
+    })).resolves.toEqual({ status: 'unchanged', runId: null });
+    await expect(owningWorker.complete(page.id, 'page-recovery-worker')).resolves.toBe(true);
+
+    const finalizer = await enqueueJob(databaseClient.db, {
+      type: 'commerce.financial-scan',
+      payload: {
+        kind: 'continuation', scanRunId, phase: 'classification_replay_finalize',
+        cursorDigestSha256: finalizeDigest, limit: 100
+      },
+      deduplicationKey: `test:replay-finalizer-crash:${scanRunId}`, runAt: new Date(0)
+    });
+    await expect(owningWorker.claimNext('finalizer-crash-worker')).resolves.toMatchObject({
+      id: finalizer.id
+    });
+    await databaseClient.db.update(financialScanRuns).set({
+      state: 'completed', safeOutcome: 'completed', cursorDigestSha256: null,
+      completedAt: currentTime
+    }).where(eq(financialScanRuns.id, scanRunId));
+    currentTime = new Date(currentTime.getTime() + applicationConfig.jobs.leaseMs + 1);
+
+    await expect(retiredWorker.claimNext('retired-finalizer-recovery')).resolves.toBeNull();
+    const recoveredFinalizer = await owningWorker.claimNext('finalizer-recovery-worker');
+    expect(recoveredFinalizer).toMatchObject({
+      id: finalizer.id,
+      payload: expect.objectContaining({ phase: 'classification_replay_finalize' })
+    });
+    await expect(processFinancialScanJob(replayDependencies, {
+      payload: recoveredFinalizer!.payload as never,
+      correlationId: 'replay-finalizer-crash-recovery', signal: new AbortController().signal
+    })).resolves.toEqual({ status: 'unchanged', runId: null });
+    await expect(owningWorker.complete(finalizer.id, 'finalizer-recovery-worker')).resolves.toBe(true);
+    await expect(databaseClient.db.select().from(jobs).where(eq(jobs.id, finalizer.id)))
+      .resolves.toEqual([expect.objectContaining({ status: 'succeeded', attempts: 2 })]);
+  });
+
+  it('keeps a replay finalizer claim-ineligible while any run-linked child failed', async () => {
+    const scanRunId = crypto.randomUUID();
+    const due = new Date(0);
+    await databaseClient.db.insert(financialScanRuns).values({
+      id: scanRunId, rootKey: 'commerce.financial-classification:scan:2:2',
+      kind: 'classification_replay', phase: 'classification_replay_finalize',
+      classifierVersion: 2, allocationAlgorithmVersion: 2, replayId: 'c2-a2',
+      cursorDigestSha256: 'b'.repeat(64)
+    });
+    await enqueueJob(databaseClient.db, {
+      type: 'commerce.financial-classification',
+      payload: {
+        subjectType: 'balance_transaction', subjectId: crypto.randomUUID(),
+        sourceFingerprintSha256: 'a'.repeat(64), classifierVersion: 2,
+        allocationAlgorithmVersion: 2, replayId: 'c2-a2', scanRunId
+      },
+      deduplicationKey: `test:replay-child:${scanRunId}`, runAt: due, maxAttempts: 1
+    });
+    await enqueueJob(databaseClient.db, {
+      type: 'commerce.financial-scan',
+      payload: {
+        kind: 'continuation', scanRunId, phase: 'classification_replay_finalize',
+        cursorDigestSha256: 'b'.repeat(64), limit: 100
+      },
+      deduplicationKey: `test:replay-finalizer:${scanRunId}`, runAt: due
+    });
+    const repository = createPostgresJobRepository(
+      databaseClient.db, applicationConfig.jobs, () => new Date(1), 'local-only',
+      { classifierVersion: 2, allocationAlgorithmVersion: 2 }
+    );
+
+    const child = await repository.claimNext('replay-child-worker');
+    expect(child?.type).toBe('commerce.financial-classification');
+    await expect(repository.fail(
+      child!.id, 'replay-child-worker', 'bounded replay failure', false
+    )).resolves.toBe(true);
+
+    await expect(repository.claimNext('replay-finalizer-worker')).resolves.toBeNull();
+    const [finalizer] = await databaseClient.db.select().from(jobs).where(
+      eq(jobs.deduplicationKey, `test:replay-finalizer:${scanRunId}`)
+    );
+    expect(finalizer?.status).toBe('pending');
+
+    await databaseClient.db.update(jobs).set({ status: 'succeeded' }).where(eq(jobs.id, child!.id));
+    await expect(repository.claimNext('replay-finalizer-worker')).resolves.toMatchObject({
+      id: finalizer!.id, type: 'commerce.financial-scan',
+      payload: expect.objectContaining({ phase: 'classification_replay_finalize', scanRunId })
+    });
   });
 
   it('reschedules a retry and eventually marks an exhausted job failed', async () => {

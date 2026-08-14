@@ -54,14 +54,28 @@ describe('createFinancialClassificationHandler', () => {
     });
   });
 
+  it('rejects a predecessor pair when only the deployed implementation is retained', async () => {
+    const handler = createFinancialClassificationHandler({
+      database: {} as Database, targetClassifierVersion: 2,
+      targetAllocationAlgorithmVersion: 3
+    });
+    const predecessor = job({
+      classifierVersion: 1, allocationAlgorithmVersion: 1, replayId: 'c1-a1'
+    });
+
+    await expect(handler(predecessor, new AbortController().signal))
+      .rejects.toBeInstanceOf(PermanentJobError);
+    expect(replay).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['wrong job family', { type: 'commerce.financial-source' }],
     ['extra payload field', { payload: { ...job().payload, privateProviderText: 'do-not-retain' } }],
     ['tampered deduplication key', { deduplicationKey: 'financial:classification:tampered' }],
     ['null deduplication key', { deduplicationKey: null }],
     ['wrong max attempts', { maxAttempts: 4 }],
-    ['wrong configured classifier', { payload: { ...job().payload, classifierVersion: 1, replayId: 'c1-a3' } }],
-    ['wrong configured algorithm', { payload: { ...job().payload, allocationAlgorithmVersion: 2, replayId: 'c2-a2' } }]
+    ['unsupported future classifier', { payload: { ...job().payload, classifierVersion: 3, replayId: 'c3-a3' } }],
+    ['unsupported future algorithm', { payload: { ...job().payload, allocationAlgorithmVersion: 4, replayId: 'c2-a4' } }]
   ])('rejects %s before replay', async (_name, override) => {
     const handler = createFinancialClassificationHandler({
       database: {} as Database, targetClassifierVersion: 2,

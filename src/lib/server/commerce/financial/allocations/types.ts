@@ -68,7 +68,7 @@ export interface RefundPaymentCapacity {
 }
 
 export interface EarlierFinalizedRefundComponent {
-  readonly refundId: string;
+  readonly providerRefundId: string;
   readonly providerCreatedAt: string;
   readonly orderItemId: string;
   readonly subtotalMinor: number;
@@ -79,7 +79,7 @@ export interface EarlierFinalizedRefundComponent {
 export interface RefundAllocationInput extends FinancialAllocationMetadata {
   readonly sourceKind: 'refund';
   /** Provider identity/time make earlier finalized facts a strict, replayable order. */
-  readonly refundId?: string;
+  readonly providerRefundId?: string;
   readonly providerCreatedAt?: string;
   readonly presentmentAmountMinor: number;
   readonly presentmentCurrency: string;

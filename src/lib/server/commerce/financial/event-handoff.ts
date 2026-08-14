@@ -3,13 +3,16 @@ import { enqueueActiveEntityJob } from '$lib/server/jobs/repository';
 import { PermanentFinancialError } from './errors';
 import {
   createFinancialPayoutEventJob,
-  createFinancialSourceEventJob
+  createFinancialSourceEventJob,
+  createFinancialSourceGraphJob
 } from './jobs';
+import { rearmCurrentProjectionSubjectsForFinancialSources } from './ledger';
 
 export interface FinancialSourceEventHandoff {
   readonly sourceKind: 'payment' | 'refund' | 'dispute';
   readonly sourceId: string;
   readonly providerEventId: string;
+  readonly projectionGraphSourceIds: readonly string[];
 }
 
 export interface FinancialPayoutEventHandoff {
@@ -20,6 +23,8 @@ export interface FinancialPayoutEventHandoff {
 function invalid(): never {
   throw new PermanentFinancialError('invalid_job_payload');
 }
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
 function exact(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -40,7 +45,11 @@ export async function queueFinancialSourceFromEvent(
 ): Promise<void> {
   let definition: ReturnType<typeof createFinancialSourceEventJob>;
   try {
-    if (!exact(input, ['sourceKind', 'sourceId', 'providerEventId'])) invalid();
+    if (!exact(input, [
+      'sourceKind', 'sourceId', 'providerEventId', 'projectionGraphSourceIds'
+    ]) || !Array.isArray(input.projectionGraphSourceIds) ||
+      input.projectionGraphSourceIds.some((sourceId) =>
+        typeof sourceId !== 'string' || !UUID.test(sourceId))) invalid();
     definition = createFinancialSourceEventJob({
       sourceKind: input.sourceKind as FinancialSourceEventHandoff['sourceKind'],
       sourceId: input.sourceId as string,
@@ -56,6 +65,30 @@ export async function queueFinancialSourceFromEvent(
       sourceId: definition.payload.sourceId
     }
   });
+  const projectionSourceIds = [...new Set(input.projectionGraphSourceIds.map(
+    (sourceId) => sourceId.toLowerCase()
+  ))].sort();
+  if (projectionSourceIds.length > 0) {
+    for (const sourceId of projectionSourceIds) {
+      if (sourceId === definition.payload.sourceId) continue;
+      const graphDefinition = createFinancialSourceGraphJob({
+        sourceKind: definition.payload.sourceKind,
+        sourceId,
+        providerEventId: definition.payload.trigger.providerEventId
+      });
+      await enqueueActiveEntityJob(transaction, {
+        ...graphDefinition,
+        activeEntity: {
+          sourceKind: graphDefinition.payload.sourceKind,
+          sourceId: graphDefinition.payload.sourceId
+        }
+      });
+    }
+    await rearmCurrentProjectionSubjectsForFinancialSources(transaction, {
+      sourceKind: definition.payload.sourceKind,
+      sourceIds: projectionSourceIds
+    });
+  }
 }
 
 export async function queueFinancialPayoutFromEvent(

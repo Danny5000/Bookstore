@@ -3,7 +3,6 @@ import type { SQL } from 'drizzle-orm';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { PermanentFinancialError } from './errors';
 import {
-  activateFinancialProjectionVersionLocked,
   rebaseApprovedCorrectionDistributionLocked,
   replayFinancialClassification,
   replayFinancialClassificationLocked
@@ -501,49 +500,93 @@ describe('rebaseApprovedCorrectionDistributionLocked', () => {
   });
 });
 
-describe('activateFinancialProjectionVersionLocked', () => {
-  it('atomically advances a componentwise-monotonic pair', async () => {
-    const database = executor([
-      [{ classifierVersion: 1, allocationAlgorithmVersion: 2 }],
-      [{ classifierVersion: 2, allocationAlgorithmVersion: 3 }],
+describe('replayFinancialClassification operation identity lock', () => {
+  it('still builds an inactive supported target when no composite barrier is registered', async () => {
+    const executorState = executor([
+      [{ classifierVersion: 1, allocationAlgorithmVersion: 1,
+        pendingClassifierVersion: null, pendingAllocationAlgorithmVersion: null,
+        pendingReplayId: null, pendingScanRunId: null }],
       []
     ]);
-    await expect(activateFinancialProjectionVersionLocked(database.tx, {
-      classifierVersion: 2, allocationAlgorithmVersion: 3,
-      correlationId: 'activate-c2-a3'
-    })).resolves.toBe('activated');
-    const renderedCalls = database.calls.map(rendered);
-    expect(renderedCalls[0]?.sql).toContain('for update');
-    expect(renderedCalls[1]?.sql).toContain('update financial_projection_versions');
-    expect(renderedCalls[2]?.params).not.toContain('activate-c2-a3-private');
+    const database = {
+      transaction: async <Value>(work: (transaction: never) => Promise<Value>) =>
+        work(executorState.tx)
+    } as never;
+
+    await replayFinancialClassification({
+      database, targetClassifierVersion: 2, targetAllocationAlgorithmVersion: 3
+    }, {
+      payload: {
+        subjectType: 'balance_transaction', subjectId: balanceTransactionId,
+        sourceFingerprintSha256: 'c'.repeat(64), classifierVersion: 2,
+        allocationAlgorithmVersion: 3, replayId: 'c2-a3'
+      },
+      correlationId: 'inactive-unlinked-replay', signal: new AbortController().signal
+    }).catch(() => undefined);
+
+    expect(executorState.calls.length).toBeGreaterThan(1);
+    expect(executorState.calls.map((query) => rendered(query).sql).join('\n'))
+      .not.toContain('update financial_projection_versions');
   });
 
-  it('never lets a stale worker downgrade the active pair', async () => {
-    const database = executor([
-      [{ classifierVersion: 2, allocationAlgorithmVersion: 3 }]
+  it('still converges a run-linked replay for the already active pair', async () => {
+    const executorState = executor([
+      [{ classifierVersion: 2, allocationAlgorithmVersion: 3,
+        pendingClassifierVersion: null, pendingAllocationAlgorithmVersion: null,
+        pendingReplayId: null, pendingScanRunId: null }],
+      []
     ]);
-    await expect(activateFinancialProjectionVersionLocked(database.tx, {
-      classifierVersion: 1, allocationAlgorithmVersion: 2,
-      correlationId: 'stale-c1-a2'
-    })).resolves.toBe('superseded');
-    expect(database.calls).toHaveLength(1);
+    const database = {
+      transaction: async <Value>(work: (transaction: never) => Promise<Value>) =>
+        work(executorState.tx)
+    } as never;
+
+    await replayFinancialClassification({
+      database, targetClassifierVersion: 2, targetAllocationAlgorithmVersion: 3
+    }, {
+      payload: {
+        subjectType: 'balance_transaction', subjectId: balanceTransactionId,
+        sourceFingerprintSha256: 'c'.repeat(64), classifierVersion: 2,
+        allocationAlgorithmVersion: 3, replayId: 'c2-a3', scanRunId: randomUUID()
+      },
+      correlationId: 'active-run-linked-replay', signal: new AbortController().signal
+    }).catch(() => undefined);
+
+    expect(executorState.calls.length).toBeGreaterThan(1);
   });
 
-  it('fails closed for incomparable version pairs', async () => {
-    const database = executor([
-      [{ classifierVersion: 2, allocationAlgorithmVersion: 1 }]
+  it('never activates the pending target from a run-linked child job', async () => {
+    const scanRunId = randomUUID();
+    const executorState = executor([
+      [{ classifierVersion: 1, allocationAlgorithmVersion: 1,
+        pendingClassifierVersion: 2, pendingAllocationAlgorithmVersion: 3,
+        pendingScanRunId: scanRunId }],
+      []
     ]);
-    await expect(activateFinancialProjectionVersionLocked(database.tx, {
-      classifierVersion: 1, allocationAlgorithmVersion: 2,
-      correlationId: 'incomparable'
-    })).rejects.toMatchObject({
-      name: 'PermanentFinancialError', safeCode: 'source_linkage_mismatch'
-    });
-    expect(database.calls).toHaveLength(1);
-  });
-});
+    const database = {
+      transaction: async <Value>(work: (transaction: never) => Promise<Value>) =>
+        work(executorState.tx)
+    } as never;
 
-describe('replayFinancialClassification operation identity lock', () => {
+    await replayFinancialClassification({
+      database, targetClassifierVersion: 2, targetAllocationAlgorithmVersion: 3
+    }, {
+      payload: {
+        subjectType: 'balance_transaction', subjectId: balanceTransactionId,
+        sourceFingerprintSha256: 'c'.repeat(64), classifierVersion: 2,
+        allocationAlgorithmVersion: 3, replayId: 'c2-a3', scanRunId
+      } as never,
+      correlationId: 'pending-child-does-not-activate',
+      signal: new AbortController().signal
+    }).catch(() => undefined);
+
+    expect(rendered(executorState.calls[0]!).sql).toMatch(
+      /from financial_projection_versions[\s\S]*for update/iu
+    );
+    expect(executorState.calls.map((query) => rendered(query).sql).join('\n'))
+      .not.toContain('update financial_projection_versions');
+  });
+
   it('takes the singleton version row as the first transaction statement and no-ops stale work', async () => {
     const executorState = executor([
       [{ classifierVersion: 3, allocationAlgorithmVersion: 4 }]
@@ -628,8 +671,12 @@ describe('replayFinancialClassificationLocked', () => {
         sourceFamily: 'charge', sourceId: 'ch_safe', rawType: 'charge',
         reportingCategory: 'charge', amountMinor: 100, feeMinor: 10,
         netMinor: 90, currency: 'USD' }],
-      [{ id: grossTip, basis: 'gross_amount', reversalOfSetId: null },
-      { id: feeTip, basis: 'fee', reversalOfSetId: null }],
+      [{ id: grossTip, basis: 'gross_amount', allocationIdentity: 'payment:v1:gross',
+        supersedesSetId: null, reversalOfSetId: null,
+        classifierVersion: 1, algorithmVersion: 1 },
+      { id: feeTip, basis: 'fee', allocationIdentity: 'payment:v1:fee',
+        supersedesSetId: null, reversalOfSetId: null,
+        classifierVersion: 1, algorithmVersion: 1 }],
       [{ id: feeDetailId, rawType: 'stripe_fee', amountMinor: 10,
         currency: 'USD', fingerprintSha256: 'd'.repeat(64) }],
       [], [], []

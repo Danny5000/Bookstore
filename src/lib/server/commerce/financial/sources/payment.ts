@@ -27,7 +27,10 @@ import {
 import { PermanentFinancialError, RetryableFinancialError } from '../errors';
 import { observeFinancialIssue, resolveFinancialIssueAfterRecompute } from '../issues';
 import { stageBalanceTransaction } from '../ledger';
-import { lockFinancialProjectionRows } from '../locks';
+import {
+  lockActiveFinancialProjectionImplementation,
+  lockFinancialProjectionRows
+} from '../locks';
 import type {
   FinancialEvidenceStatus,
   FinancialIssueCode,
@@ -507,6 +510,10 @@ export async function reconcilePaymentFinancialSource(
   throwIfAborted(signal);
 
   return database.transaction(async (tx) => {
+    await lockActiveFinancialProjectionImplementation(tx, {
+      classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
+    });
     const facts = await lockCanonicalPaymentPurchaseFacts(tx, {
       paymentId: routing.id, orderId: routing.orderId, payment: providerPayment, charge
     });
@@ -585,7 +592,9 @@ export async function reconcilePaymentFinancialSource(
             order by current.basis, current.id
           `) as CurrentPaymentAllocationTip[];
           if (currentRows.length > 2 || currentRows.some((row) =>
-            row.sourceKind !== 'payment' || row.sourceId !== routing.id ||
+            !((row.sourceKind === 'payment' && row.sourceId === routing.id) ||
+              (row.sourceKind === 'adjustment' &&
+                row.sourceId === staged.balanceTransactionId)) ||
             !['gross_amount', 'fee'].includes(row.basis)) ||
             new Set(currentRows.map((row) => row.basis)).size !== currentRows.length) {
             throw new PermanentFinancialError('source_linkage_mismatch');

@@ -127,6 +127,42 @@ async function rows(tx: DatabaseTransaction, query: SQL): Promise<unknown[]> {
   return ((await tx.execute(query)) as SqlResult).rows ?? [];
 }
 
+/**
+ * Linearizes an ordinary provider projection against replay activation. Callers must take this
+ * before purchase, payout, balance-transaction, or issue locks so a retained worker either
+ * finishes wholly under its active implementation or retries without publishing stale state.
+ */
+export async function lockActiveFinancialProjectionImplementation(
+  tx: DatabaseTransaction,
+  input: {
+    readonly classifierVersion: number;
+    readonly allocationAlgorithmVersion: number;
+  }
+): Promise<void> {
+  if (!positiveInt32(input.classifierVersion) ||
+    !positiveInt32(input.allocationAlgorithmVersion)) invalid();
+  const authorityRows = await rows(tx, sql`
+    select classifier_version as "classifierVersion",
+      allocation_algorithm_version as "allocationAlgorithmVersion"
+    from financial_projection_versions
+    where singleton = true
+    for update
+  `) as Array<{
+    classifierVersion: number;
+    allocationAlgorithmVersion: number;
+  }>;
+  const authority = authorityRows[0];
+  if (!authority || authorityRows.length !== 1 ||
+    !positiveInt32(authority.classifierVersion) ||
+    !positiveInt32(authority.allocationAlgorithmVersion)) {
+    throw new PermanentFinancialError('source_linkage_mismatch');
+  }
+  if (authority.classifierVersion !== input.classifierVersion ||
+    authority.allocationAlgorithmVersion !== input.allocationAlgorithmVersion) {
+    throw new RetryableFinancialError('state_changed');
+  }
+}
+
 async function advisory(tx: DatabaseTransaction, key: string): Promise<void> {
   await rows(tx, sql`select pg_advisory_xact_lock(hashtextextended(${key}, 0))`);
 }

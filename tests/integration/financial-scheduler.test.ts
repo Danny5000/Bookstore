@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { eq, inArray, sql } from 'drizzle-orm';
+import { eq, inArray, sql, type SQLWrapper } from 'drizzle-orm';
+import { PgDialect } from 'drizzle-orm/pg-core';
 import { expect, it } from 'vitest';
 import {
   createFinancialScheduleEnsurer,
@@ -7,18 +8,72 @@ import {
 } from '$lib/server/commerce/financial/scans/scheduler';
 import { processFinancialScanJob } from '$lib/server/commerce/financial/scans/service';
 import {
+  rearmCurrentProjectionSubjectsForFinancialSource,
+  stageBalanceTransaction
+} from '$lib/server/commerce/financial/ledger';
+import { createFinancialClassificationHandler } from '$lib/server/commerce/financial/handlers/classification';
+import { createFinancialClassificationSubjectJob } from '$lib/server/commerce/financial/jobs';
+import { replayFinancialClassificationLocked } from '$lib/server/commerce/financial/rebase';
+import {
   loadFinancialSourceScanPage,
+  startOrResumeFinancialScan,
   loadIncompletePayoutRunPage
 } from '$lib/server/commerce/financial/scans/repository';
 import type { StripeCommerceGateway } from '$lib/server/commerce/stripe/types';
-import type { FinancialScanRunRow } from '$lib/server/db/schema';
+import type { Database } from '$lib/server/db/client';
+import type { DatabaseTransaction } from '$lib/server/db/transaction';
+import type { FinancialScanRunRow, JsonObject } from '$lib/server/db/schema';
 import {
-  financialReconciliationIssues, financialScanRuns, jobs, orders, payments,
+  financialProjectionVersions, financialReconciliationIssues, financialScanRuns, jobs, orders, payments,
   payoutImportRuns, stripeBalanceTransactions, stripePayouts
 } from '$lib/server/db/schema';
 import { createPostgresJobRepository } from '$lib/server/jobs/repository';
 import { runWorker } from '$lib/server/jobs/runner';
 import { applicationConfig, databaseClient } from './database';
+
+const dialect = new PgDialect();
+
+function renderedQuery(query: unknown): string {
+  return dialect.sqlToQuery((query as SQLWrapper).getSQL()).sql;
+}
+
+function deferred<Value>() {
+  let resolve!: (value: Value) => void;
+  const promise = new Promise<Value>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function waitForBlockedProjectionFinalizer(): Promise<number[]> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const result = await databaseClient.pool.query<{ blockers: number[] }>(`
+      select pg_blocking_pids(pid) as blockers
+      from pg_stat_activity
+      where cardinality(pg_blocking_pids(pid)) > 0
+        and query like '%pending_classifier_version%'
+      order by pid
+    `);
+    if (result.rows[0]?.blockers.length) return result.rows[0].blockers;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error('Timed out waiting for the replay finalizer at the projection-version fence');
+}
+
+async function blockedReplayEnrollmentPids(): Promise<number[]> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const result = await databaseClient.pool.query<{ blockers: number[] }>(`
+      select pg_blocking_pids(pid) as blockers
+      from pg_stat_activity
+      where cardinality(pg_blocking_pids(pid)) > 0
+        and wait_event_type = 'Lock'
+        and wait_event = 'advisory'
+        and query like '%hashtextextended%'
+      order by pid
+    `);
+    if (result.rows[0]?.blockers.length) return result.rows[0].blockers;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return [];
+}
 
 it('converges concurrent workers on permanent roots and creates one new hour', async () => {
   const now = new Date('2026-08-12T19:42:00.000Z');
@@ -390,7 +445,7 @@ it('scans pending and retryable exceptions but excludes durable exception-impact
   expect(page.hasMore).toBe(false);
 });
 
-it('completes a disabled composite replay across multiple durable pages without provider access', async () => {
+it('seals a disabled composite replay behind its durable child barrier without provider access', async () => {
   const now = new Date('2026-08-12T21:00:00.000Z');
   await databaseClient.db.insert(stripeBalanceTransactions).values(
     Array.from({ length: 101 }, (_, index) => ({
@@ -420,16 +475,674 @@ it('completes a disabled composite replay across multiple durable pages without 
       cursorDigestSha256: afterFirstPage!.cursorDigestSha256!, limit: 100
     },
     correlationId: 'scan-disabled-second-page', signal
-  })).resolves.toEqual({ status: 'completed', runId: afterFirstPage!.id });
+  })).resolves.toEqual({ status: 'continued', runId: afterFirstPage!.id });
 
-  const [completed] = await databaseClient.db.select().from(financialScanRuns);
-  expect(completed).toMatchObject({
-    state: 'completed', processedCount: 101, enqueuedCount: 101, pageCount: 2,
-    checkpoint: null, cursorDigestSha256: null, safeOutcome: 'completed'
+  const [sealed] = await databaseClient.db.select().from(financialScanRuns);
+  expect(sealed).toMatchObject({
+    state: 'running', phase: 'classification_replay_finalize',
+    processedCount: 101, enqueuedCount: 101, pageCount: 2,
+    checkpoint: null, cursorDigestSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+    safeOutcome: null, completedAt: null
   });
-  expect(await databaseClient.db.select().from(jobs).where(
+  const children = await databaseClient.db.select().from(jobs).where(
     eq(jobs.type, 'commerce.financial-classification')
-  )).toHaveLength(101);
+  );
+  expect(children).toHaveLength(101);
+  expect(children.every((job) => job.payload.scanRunId === sealed!.id)).toBe(true);
+  expect(await databaseClient.db.select().from(jobs).where(eq(
+    jobs.deduplicationKey,
+    `commerce.financial-scan:${sealed!.id}:classification_replay_finalize:${sealed!.cursorDigestSha256}`
+  ))).toHaveLength(1);
+});
+
+it('enrolls evidence inserted after replay enumeration before allowing target activation', async () => {
+  const gateway = new Proxy({}, {
+    get: () => () => { throw new Error('disabled replay must not call the provider'); }
+  }) as StripeCommerceGateway;
+  const dependencies = { database: databaseClient.db, gateway, runtimeMode: 'disabled' as const };
+  const signal = new AbortController().signal;
+
+  await expect(processFinancialScanJob(dependencies, {
+    payload: { kind: 'composite_replay', classifierVersion: 2,
+      allocationAlgorithmVersion: 2, replayId: 'c2-a2' },
+    correlationId: 'scan-late-evidence-root', signal
+  })).resolves.toEqual({ status: 'continued', runId: expect.any(String) });
+  const [sealed] = await databaseClient.db.select().from(financialScanRuns);
+  expect(sealed).toMatchObject({
+    state: 'running', phase: 'classification_replay_finalize', completedAt: null
+  });
+  const [pendingVersion] = await databaseClient.db.select().from(financialProjectionVersions);
+  expect(pendingVersion).toMatchObject({
+    classifierVersion: 1, allocationAlgorithmVersion: 1,
+    pendingClassifierVersion: 2, pendingAllocationAlgorithmVersion: 2,
+    pendingScanRunId: sealed!.id
+  });
+
+  const suffix = randomUUID().replaceAll('-', '');
+  await stageBalanceTransaction(databaseClient.db, {
+    id: `txn_late_replay_${suffix}`, livemode: false,
+    sourceFamily: 'adjustment', sourceId: null, rawType: 'adjustment',
+    reportingCategory: 'other_adjustment', balanceType: 'adjustment',
+    amountMinor: 25, feeMinor: 1, netMinor: 24, currency: 'USD', status: 'available',
+    createdAt: new Date('2026-08-12T21:00:00.000Z'),
+    availableAt: new Date('2026-08-12T21:00:00.000Z'), exchangeRate: null,
+    exchangeSourceCurrency: null, exchangeTargetCurrency: null,
+    feeDetails: [{ ordinal: 0, rawType: 'stripe_fee', amountMinor: 1, currency: 'USD' }]
+  }, { correlationId: 'scan-late-evidence-stage' }, {
+    classifierVersion: 2, allocationAlgorithmVersion: 2
+  });
+
+  const linkedChildren = await databaseClient.db.select().from(jobs).where(
+    eq(jobs.type, 'commerce.financial-classification')
+  );
+  expect(linkedChildren.map((job) => ({
+    scanRunId: job.payload.scanRunId, subjectType: job.payload.subjectType
+  }))).toEqual(expect.arrayContaining([
+    { scanRunId: sealed!.id, subjectType: 'balance_transaction' },
+    { scanRunId: sealed!.id, subjectType: 'fee_detail' }
+  ]));
+
+  await databaseClient.db.update(jobs).set({
+    status: 'failed', attempts: 5, completedAt: new Date(), lastError: 'bounded child failure'
+  }).where(eq(jobs.type, 'commerce.financial-classification'));
+  const repository = createPostgresJobRepository(
+    databaseClient.db, applicationConfig.jobs, () => new Date('2100-01-01T00:00:00.000Z'),
+    'local-only', { classifierVersion: 2, allocationAlgorithmVersion: 2 }
+  );
+  await expect(repository.claimNext('late-replay-finalizer')).resolves.toBeNull();
+  expect((await databaseClient.db.select().from(financialProjectionVersions))[0])
+    .toMatchObject({ classifierVersion: 1, allocationAlgorithmVersion: 1 });
+  expect((await databaseClient.db.select().from(financialScanRuns))[0])
+    .toMatchObject({ state: 'running', completedAt: null });
+
+  await databaseClient.db.update(jobs).set({ status: 'succeeded' }).where(
+    eq(jobs.type, 'commerce.financial-classification')
+  );
+  const finalizer = await repository.claimNext('late-replay-finalizer');
+  expect(finalizer).toMatchObject({
+    type: 'commerce.financial-scan',
+    payload: expect.objectContaining({
+      kind: 'continuation', phase: 'classification_replay_finalize',
+      scanRunId: sealed!.id
+    })
+  });
+  await expect(processFinancialScanJob(dependencies, {
+    payload: finalizer!.payload as never,
+    correlationId: 'scan-late-evidence-finalize', signal
+  })).resolves.toEqual({ status: 'completed', runId: sealed!.id });
+  await expect(repository.complete(finalizer!.id, 'late-replay-finalizer')).resolves.toBe(true);
+  expect((await databaseClient.db.select().from(financialProjectionVersions))[0])
+    .toMatchObject({
+      classifierVersion: 2, allocationAlgorithmVersion: 2,
+      pendingClassifierVersion: null, pendingAllocationAlgorithmVersion: null,
+      pendingReplayId: null, pendingScanRunId: null
+    });
+  expect((await databaseClient.db.select().from(financialScanRuns))[0])
+    .toMatchObject({ state: 'completed', safeOutcome: 'completed', completedAt: expect.any(Date) });
+  await expect(processFinancialScanJob(dependencies, {
+    payload: finalizer!.payload as never,
+    correlationId: 'scan-late-evidence-finalize-retry', signal
+  })).resolves.toEqual({ status: 'unchanged', runId: null });
+});
+
+it('rechecks the child barrier after a finalizer claim races an uncommitted late insert', async () => {
+  const gateway = new Proxy({}, {
+    get: () => () => { throw new Error('disabled replay must not call the provider'); }
+  }) as StripeCommerceGateway;
+  const dependencies = { database: databaseClient.db, gateway, runtimeMode: 'disabled' as const };
+  const signal = new AbortController().signal;
+  await processFinancialScanJob(dependencies, {
+    payload: { kind: 'composite_replay', classifierVersion: 2,
+      allocationAlgorithmVersion: 2, replayId: 'c2-a2' },
+    correlationId: 'scan-raced-late-root', signal
+  });
+  const [sealed] = await databaseClient.db.select().from(financialScanRuns);
+  const projectionLocked = deferred<void>();
+  const releaseProjection = deferred<void>();
+  const stagedDatabase = {
+    transaction: (work: (tx: never) => Promise<unknown>) =>
+      databaseClient.db.transaction(async (tx) => {
+        let gated = false;
+        const proxy = new Proxy(tx, {
+          get(target, property) {
+            if (property === 'execute') {
+              return async (query: unknown) => {
+                const result = await tx.execute(query as never);
+                if (!gated && renderedQuery(query).includes('from financial_projection_versions')) {
+                  gated = true;
+                  projectionLocked.resolve();
+                  await releaseProjection.promise;
+                }
+                return result;
+              };
+            }
+            const value = Reflect.get(target, property, target) as unknown;
+            return typeof value === 'function' ? value.bind(target) : value;
+          }
+        });
+        return work(proxy as never);
+      })
+  } as unknown as Database;
+  const suffix = randomUUID().replaceAll('-', '');
+  const staging = stageBalanceTransaction(stagedDatabase, {
+    id: `txn_raced_late_${suffix}`, livemode: false,
+    sourceFamily: 'adjustment', sourceId: null, rawType: 'adjustment',
+    reportingCategory: 'other_adjustment', balanceType: 'adjustment',
+    amountMinor: 25, feeMinor: 0, netMinor: 25, currency: 'USD', status: 'available',
+    createdAt: new Date('2026-08-12T21:00:00.000Z'),
+    availableAt: new Date('2026-08-12T21:00:00.000Z'), exchangeRate: null,
+    exchangeSourceCurrency: null, exchangeTargetCurrency: null, feeDetails: []
+  }, { correlationId: 'scan-raced-late-stage' }, {
+    classifierVersion: 2, allocationAlgorithmVersion: 2
+  });
+  await projectionLocked.promise;
+
+  const repository = createPostgresJobRepository(
+    databaseClient.db, applicationConfig.jobs, () => new Date('2100-01-01T00:00:00.000Z'),
+    'local-only', { classifierVersion: 2, allocationAlgorithmVersion: 2 }
+  );
+  const finalizer = await repository.claimNext('raced-late-finalizer');
+  expect(finalizer?.payload).toMatchObject({
+    phase: 'classification_replay_finalize', scanRunId: sealed!.id
+  });
+  const finalization = processFinancialScanJob(dependencies, {
+    payload: finalizer!.payload as never,
+    correlationId: 'scan-raced-late-finalize', signal
+  });
+  await expect(waitForBlockedProjectionFinalizer()).resolves.toEqual(
+    expect.arrayContaining([expect.any(Number)])
+  );
+  releaseProjection.resolve();
+  await expect(staging).resolves.toMatchObject({ disposition: 'inserted' });
+  await expect(finalization).rejects.toMatchObject({
+    name: 'RetryableFinancialError', safeCode: 'state_changed'
+  });
+  expect((await databaseClient.db.select().from(jobs).where(eq(jobs.id, finalizer!.id)))[0])
+    .toMatchObject({
+      status: 'running', attempts: 1, rerunRequestedAt: expect.any(Date)
+    });
+  await expect(repository.fail(
+    finalizer!.id, 'raced-late-finalizer', 'Transient job handler failure', true
+  )).resolves.toBe(true);
+  expect((await databaseClient.db.select().from(jobs).where(eq(jobs.id, finalizer!.id)))[0])
+    .toMatchObject({
+      status: 'pending', attempts: 0, rerunRequestedAt: null, completedAt: null
+    });
+  await expect(repository.claimNext('raced-late-finalizer-retry')).resolves.toMatchObject({
+    type: 'commerce.financial-classification',
+    payload: expect.objectContaining({ scanRunId: sealed!.id })
+  });
+  expect((await databaseClient.db.select().from(financialProjectionVersions))[0])
+    .toMatchObject({
+      classifierVersion: 1, allocationAlgorithmVersion: 1,
+      pendingClassifierVersion: 2, pendingAllocationAlgorithmVersion: 2,
+      pendingScanRunId: sealed!.id
+    });
+  expect((await databaseClient.db.select().from(financialScanRuns))[0])
+    .toMatchObject({ state: 'running', phase: 'classification_replay_finalize' });
+}, 15_000);
+
+it('serializes route publication with finalization before discovering and rearming subjects', async () => {
+  const gateway = new Proxy({}, {
+    get: () => () => { throw new Error('disabled replay must not call the provider'); }
+  }) as StripeCommerceGateway;
+  const dependencies = { database: databaseClient.db, gateway, runtimeMode: 'disabled' as const };
+  const signal = new AbortController().signal;
+  const suffix = randomUUID().replaceAll('-', '');
+  const providerChargeId = `ch_route_enrollment_${suffix}`;
+  const staged = await stageBalanceTransaction(databaseClient.db, {
+    id: `txn_route_enrollment_${suffix}`, livemode: false,
+    sourceFamily: 'charge', sourceId: providerChargeId, rawType: 'charge',
+    reportingCategory: 'charge', balanceType: 'payments', amountMinor: 100,
+    feeMinor: 0, netMinor: 100, currency: 'USD', status: 'available',
+    createdAt: new Date('2026-08-12T21:00:00.000Z'),
+    availableAt: new Date('2026-08-12T21:00:00.000Z'), exchangeRate: null,
+    exchangeSourceCurrency: null, exchangeTargetCurrency: null, feeDetails: []
+  }, { correlationId: `route-enrollment-stage-${suffix}` });
+  await processFinancialScanJob(dependencies, {
+    payload: { kind: 'composite_replay', classifierVersion: 2,
+      allocationAlgorithmVersion: 2, replayId: 'c2-a2' },
+    correlationId: `route-enrollment-root-${suffix}`, signal
+  });
+  const [sealed] = await databaseClient.db.select().from(financialScanRuns);
+  await databaseClient.db.update(jobs).set({
+    status: 'succeeded', attempts: 1, completedAt: new Date()
+  }).where(eq(jobs.type, 'commerce.financial-classification'));
+
+  const beforeAuthorityRead = deferred<void>();
+  const releasePublisher = deferred<void>();
+  const publisher = databaseClient.db.transaction(async (tx) => {
+    const [order] = await tx.insert(orders).values({
+      status: 'checkout_open', currency: 'USD', subtotalMinor: 100,
+      clientCheckoutAttemptId: randomUUID(), quoteFingerprintSha256: 'a'.repeat(64),
+      statusTokenSha256: 'b'.repeat(64)
+    }).returning();
+    const [payment] = await tx.insert(payments).values({
+      orderId: order!.id, stripePaymentIntentId: `pi_route_enrollment_${suffix}`,
+      stripeLatestChargeId: providerChargeId, status: 'succeeded', amountMinor: 100,
+      currency: 'USD', paymentMethodCategory: 'card', paidAt: new Date()
+    }).returning();
+    let gated = false;
+    const proxy = new Proxy(tx, {
+      get(target, property) {
+        if (property === 'execute') {
+          return async (query: unknown) => {
+            if (!gated && renderedQuery(query).includes('from financial_projection_versions')) {
+              gated = true;
+              beforeAuthorityRead.resolve();
+              await releasePublisher.promise;
+            }
+            return tx.execute(query as never);
+          };
+        }
+        const value = Reflect.get(target, property, target) as unknown;
+        return typeof value === 'function' ? value.bind(target) : value;
+      }
+    });
+    await rearmCurrentProjectionSubjectsForFinancialSource(proxy as DatabaseTransaction, {
+      sourceKind: 'payment', sourceId: payment!.id
+    });
+  });
+  await beforeAuthorityRead.promise;
+
+  const repository = createPostgresJobRepository(
+    databaseClient.db, applicationConfig.jobs, () => new Date('2100-01-01T00:00:00.000Z'),
+    'local-only', { classifierVersion: 2, allocationAlgorithmVersion: 2 }
+  );
+  const finalizer = await repository.claimNext('route-enrollment-finalizer');
+  expect(finalizer?.payload).toMatchObject({
+    phase: 'classification_replay_finalize', scanRunId: sealed!.id
+  });
+  const finalization = processFinancialScanJob(dependencies, {
+    payload: finalizer!.payload as never,
+    correlationId: `route-enrollment-finalize-${suffix}`, signal
+  });
+  const blockers = await blockedReplayEnrollmentPids();
+  releasePublisher.resolve();
+  await expect(publisher).resolves.toBeUndefined();
+  const finalOutcome = await finalization.then(
+    (value) => ({ status: 'resolved' as const, value }),
+    (error: unknown) => ({ status: 'rejected' as const, error })
+  );
+
+  expect(blockers).toEqual(expect.arrayContaining([expect.any(Number)]));
+  expect(finalOutcome).toMatchObject({
+    status: 'rejected',
+    error: { name: 'RetryableFinancialError', safeCode: 'state_changed' }
+  });
+  expect((await databaseClient.db.select().from(financialProjectionVersions))[0])
+    .toMatchObject({
+      classifierVersion: 1, allocationAlgorithmVersion: 1,
+      pendingClassifierVersion: 2, pendingAllocationAlgorithmVersion: 2,
+      pendingScanRunId: sealed!.id
+    });
+  expect((await databaseClient.db.select().from(jobs).where(eq(
+    jobs.type, 'commerce.financial-classification'
+  ))).some((job) => job.payload.subjectId === staged.balanceTransactionId &&
+    job.payload.scanRunId === sealed!.id && job.status === 'pending')).toBe(true);
+}, 15_000);
+
+it('refreshes the retry budget when material route evidence rearms pending work', async () => {
+  const suffix = randomUUID().replaceAll('-', '');
+  const providerChargeId = `ch_retry_budget_${suffix}`;
+  const staged = await stageBalanceTransaction(databaseClient.db, {
+    id: `txn_retry_budget_${suffix}`, livemode: false,
+    sourceFamily: 'charge', sourceId: providerChargeId, rawType: 'charge',
+    reportingCategory: 'charge', balanceType: 'payments', amountMinor: 100,
+    feeMinor: 0, netMinor: 100, currency: 'USD', status: 'available',
+    createdAt: new Date('2026-08-12T21:00:00.000Z'),
+    availableAt: new Date('2026-08-12T21:00:00.000Z'), exchangeRate: null,
+    exchangeSourceCurrency: null, exchangeTargetCurrency: null, feeDetails: []
+  }, { correlationId: `retry-budget-stage-${suffix}` });
+  const [balance] = await databaseClient.db.select().from(stripeBalanceTransactions).where(
+    eq(stripeBalanceTransactions.id, staged.balanceTransactionId)
+  );
+  const subject = createFinancialClassificationSubjectJob({
+    subjectType: 'balance_transaction', subjectId: staged.balanceTransactionId,
+    sourceFingerprintSha256: balance!.fingerprintSha256,
+    classifierVersion: 1, allocationAlgorithmVersion: 1
+  });
+  const [insertedSubject] = await databaseClient.db.insert(jobs).values({
+    type: subject.type, payload: subject.payload as JsonObject,
+    deduplicationKey: subject.deduplicationKey, maxAttempts: subject.maxAttempts,
+    status: 'pending', attempts: subject.maxAttempts - 1,
+    lastError: 'transient failure before route publication',
+    runAt: new Date('2100-01-01T00:00:00.000Z')
+  }).returning();
+  const [order] = await databaseClient.db.insert(orders).values({
+    status: 'checkout_open', currency: 'USD', subtotalMinor: 100,
+    clientCheckoutAttemptId: randomUUID(), quoteFingerprintSha256: 'a'.repeat(64),
+    statusTokenSha256: 'b'.repeat(64)
+  }).returning();
+  const [payment] = await databaseClient.db.insert(payments).values({
+    orderId: order!.id, stripePaymentIntentId: `pi_retry_budget_${suffix}`,
+    stripeLatestChargeId: providerChargeId, status: 'succeeded', amountMinor: 100,
+    currency: 'USD', paymentMethodCategory: 'card', paidAt: new Date()
+  }).returning();
+
+  await databaseClient.db.transaction((tx) =>
+    rearmCurrentProjectionSubjectsForFinancialSource(tx, {
+      sourceKind: 'payment', sourceId: payment!.id
+    })
+  );
+  expect((await databaseClient.db.select().from(jobs).where(eq(jobs.id, insertedSubject!.id)))[0])
+    .toMatchObject({ status: 'pending', attempts: 0, lastError: null });
+
+  const repository = createPostgresJobRepository(
+    databaseClient.db, applicationConfig.jobs, () => new Date('2100-01-01T00:00:00.000Z'),
+    'local-only', { classifierVersion: 1, allocationAlgorithmVersion: 1 }
+  );
+  const claimed = await repository.claimNext('retry-budget-worker');
+  expect(claimed).toMatchObject({ id: insertedSubject!.id, attempts: 1 });
+  await expect(repository.fail(
+    claimed!.id, 'retry-budget-worker', 'one new transient failure', true
+  )).resolves.toBe(true);
+  expect((await databaseClient.db.select().from(jobs).where(eq(jobs.id, insertedSubject!.id)))[0])
+    .toMatchObject({ status: 'pending', attempts: 1, lastError: 'one new transient failure' });
+  expect(staged.balanceTransactionId).toBe(subject.payload.subjectId);
+});
+
+it('rejects a linked child with a null target field before activation', async () => {
+  const gateway = new Proxy({}, {
+    get: () => () => { throw new Error('disabled replay must not call the provider'); }
+  }) as StripeCommerceGateway;
+  const dependencies = { database: databaseClient.db, gateway, runtimeMode: 'disabled' as const };
+  const signal = new AbortController().signal;
+  await processFinancialScanJob(dependencies, {
+    payload: { kind: 'composite_replay', classifierVersion: 2,
+      allocationAlgorithmVersion: 2, replayId: 'c2-a2' },
+    correlationId: 'scan-null-child-root', signal
+  });
+  const [sealed] = await databaseClient.db.select().from(financialScanRuns);
+  await databaseClient.db.insert(jobs).values({
+    type: 'commerce.financial-classification',
+    payload: {
+      subjectType: 'balance_transaction', subjectId: randomUUID(),
+      sourceFingerprintSha256: 'a'.repeat(64), classifierVersion: null,
+      allocationAlgorithmVersion: 2, replayId: 'c2-a2', scanRunId: sealed!.id
+    },
+    deduplicationKey: `malformed-linked-child:${randomUUID()}`,
+    status: 'succeeded', attempts: 1, maxAttempts: 5, completedAt: new Date()
+  });
+  const repository = createPostgresJobRepository(
+    databaseClient.db, applicationConfig.jobs, () => new Date('2100-01-01T00:00:00.000Z'),
+    'local-only', { classifierVersion: 2, allocationAlgorithmVersion: 2 }
+  );
+  const finalizer = await repository.claimNext('null-child-finalizer');
+
+  await expect(processFinancialScanJob(dependencies, {
+    payload: finalizer!.payload as never,
+    correlationId: 'scan-null-child-finalize', signal
+  })).rejects.toMatchObject({
+    name: 'RetryableFinancialError', safeCode: 'state_changed'
+  });
+  expect((await databaseClient.db.select().from(financialProjectionVersions))[0])
+    .toMatchObject({
+      classifierVersion: 1, allocationAlgorithmVersion: 1,
+      pendingClassifierVersion: 2, pendingAllocationAlgorithmVersion: 2,
+      pendingScanRunId: sealed!.id
+    });
+});
+
+it('adopts an existing permanent subject job into its replay-run barrier', async () => {
+  const suffix = randomUUID().replaceAll('-', '');
+  await stageBalanceTransaction(databaseClient.db, {
+    id: `txn_replay_adopt_${suffix}`, livemode: false,
+    sourceFamily: 'adjustment', sourceId: null, rawType: 'adjustment',
+    reportingCategory: 'other_adjustment', balanceType: 'adjustment',
+    amountMinor: 25, feeMinor: 0, netMinor: 25, currency: 'USD', status: 'available',
+    createdAt: new Date('2026-08-12T21:00:00.000Z'),
+    availableAt: new Date('2026-08-12T21:00:00.000Z'), exchangeRate: null,
+    exchangeSourceCurrency: null, exchangeTargetCurrency: null, feeDetails: []
+  }, { correlationId: 'scan-adopt-stage' });
+  const [ordinary] = await databaseClient.db.select().from(jobs).where(
+    eq(jobs.type, 'commerce.financial-classification')
+  );
+  expect(ordinary?.payload.scanRunId).toBeUndefined();
+  await databaseClient.db.update(jobs).set({
+    status: 'succeeded', completedAt: new Date()
+  }).where(eq(jobs.id, ordinary!.id));
+
+  const gateway = new Proxy({}, {
+    get: () => () => { throw new Error('disabled replay must not call the provider'); }
+  }) as StripeCommerceGateway;
+  await processFinancialScanJob({
+    database: databaseClient.db, gateway, runtimeMode: 'disabled'
+  }, {
+    payload: { kind: 'composite_replay', classifierVersion: 1,
+      allocationAlgorithmVersion: 1, replayId: 'c1-a1' },
+    correlationId: 'scan-adopt-root', signal: new AbortController().signal
+  });
+  const [sealed] = await databaseClient.db.select().from(financialScanRuns);
+  const [adopted] = await databaseClient.db.select().from(jobs).where(
+    eq(jobs.id, ordinary!.id)
+  );
+  expect(adopted).toMatchObject({
+    id: ordinary!.id, status: 'succeeded',
+    payload: expect.objectContaining({ scanRunId: sealed!.id })
+  });
+});
+
+it('adopts an exhausted permanent subject without resurrecting it', async () => {
+  const suffix = randomUUID().replaceAll('-', '');
+  await stageBalanceTransaction(databaseClient.db, {
+    id: `txn_replay_failed_adopt_${suffix}`, livemode: false,
+    sourceFamily: 'adjustment', sourceId: null, rawType: 'adjustment',
+    reportingCategory: 'other_adjustment', balanceType: 'adjustment',
+    amountMinor: 25, feeMinor: 0, netMinor: 25, currency: 'USD', status: 'available',
+    createdAt: new Date('2026-08-12T21:00:00.000Z'),
+    availableAt: new Date('2026-08-12T21:00:00.000Z'), exchangeRate: null,
+    exchangeSourceCurrency: null, exchangeTargetCurrency: null, feeDetails: []
+  }, { correlationId: 'scan-failed-adopt-stage' });
+  const [ordinary] = await databaseClient.db.select().from(jobs).where(
+    eq(jobs.type, 'commerce.financial-classification')
+  );
+  await databaseClient.db.update(jobs).set({
+    status: 'failed', attempts: ordinary!.maxAttempts,
+    completedAt: new Date('2026-08-12T21:30:00.000Z'),
+    lastError: 'permanent classification failure'
+  }).where(eq(jobs.id, ordinary!.id));
+
+  const gateway = new Proxy({}, {
+    get: () => () => { throw new Error('disabled replay must not call the provider'); }
+  }) as StripeCommerceGateway;
+  await processFinancialScanJob({
+    database: databaseClient.db, gateway, runtimeMode: 'disabled'
+  }, {
+    payload: { kind: 'composite_replay', classifierVersion: 1,
+      allocationAlgorithmVersion: 1, replayId: 'c1-a1' },
+    correlationId: 'scan-failed-adopt-root', signal: new AbortController().signal
+  });
+  const [sealed] = await databaseClient.db.select().from(financialScanRuns);
+  const [adopted] = await databaseClient.db.select().from(jobs).where(
+    eq(jobs.id, ordinary!.id)
+  );
+  expect(adopted).toMatchObject({
+    id: ordinary!.id, status: 'failed', attempts: ordinary!.maxAttempts,
+    lastError: 'permanent classification failure',
+    payload: expect.objectContaining({ scanRunId: sealed!.id })
+  });
+});
+
+it('rearms a running permanent subject job after replay-run adoption', async () => {
+  const suffix = randomUUID().replaceAll('-', '');
+  const staged = await stageBalanceTransaction(databaseClient.db, {
+    id: `txn_replay_running_adopt_${suffix}`, livemode: false,
+    sourceFamily: 'adjustment', sourceId: null, rawType: 'adjustment',
+    reportingCategory: 'other_adjustment', balanceType: 'adjustment',
+    amountMinor: 25, feeMinor: 0, netMinor: 25, currency: 'USD', status: 'available',
+    createdAt: new Date('2026-08-12T21:00:00.000Z'),
+    availableAt: new Date('2026-08-12T21:00:00.000Z'), exchangeRate: null,
+    exchangeSourceCurrency: null, exchangeTargetCurrency: null, feeDetails: []
+  }, { correlationId: 'scan-running-adopt-stage' }, {
+    classifierVersion: 2, allocationAlgorithmVersion: 2
+  });
+  const [balance] = await databaseClient.db.select().from(stripeBalanceTransactions).where(
+    eq(stripeBalanceTransactions.id, staged.balanceTransactionId)
+  );
+  await databaseClient.db.transaction((tx) => replayFinancialClassificationLocked(tx, {
+    subjectType: 'balance_transaction', subjectId: staged.balanceTransactionId,
+    sourceFingerprintSha256: balance!.fingerprintSha256,
+    classifierVersion: 1, allocationAlgorithmVersion: 1, replayId: 'c1-a1',
+    correlationId: 'scan-running-adopt-active-predecessor'
+  }));
+  const ordinary = createFinancialClassificationSubjectJob({
+    subjectType: 'balance_transaction', subjectId: staged.balanceTransactionId,
+    sourceFingerprintSha256: balance!.fingerprintSha256,
+    classifierVersion: 2, allocationAlgorithmVersion: 2
+  });
+  await databaseClient.db.insert(jobs).values({
+    type: ordinary.type, payload: ordinary.payload as JsonObject,
+    deduplicationKey: ordinary.deduplicationKey, maxAttempts: ordinary.maxAttempts
+  });
+  const repository = createPostgresJobRepository(
+    databaseClient.db, applicationConfig.jobs,
+    () => new Date('2100-01-01T00:00:00.000Z'), 'all',
+    { classifierVersion: 2, allocationAlgorithmVersion: 2 }
+  );
+  const claimed = await repository.claimNext('running-adopt-worker');
+  expect(claimed).toMatchObject({
+    type: 'commerce.financial-classification',
+    payload: expect.not.objectContaining({ scanRunId: expect.anything() })
+  });
+
+  const gateway = new Proxy({}, {
+    get: () => () => { throw new Error('disabled replay must not call the provider'); }
+  }) as StripeCommerceGateway;
+  await processFinancialScanJob({
+    database: databaseClient.db, gateway, runtimeMode: 'disabled'
+  }, {
+    payload: { kind: 'composite_replay', classifierVersion: 2,
+      allocationAlgorithmVersion: 2, replayId: 'c2-a2' },
+    correlationId: 'scan-running-adopt-root', signal: new AbortController().signal
+  });
+  const [sealed] = await databaseClient.db.select().from(financialScanRuns);
+  const [adopted] = await databaseClient.db.select().from(jobs).where(eq(jobs.id, claimed!.id));
+  expect(adopted).toMatchObject({
+    id: claimed!.id, status: 'running', attempts: 1,
+    rerunRequestedAt: expect.any(Date),
+    payload: expect.objectContaining({ scanRunId: sealed!.id })
+  });
+
+  const staleHandler = createFinancialClassificationHandler({
+    database: databaseClient.db,
+    targetClassifierVersion: 2, targetAllocationAlgorithmVersion: 2
+  });
+  await expect(staleHandler(claimed!, new AbortController().signal)).resolves.toBeUndefined();
+  await expect(repository.complete(claimed!.id, 'running-adopt-worker')).resolves.toBe(true);
+  expect((await databaseClient.db.select().from(jobs).where(eq(jobs.id, claimed!.id)))[0])
+    .toMatchObject({
+      id: claimed!.id, status: 'pending', attempts: 0,
+      rerunRequestedAt: null, completedAt: null,
+      payload: expect.objectContaining({ scanRunId: sealed!.id })
+    });
+  await expect(repository.claimNext('running-adopt-retry')).resolves.toMatchObject({
+    id: claimed!.id,
+    payload: expect.objectContaining({ scanRunId: sealed!.id })
+  });
+});
+
+it('lets an exact pending target finish before keyset adoption links it', async () => {
+  const suffix = randomUUID().replaceAll('-', '');
+  const staged = await stageBalanceTransaction(databaseClient.db, {
+    id: `txn_replay_pending_claim_${suffix}`, livemode: false,
+    sourceFamily: 'adjustment', sourceId: null, rawType: 'adjustment',
+    reportingCategory: 'other_adjustment', balanceType: 'adjustment',
+    amountMinor: 25, feeMinor: 0, netMinor: 25, currency: 'USD', status: 'available',
+    createdAt: new Date('2026-08-12T21:00:00.000Z'),
+    availableAt: new Date('2026-08-12T21:00:00.000Z'), exchangeRate: null,
+    exchangeSourceCurrency: null, exchangeTargetCurrency: null, feeDetails: []
+  }, { correlationId: 'scan-pending-claim-stage' }, {
+    classifierVersion: 2, allocationAlgorithmVersion: 2
+  });
+  const [balance] = await databaseClient.db.select().from(stripeBalanceTransactions).where(
+    eq(stripeBalanceTransactions.id, staged.balanceTransactionId)
+  );
+  await databaseClient.db.transaction((tx) => replayFinancialClassificationLocked(tx, {
+    subjectType: 'balance_transaction', subjectId: staged.balanceTransactionId,
+    sourceFingerprintSha256: balance!.fingerprintSha256,
+    classifierVersion: 1, allocationAlgorithmVersion: 1, replayId: 'c1-a1',
+    correlationId: 'scan-pending-claim-active-predecessor'
+  }));
+  const ordinary = createFinancialClassificationSubjectJob({
+    subjectType: 'balance_transaction', subjectId: staged.balanceTransactionId,
+    sourceFingerprintSha256: balance!.fingerprintSha256,
+    classifierVersion: 2, allocationAlgorithmVersion: 2
+  });
+  await databaseClient.db.insert(jobs).values({
+    type: ordinary.type, payload: ordinary.payload as JsonObject,
+    deduplicationKey: ordinary.deduplicationKey, maxAttempts: ordinary.maxAttempts
+  });
+  const rootPayload = {
+    kind: 'composite_replay' as const, classifierVersion: 2,
+    allocationAlgorithmVersion: 2, replayId: 'c2-a2'
+  };
+  const run = await startOrResumeFinancialScan(databaseClient.db, rootPayload);
+  const repository = createPostgresJobRepository(
+    databaseClient.db, applicationConfig.jobs,
+    () => new Date('2100-01-01T00:00:00.000Z'), 'all',
+    { classifierVersion: 2, allocationAlgorithmVersion: 2 }
+  );
+  const claimed = await repository.claimNext('pending-before-adopt-worker');
+  expect(claimed).toMatchObject({ id: expect.any(String), payload: ordinary.payload });
+  const handler = createFinancialClassificationHandler({
+    database: databaseClient.db,
+    targetClassifierVersion: 2, targetAllocationAlgorithmVersion: 2
+  });
+  await expect(handler(claimed!, new AbortController().signal)).resolves.toBeUndefined();
+  await expect(repository.complete(claimed!.id, 'pending-before-adopt-worker')).resolves.toBe(true);
+
+  const gateway = new Proxy({}, {
+    get: () => () => { throw new Error('disabled replay must not call the provider'); }
+  }) as StripeCommerceGateway;
+  await processFinancialScanJob({
+    database: databaseClient.db, gateway, runtimeMode: 'disabled'
+  }, {
+    payload: rootPayload, correlationId: 'scan-pending-claim-root',
+    signal: new AbortController().signal
+  });
+  expect((await databaseClient.db.select().from(jobs).where(eq(jobs.id, claimed!.id)))[0])
+    .toMatchObject({
+      id: claimed!.id, status: 'succeeded',
+      payload: expect.objectContaining({ scanRunId: run.id })
+    });
+});
+
+it('lets an active-version worker enroll new evidence into a newer pending replay', async () => {
+  const gateway = new Proxy({}, {
+    get: () => () => { throw new Error('disabled replay must not call the provider'); }
+  }) as StripeCommerceGateway;
+  await processFinancialScanJob({
+    database: databaseClient.db, gateway, runtimeMode: 'disabled'
+  }, {
+    payload: { kind: 'composite_replay', classifierVersion: 2,
+      allocationAlgorithmVersion: 2, replayId: 'c2-a2' },
+    correlationId: 'scan-active-worker-enrollment-root',
+    signal: new AbortController().signal
+  });
+  const [run] = await databaseClient.db.select().from(financialScanRuns);
+  const suffix = randomUUID().replaceAll('-', '');
+  const staged = await stageBalanceTransaction(databaseClient.db, {
+    id: `txn_replay_active_worker_${suffix}`, livemode: false,
+    sourceFamily: 'adjustment', sourceId: null, rawType: 'adjustment',
+    reportingCategory: 'other_adjustment', balanceType: 'adjustment',
+    amountMinor: 25, feeMinor: 0, netMinor: 25, currency: 'USD', status: 'available',
+    createdAt: new Date('2026-08-12T21:00:00.000Z'),
+    availableAt: new Date('2026-08-12T21:00:00.000Z'), exchangeRate: null,
+    exchangeSourceCurrency: null, exchangeTargetCurrency: null,
+    feeDetails: []
+  }, { correlationId: 'scan-active-worker-enrollment-stage' });
+  const linked = (await databaseClient.db.select().from(jobs)).filter((job) =>
+    job.type === 'commerce.financial-classification' &&
+    job.payload.subjectId === staged.balanceTransactionId &&
+    job.payload.classifierVersion === 2
+  );
+  expect(linked).toEqual([
+    expect.objectContaining({
+      status: 'pending',
+      payload: expect.objectContaining({ scanRunId: run!.id, replayId: 'c2-a2' })
+    })
+  ]);
 });
 
 it('rediscovers a pending source next hour after its prior generation exhausts', async () => {

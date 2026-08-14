@@ -155,7 +155,7 @@ There is no generic Resolve action. An issue resolves only in the same transacti
 
 ## Coordinated backup and restore
 
-Use the full logical database backup and private-storage procedure in [storage, ingestion, publication, and recovery](storage-ingestion-and-publication.md). Stop app and worker in a maintenance window, use PostgreSQL `pg_dump --format=custom`, retain the migration journal and application-image digest, checksum and encrypt the backup set, and prove it through an isolated `pg_restore`. Never copy a live PostgreSQL data directory.
+Use the full logical database backup and private-storage procedure in [storage, ingestion, publication, and recovery](storage-ingestion-and-publication.md). Stop app and worker in a maintenance window, create both the backup and verification plaintext workspaces through the documented collision-safe Windows or GNU/Linux helper, use PostgreSQL `pg_dump --format=custom`, retain the migration journal and application-image digest, and reject every missing or empty required file before hashing it. Every material native command must pass the reusable fail-closed exit assertion. Encrypt and authenticate the complete backup set, retrieve the exact destination ciphertext, prove its SHA-256 equals the source ciphertext hash, test-decrypt that destination copy into the fresh restricted workspace, and restore only from that verified plaintext. Then securely delete its dumps, archives, manifests, and verification plaintext or put every plaintext artifact under documented access-controlled retention. Never copy a live PostgreSQL data directory.
 
 A Plan 6B-only table dump is not a valid bookstore backup. The checkpoint also adds state to `payments`, `refunds`, `disputes`, and `entitlement_grants`, and its rows depend on users, orders/items, refund allocations, jobs, and audit history. The full custom archive must retain schemas, enums, functions, views, restrictive foreign keys, immutable triggers, `drizzle.__drizzle_migrations`, and all application tables.
 
@@ -184,7 +184,7 @@ The archive contains these 20 Plan 6B tables. This is their parent-first logical
 | 19 | `financial_reconciliation_issues` | Optional existing administrator plus a semantic internal resource restored above. |
 | 20 | `refund_allocation_finalization_effects` | Existing refund allocation, draft/version/item, order item, and purchase grant. |
 
-Restore first into a uniquely named isolated Compose project with no public application ports. Restore the full database and storage archive, run committed migrations, compare the migration journal and aggregate row counts, and execute every read-only check below while app and worker remain stopped. A structural count other than zero blocks acceptance. Missing/pending classification rows and incomplete projection rows are operational evidence rather than permission to edit; reconcile them with durable jobs/issues as described with each query. Start only the isolated maintenance-mode app after the checks pass; keep the worker stopped until the provider-runtime conditions below are satisfied, then follow a separately approved production replacement/rollback procedure.
+Restore first into a collision-resistant isolated Compose project only after a fail-closed preflight proves that no container, network, database volume, or storage volume matches its generated identity; expose no public application ports. Restore the full database and storage archive from the verified test-decryption of the exact destination ciphertext, run committed migrations, compare the complete required-file manifest, migration journal, and aggregate row counts, and execute every read-only check below while app and worker remain stopped. A structural count other than zero blocks acceptance. Missing/pending classification rows and incomplete projection rows are operational evidence rather than permission to edit; reconcile them with durable jobs/issues as described with each query. Check worker absence around each service start. Start only the isolated maintenance-mode app after the checks pass. Maintenance mode admits only `/health/live` and `/health/ready`; do not claim UI authentication, administrator pages, or reader rendering as rehearsal evidence. Keep the general worker stopped for the entire isolated restore rehearsal. Inventory the generated project immediately before teardown, fail closed on `down --volumes`, prove all generated resources absent afterward, and apply the plaintext disposition policy to every verified or tool-created plaintext artifact before following a separately approved production replacement/rollback procedure.
 
 ### Post-restore orphan check
 
@@ -243,9 +243,83 @@ with orphan_counts as (
   left join stripe_balance_transactions bt on bt.id = s.balance_transaction_id
   left join financial_allocation_sets predecessor on predecessor.id = s.supersedes_set_id
   left join financial_allocation_sets reversal on reversal.id = s.reversal_of_set_id
+  left join financial_classification_versions parent_classification
+    on parent_classification.subject_type = 'balance_transaction'
+    and parent_classification.subject_id = s.balance_transaction_id
+    and parent_classification.classifier_version = s.classifier_version
+    and parent_classification.source_fingerprint_sha256 = s.source_fingerprint_sha256
   where bt.id is null
      or (s.supersedes_set_id is not null and predecessor.id is null)
      or (s.reversal_of_set_id is not null and reversal.id is null)
+     or (s.reversal_of_set_id is not null and (
+       reversal.source_kind <> s.source_kind
+       or reversal.source_internal_id <> s.source_internal_id
+       or reversal.basis <> s.basis
+       or reversal.currency <> s.currency
+       or reversal.reversal_of_set_id is not null
+       or reversal.classifier_version <> s.classifier_version
+       or reversal.algorithm_version <> s.algorithm_version
+     ))
+     or (s.supersedes_set_id is not null and (
+       predecessor.balance_transaction_id <> s.balance_transaction_id
+       or predecessor.basis <> s.basis
+       or predecessor.currency <> s.currency
+       or predecessor.expected_effect_minor <> s.expected_effect_minor
+       or predecessor.source_fingerprint_sha256 <> s.source_fingerprint_sha256
+       or predecessor.classifier_version > s.classifier_version
+       or predecessor.algorithm_version > s.algorithm_version
+       or not coalesce((
+         (
+           predecessor.source_kind = s.source_kind
+           and predecessor.source_internal_id = s.source_internal_id
+           and (
+             predecessor.reversal_of_set_id is not distinct from s.reversal_of_set_id
+             or (
+               predecessor.reversal_of_set_id is not null
+               and s.reversal_of_set_id is not null
+               and reversal.supersedes_set_id = predecessor.reversal_of_set_id
+             )
+           )
+         )
+         or (
+           predecessor.source_kind = 'adjustment'
+           and predecessor.source_internal_id = s.balance_transaction_id
+           and predecessor.scope = 'account'
+           and predecessor.reversal_of_set_id is null
+           and s.source_kind in ('payment', 'refund', 'dispute')
+           and parent_classification.id is not null
+           and (
+             (s.reversal_of_set_id is null and (
+               (s.source_kind = 'payment'
+                 and parent_classification.classification = 'charge'
+                 and bt.amount_minor > 0)
+               or (s.source_kind = 'refund' and (
+                 (parent_classification.classification = 'refund' and bt.amount_minor < 0)
+                 or (parent_classification.classification = 'refund_failure'
+                   and bt.amount_minor > 0)
+               ))
+               or (s.source_kind = 'dispute' and (
+                 (parent_classification.classification = 'dispute_withdrawal'
+                   and bt.amount_minor < 0)
+                 or (parent_classification.classification in (
+                   'dispute_reinstatement', 'fee_credit'
+                 ) and bt.amount_minor > 0)
+               ))
+             ))
+             or (s.reversal_of_set_id is not null
+               and s.basis = 'gross_amount'
+               and s.expected_effect_minor > 0
+               and bt.amount_minor > 0
+               and (
+                 (s.source_kind = 'refund'
+                   and parent_classification.classification = 'refund_failure')
+                 or (s.source_kind = 'dispute'
+                   and parent_classification.classification = 'dispute_reinstatement')
+               ))
+           )
+         )
+       ), false)
+     ))
 
   union all
   select 'allocation_set_semantic_source', count(*)::bigint
@@ -547,17 +621,17 @@ with active as (
   where s.classifier_version = a.classifier_version
     and s.algorithm_version = a.allocation_algorithm_version
 ), tips as (
-  select s.balance_transaction_id, s.basis, s.source_fingerprint_sha256, count(*)::bigint as tip_count
+  select s.balance_transaction_id, s.basis, count(*)::bigint as tip_count
   from active_sets s
   where not exists (
     select 1 from active_sets successor where successor.supersedes_set_id = s.id
   )
-  group by s.balance_transaction_id, s.basis, s.source_fingerprint_sha256
+  group by s.balance_transaction_id, s.basis
 )
-select balance_transaction_id, basis, source_fingerprint_sha256, tip_count
+select balance_transaction_id, basis, tip_count
 from tips
 where tip_count > 1
-order by balance_transaction_id, basis, source_fingerprint_sha256;
+order by balance_transaction_id, basis;
 ```
 
 The incomplete projection query may legitimately show `missing_source`, `allocation_incomplete`, or a bounded exception while recovery is pending. Each row must agree with durable source state/issues. The final tip query must be empty.
@@ -799,9 +873,13 @@ with scan_checks as (
   from financial_scan_runs r
   where r.phase not in (
       'source_page', 'payout_discovery_page', 'incomplete_payout_run_page',
-      'payout_impact_page', 'classification_replay_page'
+      'payout_impact_page', 'classification_replay_page',
+      'classification_replay_finalize'
     )
-    or (r.kind = 'classification_replay' and r.phase <> 'classification_replay_page')
+    or (r.kind = 'classification_replay' and
+      r.phase not in ('classification_replay_page', 'classification_replay_finalize'))
+    or (r.kind = 'classification_replay' and r.state = 'completed' and
+      r.phase <> 'classification_replay_finalize')
     or (r.kind = 'payout_impact' and r.phase <> 'payout_impact_page')
     or (r.kind in ('initial_backfill', 'hourly') and
       r.phase not in ('source_page', 'payout_discovery_page', 'incomplete_payout_run_page'))
@@ -811,6 +889,7 @@ with scan_checks as (
       r.checkpoint !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
     or (r.phase = 'classification_replay_page' and r.checkpoint is not null and
       r.checkpoint !~ '^(balance_transaction|fee_detail):[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+    or (r.phase = 'classification_replay_finalize' and r.checkpoint is not null)
 
   union all
   select 'scan_lifecycle_shape', count(*)::bigint
@@ -835,6 +914,20 @@ with scan_checks as (
        'c' || classifier_version::text || '-a' || allocation_algorithm_version::text)
 
   union all
+  select 'pending_replay_authority_mismatch', count(*)::bigint
+  from financial_projection_versions version
+  left join financial_scan_runs replay on replay.id = version.pending_scan_run_id
+  where version.singleton = true and version.pending_scan_run_id is not null
+    and (replay.id is null
+      or replay.kind is distinct from 'classification_replay'
+      or replay.state is distinct from 'running'
+      or replay.phase not in ('classification_replay_page', 'classification_replay_finalize')
+      or replay.classifier_version is distinct from version.pending_classifier_version
+      or replay.allocation_algorithm_version is distinct from
+        version.pending_allocation_algorithm_version
+      or replay.replay_id is distinct from version.pending_replay_id)
+
+  union all
   select 'failed_running_scan_retry_exhausted', count(*)::bigint
   from financial_scan_runs r
   join jobs j on j.deduplication_key = (case
@@ -857,7 +950,9 @@ from scan_checks
 order by check_name;
 ```
 
-After restore acceptance, start only the maintenance-mode app while the base deployment is Stripe-disabled. Keep the worker stopped: a disabled worker must not claim restored pending/running provider source, payout, or scan jobs because it cannot retrieve the canonical evidence needed to complete them. Enable the separately approved Stripe overlay and pass its preflight before starting the worker, or prove that no provider-backed work is pending/running. The overlay still leaves the application in maintenance and is not production-launch authorization. Local classifier replay may run only once a worker is deliberately started under that approved runtime.
+During rehearsal, start only the maintenance-mode app while the base deployment is Stripe-disabled. Keep the general worker stopped for the entire isolated restore rehearsal. Provider absence is not sufficient isolation: in addition to provider-backed financial jobs, the general worker can claim local-only claim-email and SMTP outbox jobs, including `commerce.claim-email` and `commerce.claim-email-request`. Therefore neither disabled Stripe nor an empty provider-backed queue makes a rehearsal worker safe.
+
+Starting a worker belongs only to a separately approved production replacement after the rehearsal is accepted, with the required Stripe and SMTP runtime, preflight, maintenance, and rollback controls. A future rehearsal could include one only after an explicit no-egress rehearsal runtime, synthetic SMTP, and job-family allowlist are implemented and approved; this repository does not currently supply that runtime. Local classifier replay must wait for that approved production-replacement worker rather than running inside the rehearsal. Teardown follows the storage runbook and must cover the named restore project and every plaintext dump, archive, manifest, test-decryption directory, and verification plaintext artifact through secure deletion or access-controlled retention under policy.
 
 ## Final gate evidence (2026-08-13)
 

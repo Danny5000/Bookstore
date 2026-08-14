@@ -10,6 +10,7 @@ import {
 
 const jobMocks = vi.hoisted(() => ({
   enqueueActiveEntityJob: vi.fn(),
+  enqueueFinancialClassificationJob: vi.fn(),
   enqueueJob: vi.fn()
 }));
 
@@ -17,8 +18,8 @@ vi.mock('$lib/server/jobs/repository', () => jobMocks);
 
 import {
   commitFinancialScanPage,
-  completeEmptyFinancialReplay,
-  freezePayoutDiscoveryWindow
+  freezePayoutDiscoveryWindow,
+  startOrResumeFinancialScan
 } from './repository';
 
 const RUN_ID = '00000000-0000-4000-8000-000000001701';
@@ -60,6 +61,36 @@ function database(): Database {
 describe('financial scan page job handoff', () => {
   beforeEach(() => vi.clearAllMocks());
 
+  it('locks replay authority before the projection-enrollment fence during registration', async () => {
+    const stoppedAtEnrollment = new Error('stopped at projection enrollment');
+    const execute = vi.fn()
+      .mockResolvedValueOnce({ rows: [{
+        classifierVersion: 1,
+        allocationAlgorithmVersion: 1,
+        pendingClassifierVersion: null,
+        pendingAllocationAlgorithmVersion: null,
+        pendingReplayId: null,
+        pendingScanRunId: null
+      }] })
+      .mockRejectedValueOnce(stoppedAtEnrollment);
+    const mocked = {
+      transaction: vi.fn(async (work) => work({ execute, rollback: vi.fn() }))
+    } as unknown as Database;
+
+    await expect(startOrResumeFinancialScan(mocked, {
+      kind: 'composite_replay', classifierVersion: 2,
+      allocationAlgorithmVersion: 2, replayId: 'c2-a2'
+    })).rejects.toBe(stoppedAtEnrollment);
+
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(rendered(execute.mock.calls[0]![0]).sql).toMatch(
+      /from financial_projection_versions[\s\S]*for update/u
+    );
+    expect(rendered(execute.mock.calls[1]![0]).params).toContain(
+      'pale-orbit:financial:replay-enrollment'
+    );
+  });
+
   it('sorts and guards source/payout roots while leaving classification and continuation generic', async () => {
     const sourceHigh = createFinancialSourceScanJob({
       sourceKind: 'refund', sourceId: '00000000-0000-4000-8000-000000001799',
@@ -97,12 +128,13 @@ describe('financial scan page job handoff', () => {
       '00000000-0000-4000-8000-000000001702',
       '00000000-0000-4000-8000-000000001799'
     ]);
-    expect(jobMocks.enqueueJob).toHaveBeenCalledTimes(2);
-    expect(jobMocks.enqueueJob.mock.calls[0]?.[1]).toMatchObject({
+    expect(jobMocks.enqueueFinancialClassificationJob).toHaveBeenCalledOnce();
+    expect(jobMocks.enqueueFinancialClassificationJob.mock.calls[0]?.[1]).toMatchObject({
       type: classification.type,
       deduplicationKey: classification.deduplicationKey
     });
-    expect(jobMocks.enqueueJob.mock.calls[1]?.[1]).toMatchObject({
+    expect(jobMocks.enqueueJob).toHaveBeenCalledOnce();
+    expect(jobMocks.enqueueJob.mock.calls[0]?.[1]).toMatchObject({
       type: 'commerce.financial-scan',
       payload: { kind: 'continuation' }
     });
@@ -138,34 +170,41 @@ describe('financial scan page job handoff', () => {
     ]));
   });
 
-  it('locks the projection version before completing a zero-subject composite replay', async () => {
+  it('seals a terminal replay page behind a durable finalizer without activating it', async () => {
     const replay = runRow({
       rootKey: 'commerce.financial-classification:scan:2:3',
       kind: 'classification_replay', phase: 'classification_replay_page',
       classifierVersion: 2, allocationAlgorithmVersion: 3, replayId: 'c2-a3'
     });
     const execute = vi.fn()
-      .mockResolvedValueOnce({ rows: [{ classifierVersion: 1, allocationAlgorithmVersion: 1 }] })
-      .mockResolvedValueOnce({ rows: [{ classifierVersion: 2, allocationAlgorithmVersion: 3 }] })
-      .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [replay] })
       .mockResolvedValueOnce({ rows: [runRow({
-        ...replay, state: 'completed', pageCount: 1, safeOutcome: 'completed',
-        completedAt: new Date('2026-08-12T22:01:00.000Z')
+        ...replay, phase: 'classification_replay_finalize', state: 'running',
+        pageCount: 1, cursorDigestSha256: 'f'.repeat(64)
       })] });
     const mocked = {
       transaction: vi.fn(async (work) => work({ execute, rollback: vi.fn() }))
     } as unknown as Database;
 
-    await completeEmptyFinancialReplay(mocked, {
-      runId: RUN_ID, expectedCheckpoint: null, expectedPageCount: 0,
-      classifierVersion: 2, allocationAlgorithmVersion: 3,
-      correlationId: 'empty-replay-c2-a3'
+    await expect(commitFinancialScanPage(mocked, {
+      runId: RUN_ID, expectedPhase: 'classification_replay_page',
+      expectedCheckpoint: null, expectedPageCount: 0,
+      nextPhase: 'classification_replay_page', nextCheckpoint: null,
+      processedCount: 0, children: [], complete: true
+    })).resolves.toMatchObject({
+      state: 'running', phase: 'classification_replay_finalize', completedAt: null
     });
 
-    expect(rendered(execute.mock.calls[0]![0]).sql).toContain('financial_projection_versions');
-    expect(rendered(execute.mock.calls[3]![0]).sql).toContain('pg_advisory_xact_lock');
+    expect(execute.mock.calls.map(([query]) => rendered(query).sql).join('\n'))
+      .not.toContain('update financial_projection_versions');
+    expect(jobMocks.enqueueJob).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      type: 'commerce.financial-scan',
+      payload: expect.objectContaining({
+        kind: 'continuation', scanRunId: RUN_ID,
+        phase: 'classification_replay_finalize'
+      })
+    }));
   });
 
   it('atomically advances contiguous payout coverage on the terminal discovery page', async () => {

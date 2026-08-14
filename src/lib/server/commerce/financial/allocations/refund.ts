@@ -40,13 +40,13 @@ function compareCodePoints(left: string, right: string): number {
 }
 
 function compareChronology(
-  left: { providerCreatedAtEpochMs: number; refundId: string },
-  right: { providerCreatedAtEpochMs: number; refundId: string }
+  left: { providerCreatedAtEpochMs: number; providerRefundId: string },
+  right: { providerCreatedAtEpochMs: number; providerRefundId: string }
 ): number {
   if (left.providerCreatedAtEpochMs !== right.providerCreatedAtEpochMs) {
     return left.providerCreatedAtEpochMs < right.providerCreatedAtEpochMs ? -1 : 1;
   }
-  return compareCodePoints(left.refundId, right.refundId);
+  return compareCodePoints(left.providerRefundId, right.providerRefundId);
 }
 
 function assertNonEmptyId(value: string): void {
@@ -107,13 +107,15 @@ function computedCapacity(
   input: RefundAllocationInput,
   components: readonly RefundAllocationComponent[]
 ): ReadonlyMap<string, { subtotalMinor: number; taxMinor: number }> | null {
-  const hasAnyChronology = input.refundId !== undefined || input.providerCreatedAt !== undefined ||
+  const hasAnyChronology = input.providerRefundId !== undefined ||
+    input.providerCreatedAt !== undefined ||
     input.paymentItemCapacities !== undefined || input.earlierFinalized !== undefined;
   if (!hasAnyChronology) return null;
-  if (!input.refundId || !input.providerCreatedAt || !input.paymentItemCapacities || !input.earlierFinalized) {
+  if (!input.providerRefundId || !input.providerCreatedAt ||
+    !input.paymentItemCapacities || !input.earlierFinalized) {
     linkageMismatch();
   }
-  assertNonEmptyId(input.refundId);
+  assertNonEmptyId(input.providerRefundId);
   const currentProviderCreatedAtEpochMs = Date.parse(input.providerCreatedAt);
   if (Number.isNaN(currentProviderCreatedAtEpochMs)) linkageMismatch();
 
@@ -123,15 +125,18 @@ function computedCapacity(
     if (capacity.has(item.orderItemId)) mismatch();
     capacity.set(item.orderItemId, { subtotalMinor: item.subtotalMinor, taxMinor: item.taxMinor });
   }
-  const current = { refundId: input.refundId, providerCreatedAtEpochMs: currentProviderCreatedAtEpochMs };
+  const current = {
+    providerRefundId: input.providerRefundId,
+    providerCreatedAtEpochMs: currentProviderCreatedAtEpochMs
+  };
   const earlier = input.earlierFinalized.map((fact) => {
     const providerCreatedAtEpochMs = Date.parse(fact.providerCreatedAt);
     if (Number.isNaN(providerCreatedAtEpochMs)) mismatch();
-    return { fact, refundId: fact.refundId, providerCreatedAtEpochMs };
+    return { fact, providerRefundId: fact.providerRefundId, providerCreatedAtEpochMs };
   }).sort(compareChronology);
   const factKeys = new Set<string>();
   for (const { fact, providerCreatedAtEpochMs } of earlier) {
-    assertNonEmptyId(fact.refundId);
+    assertNonEmptyId(fact.providerRefundId);
     assertNonEmptyId(fact.orderItemId);
     assertCurrency(fact.presentmentCurrency);
     assertSafeMoney(fact.subtotalMinor);
@@ -139,9 +144,12 @@ function computedCapacity(
     if (
       fact.presentmentCurrency !== input.presentmentCurrency ||
       fact.subtotalMinor < 0 || fact.taxMinor < 0 ||
-      compareChronology({ refundId: fact.refundId, providerCreatedAtEpochMs }, current) >= 0
+      compareChronology({
+        providerRefundId: fact.providerRefundId,
+        providerCreatedAtEpochMs
+      }, current) >= 0
     ) mismatch();
-    const factKey = `${fact.refundId}\u0000${providerCreatedAtEpochMs}\u0000${fact.orderItemId}`;
+    const factKey = `${fact.providerRefundId}\u0000${providerCreatedAtEpochMs}\u0000${fact.orderItemId}`;
     if (factKeys.has(factKey)) mismatch();
     factKeys.add(factKey);
     const remaining = capacity.get(fact.orderItemId);

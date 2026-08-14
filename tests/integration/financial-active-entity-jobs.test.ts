@@ -6,6 +6,7 @@ import {
   createFinancialPayoutEventJob,
   createFinancialPayoutScanJob,
   createFinancialSourceEventJob,
+  createFinancialSourceGraphJob,
   createFinancialSourceScanJob
 } from '$lib/server/commerce/financial/jobs';
 import {
@@ -19,9 +20,12 @@ const SOURCE_ID = '00000000-0000-4000-8000-000000001621';
 const SCAN_RUN_ID = '00000000-0000-4000-8000-000000001622';
 const HOUR = '2026-08-12T12:00:00.000Z';
 const NEXT_HOUR = '2026-08-12T13:00:00.000Z';
+const FAR_FUTURE = new Date('2099-01-01T00:00:00.000Z');
 
 function sourceInput(spec: ReturnType<
-  typeof createFinancialSourceEventJob | typeof createFinancialSourceScanJob
+  typeof createFinancialSourceEventJob |
+  typeof createFinancialSourceGraphJob |
+  typeof createFinancialSourceScanJob
 >) {
   return {
     ...spec,
@@ -74,7 +78,9 @@ describe('PostgreSQL active financial entity jobs', () => {
     expect(results[0].id).toBe(results[1].id);
     expect(await databaseClient.db.select().from(jobs)).toHaveLength(1);
 
-    const repository = createPostgresJobRepository(databaseClient.db, applicationConfig.jobs);
+    const repository = createPostgresJobRepository(
+      databaseClient.db, applicationConfig.jobs, () => FAR_FUTURE
+    );
     const claimed = await repository.claimNext('worker-a');
     expect(claimed?.id).toBe(results[0].id);
     const whileRunning = await databaseClient.db.transaction((transaction) =>
@@ -108,7 +114,9 @@ describe('PostgreSQL active financial entity jobs', () => {
     const event = await databaseClient.db.transaction((transaction) =>
       enqueueActiveEntityJob(transaction, sourceInput(eventSpec))
     );
-    const repository = createPostgresJobRepository(databaseClient.db, applicationConfig.jobs);
+    const repository = createPostgresJobRepository(
+      databaseClient.db, applicationConfig.jobs, () => FAR_FUTURE
+    );
     expect((await repository.claimNext('worker-terminal'))?.id).toBe(event.id);
     await databaseClient.db.update(jobs)
       .set({ attempts: eventSpec.maxAttempts })
@@ -132,6 +140,74 @@ describe('PostgreSQL active financial entity jobs', () => {
     expect(await databaseClient.db.select().from(jobs)).toHaveLength(2);
   });
 
+  it('coalesces active graph work, gives terminal graph publication a fresh generation, and keeps exact graph retry permanent', async () => {
+    const eventSpec = createFinancialSourceEventJob({
+      sourceKind: 'refund', sourceId: SOURCE_ID,
+      providerEventId: 'evt_active_graph_origin_1621'
+    });
+    const graphSpec = createFinancialSourceGraphJob({
+      sourceKind: 'refund', sourceId: SOURCE_ID,
+      providerEventId: 'evt_active_graph_publication_1621'
+    });
+    const event = await databaseClient.db.transaction((transaction) =>
+      enqueueActiveEntityJob(transaction, sourceInput(eventSpec))
+    );
+    const pendingCoalesced = await databaseClient.db.transaction((transaction) =>
+      enqueueActiveEntityJob(transaction, sourceInput(graphSpec))
+    );
+    expect(pendingCoalesced.id).toBe(event.id);
+    expect(await databaseClient.db.select().from(jobs)).toHaveLength(1);
+
+    const repository = createPostgresJobRepository(
+      databaseClient.db, applicationConfig.jobs, () => FAR_FUTURE
+    );
+    expect((await repository.claimNext('worker-graph-event'))?.id).toBe(event.id);
+    const runningCoalesced = await databaseClient.db.transaction((transaction) =>
+      enqueueActiveEntityJob(transaction, sourceInput(graphSpec))
+    );
+    expect(runningCoalesced).toMatchObject({
+      id: event.id,
+      status: 'running',
+      rerunRequestedAt: expect.anything()
+    });
+    await expect(repository.complete(event.id, 'worker-graph-event')).resolves.toBe(true);
+    expect((await databaseClient.db.select().from(jobs))[0]).toMatchObject({
+      id: event.id,
+      status: 'pending',
+      attempts: 0,
+      rerunRequestedAt: null
+    });
+    expect((await repository.claimNext('worker-graph-rerun'))?.id).toBe(event.id);
+    await expect(repository.complete(event.id, 'worker-graph-rerun')).resolves.toBe(true);
+
+    const graph = await databaseClient.db.transaction((transaction) =>
+      enqueueActiveEntityJob(transaction, sourceInput(graphSpec))
+    );
+    expect(graph).toMatchObject({ status: 'pending', payload: graphSpec.payload });
+    expect(graph.id).not.toBe(event.id);
+    const localOnly = createPostgresJobRepository(
+      databaseClient.db,
+      applicationConfig.jobs,
+      () => FAR_FUTURE,
+      'local-only'
+    );
+    await expect(localOnly.claimNext('worker-graph-local')).resolves.toBeNull();
+    expect((await repository.claimNext('worker-graph-provider'))?.id).toBe(graph.id);
+    await expect(repository.complete(graph.id, 'worker-graph-provider')).resolves.toBe(true);
+
+    const exactGraphReplay = await databaseClient.db.transaction((transaction) =>
+      enqueueActiveEntityJob(transaction, sourceInput(graphSpec))
+    );
+    expect(exactGraphReplay).toMatchObject({
+      id: graph.id,
+      status: 'succeeded',
+      attempts: 1,
+      payload: graphSpec.payload,
+      deduplicationKey: graphSpec.deduplicationKey
+    });
+    expect(await databaseClient.db.select().from(jobs)).toHaveLength(2);
+  });
+
   it('turns a distinct trigger arriving before failure into one fresh attempt', async () => {
     const event = sourceInput(createFinancialSourceEventJob({
       sourceKind: 'dispute', sourceId: SOURCE_ID,
@@ -140,7 +216,9 @@ describe('PostgreSQL active financial entity jobs', () => {
     const queued = await databaseClient.db.transaction((transaction) =>
       enqueueActiveEntityJob(transaction, event)
     );
-    const repository = createPostgresJobRepository(databaseClient.db, applicationConfig.jobs);
+    const repository = createPostgresJobRepository(
+      databaseClient.db, applicationConfig.jobs, () => FAR_FUTURE
+    );
     expect((await repository.claimNext('worker-failure-a'))?.id).toBe(queued.id);
 
     await databaseClient.db.transaction((transaction) =>

@@ -30,6 +30,7 @@ import { FINANCIAL_ALLOCATION_ALGORITHM_VERSION, FINANCIAL_CLASSIFIER_VERSION } 
 import { PermanentFinancialError, RetryableFinancialError } from '../errors';
 import { observeFinancialIssue, resolveFinancialIssueAfterRecompute } from '../issues';
 import {
+  lockActiveFinancialProjectionImplementation,
   lockFinancialProjectionRows,
   type FinancialProjectionLockRows
 } from '../locks';
@@ -386,27 +387,11 @@ function samePresentmentProjection(
   ));
 }
 
-function causalRootFromLoadedPlans(
-  setId: string,
-  plans: ReadonlyMap<string, FinancialAllocationPlan>
-): string {
-  const visited = new Set<string>();
-  let currentId = setId;
-  while (true) {
-    if (visited.has(currentId)) throw new PermanentFinancialError('source_linkage_mismatch');
-    visited.add(currentId);
-    const plan = plans.get(currentId);
-    if (!plan) throw new PermanentFinancialError('source_linkage_mismatch');
-    if (plan.supersedesSetId === null) return currentId;
-    currentId = plan.supersedesSetId;
-  }
-}
-
 function storedEffectsForCurrentSet(
   facts: Awaited<ReturnType<typeof lockCanonicalPaymentPurchaseFacts>>,
   balance: LockedBalance,
   grossSetId: string,
-  plans: ReadonlyMap<string, FinancialAllocationPlan>
+  _plans: ReadonlyMap<string, FinancialAllocationPlan>
 ): readonly BoundDisputePresentmentEffect[] {
   const allocationById = new Map(facts.disputeItemAllocations.map((row) => [row.id, row]));
   return facts.disputeItemAllocations
@@ -415,9 +400,7 @@ function storedEffectsForCurrentSet(
       const original =
         row.reversesAllocationId === null ? row : allocationById.get(row.reversesAllocationId);
       if (!original) throw new PermanentFinancialError('source_linkage_mismatch');
-      const withdrawalSetId = causalRootFromLoadedPlans(
-        original.grossAllocationSetId, plans
-      );
+      const withdrawalSetId = original.grossAllocationSetId;
       return {
         allocationId: row.id,
         withdrawalSetId,
@@ -782,13 +765,12 @@ async function recomputeLockedDisputeFinancialProjectionForVersionInSavepoint(
         replacementSetId: saved.setId, sourceFingerprint: plan.sourceFingerprint,
         disposition: saved.disposition });
       if (plan.basis === 'gross_amount') {
-        causalRootByGrossSet.set(saved.setId, grossTip === undefined ? saved.setId :
-          causalRootByGrossSet.get(grossTip.id) ?? grossTip.id);
+        causalRootByGrossSet.set(saved.setId, saved.setId);
       }
     }
     if (bundle.presentmentEffects.length > 0) {
       priorEffects.push(...await persistPresentmentEffects(tx, sourceDispute.id,
-        pair[0]!.setId, causalRootByGrossSet.get(pair[0]!.setId) ?? pair[0]!.setId,
+        pair[0]!.setId, pair[0]!.setId,
         bundle.presentmentEffects));
     }
   }
@@ -976,6 +958,10 @@ export async function reconcileDisputeFinancialSource(
 
   return database.transaction(async (tx) => {
     throwIfFinancialSourceAborted(signal);
+    await lockActiveFinancialProjectionImplementation(tx, {
+      classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
+    });
     const facts = await lockCanonicalPaymentPurchaseFacts(tx, {
       paymentId: routing.paymentId,
       orderId: routing.orderId,
@@ -1339,12 +1325,7 @@ export async function reconcileDisputeFinancialSource(
               pair.push(saved);
               planBySetId.set(saved.setId, unchanged ? currentPlan! : plan);
               if (plan.basis === 'gross_amount') {
-                causalRootByGrossSet.set(
-                  saved.setId,
-                  currentSetId === null
-                    ? saved.setId
-                    : causalRootByGrossSet.get(currentSetId) ?? currentSetId
-                );
+                causalRootByGrossSet.set(saved.setId, saved.setId);
               }
               activeSetByBalanceBasis.set(`${balance.id}:${plan.basis}`, saved.setId);
             }
@@ -1361,7 +1342,7 @@ export async function reconcileDisputeFinancialSource(
                       projectionTx,
                       sourceDispute.id,
                       pair[0]!.setId,
-                      causalRootByGrossSet.get(pair[0]!.setId) ?? pair[0]!.setId,
+                      pair[0]!.setId,
                       bundle.presentmentEffects
                     ))
               );

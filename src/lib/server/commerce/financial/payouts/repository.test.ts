@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Database } from '$lib/server/db/client';
 import { payoutSnapshotFixture } from '../../../../../../tests/fixtures/stripe/payout';
+import { PgDialect } from 'drizzle-orm/pg-core';
+import type { SQLWrapper } from 'drizzle-orm';
 
 const jobMocks = vi.hoisted(() => ({
   enqueueActiveEntityJob: vi.fn(),
@@ -17,6 +19,9 @@ vi.mock('../locks', () => lockMocks);
 vi.mock('../issues', () => issueMocks);
 
 import { persistPayoutImportPage, stagePayoutSnapshot } from './repository';
+
+const dialect = new PgDialect();
+const compiled = (query: unknown) => dialect.sqlToQuery((query as SQLWrapper).getSQL());
 
 describe('payout repository', () => {
   beforeEach(() => {
@@ -37,10 +42,32 @@ describe('payout repository', () => {
     });
   });
 
+  it('takes the replay-enrollment fence before the payout graph lock', async () => {
+    const stop = new Error('stop after observing lock order');
+    const execute = vi.fn()
+      .mockResolvedValueOnce({ rows: [] })
+      .mockRejectedValueOnce(stop);
+    const database = {
+      transaction: vi.fn(async (work) => work({ execute, rollback: vi.fn() }))
+    } as unknown as Database;
+
+    await expect(stagePayoutSnapshot(database, payoutSnapshotFixture(), {
+      correlationId: 'payout-stage-enrollment-order'
+    })).rejects.toBe(stop);
+
+    expect(compiled(execute.mock.calls[0]?.[0]).params).toEqual([
+      'pale-orbit:financial:replay-enrollment'
+    ]);
+    expect(compiled(execute.mock.calls[1]?.[0]).params[0]).toMatch(
+      /^pale-orbit:financial:payout:/u
+    );
+  });
+
   it('sorts and guards related payout roots by their target provider ID', async () => {
     const payoutId = '00000000-0000-4000-8000-000000000102';
     const execute = vi.fn()
       .mockResolvedValue({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [{ id: payoutId }] })

@@ -267,7 +267,7 @@ describe('financial allocation schema declarations', () => {
       'financial_allocation_sets(reversal_of_set_id) -> financial_allocation_sets(id) [restrict]',
       'financial_allocation_sets(reversal_of_set_id,source_kind,source_internal_id,basis,currency) -> financial_allocation_sets(id,source_kind,source_internal_id,basis,currency) [restrict]',
       'financial_allocation_sets(supersedes_set_id) -> financial_allocation_sets(id) [restrict]',
-      'financial_allocation_sets(supersedes_set_id,balance_transaction_id,source_kind,source_internal_id,basis,currency,expected_effect_minor,source_fingerprint_sha256) -> financial_allocation_sets(id,balance_transaction_id,source_kind,source_internal_id,basis,currency,expected_effect_minor,source_fingerprint_sha256) [restrict]',
+      'financial_allocation_sets(supersedes_set_id,balance_transaction_id,basis,currency,expected_effect_minor,source_fingerprint_sha256) -> financial_allocation_sets(id,balance_transaction_id,basis,currency,expected_effect_minor,source_fingerprint_sha256) [restrict]',
       'financial_item_allocations(allocation_set_id) -> financial_allocation_sets(id) [restrict]',
       'financial_item_allocations(order_item_id) -> order_items(id) [restrict]',
       'financial_reconciliation_issues(resolved_by_admin_id) -> user(id) [restrict]',

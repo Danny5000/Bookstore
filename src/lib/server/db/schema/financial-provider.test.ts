@@ -122,7 +122,9 @@ describe('financial provider schema declarations', () => {
       )
     ).toEqual({
       financial_projection_versions: [
-        'singleton', 'classifier_version', 'allocation_algorithm_version', 'activated_at',
+        'singleton', 'classifier_version', 'allocation_algorithm_version',
+        'pending_classifier_version', 'pending_allocation_algorithm_version',
+        'pending_replay_id', 'pending_scan_run_id', 'activated_at',
         'activation_correlation_id'
       ],
       financial_payout_discovery_state: ['singleton', 'covered_through', 'updated_at'],
@@ -257,6 +259,7 @@ describe('financial provider schema declarations', () => {
         indexes: [], unique: [],
         checks: [
           'financial_projection_versions_correlation_safe',
+          'financial_projection_versions_pending_consistent',
           'financial_projection_versions_singleton_true',
           'financial_projection_versions_versions_positive'
         ]

@@ -32,7 +32,8 @@ const scanPhaseSchema = z.enum([
   'payout_discovery_page',
   'incomplete_payout_run_page',
   'payout_impact_page',
-  'classification_replay_page'
+  'classification_replay_page',
+  'classification_replay_finalize'
 ]);
 const subjectTypeSchema = z.enum(['balance_transaction', 'fee_detail']);
 
@@ -41,6 +42,14 @@ const sourceEventPayloadSchema = z.strictObject({
   sourceId: uuidSchema,
   trigger: z.strictObject({
     kind: z.literal('event'),
+    providerEventId: eventIdSchema
+  })
+});
+const sourceGraphPayloadSchema = z.strictObject({
+  sourceKind: sourceKindSchema,
+  sourceId: uuidSchema,
+  trigger: z.strictObject({
+    kind: z.literal('graph'),
     providerEventId: eventIdSchema
   })
 });
@@ -132,14 +141,17 @@ const classificationSubjectPayloadSchema = z.strictObject({
   sourceFingerprintSha256: sha256Schema,
   classifierVersion: positiveInt32Schema,
   allocationAlgorithmVersion: positiveInt32Schema,
-  replayId: z.string().min(5).max(63).regex(/^c[1-9]\d*-a[1-9]\d*$/u)
+  replayId: z.string().min(5).max(63).regex(/^c[1-9]\d*-a[1-9]\d*$/u),
+  scanRunId: uuidSchema.optional()
 });
 
 export type FinancialSourceEventJobPayload = z.output<typeof sourceEventPayloadSchema>;
+export type FinancialSourceGraphJobPayload = z.output<typeof sourceGraphPayloadSchema>;
 export type FinancialSourceScanJobPayload = z.output<typeof sourceScanPayloadSchema>;
 export type FinancialSourcePayoutImpactJobPayload = z.output<typeof sourcePayoutImpactPayloadSchema>;
 export type FinancialSourceJobPayload =
   | FinancialSourceEventJobPayload
+  | FinancialSourceGraphJobPayload
   | FinancialSourceScanJobPayload
   | FinancialSourcePayoutImpactJobPayload;
 export type FinancialPayoutEventJobPayload = z.output<typeof payoutEventPayloadSchema>;
@@ -270,6 +282,26 @@ export function createFinancialSourceEventJob(input: {
     trigger: { kind: 'event', providerEventId: input.providerEventId }
   });
   return sourceSpec(payload, `stripe:financial-source:event:${payload.trigger.providerEventId}`);
+}
+
+export function parseFinancialSourceGraphJobPayload(value: unknown): FinancialSourceGraphJobPayload {
+  return parseStrict(sourceGraphPayloadSchema, value);
+}
+
+export function createFinancialSourceGraphJob(input: {
+  sourceKind: FinancialSourceGraphJobPayload['sourceKind'];
+  sourceId: string;
+  providerEventId: string;
+}): FinancialJobSpec<typeof FINANCIAL_SOURCE_JOB, FinancialSourceGraphJobPayload> {
+  const payload = parseFinancialSourceGraphJobPayload({
+    sourceKind: input.sourceKind,
+    sourceId: input.sourceId,
+    trigger: { kind: 'graph', providerEventId: input.providerEventId }
+  });
+  return sourceSpec(
+    payload,
+    `financial:source:graph:${payload.trigger.providerEventId}:${payload.sourceKind}:${payload.sourceId}`
+  );
 }
 
 export function parseFinancialSourceScanJobPayload(value: unknown): FinancialSourceScanJobPayload {
@@ -526,6 +558,7 @@ export function createFinancialClassificationSubjectJob(input: {
   sourceFingerprintSha256: string;
   classifierVersion: number;
   allocationAlgorithmVersion: number;
+  scanRunId?: string;
 }): FinancialClassificationJobSpec {
   const payload = parseFinancialClassificationSubjectJobPayload({
     ...input,
@@ -562,6 +595,13 @@ function expectedIdentity(type: FinancialJobIdentity['type'], payload: unknown):
     if (triggerKind === 'event') {
       const parsed = parseFinancialSourceEventJobPayload(payload);
       return sourceSpec(parsed, `stripe:financial-source:event:${parsed.trigger.providerEventId}`);
+    }
+    if (triggerKind === 'graph') {
+      const parsed = parseFinancialSourceGraphJobPayload(payload);
+      return sourceSpec(
+        parsed,
+        `financial:source:graph:${parsed.trigger.providerEventId}:${parsed.sourceKind}:${parsed.sourceId}`
+      );
     }
     if (triggerKind === 'scan') {
       const parsed = parseFinancialSourceScanJobPayload(payload);

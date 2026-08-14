@@ -14,7 +14,11 @@ import {
   persistFinancialAllocationReplayPlanLocked
 } from '../allocations/repository';
 import { observeFinancialIssue, resolveFinancialIssueAfterRecompute } from '../issues';
-import { lockFinancialProjectionRows, type FinancialProjectionLockRows } from '../locks';
+import {
+  lockActiveFinancialProjectionImplementation,
+  lockFinancialProjectionRows,
+  type FinancialProjectionLockRows
+} from '../locks';
 import { stageBalanceTransaction } from '../ledger';
 import { PermanentFinancialError } from '../errors';
 import {
@@ -36,7 +40,10 @@ vi.mock('../issues', () => ({
   observeFinancialIssue: vi.fn(),
   resolveFinancialIssueAfterRecompute: vi.fn()
 }));
-vi.mock('../locks', () => ({ lockFinancialProjectionRows: vi.fn() }));
+vi.mock('../locks', () => ({
+  lockActiveFinancialProjectionImplementation: vi.fn(),
+  lockFinancialProjectionRows: vi.fn()
+}));
 vi.mock('$lib/server/audit/service', () => ({ appendAuditEvent: vi.fn() }));
 
 const disputeId = '00000000-0000-4000-8000-000000000301';
@@ -673,6 +680,12 @@ describe('reconcileDisputeFinancialSource', () => {
         balanceTransactionIds: [balanceId, siblingBalanceId].sort()
       })
     );
+    expect(lockActiveFinancialProjectionImplementation).toHaveBeenCalledWith(tx, {
+      classifierVersion: 1,
+      allocationAlgorithmVersion: 1
+    });
+    expect(vi.mocked(lockActiveFinancialProjectionImplementation).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(lockCanonicalPaymentPurchaseFacts).mock.invocationCallOrder[0]!);
   });
 
   it('replays an already persisted transaction without treating its own presentment rows as prior chronology', async () => {

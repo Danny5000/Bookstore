@@ -556,7 +556,8 @@ export async function fulfillCheckoutEvent(
         await dependencies.queueFinancialSourceFromEvent(transaction, {
           sourceKind: 'payment',
           sourceId: existingPayment.id,
-          providerEventId: event.providerEventId
+          providerEventId: event.providerEventId,
+          projectionGraphSourceIds: []
         });
       }
       await dependencies.completeStripeEvent(transaction, event.id, now);
@@ -604,10 +605,16 @@ export async function fulfillCheckoutEvent(
       }).where(eq(orders.id, order.id));
     }
     if (paymentFact) {
+      const projectionGraphPublished = existingPayment === undefined ||
+        existingPayment.status !== paymentFact.status ||
+        existingPayment.stripeLatestChargeId !== paymentFact.stripeLatestChargeId ||
+        existingPayment.paidAt?.getTime() !== paymentFact.paidAt?.getTime() ||
+        command.state === 'paid';
       await dependencies.queueFinancialSourceFromEvent(transaction, {
         sourceKind: 'payment',
         sourceId: paymentFact.id,
-        providerEventId: event.providerEventId
+        providerEventId: event.providerEventId,
+        projectionGraphSourceIds: projectionGraphPublished ? [paymentFact.id] : []
       });
     }
     await dependencies.completeStripeEvent(transaction, event.id, now);

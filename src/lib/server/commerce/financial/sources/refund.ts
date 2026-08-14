@@ -36,7 +36,10 @@ import {
 } from '../constants';
 import { PermanentFinancialError, RetryableFinancialError } from '../errors';
 import { observeFinancialIssue, resolveFinancialIssueAfterRecompute } from '../issues';
-import { lockFinancialProjectionRows } from '../locks';
+import {
+  lockActiveFinancialProjectionImplementation,
+  lockFinancialProjectionRows
+} from '../locks';
 import { stageBalanceTransaction } from '../ledger';
 import type {
   FinancialAllocationPlan,
@@ -89,6 +92,7 @@ interface LockedBalanceRow {
 
 interface RefundHistoryRow {
   readonly refundId: string;
+  readonly providerRefundId: string;
   readonly providerCreatedAt: Date;
   readonly refundStatus: string;
   readonly allocationStatus: string;
@@ -429,11 +433,23 @@ function sameInstant(left: Date, right: Date): boolean {
 }
 
 function compareChronology(
-  left: { readonly providerCreatedAt: Date; readonly refundId: string },
-  right: { readonly providerCreatedAt: Date; readonly refundId: string }
+  left: {
+    readonly providerCreatedAt: Date;
+    readonly providerRefundId: string;
+    readonly refundId: string;
+  },
+  right: {
+    readonly providerCreatedAt: Date;
+    readonly providerRefundId: string;
+    readonly refundId: string;
+  }
 ): number {
   const difference = left.providerCreatedAt.getTime() - right.providerCreatedAt.getTime();
-  return difference !== 0 ? difference : left.refundId < right.refundId ? -1 : left.refundId > right.refundId ? 1 : 0;
+  if (difference !== 0) return difference;
+  if (left.providerRefundId !== right.providerRefundId) {
+    return left.providerRefundId < right.providerRefundId ? -1 : 1;
+  }
+  return left.refundId < right.refundId ? -1 : left.refundId > right.refundId ? 1 : 0;
 }
 
 function durableIssueCode(error: unknown): FinancialIssueCode | null {
@@ -494,6 +510,8 @@ async function loadCurrentStoredPlans(
   const sets = await rows(transaction, sql`
     select allocation.id, allocation.allocation_identity as "allocationIdentity",
       allocation.balance_transaction_id as "balanceTransactionId", allocation.basis,
+      allocation.source_kind as "sourceKind",
+      allocation.source_internal_id as "sourceId",
       allocation.scope, allocation.currency,
       allocation.expected_effect_minor as "expectedEffectMinor",
       allocation.algorithm_version as "algorithmVersion",
@@ -501,8 +519,7 @@ async function loadCurrentStoredPlans(
       allocation.supersedes_set_id as "supersedesSetId",
       allocation.reversal_of_set_id as "reversalOfSetId"
     from financial_allocation_sets allocation
-    where allocation.source_kind = 'refund' and allocation.source_internal_id = ${refundId}
-      and allocation.balance_transaction_id = ${balanceTransactionId}
+    where allocation.balance_transaction_id = ${balanceTransactionId}
       and not exists (
         select 1 from financial_allocation_sets successor
         where successor.supersedes_set_id = allocation.id
@@ -511,13 +528,19 @@ async function loadCurrentStoredPlans(
     for update
   `) as Array<{
     id: string; allocationIdentity: string; balanceTransactionId: string;
+    sourceKind: string; sourceId: string;
     basis: 'gross_amount' | 'fee'; scope: 'title' | 'account' | 'unresolved';
     currency: string; expectedEffectMinor: number; algorithmVersion: number;
     sourceFingerprint: string; supersedesSetId: string | null; reversalOfSetId: string | null;
   }>;
   const result = new Map<'gross_amount' | 'fee', StoredPlan>();
   for (const set of sets) {
-    if (result.has(set.basis)) throw new PermanentFinancialError('source_linkage_mismatch');
+    const expectedOwner = set.sourceKind === 'refund' && set.sourceId === refundId;
+    const balanceFallback = set.sourceKind === 'adjustment' &&
+      set.sourceId === balanceTransactionId;
+    if ((!expectedOwner && !balanceFallback) || result.has(set.basis)) {
+      throw new PermanentFinancialError('source_linkage_mismatch');
+    }
     const items = await rows(transaction, sql`
       select order_item_id as "orderItemId", component, effect_minor as "effectMinor",
         currency, tie_break_key as "tieBreakKey"
@@ -642,7 +665,8 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
     try {
       const value = await transaction.transaction(async (projectionTx) => {
         const history = await rows(projectionTx, sql`
-          select refund.id as "refundId", refund.provider_created_at as "providerCreatedAt",
+          select refund.id as "refundId", refund.stripe_refund_id as "providerRefundId",
+            refund.provider_created_at as "providerCreatedAt",
             refund.status as "refundStatus", refund.allocation_status as "allocationStatus",
             component.refund_allocation_id as "refundAllocationId",
             component.order_item_id as "orderItemId", component.subtotal_minor as "subtotalMinor",
@@ -651,7 +675,8 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
           join refund_allocations allocation on allocation.id = component.refund_allocation_id
           join refunds refund on refund.id = component.refund_id
           where refund.payment_id = ${input.paymentId}
-          order by refund.provider_created_at, refund.id, component.order_item_id
+          order by refund.provider_created_at, refund.stripe_refund_id collate "C",
+            refund.id, component.order_item_id
         `) as RefundHistoryRow[];
         const currentHistory = history.filter((row) => row.refundId === input.refundId);
         const allocationById = new Map(input.finalizedAllocations.map((row) => [row.id, row]));
@@ -759,26 +784,34 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
         let primaryPlans: readonly [FinancialAllocationPlan, FinancialAllocationPlan];
         if (hasFinalizedAttribution) {
           const currentCreatedAt = currentHistory[0]?.providerCreatedAt;
-          if (!currentCreatedAt || currentHistory.some((row) =>
+          const currentProviderRefundId = currentHistory[0]?.providerRefundId;
+          if (!currentCreatedAt || !currentProviderRefundId || currentHistory.some((row) =>
+            row.providerRefundId !== currentProviderRefundId ||
             !sameInstant(new Date(row.providerCreatedAt), new Date(currentCreatedAt)))) {
             throw new PermanentFinancialError('source_linkage_mismatch');
           }
           const currentChronology = {
             refundId: input.refundId,
+            providerRefundId: currentProviderRefundId,
             providerCreatedAt: new Date(currentCreatedAt)
           };
           const earlierFinalized: EarlierFinalizedRefundComponent[] = history.flatMap((row) => {
-            const chronology = { refundId: row.refundId, providerCreatedAt: new Date(row.providerCreatedAt) };
+            const chronology = {
+              refundId: row.refundId,
+              providerRefundId: row.providerRefundId,
+              providerCreatedAt: new Date(row.providerCreatedAt)
+            };
             return row.refundId === input.refundId || row.refundStatus !== 'succeeded' ||
               row.allocationStatus !== 'finalized' || compareChronology(chronology, currentChronology) >= 0
               ? []
-              : [{ refundId: row.refundId, providerCreatedAt: chronology.providerCreatedAt.toISOString(),
+              : [{ providerRefundId: row.providerRefundId,
+                  providerCreatedAt: chronology.providerCreatedAt.toISOString(),
                   orderItemId: row.orderItemId, subtotalMinor: row.subtotalMinor,
                   taxMinor: row.taxMinor, presentmentCurrency: row.currency }];
           });
           primaryPlans = buildRefundAllocationPlan({
             ...metadata,
-            refundId: input.refundId,
+            providerRefundId: currentProviderRefundId,
             providerCreatedAt: new Date(currentCreatedAt).toISOString(),
             presentmentAmountMinor: input.amountMinor,
             presentmentCurrency: input.currency,
@@ -1160,6 +1193,10 @@ export async function reconcileRefundFinancialSource(
 
   return database.transaction(async (transaction) => {
     throwIfFinancialSourceAborted(signal);
+    await lockActiveFinancialProjectionImplementation(transaction, {
+      classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
+    });
     const facts = await lockCanonicalPaymentPurchaseFacts(transaction, {
       paymentId: routing.paymentId,
       orderId: routing.orderId,

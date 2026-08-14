@@ -17,6 +17,7 @@ import {
   createFinancialPayoutScanJob,
   createFinancialScanContinuationJob,
   createFinancialSourceEventJob,
+  createFinancialSourceGraphJob,
   createFinancialSourcePayoutImpactJob,
   createFinancialSourceScanJob,
   parseFinancialClassificationSubjectJobPayload,
@@ -31,6 +32,7 @@ import {
   parseFinancialPayoutScanJobPayload,
   parseFinancialScanContinuationJobPayload,
   parseFinancialSourceEventJobPayload,
+  parseFinancialSourceGraphJobPayload,
   parseFinancialSourcePayoutImpactJobPayload,
   parseFinancialSourceScanJobPayload
 } from './jobs';
@@ -47,7 +49,8 @@ const CONTINUATION_PHASES = [
   'payout_discovery_page',
   'incomplete_payout_run_page',
   'payout_impact_page',
-  'classification_replay_page'
+  'classification_replay_page',
+  'classification_replay_finalize'
 ] as const;
 
 function expectInvalid(work: () => unknown): void {
@@ -77,7 +80,7 @@ describe('financial job identities', () => {
     ]);
   });
 
-  it('creates strict event, scan, and payout-impact source identities from local source IDs', () => {
+  it('creates strict event, graph, scan, and payout-impact source identities from local source IDs', () => {
     const event = createFinancialSourceEventJob({
       sourceKind: 'refund',
       sourceId: SOURCE_ID,
@@ -94,6 +97,25 @@ describe('financial job identities', () => {
       maxAttempts: 12
     });
     expect(parseFinancialSourceEventJobPayload(event.payload)).toEqual(event.payload);
+
+    const graph = createFinancialSourceGraphJob({
+      sourceKind: 'refund',
+      sourceId: SOURCE_ID,
+      providerEventId: 'evt_financial_graph_701'
+    });
+    expect(graph).toEqual({
+      type: FINANCIAL_SOURCE_JOB,
+      payload: {
+        sourceKind: 'refund',
+        sourceId: SOURCE_ID,
+        trigger: { kind: 'graph', providerEventId: 'evt_financial_graph_701' }
+      },
+      deduplicationKey:
+        `financial:source:graph:evt_financial_graph_701:refund:${SOURCE_ID}`,
+      maxAttempts: 12
+    });
+    expect(parseFinancialSourceGraphJobPayload(graph.payload)).toEqual(graph.payload);
+    expect(parseFinancialJobIdentity(graph)).toEqual(graph);
 
     const scan = createFinancialSourceScanJob({
       sourceKind: 'payment',
@@ -273,13 +295,14 @@ describe('financial job identities', () => {
       .toEqual(continuation.payload);
   });
 
-  it('derives the composite replay identity for one classification subject', () => {
+  it('derives a run-linked composite replay identity for one classification subject', () => {
     const classification = createFinancialClassificationSubjectJob({
       subjectType: 'fee_detail',
       subjectId: SUBJECT_ID,
       sourceFingerprintSha256: FINGERPRINT,
       classifierVersion: 4,
-      allocationAlgorithmVersion: 5
+      allocationAlgorithmVersion: 5,
+      scanRunId: SCAN_RUN_ID
     });
     expect(classification).toEqual({
       type: FINANCIAL_CLASSIFICATION_JOB,
@@ -289,7 +312,8 @@ describe('financial job identities', () => {
         sourceFingerprintSha256: FINGERPRINT,
         classifierVersion: 4,
         allocationAlgorithmVersion: 5,
-        replayId: 'c4-a5'
+        replayId: 'c4-a5',
+        scanRunId: SCAN_RUN_ID
       },
       deduplicationKey:
         `financial:classification:4:5:fee_detail:${SUBJECT_ID}:${FINGERPRINT}`,
@@ -335,6 +359,9 @@ describe('financial job identities', () => {
     const identities = [
       createFinancialSourceEventJob({
         sourceKind: 'payment', sourceId: SOURCE_ID, providerEventId: 'evt_roundtrip_701'
+      }),
+      createFinancialSourceGraphJob({
+        sourceKind: 'refund', sourceId: SOURCE_ID, providerEventId: 'evt_roundtrip_graph_701'
       }),
       createFinancialSourceScanJob({
         sourceKind: 'refund',
@@ -434,6 +461,16 @@ describe('financial job identities', () => {
         }),
         createFinancialSourceEventJob({
           sourceKind: 'payment', sourceId: SOURCE_ID, providerEventId: 'evt_generation_702'
+        })
+      ],
+      [
+        createFinancialSourceGraphJob({
+          sourceKind: 'refund', sourceId: SOURCE_ID,
+          providerEventId: 'evt_generation_graph_701'
+        }),
+        createFinancialSourceGraphJob({
+          sourceKind: 'refund', sourceId: SOURCE_ID,
+          providerEventId: 'evt_generation_graph_702'
         })
       ],
       [
@@ -553,6 +590,13 @@ describe('financial job identities', () => {
       sourceKind: 'payment',
       sourceId: SOURCE_ID,
       trigger: { kind: 'event', providerEventId: 'evt_valid_701', extra: true }
+    }));
+    expectInvalid(() => parseFinancialSourceGraphJobPayload({
+      sourceKind: 'refund',
+      sourceId: SOURCE_ID,
+      trigger: {
+        kind: 'graph', providerEventId: 'evt_valid_graph_701', providerRefundId: 'private'
+      }
     }));
     expectInvalid(() => parseFinancialSourceScanJobPayload({
       sourceKind: 'payment',

@@ -7,7 +7,8 @@ import { PermanentFinancialError, RetryableFinancialError } from '../errors';
 import {
   FINANCIAL_PAYOUT_JOB,
   FINANCIAL_SOURCE_JOB,
-  createFinancialSourceEventJob
+  createFinancialSourceEventJob,
+  createFinancialSourceGraphJob
 } from '../jobs';
 import { createFinancialSourceHandler } from './source';
 
@@ -81,6 +82,7 @@ describe('createFinancialSourceHandler', () => {
 
   it.each([
     ['payment', 'event', reconcilers.payment],
+    ['refund', 'graph', reconcilers.refund],
     ['refund', 'scan', reconcilers.refund],
     ['dispute', 'payout_impact', reconcilers.dispute]
   ] as const)('strictly parses and dispatches one %s %s job', async (sourceKind, triggerKind, reconcile) => {
@@ -90,12 +92,17 @@ describe('createFinancialSourceHandler', () => {
     const jobId = randomUUID();
     const trigger = triggerKind === 'event'
       ? { kind: 'event' as const, providerEventId: 'evt_handler_green' }
+      : triggerKind === 'graph'
+        ? { kind: 'graph' as const, providerEventId: 'evt_handler_graph_green' }
       : triggerKind === 'scan'
         ? { kind: 'scan' as const, scanRunId: randomUUID(), scanGenerationHour: '2026-08-12T12:00:00.000Z' }
         : { kind: 'payout_impact' as const, payoutId: randomUUID(), payoutGeneration: 1 };
     const signal = new AbortController().signal;
     const deduplicationKey = trigger.kind === 'event'
       ? `stripe:financial-source:event:${trigger.providerEventId}`
+      : trigger.kind === 'graph'
+        ? createFinancialSourceGraphJob({ sourceKind, sourceId,
+            providerEventId: trigger.providerEventId }).deduplicationKey
       : trigger.kind === 'scan'
         ? `financial:source:scan:${sourceKind}:${sourceId}:${trigger.scanGenerationHour}`
         : `financial:source:payout-impact:${trigger.payoutId}:${trigger.payoutGeneration}:` +

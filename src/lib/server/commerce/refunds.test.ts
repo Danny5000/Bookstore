@@ -107,6 +107,28 @@ describe('deterministic refund allocation', () => {
     }))).toEqual({ state: 'needs_review', allocations: [] });
   });
 
+  it('breaks equal provider-time ties by provider refund ID instead of the local UUID', () => {
+    const providerFirst = refund('local-z', 1, {
+      providerRefundId: 're_provider_a',
+      providerCreatedAt: new Date('2026-08-10T13:00:00.000Z')
+    });
+    const providerSecond = refund('local-a', 1, {
+      providerRefundId: 're_provider_z',
+      providerCreatedAt: new Date('2026-08-10T13:00:00.000Z')
+    });
+
+    expect(allocateDeterministicRefunds(facts({
+      items: [item('item-a', 1), item('item-b', 1)],
+      refunds: [providerSecond, providerFirst]
+    }))).toEqual({
+      state: 'allocated',
+      allocations: [
+        { refundId: providerFirst.refundId, orderItemId: 'item-a', amountMinor: 1 },
+        { refundId: providerSecond.refundId, orderItemId: 'item-b', amountMinor: 1 }
+      ]
+    });
+  });
+
   it('allocates one remaining refund when it exactly fills all remaining item capacity', () => {
     const first = refund('refund-1', 500);
     const final = refund('refund-2', 2000);

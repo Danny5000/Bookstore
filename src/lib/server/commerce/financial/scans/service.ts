@@ -19,7 +19,7 @@ import {
 import { PermanentFinancialError, RetryableFinancialError } from '../errors';
 import {
   commitFinancialScanPage,
-  completeEmptyFinancialReplay,
+  finalizeFinancialReplay,
   freezePayoutDiscoveryWindow,
   loadClassificationReplayPage,
   loadFinancialSourceScanPage,
@@ -124,28 +124,32 @@ export async function processFinancialScanJob(
     ), 'payout_impact_page', page.checkpoint, !page.hasMore);
   }
 
+  if (run.phase === 'classification_replay_finalize') {
+    if (!positiveInt(run.classifierVersion) || !positiveInt(run.allocationAlgorithmVersion) ||
+      run.cursorDigestSha256 === null) {
+      throw new PermanentFinancialError('source_linkage_mismatch');
+    }
+    abortIfNeeded(input.signal);
+    const completed = await finalizeFinancialReplay(dependencies.database, {
+      runId: run.id, expectedCursorDigestSha256: run.cursorDigestSha256,
+      expectedPageCount: run.pageCount, classifierVersion: run.classifierVersion,
+      allocationAlgorithmVersion: run.allocationAlgorithmVersion,
+      correlationId: input.correlationId
+    });
+    return { status: 'completed', runId: completed.id };
+  }
+
   if (run.phase === 'classification_replay_page') {
     if (!positiveInt(run.classifierVersion) || !positiveInt(run.allocationAlgorithmVersion)) {
       throw new PermanentFinancialError('source_linkage_mismatch');
     }
     const page = await loadClassificationReplayPage(dependencies.database, run, limit);
-    if (!page.hasMore && page.data.length === 0 && run.processedCount === 0) {
-      abortIfNeeded(input.signal);
-      const completed = await completeEmptyFinancialReplay(dependencies.database, {
-        runId: run.id,
-        expectedCheckpoint: run.checkpoint,
-        expectedPageCount: run.pageCount,
-        classifierVersion: run.classifierVersion,
-        allocationAlgorithmVersion: run.allocationAlgorithmVersion,
-        correlationId: input.correlationId
-      });
-      return { status: 'completed', runId: completed.id };
-    }
     return finishPage(dependencies.database, input.signal, run, page, page.data.map((subject) =>
       createFinancialClassificationSubjectJob({
         ...subject,
         classifierVersion: run.classifierVersion!,
-        allocationAlgorithmVersion: run.allocationAlgorithmVersion!
+        allocationAlgorithmVersion: run.allocationAlgorithmVersion!,
+        scanRunId: run.id
       })
     ), 'classification_replay_page', page.checkpoint, !page.hasMore);
   }
@@ -271,6 +275,6 @@ async function finishPage(
 function isScanPhase(value: string): value is CommitFinancialScanPageInput['nextPhase'] {
   return [
     'source_page', 'payout_discovery_page', 'incomplete_payout_run_page',
-    'payout_impact_page', 'classification_replay_page'
+    'payout_impact_page', 'classification_replay_page', 'classification_replay_finalize'
   ].includes(value);
 }

@@ -4,8 +4,20 @@ import { describe, expect, it, vi } from 'vitest';
 import { createCommerceMessageEnqueuer } from '$lib/server/commerce/email/enqueue';
 import { parseCommerceEmailPayload } from '$lib/server/commerce/email/payload';
 import { PermanentCommerceError } from '$lib/server/commerce/errors';
-import { FINANCIAL_SOURCE_JOB, parseFinancialJobIdentity } from '$lib/server/commerce/financial/jobs';
+import {
+  FINANCIAL_CLASSIFICATION_JOB,
+  FINANCIAL_SOURCE_JOB,
+  createFinancialClassificationSubjectJob,
+  parseFinancialJobIdentity
+} from '$lib/server/commerce/financial/jobs';
+import { createFinancialClassificationHandler } from '$lib/server/commerce/financial/handlers/classification';
+import { createFinancialSourceHandler } from '$lib/server/commerce/financial/handlers/source';
+import { stageBalanceTransaction } from '$lib/server/commerce/financial/ledger';
+import { replayFinancialClassificationLocked } from '$lib/server/commerce/financial/rebase';
+import { loadCurrentEffectiveAllocationProjection } from '$lib/server/commerce/financial/allocations/repository';
 import { projectEffectiveEntitlement } from '$lib/server/commerce/grants';
+import { createFixtureStripeGateway } from '$lib/server/commerce/stripe/fixture-gateway';
+import type { StripeCommerceGateway } from '$lib/server/commerce/stripe/types';
 import {
   fulfillRefundEvent,
   type RefundFulfillmentDependencies
@@ -21,14 +33,24 @@ import {
   outboxMessages,
   payments,
   refundAllocations,
+  refundAllocationComponents,
   refunds,
+  stripeBalanceTransactions,
   stripeEvents,
   titles,
   user
 } from '$lib/server/db/schema';
+import { createPostgresJobRepository } from '$lib/server/jobs/repository';
+import type { JobHandler } from '$lib/server/jobs/types';
+import { OUTBOX_DISPATCH_JOB } from '$lib/server/outbox/repository';
+import { balanceTransactionSnapshotFixture } from '../fixtures/stripe/balance-transaction';
+import { chargeSnapshotFixture } from '../fixtures/stripe/charge';
+import { paymentSnapshotFixture } from '../fixtures/stripe/payment';
+import { refundSnapshotFixture } from '../fixtures/stripe/refund';
 import { applicationConfig, databaseClient } from './database';
 
 const now = new Date('2026-08-10T14:00:00.000Z');
+const FAR_FUTURE = new Date('2099-01-01T00:00:00.000Z');
 
 interface PurchaseFixture {
   orderId: string;
@@ -41,8 +63,13 @@ interface PurchaseFixture {
 
 async function createPurchase(
   totals: readonly number[],
-  owner: 'account' | 'guest' = 'account'
+  owner: 'account' | 'guest' = 'account',
+  taxes: readonly number[] = totals.map(() => 0)
 ): Promise<PurchaseFixture> {
+  if (taxes.length !== totals.length || taxes.some((tax, index) =>
+    !Number.isSafeInteger(tax) || tax < 0 || tax > totals[index]!)) {
+    throw new Error('Invalid refund fixture tax split');
+  }
   const orderId = randomUUID();
   const email = `${owner}-${orderId}@example.com`;
   let userId: string | null = null;
@@ -64,6 +91,7 @@ async function createPurchase(
   }
 
   const totalMinor = totals.reduce((sum, value) => sum + value, 0);
+  const taxMinor = taxes.reduce((sum, value) => sum + value, 0);
   await databaseClient.db.insert(orders).values({
     id: orderId,
     status: 'paid',
@@ -71,8 +99,8 @@ async function createPurchase(
     guestIdentityId,
     purchaseEmail: email,
     currency: 'USD',
-    subtotalMinor: totalMinor,
-    taxMinor: 0,
+    subtotalMinor: totalMinor - taxMinor,
+    taxMinor,
     totalMinor,
     clientCheckoutAttemptId: randomUUID(),
     quoteFingerprintSha256: 'a'.repeat(64),
@@ -84,6 +112,7 @@ async function createPurchase(
 
   const items: PurchaseFixture['items'] = [];
   for (const [index, itemTotal] of totals.entries()) {
+    const itemTax = taxes[index]!;
     const titleId = randomUUID();
     const itemId = randomUUID();
     await databaseClient.db.insert(titles).values({
@@ -105,8 +134,8 @@ async function createPurchase(
       creatorNameSnapshot: 'Private creator',
       format: 'prose',
       currency: 'USD',
-      unitSubtotalMinor: itemTotal,
-      taxMinor: 0,
+      unitSubtotalMinor: itemTotal - itemTax,
+      taxMinor: itemTax,
       totalMinor: itemTotal,
       stripeLineItemId: `li_test_${itemId}`
     });
@@ -204,6 +233,36 @@ function dependencies(
   };
 }
 
+async function drainRefundFinancialJobs(gateway: StripeCommerceGateway): Promise<void> {
+  const repository = createPostgresJobRepository(
+    databaseClient.db,
+    applicationConfig.jobs,
+    () => FAR_FUTURE
+  );
+  const handlers = new Map<string, JobHandler>([
+    [FINANCIAL_SOURCE_JOB, createFinancialSourceHandler({
+      database: databaseClient.db,
+      gateway
+    })],
+    [FINANCIAL_CLASSIFICATION_JOB, createFinancialClassificationHandler({
+      database: databaseClient.db,
+      targetClassifierVersion: 1,
+      targetAllocationAlgorithmVersion: 1
+    })],
+    [OUTBOX_DISPATCH_JOB, async () => {}]
+  ]);
+  for (let index = 0; index < 24; index += 1) {
+    const workerId = `refund-convergence-${index}`;
+    const job = await repository.claimNext(workerId);
+    if (!job) return;
+    const handler = handlers.get(job.type);
+    if (!handler) throw new Error(`Unexpected refund convergence job: ${job.type}`);
+    await handler(job, new AbortController().signal);
+    expect(await repository.complete(job.id, workerId)).toBe(true);
+  }
+  throw new Error('Refund convergence exceeded its bounded job count.');
+}
+
 describe('canonical refund fulfillment', () => {
   it('atomically hands one canonical terminal refund to financial reconciliation', async () => {
     const fixture = await createPurchase([1403]);
@@ -287,6 +346,44 @@ describe('canonical refund fulfillment', () => {
     expect(await databaseClient.db.select().from(outboxMessages)).toHaveLength(1);
   });
 
+  it('keeps both reconciled refunds current on a distinct exact no-op event', async () => {
+    const fixture = await createPurchase([1403]);
+    const firstProviderId = `re_test_${randomUUID()}`;
+    const secondProviderId = `re_test_${randomUUID()}`;
+    const first = await createRefundEvent(firstProviderId, 1);
+    await fulfillRefundEvent(
+      databaseClient.db,
+      snapshots(fixture, first, 500, 'succeeded', 1),
+      dependencies()
+    );
+    const second = await createRefundEvent(secondProviderId, 2);
+    await fulfillRefundEvent(
+      databaseClient.db,
+      snapshots(fixture, second, 903, 'succeeded', 2),
+      dependencies()
+    );
+    await databaseClient.db.update(refunds).set({
+      financialEvidenceStatus: 'fee_reconciled'
+    });
+
+    const distinctNoop = await createRefundEvent(secondProviderId, 3);
+    await fulfillRefundEvent(
+      databaseClient.db,
+      snapshots(fixture, distinctNoop, 903, 'succeeded', 2),
+      dependencies()
+    );
+
+    const persisted = await databaseClient.db.select().from(refunds);
+    expect(persisted).toHaveLength(2);
+    expect(persisted.every((refund) =>
+      refund.allocationStatus === 'finalized' &&
+      refund.financialEvidenceStatus === 'fee_reconciled'
+    )).toBe(true);
+    expect((await databaseClient.db.select().from(stripeEvents).where(
+      eq(stripeEvents.id, distinctNoop.id)
+    ))[0]).toMatchObject({ status: 'processed', processedAt: expect.any(Date) });
+  });
+
   it('deterministically allocates one full multi-title refund and sends one aggregate change', async () => {
     const fixture = await createPurchase([1000, 1500]);
     const event = await createRefundEvent(`re_test_${randomUUID()}`);
@@ -331,6 +428,222 @@ describe('canonical refund fulfillment', () => {
     expect((await databaseClient.db.select().from(entitlementGrants))
       .every((grant) => grant.state === 'active')).toBe(true);
     expect(await databaseClient.db.select().from(outboxMessages)).toHaveLength(0);
+  });
+
+  it('persists deterministic subtotal and tax components that financial replay can consume', async () => {
+    const fixture = await createPurchase([100], 'account', [20]);
+    const event = await createRefundEvent(`re_test_${randomUUID()}`, 1);
+    await fulfillRefundEvent(
+      databaseClient.db,
+      snapshots(fixture, event, 50, 'succeeded', 1),
+      dependencies()
+    );
+    const [refund] = await databaseClient.db.select().from(refunds);
+    expect(await databaseClient.db.select().from(refundAllocationComponents)).toEqual([
+      expect.objectContaining({
+        refundId: refund!.id, orderItemId: fixture.items[0]!.id,
+        subtotalMinor: 40, taxMinor: 10, totalMinor: 50, currency: 'USD'
+      })
+    ]);
+
+    const staged = await stageBalanceTransaction(databaseClient.db, {
+      id: `txn_refund_components_${randomUUID()}`, livemode: false,
+      sourceFamily: 'refund', sourceId: refund!.stripeRefundId,
+      rawType: 'refund', reportingCategory: 'refund', balanceType: 'payments',
+      amountMinor: -50, feeMinor: 0, netMinor: -50, currency: 'USD',
+      status: 'available', createdAt: refund!.providerCreatedAt,
+      availableAt: refund!.providerCreatedAt, exchangeRate: null,
+      exchangeSourceCurrency: null, exchangeTargetCurrency: null, feeDetails: []
+    }, { correlationId: 'refund-components-stage' });
+    const [balance] = await databaseClient.pool.query<{ fingerprint_sha256: string }>(
+      'select fingerprint_sha256 from stripe_balance_transactions where id=$1',
+      [staged.balanceTransactionId]
+    ).then((result) => result.rows);
+    await expect(databaseClient.db.transaction((tx) =>
+      replayFinancialClassificationLocked(tx, {
+        subjectType: 'balance_transaction', subjectId: staged.balanceTransactionId,
+        sourceFingerprintSha256: balance!.fingerprint_sha256,
+        classifierVersion: 1, allocationAlgorithmVersion: 1, replayId: 'c1-a1',
+        correlationId: 'refund-components-replay'
+      }))).resolves.toMatchObject({ status: 'replayed' });
+    await expect(loadCurrentEffectiveAllocationProjection(databaseClient.db, {
+      balanceTransactionIds: [staged.balanceTransactionId]
+    })).resolves.toEqual([
+      expect.objectContaining({
+        status: 'complete', basis: 'gross_amount', scope: 'title',
+        items: expect.arrayContaining([
+          expect.objectContaining({ component: 'refund_subtotal', effectMinor: -40 }),
+          expect.objectContaining({ component: 'refund_tax', effectMinor: -10 })
+        ])
+      }),
+      expect.objectContaining({ status: 'complete', basis: 'fee', scope: 'title' })
+    ]);
+  });
+
+  it('assigns same-time immutable components in provider-refund-ID order, not local UUID order', async () => {
+    const fixture = await createPurchase([2], 'account', [1]);
+    const providerCreatedAt = new Date('2026-08-10T13:01:00.000Z');
+    const providerFirst = {
+      id: 'ffffffff-ffff-4fff-bfff-fffffffffff1',
+      providerId: `re_a_${randomUUID()}`
+    };
+    const providerSecond = {
+      id: '00000000-0000-4000-8000-000000000001',
+      providerId: `re_z_${randomUUID()}`
+    };
+    await databaseClient.db.insert(refunds).values([
+      {
+        id: providerFirst.id,
+        paymentId: fixture.paymentId,
+        stripeRefundId: providerFirst.providerId,
+        status: 'succeeded',
+        amountMinor: 1,
+        currency: 'USD',
+        reason: 'requested_by_customer',
+        providerCreatedAt,
+        allocationStatus: 'needs_review'
+      },
+      {
+        id: providerSecond.id,
+        paymentId: fixture.paymentId,
+        stripeRefundId: providerSecond.providerId,
+        status: 'succeeded',
+        amountMinor: 1,
+        currency: 'USD',
+        reason: 'requested_by_customer',
+        providerCreatedAt,
+        allocationStatus: 'needs_review'
+      }
+    ]);
+    const event = await createRefundEvent(providerSecond.providerId, 1);
+
+    await fulfillRefundEvent(
+      databaseClient.db,
+      snapshots(fixture, event, 1, 'succeeded', 1),
+      dependencies()
+    );
+
+    const components = await databaseClient.db.select().from(refundAllocationComponents);
+    const componentByRefundId = new Map(components.map((component) => [
+      component.refundId,
+      component
+    ]));
+    expect(componentByRefundId.get(providerFirst.id)).toMatchObject({
+      subtotalMinor: 1,
+      taxMinor: 0,
+      totalMinor: 1
+    });
+    expect(componentByRefundId.get(providerSecond.id)).toMatchObject({
+      subtotalMinor: 0,
+      taxMinor: 1,
+      totalMinor: 1
+    });
+  });
+
+  it('commits an exception instead of rewriting immutable component chronology', async () => {
+    const fixture = await createPurchase([2], 'account', [1]);
+    const later = await createRefundEvent(`re_test_${randomUUID()}`, 2);
+    await fulfillRefundEvent(
+      databaseClient.db,
+      snapshots(fixture, later, 1, 'succeeded', 2),
+      dependencies()
+    );
+    const beforeAllocations = await databaseClient.db.select().from(refundAllocations);
+    const beforeComponents = await databaseClient.db.select().from(refundAllocationComponents);
+    expect(beforeComponents).toEqual([expect.objectContaining({
+      subtotalMinor: 1, taxMinor: 0, totalMinor: 1
+    })]);
+
+    const earlier = await createRefundEvent(`re_test_${randomUUID()}`, 1);
+    await fulfillRefundEvent(
+      databaseClient.db,
+      snapshots(fixture, earlier, 1, 'succeeded', 1),
+      dependencies()
+    );
+
+    expect(await databaseClient.db.select().from(refundAllocations)).toEqual(beforeAllocations);
+    expect(await databaseClient.db.select().from(refundAllocationComponents)).toEqual(beforeComponents);
+    expect((await databaseClient.db.select().from(refunds)).every((refund) =>
+      refund.status === 'succeeded' &&
+      refund.allocationStatus === 'exception' &&
+      refund.financialEvidenceStatus === 'exception'
+    )).toBe(true);
+    expect((await databaseClient.db.select().from(stripeEvents).where(
+      eq(stripeEvents.id, earlier.id)
+    ))[0]).toMatchObject({ status: 'exception', processedAt: expect.any(Date) });
+  });
+
+  it('fails closed when a same-time provider-earlier refund follows a component-backed refund', async () => {
+    const fixture = await createPurchase([2], 'account', [1]);
+    const providerCreatedAt = new Date('2026-08-10T13:01:00.000Z');
+    const providerEarlier = {
+      id: 'ffffffff-ffff-4fff-bfff-fffffffffff2',
+      providerId: `re_a_${randomUUID()}`
+    };
+    const providerLater = {
+      id: '00000000-0000-4000-8000-000000000002',
+      providerId: `re_z_${randomUUID()}`
+    };
+    await databaseClient.db.insert(refunds).values([
+      {
+        id: providerEarlier.id,
+        paymentId: fixture.paymentId,
+        stripeRefundId: providerEarlier.providerId,
+        status: 'succeeded',
+        amountMinor: 1,
+        currency: 'USD',
+        reason: 'requested_by_customer',
+        providerCreatedAt,
+        allocationStatus: 'needs_review'
+      },
+      {
+        id: providerLater.id,
+        paymentId: fixture.paymentId,
+        stripeRefundId: providerLater.providerId,
+        status: 'succeeded',
+        amountMinor: 1,
+        currency: 'USD',
+        reason: 'requested_by_customer',
+        providerCreatedAt,
+        allocationStatus: 'finalized'
+      }
+    ]);
+    const [laterAllocation] = await databaseClient.db.insert(refundAllocations).values({
+      refundId: providerLater.id,
+      orderItemId: fixture.items[0]!.id,
+      amountMinor: 1,
+      source: 'automatic',
+      createdAt: now
+    }).returning();
+    await databaseClient.db.insert(refundAllocationComponents).values({
+      refundAllocationId: laterAllocation!.id,
+      refundId: providerLater.id,
+      orderItemId: fixture.items[0]!.id,
+      subtotalMinor: 1,
+      taxMinor: 0,
+      totalMinor: 1,
+      currency: 'USD',
+      createdAt: now
+    });
+    const event = await createRefundEvent(providerEarlier.providerId, 1);
+    const allocationsBefore = await databaseClient.db.select().from(refundAllocations);
+    const componentsBefore = await databaseClient.db.select().from(refundAllocationComponents);
+
+    await fulfillRefundEvent(
+      databaseClient.db,
+      snapshots(fixture, event, 1, 'succeeded', 1),
+      dependencies()
+    );
+
+    expect(await databaseClient.db.select().from(refundAllocations)).toEqual(allocationsBefore);
+    expect(await databaseClient.db.select().from(refundAllocationComponents)).toEqual(componentsBefore);
+    expect((await databaseClient.db.select().from(refunds)).every((refund) =>
+      refund.allocationStatus === 'exception' &&
+      refund.financialEvidenceStatus === 'exception'
+    )).toBe(true);
+    expect((await databaseClient.db.select().from(stripeEvents)
+      .where(eq(stripeEvents.id, event.id)))[0])
+      .toMatchObject({ status: 'exception', processedAt: expect.any(Date) });
   });
 
   it('marks every succeeded refund as an allocation exception when a complete legacy graph exceeds item capacity', async () => {
@@ -400,18 +713,247 @@ describe('canonical refund fulfillment', () => {
   });
 
   it('recomputes prior ambiguous rows when cumulative refunds prove the whole order', async () => {
-    const fixture = await createPurchase([1000, 1500]);
-    const first = await createRefundEvent(`re_test_${randomUUID()}`, 1);
-    await fulfillRefundEvent(databaseClient.db, snapshots(fixture, first, 800, 'succeeded', 1), dependencies());
-    const second = await createRefundEvent(`re_test_${randomUUID()}`, 2);
-    await fulfillRefundEvent(databaseClient.db, snapshots(fixture, second, 1700, 'succeeded', 2), dependencies());
-    expect((await databaseClient.db.select().from(refundAllocations))
-      .reduce((sum, allocation) => sum + allocation.amountMinor, 0)).toBe(2500);
-    expect((await databaseClient.db.select().from(refunds))
-      .every((refund) =>
-        refund.allocationStatus === 'finalized' &&
-        refund.financialEvidenceStatus === 'pending'
-      )).toBe(true);
+    const totals = [500, 1000, 1500] as const;
+    const taxes = [101, 333, 499] as const;
+    const fixture = await createPurchase(totals, 'account', taxes);
+    const stable = await createRefundEvent(`re_test_${randomUUID()}`, 1);
+    await fulfillRefundEvent(
+      databaseClient.db,
+      snapshots(fixture, stable, 500, 'succeeded', 1),
+      dependencies()
+    );
+    const [stableRefund] = await databaseClient.db.select().from(refunds).where(
+      eq(refunds.stripeRefundId, stable.objectId)
+    );
+    if (!stableRefund) throw new Error('Expected stable refund');
+    const [stableAllocation] = await databaseClient.db.insert(refundAllocations).values({
+      refundId: stableRefund.id,
+      orderItemId: fixture.items[0]!.id,
+      amountMinor: 500,
+      source: 'administrative',
+      createdAt: now
+    }).returning();
+    if (!stableAllocation) throw new Error('Expected stable allocation');
+    await databaseClient.db.insert(refundAllocationComponents).values({
+      refundAllocationId: stableAllocation.id,
+      refundId: stableRefund.id,
+      orderItemId: fixture.items[0]!.id,
+      subtotalMinor: 399,
+      taxMinor: 101,
+      totalMinor: 500,
+      currency: 'USD',
+      createdAt: now
+    });
+    await databaseClient.db.update(refunds).set({
+      allocationStatus: 'finalized',
+      financialEvidenceStatus: 'fee_reconciled'
+    })
+      .where(eq(refunds.id, stableRefund.id));
+
+    const ambiguous = await createRefundEvent(`re_test_${randomUUID()}`, 2);
+    await fulfillRefundEvent(
+      databaseClient.db,
+      snapshots(fixture, ambiguous, 800, 'succeeded', 2),
+      dependencies()
+    );
+    const [ambiguousRefund] = await databaseClient.db.select().from(refunds).where(
+      eq(refunds.stripeRefundId, ambiguous.objectId)
+    );
+    if (!ambiguousRefund) throw new Error('Expected ambiguous refund');
+    const priorBalanceProviderId = `txn_prior_refund_rearm_${randomUUID()}`;
+    const staged = await stageBalanceTransaction(databaseClient.db, {
+      id: priorBalanceProviderId, livemode: false,
+      sourceFamily: 'refund', sourceId: ambiguousRefund.stripeRefundId,
+      rawType: 'refund', reportingCategory: 'refund', balanceType: 'payments',
+      amountMinor: -800, feeMinor: 0, netMinor: -800, currency: 'USD',
+      status: 'available', createdAt: ambiguousRefund.providerCreatedAt,
+      availableAt: ambiguousRefund.providerCreatedAt, exchangeRate: null,
+      exchangeSourceCurrency: null, exchangeTargetCurrency: null, feeDetails: []
+    }, { correlationId: 'prior-refund-rearm-stage' });
+    const [balance] = await databaseClient.db.select().from(stripeBalanceTransactions).where(
+      eq(stripeBalanceTransactions.id, staged.balanceTransactionId)
+    );
+    const projectionSpec = createFinancialClassificationSubjectJob({
+      subjectType: 'balance_transaction', subjectId: staged.balanceTransactionId,
+      sourceFingerprintSha256: balance!.fingerprintSha256,
+      classifierVersion: 1, allocationAlgorithmVersion: 1
+    });
+    const [existingProjectionJob] = (await databaseClient.db.select().from(jobs)).filter((job) =>
+      job.type === projectionSpec.type && job.deduplicationKey === projectionSpec.deduplicationKey
+    );
+    const projectionJobId = existingProjectionJob?.id ?? (await databaseClient.db.insert(jobs)
+      .values({
+        type: projectionSpec.type, payload: projectionSpec.payload as never,
+        deduplicationKey: projectionSpec.deduplicationKey, maxAttempts: projectionSpec.maxAttempts
+      }).returning({ id: jobs.id }))[0]!.id;
+    await databaseClient.db.update(jobs).set({
+      status: 'succeeded', attempts: 1, completedAt: now, lastError: null
+    }).where(eq(jobs.id, projectionJobId));
+    for (const sourceId of [stableRefund.id, ambiguousRefund.id]) {
+      const [sourceJob] = (await databaseClient.db.select().from(jobs)).filter((job) =>
+        job.type === FINANCIAL_SOURCE_JOB &&
+        (job.payload as { sourceId?: unknown }).sourceId === sourceId
+      );
+      if (!sourceJob) throw new Error('Expected prior source job');
+      await databaseClient.db.update(jobs).set({
+        status: 'succeeded', attempts: 1, completedAt: now, lastError: null
+      }).where(eq(jobs.id, sourceJob.id));
+    }
+
+    const current = await createRefundEvent(`re_test_${randomUUID()}`, 3);
+    const currentInput = snapshots(fixture, current, 1700, 'succeeded', 3);
+    await fulfillRefundEvent(databaseClient.db, currentInput, dependencies());
+    const beforeDrain = await databaseClient.db.select().from(refunds);
+    const [currentRefund] = beforeDrain.filter((refund) =>
+      refund.stripeRefundId === current.objectId
+    );
+    if (!currentRefund) throw new Error('Expected current refund');
+    const allocations = await databaseClient.db.select().from(refundAllocations);
+    const components = await databaseClient.db.select().from(refundAllocationComponents);
+    expect(allocations.reduce((sum, allocation) => sum + allocation.amountMinor, 0)).toBe(3000);
+    expect(components).toHaveLength(allocations.length);
+    const refundById = new Map(beforeDrain.map((refund) => [refund.id, refund]));
+    const componentByAllocationId = new Map(
+      components.map((component) => [component.refundAllocationId, component])
+    );
+    const capacityByItemId = new Map(fixture.items.map((item, index) => [item.id, {
+      subtotalMinor: BigInt(totals[index]! - taxes[index]!),
+      taxMinor: BigInt(taxes[index]!)
+    }]));
+    for (const item of fixture.items) {
+      const remaining = capacityByItemId.get(item.id)!;
+      const chronological = allocations.filter((allocation) => allocation.orderItemId === item.id)
+        .sort((left, right) => {
+          const leftRefund = refundById.get(left.refundId)!;
+          const rightRefund = refundById.get(right.refundId)!;
+          return leftRefund.providerCreatedAt.getTime() - rightRefund.providerCreatedAt.getTime() ||
+            (leftRefund.stripeRefundId < rightRefund.stripeRefundId ? -1
+              : leftRefund.stripeRefundId > rightRefund.stripeRefundId ? 1 : 0) ||
+            leftRefund.id.localeCompare(rightRefund.id) || left.id.localeCompare(right.id);
+        });
+      for (const allocation of chronological) {
+        const component = componentByAllocationId.get(allocation.id);
+        const amount = BigInt(allocation.amountMinor);
+        const remainingTotal = remaining.subtotalMinor + remaining.taxMinor;
+        let expectedSubtotal = amount * remaining.subtotalMinor / remainingTotal;
+        let expectedTax = amount * remaining.taxMinor / remainingTotal;
+        const subtotalRemainder = amount * remaining.subtotalMinor % remainingTotal;
+        const taxRemainder = amount * remaining.taxMinor % remainingTotal;
+        if (amount - expectedSubtotal - expectedTax === 1n) {
+          if (subtotalRemainder >= taxRemainder) expectedSubtotal += 1n;
+          else expectedTax += 1n;
+        }
+        expect(component).toMatchObject({
+          refundId: allocation.refundId, orderItemId: allocation.orderItemId,
+          subtotalMinor: Number(expectedSubtotal), taxMinor: Number(expectedTax),
+          totalMinor: allocation.amountMinor, currency: 'USD'
+        });
+        remaining.subtotalMinor -= expectedSubtotal;
+        remaining.taxMinor -= expectedTax;
+      }
+      expect(remaining).toEqual({ subtotalMinor: 0n, taxMinor: 0n });
+    }
+    expect((await databaseClient.db.select().from(jobs).where(eq(jobs.id, projectionJobId)))[0])
+      .toMatchObject({ status: 'pending', attempts: 0, lastError: null });
+    expect(beforeDrain).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: stableRefund.id,
+        allocationStatus: 'finalized',
+        financialEvidenceStatus: 'fee_reconciled'
+      }),
+      expect.objectContaining({
+        id: ambiguousRefund.id,
+        allocationStatus: 'finalized',
+        financialEvidenceStatus: 'pending'
+      }),
+      expect.objectContaining({
+        id: currentRefund.id,
+        allocationStatus: 'finalized',
+        financialEvidenceStatus: 'pending'
+      })
+    ]));
+    const sourceJobsBeforeDrain = (await databaseClient.db.select().from(jobs)).filter((job) =>
+      job.type === FINANCIAL_SOURCE_JOB
+    );
+    const graphJobs = sourceJobsBeforeDrain.filter((job) =>
+      (job.payload as { trigger?: { kind?: unknown } }).trigger?.kind === 'graph'
+    );
+    expect(graphJobs).toEqual([expect.objectContaining({
+      payload: {
+        sourceKind: 'refund',
+        sourceId: ambiguousRefund.id,
+        trigger: { kind: 'graph', providerEventId: current.providerEventId }
+      },
+      deduplicationKey:
+        `financial:source:graph:${current.providerEventId}:refund:${ambiguousRefund.id}`,
+      status: 'pending'
+    })]);
+
+    const stripe = createFixtureStripeGateway();
+    stripe.harness.setPayment(paymentSnapshotFixture({
+      paymentIntentId: fixture.paymentIntentId,
+      metadataOrderId: fixture.orderId,
+      latestChargeId: `ch_test_${fixture.orderId}`,
+      amountMinor: 3000,
+      currency: 'usd',
+      paidAt: new Date('2026-08-10T12:05:00.000Z')
+    }));
+    stripe.harness.setCharge(chargeSnapshotFixture({
+      id: `ch_test_${fixture.orderId}`,
+      paymentIntentId: fixture.paymentIntentId,
+      amountMinor: 3000,
+      amountRefundedMinor: 3000,
+      currency: 'USD',
+      createdAt: new Date('2026-08-10T12:05:00.000Z')
+    }));
+    const currentBalanceProviderId = `txn_current_refund_rearm_${randomUUID()}`;
+    for (const evidence of [
+      {
+        refund: ambiguousRefund,
+        amountMinor: 800,
+        balanceTransactionId: priorBalanceProviderId
+      },
+      {
+        refund: currentRefund,
+        amountMinor: 1700,
+        balanceTransactionId: currentBalanceProviderId
+      }
+    ]) {
+      stripe.harness.setRefund(refundSnapshotFixture({
+        providerRefundId: evidence.refund.stripeRefundId,
+        paymentIntentId: fixture.paymentIntentId,
+        amountMinor: evidence.amountMinor,
+        providerCreatedAt: evidence.refund.providerCreatedAt,
+        balanceTransactionId: evidence.balanceTransactionId
+      }));
+      stripe.harness.setBalanceTransaction(balanceTransactionSnapshotFixture({
+        id: evidence.balanceTransactionId,
+        sourceId: evidence.refund.stripeRefundId,
+        sourceFamily: 'refund',
+        rawType: 'refund',
+        reportingCategory: 'refund',
+        amountMinor: -evidence.amountMinor,
+        feeMinor: 0,
+        netMinor: -evidence.amountMinor,
+        currency: 'USD',
+        createdAt: evidence.refund.providerCreatedAt,
+        availableAt: evidence.refund.providerCreatedAt,
+        feeDetails: []
+      }));
+    }
+    await drainRefundFinancialJobs(stripe.gateway);
+    const convergedRefunds = await databaseClient.db.select().from(refunds);
+    expect(convergedRefunds.every((refund) =>
+      refund.allocationStatus === 'finalized' &&
+      refund.financialEvidenceStatus === 'fee_reconciled'
+    )).toBe(true);
+    expect((await databaseClient.db.select().from(jobs)).every((job) =>
+      job.status === 'succeeded'
+    )).toBe(true);
+
+    const jobsBeforeExactReplay = await databaseClient.db.select().from(jobs);
+    await fulfillRefundEvent(databaseClient.db, currentInput, dependencies());
+    expect(await databaseClient.db.select().from(jobs)).toEqual(jobsBeforeExactReplay);
     expect((await databaseClient.db.select().from(entitlementGrants))
       .every((grant) => grant.state === 'revoked')).toBe(true);
   });
@@ -622,6 +1164,7 @@ describe('canonical refund fulfillment', () => {
       )).rejects.toThrow(`forced ${failure} failure`);
       expect(await databaseClient.db.select().from(refunds)).toHaveLength(0);
       expect(await databaseClient.db.select().from(refundAllocations)).toHaveLength(0);
+      expect(await databaseClient.db.select().from(refundAllocationComponents)).toHaveLength(0);
       expect((await databaseClient.db.select().from(entitlementGrants))[0]?.state).toBe('active');
       expect((await databaseClient.db.select().from(entitlements))[0]?.revokedAt).toBeNull();
       expect((await databaseClient.db.select().from(stripeEvents))[0]?.status).toBe('pending');

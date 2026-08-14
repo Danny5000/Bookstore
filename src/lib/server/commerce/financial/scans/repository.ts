@@ -3,20 +3,29 @@ import { sql, type SQL } from 'drizzle-orm';
 import type { Database } from '$lib/server/db/client';
 import type { FinancialScanRunRow, JsonObject } from '$lib/server/db/schema';
 import type { DatabaseExecutor } from '$lib/server/db/transaction';
-import { enqueueActiveEntityJob, enqueueJob } from '$lib/server/jobs/repository';
+import {
+  enqueueActiveEntityJob,
+  enqueueFinancialClassificationJob,
+  enqueueJob
+} from '$lib/server/jobs/repository';
 import { PermanentFinancialError, RetryableFinancialError } from '../errors';
 import {
   FINANCIAL_INITIAL_PAYOUT_LOOKBACK_MS,
   FINANCIAL_PAYOUT_OVERLAP_MS
 } from '../constants';
-import { activateFinancialProjectionVersionLocked } from '../rebase';
+import {
+  lockFinancialProjectionAuthority,
+  lockFinancialProjectionEnrollment
+} from '../rebase';
 import {
   createFinancialCompositeReplayScanJob,
   createFinancialHourlyScanJob,
   createFinancialInitialScanJob,
   createFinancialPayoutImpactScanJob,
   createFinancialScanContinuationJob,
+  FINANCIAL_CLASSIFICATION_JOB,
   FINANCIAL_PAYOUT_JOB,
+  FINANCIAL_SCAN_JOB,
   FINANCIAL_SOURCE_JOB,
   parseFinancialJobIdentity,
   parseFinancialScanContinuationJobPayload,
@@ -63,9 +72,9 @@ export interface CommitFinancialScanPageInput {
   readonly complete: boolean;
 }
 
-export interface CompleteEmptyFinancialReplayInput {
+export interface FinalizeFinancialReplayInput {
   readonly runId: string;
-  readonly expectedCheckpoint: string | null;
+  readonly expectedCursorDigestSha256: string;
   readonly expectedPageCount: number;
   readonly classifierVersion: number;
   readonly allocationAlgorithmVersion: number;
@@ -77,7 +86,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 const SHA256 = /^[a-f0-9]{64}$/u;
 const PHASES = [
   'source_page', 'payout_discovery_page', 'incomplete_payout_run_page',
-  'payout_impact_page', 'classification_replay_page'
+  'payout_impact_page', 'classification_replay_page', 'classification_replay_finalize'
 ] as const;
 
 function invalid(): never {
@@ -290,31 +299,69 @@ export async function startOrResumeFinancialScan(
 ): Promise<FinancialScanRunRow> {
   const definition = rootSpec(payload);
   return database.transaction(async (transaction) => {
+    const authority = definition.kind === 'classification_replay'
+      ? await lockFinancialProjectionAuthority(transaction)
+      : null;
+    if (authority !== null) await lockFinancialProjectionEnrollment(transaction);
     await rows(transaction, sql`
       select pg_advisory_xact_lock(hashtextextended(${`pale-orbit:financial:scan:${definition.rootKey}`}, 0))
     `);
     const existing = await rows(transaction, sql`
       select ${RUN_COLUMNS} from financial_scan_runs where root_key = ${definition.rootKey} for update
     `);
+    let current: FinancialScanRunRow;
     if (existing[0]) {
-      const current = canonicalRun(existing[0]);
+      current = canonicalRun(existing[0]);
       if (current.kind !== definition.kind || current.classifierVersion !== definition.classifierVersion ||
         current.allocationAlgorithmVersion !== definition.allocationAlgorithmVersion ||
         current.replayId !== definition.replayId) {
         throw new PermanentFinancialError('source_linkage_mismatch');
       }
+    } else {
+      const inserted = await rows(transaction, sql`
+        insert into financial_scan_runs (
+          root_key, kind, phase, classifier_version, allocation_algorithm_version, replay_id
+        ) values (
+          ${definition.rootKey}, ${definition.kind}, ${definition.phase},
+          ${definition.classifierVersion}, ${definition.allocationAlgorithmVersion}, ${definition.replayId}
+        ) returning ${RUN_COLUMNS}
+      `);
+      current = canonicalRun(inserted[0]);
+    }
+    if (authority === null || current.state !== 'running') return current;
+    if (!positiveVersion(definition.classifierVersion) ||
+      !positiveVersion(definition.allocationAlgorithmVersion) || definition.replayId === null) invalid();
+    const targetActive = definition.classifierVersion === authority.classifierVersion &&
+      definition.allocationAlgorithmVersion === authority.allocationAlgorithmVersion;
+    const targetSuperseded = definition.classifierVersion <= authority.classifierVersion &&
+      definition.allocationAlgorithmVersion <= authority.allocationAlgorithmVersion;
+    if (targetActive || targetSuperseded) return current;
+    const targetAdvances = definition.classifierVersion >= authority.classifierVersion &&
+      definition.allocationAlgorithmVersion >= authority.allocationAlgorithmVersion;
+    if (!targetAdvances) invalid();
+    if (authority.pendingScanRunId !== null) {
+      if (authority.pendingScanRunId !== current.id ||
+        authority.pendingClassifierVersion !== definition.classifierVersion ||
+        authority.pendingAllocationAlgorithmVersion !== definition.allocationAlgorithmVersion ||
+        authority.pendingReplayId !== definition.replayId) stateChanged();
       return current;
     }
-    const inserted = await rows(transaction, sql`
-      insert into financial_scan_runs (
-        root_key, kind, phase, classifier_version, allocation_algorithm_version, replay_id
-      ) values (
-        ${definition.rootKey}, ${definition.kind}, ${definition.phase},
-        ${definition.classifierVersion}, ${definition.allocationAlgorithmVersion}, ${definition.replayId}
-      ) returning ${RUN_COLUMNS}
-    `);
-    return canonicalRun(inserted[0]);
+    const registered = await rows(transaction, sql`
+      update financial_projection_versions set
+        pending_classifier_version = ${definition.classifierVersion},
+        pending_allocation_algorithm_version = ${definition.allocationAlgorithmVersion},
+        pending_replay_id = ${definition.replayId}, pending_scan_run_id = ${current.id}
+      where singleton = true and pending_scan_run_id is null
+      returning pending_scan_run_id as "pendingScanRunId"
+    `) as Array<{ pendingScanRunId: string }>;
+    if (registered.length !== 1 || registered[0]?.pendingScanRunId !== current.id) stateChanged();
+    return current;
   });
+}
+
+function positiveVersion(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 1 &&
+    (value as number) <= 2_147_483_647;
 }
 
 function cursorDigest(phaseValue: string, checkpointValue: string | null): string {
@@ -531,13 +578,14 @@ export async function loadClassificationReplayPage(
   return boundedPage(result, limit, (subject) => `${subject.subjectType}:${subject.subjectId}`);
 }
 
-function assertCompleteEmptyReplay(
+function assertFinalizeReplay(
   value: unknown
-): asserts value is CompleteEmptyFinancialReplayInput {
+): asserts value is FinalizeFinancialReplayInput {
   if (!exact(value, [
-    'runId', 'expectedCheckpoint', 'expectedPageCount', 'classifierVersion',
+    'runId', 'expectedCursorDigestSha256', 'expectedPageCount', 'classifierVersion',
     'allocationAlgorithmVersion', 'correlationId'
-  ]) || !uuid(value.runId) || !checkpoint(value.expectedCheckpoint) ||
+  ]) || !uuid(value.runId) || typeof value.expectedCursorDigestSha256 !== 'string' ||
+    !SHA256.test(value.expectedCursorDigestSha256) ||
     !count(value.expectedPageCount) || !count(value.classifierVersion) ||
     value.classifierVersion === 0 || !count(value.allocationAlgorithmVersion) ||
     value.allocationAlgorithmVersion === 0 || typeof value.correlationId !== 'string' ||
@@ -545,20 +593,17 @@ function assertCompleteEmptyReplay(
 }
 
 /**
- * Version activation must be the first database statement in this transaction. This preserves
- * the global replay order: projection version -> scan run -> local financial graph.
+ * The authority row is the first database statement, followed by the scan-run lock. Holding it
+ * fences late provider-fact inserts while the durable child-status barrier and target are checked.
  */
-export async function completeEmptyFinancialReplay(
+export async function finalizeFinancialReplay(
   database: Database,
-  input: CompleteEmptyFinancialReplayInput
+  input: FinalizeFinancialReplayInput
 ): Promise<FinancialScanRunRow> {
-  assertCompleteEmptyReplay(input);
-  return database.transaction(async (transaction) => {
-    await activateFinancialProjectionVersionLocked(transaction, {
-      classifierVersion: input.classifierVersion,
-      allocationAlgorithmVersion: input.allocationAlgorithmVersion,
-      correlationId: input.correlationId
-    });
+  assertFinalizeReplay(input);
+  const outcome = await database.transaction(async (transaction) => {
+    const authority = await lockFinancialProjectionAuthority(transaction);
+    await lockFinancialProjectionEnrollment(transaction);
     await rows(transaction, sql`
       select pg_advisory_xact_lock(hashtextextended(
         ${`pale-orbit:financial:scan-run:${input.runId}`}, 0
@@ -566,22 +611,97 @@ export async function completeEmptyFinancialReplay(
     `);
     const current = await selectRun(transaction, input.runId, true);
     if (!current || current.state !== 'running' || current.kind !== 'classification_replay' ||
-      current.phase !== 'classification_replay_page' ||
-      current.checkpoint !== input.expectedCheckpoint ||
-      current.pageCount !== input.expectedPageCount || current.processedCount !== 0 ||
+      current.phase !== 'classification_replay_finalize' || current.checkpoint !== null ||
+      current.cursorDigestSha256 !== input.expectedCursorDigestSha256 ||
+      current.pageCount !== input.expectedPageCount ||
       current.classifierVersion !== input.classifierVersion ||
       current.allocationAlgorithmVersion !== input.allocationAlgorithmVersion ||
       current.replayId !== `c${input.classifierVersion}-a${input.allocationAlgorithmVersion}`) {
       stateChanged();
     }
+    const childRows = await rows(transaction, sql`
+      select count(*)::integer as "childCount",
+        count(*) filter (where status <> 'succeeded')::integer as "incompleteCount",
+        count(*) filter (where
+          payload ->> 'classifierVersion' is distinct from ${String(input.classifierVersion)} or
+          payload ->> 'allocationAlgorithmVersion' is distinct from
+            ${String(input.allocationAlgorithmVersion)} or
+          payload ->> 'replayId' is distinct from
+            ${`c${input.classifierVersion}-a${input.allocationAlgorithmVersion}`}
+        )::integer as "invalidCount"
+      from jobs
+      where type = ${FINANCIAL_CLASSIFICATION_JOB}
+        and payload ->> 'scanRunId' = ${input.runId}
+    `) as Array<{ childCount: number; incompleteCount: number; invalidCount: number }>;
+    const childState = childRows[0];
+    if (!childState || childRows.length !== 1 || !count(childState.childCount) ||
+      !count(childState.incompleteCount) || !count(childState.invalidCount) ||
+      childState.childCount < current.enqueuedCount || childState.invalidCount !== 0) {
+      stateChanged();
+    }
+    if (childState.incompleteCount !== 0) {
+      const finalizer = createFinancialScanContinuationJob({
+        scanRunId: current.id, phase: 'classification_replay_finalize',
+        cursorDigestSha256: current.cursorDigestSha256, limit: 100
+      });
+      const requested = await rows(transaction, sql`
+        update jobs set rerun_requested_at = coalesce(rerun_requested_at, now()),
+          updated_at = now()
+        where type = ${FINANCIAL_SCAN_JOB}
+          and deduplication_key = ${finalizer.deduplicationKey}
+          and payload = ${finalizer.payload as JsonObject}::jsonb
+          and status = 'running'
+        returning id
+      `) as Array<{ id: string }>;
+      if (requested.length !== 1 || !uuid(requested[0]?.id)) stateChanged();
+      return { run: current, deferred: true as const };
+    }
+    const pendingMatches = authority.pendingScanRunId === input.runId &&
+      authority.pendingClassifierVersion === input.classifierVersion &&
+      authority.pendingAllocationAlgorithmVersion === input.allocationAlgorithmVersion &&
+      authority.pendingReplayId ===
+        `c${input.classifierVersion}-a${input.allocationAlgorithmVersion}`;
+    const alreadyPublished = input.classifierVersion <= authority.classifierVersion &&
+      input.allocationAlgorithmVersion <= authority.allocationAlgorithmVersion;
+    if (pendingMatches) {
+      const activated = await rows(transaction, sql`
+        update financial_projection_versions set
+          classifier_version = ${input.classifierVersion},
+          allocation_algorithm_version = ${input.allocationAlgorithmVersion},
+          pending_classifier_version = null, pending_allocation_algorithm_version = null,
+          pending_replay_id = null, pending_scan_run_id = null,
+          activated_at = now(), activation_correlation_id = ${input.correlationId}
+        where singleton = true and pending_scan_run_id = ${input.runId}
+        returning classifier_version as "classifierVersion",
+          allocation_algorithm_version as "allocationAlgorithmVersion"
+      `) as Array<{ classifierVersion: number; allocationAlgorithmVersion: number }>;
+      if (activated.length !== 1 ||
+        activated[0]?.classifierVersion !== input.classifierVersion ||
+        activated[0]?.allocationAlgorithmVersion !== input.allocationAlgorithmVersion) {
+        stateChanged();
+      }
+      await rows(transaction, sql`
+        insert into audit_events
+          (actor_type, actor_id, action, outcome, resource_type, resource_id,
+            correlation_id, after)
+        values ('system', 'financial-worker', 'financial.projection_version.activated',
+          'succeeded', 'financial_projection_version', null, ${input.correlationId},
+          ${JSON.stringify({ classifierVersion: input.classifierVersion,
+            allocationAlgorithmVersion: input.allocationAlgorithmVersion })}::jsonb)
+      `);
+    } else if (!alreadyPublished) {
+      stateChanged();
+    }
     const updated = await rows(transaction, sql`
       update financial_scan_runs set state = 'completed', checkpoint = null,
-        cursor_digest_sha256 = null, page_count = page_count + 1,
+        cursor_digest_sha256 = null,
         safe_outcome = 'completed', completed_at = now(), updated_at = now()
       where id = ${input.runId} returning ${RUN_COLUMNS}
     `);
-    return canonicalRun(updated[0]);
+    return { run: canonicalRun(updated[0]), deferred: false as const };
   });
+  if (outcome.deferred) stateChanged();
+  return outcome.run;
 }
 
 function assertCommit(value: unknown): asserts value is CommitFinancialScanPageInput {
@@ -613,6 +733,15 @@ export async function commitFinancialScanPage(
       current.checkpoint !== input.expectedCheckpoint || current.pageCount !== input.expectedPageCount) {
       stateChanged();
     }
+    const sealsReplay = current.kind === 'classification_replay' &&
+      current.phase === 'classification_replay_page' && input.complete;
+    if (current.kind === 'classification_replay' && identities.some((identity) => {
+      if (identity.type !== FINANCIAL_CLASSIFICATION_JOB) return true;
+      return identity.payload.scanRunId !== current.id ||
+        identity.payload.classifierVersion !== current.classifierVersion ||
+        identity.payload.allocationAlgorithmVersion !== current.allocationAlgorithmVersion ||
+        identity.payload.replayId !== current.replayId;
+    })) invalid();
     if (current.processedCount + input.processedCount > 2_147_483_647 ||
       current.enqueuedCount + identities.length > 2_147_483_647 ||
       current.pageCount === 2_147_483_647) invalid();
@@ -647,18 +776,25 @@ export async function commitFinancialScanPage(
       await enqueueActiveScanChild(transaction, identity);
     }
     for (const identity of genericIdentities) {
-      await enqueueJob(transaction, {
-        type: identity.type,
-        payload: identity.payload as JsonObject,
-        deduplicationKey: identity.deduplicationKey,
-        maxAttempts: identity.maxAttempts
-      });
+      if (identity.type === FINANCIAL_CLASSIFICATION_JOB) {
+        await enqueueFinancialClassificationJob(transaction, identity);
+      } else {
+        await enqueueJob(transaction, {
+          type: identity.type,
+          payload: identity.payload as JsonObject,
+          deduplicationKey: identity.deduplicationKey,
+          maxAttempts: identity.maxAttempts
+        });
+      }
     }
-    const digest = input.complete ? null : cursorDigest(input.nextPhase, input.nextCheckpoint);
-    if (!input.complete) {
+    const completesRun = input.complete && !sealsReplay;
+    const committedPhase = sealsReplay ? 'classification_replay_finalize' : input.nextPhase;
+    const committedCheckpoint = sealsReplay || completesRun ? null : input.nextCheckpoint;
+    const digest = completesRun ? null : cursorDigest(committedPhase, committedCheckpoint);
+    if (!completesRun) {
       const continuation = createFinancialScanContinuationJob({
         scanRunId: input.runId,
-        phase: input.nextPhase,
+        phase: committedPhase,
         cursorDigestSha256: digest!,
         limit: 100
       });
@@ -671,14 +807,14 @@ export async function commitFinancialScanPage(
     }
     const updated = await rows(transaction, sql`
       update financial_scan_runs set
-        phase = ${input.nextPhase}, state = ${input.complete ? 'completed' : 'running'},
-        checkpoint = ${input.complete ? null : input.nextCheckpoint},
+        phase = ${committedPhase}, state = ${completesRun ? 'completed' : 'running'},
+        checkpoint = ${committedCheckpoint},
         cursor_digest_sha256 = ${digest},
         processed_count = processed_count + ${input.processedCount},
         enqueued_count = enqueued_count + ${identities.length},
         page_count = page_count + 1,
-        safe_outcome = ${input.complete ? 'completed' : null},
-        completed_at = ${input.complete ? new Date() : null}, updated_at = now()
+        safe_outcome = ${completesRun ? 'completed' : null},
+        completed_at = ${completesRun ? new Date() : null}, updated_at = now()
       where id = ${input.runId} returning ${RUN_COLUMNS}
     `);
     return canonicalRun(updated[0]);

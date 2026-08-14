@@ -10,7 +10,7 @@ import {
   classifyBalanceTransaction,
   classifyFeeDetail
 } from './classification';
-import { PermanentFinancialError } from './errors';
+import { PermanentFinancialError, RetryableFinancialError } from './errors';
 import {
   observeFinancialIssue,
   resolveFinancialIssueAfterRecompute
@@ -443,10 +443,13 @@ export interface FinancialClassificationReplayInput {
   readonly signal: AbortSignal;
 }
 
-export interface FinancialProjectionVersionInput {
+export interface FinancialProjectionAuthority {
   readonly classifierVersion: number;
   readonly allocationAlgorithmVersion: number;
-  readonly correlationId: string;
+  readonly pendingClassifierVersion: number | null;
+  readonly pendingAllocationAlgorithmVersion: number | null;
+  readonly pendingReplayId: string | null;
+  readonly pendingScanRunId: string | null;
 }
 
 function positiveInt32(value: unknown): value is number {
@@ -454,66 +457,84 @@ function positiveInt32(value: unknown): value is number {
     (value as number) <= 2_147_483_647;
 }
 
-function assertProjectionVersionInput(
-  value: unknown
-): asserts value is FinancialProjectionVersionInput {
-  if (!exact(value, [
-    'classifierVersion', 'allocationAlgorithmVersion', 'correlationId'
-  ]) || !positiveInt32(value.classifierVersion) ||
-    !positiveInt32(value.allocationAlgorithmVersion) ||
-    typeof value.correlationId !== 'string' || value.correlationId.length < 1 ||
-    value.correlationId.length > 100) invalid();
+function canonicalFinancialProjectionAuthority(
+  authorityRows: Array<Record<string, unknown>>
+): FinancialProjectionAuthority {
+  const raw = authorityRows[0];
+  if (!raw || authorityRows.length !== 1 || !positiveInt32(raw.classifierVersion) ||
+    !positiveInt32(raw.allocationAlgorithmVersion)) invalid();
+  const pendingClassifierVersion = raw.pendingClassifierVersion ?? null;
+  const pendingAllocationAlgorithmVersion = raw.pendingAllocationAlgorithmVersion ?? null;
+  const pendingReplayId = raw.pendingReplayId ?? null;
+  const pendingScanRunId = raw.pendingScanRunId ?? null;
+  const pendingValues = [pendingClassifierVersion, pendingAllocationAlgorithmVersion,
+    pendingReplayId, pendingScanRunId];
+  const hasPending = pendingValues.every((value) => value !== null);
+  if (!hasPending && pendingValues.some((value) => value !== null)) invalid();
+  if (hasPending && (!positiveInt32(pendingClassifierVersion) ||
+    !positiveInt32(pendingAllocationAlgorithmVersion) ||
+    typeof pendingReplayId !== 'string' ||
+    pendingReplayId !== `c${pendingClassifierVersion}-a${pendingAllocationAlgorithmVersion}` ||
+    typeof pendingScanRunId !== 'string' || !UUID_PATTERN.test(pendingScanRunId) ||
+    pendingClassifierVersion < raw.classifierVersion ||
+    pendingAllocationAlgorithmVersion < raw.allocationAlgorithmVersion ||
+    (pendingClassifierVersion === raw.classifierVersion &&
+      pendingAllocationAlgorithmVersion === raw.allocationAlgorithmVersion))) invalid();
+  return {
+    classifierVersion: raw.classifierVersion,
+    allocationAlgorithmVersion: raw.allocationAlgorithmVersion,
+    pendingClassifierVersion: hasPending ? pendingClassifierVersion as number : null,
+    pendingAllocationAlgorithmVersion:
+      hasPending ? pendingAllocationAlgorithmVersion as number : null,
+    pendingReplayId: hasPending ? pendingReplayId as string : null,
+    pendingScanRunId: hasPending ? pendingScanRunId as string : null
+  };
 }
 
-export async function activateFinancialProjectionVersionLocked(
-  transaction: DatabaseTransaction,
-  input: FinancialProjectionVersionInput
-): Promise<'activated' | 'unchanged' | 'superseded'> {
-  assertProjectionVersionInput(input);
-  const activeRows = await rows(transaction, sql`
+export async function loadFinancialProjectionAuthority(
+  transaction: DatabaseTransaction
+): Promise<FinancialProjectionAuthority> {
+  return canonicalFinancialProjectionAuthority(await rows(transaction, sql`
     select classifier_version as "classifierVersion",
-      allocation_algorithm_version as "allocationAlgorithmVersion"
+      allocation_algorithm_version as "allocationAlgorithmVersion",
+      pending_classifier_version as "pendingClassifierVersion",
+      pending_allocation_algorithm_version as "pendingAllocationAlgorithmVersion",
+      pending_replay_id as "pendingReplayId",
+      pending_scan_run_id as "pendingScanRunId"
+    from financial_projection_versions
+    where singleton = true
+  `) as Array<Record<string, unknown>>);
+}
+
+export async function lockFinancialProjectionAuthority(
+  transaction: DatabaseTransaction
+): Promise<FinancialProjectionAuthority> {
+  return canonicalFinancialProjectionAuthority(await rows(transaction, sql`
+    select classifier_version as "classifierVersion",
+      allocation_algorithm_version as "allocationAlgorithmVersion",
+      pending_classifier_version as "pendingClassifierVersion",
+      pending_allocation_algorithm_version as "pendingAllocationAlgorithmVersion",
+      pending_replay_id as "pendingReplayId",
+      pending_scan_run_id as "pendingScanRunId"
     from financial_projection_versions
     where singleton = true
     for update
-  `) as Array<{ classifierVersion: number; allocationAlgorithmVersion: number }>;
-  const active = activeRows[0];
-  if (!active || activeRows.length !== 1 || !positiveInt32(active.classifierVersion) ||
-    !positiveInt32(active.allocationAlgorithmVersion)) invalid();
-  if (active.classifierVersion === input.classifierVersion &&
-    active.allocationAlgorithmVersion === input.allocationAlgorithmVersion) {
-    return 'unchanged';
-  }
-  const targetAtOrBelow = input.classifierVersion <= active.classifierVersion &&
-    input.allocationAlgorithmVersion <= active.allocationAlgorithmVersion;
-  if (targetAtOrBelow) return 'superseded';
-  const targetAtOrAbove = input.classifierVersion >= active.classifierVersion &&
-    input.allocationAlgorithmVersion >= active.allocationAlgorithmVersion;
-  if (!targetAtOrAbove) invalid();
-  const updatedRows = await rows(transaction, sql`
-    update financial_projection_versions
-    set classifier_version = ${input.classifierVersion},
-      allocation_algorithm_version = ${input.allocationAlgorithmVersion},
-      activated_at = now(), activation_correlation_id = ${input.correlationId}
-    where singleton = true
-      and classifier_version = ${active.classifierVersion}
-      and allocation_algorithm_version = ${active.allocationAlgorithmVersion}
-    returning classifier_version as "classifierVersion",
-      allocation_algorithm_version as "allocationAlgorithmVersion"
-  `) as Array<{ classifierVersion: number; allocationAlgorithmVersion: number }>;
-  if (updatedRows.length !== 1 ||
-    updatedRows[0]?.classifierVersion !== input.classifierVersion ||
-    updatedRows[0]?.allocationAlgorithmVersion !== input.allocationAlgorithmVersion) invalid();
+  `) as Array<Record<string, unknown>>);
+}
+
+/**
+ * Serializes every operation that can publish or enroll projection graph evidence. Callers that
+ * lock the version authority must do so before this fence; commerce graph publishers take only
+ * this fence and read the authority without a row lock.
+ */
+export async function lockFinancialProjectionEnrollment(
+  transaction: DatabaseTransaction
+): Promise<void> {
   await rows(transaction, sql`
-    insert into audit_events
-      (actor_type, actor_id, action, outcome, resource_type, resource_id,
-        correlation_id, after)
-    values ('system', 'financial-worker', 'financial.projection_version.activated',
-      'succeeded', 'financial_projection_version', null, ${input.correlationId},
-      ${JSON.stringify({ classifierVersion: input.classifierVersion,
-        allocationAlgorithmVersion: input.allocationAlgorithmVersion })}::jsonb)
+    select pg_advisory_xact_lock(hashtextextended(
+      ${'pale-orbit:financial:replay-enrollment'}, 0
+    ))
   `);
-  return 'activated';
 }
 
 interface ClassificationReplayLockedInput extends FinancialClassificationSubjectJobPayload {
@@ -551,6 +572,8 @@ interface ReplayAllocationTipRow {
   readonly allocationIdentity: string;
   readonly supersedesSetId: string | null;
   readonly reversalOfSetId: string | null;
+  readonly classifierVersion: number;
+  readonly algorithmVersion: number;
 }
 
 interface ReplayOrderItemRow {
@@ -559,6 +582,11 @@ interface ReplayOrderItemRow {
   readonly unitSubtotalMinor: number;
   readonly taxMinor: number | null;
   readonly currency: string;
+}
+
+interface RequiredActiveProjectionPredecessor {
+  readonly classifierVersion: number;
+  readonly allocationAlgorithmVersion: number;
 }
 
 function assertClassificationReplayLockedInput(
@@ -652,7 +680,35 @@ type ReplayGraph =
       readonly paymentId: null;
       readonly orderId: null;
       readonly orderItems: readonly [];
+      readonly accountFallback: boolean;
     };
+
+async function loadReplayRoutingRows(
+  transaction: DatabaseTransaction,
+  balance: ReplayBalanceRow
+): Promise<unknown[]> {
+  if (balance.sourceFamily === 'charge') {
+    return rows(transaction, sql`
+      select payment.id, payment.id as "paymentId", payment.order_id as "orderId"
+      from payments payment where payment.stripe_latest_charge_id = ${balance.sourceId}
+    `);
+  }
+  if (balance.sourceFamily === 'refund') {
+    return rows(transaction, sql`
+      select refund.id, refund.payment_id as "paymentId", payment.order_id as "orderId"
+      from refunds refund join payments payment on payment.id = refund.payment_id
+      where refund.stripe_refund_id = ${balance.sourceId}
+    `);
+  }
+  if (balance.sourceFamily === 'dispute') {
+    return rows(transaction, sql`
+      select dispute.id, dispute.payment_id as "paymentId", payment.order_id as "orderId"
+      from disputes dispute join payments payment on payment.id = dispute.payment_id
+      where dispute.stripe_dispute_id = ${balance.sourceId}
+    `);
+  }
+  invalid();
+}
 
 async function lockReplayGraph(
   transaction: DatabaseTransaction,
@@ -661,7 +717,7 @@ async function lockReplayGraph(
   if (balance.sourceFamily === 'adjustment' ||
     balance.sourceFamily === 'unknown' || balance.sourceFamily === null) {
     return { sourceKind: 'adjustment', sourceId: balance.id,
-      paymentId: null, orderId: null, orderItems: [] };
+      paymentId: null, orderId: null, orderItems: [], accountFallback: false };
   }
   if (balance.sourceFamily === 'payout') {
     if (balance.sourceId === null) invalid();
@@ -677,26 +733,15 @@ async function lockReplayGraph(
       payoutGeneration: payout.payoutGeneration,
       paymentId: null, orderId: null, orderItems: [] };
   }
-  let routingRows: unknown[];
-  if (balance.sourceFamily === 'charge') {
-    routingRows = await rows(transaction, sql`
-      select payment.id, payment.id as "paymentId", payment.order_id as "orderId"
-      from payments payment where payment.stripe_latest_charge_id = ${balance.sourceId}
+  const routingRows = await loadReplayRoutingRows(transaction, balance);
+  if (routingRows.length === 0) {
+    const memberships = await rows(transaction, sql`
+      select payout_id from stripe_payout_balance_transactions
+      where balance_transaction_id = ${balance.id}
     `);
-  } else if (balance.sourceFamily === 'refund') {
-    routingRows = await rows(transaction, sql`
-      select refund.id, refund.payment_id as "paymentId", payment.order_id as "orderId"
-      from refunds refund join payments payment on payment.id = refund.payment_id
-      where refund.stripe_refund_id = ${balance.sourceId}
-    `);
-  } else if (balance.sourceFamily === 'dispute') {
-    routingRows = await rows(transaction, sql`
-      select dispute.id, dispute.payment_id as "paymentId", payment.order_id as "orderId"
-      from disputes dispute join payments payment on payment.id = dispute.payment_id
-      where dispute.stripe_dispute_id = ${balance.sourceId}
-    `);
-  } else {
-    invalid();
+    if (memberships.length !== 1) invalid();
+    return { sourceKind: 'adjustment', sourceId: balance.id,
+      paymentId: null, orderId: null, orderItems: [], accountFallback: true };
   }
   const routing = routingRows[0] as {
     id?: unknown; paymentId?: unknown; orderId?: unknown;
@@ -814,6 +859,25 @@ function componentForFeeDecision(
   return components[decision.classification as keyof typeof components] ?? null;
 }
 
+function accountFallbackClassificationMatches(
+  balance: ReplayBalanceRow,
+  decision: FinancialClassificationDecision
+): boolean {
+  if (balance.sourceFamily === 'charge') {
+    return decision.classification === 'charge' && balance.amountMinor > 0;
+  }
+  if (balance.sourceFamily === 'refund') {
+    return (decision.classification === 'refund' && balance.amountMinor < 0) ||
+      (decision.classification === 'refund_failure' && balance.amountMinor > 0);
+  }
+  if (balance.sourceFamily === 'dispute') {
+    return (decision.classification === 'dispute_withdrawal' && balance.amountMinor < 0) ||
+      (['dispute_reinstatement', 'fee_credit'].includes(decision.classification) &&
+        balance.amountMinor > 0);
+  }
+  return false;
+}
+
 function predecessorForReplay(
   current: ReplayAllocationTipRow | undefined,
   desiredIdentity: string
@@ -826,9 +890,19 @@ function predecessorForReplay(
 
 export async function replayFinancialClassificationLocked(
   transaction: DatabaseTransaction,
-  input: ClassificationReplayLockedInput
+  input: ClassificationReplayLockedInput,
+  requiredActivePredecessor: RequiredActiveProjectionPredecessor | null = null
 ): Promise<ClassificationReplayResult> {
   assertClassificationReplayLockedInput(input);
+  if (requiredActivePredecessor !== null &&
+    (!exact(requiredActivePredecessor, ['classifierVersion', 'allocationAlgorithmVersion']) ||
+      !positiveInt32(requiredActivePredecessor.classifierVersion) ||
+      !positiveInt32(requiredActivePredecessor.allocationAlgorithmVersion) ||
+      requiredActivePredecessor.classifierVersion > input.classifierVersion ||
+      requiredActivePredecessor.allocationAlgorithmVersion > input.allocationAlgorithmVersion ||
+      (requiredActivePredecessor.classifierVersion === input.classifierVersion &&
+        requiredActivePredecessor.allocationAlgorithmVersion ===
+          input.allocationAlgorithmVersion))) invalid();
   const discovered = await discoverReplayBalance(transaction, input, false);
   const parentDecision = classifyBalanceTransaction({
     sourceFamily: discovered.sourceFamily, rawType: discovered.rawType,
@@ -943,7 +1017,9 @@ export async function replayFinancialClassificationLocked(
       allocation.basis,
       allocation.allocation_identity as "allocationIdentity",
       allocation.supersedes_set_id as "supersedesSetId",
-      allocation.reversal_of_set_id as "reversalOfSetId"
+      allocation.reversal_of_set_id as "reversalOfSetId",
+      allocation.classifier_version as "classifierVersion",
+      allocation.algorithm_version as "algorithmVersion"
     from financial_allocation_sets allocation
     where allocation.balance_transaction_id in (${sql.join(
       sourceBalanceIds.map((id) => sql`${id}::uuid`), sql`, `
@@ -956,7 +1032,8 @@ export async function replayFinancialClassificationLocked(
     tip.balanceTransactionId ?? balance.id;
   if (tips.some((tip) => !UUID_PATTERN.test(tip.id) ||
     !sourceBalanceIds.includes(tipBalanceId(tip)) ||
-    (tip.basis !== 'gross_amount' && tip.basis !== 'fee')) ||
+    (tip.basis !== 'gross_amount' && tip.basis !== 'fee') ||
+    !positiveInt32(tip.classifierVersion) || !positiveInt32(tip.algorithmVersion)) ||
     sourceBalanceIds.some((id) =>
       tips.filter((tip) => tipBalanceId(tip) === id && tip.basis === 'gross_amount').length > 1 ||
       tips.filter((tip) => tipBalanceId(tip) === id && tip.basis === 'fee').length > 1)) {
@@ -969,6 +1046,17 @@ export async function replayFinancialClassificationLocked(
     return { status: 'exception', subjectId: input.subjectId,
       safeCode: 'classification_fork', issueId: issue.id };
   }
+  const supersedingTips = tips.filter((tip) =>
+    tip.classifierVersion >= input.classifierVersion &&
+    tip.algorithmVersion >= input.allocationAlgorithmVersion &&
+    (tip.classifierVersion > input.classifierVersion ||
+      tip.algorithmVersion > input.allocationAlgorithmVersion));
+  if (supersedingTips.length > 0) {
+    if (supersedingTips.length !== tips.length) invalid();
+    return { status: 'unchanged', subjectId: input.subjectId };
+  }
+  if (tips.some((tip) => tip.classifierVersion > input.classifierVersion ||
+    tip.algorithmVersion > input.allocationAlgorithmVersion)) invalid();
   const allDetails = await rows(transaction, sql`
     select id, balance_transaction_id as "balanceTransactionId",
       raw_type as "rawType", amount_minor as "amountMinor", currency,
@@ -995,6 +1083,71 @@ export async function replayFinancialClassificationLocked(
   if (input.subjectType === 'fee_detail' && !allDetails.some((detail) =>
     detail.id === input.subjectId && detail.fingerprintSha256 === input.sourceFingerprintSha256)) {
     invalid();
+  }
+  if (requiredActivePredecessor !== null) {
+    const hasActiveTips = (balanceTransactionId: string): boolean =>
+      (['gross_amount', 'fee'] as const).every((basis) => tips.some((tip) =>
+        tipBalanceId(tip) === balanceTransactionId && tip.basis === basis &&
+        tip.classifierVersion >= requiredActivePredecessor.classifierVersion &&
+        tip.algorithmVersion >= requiredActivePredecessor.allocationAlgorithmVersion));
+    const missingActiveTips = sourceBalanceIds.filter((id) => !hasActiveTips(id));
+    if (missingActiveTips.length > 0) {
+      const activeDecisions = await rows(transaction, sql`
+        select subject_type as "subjectType", subject_id as "subjectId",
+          classifier_version as "classifierVersion",
+          source_fingerprint_sha256 as "sourceFingerprintSha256", classification
+        from financial_classification_versions
+        where classifier_version = ${requiredActivePredecessor.classifierVersion}
+          and ((subject_type = 'balance_transaction' and subject_id in (${sql.join(
+            sourceBalanceIds.map((id) => sql`${id}::uuid`), sql`, `
+          )}))
+          ${allDetails.length === 0 ? sql`` : sql`or
+            (subject_type = 'fee_detail' and subject_id in (${sql.join(
+              allDetails.map((detail) => sql`${detail.id}::uuid`), sql`, `
+            )}))`})
+        order by subject_type, subject_id
+      `) as Array<{
+        subjectType: 'balance_transaction' | 'fee_detail';
+        subjectId: string;
+        classifierVersion: number;
+        sourceFingerprintSha256: string;
+        classification: string;
+      }>;
+      const expectedSubjects = new Map<string, {
+        fingerprint: string;
+        balanceTransactionId: string;
+      }>();
+      for (const source of lockedSourceBalances) {
+        expectedSubjects.set(`balance_transaction:${source.id}`, {
+          fingerprint: source.fingerprintSha256, balanceTransactionId: source.id
+        });
+      }
+      for (const detail of allDetails) {
+        expectedSubjects.set(`fee_detail:${detail.id}`, {
+          fingerprint: detail.fingerprintSha256,
+          balanceTransactionId: detailBalanceId(detail)
+        });
+      }
+      const unknownBalances = new Set<string>();
+      const seenSubjects = new Set<string>();
+      for (const decision of activeDecisions) {
+        const key = `${decision.subjectType}:${decision.subjectId}`;
+        const expected = expectedSubjects.get(key);
+        if (!expected || seenSubjects.has(key) ||
+          decision.classifierVersion !== requiredActivePredecessor.classifierVersion ||
+          decision.sourceFingerprintSha256 !== expected.fingerprint) {
+          throw new RetryableFinancialError('state_changed');
+        }
+        seenSubjects.add(key);
+        if (decision.classification === 'unknown') {
+          unknownBalances.add(expected.balanceTransactionId);
+        }
+      }
+      if (seenSubjects.size !== expectedSubjects.size || missingActiveTips.some((id) =>
+        !unknownBalances.has(id))) {
+        throw new RetryableFinancialError('state_changed');
+      }
+    }
   }
   const details = allDetails.filter((detail) => detailBalanceId(detail) === balance.id);
 
@@ -1278,6 +1431,10 @@ export async function replayFinancialClassificationLocked(
       ? { status: 'unchanged', subjectId: input.subjectId }
       : { status: 'replayed', subjectId: input.subjectId, allocationSetIds };
   }
+  if (graph.sourceKind === 'adjustment' && graph.accountFallback &&
+    (await loadReplayRoutingRows(transaction, balance)).length !== 0) {
+    throw new RetryableFinancialError('state_changed');
+  }
   const currentGross = tips.find((tip) => tipBalanceId(tip) === balance.id &&
     tip.basis === 'gross_amount');
   const currentFee = tips.find((tip) => tipBalanceId(tip) === balance.id && tip.basis === 'fee');
@@ -1301,7 +1458,9 @@ export async function replayFinancialClassificationLocked(
   } else if (graph.sourceKind === 'payout' || graph.sourceKind === 'adjustment') {
     if ((graph.sourceKind === 'payout' && parentDecision.classification !== 'payout') ||
       (graph.sourceKind === 'adjustment' &&
-        !['other', 'fee_credit', 'provider_fee_tax'].includes(parentDecision.classification))) {
+        !(graph.accountFallback
+          ? accountFallbackClassificationMatches(balance, parentDecision)
+          : ['other', 'fee_credit', 'provider_fee_tax'].includes(parentDecision.classification)))) {
       invalid();
     }
     const prefix = `${graph.sourceKind}:${graph.sourceId}:${balance.id}:replay:${input.replayId}`;
@@ -1377,7 +1536,9 @@ export async function replayFinancialClassificationLocked(
  * The singleton projection-version row is the global operation-identity lock for replay.
  * It must remain the first database statement in this transaction. Order-scoped commerce and
  * administrative flows never acquire it later, so every replay orders version -> purchase graph
- * -> payout closure -> financial rows and cannot form an order -> version cycle.
+ * -> payout closure -> financial rows and cannot form an order -> version cycle. Subject jobs
+ * may build evidence for the registered pending target, but only the terminal scan finalizer may
+ * publish that target globally.
  */
 export async function replayFinancialClassification(
   dependencies: FinancialClassificationReplayDependencies,
@@ -1393,14 +1554,40 @@ export async function replayFinancialClassification(
     if (input.signal.aborted) {
       throw new DOMException('Financial classification replay was aborted.', 'AbortError');
     }
-    const activation = await activateFinancialProjectionVersionLocked(transaction, {
-      classifierVersion: dependencies.targetClassifierVersion,
-      allocationAlgorithmVersion: dependencies.targetAllocationAlgorithmVersion,
-      correlationId: input.correlationId
-    });
-    if (activation === 'superseded') return;
+    const authority = await lockFinancialProjectionAuthority(transaction);
+    const targetsActive = authority.classifierVersion === input.payload.classifierVersion &&
+      authority.allocationAlgorithmVersion === input.payload.allocationAlgorithmVersion;
+    const targetsRegisteredPending = authority.pendingClassifierVersion ===
+      input.payload.classifierVersion &&
+      authority.pendingAllocationAlgorithmVersion ===
+        input.payload.allocationAlgorithmVersion &&
+      authority.pendingReplayId === input.payload.replayId &&
+      authority.pendingScanRunId !== null;
+    const targetsPending = targetsRegisteredPending &&
+      authority.pendingScanRunId === (input.payload.scanRunId ?? null);
+    const superseded = input.payload.classifierVersion <= authority.classifierVersion &&
+      input.payload.allocationAlgorithmVersion <= authority.allocationAlgorithmVersion;
+    const advancesActive = input.payload.classifierVersion >= authority.classifierVersion &&
+      input.payload.allocationAlgorithmVersion >= authority.allocationAlgorithmVersion;
+    if (input.payload.scanRunId === undefined) {
+      if (!targetsActive && !targetsRegisteredPending) {
+        if (superseded) return;
+        if (authority.pendingScanRunId !== null || !advancesActive) invalid();
+      }
+    } else if (!targetsPending &&
+      !(targetsActive && authority.pendingScanRunId === null)) {
+      if (superseded) return;
+      invalid();
+    }
     await replayFinancialClassificationLocked(transaction, {
-      ...input.payload, correlationId: input.correlationId
+      subjectType: input.payload.subjectType, subjectId: input.payload.subjectId,
+      sourceFingerprintSha256: input.payload.sourceFingerprintSha256,
+      classifierVersion: input.payload.classifierVersion,
+      allocationAlgorithmVersion: input.payload.allocationAlgorithmVersion,
+      replayId: input.payload.replayId, correlationId: input.correlationId
+    }, targetsActive ? null : {
+      classifierVersion: authority.classifierVersion,
+      allocationAlgorithmVersion: authority.allocationAlgorithmVersion
     });
     if (input.signal.aborted) {
       throw new DOMException('Financial classification replay was aborted.', 'AbortError');

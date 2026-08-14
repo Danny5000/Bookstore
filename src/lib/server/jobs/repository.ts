@@ -10,8 +10,13 @@ import {
   FINANCIAL_SCAN_JOB,
   FINANCIAL_SOURCE_JOB,
   parseFinancialJobIdentity,
+  type FinancialClassificationJobSpec,
   type FinancialJobIdentity
 } from '$lib/server/commerce/financial/jobs';
+import {
+  FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+  FINANCIAL_CLASSIFIER_VERSION
+} from '$lib/server/commerce/financial/constants';
 import { STRIPE_EVENT_JOB } from '$lib/server/commerce/job';
 import { computeRetryDelayMs } from './backoff';
 import type { JobRecord, JobRepository } from './types';
@@ -310,6 +315,124 @@ export async function enqueueJob(
   return existing;
 }
 
+function sameClassificationSubject(
+  left: Extract<FinancialJobIdentity, { readonly type: typeof FINANCIAL_CLASSIFICATION_JOB }>,
+  right: Extract<FinancialJobIdentity, { readonly type: typeof FINANCIAL_CLASSIFICATION_JOB }>
+): boolean {
+  return left.deduplicationKey === right.deduplicationKey &&
+    left.maxAttempts === right.maxAttempts &&
+    left.payload.subjectType === right.payload.subjectType &&
+    left.payload.subjectId === right.payload.subjectId &&
+    left.payload.sourceFingerprintSha256 === right.payload.sourceFingerprintSha256 &&
+    left.payload.classifierVersion === right.payload.classifierVersion &&
+    left.payload.allocationAlgorithmVersion === right.payload.allocationAlgorithmVersion &&
+    left.payload.replayId === right.payload.replayId;
+}
+
+/**
+ * A permanent subject identity can predate its composite replay or a graph publication that
+ * changes its projection. Preserve its permanent key while linking it to the run and, when the
+ * caller publishes new graph evidence, durably rearm terminal/running work.
+ */
+async function enqueueFinancialClassificationJobInternal(
+  transaction: DatabaseTransaction,
+  input: FinancialClassificationJobSpec,
+  rearmExisting: boolean
+): Promise<JobRow> {
+  assertTransaction(transaction);
+  const expected = parseFinancialJobIdentity(input);
+  if (expected.type !== FINANCIAL_CLASSIFICATION_JOB) {
+    throw new Error('Invalid financial classification job');
+  }
+  await enqueueJob(transaction, {
+    type: expected.type, payload: expected.payload as JsonObject,
+    deduplicationKey: expected.deduplicationKey, maxAttempts: expected.maxAttempts
+  });
+  const locked = await executeJobRows(transaction, sql`
+    select ${ACTIVE_JOB_COLUMNS} from jobs
+    where deduplication_key = ${expected.deduplicationKey}
+    limit 1 for update
+  `);
+  const row = locked[0];
+  if (!row) throw new Error('Financial classification job could not be loaded');
+  const existing = parseFinancialJobIdentity({
+    type: row.type, payload: row.payload, deduplicationKey: row.deduplicationKey,
+    maxAttempts: row.maxAttempts
+  });
+  if (existing.type !== FINANCIAL_CLASSIFICATION_JOB ||
+    !sameClassificationSubject(existing, expected)) {
+    throw new Error('Financial classification job identity mismatch');
+  }
+  const needsAdoption = expected.payload.scanRunId !== undefined &&
+    existing.payload.scanRunId === undefined;
+  if (expected.payload.scanRunId !== undefined &&
+    existing.payload.scanRunId !== undefined &&
+    existing.payload.scanRunId !== expected.payload.scanRunId) {
+    throw new Error('Financial classification job replay mismatch');
+  }
+  if (!needsAdoption && !rearmExisting) return row;
+  const payload = needsAdoption ? expected.payload : existing.payload;
+  const rearmTerminal = rearmExisting;
+  const markRunningForRerun = needsAdoption || rearmExisting;
+  const adopted = await executeJobRows(transaction, sql`
+    update jobs set
+      payload = ${payload as JsonObject}::jsonb,
+      status = case
+        when ${rearmTerminal} and status in ('succeeded', 'failed') then 'pending'::job_status
+        else status
+      end,
+      run_at = case
+        when (${rearmTerminal} and status in ('succeeded', 'failed'))
+          or (${rearmExisting} and status = 'pending') then now()
+        else run_at
+      end,
+      attempts = case
+        when ${rearmExisting} and status in ('pending', 'succeeded', 'failed') then 0
+        else attempts
+      end,
+      locked_at = case
+        when ${rearmTerminal} and status in ('succeeded', 'failed') then null
+        else locked_at
+      end,
+      locked_by = case
+        when ${rearmTerminal} and status in ('succeeded', 'failed') then null
+        else locked_by
+      end,
+      last_error = case
+        when ${rearmExisting} and status in ('pending', 'succeeded', 'failed') then null
+        else last_error
+      end,
+      rerun_requested_at = case
+        when ${markRunningForRerun} and status = 'running'
+          then coalesce(rerun_requested_at, now())
+        else rerun_requested_at
+      end,
+      completed_at = case
+        when ${rearmTerminal} and status in ('succeeded', 'failed') then null
+        else completed_at
+      end,
+      updated_at = now()
+    where id = ${row.id}
+    returning ${ACTIVE_JOB_COLUMNS}
+  `);
+  if (adopted.length !== 1) throw new Error('Financial classification job adoption failed');
+  return adopted[0]!;
+}
+
+export async function enqueueFinancialClassificationJob(
+  transaction: DatabaseTransaction,
+  input: FinancialClassificationJobSpec
+): Promise<JobRow> {
+  return enqueueFinancialClassificationJobInternal(transaction, input, false);
+}
+
+export async function rearmFinancialClassificationJob(
+  transaction: DatabaseTransaction,
+  input: FinancialClassificationJobSpec
+): Promise<JobRow> {
+  return enqueueFinancialClassificationJobInternal(transaction, input, true);
+}
+
 export interface RearmExhaustedJobInput {
   type: string;
   payload: JsonObject;
@@ -318,6 +441,11 @@ export interface RearmExhaustedJobInput {
 }
 
 export type JobClaimPolicy = 'all' | 'local-only';
+
+export interface FinancialClassificationImplementationVersion {
+  readonly classifierVersion: number;
+  readonly allocationAlgorithmVersion: number;
+}
 
 export async function rearmExhaustedJob(
   database: DatabaseExecutor,
@@ -361,13 +489,27 @@ export function createPostgresJobRepository(
   database: Database,
   config: JobConfig,
   now: () => Date = () => new Date(),
-  claimPolicy: JobClaimPolicy = 'all'
+  claimPolicy: JobClaimPolicy = 'all',
+  classificationImplementation: FinancialClassificationImplementationVersion = {
+    classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+    allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
+  }
 ): JobRepository {
   if (claimPolicy !== 'all' && claimPolicy !== 'local-only') {
     throw new Error('Invalid job claim policy');
   }
+  if (!classificationImplementation || typeof classificationImplementation !== 'object' ||
+    Reflect.ownKeys(classificationImplementation).length !== 2 ||
+    !Number.isSafeInteger(classificationImplementation.classifierVersion) ||
+    classificationImplementation.classifierVersion < 1 ||
+    classificationImplementation.classifierVersion > 2_147_483_647 ||
+    !Number.isSafeInteger(classificationImplementation.allocationAlgorithmVersion) ||
+    classificationImplementation.allocationAlgorithmVersion < 1 ||
+    classificationImplementation.allocationAlgorithmVersion > 2_147_483_647) {
+    throw new Error('Invalid financial classification implementation version');
+  }
   const claimProviderBackedJobs = claimPolicy === 'all';
-  const claimableJob = sql`
+  const policyAllowsJob = sql`(
     ${claimProviderBackedJobs}
     or type not in (
       ${STRIPE_EVENT_JOB}, ${FINANCIAL_SOURCE_JOB},
@@ -380,10 +522,114 @@ export function createPostgresJobRepository(
         payload ->> 'kind' = 'composite_replay'
         or (
           payload ->> 'kind' = 'continuation'
-          and payload ->> 'phase' = 'classification_replay_page'
+          and payload ->> 'phase' in (
+            'classification_replay_page', 'classification_replay_finalize'
+          )
         )
       )
     )
+  )`;
+  const replayFinalizerReady = sql`(
+    not (
+      type = ${FINANCIAL_SCAN_JOB}
+      and payload ->> 'kind' = 'continuation'
+      and payload ->> 'phase' = 'classification_replay_finalize'
+    ) or exists (
+      select 1 from financial_scan_runs completed_replay_run
+      where completed_replay_run.id::text = jobs.payload ->> 'scanRunId'
+        and completed_replay_run.kind = 'classification_replay'
+        and completed_replay_run.state = 'completed'
+    ) or not exists (
+      select 1 from jobs replay_child
+      where replay_child.type = ${FINANCIAL_CLASSIFICATION_JOB}
+        and replay_child.payload ->> 'scanRunId' = jobs.payload ->> 'scanRunId'
+        and replay_child.status <> 'succeeded'
+    )
+  )`;
+  const replayImplementationSupported = sql`(
+    not (
+      type = ${FINANCIAL_CLASSIFICATION_JOB}
+      or (type = ${FINANCIAL_SCAN_JOB} and payload ->> 'kind' = 'composite_replay')
+      or (
+        type = ${FINANCIAL_SCAN_JOB}
+        and payload ->> 'kind' = 'continuation'
+        and payload ->> 'phase' in (
+          'classification_replay_page', 'classification_replay_finalize'
+        )
+      )
+    )
+    or (
+      (
+        type = ${FINANCIAL_CLASSIFICATION_JOB}
+        or (type = ${FINANCIAL_SCAN_JOB} and payload ->> 'kind' = 'composite_replay')
+      )
+      and payload ->> 'classifierVersion' =
+          ${String(classificationImplementation.classifierVersion)}
+        and payload ->> 'allocationAlgorithmVersion' =
+          ${String(classificationImplementation.allocationAlgorithmVersion)}
+    )
+    or (
+      type = ${FINANCIAL_SCAN_JOB}
+      and payload ->> 'kind' = 'continuation'
+      and payload ->> 'phase' in (
+        'classification_replay_page', 'classification_replay_finalize'
+      )
+      and exists (
+        select 1 from financial_scan_runs replay_run
+        where replay_run.id::text = jobs.payload ->> 'scanRunId'
+          and replay_run.kind = 'classification_replay'
+          and replay_run.classifier_version =
+            ${classificationImplementation.classifierVersion}
+          and replay_run.allocation_algorithm_version =
+            ${classificationImplementation.allocationAlgorithmVersion}
+          and (
+            (
+              replay_run.state = 'running'
+              and replay_run.phase = jobs.payload ->> 'phase'
+            )
+            or (
+              jobs.payload ->> 'phase' = 'classification_replay_page'
+              and replay_run.phase = 'classification_replay_finalize'
+              and replay_run.state in ('running', 'completed')
+            )
+            or (
+              jobs.payload ->> 'phase' = 'classification_replay_finalize'
+              and replay_run.state = 'completed'
+            )
+          )
+      )
+    )
+  )`;
+  const providerImplementationSupported = sql`(
+    not (
+      type in (${FINANCIAL_SOURCE_JOB}, ${FINANCIAL_PAYOUT_JOB})
+      or (
+        type = ${FINANCIAL_SCAN_JOB}
+        and not coalesce(
+          payload ->> 'kind' = 'composite_replay'
+          or (
+            payload ->> 'kind' = 'continuation'
+            and payload ->> 'phase' in (
+              'classification_replay_page', 'classification_replay_finalize'
+            )
+          ),
+          false
+        )
+      )
+    )
+    or exists (
+      select 1 from financial_projection_versions active_projection
+      where active_projection.singleton = true
+        and active_projection.classifier_version =
+          ${classificationImplementation.classifierVersion}
+        and active_projection.allocation_algorithm_version =
+          ${classificationImplementation.allocationAlgorithmVersion}
+    )
+  )`;
+  const claimableJob = sql`
+    (${policyAllowsJob}) and (${replayFinalizerReady})
+      and (${replayImplementationSupported})
+      and (${providerImplementationSupported})
   `;
   return {
     async claimNext(workerId): Promise<JobRecord | null> {

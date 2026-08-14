@@ -135,11 +135,22 @@ function rendered(query: SQL): { sql: string; params: unknown[] } {
   });
 }
 
-function database(responses: Array<unknown[] | Error>) {
+function database(
+  responses: Array<unknown[] | Error>,
+  authority: Record<string, unknown> = {
+    classifierVersion: 1, allocationAlgorithmVersion: 1,
+    pendingClassifierVersion: null, pendingAllocationAlgorithmVersion: null,
+    pendingReplayId: null, pendingScanRunId: null
+  }
+) {
+  responses.unshift([authority]);
   const calls: SQL[] = [];
   const tx = {
     execute: async (query: SQL) => {
       calls.push(query);
+      if (rendered(query).params.includes('pale-orbit:financial:replay-enrollment')) {
+        return { rows: [] };
+      }
       const response = responses.shift() ?? [];
       if (response instanceof Error) throw response;
       return { rows: response };
@@ -151,15 +162,85 @@ function database(responses: Array<unknown[] | Error>) {
 const PARENT_ID = '11111111-1111-4111-8111-111111111111';
 
 describe('stageBalanceTransaction orchestration', () => {
+  it.each([
+    {
+      label: 'behind',
+      authority: { classifierVersion: 2, allocationAlgorithmVersion: 2 },
+      implementation: { classifierVersion: 1, allocationAlgorithmVersion: 1 },
+      expected: { name: 'RetryableFinancialError', safeCode: 'state_changed' }
+    },
+    {
+      label: 'incomparable',
+      authority: { classifierVersion: 2, allocationAlgorithmVersion: 1 },
+      implementation: { classifierVersion: 1, allocationAlgorithmVersion: 2 },
+      expected: { name: 'PermanentFinancialError', safeCode: 'source_linkage_mismatch' }
+    }
+  ])('rejects a $label worker before inserting provider evidence', async ({
+    label, authority, implementation, expected
+  }) => {
+    const fake = database([], {
+      ...authority,
+      pendingClassifierVersion: null,
+      pendingAllocationAlgorithmVersion: null,
+      pendingReplayId: null,
+      pendingScanRunId: null
+    });
+
+    await expect(stageBalanceTransaction(
+      fake.database, snapshot(), { correlationId: `ledger-${label}-worker` }, implementation
+    )).rejects.toMatchObject(expected);
+    expect(fake.calls).toHaveLength(1);
+  });
+
+  it('uses the deployed implementation version and skips an active predecessor projection', async () => {
+    collaborators.appendClassificationDecisionLocked.mockResolvedValue({ id: 'classification' });
+    const fake = database([[], [], [{ id: PARENT_ID }], [{ id: 'fee-0' }],
+      [{ id: 'fee-1' }], []]);
+
+    await expect(stageBalanceTransaction(
+      fake.database, snapshot(), { correlationId: 'ledger-deployed-version' },
+      { classifierVersion: 2, allocationAlgorithmVersion: 3 }
+    )).resolves.toMatchObject({ disposition: 'inserted' });
+
+    for (const [, classificationInput] of collaborators.appendClassificationDecisionLocked.mock.calls) {
+      expect(classificationInput).toMatchObject({ classifierVersion: 2 });
+    }
+    expect(fake.calls.map(rendered).map((query) => query.sql).join('\n'))
+      .not.toMatch(/from stripe_balance_transactions balance\s+where balance\.id/iu);
+  });
+
+  it('rejects an incompatible pending replay before inserting provider evidence', async () => {
+    const fake = database([[], [], [{ id: PARENT_ID }], [{ id: 'fee-0' }],
+      [{ id: 'fee-1' }], []], {
+      classifierVersion: 1, allocationAlgorithmVersion: 1,
+      pendingClassifierVersion: 2, pendingAllocationAlgorithmVersion: 2,
+      pendingReplayId: 'c2-a2',
+      pendingScanRunId: '00000000-0000-4000-8000-000000000222'
+    });
+
+    await expect(stageBalanceTransaction(
+      fake.database, snapshot(), { correlationId: 'ledger-incompatible-pending' },
+      { classifierVersion: 3, allocationAlgorithmVersion: 3 }
+    )).rejects.toMatchObject({
+      name: 'PermanentFinancialError', safeCode: 'source_linkage_mismatch'
+    });
+    expect(fake.calls).toHaveLength(1);
+  });
+
   it('takes the provider advisory lock, inserts sorted evidence, classifies it, and writes one safe import audit', async () => {
     collaborators.appendClassificationDecisionLocked.mockResolvedValue({ id: 'classification' });
     const fake = database([[], [], [{ id: PARENT_ID }], [{ id: 'fee-0' }], [{ id: 'fee-1' }], []]);
     await expect(stageBalanceTransaction(fake.database, snapshot(), { correlationId: 'ledger-insert' }))
       .resolves.toEqual({ balanceTransactionId: PARENT_ID, disposition: 'inserted' });
-    expect(rendered(fake.calls[0]!).sql).toContain('pg_advisory_xact_lock');
-    expect(rendered(fake.calls[0]!).params).toContain('pale-orbit:financial:balance-transaction:txn_test_ledger_101');
-    expect(rendered(fake.calls[1]!).sql).toContain('for update');
-    expect(rendered(fake.calls[2]!).sql).toContain('insert into stripe_balance_transactions');
+    expect(rendered(fake.calls[0]!).sql).toMatch(
+      /from financial_projection_versions[\s\S]*for update/iu
+    );
+    expect(rendered(fake.calls[1]!).sql).toContain('pg_advisory_xact_lock');
+    expect(rendered(fake.calls[1]!).params).toContain('pale-orbit:financial:replay-enrollment');
+    expect(rendered(fake.calls[2]!).sql).toContain('pg_advisory_xact_lock');
+    expect(rendered(fake.calls[2]!).params).toContain('pale-orbit:financial:balance-transaction:txn_test_ledger_101');
+    expect(rendered(fake.calls[3]!).sql).toContain('for update');
+    expect(rendered(fake.calls[4]!).sql).toContain('insert into stripe_balance_transactions');
     expect(collaborators.appendClassificationDecisionLocked).toHaveBeenCalledTimes(3);
     for (const [, classificationInput] of collaborators.appendClassificationDecisionLocked.mock.calls) {
       expect(classificationInput).toMatchObject({ classifierVersion: FINANCIAL_CLASSIFIER_VERSION });
@@ -176,12 +257,12 @@ describe('stageBalanceTransaction orchestration', () => {
     const exact = database([[], [stored], [{ ordinal: 0, rawType: 'stripe_fee', amountMinor: 70, currency: 'USD', fingerprintSha256: fingerprintBalanceTransactionFeeDetail(stored.fingerprintSha256, snapshot().feeDetails[1]!) }, { ordinal: 1, rawType: 'tax', amountMinor: 1, currency: 'USD', fingerprintSha256: fingerprintBalanceTransactionFeeDetail(stored.fingerprintSha256, snapshot().feeDetails[0]!) }]]);
     await expect(stageBalanceTransaction(exact.database, snapshot(), { correlationId: 'ledger-replay' }))
       .resolves.toEqual({ balanceTransactionId: PARENT_ID, disposition: 'unchanged' });
-    expect(exact.calls).toHaveLength(5);
+    expect(exact.calls).toHaveLength(7);
 
     const available = database([[], [stored], [{ ordinal: 0, rawType: 'stripe_fee', amountMinor: 70, currency: 'USD', fingerprintSha256: fingerprintBalanceTransactionFeeDetail(stored.fingerprintSha256, snapshot().feeDetails[1]!) }, { ordinal: 1, rawType: 'tax', amountMinor: 1, currency: 'USD', fingerprintSha256: fingerprintBalanceTransactionFeeDetail(stored.fingerprintSha256, snapshot().feeDetails[0]!) }], [{ id: PARENT_ID }], []]);
     await expect(stageBalanceTransaction(available.database, snapshot({ status: 'available' }), { correlationId: 'ledger-available' }))
       .resolves.toEqual({ balanceTransactionId: PARENT_ID, disposition: 'advanced' });
-    expect(rendered(available.calls[3]!).sql).toContain("status = 'available'");
+    expect(rendered(available.calls[5]!).sql).toContain("status = 'available'");
   });
 
   it('observes a collision within the transaction and throws only after it commits', async () => {

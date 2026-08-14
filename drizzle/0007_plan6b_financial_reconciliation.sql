@@ -67,7 +67,7 @@ CREATE TABLE "financial_allocation_sets" (
 	"supersedes_set_id" uuid,
 	"reversal_of_set_id" uuid,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
-	CONSTRAINT "financial_allocation_sets_supersession_identity_unique" UNIQUE("id","balance_transaction_id","source_kind","source_internal_id","basis","currency","expected_effect_minor","source_fingerprint_sha256"),
+	CONSTRAINT "financial_allocation_sets_supersession_identity_unique" UNIQUE("id","balance_transaction_id","basis","currency","expected_effect_minor","source_fingerprint_sha256"),
 	CONSTRAINT "financial_allocation_sets_reversal_identity_unique" UNIQUE("id","source_kind","source_internal_id","basis","currency"),
 	CONSTRAINT "financial_allocation_sets_source_identity_unique" UNIQUE("id","source_internal_id"),
 	CONSTRAINT "financial_allocation_sets_effect_bounded" CHECK ("financial_allocation_sets"."expected_effect_minor" between -99999999 and 99999999),
@@ -248,11 +248,33 @@ CREATE TABLE "financial_projection_versions" (
 	"singleton" boolean PRIMARY KEY DEFAULT true NOT NULL,
 	"classifier_version" integer NOT NULL,
 	"allocation_algorithm_version" integer NOT NULL,
+	"pending_classifier_version" integer,
+	"pending_allocation_algorithm_version" integer,
+	"pending_replay_id" varchar(50),
+	"pending_scan_run_id" uuid,
 	"activated_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"activation_correlation_id" varchar(100) NOT NULL,
 	CONSTRAINT "financial_projection_versions_singleton_true" CHECK ("financial_projection_versions"."singleton" = true),
 	CONSTRAINT "financial_projection_versions_versions_positive" CHECK ("financial_projection_versions"."classifier_version" > 0 and "financial_projection_versions"."allocation_algorithm_version" > 0),
-	CONSTRAINT "financial_projection_versions_correlation_safe" CHECK (char_length("financial_projection_versions"."activation_correlation_id") between 1 and 100)
+	CONSTRAINT "financial_projection_versions_correlation_safe" CHECK (char_length("financial_projection_versions"."activation_correlation_id") between 1 and 100),
+	CONSTRAINT "financial_projection_versions_pending_consistent" CHECK ((
+        "financial_projection_versions"."pending_classifier_version" is null and
+        "financial_projection_versions"."pending_allocation_algorithm_version" is null and
+        "financial_projection_versions"."pending_replay_id" is null and
+        "financial_projection_versions"."pending_scan_run_id" is null
+      ) or (
+        "financial_projection_versions"."pending_classifier_version" is not null and
+        "financial_projection_versions"."pending_allocation_algorithm_version" is not null and
+        "financial_projection_versions"."pending_replay_id" is not null and
+        "financial_projection_versions"."pending_scan_run_id" is not null and
+        "financial_projection_versions"."pending_classifier_version" >= "financial_projection_versions"."classifier_version" and
+        "financial_projection_versions"."pending_allocation_algorithm_version" >= "financial_projection_versions"."allocation_algorithm_version" and
+        ("financial_projection_versions"."pending_classifier_version" > "financial_projection_versions"."classifier_version" or
+          "financial_projection_versions"."pending_allocation_algorithm_version" > "financial_projection_versions"."allocation_algorithm_version") and
+        "financial_projection_versions"."pending_replay_id" = 'c' ||
+          "financial_projection_versions"."pending_classifier_version"::text || '-a' ||
+          "financial_projection_versions"."pending_allocation_algorithm_version"::text
+      ))
 );
 --> statement-breakpoint
 INSERT INTO "financial_projection_versions"
@@ -581,8 +603,130 @@ ALTER TABLE "dispute_item_allocations" ADD CONSTRAINT "dispute_item_allocations_
 ALTER TABLE "financial_allocation_sets" ADD CONSTRAINT "financial_allocation_sets_balance_transaction_id_stripe_balance_transactions_id_fk" FOREIGN KEY ("balance_transaction_id") REFERENCES "public"."stripe_balance_transactions"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "financial_allocation_sets" ADD CONSTRAINT "financial_allocation_sets_supersedes_set_id_financial_allocation_sets_id_fk" FOREIGN KEY ("supersedes_set_id") REFERENCES "public"."financial_allocation_sets"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "financial_allocation_sets" ADD CONSTRAINT "financial_allocation_sets_reversal_of_set_id_financial_allocation_sets_id_fk" FOREIGN KEY ("reversal_of_set_id") REFERENCES "public"."financial_allocation_sets"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "financial_allocation_sets" ADD CONSTRAINT "financial_allocation_sets_supersedes_graph_fk" FOREIGN KEY ("supersedes_set_id","balance_transaction_id","source_kind","source_internal_id","basis","currency","expected_effect_minor","source_fingerprint_sha256") REFERENCES "public"."financial_allocation_sets"("id","balance_transaction_id","source_kind","source_internal_id","basis","currency","expected_effect_minor","source_fingerprint_sha256") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "financial_allocation_sets" ADD CONSTRAINT "financial_allocation_sets_supersedes_graph_fk" FOREIGN KEY ("supersedes_set_id","balance_transaction_id","basis","currency","expected_effect_minor","source_fingerprint_sha256") REFERENCES "public"."financial_allocation_sets"("id","balance_transaction_id","basis","currency","expected_effect_minor","source_fingerprint_sha256") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "financial_allocation_sets" ADD CONSTRAINT "financial_allocation_sets_reversal_graph_fk" FOREIGN KEY ("reversal_of_set_id","source_kind","source_internal_id","basis","currency") REFERENCES "public"."financial_allocation_sets"("id","source_kind","source_internal_id","basis","currency") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+CREATE OR REPLACE FUNCTION "enforce_financial_allocation_supersession_lineage"()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  predecessor "financial_allocation_sets"%ROWTYPE;
+  reversal_target "financial_allocation_sets"%ROWTYPE;
+  parent_classification text;
+  parent_classification_count integer;
+  parent_amount_minor integer;
+  parent_balance_transaction_count integer;
+  valid_lineage boolean := false;
+BEGIN
+  IF NEW.reversal_of_set_id IS NOT NULL THEN
+    SELECT * INTO reversal_target
+    FROM "financial_allocation_sets"
+    WHERE id = NEW.reversal_of_set_id;
+    IF NOT FOUND
+      OR reversal_target.source_kind <> NEW.source_kind
+      OR reversal_target.source_internal_id <> NEW.source_internal_id
+      OR reversal_target.basis <> NEW.basis
+      OR reversal_target.currency <> NEW.currency
+      OR reversal_target.reversal_of_set_id IS NOT NULL
+      OR reversal_target.classifier_version <> NEW.classifier_version
+      OR reversal_target.algorithm_version <> NEW.algorithm_version THEN
+      RAISE EXCEPTION 'invalid financial allocation reversal target'
+        USING ERRCODE = '23514',
+          CONSTRAINT = 'financial_allocation_sets_supersession_lineage_check';
+    END IF;
+  END IF;
+
+  IF NEW.supersedes_set_id IS NULL THEN
+    RETURN NEW;
+  END IF;
+
+  SELECT * INTO predecessor
+  FROM "financial_allocation_sets"
+  WHERE id = NEW.supersedes_set_id;
+  IF NOT FOUND
+    OR predecessor.balance_transaction_id <> NEW.balance_transaction_id
+    OR predecessor.basis <> NEW.basis
+    OR predecessor.currency <> NEW.currency
+    OR predecessor.expected_effect_minor <> NEW.expected_effect_minor
+    OR predecessor.source_fingerprint_sha256 <> NEW.source_fingerprint_sha256
+    OR predecessor.classifier_version > NEW.classifier_version
+    OR predecessor.algorithm_version > NEW.algorithm_version THEN
+    RAISE EXCEPTION 'invalid financial allocation predecessor'
+      USING ERRCODE = '23514',
+        CONSTRAINT = 'financial_allocation_sets_supersession_lineage_check';
+  END IF;
+
+  valid_lineage := COALESCE(predecessor.source_kind = NEW.source_kind
+    AND predecessor.source_internal_id = NEW.source_internal_id
+    AND (
+      predecessor.reversal_of_set_id IS NOT DISTINCT FROM NEW.reversal_of_set_id
+      OR (
+        predecessor.reversal_of_set_id IS NOT NULL
+        AND NEW.reversal_of_set_id IS NOT NULL
+        AND reversal_target.supersedes_set_id = predecessor.reversal_of_set_id
+      )
+    ), false);
+
+  IF NOT valid_lineage
+    AND predecessor.source_kind = 'adjustment'
+    AND predecessor.source_internal_id = NEW.balance_transaction_id
+    AND predecessor.scope = 'account'
+    AND predecessor.reversal_of_set_id IS NULL
+    AND NEW.source_kind IN ('payment', 'refund', 'dispute') THEN
+    SELECT min(classification::text), count(*)::integer
+      INTO parent_classification, parent_classification_count
+    FROM "financial_classification_versions"
+    WHERE subject_type = 'balance_transaction'
+      AND subject_id = NEW.balance_transaction_id
+      AND classifier_version = NEW.classifier_version
+      AND source_fingerprint_sha256 = NEW.source_fingerprint_sha256;
+    SELECT min(amount_minor), count(*)::integer
+      INTO parent_amount_minor, parent_balance_transaction_count
+    FROM "stripe_balance_transactions"
+    WHERE id = NEW.balance_transaction_id;
+    valid_lineage := COALESCE(
+      parent_classification_count = 1
+      AND parent_balance_transaction_count = 1
+      AND CASE
+        WHEN NEW.reversal_of_set_id IS NULL THEN
+          (NEW.source_kind = 'payment' AND parent_classification = 'charge'
+            AND parent_amount_minor > 0)
+          OR (NEW.source_kind = 'refund' AND (
+            (parent_classification = 'refund' AND parent_amount_minor < 0)
+            OR (parent_classification = 'refund_failure' AND parent_amount_minor > 0)
+          ))
+          OR (NEW.source_kind = 'dispute' AND (
+            (parent_classification = 'dispute_withdrawal' AND parent_amount_minor < 0)
+            OR (parent_classification IN ('dispute_reinstatement', 'fee_credit')
+              AND parent_amount_minor > 0)
+          ))
+        ELSE
+          NEW.basis = 'gross_amount'
+          AND NEW.expected_effect_minor > 0
+          AND parent_amount_minor > 0
+          AND (
+            (NEW.source_kind = 'refund' AND parent_classification = 'refund_failure')
+            OR (NEW.source_kind = 'dispute'
+              AND parent_classification = 'dispute_reinstatement')
+          )
+        END,
+      false
+    );
+  END IF;
+
+  IF valid_lineage IS NOT TRUE THEN
+    RAISE EXCEPTION 'invalid financial allocation supersession lineage'
+      USING ERRCODE = '23514',
+        CONSTRAINT = 'financial_allocation_sets_supersession_lineage_check';
+  END IF;
+  RETURN NEW;
+END;
+$$;--> statement-breakpoint
+CREATE CONSTRAINT TRIGGER "financial_allocation_sets_supersession_lineage_check"
+AFTER INSERT OR UPDATE ON "financial_allocation_sets"
+NOT DEFERRABLE INITIALLY IMMEDIATE
+FOR EACH ROW
+EXECUTE FUNCTION "enforce_financial_allocation_supersession_lineage"();--> statement-breakpoint
 ALTER TABLE "financial_item_allocations" ADD CONSTRAINT "financial_item_allocations_allocation_set_id_financial_allocation_sets_id_fk" FOREIGN KEY ("allocation_set_id") REFERENCES "public"."financial_allocation_sets"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "financial_item_allocations" ADD CONSTRAINT "financial_item_allocations_order_item_id_order_items_id_fk" FOREIGN KEY ("order_item_id") REFERENCES "public"."order_items"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "financial_reconciliation_issues" ADD CONSTRAINT "financial_reconciliation_issues_resolved_by_admin_id_user_id_fk" FOREIGN KEY ("resolved_by_admin_id") REFERENCES "public"."user"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
@@ -696,7 +840,8 @@ BEGIN
     JOIN "order_items" item ON item.id = allocation.order_item_id
     WHERE refund.status = 'succeeded'
       AND refund.allocation_status = 'finalized'
-    ORDER BY allocation.order_item_id, refund.provider_created_at, refund.id, allocation.id
+    ORDER BY allocation.order_item_id, refund.provider_created_at,
+      refund.stripe_refund_id COLLATE "C", refund.id, allocation.id
   LOOP
     IF current_order_item_id IS DISTINCT FROM allocation_row.order_item_id THEN
       current_order_item_id := allocation_row.order_item_id;
@@ -958,8 +1103,15 @@ CREATE VIEW "public"."current_financial_projection_heads" AS (
   ), correction_tip_candidates as (
     select correction.*
     from "refund_reporting_correction_sets" correction
-    where not exists (
-      select 1 from "refund_reporting_correction_sets" successor
+    where exists (
+      select 1 from eligible_allocation_sets anchor
+      where anchor.id = correction.base_allocation_set_id
+    )
+    and not exists (
+      select 1
+      from "refund_reporting_correction_sets" successor
+      join eligible_allocation_sets successor_anchor
+        on successor_anchor.id = successor.base_allocation_set_id
       where successor.predecessor_correction_set_id = correction.id
     )
   ), correction_prevalidation as (
@@ -1467,10 +1619,23 @@ BEGIN
   IF NEW.singleton IS DISTINCT FROM OLD.singleton OR
      NEW.classifier_version < OLD.classifier_version OR
      NEW.allocation_algorithm_version < OLD.allocation_algorithm_version OR
-     (NEW.classifier_version = OLD.classifier_version AND
-       NEW.allocation_algorithm_version = OLD.allocation_algorithm_version) OR
      NEW.activated_at < OLD.activated_at THEN
     RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'invalid financial projection version transition';
+  END IF;
+  IF NEW.classifier_version = OLD.classifier_version AND
+     NEW.allocation_algorithm_version = OLD.allocation_algorithm_version THEN
+    IF OLD.pending_scan_run_id IS NOT NULL OR NEW.pending_scan_run_id IS NULL OR
+       NEW.activated_at IS DISTINCT FROM OLD.activated_at OR
+       NEW.activation_correlation_id IS DISTINCT FROM OLD.activation_correlation_id THEN
+      RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'invalid financial projection version transition';
+    END IF;
+  ELSE
+    IF OLD.pending_scan_run_id IS NULL OR
+       NEW.pending_scan_run_id IS NOT NULL OR
+       NEW.classifier_version IS DISTINCT FROM OLD.pending_classifier_version OR
+       NEW.allocation_algorithm_version IS DISTINCT FROM OLD.pending_allocation_algorithm_version THEN
+      RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'invalid financial projection version transition';
+    END IF;
   END IF;
   RETURN NEW;
 END;

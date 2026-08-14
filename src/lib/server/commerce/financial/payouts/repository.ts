@@ -1,7 +1,10 @@
 import { createHash } from 'node:crypto';
 import { sql, type SQL } from 'drizzle-orm';
 import type { PayoutSnapshot } from '$lib/server/commerce/stripe/types';
-import { parsePayoutSnapshot } from '$lib/server/commerce/stripe/financial-schemas';
+import {
+  parseFinancialProviderId,
+  parsePayoutSnapshot
+} from '$lib/server/commerce/stripe/financial-schemas';
 import type { Database } from '$lib/server/db/client';
 import type { PayoutImportRunRow } from '$lib/server/db/schema';
 import type { DatabaseExecutor, DatabaseTransaction } from '$lib/server/db/transaction';
@@ -16,6 +19,7 @@ import {
 import { lockPayoutImportRows } from '../locks';
 import { observeFinancialIssue, resolveFinancialIssueAfterRecompute } from '../issues';
 import { enqueueCurrentAccountProjectionsForPayout } from '../ledger';
+import { lockFinancialProjectionEnrollment } from '../rebase';
 import type { CurrentPayoutEvidence } from '../types';
 
 export interface StartPayoutImportInput {
@@ -86,6 +90,25 @@ function payoutFingerprint(snapshot: PayoutSnapshot): string {
     snapshot.currency, snapshot.automatic, snapshot.method,
     snapshot.createdAt.toISOString()
   ]);
+}
+
+export async function loadPayoutGeneration(
+  database: Database,
+  untrustedProviderPayoutId: string
+): Promise<number | null> {
+  let providerPayoutId: string;
+  try {
+    providerPayoutId = parseFinancialProviderId(untrustedProviderPayoutId);
+  } catch {
+    invalid();
+  }
+  const found = await rows(database, sql`
+    select financial_generation as generation
+    from stripe_payouts where provider_id = ${providerPayoutId}
+  `) as Array<{ generation: number }>;
+  if (found.length === 0) return null;
+  if (found.length !== 1 || !generation(found[0]?.generation)) invalid();
+  return found[0]!.generation;
 }
 
 function validStatusTransition(current: string, next: PayoutSnapshot['status']): boolean {
@@ -282,9 +305,16 @@ async function resolveReferencedPayoutIssues(
 export async function stagePayoutSnapshot(
   database: Database,
   untrustedSnapshot: PayoutSnapshot,
-  context: { readonly correlationId: string }
+  context: {
+    readonly correlationId: string;
+    readonly expectedGeneration?: number | null;
+  }
 ): Promise<{ payoutId: string; generation: number; changed: boolean }> {
-  if (!exact(context, ['correlationId']) || !text(context.correlationId)) invalid();
+  const guarded = exact(context, ['correlationId', 'expectedGeneration']);
+  if ((!guarded && !exact(context, ['correlationId'])) || !text(context.correlationId) ||
+    (guarded && context.expectedGeneration !== null && !generation(context.expectedGeneration))) {
+    invalid();
+  }
   let snapshot: PayoutSnapshot;
   try {
     snapshot = parsePayoutSnapshot(untrustedSnapshot, untrustedSnapshot?.livemode);
@@ -293,6 +323,7 @@ export async function stagePayoutSnapshot(
   }
   const fingerprint = payoutFingerprint(snapshot);
   const outcome: StageOutcome = await database.transaction(async (tx) => {
+    await lockFinancialProjectionEnrollment(tx);
     await rows(tx, sql`select pg_advisory_xact_lock(hashtextextended(${`pale-orbit:financial:payout:${snapshot.id}`}, 0))`);
     const currentRows = await rows(tx, sql`
       select id, provider_id as "providerId", live_mode as "liveMode", amount_minor as "amountMinor",
@@ -306,9 +337,12 @@ export async function stagePayoutSnapshot(
         fingerprint_sha256 as "fingerprintSha256"
       from stripe_payouts where provider_id = ${snapshot.id} for update
     `) as Array<Record<string, unknown>>;
+    const current = currentRows[0];
+    if (guarded && (current?.financialGeneration ?? null) !== context.expectedGeneration) {
+      throw new RetryableFinancialError('state_changed');
+    }
     const balanceTransactionId = await linkedBalanceTransactionId(tx, snapshot.balanceTransactionId);
     const failureBalanceTransactionId = await linkedBalanceTransactionId(tx, snapshot.failureBalanceTransactionId);
-    const current = currentRows[0];
     if (!current) {
       const inserted = await rows(tx, sql`
         insert into stripe_payouts (
@@ -375,7 +409,6 @@ export async function stagePayoutSnapshot(
         tx, payoutId, snapshot, failureBalanceTransactionId, context.correlationId
       );
       await resolveReferencedPayoutIssues(tx, snapshot, context.correlationId);
-      await enqueueCurrentAccountProjectionsForPayout(tx, snapshot.id);
       return { payoutId, generation: current.financialGeneration, changed: false };
     }
     if (!validStatusTransition(String(current.status), snapshot.status) ||
@@ -581,6 +614,7 @@ export async function publishPayoutMembership(
 ): Promise<{ generation: number; membershipCount: number }> {
   assertPublish(input);
   const outcome = await database.transaction(async (tx) => {
+    await lockFinancialProjectionEnrollment(tx);
     const locked = await lockPayoutImportRows(tx, {
       payoutId: input.payoutId,
       runId: input.runId,
@@ -602,12 +636,14 @@ export async function publishPayoutMembership(
       throw new RetryableFinancialError('state_changed');
     }
     const payoutRows = await rows(tx, sql`
-      select automatic, method, status, reconciliation_status as "reconciliationStatus",
+      select provider_id as "providerId", automatic, method, status,
+        reconciliation_status as "reconciliationStatus",
         financial_generation as "financialGeneration"
       from stripe_payouts where id = ${input.payoutId}
-    `) as Array<{ automatic: boolean; method: string; status: string; reconciliationStatus: string; financialGeneration: number }>;
+    `) as Array<{ providerId: string; automatic: boolean; method: string; status: string; reconciliationStatus: string; financialGeneration: number }>;
     const payout = payoutRows[0];
-    if (!payout || payout.financialGeneration !== input.expectedGeneration || !payout.automatic ||
+    if (!payout || !text(payout.providerId, 255) ||
+      payout.financialGeneration !== input.expectedGeneration || !payout.automatic ||
       payout.method !== 'standard' || payout.status !== 'paid' ||
       payout.reconciliationStatus !== 'completed') {
       await rows(tx, sql`
@@ -661,6 +697,7 @@ export async function publishPayoutMembership(
         values (${input.payoutId}, ${id}, ${input.runId}) on conflict do nothing
       `);
     }
+    await enqueueCurrentAccountProjectionsForPayout(tx, payout.providerId);
     const nextGeneration = payout.financialGeneration + 1;
     await rows(tx, sql`
       update payout_import_runs set state = 'published', safe_outcome = 'published',
