@@ -371,7 +371,7 @@ describe('financial reconciliation operations guide', () => {
     }>(sql.raw(blocks[2]!));
     const counts = new Map(result.rows.map((row) => [row.check_name, Number(row.violation_count)]));
     expect(counts.get('allocation_set_parent_or_chain')).toBe(1);
-    expect(counts.get('allocation_set_semantic_source')).toBeUndefined();
+    expect(counts.get('allocation_set_semantic_source')).toBe(1);
   });
 
   it('reports an adjustment takeover whose exact parent classification is missing', async () => {
@@ -435,6 +435,6 @@ describe('financial reconciliation operations guide', () => {
     }>(sql.raw(blocks[2]!));
     const counts = new Map(result.rows.map((row) => [row.check_name, Number(row.violation_count)]));
     expect(counts.get('allocation_set_parent_or_chain')).toBe(1);
-    expect(counts.get('allocation_set_semantic_source')).toBeUndefined();
+    expect(counts.get('allocation_set_semantic_source')).toBe(1);
   });
 });
