@@ -5,6 +5,8 @@ import { expect, it } from 'vitest';
 import { stageBalanceTransaction } from '$lib/server/commerce/financial/ledger';
 import { loadCurrentEffectiveAllocationProjection } from '$lib/server/commerce/financial/allocations/repository';
 import { reconcilePaymentFinancialSource } from '$lib/server/commerce/financial/sources/payment';
+import { createFinancialClassificationHandler } from '$lib/server/commerce/financial/handlers/classification';
+import { FINANCIAL_CLASSIFICATION_JOB } from '$lib/server/commerce/financial/jobs';
 import {
   loadCurrentPayoutEvidence,
   persistPayoutImportPage,
@@ -44,11 +46,13 @@ import { balanceTransactionSnapshotFixture } from '../fixtures/stripe/balance-tr
 import { chargeSnapshotFixture } from '../fixtures/stripe/charge';
 import { paymentSnapshotFixture } from '../fixtures/stripe/payment';
 import { payoutSnapshotFixture } from '../fixtures/stripe/payout';
-import { databaseClient } from './database';
+import { applicationConfig, databaseClient } from './database';
 import type { Database } from '$lib/server/db/client';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
+import { createPostgresJobRepository } from '$lib/server/jobs/repository';
 
 const dialect = new PgDialect();
+const CLAIM_FIRST = new Date('2000-01-01T00:00:00.000Z');
 
 function rendered(query: unknown): string {
   return dialect.sqlToQuery((query as SQLWrapper).getSQL()).sql;
@@ -110,6 +114,76 @@ function databasePausedBeforeAdvisory(
       return typeof value === 'function' ? value.bind(target) : value;
     }
   }) as Database;
+}
+
+async function claimActiveParentClassificationJob(
+  subjectId: string,
+  workerId: string,
+  version = 1
+) {
+  const [balance] = await databaseClient.db.select().from(stripeBalanceTransactions).where(
+    eq(stripeBalanceTransactions.id, subjectId)
+  );
+  if (!balance) throw new Error('Expected the classification subject balance transaction');
+  const deduplicationKey = `financial:classification:${version}:${version}:` +
+    `balance_transaction:${subjectId}:${balance.fingerprintSha256}`;
+  const matches = (await databaseClient.db.select().from(jobs).where(
+    eq(jobs.deduplicationKey, deduplicationKey)
+  )).filter((job) =>
+    job.type === FINANCIAL_CLASSIFICATION_JOB &&
+    job.status === 'pending' &&
+    job.payload.subjectType === 'balance_transaction' &&
+    job.payload.subjectId === subjectId &&
+    job.payload.sourceFingerprintSha256 === balance.fingerprintSha256 &&
+    job.payload.classifierVersion === version &&
+    job.payload.allocationAlgorithmVersion === version &&
+    job.payload.replayId === `c${version}-a${version}`
+  );
+  expect(matches).toHaveLength(1);
+  const target = matches[0];
+  if (!target) throw new Error('Expected one pending parent classification job');
+  await databaseClient.db.update(jobs).set({ runAt: CLAIM_FIRST }).where(eq(jobs.id, target.id));
+  const repository = createPostgresJobRepository(
+    databaseClient.db,
+    applicationConfig.jobs,
+    () => new Date(),
+    'local-only',
+    { classifierVersion: version, allocationAlgorithmVersion: version }
+  );
+  const claimed = await repository.claimNext(workerId);
+  expect(claimed).toMatchObject({ id: target.id, type: FINANCIAL_CLASSIFICATION_JOB });
+  if (!claimed) throw new Error('Expected the parent classification job to be claimable');
+  return { repository, claimed, workerId, version };
+}
+
+async function handleAndCompleteParentClassificationJob(
+  claim: Awaited<ReturnType<typeof claimActiveParentClassificationJob>>,
+  database: Database = databaseClient.db
+) {
+  const handler = createFinancialClassificationHandler({
+    database,
+    targetClassifierVersion: claim.version,
+    targetAllocationAlgorithmVersion: claim.version
+  });
+  await handler(claim.claimed, new AbortController().signal);
+  expect(await claim.repository.complete(claim.claimed.id, claim.workerId)).toBe(true);
+  const [stored] = await databaseClient.db.select().from(jobs).where(eq(jobs.id, claim.claimed.id));
+  if (!stored) throw new Error('Expected the completed parent classification job');
+  return stored;
+}
+
+async function runActiveParentClassificationJob(
+  subjectId: string,
+  workerId: string,
+  version = 1
+) {
+  const completed = await handleAndCompleteParentClassificationJob(
+    await claimActiveParentClassificationJob(subjectId, workerId, version)
+  );
+  expect(completed).toMatchObject({
+    status: 'succeeded', rerunRequestedAt: null, completedAt: expect.any(Date)
+  });
+  return completed;
 }
 
 async function createPublishableRun(suffix: string, balanceTransactionId?: string) {
@@ -880,12 +954,10 @@ it('enqueues account projections for payout members without a proven bookstore s
       eq(stripeBalanceTransactions.id, member.balanceTransactionId)
     );
     if (!balance) throw new Error('Expected unrelated payout member');
-    await databaseClient.db.transaction((tx) => replayFinancialClassificationLocked(tx, {
-      subjectType: 'balance_transaction', subjectId: balance.id,
-      sourceFingerprintSha256: balance.fingerprintSha256,
-      classifierVersion: 1, allocationAlgorithmVersion: 1, replayId: 'c1-a1',
-      correlationId: `unrelated-account-${balance.id}`
-    }));
+    await runActiveParentClassificationJob(
+      balance.id,
+      `unrelated-account-${balance.id}`
+    );
     const fallbackSets = await databaseClient.db.select().from(financialAllocationSets).where(
       eq(financialAllocationSets.balanceTransactionId, balance.id)
     );
@@ -1082,42 +1154,58 @@ it('retries account fallback when a bookstore charge link appears after routing 
     job.payload.classifierVersion === 1
   );
   expect(projectionJobs).toHaveLength(2);
+  const parentJob = projectionJobs.find((job) =>
+    job.payload.subjectType === 'balance_transaction'
+  );
+  const feeJobs = projectionJobs.filter((job) => job.payload.subjectType === 'fee_detail');
+  if (!parentJob) throw new Error('Expected the racing parent classification job');
+  expect(feeJobs).toHaveLength(1);
   await databaseClient.db.update(jobs).set({
     status: 'failed', attempts: 8, lastError: 'Stale account route', completedAt: new Date()
-  }).where(inArray(jobs.id, projectionJobs.map((job) => job.id)));
+  }).where(inArray(jobs.id, feeJobs.map((job) => job.id)));
 
   const routingRead = deferred<void>();
   const releaseReplay = deferred<void>();
-  const staleReplay = databaseClient.db.transaction(async (tx) => {
-    let routingReadCount = 0;
-    const proxy = new Proxy(tx, {
-      get(target, property) {
-        if (property === 'execute') {
-          return async (query: unknown) => {
-            const result = await tx.execute(query as never);
-            if (rendered(query).includes(
-              'from payments payment where payment.stripe_latest_charge_id'
-            )) {
-              routingReadCount += 1;
-              if (routingReadCount === 2) {
-                routingRead.resolve();
-                await releaseReplay.promise;
+  let routingReadCount = 0;
+  const staleDatabase = new Proxy(databaseClient.db, {
+    get(target, property) {
+      if (property === 'transaction') {
+        return async (work: (tx: DatabaseTransaction) => Promise<unknown>) =>
+          target.transaction(async (tx) => {
+            const proxy = new Proxy(tx, {
+              get(transaction, transactionProperty) {
+                if (transactionProperty === 'execute') {
+                  return async (query: unknown) => {
+                    const result = await tx.execute(query as never);
+                    if (rendered(query).includes(
+                      'from payments payment where payment.stripe_latest_charge_id'
+                    )) {
+                      routingReadCount += 1;
+                      if (routingReadCount === 2) {
+                        routingRead.resolve();
+                        await releaseReplay.promise;
+                      }
+                    }
+                    return result;
+                  };
+                }
+                const value = Reflect.get(transaction, transactionProperty, transaction);
+                return typeof value === 'function' ? value.bind(transaction) : value;
               }
-            }
-            return result;
-          };
-        }
-        const value = Reflect.get(target, property, target) as unknown;
-        return typeof value === 'function' ? value.bind(target) : value;
+            });
+            return work(proxy as unknown as DatabaseTransaction);
+          });
       }
-    });
-    return replayFinancialClassificationLocked(proxy as DatabaseTransaction, {
-      subjectType: 'balance_transaction', subjectId: balance.id,
-      sourceFingerprintSha256: balance.fingerprintSha256,
-      classifierVersion: 1, allocationAlgorithmVersion: 1, replayId: 'c1-a1',
-      correlationId: `racing-link-stale-${suffix}`
-    });
-  });
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  }) as Database;
+  const staleClaim = await claimActiveParentClassificationJob(
+    balance.id,
+    `racing-link-stale-${suffix}`
+  );
+  expect(staleClaim.claimed.id).toBe(parentJob.id);
+  const staleReplay = handleAndCompleteParentClassificationJob(staleClaim, staleDatabase);
   await routingRead.promise;
 
   try {
@@ -1160,11 +1248,19 @@ it('retries account fallback when a bookstore charge link appears after routing 
         projectionGraphSourceIds: [payment.id]
       });
     });
+    const [runningMarker] = await databaseClient.db.select().from(jobs).where(
+      eq(jobs.id, parentJob.id)
+    );
+    expect(runningMarker).toMatchObject({
+      status: 'running', rerunRequestedAt: expect.any(Date)
+    });
   } finally {
     releaseReplay.resolve();
   }
 
-  await expect(staleReplay).resolves.toMatchObject({ status: 'replayed' });
+  await expect(staleReplay).resolves.toMatchObject({
+    status: 'pending', attempts: 0, rerunRequestedAt: null, completedAt: null
+  });
   const staleSets = await databaseClient.db.select().from(financialAllocationSets).where(
     eq(financialAllocationSets.balanceTransactionId, balance.id)
   );
@@ -1176,12 +1272,10 @@ it('retries account fallback when a bookstore charge link appears after routing 
   expect(rearmed.every((job) => job.status === 'pending' && job.attempts === 0 &&
     job.completedAt === null && job.lastError === null)).toBe(true);
 
-  await databaseClient.db.transaction((tx) => replayFinancialClassificationLocked(tx, {
-    subjectType: 'balance_transaction', subjectId: balance.id,
-    sourceFingerprintSha256: balance.fingerprintSha256,
-    classifierVersion: 1, allocationAlgorithmVersion: 1, replayId: 'c1-a1',
-    correlationId: `racing-link-current-${suffix}`
-  }));
+  await runActiveParentClassificationJob(
+    balance.id,
+    `racing-link-current-${suffix}`
+  );
   const current = await loadCurrentEffectiveAllocationProjection(databaseClient.db, {
     balanceTransactionIds: [balance.id]
   });
@@ -1338,19 +1432,10 @@ it('supersedes an unrelated account allocation when a bookstore charge link arri
     eq(stripeBalanceTransactions.id, staged.balanceTransactionId)
   );
   if (!balance) throw new Error('Expected unrelated payout member');
-  const replay = (correlationId: string) => databaseClient.db.transaction((tx) =>
-    replayFinancialClassificationLocked(tx, {
-      subjectType: 'balance_transaction',
-      subjectId: balance.id,
-      sourceFingerprintSha256: balance.fingerprintSha256,
-      classifierVersion: 1,
-      allocationAlgorithmVersion: 1,
-      replayId: 'c1-a1',
-      correlationId
-    })
+  await runActiveParentClassificationJob(
+    balance.id,
+    `late-link-account-${suffix}`
   );
-
-  await replay(`late-link-account-${suffix}`);
   await expect(loadCurrentEffectiveAllocationProjection(databaseClient.db, {
     balanceTransactionIds: [balance.id]
   })).resolves.toEqual([
@@ -1493,7 +1578,10 @@ it('supersedes a refund-failure account fallback with title reversal lineage aft
       replayId: `c${version}-a${version}`, correlationId
     }));
 
-  await replay(failure, `late-refund-account-${suffix}`);
+  await runActiveParentClassificationJob(
+    failure.id,
+    `late-refund-account-${suffix}`
+  );
   const fallbackSets = await databaseClient.db.select().from(financialAllocationSets).where(
     eq(financialAllocationSets.balanceTransactionId, failure.id)
   );
@@ -1521,9 +1609,19 @@ it('supersedes a refund-failure account fallback with title reversal lineage aft
     totalMinor: 100, currency: 'USD'
   });
 
-  await expect(replay(failure, `late-refund-title-${suffix}`)).resolves.toMatchObject({
-    status: 'replayed', subjectId: failure.id
-  });
+  await databaseClient.db.transaction((tx) => queueFinancialSourceFromEvent(tx, {
+    sourceKind: 'refund', sourceId: refund.id,
+    providerEventId: `evt_financial_late_refund_${suffix}`,
+    projectionGraphSourceIds: [refund.id]
+  }));
+  await runActiveParentClassificationJob(
+    primary.id,
+    `late-refund-primary-${suffix}`
+  );
+  await runActiveParentClassificationJob(
+    failure.id,
+    `late-refund-failure-${suffix}`
+  );
   const history = await databaseClient.db.select().from(financialAllocationSets).where(
     inArray(financialAllocationSets.balanceTransactionId, [primary.id, failure.id])
   );
@@ -1639,7 +1737,10 @@ it('supersedes a dispute-reinstatement account fallback with title reversal line
       replayId: `c${version}-a${version}`, correlationId
     }));
 
-  await replay(reinstatement, `late-dispute-account-${suffix}`);
+  await runActiveParentClassificationJob(
+    reinstatement.id,
+    `late-dispute-account-${suffix}`
+  );
   const fallbackSets = await databaseClient.db.select().from(financialAllocationSets).where(
     eq(financialAllocationSets.balanceTransactionId, reinstatement.id)
   );
@@ -1657,9 +1758,19 @@ it('supersedes a dispute-reinstatement account fallback with title reversal line
   }).returning();
   if (!dispute) throw new Error('Expected late-link dispute');
 
-  await expect(replay(reinstatement, `late-dispute-title-${suffix}`)).resolves.toMatchObject({
-    status: 'replayed', subjectId: reinstatement.id
-  });
+  await databaseClient.db.transaction((tx) => queueFinancialSourceFromEvent(tx, {
+    sourceKind: 'dispute', sourceId: dispute.id,
+    providerEventId: `evt_financial_late_dispute_${suffix}`,
+    projectionGraphSourceIds: [dispute.id]
+  }));
+  await runActiveParentClassificationJob(
+    withdrawal.id,
+    `late-dispute-withdrawal-${suffix}`
+  );
+  await runActiveParentClassificationJob(
+    reinstatement.id,
+    `late-dispute-reinstatement-${suffix}`
+  );
   const history = await databaseClient.db.select().from(financialAllocationSets).where(
     inArray(financialAllocationSets.balanceTransactionId, [withdrawal.id, reinstatement.id])
   );

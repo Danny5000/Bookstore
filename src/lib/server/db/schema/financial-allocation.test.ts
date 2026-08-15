@@ -275,8 +275,29 @@ describe('financial allocation schema declarations', () => {
     expect(query).toMatch(
       /selected_set_issue_count = 0 and active_job_marker_count = 0[\s\S]+?as is_complete/u
     );
+    const selectedHeadShape = query.slice(
+      query.lastIndexOf('select balance_transaction_id, basis'),
+      query.indexOf('as is_complete', query.lastIndexOf('select balance_transaction_id, basis'))
+    );
+    expect(selectedHeadShape).toContain('then base_set_id else null::uuid end as base_set_id');
+    expect(selectedHeadShape).toContain(
+      'then correction_tip_id else null::uuid end as compatible_correction_tip_id'
+    );
+    expect(selectedHeadShape).toContain('then scope else null::financial_allocation_scope end as scope');
+    expect(selectedHeadShape).toContain('then currency else null::varchar(3) end as currency');
+    expect(selectedHeadShape).toContain(
+      'then expected_effect_minor else null::integer end as expected_effect_minor'
+    );
+    expect(selectedHeadShape.match(/active_job_marker_count = 0/gu)).toHaveLength(6);
     expect(query).toMatch(
       /when selected_set_issue_count > 0 then selected_set_issue_code[\s\S]+?when active_job_marker_count > 0 then 'missing_source'/u
+    );
+    const proposedIssueCase = query.slice(
+      query.indexOf('when selected_set_issue_count > 0 then selected_set_issue_code'),
+      query.indexOf('end as proposed_issue_code')
+    );
+    expect(proposedIssueCase).toMatch(
+      /when parent_decision_count > 1 then 'classification_fork'[\s\S]+?when parent_unknown_count > 0 then 'unsupported_category'[\s\S]+?when basis = 'fee'::financial_allocation_basis and fee_currency_mismatch_count > 0 then 'currency_mismatch'[\s\S]+?when basis = 'fee'::financial_allocation_basis and fee_detail_amount_sum <> provider_fee_minor then 'allocation_mismatch'[\s\S]+?when basis = 'fee'::financial_allocation_basis and fee_decision_count > fee_detail_count then 'classification_fork'[\s\S]+?when basis = 'fee'::financial_allocation_basis and fee_unknown_count > 0 then 'unsupported_category'[\s\S]+?when active_job_marker_count > 0 then 'missing_source'[\s\S]+?when base_count = 0 then 'missing_source'/u
     );
   });
 

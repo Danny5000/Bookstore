@@ -1528,7 +1528,6 @@ CREATE VIEW "public"."current_financial_projection_heads" AS (
     case
       when selected_set_issue_count > 0 then selected_set_issue_code
       when classification_fork_issue_count > 0 then 'classification_fork'::varchar(100)
-      when active_job_marker_count > 0 then 'missing_source'::varchar(100)
       when parent_decision_count = 0 then 'missing_source'::varchar(100)
       when parent_decision_count > 1 then 'classification_fork'::varchar(100)
       when parent_unknown_count > 0 then 'unsupported_category'::varchar(100)
@@ -1537,6 +1536,7 @@ CREATE VIEW "public"."current_financial_projection_heads" AS (
       when basis = 'fee'::financial_allocation_basis and fee_decision_count > fee_detail_count then 'classification_fork'::varchar(100)
       when basis = 'fee'::financial_allocation_basis and fee_unknown_count > 0 then 'unsupported_category'::varchar(100)
       when basis = 'fee'::financial_allocation_basis and fee_decision_count < fee_detail_count then 'missing_source'::varchar(100)
+      when active_job_marker_count > 0 then 'missing_source'::varchar(100)
       when base_count = 0 then 'missing_source'::varchar(100)
       when base_count > 1 then 'allocation_fork'::varchar(100)
       when source_fingerprint_sha256 <> provider_fingerprint then 'immutable_mismatch'::varchar(100)

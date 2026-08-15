@@ -31,7 +31,7 @@ describe('financial allocation repository', () => {
     ]);
   });
 
-  it('surfaces a current unknown parent classification as unsupported_category for both bases', async () => {
+  it('surfaces a current unknown parent classification even while its exact active job is pending', async () => {
     const suffix = randomUUID();
     const staged = await stageBalanceTransaction(databaseClient.db, {
       id: `txn_allocation_unknown_${suffix}`, livemode: false, sourceFamily: 'unknown', sourceId: null,
@@ -40,6 +40,18 @@ describe('financial allocation repository', () => {
       createdAt: new Date('2026-08-01T00:00:00.000Z'), availableAt: new Date('2026-08-02T00:00:00.000Z'),
       exchangeRate: null, exchangeSourceCurrency: null, exchangeTargetCurrency: null, feeDetails: []
     }, { correlationId: 'allocation-repository-unknown' });
+    const marker = await databaseClient.pool.query<{ status: string }>(
+      `select status::text
+       from jobs
+       where type='commerce.financial-classification'
+         and payload->>'subjectType'='balance_transaction'
+         and payload->>'subjectId'=$1
+         and (payload->>'classifierVersion')::integer=1
+         and (payload->>'allocationAlgorithmVersion')::integer=1`,
+      [staged.balanceTransactionId]
+    );
+    expect(marker.rows).toEqual([{ status: 'pending' }]);
+
     await expect(loadCurrentEffectiveAllocationProjection(databaseClient.db, {
       balanceTransactionIds: [staged.balanceTransactionId]
     })).resolves.toEqual([
