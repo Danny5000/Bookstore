@@ -497,6 +497,152 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     insert into payments (id, order_id, stripe_payment_intent_id, status, amount_minor, currency)
     values ($1, $2, 'pi_restore_refund_components', 'pending', 8, 'USD')
   `, [paymentId, orderId]);
+  const chargeTransactionId = '45000000-0000-4000-8000-000000000001';
+  const chargeAllocationSetId = '45000000-0000-4000-8000-000000000002';
+  const chargeSubtotalItemId = '45000000-0000-4000-8000-000000000003';
+  const chargeFingerprint = '4'.repeat(64);
+  await pool.query(`
+    update payments set stripe_latest_charge_id = 'ch_restore_component_semantics'
+    where id = $1
+  `, [paymentId]);
+  await pool.query(`
+    insert into stripe_balance_transactions (
+      id, provider_id, live_mode, source_family, source_id, raw_type,
+      reporting_category, balance_type, amount_minor, fee_minor, net_minor,
+      currency, status, provider_created_at, available_at, fingerprint_sha256
+    ) values (
+      $1, 'bt_restore_component_semantics', false, 'charge',
+      'ch_restore_component_semantics', 'charge', 'charge', 'payments',
+      8, 0, 8, 'USD', 'available', '2026-08-02T00:00:00.000Z',
+      '2026-08-02T00:00:00.000Z', $2
+    )
+  `, [chargeTransactionId, chargeFingerprint]);
+  await pool.query(`
+    insert into financial_classification_versions (
+      subject_type, subject_id, classifier_version, classification,
+      source_fingerprint_sha256
+    ) values ('balance_transaction', $1, 1, 'charge', $2)
+  `, [chargeTransactionId, chargeFingerprint]);
+  await pool.query(`
+    insert into financial_allocation_sets (
+      id, allocation_identity, balance_transaction_id, source_kind,
+      source_internal_id, basis, scope, expected_effect_minor, currency,
+      algorithm_version, classifier_version, source_fingerprint_sha256
+    ) values (
+      $1, 'restore:charge:component-semantics', $2, 'payment', $3,
+      'gross_amount', 'title', 8, 'USD', 1, 1, $4
+    )
+  `, [chargeAllocationSetId, chargeTransactionId, paymentId, chargeFingerprint]);
+  await pool.query(`
+    insert into financial_item_allocations (
+      id, allocation_set_id, order_item_id, component, effect_minor, currency,
+      tie_break_key
+    ) values
+      ($1, $2, $3, 'sale_subtotal', 3, 'USD', 'restore:charge:first:subtotal'),
+      ('45000000-0000-4000-8000-000000000004', $2, $3,
+        'sale_tax', 1, 'USD', 'restore:charge:first:tax'),
+      ('45000000-0000-4000-8000-000000000005', $2, $4,
+        'sale_subtotal', 3, 'USD', 'restore:charge:second:subtotal'),
+      ('45000000-0000-4000-8000-000000000006', $2, $4,
+        'sale_tax', 1, 'USD', 'restore:charge:second:tax')
+  `, [chargeSubtotalItemId, chargeAllocationSetId, firstItemId, secondItemId]);
+  await expectPass('charge allocation component semantics baseline', true);
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations set component = 'other' where id = $1
+  `, [chargeSubtotalItemId]);
+  await expectRejection(
+    'charge gross allocation cannot masquerade as another component',
+    'financial_item_allocation_semantic_component=1'
+  );
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations set component = 'sale_subtotal' where id = $1
+  `, [chargeSubtotalItemId]);
+  await expectPass('charge allocation component semantics repair', true);
+  const chargeFeeDetailId = '45000000-0000-4000-8000-000000000007';
+  const chargeFeeTaxDetailId = '45000000-0000-4000-8000-000000000008';
+  const chargeFeeSetId = '45000000-0000-4000-8000-000000000009';
+  const chargeFeeItemId = '45000000-0000-4000-8000-00000000000a';
+  const chargeFeeTaxItemId = '45000000-0000-4000-8000-00000000000b';
+  await mutateAppendOnlyFixture(`
+    update stripe_balance_transactions set fee_minor = 1, net_minor = 7 where id = $1
+  `, [chargeTransactionId]);
+  await pool.query(`
+    insert into stripe_balance_transaction_fee_details (
+      id, balance_transaction_id, ordinal, raw_type, amount_minor, currency,
+      fingerprint_sha256
+    ) values
+      ($1, $3, 0, 'stripe_fee', 1, 'USD', $4),
+      ($2, $3, 1, 'tax', 0, 'USD', $5)
+  `, [chargeFeeDetailId, chargeFeeTaxDetailId, chargeTransactionId,
+    '5'.repeat(64), '6'.repeat(64)]);
+  await pool.query(`
+    insert into financial_classification_versions (
+      subject_type, subject_id, classifier_version, classification,
+      source_fingerprint_sha256
+    ) values
+      ('fee_detail', $1, 1, 'processing_fee', $3),
+      ('fee_detail', $2, 1, 'provider_fee_tax', $4)
+  `, [chargeFeeDetailId, chargeFeeTaxDetailId, '5'.repeat(64), '6'.repeat(64)]);
+  await pool.query(`
+    insert into financial_allocation_sets (
+      id, allocation_identity, balance_transaction_id, source_kind,
+      source_internal_id, basis, scope, expected_effect_minor, currency,
+      algorithm_version, classifier_version, source_fingerprint_sha256
+    ) values (
+      $1, 'restore:charge:fee-component-conservation', $2, 'payment', $3,
+      'fee', 'title', -1, 'USD', 1, 1, $4
+    )
+  `, [chargeFeeSetId, chargeTransactionId, paymentId, chargeFingerprint]);
+  await pool.query(`
+    insert into financial_item_allocations (
+      id, allocation_set_id, order_item_id, component, effect_minor, currency,
+      tie_break_key
+    ) values
+      ($1, $3, $4, 'processing_fee', -1, 'USD', 'restore:charge:fee'),
+      ($2, $3, $4, 'provider_fee_tax', 0, 'USD', 'restore:charge:fee-tax')
+  `, [chargeFeeItemId, chargeFeeTaxItemId, chargeFeeSetId, firstItemId]);
+  await expectPass('charge fee component conservation baseline', true);
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations
+    set effect_minor = case id when $1 then 0 else -1 end
+    where id in ($1, $2)
+  `, [chargeFeeItemId, chargeFeeTaxItemId]);
+  await expectRejection(
+    'charge fee effects cannot move between valid classified components',
+    'financial_fee_component_conservation=2'
+  );
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations
+    set effect_minor = case id when $1 then -1 else 0 end
+    where id in ($1, $2)
+  `, [chargeFeeItemId, chargeFeeTaxItemId]);
+  await expectPass('charge fee component conservation repair', true);
+  await mutateAppendOnlyFixture(`
+    delete from financial_item_allocations where id = $1
+  `, [chargeFeeTaxItemId]);
+  await mutateAppendOnlyFixture(`
+    update financial_classification_versions set classification = 'refund_fee'
+    where subject_type = 'fee_detail' and subject_id = $1
+      and classifier_version = 1 and source_fingerprint_sha256 = $2
+  `, [chargeFeeTaxDetailId, '6'.repeat(64)]);
+  await expectRejection(
+    'zero fee detail still requires a source-valid exact classification',
+    'financial_fee_detail_semantic_classification=1'
+  );
+  await mutateAppendOnlyFixture(`
+    update financial_classification_versions set classification = 'provider_fee_tax'
+    where subject_type = 'fee_detail' and subject_id = $1
+      and classifier_version = 1 and source_fingerprint_sha256 = $2
+  `, [chargeFeeTaxDetailId, '6'.repeat(64)]);
+  await pool.query(`
+    insert into financial_item_allocations (
+      id, allocation_set_id, order_item_id, component, effect_minor, currency,
+      tie_break_key
+    ) values (
+      $1, $2, $3, 'provider_fee_tax', 0, 'USD', 'restore:charge:fee-tax'
+    )
+  `, [chargeFeeTaxItemId, chargeFeeSetId, firstItemId]);
+  await expectPass('zero fee detail classification semantics repair', true);
   await pool.query(`
     insert into refunds (
       id, payment_id, stripe_refund_id, status, amount_minor, currency,
@@ -538,6 +684,185 @@ async function exerciseInvariantWitnesses(): Promise<void> {
   } finally {
     await pool.query('set session_replication_role = origin');
   }
+
+  const unresolvedRefundId = '47000000-0000-4000-8000-000000000001';
+  const unresolvedTransactionId = '47000000-0000-4000-8000-000000000002';
+  const unresolvedGrossSetId = '47000000-0000-4000-8000-000000000003';
+  const unresolvedFeeDetailId = '47000000-0000-4000-8000-000000000004';
+  const unresolvedFeeSetId = '47000000-0000-4000-8000-000000000005';
+  const unresolvedFingerprint = 'c'.repeat(64);
+  await pool.query(`
+    insert into refunds (
+      id, payment_id, stripe_refund_id, status, amount_minor, currency,
+      provider_created_at, allocation_status
+    ) values (
+      $1, $2, 're_restore_unresolved_fee_semantics', 'succeeded', 1, 'USD',
+      '2026-08-02T12:00:00.000Z', 'needs_review'
+    )
+  `, [unresolvedRefundId, paymentId]);
+  await pool.query(`
+    insert into stripe_balance_transactions (
+      id, provider_id, live_mode, source_family, source_id, raw_type,
+      reporting_category, balance_type, amount_minor, fee_minor, net_minor,
+      currency, status, provider_created_at, available_at, fingerprint_sha256
+    ) values (
+      $1, 'bt_restore_unresolved_fee_semantics', false, 'refund',
+      're_restore_unresolved_fee_semantics', 'refund', 'refund', 'payments',
+      -1, 0, -1, 'USD', 'available', '2026-08-02T12:00:00.000Z',
+      '2026-08-02T12:00:00.000Z', $2
+    )
+  `, [unresolvedTransactionId, unresolvedFingerprint]);
+  await pool.query(`
+    insert into financial_classification_versions (
+      subject_type, subject_id, classifier_version, classification,
+      source_fingerprint_sha256
+    ) values ('balance_transaction', $1, 1, 'refund', $2)
+  `, [unresolvedTransactionId, unresolvedFingerprint]);
+  await pool.query(`
+    insert into financial_allocation_sets (
+      id, allocation_identity, balance_transaction_id, source_kind,
+      source_internal_id, basis, scope, expected_effect_minor, currency,
+      algorithm_version, classifier_version, source_fingerprint_sha256
+    ) values
+      ($1, 'restore:refund:unresolved-gross', $3, 'refund', $4,
+        'gross_amount', 'unresolved', -1, 'USD', 1, 1, $5),
+      ($2, 'restore:refund:unresolved-fee', $3, 'refund', $4,
+        'fee', 'unresolved', 0, 'USD', 1, 1, $5)
+  `, [
+    unresolvedGrossSetId,
+    unresolvedFeeSetId,
+    unresolvedTransactionId,
+    unresolvedRefundId,
+    unresolvedFingerprint
+  ]);
+  await pool.query(`
+    insert into stripe_balance_transaction_fee_details (
+      id, balance_transaction_id, ordinal, raw_type, amount_minor, currency,
+      fingerprint_sha256
+    ) values ($1, $2, 0, 'stripe_fee', 0, 'USD', $3)
+  `, [unresolvedFeeDetailId, unresolvedTransactionId, 'd'.repeat(64)]);
+  await pool.query(`
+    insert into financial_classification_versions (
+      subject_type, subject_id, classifier_version, classification,
+      source_fingerprint_sha256
+    ) values ('fee_detail', $1, 1, 'processing_fee', $2)
+  `, [unresolvedFeeDetailId, 'd'.repeat(64)]);
+  await expectRejection(
+    'unresolved refund zero fee detail still requires a refund-valid classification',
+    'financial_fee_detail_semantic_classification=1'
+  );
+  await mutateAppendOnlyFixture(`
+    update financial_classification_versions set classification = 'refund_fee'
+    where subject_type = 'fee_detail' and subject_id = $1
+      and classifier_version = 1 and source_fingerprint_sha256 = $2
+  `, [unresolvedFeeDetailId, 'd'.repeat(64)]);
+  await expectPass('unresolved refund zero fee detail classification repair', true);
+  await mutateAppendOnlyFixture(`
+    update financial_classification_versions set classification = 'refund_failure'
+    where subject_type = 'balance_transaction' and subject_id = $1
+      and classifier_version = 1 and source_fingerprint_sha256 = $2
+  `, [unresolvedTransactionId, unresolvedFingerprint]);
+  await expectRejection(
+    'unresolved refund fee details require an exact refund parent classification',
+    'financial_fee_detail_semantic_classification=1'
+  );
+  await mutateAppendOnlyFixture(`
+    update financial_classification_versions set classification = 'refund'
+    where subject_type = 'balance_transaction' and subject_id = $1
+      and classifier_version = 1 and source_fingerprint_sha256 = $2
+  `, [unresolvedTransactionId, unresolvedFingerprint]);
+  await expectPass('unresolved refund parent classification repair', true);
+
+  const correctionAdminId = '46000000-0000-4000-8000-000000000001';
+  const correctionTransactionId = '46000000-0000-4000-8000-000000000002';
+  const correctionAllocationSetId = '46000000-0000-4000-8000-000000000003';
+  const correctionFinancialItemId = '46000000-0000-4000-8000-000000000004';
+  const correctionSetId = '46000000-0000-4000-8000-000000000005';
+  const correctionItemId = '46000000-0000-4000-8000-000000000006';
+  const correctionFingerprint = 'a'.repeat(64);
+  await pool.query(`
+    insert into "user" (id, name, email, email_verified)
+    values ($1, 'Restore correction admin', 'restore-correction@example.invalid', true)
+  `, [correctionAdminId]);
+  await pool.query(`
+    insert into stripe_balance_transactions (
+      id, provider_id, live_mode, source_family, source_id, raw_type,
+      reporting_category, balance_type, amount_minor, fee_minor, net_minor,
+      currency, status, provider_created_at, available_at, fingerprint_sha256
+    ) values (
+      $1, 'bt_restore_correction_semantics', false, 'refund',
+      're_restore_capacity_1', 'refund', 'refund', 'payments',
+      -2, 0, -2, 'USD', 'available', '2026-08-03T00:00:00.000Z',
+      '2026-08-03T00:00:00.000Z', $2
+    )
+  `, [correctionTransactionId, correctionFingerprint]);
+  await pool.query(`
+    insert into financial_classification_versions (
+      subject_type, subject_id, classifier_version, classification,
+      source_fingerprint_sha256
+    ) values ('balance_transaction', $1, 1, 'refund', $2)
+  `, [correctionTransactionId, correctionFingerprint]);
+  await pool.query(`
+    insert into financial_allocation_sets (
+      id, allocation_identity, balance_transaction_id, source_kind,
+      source_internal_id, basis, scope, expected_effect_minor, currency,
+      algorithm_version, classifier_version, source_fingerprint_sha256
+    ) values (
+      $1, 'restore:refund:correction-semantics', $2, 'refund', $3,
+      'gross_amount', 'title', -2, 'USD', 1, 1, $4
+    )
+  `, [
+    correctionAllocationSetId,
+    correctionTransactionId,
+    capacityRefundOneId,
+    correctionFingerprint
+  ]);
+  await pool.query(`
+    insert into financial_item_allocations (
+      id, allocation_set_id, order_item_id, component, effect_minor, currency,
+      tie_break_key
+    ) values (
+      $1, $2, $3, 'refund_subtotal', -2, 'USD', 'restore:refund:correction-base'
+    )
+  `, [correctionFinancialItemId, correctionAllocationSetId, firstItemId]);
+  await pool.query(`
+    insert into refund_reporting_correction_sets (
+      id, refund_id, correction_version, kind, base_allocation_set_id,
+      source_fingerprint_sha256, approved_by_admin_id, created_by_admin_id,
+      correlation_id
+    ) values (
+      $1, $2, 1, 'allocation_attribution_correction', $3, $4, $5, $5,
+      'restore-correction-semantics'
+    )
+  `, [
+    correctionSetId,
+    capacityRefundOneId,
+    correctionAllocationSetId,
+    correctionFingerprint,
+    correctionAdminId
+  ]);
+  await pool.query(`
+    insert into refund_reporting_correction_items (
+      id, correction_set_id, domain, source_allocation_set_id, order_item_id,
+      component, currency, approved_absolute_minor, delta_minor,
+      stable_tie_break_key
+    ) values (
+      $1, $2, 'settlement', $3, $4, 'refund_subtotal', 'USD', -2, 0,
+      'restore:refund:correction-item'
+    )
+  `, [correctionItemId, correctionSetId, correctionAllocationSetId, firstItemId]);
+  await expectPass('refund correction component semantics baseline', true);
+  await mutateAppendOnlyFixture(`
+    update refund_reporting_correction_items set component = 'refund_fee' where id = $1
+  `, [correctionItemId]);
+  await expectRejection(
+    'refund gross correction cannot masquerade as a fee component',
+    'refund_reporting_correction_item_semantics=1'
+  );
+  await mutateAppendOnlyFixture(`
+    update refund_reporting_correction_items set component = 'refund_subtotal' where id = $1
+  `, [correctionItemId]);
+  await expectPass('refund correction component semantics repair', true);
 
   await pool.query(`
     update refunds set allocation_status = 'exception' where id = $1
@@ -877,11 +1202,13 @@ async function exerciseInvariantWitnesses(): Promise<void> {
   const childlessReinstatementTransactionId = '42000000-0000-4000-8000-000000000005';
   const childlessReinstatementSetId = '42000000-0000-4000-8000-000000000006';
   const childlessReinstatementAllocationId = '42000000-0000-4000-8000-000000000007';
+  const childlessReinstatementFinancialItemId =
+    '42000000-0000-4000-8000-000000000008';
   await insertDisputeEffect({
     allocationId: childlessReinstatementAllocationId,
     disputeId: childlessDisputeId,
     effect: 'reinstatement',
-    financialItemId: '42000000-0000-4000-8000-000000000008',
+    financialItemId: childlessReinstatementFinancialItemId,
     fingerprintCharacter: 'f',
     orderItemId: combinedSecondItemId,
     providerCreatedAt: '2026-08-08T03:00:00.000Z',
@@ -926,11 +1253,52 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     update dispute_item_allocations set reverses_allocation_id = $1 where id = $2
   `, [childlessWithdrawalAllocationId, childlessReinstatementAllocationId]);
   await expectPass('reinstatement immutable reversal graph repair', true);
+  await mutateAppendOnlyFixture(`
+    update stripe_balance_transactions set amount_minor = 5, net_minor = 5 where id = $1
+  `, [childlessReinstatementTransactionId]);
+  await mutateAppendOnlyFixture(`
+    update financial_allocation_sets set expected_effect_minor = 5 where id = $1
+  `, [childlessReinstatementSetId]);
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations set effect_minor = 5 where id = $1
+  `, [childlessReinstatementFinancialItemId]);
+  await mutateAppendOnlyFixture(`
+    update dispute_item_allocations
+    set subtotal_effect_minor = 5, tax_effect_minor = 0, total_effect_minor = 5
+    where id = $1
+  `, [childlessReinstatementAllocationId]);
+  await expectPass('same-currency partial reinstatement remains valid', true);
+  await mutateAppendOnlyFixture(`
+    update stripe_balance_transactions set amount_minor = 10, net_minor = 10 where id = $1
+  `, [childlessReinstatementTransactionId]);
+  await mutateAppendOnlyFixture(`
+    update financial_allocation_sets set expected_effect_minor = 10 where id = $1
+  `, [childlessReinstatementSetId]);
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations set effect_minor = 10 where id = $1
+  `, [childlessReinstatementFinancialItemId]);
+  await mutateAppendOnlyFixture(`
+    update dispute_item_allocations
+    set subtotal_effect_minor = 10, tax_effect_minor = 0, total_effect_minor = 10
+    where id = $1
+  `, [childlessReinstatementAllocationId]);
+  await expectPass('same-currency full reinstatement repair', true);
 
   const crossCurrencyTransactionId = '44000000-0000-4000-8000-000000000001';
   const crossCurrencySetId = '44000000-0000-4000-8000-000000000002';
   const crossCurrencyFinancialItemId = '44000000-0000-4000-8000-000000000003';
   const crossCurrencyAllocationId = '44000000-0000-4000-8000-000000000004';
+  const crossCurrencyReinstatementTransactionId =
+    '44000000-0000-4000-8000-000000000005';
+  const crossCurrencyReinstatementSetId = '44000000-0000-4000-8000-000000000006';
+  const crossCurrencyReinstatementFinancialItemId =
+    '44000000-0000-4000-8000-000000000007';
+  const crossCurrencyReinstatementAllocationId =
+    '44000000-0000-4000-8000-000000000008';
+  const crossCurrencyReinstatementFeeDetailId =
+    '44000000-0000-4000-8000-000000000009';
+  const crossCurrencyReinstatementFeeSetId =
+    '44000000-0000-4000-8000-00000000000a';
   await insertDisputeEffect({
     allocationId: crossCurrencyAllocationId,
     disputeId: childlessDisputeId,
@@ -972,26 +1340,132 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     where id = $1
   `, [crossCurrencyAllocationId]);
   await expectPass('cross-currency withdrawal presentment repair', true);
-  await mutateAppendOnlyFixture(
-    'delete from dispute_item_allocations where id = $1',
-    [crossCurrencyAllocationId]
-  );
-  await mutateAppendOnlyFixture(
-    'delete from financial_item_allocations where id = $1',
-    [crossCurrencyFinancialItemId]
-  );
-  await mutateAppendOnlyFixture(
-    'delete from financial_allocation_sets where id = $1',
-    [crossCurrencySetId]
+  await insertDisputeEffect({
+    allocationId: crossCurrencyReinstatementAllocationId,
+    disputeId: childlessDisputeId,
+    effect: 'reinstatement',
+    financialItemId: crossCurrencyReinstatementFinancialItemId,
+    fingerprintCharacter: '3',
+    orderItemId: combinedSecondItemId,
+    providerCreatedAt: '2026-08-08T05:00:00.000Z',
+    providerId: 'bt_restore_cross_currency_reinstatement',
+    reversalOfSetId: null,
+    reversesAllocationId: crossCurrencyAllocationId,
+    setId: crossCurrencyReinstatementSetId,
+    signedSubtotalMinor: 10,
+    stripeDisputeId: childlessStripeDisputeId,
+    transactionId: crossCurrencyReinstatementTransactionId
+  });
+  await mutateAppendOnlyFixture(`
+    update stripe_balance_transactions set currency = 'EUR' where id = $1
+  `, [crossCurrencyReinstatementTransactionId]);
+  await mutateAppendOnlyFixture(`
+    update financial_allocation_sets
+    set currency = 'EUR', reversal_of_set_id = $2 where id = $1
+  `, [crossCurrencyReinstatementSetId, crossCurrencySetId]);
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations set currency = 'EUR' where id = $1
+  `, [crossCurrencyReinstatementFinancialItemId]);
+  await pool.query(`
+    insert into stripe_balance_transaction_fee_details (
+      id, balance_transaction_id, ordinal, raw_type, amount_minor, currency,
+      fingerprint_sha256
+    ) values ($1, $2, 0, 'tax', 0, 'EUR', $3)
+  `, [
+    crossCurrencyReinstatementFeeDetailId,
+    crossCurrencyReinstatementTransactionId,
+    '7'.repeat(64)
+  ]);
+  await pool.query(`
+    insert into financial_classification_versions (
+      subject_type, subject_id, classifier_version, classification,
+      source_fingerprint_sha256
+    ) values ('fee_detail', $1, 1, 'provider_fee_tax', $2)
+  `, [crossCurrencyReinstatementFeeDetailId, '7'.repeat(64)]);
+  await pool.query(`
+    insert into financial_allocation_sets (
+      id, allocation_identity, balance_transaction_id, source_kind,
+      source_internal_id, basis, scope, expected_effect_minor, currency,
+      algorithm_version, classifier_version, source_fingerprint_sha256
+    ) values (
+      $1, 'restore:cross-currency-reinstatement-fee', $2, 'dispute', $3,
+      'fee', 'title', 0, 'EUR', 1, 1, repeat('3', 64)
+    )
+  `, [
+    crossCurrencyReinstatementFeeSetId,
+    crossCurrencyReinstatementTransactionId,
+    childlessDisputeId
+  ]);
+  await expectPass('full cross-currency reinstatement baseline', true);
+
+  await mutateAppendOnlyFixture(`
+    update stripe_balance_transactions set amount_minor = 5, net_minor = 5 where id = $1
+  `, [crossCurrencyReinstatementTransactionId]);
+  await mutateAppendOnlyFixture(`
+    update financial_allocation_sets set expected_effect_minor = 5 where id = $1
+  `, [crossCurrencyReinstatementSetId]);
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations set effect_minor = 5 where id = $1
+  `, [crossCurrencyReinstatementFinancialItemId]);
+  await expectRejection(
+    'cross-currency reinstatement cannot partially restore settlement',
+    'dispute_item_allocation_graph=1'
   );
   await mutateAppendOnlyFixture(`
-    delete from financial_classification_versions where subject_id = $1
-  `, [crossCurrencyTransactionId]);
-  await mutateAppendOnlyFixture(
-    'delete from stripe_balance_transactions where id = $1',
-    [crossCurrencyTransactionId]
+    update stripe_balance_transactions set amount_minor = 10, net_minor = 10 where id = $1
+  `, [crossCurrencyReinstatementTransactionId]);
+  await mutateAppendOnlyFixture(`
+    update financial_allocation_sets set expected_effect_minor = 10 where id = $1
+  `, [crossCurrencyReinstatementSetId]);
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations set effect_minor = 10 where id = $1
+  `, [crossCurrencyReinstatementFinancialItemId]);
+  await expectPass('cross-currency reinstatement settlement repair', true);
+
+  await mutateAppendOnlyFixture(`
+    update dispute_item_allocations
+    set subtotal_effect_minor = 5, tax_effect_minor = 0, total_effect_minor = 5
+    where id = $1
+  `, [crossCurrencyReinstatementAllocationId]);
+  await expectRejection(
+    'cross-currency reinstatement cannot partially restore presentment',
+    'dispute_item_allocation_graph=1'
   );
-  await expectPass('cross-currency withdrawal witness cleanup', true);
+  await mutateAppendOnlyFixture(`
+    update dispute_item_allocations
+    set subtotal_effect_minor = 10, tax_effect_minor = 0, total_effect_minor = 10
+    where id = $1
+  `, [crossCurrencyReinstatementAllocationId]);
+  await expectPass('cross-currency reinstatement presentment repair', true);
+  await mutateAppendOnlyFixture(
+    'delete from dispute_item_allocations where id in ($1, $2)',
+    [crossCurrencyAllocationId, crossCurrencyReinstatementAllocationId]
+  );
+  await mutateAppendOnlyFixture(
+    'delete from financial_item_allocations where id in ($1, $2)',
+    [crossCurrencyFinancialItemId, crossCurrencyReinstatementFinancialItemId]
+  );
+  await mutateAppendOnlyFixture(
+    'delete from financial_allocation_sets where id in ($1, $2, $3)',
+    [crossCurrencySetId, crossCurrencyReinstatementSetId,
+      crossCurrencyReinstatementFeeSetId]
+  );
+  await mutateAppendOnlyFixture(`
+    delete from financial_classification_versions where subject_id in ($1, $2, $3)
+  `, [
+    crossCurrencyTransactionId,
+    crossCurrencyReinstatementTransactionId,
+    crossCurrencyReinstatementFeeDetailId
+  ]);
+  await mutateAppendOnlyFixture(
+    'delete from stripe_balance_transaction_fee_details where id = $1',
+    [crossCurrencyReinstatementFeeDetailId]
+  );
+  await mutateAppendOnlyFixture(
+    'delete from stripe_balance_transactions where id in ($1, $2)',
+    [crossCurrencyTransactionId, crossCurrencyReinstatementTransactionId]
+  );
+  await expectPass('cross-currency withdrawal and reinstatement witness cleanup', true);
 
   const duplicateChronologyRefundComponentId =
     '40000000-0000-4000-8000-0000000000e0';

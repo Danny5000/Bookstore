@@ -446,6 +446,187 @@ with orphan_counts as (
      or s.source_kind in ('payout', 'adjustment')
 
   union all
+  select 'financial_item_allocation_semantic_component', count(*)::bigint
+  from financial_item_allocations i
+  join financial_allocation_sets s on s.id = i.allocation_set_id
+  left join financial_classification_versions component_parent_classification
+    on component_parent_classification.subject_type = 'balance_transaction'
+   and component_parent_classification.subject_id = s.balance_transaction_id
+   and component_parent_classification.classifier_version = s.classifier_version
+   and component_parent_classification.source_fingerprint_sha256 =
+     s.source_fingerprint_sha256
+  where not coalesce((
+    s.scope = 'title' and (
+      (s.basis = 'gross_amount' and (
+        (s.source_kind = 'payment'
+          and component_parent_classification.classification = 'charge'
+          and s.reversal_of_set_id is null
+          and i.component in ('sale_subtotal', 'sale_tax'))
+        or (s.source_kind = 'refund'
+          and i.component in ('refund_subtotal', 'refund_tax')
+          and (
+            (component_parent_classification.classification = 'refund'
+              and s.reversal_of_set_id is null)
+            or (component_parent_classification.classification = 'refund_failure'
+              and s.reversal_of_set_id is not null)
+          ))
+        or (s.source_kind = 'dispute' and (
+          (component_parent_classification.classification = 'dispute_withdrawal'
+            and s.reversal_of_set_id is null
+            and i.component in ('dispute_subtotal', 'dispute_tax'))
+          or (component_parent_classification.classification = 'dispute_reinstatement'
+            and s.reversal_of_set_id is not null
+            and i.component = 'dispute_reinstatement')
+          or (component_parent_classification.classification = 'fee_credit'
+            and s.reversal_of_set_id is null
+            and i.component = 'fee_credit')
+        ))
+      ))
+      or (s.basis = 'fee'
+        and s.reversal_of_set_id is null
+        and (
+          (s.source_kind = 'payment'
+            and component_parent_classification.classification = 'charge'
+            and i.component in (
+              'processing_fee', 'provider_fee_tax', 'fee_credit', 'other'
+            ))
+          or (s.source_kind = 'refund'
+            and component_parent_classification.classification in ('refund', 'refund_failure')
+            and i.component in (
+              'refund_fee', 'provider_fee_tax', 'fee_credit', 'other'
+            ))
+          or (s.source_kind = 'dispute'
+            and component_parent_classification.classification = 'dispute_withdrawal'
+            and i.component in (
+              'dispute_fee', 'provider_fee_tax', 'fee_credit', 'other'
+            ))
+        )
+        and exists (
+          select 1
+          from stripe_balance_transaction_fee_details component_detail
+          join financial_classification_versions component_detail_classification
+            on component_detail_classification.subject_type = 'fee_detail'
+           and component_detail_classification.subject_id = component_detail.id
+           and component_detail_classification.classifier_version = s.classifier_version
+           and component_detail_classification.source_fingerprint_sha256 =
+             component_detail.fingerprint_sha256
+           and component_detail_classification.classification::text = i.component::text
+          where component_detail.balance_transaction_id = s.balance_transaction_id
+        ))
+    )
+  ), false)
+
+  union all
+  select 'financial_fee_detail_semantic_classification', count(*)::bigint
+  from financial_allocation_sets fee_set
+  join stripe_balance_transaction_fee_details fee_detail
+    on fee_detail.balance_transaction_id = fee_set.balance_transaction_id
+  left join financial_classification_versions fee_parent_classification
+    on fee_parent_classification.subject_type = 'balance_transaction'
+   and fee_parent_classification.subject_id = fee_set.balance_transaction_id
+   and fee_parent_classification.classifier_version = fee_set.classifier_version
+   and fee_parent_classification.source_fingerprint_sha256 =
+     fee_set.source_fingerprint_sha256
+  left join financial_classification_versions fee_detail_classification
+    on fee_detail_classification.subject_type = 'fee_detail'
+   and fee_detail_classification.subject_id = fee_detail.id
+   and fee_detail_classification.classifier_version = fee_set.classifier_version
+   and fee_detail_classification.source_fingerprint_sha256 = fee_detail.fingerprint_sha256
+  where fee_set.basis = 'fee'
+    and fee_set.reversal_of_set_id is null
+    and (
+      (fee_set.scope = 'title'
+        and fee_set.source_kind in ('payment', 'refund', 'dispute'))
+      or (fee_set.scope = 'unresolved'
+        and fee_set.source_kind = 'refund')
+    )
+    and not coalesce((
+      (fee_set.source_kind = 'payment'
+        and fee_parent_classification.classification = 'charge'
+        and fee_detail_classification.classification in (
+          'processing_fee', 'provider_fee_tax', 'fee_credit', 'other'
+        ))
+      or (fee_set.source_kind = 'refund'
+        and (
+          (fee_set.scope = 'title'
+            and fee_parent_classification.classification in ('refund', 'refund_failure'))
+          or (fee_set.scope = 'unresolved'
+            and fee_parent_classification.classification = 'refund')
+        )
+        and fee_detail_classification.classification in (
+          'refund_fee', 'provider_fee_tax', 'fee_credit', 'other'
+        ))
+      or (fee_set.source_kind = 'dispute'
+        and fee_parent_classification.classification in (
+          'dispute_withdrawal', 'dispute_reinstatement'
+        )
+        and fee_detail_classification.classification in (
+          'dispute_fee', 'provider_fee_tax', 'fee_credit', 'other'
+        ))
+    ), false)
+
+  union all
+  select 'financial_fee_component_conservation', count(*)::bigint
+  from (
+    with eligible_fee_sets as (
+      select s.id, s.balance_transaction_id, s.classifier_version
+      from financial_allocation_sets s
+      join financial_classification_versions parent_classification
+        on parent_classification.subject_type = 'balance_transaction'
+       and parent_classification.subject_id = s.balance_transaction_id
+       and parent_classification.classifier_version = s.classifier_version
+       and parent_classification.source_fingerprint_sha256 = s.source_fingerprint_sha256
+      where s.basis = 'fee'
+        and s.scope = 'title'
+        and s.reversal_of_set_id is null
+        and (
+          (s.source_kind = 'payment' and parent_classification.classification = 'charge')
+          or (s.source_kind = 'refund'
+            and parent_classification.classification in ('refund', 'refund_failure'))
+          or (s.source_kind = 'dispute'
+            and parent_classification.classification = 'dispute_withdrawal')
+        )
+    ), expected_components as (
+      select eligible.id as allocation_set_id,
+        detail_classification.classification::text as component,
+        -sum(detail.amount_minor)::bigint as expected_component_minor
+      from eligible_fee_sets eligible
+      join stripe_balance_transaction_fee_details detail
+        on detail.balance_transaction_id = eligible.balance_transaction_id
+      join financial_classification_versions detail_classification
+        on detail_classification.subject_type = 'fee_detail'
+       and detail_classification.subject_id = detail.id
+       and detail_classification.classifier_version = eligible.classifier_version
+       and detail_classification.source_fingerprint_sha256 = detail.fingerprint_sha256
+      where detail_classification.classification in (
+        'processing_fee', 'refund_fee', 'dispute_fee',
+        'provider_fee_tax', 'fee_credit', 'other'
+      )
+      group by eligible.id, detail_classification.classification
+    ), actual_components as (
+      select eligible.id as allocation_set_id, item.component::text as component,
+        sum(item.effect_minor)::bigint as actual_component_minor
+      from eligible_fee_sets eligible
+      join financial_item_allocations item on item.allocation_set_id = eligible.id
+      group by eligible.id, item.component
+    ), component_keys as (
+      select allocation_set_id, component from expected_components
+      union
+      select allocation_set_id, component from actual_components
+    )
+    select key.allocation_set_id, key.component
+    from component_keys key
+    left join expected_components expected
+      on expected.allocation_set_id = key.allocation_set_id
+     and expected.component = key.component
+    left join actual_components actual
+      on actual.allocation_set_id = key.allocation_set_id
+     and actual.component = key.component
+    where coalesce(actual.actual_component_minor, 0) is distinct from
+      coalesce(expected.expected_component_minor, 0)
+  ) mismatched_fee_component
+
+  union all
   select 'financial_issue_vocabulary', count(*)::bigint
   from financial_reconciliation_issues i
   where i.resource_type not in (
@@ -533,6 +714,8 @@ with orphan_counts as (
     on s.id = a.gross_allocation_set_id and s.source_internal_id = a.dispute_id
   left join order_items oi on oi.id = a.order_item_id
   left join dispute_item_allocations reversal on reversal.id = a.reverses_allocation_id
+  left join financial_allocation_sets reversed_set
+    on reversed_set.id = s.reversal_of_set_id
   where d.id is null or dispute_payment.id is null or s.id is null or oi.id is null
      or s.source_kind <> 'dispute'
      or s.basis <> 'gross_amount'
@@ -552,6 +735,19 @@ with orphan_counts as (
        from dispute_item_allocations presentment
        where presentment.gross_allocation_set_id = s.id
      ) <> -d.amount_minor)
+     or (s.currency <> a.currency and a.effect = 'reinstatement' and (
+       reversed_set.id is null
+       or s.expected_effect_minor is distinct from -reversed_set.expected_effect_minor
+       or (
+         select coalesce(sum(reinstatement_presentment.total_effect_minor), 0)::bigint
+         from dispute_item_allocations reinstatement_presentment
+         where reinstatement_presentment.gross_allocation_set_id = s.id
+       ) is distinct from -(
+         select coalesce(sum(withdrawal_presentment.total_effect_minor), 0)::bigint
+         from dispute_item_allocations withdrawal_presentment
+         where withdrawal_presentment.gross_allocation_set_id = s.reversal_of_set_id
+       )
+     ))
      or (a.reverses_allocation_id is not null and (
        reversal.id is null
        or reversal.effect <> 'withdrawal'
@@ -684,6 +880,37 @@ with orphan_counts as (
   left join order_items oi on oi.id = i.order_item_id
   where c.id is null or oi.id is null
      or (i.source_allocation_set_id is not null and s.id is null)
+
+  union all
+  select 'refund_reporting_correction_item_semantics', count(*)::bigint
+  from refund_reporting_correction_items i
+  left join refund_reporting_correction_sets correction
+    on correction.id = i.correction_set_id
+  left join financial_allocation_sets source_set
+    on source_set.id = i.source_allocation_set_id
+  left join financial_classification_versions source_classification
+    on source_classification.subject_type = 'balance_transaction'
+   and source_classification.subject_id = source_set.balance_transaction_id
+   and source_classification.classifier_version = source_set.classifier_version
+   and source_classification.source_fingerprint_sha256 =
+     source_set.source_fingerprint_sha256
+  where not coalesce((
+    (i.domain = 'presentment'
+      and i.source_allocation_set_id is null
+      and i.component in ('refund_subtotal', 'refund_tax'))
+    or (i.domain = 'settlement'
+      and correction.id is not null
+      and source_set.source_kind = 'refund'
+      and source_set.source_internal_id = correction.refund_id
+      and source_set.scope = 'title'
+      and source_set.reversal_of_set_id is null
+      and source_classification.classification = 'refund'
+      and (
+        (source_set.basis = 'gross_amount'
+          and i.component in ('refund_subtotal', 'refund_tax'))
+        or (source_set.basis = 'fee' and i.component = 'refund_fee')
+      ))
+  ), false)
 
   union all
   select 'refund_finalization_effect_graph', count(*)::bigint

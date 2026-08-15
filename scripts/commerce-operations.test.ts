@@ -748,6 +748,10 @@ describe('commerce operations contract', () => {
       'financial_classification_decision_ambiguity',
       'financial_unknown_classification_issue',
       'financial_item_allocation_parent',
+      'financial_item_allocation_semantic_component',
+      'financial_fee_detail_semantic_classification',
+      'financial_fee_component_conservation',
+      'refund_reporting_correction_item_semantics',
       'dispute_presentment_child_cardinality',
       'pending_replay_child_count_mismatch',
       'pending_replay_child_version_mismatch',
@@ -833,6 +837,49 @@ describe('commerce operations contract', () => {
     expect(financialVerifier).toMatch(
       /financial_item_allocation_parent[\s\S]*s\.scope <> 'title'[\s\S]*i\.currency <> s\.currency[\s\S]*payment_source\.order_id[\s\S]*refund_payment\.order_id[\s\S]*dispute_payment\.order_id/u
     );
+    expect(financialVerifier).toMatch(
+      /financial_item_allocation_semantic_component[\s\S]*component_parent_classification[\s\S]*component_detail_classification/u
+    );
+    for (const componentRule of [
+      "component_parent_classification.classification = 'charge'",
+      "i.component in ('sale_subtotal', 'sale_tax')",
+      "component_parent_classification.classification in ('refund', 'refund_failure')",
+      "i.component in ('refund_subtotal', 'refund_tax')",
+      "component_parent_classification.classification = 'dispute_withdrawal'",
+      "i.component in ('dispute_subtotal', 'dispute_tax')",
+      "component_parent_classification.classification = 'dispute_reinstatement'",
+      "i.component = 'dispute_reinstatement'",
+      "component_parent_classification.classification = 'fee_credit'",
+      "i.component = 'fee_credit'",
+      'component_detail_classification.classification::text = i.component::text'
+    ]) {
+      expect(financialVerifier, componentRule).toContain(componentRule);
+    }
+    expect(financialVerifier).toMatch(
+      /component_detail_classification\.source_fingerprint_sha256\s*=\s*component_detail\.fingerprint_sha256/u
+    );
+    expect(financialVerifier).toMatch(
+      /financial_fee_detail_semantic_classification[\s\S]*fee_detail_classification\.source_fingerprint_sha256\s*=\s*fee_detail\.fingerprint_sha256[\s\S]*fee_parent_classification\.classification = 'charge'[\s\S]*fee_detail_classification\.classification in \([\s\S]*'processing_fee'[\s\S]*fee_parent_classification\.classification in \('refund', 'refund_failure'\)[\s\S]*'refund_fee'[\s\S]*fee_parent_classification\.classification in \([\s\S]*'dispute_withdrawal', 'dispute_reinstatement'[\s\S]*'dispute_fee'/u
+    );
+    expect(financialVerifier).toMatch(
+      /financial_fee_detail_semantic_classification[\s\S]*fee_set\.scope = 'title'[\s\S]*fee_set\.scope = 'unresolved'[\s\S]*fee_set\.source_kind = 'refund'[\s\S]*fee_parent_classification\.classification = 'refund'/u
+    );
+    expect(financialVerifier).toMatch(
+      /fee_set\.scope = 'unresolved'\s+and fee_set\.source_kind = 'refund'\)\s+\)\s+and not coalesce\(\([\s\S]*fee_set\.source_kind = 'refund'[\s\S]*fee_set\.scope = 'title'[\s\S]*fee_parent_classification\.classification in \('refund', 'refund_failure'\)[\s\S]*fee_set\.scope = 'unresolved'[\s\S]*fee_parent_classification\.classification = 'refund'/u
+    );
+    for (const feeComponentRule of [
+      "'financial_fee_component_conservation'",
+      '-sum(detail.amount_minor)::bigint as expected_component_minor',
+      'sum(item.effect_minor)::bigint as actual_component_minor',
+      'detail_classification.source_fingerprint_sha256 = detail.fingerprint_sha256',
+      'coalesce(actual.actual_component_minor, 0) is distinct from',
+      'coalesce(expected.expected_component_minor, 0)'
+    ]) {
+      expect(financialVerifier, feeComponentRule).toContain(feeComponentRule);
+    }
+    expect(financialVerifier).toMatch(
+      /refund_reporting_correction_item_semantics[\s\S]*i\.domain = 'presentment'[\s\S]*i\.component in \('refund_subtotal', 'refund_tax'\)[\s\S]*source_set\.source_kind = 'refund'[\s\S]*source_set\.scope = 'title'[\s\S]*source_classification\.classification = 'refund'[\s\S]*source_set\.basis = 'gross_amount'[\s\S]*source_set\.basis = 'fee'/u
+    );
     for (const providerSourceRule of [
       "s.source_fingerprint_sha256 is distinct from source_bt.fingerprint_sha256",
       "payment_source.stripe_latest_charge_id is null",
@@ -881,6 +928,12 @@ describe('commerce operations contract', () => {
     );
     expect(financialVerifier).toMatch(
       /s\.currency <> a\.currency[\s\S]*?a\.effect = 'withdrawal'[\s\S]*?sum\(presentment\.total_effect_minor\)[\s\S]*?<> -d\.amount_minor/u
+    );
+    expect(financialVerifier).toContain(
+      's.expected_effect_minor is distinct from -reversed_set.expected_effect_minor'
+    );
+    expect(financialVerifier).toMatch(
+      /a\.effect = 'reinstatement'[\s\S]*sum\(reinstatement_presentment\.total_effect_minor\)[\s\S]*sum\(withdrawal_presentment\.total_effect_minor\)/u
     );
     expect(financialVerifier).toContain(
       'a.subtotal_effect_minor > -reversal.subtotal_effect_minor'
