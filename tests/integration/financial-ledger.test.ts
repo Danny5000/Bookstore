@@ -453,6 +453,104 @@ describe('financial balance-transaction ledger', () => {
     )).rejects.toMatchObject({ code: '55000' });
   });
 
+  it('requires a persisted administrator role for direct user resolution and audits a valid admin', async () => {
+    async function createUser(role: 'customer' | 'admin' | null): Promise<string> {
+      const id = randomUUID();
+      await databaseClient.pool.query(
+        `insert into "user" (id, name, email, email_verified)
+         values ($1, $2, $3, true)`,
+        [id, `Financial ${role ?? 'Roleless'}`, `financial-${id}@example.com`]
+      );
+      if (role) {
+        await databaseClient.pool.query(
+          `insert into user_roles (user_id, role) values ($1, $2)`,
+          [id, role]
+        );
+      }
+      return id;
+    }
+
+    async function openIssue(label: string): Promise<{ issueId: string; resourceId: string }> {
+      const resourceId = randomUUID();
+      await databaseClient.db.transaction((tx) => observeFinancialIssue(tx, {
+        resourceType: 'financial_scan_run', resourceId, safeCode: 'missing_source',
+        impact: 'pending', actor: systemActor(), correlationId: `${label}-open`
+      }));
+      const [issue] = await databaseClient.db.select().from(financialReconciliationIssues)
+        .where(eq(financialReconciliationIssues.resourceId, resourceId));
+      return { issueId: issue!.id, resourceId };
+    }
+
+    async function rejectedUserResolution(
+      issueId: string,
+      userId: string,
+      correlationId: string
+    ): Promise<unknown> {
+      const client = await databaseClient.pool.connect();
+      try {
+        await client.query('begin');
+        let error: unknown;
+        try {
+          await client.query(
+            `select * from "public"."resolve_financial_reconciliation_issue"($1, $2, $3, $4, $5)`,
+            [issueId, userId, 'user', userId, correlationId]
+          );
+        } catch (candidate) {
+          error = candidate;
+        }
+        await client.query('rollback');
+        return error;
+      } finally {
+        client.release();
+      }
+    }
+
+    const customerId = await createUser('customer');
+    const rolelessId = await createUser(null);
+    const adminId = await createUser('admin');
+    const customerIssue = await openIssue('ledger-customer-resolver');
+    const rolelessIssue = await openIssue('ledger-roleless-resolver');
+    const adminIssue = await openIssue('ledger-admin-resolver');
+
+    expect(await rejectedUserResolution(
+      customerIssue.issueId, customerId, 'ledger-customer-resolver'
+    )).toMatchObject({ code: '22023' });
+    expect(await rejectedUserResolution(
+      rolelessIssue.issueId, rolelessId, 'ledger-roleless-resolver'
+    )).toMatchObject({ code: '22023' });
+
+    const resolved = await databaseClient.pool.query<{
+      id: string;
+      state: string;
+      resolved_by_admin_id: string | null;
+    }>(
+      `select * from "public"."resolve_financial_reconciliation_issue"($1, $2, $3, $4, $5)`,
+      [adminIssue.issueId, adminId, 'user', adminId, 'ledger-admin-resolver']
+    );
+    expect(resolved.rows).toEqual([
+      expect.objectContaining({
+        id: adminIssue.issueId, state: 'resolved', resolved_by_admin_id: adminId
+      })
+    ]);
+    expect(await databaseClient.db.select().from(financialReconciliationIssues)
+      .where(eq(financialReconciliationIssues.id, customerIssue.issueId)))
+      .toEqual([expect.objectContaining({ state: 'open', resolvedAt: null })]);
+    expect(await databaseClient.db.select().from(financialReconciliationIssues)
+      .where(eq(financialReconciliationIssues.id, rolelessIssue.issueId)))
+      .toEqual([expect.objectContaining({ state: 'open', resolvedAt: null })]);
+    expect(await databaseClient.db.select().from(auditEvents)
+      .where(eq(auditEvents.action, 'financial.issue.resolved'))).toEqual([
+      expect.objectContaining({
+        actorType: 'user', actorId: adminId, resourceType: 'financial_issue',
+        resourceId: adminIssue.issueId, correlationId: 'ledger-admin-resolver',
+        after: {
+          resourceType: 'financial_scan_run', resourceId: adminIssue.resourceId,
+          safeCode: 'missing_source', impact: 'pending', state: 'resolved', occurrenceCount: 1
+        }
+      })
+    ]);
+  });
+
   it('does not prime resolution authorization for an absent or immutable issue', async () => {
     const unknown = snapshot({
       sourceFamily: 'unknown', sourceId: null, rawType: 'future_authorization_probe',

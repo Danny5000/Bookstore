@@ -102,6 +102,7 @@ function assertResolveInput(value: unknown): asserts value is ResolveFinancialIs
   assertIdentity({ resourceType: value.resourceType, resourceId: value.resourceId, safeCode: value.safeCode });
   if (!validText(value.correlationId, 100)) unsupportedEvidence();
   assertActor(value.actor);
+  if (value.actor.type === 'user' && !value.actor.roles.includes('admin')) unsupportedEvidence();
   if (!hasExactKeys(value.proof, ['status', 'resourceType', 'resourceId', 'safeCode']) ||
     (value.proof.status !== 'resolved' && value.proof.status !== 'still_open')) unsupportedEvidence();
   assertIdentity({ resourceType: value.proof.resourceType, resourceId: value.proof.resourceId, safeCode: value.proof.safeCode });

@@ -1836,7 +1836,12 @@ BEGIN
     p_actor_id IS NULL OR char_length(p_actor_id) NOT BETWEEN 1 AND 100 OR
     p_correlation_id IS NULL OR char_length(p_correlation_id) NOT BETWEEN 1 AND 100 OR
     (p_actor_type = 'user' AND (
-      p_resolved_by_admin_id IS NULL OR p_actor_id IS DISTINCT FROM p_resolved_by_admin_id::text
+      p_resolved_by_admin_id IS NULL OR p_actor_id IS DISTINCT FROM p_resolved_by_admin_id::text OR
+      NOT EXISTS (
+        SELECT 1 FROM "public"."user_roles" resolver_role
+        WHERE resolver_role.user_id = p_resolved_by_admin_id
+          AND resolver_role.role = 'admin'
+      )
     )) OR
     (p_actor_type = 'system' AND p_resolved_by_admin_id IS NOT NULL) THEN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'invalid financial issue resolver actor';

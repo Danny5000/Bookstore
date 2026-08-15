@@ -291,6 +291,8 @@ describe('Plan 6B financial schema preservation', () => {
       /p_issue_id uuid,\s+p_resolved_by_admin_id uuid,\s+p_actor_type "public"\."audit_actor_type",\s+p_actor_id text,\s+p_correlation_id text/iu
     );
     expect(resolver).toContain('FROM "public"."financial_reconciliation_issues" issue');
+    expect(resolver).toContain('FROM "public"."user_roles" resolver_role');
+    expect(resolver).toContain("resolver_role.role = 'admin'");
     expect(resolver).toContain('UPDATE "public"."financial_reconciliation_issues"');
     expect(resolver).toContain('INSERT INTO "public"."audit_events"');
     expect(resolver).toContain("char_length(p_actor_id) NOT BETWEEN 1 AND 100");

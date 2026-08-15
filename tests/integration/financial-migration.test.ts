@@ -204,6 +204,10 @@ async function insertUserAndTitles(client: PoolClient, count: number): Promise<{
      values ($1, 'Legacy Financial User', $2, true)`,
     [userId, `legacy-${userId}@example.com`]
   );
+  await client.query(
+    `insert into user_roles (user_id, role) values ($1, 'admin')`,
+    [userId]
+  );
   const titleIds: string[] = [];
   for (let index = 0; index < count; index += 1) {
     const id = randomUUID();

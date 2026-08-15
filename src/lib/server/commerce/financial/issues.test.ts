@@ -155,6 +155,17 @@ describe('financial issue lifecycle', () => {
     expect(invalid.calls).toHaveLength(0);
   });
 
+  it.each([
+    { label: 'customer-only', roles: ['customer'] },
+    { label: 'roleless', roles: [] }
+  ])('rejects a $label user resolver before querying', async ({ roles }) => {
+    const database = executor([]);
+    await expect(resolveFinancialIssueAfterRecompute(database.tx, resolve('resolved', {
+      actor: { type: 'user', id: USER_ID, roles }
+    }))).rejects.toMatchObject({ safeCode: 'unsupported_provider_evidence' });
+    expect(database.calls).toHaveLength(0);
+  });
+
   it('does not resolve the immutable fact that a classification row was unsupported', async () => {
     const database = executor([]);
     await expect(resolveFinancialIssueAfterRecompute(database.tx, resolve('resolved', {
