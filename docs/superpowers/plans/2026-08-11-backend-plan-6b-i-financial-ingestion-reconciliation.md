@@ -1632,7 +1632,7 @@ Use the fixture gateway and real worker/job repository to exercise complete loca
 - partial/full/cumulative/failed refunds, ambiguous multi-title pending review, and reversal;
 - open/won/lost dispute with withdrawal, fee, partial/full reinstatement;
 - duplicate/out-of-order webhook and scan delivery;
-- immutable collision and unknown classifier -> exception, then supported classifier replay -> resolved/new tip;
+- immutable collision -> exception; unknown classifier -> immutable row-scoped issue, then supported classifier replay -> historical issue remains open / supported row becomes active / new tip;
 - crash after provider stage, scan page, payout page, and payout publication handoff;
 - audit-write failure rolls back the financial mutation that requires that audit;
 - exact conservation for every allocation set and provider net equation.
