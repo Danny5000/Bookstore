@@ -339,6 +339,14 @@ describe('financial reconciliation operations guide', () => {
           'adjustment', null, 'adjustment', 'other_adjustment', 'adjustment',
           100, 0, 100, 'USD', 'available', now(), now(), ${'e'.repeat(64)})
     `);
+    await databaseClient.db.execute(sql`
+      insert into financial_classification_versions (
+        subject_type, subject_id, classifier_version, classification,
+        source_fingerprint_sha256
+      ) values (
+        'balance_transaction', ${balanceTransactionId}, 1, 'other', ${fingerprint}
+      )
+    `);
     await databaseClient.db.execute(sql.raw(
       'alter table financial_allocation_sets disable trigger ' +
       'financial_allocation_sets_supersession_lineage_check'
@@ -391,6 +399,14 @@ describe('financial reconciliation operations guide', () => {
         100, 0, 100, 'USD', 'available', now(), now(), ${fingerprint})
     `);
     await databaseClient.db.execute(sql`
+      insert into financial_classification_versions (
+        subject_type, subject_id, classifier_version, classification,
+        source_fingerprint_sha256
+      ) values (
+        'balance_transaction', ${balanceTransactionId}, 1, 'other', ${fingerprint}
+      )
+    `);
+    await databaseClient.db.execute(sql`
       insert into orders (
         id, status, currency, subtotal_minor, client_checkout_attempt_id,
         quote_fingerprint_sha256, status_token_sha256
@@ -420,7 +436,7 @@ describe('financial reconciliation operations guide', () => {
             'gross_amount', 'account', 100, 'USD', 1, 1, ${fingerprint}, null),
           (${randomUUID()}, ${`payment:${paymentId}:missing-class-successor`},
             ${balanceTransactionId}, 'payment', ${paymentId},
-            'gross_amount', 'title', 100, 'USD', 1, 1, ${fingerprint}, ${predecessorId})
+            'gross_amount', 'title', 100, 'USD', 1, 2, ${fingerprint}, ${predecessorId})
       `);
     } finally {
       await databaseClient.db.execute(sql.raw(
