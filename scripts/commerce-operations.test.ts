@@ -747,11 +747,13 @@ describe('commerce operations contract', () => {
       'financial_projection_tip_ambiguity',
       'financial_classification_decision_ambiguity',
       'financial_unknown_classification_issue',
+      'allocation_set_detail_classification',
       'financial_item_allocation_parent',
       'financial_item_allocation_semantic_component',
       'financial_fee_detail_semantic_classification',
       'financial_fee_component_conservation',
       'refund_reporting_correction_item_semantics',
+      'refund_reporting_correction_history_semantics',
       'dispute_presentment_child_cardinality',
       'pending_replay_child_count_mismatch',
       'pending_replay_child_version_mismatch',
@@ -835,6 +837,15 @@ describe('commerce operations contract', () => {
     );
     expect(financialVerifier).toContain("'allocation_set_parent_or_chain'");
     expect(financialVerifier).toMatch(
+      /classification_subject[\s\S]*c\.source_fingerprint_sha256 is distinct from bt\.fingerprint_sha256[\s\S]*c\.source_fingerprint_sha256 is distinct from fd\.fingerprint_sha256[\s\S]*fee_parent_classification\.id is null/u
+    );
+    expect(financialVerifier).toMatch(
+      /allocation_set_parent_or_chain[\s\S]*parent_classification\.id is null[\s\S]*parent_classification\.classification = 'unknown'/u
+    );
+    expect(financialVerifier).toMatch(
+      /allocation_set_detail_classification[\s\S]*stripe_balance_transaction_fee_details allocation_detail[\s\S]*allocation_detail_classification\.classifier_version = s\.classifier_version[\s\S]*allocation_detail_classification\.source_fingerprint_sha256 =\s*allocation_detail\.fingerprint_sha256[\s\S]*allocation_detail_classification\.id is null[\s\S]*allocation_detail_classification\.classification = 'unknown'/u
+    );
+    expect(financialVerifier).toMatch(
       /financial_item_allocation_parent[\s\S]*s\.scope <> 'title'[\s\S]*i\.currency <> s\.currency[\s\S]*payment_source\.order_id[\s\S]*refund_payment\.order_id[\s\S]*dispute_payment\.order_id/u
     );
     expect(financialVerifier).toMatch(
@@ -880,6 +891,22 @@ describe('commerce operations contract', () => {
     expect(financialVerifier).toMatch(
       /refund_reporting_correction_item_semantics[\s\S]*i\.domain = 'presentment'[\s\S]*i\.component in \('refund_subtotal', 'refund_tax'\)[\s\S]*source_set\.source_kind = 'refund'[\s\S]*source_set\.scope = 'title'[\s\S]*source_classification\.classification = 'refund'[\s\S]*source_set\.basis = 'gross_amount'[\s\S]*source_set\.basis = 'fee'/u
     );
+    expect(financialVerifier).toMatch(
+      /refund_reporting_correction_history_semantics[\s\S]*approved_absolute_minor::bigint[\s\S]*base_item\.effect_minor[\s\S]*delta_minor::bigint[\s\S]*missing_settlement_base[\s\S]*missing_presentment_base[\s\S]*capacity_minor/u
+    );
+    const correctionHistorySql = financialVerifier.match(
+      /select 'refund_reporting_correction_history_semantics'[\s\S]*?(?=\s+union all\s+select 'refund_finalization_effect_graph')/u
+    )?.[0];
+    expect(correctionHistorySql).toBeDefined();
+    for (const forbiddenHistoryFilter of [
+      'financial_projection_versions',
+      'current_financial_projection_heads',
+      'eligible_allocation_sets',
+      'predecessor_correction_set_id',
+      'supersedes_set_id'
+    ]) {
+      expect(correctionHistorySql, forbiddenHistoryFilter).not.toContain(forbiddenHistoryFilter);
+    }
     for (const providerSourceRule of [
       "s.source_fingerprint_sha256 is distinct from source_bt.fingerprint_sha256",
       "payment_source.stripe_latest_charge_id is null",
@@ -898,6 +925,19 @@ describe('commerce operations contract', () => {
     expect(financialVerifier).toMatch(
       /s\.source_kind = 'payout'[\s\S]*?source_bt\.source_family is distinct from 'payout'[\s\S]*?source_bt\.source_id is distinct from payout_source\.provider_id[\s\S]*?s\.scope <> 'account'/u
     );
+    expect(financialVerifier).toMatch(
+      /allocation_set_semantic_source[\s\S]*source_bt\.exchange_rate[\s\S]*source_bt\.exchange_source_currency[\s\S]*source_bt\.exchange_target_currency[\s\S]*payment_source\.currency[\s\S]*refund_source\.currency[\s\S]*dispute_source\.currency/u
+    );
+    expect(financialVerifier).toMatch(
+      /source_classification\.classification = 'fee_credit'\s+and source_bt\.reporting_category = 'fee'\s+and source_bt\.raw_type in \('stripe_fee', 'stripe_fx_fee'\)\s+and source_bt\.amount_minor > 0\s+and \([\s\S]*source_bt\.exchange_rate is null[\s\S]*source_bt\.exchange_source_currency = dispute_source\.currency[\s\S]*source_bt\.exchange_target_currency = source_bt\.currency/u
+    );
+    for (const feeCreditEvidenceRule of [
+      "source_bt.reporting_category = 'fee'",
+      "source_bt.raw_type in ('stripe_fee', 'stripe_fx_fee')",
+      'source_bt.amount_minor > 0'
+    ]) {
+      expect(financialVerifier, feeCreditEvidenceRule).toContain(feeCreditEvidenceRule);
+    }
     expect(financialVerifier).toMatch(
       /s\.source_kind = 'adjustment'[\s\S]*?s\.source_internal_id <> s\.balance_transaction_id[\s\S]*?s\.scope <> 'account'/u
     );

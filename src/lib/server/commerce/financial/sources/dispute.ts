@@ -333,6 +333,25 @@ function assertDisputeBalance(dispute: DisputeSnapshot, balance: BalanceTransact
   ) {
     throw new PermanentFinancialError('source_linkage_mismatch');
   }
+  const sourceCurrency = dispute.currency.toUpperCase();
+  const hasExchangeEvidence = balance.exchangeRate !== null ||
+    balance.exchangeSourceCurrency !== null || balance.exchangeTargetCurrency !== null;
+  if (hasExchangeEvidence) {
+    if (
+      balance.exchangeRate === null ||
+      balance.exchangeSourceCurrency !== sourceCurrency ||
+      balance.exchangeTargetCurrency !== balance.currency ||
+      sourceCurrency === balance.currency
+    ) {
+      throw new PermanentFinancialError('currency_mismatch');
+    }
+    return;
+  }
+  const settlementOnlyFeeCredit = balance.reportingCategory === 'fee' &&
+    ['stripe_fee', 'stripe_fx_fee'].includes(balance.rawType) && balance.amountMinor > 0;
+  if (!settlementOnlyFeeCredit && sourceCurrency !== balance.currency) {
+    throw new PermanentFinancialError('currency_mismatch');
+  }
 }
 
 async function recordLockedIssue(

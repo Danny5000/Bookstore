@@ -255,8 +255,23 @@ with orphan_counts as (
     on c.subject_type = 'balance_transaction' and bt.id = c.subject_id
   left join stripe_balance_transaction_fee_details fd
     on c.subject_type = 'fee_detail' and fd.id = c.subject_id
-  where (c.subject_type = 'balance_transaction' and bt.id is null)
-     or (c.subject_type = 'fee_detail' and fd.id is null)
+  left join stripe_balance_transactions fee_parent_bt
+    on fee_parent_bt.id = fd.balance_transaction_id
+  left join financial_classification_versions fee_parent_classification
+    on fee_parent_classification.subject_type = 'balance_transaction'
+   and fee_parent_classification.subject_id = fd.balance_transaction_id
+   and fee_parent_classification.classifier_version = c.classifier_version
+   and fee_parent_classification.source_fingerprint_sha256 =
+     fee_parent_bt.fingerprint_sha256
+  where (c.subject_type = 'balance_transaction' and (
+       bt.id is null
+       or c.source_fingerprint_sha256 is distinct from bt.fingerprint_sha256
+     ))
+     or (c.subject_type = 'fee_detail' and (
+       fd.id is null
+       or c.source_fingerprint_sha256 is distinct from fd.fingerprint_sha256
+       or fee_parent_classification.id is null
+     ))
 
   union all
   select 'payout_linked_balance_transaction', count(*)::bigint
@@ -300,6 +315,8 @@ with orphan_counts as (
     and parent_classification.classifier_version = s.classifier_version
     and parent_classification.source_fingerprint_sha256 = s.source_fingerprint_sha256
   where bt.id is null
+     or parent_classification.id is null
+     or parent_classification.classification = 'unknown'
      or (s.supersedes_set_id is not null and predecessor.id is null)
      or (s.reversal_of_set_id is not null and reversal.id is null)
      or (s.reversal_of_set_id is not null and (
@@ -370,7 +387,26 @@ with orphan_counts as (
            )
          )
        ), false)
-     ))
+      ))
+
+  union all
+  select 'allocation_set_detail_classification', count(*)::bigint
+  from financial_allocation_sets s
+  where exists (
+    select 1
+    from stripe_balance_transaction_fee_details allocation_detail
+    left join financial_classification_versions allocation_detail_classification
+      on allocation_detail_classification.subject_type = 'fee_detail'
+     and allocation_detail_classification.subject_id = allocation_detail.id
+     and allocation_detail_classification.classifier_version = s.classifier_version
+     and allocation_detail_classification.source_fingerprint_sha256 =
+       allocation_detail.fingerprint_sha256
+    where allocation_detail.balance_transaction_id = s.balance_transaction_id
+      and (
+        allocation_detail_classification.id is null
+        or allocation_detail_classification.classification = 'unknown'
+      )
+  )
 
   union all
   select 'allocation_set_semantic_source', count(*)::bigint
@@ -382,6 +418,12 @@ with orphan_counts as (
     on s.source_kind = 'refund' and refund_source.id = s.source_internal_id
   left join disputes dispute_source
     on s.source_kind = 'dispute' and dispute_source.id = s.source_internal_id
+  left join financial_classification_versions source_classification
+    on source_classification.subject_type = 'balance_transaction'
+   and source_classification.subject_id = s.balance_transaction_id
+   and source_classification.classifier_version = s.classifier_version
+   and source_classification.source_fingerprint_sha256 =
+     s.source_fingerprint_sha256
   left join stripe_payouts payout_source
     on s.source_kind = 'payout' and payout_source.id = s.source_internal_id
   left join stripe_balance_transactions adjustment_source
@@ -393,16 +435,65 @@ with orphan_counts as (
        or payment_source.stripe_latest_charge_id is null
        or source_bt.source_family is distinct from 'charge'
        or source_bt.source_id is distinct from payment_source.stripe_latest_charge_id
+       or source_classification.classification is distinct from 'charge'
+       or not coalesce((
+         (payment_source.currency = source_bt.currency
+           and source_bt.exchange_rate is null
+           and source_bt.exchange_source_currency is null
+           and source_bt.exchange_target_currency is null)
+         or (payment_source.currency <> source_bt.currency
+           and source_bt.exchange_rate is not null
+           and source_bt.exchange_source_currency = payment_source.currency
+           and source_bt.exchange_target_currency = source_bt.currency)
+       ), false)
      ))
      or (s.source_kind = 'refund' and (
        refund_source.id is null
        or source_bt.source_family is distinct from 'refund'
        or source_bt.source_id is distinct from refund_source.stripe_refund_id
+       or source_classification.classification not in ('refund', 'refund_failure')
+       or not coalesce((
+         (refund_source.currency = source_bt.currency
+           and source_bt.exchange_rate is null
+           and source_bt.exchange_source_currency is null
+           and source_bt.exchange_target_currency is null)
+         or (refund_source.currency <> source_bt.currency
+           and source_bt.exchange_rate is not null
+           and source_bt.exchange_source_currency = refund_source.currency
+           and source_bt.exchange_target_currency = source_bt.currency)
+       ), false)
      ))
      or (s.source_kind = 'dispute' and (
        dispute_source.id is null
        or source_bt.source_family is distinct from 'dispute'
        or source_bt.source_id is distinct from dispute_source.stripe_dispute_id
+       or not coalesce((
+         (source_classification.classification in (
+           'dispute_withdrawal', 'dispute_reinstatement'
+         ) and (
+           (dispute_source.currency = source_bt.currency
+             and source_bt.exchange_rate is null
+             and source_bt.exchange_source_currency is null
+             and source_bt.exchange_target_currency is null)
+           or (dispute_source.currency <> source_bt.currency
+             and source_bt.exchange_rate is not null
+             and source_bt.exchange_source_currency = dispute_source.currency
+             and source_bt.exchange_target_currency = source_bt.currency)
+          ))
+          or (source_classification.classification = 'fee_credit'
+            and source_bt.reporting_category = 'fee'
+            and source_bt.raw_type in ('stripe_fee', 'stripe_fx_fee')
+            and source_bt.amount_minor > 0
+            and (
+              (source_bt.exchange_rate is null
+                and source_bt.exchange_source_currency is null
+                and source_bt.exchange_target_currency is null)
+              or (dispute_source.currency <> source_bt.currency
+                and source_bt.exchange_rate is not null
+                and source_bt.exchange_source_currency = dispute_source.currency
+                and source_bt.exchange_target_currency = source_bt.currency)
+          ))
+       ), false)
      ))
      or (s.source_kind = 'payout' and (
        payout_source.id is null
@@ -911,6 +1002,166 @@ with orphan_counts as (
         or (source_set.basis = 'fee' and i.component = 'refund_fee')
       ))
   ), false)
+
+  union all
+  select 'refund_reporting_correction_history_semantics', count(*)::bigint
+  from (
+    select correction.id,
+      case when
+        exists (
+          select 1
+          from refund_reporting_correction_items correction_item
+          where correction_item.correction_set_id = correction.id
+        )
+        and correction_refund.status = 'succeeded'
+        and correction_refund.currency = correction_payment.currency
+        and anchor.id is not null
+        and anchor.source_kind = 'refund'
+        and anchor.source_internal_id = correction.refund_id
+        and anchor.source_fingerprint_sha256 = correction.source_fingerprint_sha256
+      then 0 else 1 end::bigint as invalid_context,
+      (
+        select count(*)
+        from refund_reporting_correction_items correction_item
+        left join order_items correction_order_item
+          on correction_order_item.id = correction_item.order_item_id
+        where correction_item.correction_set_id = correction.id
+          and (
+            correction_order_item.id is null
+            or correction_order_item.order_id <> correction_payment.order_id
+            or (correction_item.domain = 'presentment' and (
+              correction_item.currency <> correction_refund.currency
+              or correction_order_item.currency <> correction_item.currency
+            ))
+          )
+      )::bigint as invalid_item_owner,
+      (
+        select count(*)
+        from refund_reporting_correction_items correction_item
+        left join financial_allocation_sets item_source
+          on item_source.id = correction_item.source_allocation_set_id
+        where correction_item.correction_set_id = correction.id
+          and correction_item.domain = 'settlement'
+          and (
+            item_source.id is null
+            or item_source.source_kind <> 'refund'
+            or item_source.source_internal_id <> correction.refund_id
+            or item_source.source_fingerprint_sha256 <>
+              correction.source_fingerprint_sha256
+            or correction_item.currency <> item_source.currency
+          )
+      )::bigint as invalid_settlement_source,
+      (
+        select count(*)
+        from refund_reporting_correction_items correction_item
+        left join financial_item_allocations base_item
+          on base_item.allocation_set_id = correction_item.source_allocation_set_id
+         and base_item.order_item_id = correction_item.order_item_id
+         and base_item.component = correction_item.component
+        where correction_item.correction_set_id = correction.id
+          and correction_item.domain = 'settlement'
+          and (
+            correction_item.approved_absolute_minor::bigint <>
+              coalesce(base_item.effect_minor, 0)::bigint +
+                correction_item.delta_minor::bigint
+            or (base_item.id is not null
+              and base_item.currency <> correction_item.currency)
+          )
+      )::bigint as invalid_settlement_arithmetic,
+      (
+        select count(*)
+        from financial_item_allocations base_item
+        where base_item.effect_minor <> 0
+          and exists (
+            select 1
+            from refund_reporting_correction_items source_item
+            where source_item.correction_set_id = correction.id
+              and source_item.domain = 'settlement'
+              and source_item.source_allocation_set_id = base_item.allocation_set_id
+          )
+          and not exists (
+            select 1
+            from refund_reporting_correction_items correction_item
+            where correction_item.correction_set_id = correction.id
+              and correction_item.domain = 'settlement'
+              and correction_item.source_allocation_set_id = base_item.allocation_set_id
+              and correction_item.order_item_id = base_item.order_item_id
+              and correction_item.component = base_item.component
+              and correction_item.currency = base_item.currency
+          )
+      )::bigint as missing_settlement_base,
+      (
+        select count(*)
+        from refund_allocation_components base_component
+        cross join lateral (values
+          ('refund_subtotal'::financial_component, base_component.subtotal_minor),
+          ('refund_tax'::financial_component, base_component.tax_minor)
+        ) base_value(component, amount_minor)
+        where base_component.refund_id = correction.refund_id
+          and base_value.amount_minor <> 0
+          and exists (
+            select 1
+            from refund_reporting_correction_items presentment_item
+            where presentment_item.correction_set_id = correction.id
+              and presentment_item.domain = 'presentment'
+          )
+          and not exists (
+            select 1
+            from refund_reporting_correction_items correction_item
+            where correction_item.correction_set_id = correction.id
+              and correction_item.domain = 'presentment'
+              and correction_item.order_item_id = base_component.order_item_id
+              and correction_item.component = base_value.component
+              and correction_item.currency = base_component.currency
+          )
+      )::bigint as missing_presentment_base,
+      (
+        select count(*)
+        from (
+          select correction_item.approved_absolute_minor,
+            correction_item.delta_minor,
+            correction_item.currency,
+            base_component.currency as base_currency,
+            case correction_item.component
+              when 'refund_subtotal' then coalesce(base_component.subtotal_minor, 0)
+              when 'refund_tax' then coalesce(base_component.tax_minor, 0)
+              else 0
+            end::bigint as base_minor,
+            case correction_item.component
+              when 'refund_subtotal' then correction_order_item.unit_subtotal_minor
+              when 'refund_tax' then coalesce(correction_order_item.tax_minor, 0)
+              else 0
+            end::bigint as capacity_minor
+          from refund_reporting_correction_items correction_item
+          left join refund_allocation_components base_component
+            on base_component.refund_id = correction.refund_id
+           and base_component.order_item_id = correction_item.order_item_id
+          left join order_items correction_order_item
+            on correction_order_item.id = correction_item.order_item_id
+          where correction_item.correction_set_id = correction.id
+            and correction_item.domain = 'presentment'
+        ) presentment
+        where presentment.approved_absolute_minor < 0
+           or presentment.approved_absolute_minor::bigint <>
+             presentment.base_minor + presentment.delta_minor::bigint
+           or (presentment.base_currency is not null
+             and presentment.base_currency <> presentment.currency)
+           or presentment.approved_absolute_minor::bigint > presentment.capacity_minor
+      )::bigint as invalid_presentment_arithmetic
+    from refund_reporting_correction_sets correction
+    left join refunds correction_refund on correction_refund.id = correction.refund_id
+    left join payments correction_payment
+      on correction_payment.id = correction_refund.payment_id
+    left join financial_allocation_sets anchor
+      on anchor.id = correction.base_allocation_set_id
+  ) correction_history
+  where correction_history.invalid_context
+      + correction_history.invalid_item_owner
+      + correction_history.invalid_settlement_source
+      + correction_history.invalid_settlement_arithmetic
+      + correction_history.missing_settlement_base
+      + correction_history.missing_presentment_base
+      + correction_history.invalid_presentment_arithmetic <> 0
 
   union all
   select 'refund_finalization_effect_graph', count(*)::bigint

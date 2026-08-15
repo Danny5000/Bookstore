@@ -789,6 +789,21 @@ function assertRefundBalanceLinkage(
     balance.reportingCategory !== expectedClassification) {
     throw new PermanentFinancialError('source_linkage_mismatch');
   }
+  const sourceCurrency = refund.currency.toUpperCase();
+  const hasExchangeEvidence = balance.exchangeRate !== null ||
+    balance.exchangeSourceCurrency !== null || balance.exchangeTargetCurrency !== null;
+  if (hasExchangeEvidence) {
+    if (
+      balance.exchangeRate === null ||
+      balance.exchangeSourceCurrency !== sourceCurrency ||
+      balance.exchangeTargetCurrency !== balance.currency ||
+      sourceCurrency === balance.currency
+    ) {
+      throw new PermanentFinancialError('currency_mismatch');
+    }
+  } else if (sourceCurrency !== balance.currency) {
+    throw new PermanentFinancialError('currency_mismatch');
+  }
 }
 
 async function loadRefundRouting(database: Database, refundId: string): Promise<RefundRouting> {

@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { PgDialect } from 'drizzle-orm/pg-core';
-import type { StripeCommerceGateway } from '$lib/server/commerce/stripe/types';
+import type {
+  BalanceTransactionSnapshot,
+  StripeCommerceGateway
+} from '$lib/server/commerce/stripe/types';
 import type { Database } from '$lib/server/db/client';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
 import { lockOrder } from '$lib/server/commerce/lock';
@@ -304,6 +307,73 @@ function gateway(trace: string[]): StripeCommerceGateway {
   } as unknown as StripeCommerceGateway;
 }
 
+type RefundFxBalance = Pick<
+  BalanceTransactionSnapshot,
+  'currency' | 'exchangeRate' | 'exchangeSourceCurrency' | 'exchangeTargetCurrency'
+>;
+
+const USD_WITHOUT_EXCHANGE: RefundFxBalance = {
+  currency: 'USD', exchangeRate: null,
+  exchangeSourceCurrency: null, exchangeTargetCurrency: null
+};
+const EUR_TO_USD: RefundFxBalance = {
+  currency: 'USD', exchangeRate: '1.250000000000000000',
+  exchangeSourceCurrency: 'EUR', exchangeTargetCurrency: 'USD'
+};
+
+function refundFxGateway(
+  trace: string[],
+  sourceCurrency: string,
+  primary: RefundFxBalance,
+  failure: RefundFxBalance
+): StripeCommerceGateway {
+  const provider = gateway(trace);
+  vi.mocked(provider.retrieveRefund).mockImplementation(async () => {
+    trace.push('provider.refund');
+    return {
+      providerRefundId: 're_refund_trace', paymentIntentId: 'pi_refund_trace',
+      liveMode: false, state: 'failed', amountMinor: 100,
+      currency: sourceCurrency.toLowerCase(), reason: null, providerCreatedAt: createdAt,
+      balanceTransactionId: 'txn_refund_trace',
+      failureBalanceTransactionId: 'txn_refund_failure_trace'
+    };
+  });
+  vi.mocked(provider.retrievePayment).mockImplementation(async () => {
+    trace.push('provider.payment');
+    return {
+      paymentIntentId: 'pi_refund_trace', metadataVersion: '1', metadataOrderId: orderId,
+      latestChargeId: 'ch_refund_trace', liveMode: false, state: 'succeeded', amountMinor: 1000,
+      currency: sourceCurrency.toLowerCase(), paidAt: createdAt, paymentMethodCategory: 'card'
+    };
+  });
+  vi.mocked(provider.retrieveCharge).mockImplementation(async () => {
+    trace.push('provider.charge');
+    return {
+      id: 'ch_refund_trace', paymentIntentId: 'pi_refund_trace', livemode: false,
+      amountMinor: 1000, amountRefundedMinor: 100, currency: sourceCurrency.toUpperCase(),
+      status: 'succeeded', balanceTransactionId: 'txn_charge_trace', createdAt
+    };
+  });
+  vi.mocked(provider.retrieveBalanceTransaction).mockImplementation(async (id) => {
+    trace.push(`provider.balance.${id}`);
+    const isFailure = id === 'txn_refund_failure_trace';
+    const evidence = isFailure ? failure : primary;
+    const amountMinor = isFailure ? 100 : -100;
+    return {
+      id, livemode: false, sourceId: 're_refund_trace', sourceFamily: 'refund',
+      rawType: isFailure ? 'refund_failure' : 'refund',
+      reportingCategory: isFailure ? 'refund_failure' : 'refund',
+      amountMinor, feeMinor: 0, netMinor: amountMinor, currency: evidence.currency,
+      status: 'available', balanceType: 'payments', createdAt, availableAt: createdAt,
+      exchangeRate: evidence.exchangeRate,
+      exchangeSourceCurrency: evidence.exchangeSourceCurrency,
+      exchangeTargetCurrency: evidence.exchangeTargetCurrency,
+      feeDetails: []
+    };
+  });
+  return provider;
+}
+
 describe('reconcileRefundFinancialSource', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -339,6 +409,72 @@ describe('reconcileRefundFinancialSource', () => {
       'provider.refund', 'provider.payment', 'provider.charge', 'provider.balance',
       'stage.balance', 'tx.begin'
     ]);
+  });
+
+  it.each([
+    {
+      label: 'a cross-currency primary without exchange evidence',
+      primary: USD_WITHOUT_EXCHANGE,
+      failure: EUR_TO_USD,
+      expectedSafeCode: 'currency_mismatch'
+    },
+    {
+      label: 'a cross-currency failure without exchange evidence',
+      primary: EUR_TO_USD,
+      failure: USD_WITHOUT_EXCHANGE,
+      expectedSafeCode: 'currency_mismatch'
+    },
+    {
+      label: 'a primary whose exchange source is not the refund currency',
+      primary: { ...EUR_TO_USD, exchangeSourceCurrency: 'GBP' },
+      failure: EUR_TO_USD,
+      expectedSafeCode: 'currency_mismatch'
+    },
+    {
+      label: 'a failure whose exchange target is not its settlement currency',
+      primary: EUR_TO_USD,
+      failure: { ...EUR_TO_USD, exchangeTargetCurrency: 'GBP' },
+      expectedSafeCode: 'unsupported_category'
+    }
+  ])('rejects $label before staging', async ({ primary, failure, expectedSafeCode }) => {
+    const database = routingDatabase([]);
+    prepareRefundIssueTransaction(database);
+    const provider = refundFxGateway([], 'EUR', primary, failure);
+
+    await expect(reconcileRefundFinancialSource(database, provider, {
+      refundId, correlationId: `refund-fx-${expectedSafeCode}`
+    }, new AbortController().signal)).resolves.toMatchObject({
+      status: 'exception', sourceKind: 'refund', sourceId: refundId,
+      financialEvidenceStatus: 'exception', safeCode: expectedSafeCode
+    });
+
+    expect(stageBalanceTransaction).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      label: 'same-currency primary and failure transactions without exchange evidence',
+      sourceCurrency: 'USD', primary: USD_WITHOUT_EXCHANGE, failure: USD_WITHOUT_EXCHANGE
+    },
+    {
+      label: 'primary and failure transactions with exact cross-currency evidence',
+      sourceCurrency: 'EUR', primary: EUR_TO_USD, failure: EUR_TO_USD
+    }
+  ])('admits $label', async ({ sourceCurrency, primary, failure }) => {
+    const database = routingDatabase([]);
+    vi.mocked(stageBalanceTransaction).mockImplementation(async (_database, snapshot) => ({
+      balanceTransactionId: snapshot.id === 'txn_refund_trace' ? balanceId : failureBalanceId,
+      disposition: 'inserted'
+    }));
+
+    await expect(reconcileRefundFinancialSource(
+      database,
+      refundFxGateway([], sourceCurrency, primary, failure),
+      { refundId, correlationId: `refund-fx-valid-${sourceCurrency}` },
+      new AbortController().signal
+    )).rejects.toThrow('projection-stop');
+
+    expect(stageBalanceTransaction).toHaveBeenCalledTimes(2);
   });
 
   it('keeps an independently staged transaction but aborts before purchase projection', async () => {

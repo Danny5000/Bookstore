@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SQL, SQLWrapper } from 'drizzle-orm';
-import type { StripeCommerceGateway } from '$lib/server/commerce/stripe/types';
+import type {
+  BalanceTransactionSnapshot,
+  StripeCommerceGateway
+} from '$lib/server/commerce/stripe/types';
 import type { Database } from '$lib/server/db/client';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
 import { appendAuditEvent } from '$lib/server/audit/service';
@@ -310,6 +313,90 @@ function gateway(trace: string[]): StripeCommerceGateway {
       };
     })
   } as unknown as StripeCommerceGateway;
+}
+
+type DisputeFxBalance = Pick<
+  BalanceTransactionSnapshot,
+  'currency' | 'exchangeRate' | 'exchangeSourceCurrency' | 'exchangeTargetCurrency'
+> & {
+  readonly id: string;
+  readonly rawType: string;
+  readonly reportingCategory: 'dispute' | 'dispute_reversal' | 'fee';
+  readonly amountMinor: number;
+};
+
+const WITHDRAWAL_WITHOUT_EXCHANGE: DisputeFxBalance = {
+  id: 'txn_withdrawal_trace', rawType: 'adjustment', reportingCategory: 'dispute',
+  amountMinor: -100, currency: 'USD', exchangeRate: null,
+  exchangeSourceCurrency: null, exchangeTargetCurrency: null
+};
+const REINSTATEMENT_WITHOUT_EXCHANGE: DisputeFxBalance = {
+  id: 'txn_reinstatement_trace', rawType: 'adjustment',
+  reportingCategory: 'dispute_reversal', amountMinor: 100, currency: 'USD',
+  exchangeRate: null, exchangeSourceCurrency: null, exchangeTargetCurrency: null
+};
+const WITHDRAWAL_EUR_TO_USD: DisputeFxBalance = {
+  ...WITHDRAWAL_WITHOUT_EXCHANGE,
+  exchangeRate: '1.250000000000000000',
+  exchangeSourceCurrency: 'EUR', exchangeTargetCurrency: 'USD'
+};
+const REINSTATEMENT_EUR_TO_USD: DisputeFxBalance = {
+  ...REINSTATEMENT_WITHOUT_EXCHANGE,
+  exchangeRate: '1.250000000000000000',
+  exchangeSourceCurrency: 'EUR', exchangeTargetCurrency: 'USD'
+};
+const FEE_CREDIT_WITHOUT_EXCHANGE: DisputeFxBalance = {
+  id: 'txn_fee_credit_trace', rawType: 'stripe_fee', reportingCategory: 'fee',
+  amountMinor: 5, currency: 'USD', exchangeRate: null,
+  exchangeSourceCurrency: null, exchangeTargetCurrency: null
+};
+
+function disputeFxGateway(
+  trace: string[],
+  sourceCurrency: string,
+  balances: readonly DisputeFxBalance[]
+): StripeCommerceGateway {
+  const provider = gateway(trace);
+  vi.mocked(provider.retrieveDispute).mockImplementation(async () => {
+    trace.push('provider.dispute');
+    return {
+      providerDisputeId: 'dp_dispute_trace', paymentIntentId: 'pi_dispute_trace',
+      chargeId: 'ch_dispute_trace', liveMode: false, state: 'won', amountMinor: 100,
+      currency: sourceCurrency.toLowerCase(), reason: null, providerCreatedAt: createdAt,
+      balanceTransactionIds: balances.map((balance) => balance.id)
+    };
+  });
+  vi.mocked(provider.retrievePayment).mockImplementation(async () => {
+    trace.push('provider.payment');
+    return {
+      paymentIntentId: 'pi_dispute_trace', metadataVersion: '1', metadataOrderId: orderId,
+      latestChargeId: 'ch_dispute_trace', liveMode: false, state: 'succeeded', amountMinor: 1000,
+      currency: sourceCurrency.toLowerCase(), paidAt: createdAt, paymentMethodCategory: 'card'
+    };
+  });
+  vi.mocked(provider.retrieveCharge).mockImplementation(async () => {
+    trace.push('provider.charge');
+    return {
+      id: 'ch_dispute_trace', paymentIntentId: 'pi_dispute_trace', livemode: false,
+      amountMinor: 1000, amountRefundedMinor: 0, currency: sourceCurrency.toUpperCase(),
+      status: 'succeeded', balanceTransactionId: 'txn_charge_trace', createdAt
+    };
+  });
+  vi.mocked(provider.retrieveBalanceTransaction).mockImplementation(async (id) => {
+    trace.push(`provider.balance.${id}`);
+    const balance = balances.find((candidate) => candidate.id === id);
+    if (!balance) throw new Error(`missing test balance ${id}`);
+    return {
+      id, livemode: false, sourceId: 'dp_dispute_trace', sourceFamily: 'dispute',
+      rawType: balance.rawType, reportingCategory: balance.reportingCategory,
+      amountMinor: balance.amountMinor, feeMinor: 0, netMinor: balance.amountMinor,
+      currency: balance.currency, status: 'available', balanceType: 'payments',
+      createdAt, availableAt: createdAt, exchangeRate: balance.exchangeRate,
+      exchangeSourceCurrency: balance.exchangeSourceCurrency,
+      exchangeTargetCurrency: balance.exchangeTargetCurrency, feeDetails: []
+    };
+  });
+  return provider;
 }
 
 describe('versioned locked dispute projection replay', () => {
@@ -679,6 +766,95 @@ describe('reconcileDisputeFinancialSource', () => {
       'stage.txn_reinstatement_trace',
       'tx.begin'
     ]);
+  });
+
+  it.each([
+    {
+      label: 'a cross-currency withdrawal without exchange evidence',
+      balances: [WITHDRAWAL_WITHOUT_EXCHANGE],
+      expectedSafeCode: 'currency_mismatch'
+    },
+    {
+      label: 'a cross-currency reinstatement without exchange evidence',
+      balances: [REINSTATEMENT_WITHOUT_EXCHANGE],
+      expectedSafeCode: 'currency_mismatch'
+    },
+    {
+      label: 'a withdrawal whose exchange source is not the dispute currency',
+      balances: [{ ...WITHDRAWAL_EUR_TO_USD, exchangeSourceCurrency: 'GBP' }],
+      expectedSafeCode: 'currency_mismatch'
+    },
+    {
+      label: 'a reinstatement whose exchange target is not its settlement currency',
+      balances: [{ ...REINSTATEMENT_EUR_TO_USD, exchangeTargetCurrency: 'GBP' }],
+      expectedSafeCode: 'unsupported_category'
+    },
+    {
+      label: 'a fee credit with supplied exchange evidence from the wrong source currency',
+      balances: [{
+        ...FEE_CREDIT_WITHOUT_EXCHANGE,
+        exchangeRate: '1.250000000000000000',
+        exchangeSourceCurrency: 'GBP', exchangeTargetCurrency: 'USD'
+      }],
+      expectedSafeCode: 'currency_mismatch'
+    }
+  ])('rejects $label before staging', async ({ balances, expectedSafeCode }) => {
+    const database = routingDatabase([]);
+    prepareDisputeIssueTransaction(database);
+
+    await expect(reconcileDisputeFinancialSource(
+      database,
+      disputeFxGateway([], 'EUR', balances),
+      { disputeId, correlationId: `dispute-fx-${expectedSafeCode}` },
+      new AbortController().signal
+    )).resolves.toMatchObject({
+      status: 'exception', sourceKind: 'dispute', sourceId: disputeId,
+      financialEvidenceStatus: 'exception', safeCode: expectedSafeCode
+    });
+
+    expect(stageBalanceTransaction).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      label: 'same-currency withdrawal and reinstatement transactions without exchange evidence',
+      sourceCurrency: 'USD',
+      balances: [WITHDRAWAL_WITHOUT_EXCHANGE, REINSTATEMENT_WITHOUT_EXCHANGE]
+    },
+    {
+      label: 'withdrawal and reinstatement transactions with exact cross-currency evidence',
+      sourceCurrency: 'EUR',
+      balances: [WITHDRAWAL_EUR_TO_USD, REINSTATEMENT_EUR_TO_USD]
+    },
+    {
+      label: 'a cross-currency settlement-only fee credit without exchange evidence',
+      sourceCurrency: 'EUR',
+      balances: [FEE_CREDIT_WITHOUT_EXCHANGE]
+    },
+    {
+      label: 'a fee credit with an exact supplied cross-currency tuple',
+      sourceCurrency: 'EUR',
+      balances: [{
+        ...FEE_CREDIT_WITHOUT_EXCHANGE,
+        exchangeRate: '1.250000000000000000',
+        exchangeSourceCurrency: 'EUR', exchangeTargetCurrency: 'USD'
+      }]
+    }
+  ])('admits $label', async ({ sourceCurrency, balances }) => {
+    const database = routingDatabase([]);
+    vi.mocked(stageBalanceTransaction).mockImplementation(async (_database, snapshot) => ({
+      balanceTransactionId: snapshot.id === 'txn_withdrawal_trace' ? balanceId : siblingBalanceId,
+      disposition: 'inserted'
+    }));
+
+    await expect(reconcileDisputeFinancialSource(
+      database,
+      disputeFxGateway([], sourceCurrency, balances),
+      { disputeId, correlationId: `dispute-fx-valid-${sourceCurrency}` },
+      new AbortController().signal
+    )).rejects.toThrow('projection-stop');
+
+    expect(stageBalanceTransaction).toHaveBeenCalledTimes(balances.length);
   });
 
   it('records malformed canonical provider evidence as a durable dispute exception', async () => {
