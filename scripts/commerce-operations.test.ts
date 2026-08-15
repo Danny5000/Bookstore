@@ -786,6 +786,22 @@ describe('commerce operations contract', () => {
     )[0];
     expect(verifierStructuralSql).toBeDefined();
     expect(documentedStructuralSql?.trim()).toBe(verifierStructuralSql?.trim());
+    const verifierScanSql = financialVerifier.match(
+      /with pending_replay_children as \([\s\S]*?from scan_checks\norder by check_name;/u
+    )?.[0];
+    const documentedScanSql = fencedCodeBlocks(
+      markdownSection(financialRunbook, 'Post-restore scan-checkpoint check'),
+      'sql'
+    )[0];
+    expect(verifierScanSql).toBeDefined();
+    expect(documentedScanSql?.trim()).toBe(verifierScanSql?.trim());
+    const runningScanResumeSql = verifierScanSql?.match(
+      /select 'running_scan_resume_job_missing'[\s\S]*?(?=\s+union all\s+select 'running_scan_cursor_integrity')/u
+    )?.[0];
+    expect(runningScanResumeSql).toBeDefined();
+    expect(runningScanResumeSql).toContain(
+      "and (j.status <> 'pending' or j.attempts < j.max_attempts)"
+    );
     expect(financialVerifier).toMatch(
       /combined_refund_events[\s\S]*r\.status = 'succeeded'[\s\S]*r\.allocation_status in \('finalized', 'exception'\)/u
     );

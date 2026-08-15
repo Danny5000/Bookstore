@@ -1592,6 +1592,7 @@ with pending_replay_children as (
         and j.type = 'commerce.financial-scan'
         and j.max_attempts = 8
         and j.status in ('pending', 'running', 'failed')
+        and (j.status <> 'pending' or j.attempts < j.max_attempts)
         and case
           when r.cursor_digest_sha256 is not null then j.payload = jsonb_build_object(
             'kind', 'continuation',

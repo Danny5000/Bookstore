@@ -551,6 +551,20 @@ async function exerciseInvariantWitnesses(): Promise<void> {
   await expectPass('pending replay with a resumable child');
 
   await pool.query(`
+    update jobs set attempts = max_attempts
+    where deduplication_key = $1
+  `, [replayFinalizerKey]);
+  await expectRejection(
+    'running scan with an exhausted pending resume job',
+    'running_scan_resume_job_missing=1'
+  );
+  await pool.query(`
+    update jobs set attempts = max_attempts - 1
+    where deduplication_key = $1
+  `, [replayFinalizerKey]);
+  await expectPass('running scan with a pending resume job below its attempt ceiling');
+
+  await pool.query(`
     insert into jobs (
       type, payload, deduplication_key, status, attempts, max_attempts, completed_at
     ) values (
