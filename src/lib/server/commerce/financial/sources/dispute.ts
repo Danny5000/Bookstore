@@ -28,7 +28,11 @@ import type {
   FinalizedDisputeRefund
 } from '../allocations/types';
 import { FINANCIAL_ALLOCATION_ALGORITHM_VERSION, FINANCIAL_CLASSIFIER_VERSION } from '../constants';
-import { PermanentFinancialError, RetryableFinancialError } from '../errors';
+import {
+  PermanentFinancialError,
+  RetryableFinancialError,
+  type PermanentFinancialSafeCode
+} from '../errors';
 import { observeFinancialIssue, resolveFinancialIssueAfterRecompute } from '../issues';
 import {
   lockActiveFinancialProjectionImplementation,
@@ -83,6 +87,15 @@ const CROSS_DISPUTE_PROJECTION_ISSUE_CODES: readonly FinancialIssueCode[] = [
   'allocation_mismatch',
   'correction_rebase_required'
 ];
+const ORDINARY_DISPUTE_SET_ISSUE_CODES: readonly FinancialIssueCode[] = [
+  'allocation_mismatch',
+  'classification_fork',
+  'correction_rebase_required',
+  'currency_mismatch',
+  'immutable_mismatch',
+  'source_linkage_mismatch',
+  'unsupported_category'
+];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const FINGERPRINT = /^[a-f0-9]{64}$/u;
 const CURRENCY = /^[A-Z]{3}$/u;
@@ -106,6 +119,122 @@ function stateChanged(): never {
   throw new RetryableFinancialError('state_changed');
 }
 
+interface ExactActiveDisputeTip {
+  readonly id: string;
+  readonly balanceTransactionId: string;
+  readonly basis: 'gross_amount' | 'fee';
+}
+
+interface DisputeBalanceOwner {
+  readonly balanceTransactionId: string;
+  readonly disputeId: string;
+  readonly providerSourceId: string;
+  readonly fingerprintSha256: string;
+}
+
+async function discoverDisputeBalanceOwners(
+  executor: Database | DatabaseTransaction,
+  paymentId: string
+): Promise<DisputeBalanceOwner[]> {
+  const result = await executor.execute(sql`
+    select balance.id as "balanceTransactionId", dispute.id as "disputeId",
+      balance.source_id as "providerSourceId",
+      balance.fingerprint_sha256 as "fingerprintSha256"
+    from stripe_balance_transactions balance
+    join disputes dispute on dispute.stripe_dispute_id = balance.source_id
+    where balance.source_family = 'dispute'
+      and dispute.payment_id = ${paymentId}
+    order by balance.id, dispute.id
+  `) as QueryResult;
+  const owners = (result.rows ?? []) as unknown as DisputeBalanceOwner[];
+  const seenBalanceIds = new Set<string>();
+  for (const owner of owners) {
+    if (!UUID.test(owner.balanceTransactionId) || !UUID.test(owner.disputeId) ||
+      typeof owner.providerSourceId !== 'string' || owner.providerSourceId.length === 0 ||
+      !FINGERPRINT.test(owner.fingerprintSha256) ||
+      seenBalanceIds.has(owner.balanceTransactionId)) {
+      throw new PermanentFinancialError('source_linkage_mismatch');
+    }
+    seenBalanceIds.add(owner.balanceTransactionId);
+  }
+  return owners;
+}
+
+function sameDisputeBalanceOwners(
+  left: readonly DisputeBalanceOwner[],
+  right: readonly DisputeBalanceOwner[]
+): boolean {
+  return left.length === right.length && left.every((owner, index) => {
+    const other = right[index];
+    return other?.balanceTransactionId === owner.balanceTransactionId &&
+      other.disputeId === owner.disputeId &&
+      other.providerSourceId === owner.providerSourceId &&
+      other.fingerprintSha256 === owner.fingerprintSha256;
+  });
+}
+
+async function discoverHistoricallyProjectedDisputeBalanceIds(
+  tx: DatabaseTransaction,
+  paymentId: string
+): Promise<string[]> {
+  const balanceIds = await rows(tx, sql`
+    select distinct allocation_set.balance_transaction_id as "balanceTransactionId"
+    from financial_allocation_sets allocation_set
+    join disputes dispute on dispute.id = allocation_set.source_internal_id
+    where allocation_set.source_kind = 'dispute'
+      and dispute.payment_id = ${paymentId}
+    order by allocation_set.balance_transaction_id
+  `) as Array<{ balanceTransactionId: string }>;
+  if (balanceIds.some((row) => !UUID.test(row.balanceTransactionId))) {
+    throw new PermanentFinancialError('source_linkage_mismatch');
+  }
+  return balanceIds.map((row) => row.balanceTransactionId);
+}
+
+async function discoverExactActiveDisputeTips(
+  tx: DatabaseTransaction,
+  balanceTransactionIds: readonly string[],
+  lockRows = false
+): Promise<ExactActiveDisputeTip[]> {
+  if (balanceTransactionIds.length === 0) return [];
+  const tips = await rows(tx, sql`
+    select target_set.id,
+      target_set.balance_transaction_id as "balanceTransactionId", target_set.basis
+    from financial_allocation_sets target_set
+    where target_set.balance_transaction_id in (${sql.join(
+      balanceTransactionIds.map((id) => sql`${id}::uuid`), sql`, `
+    )})
+      and target_set.classifier_version = ${FINANCIAL_CLASSIFIER_VERSION}
+      and target_set.algorithm_version = ${FINANCIAL_ALLOCATION_ALGORITHM_VERSION}
+      and not exists (
+        select 1 from financial_allocation_sets successor
+        where successor.supersedes_set_id = target_set.id
+          and successor.classifier_version = target_set.classifier_version
+          and successor.algorithm_version = target_set.algorithm_version
+    )
+    order by target_set.balance_transaction_id, target_set.basis, target_set.id
+    ${lockRows ? sql`for update` : sql``}
+  `) as ExactActiveDisputeTip[];
+  if (tips.some((tip) => !UUID.test(tip.id) ||
+    !balanceTransactionIds.includes(tip.balanceTransactionId) ||
+    (tip.basis !== 'gross_amount' && tip.basis !== 'fee'))) {
+    throw new PermanentFinancialError('source_linkage_mismatch');
+  }
+  return tips;
+}
+
+function sameExactActiveDisputeTips(
+  left: readonly ExactActiveDisputeTip[],
+  right: readonly ExactActiveDisputeTip[]
+): boolean {
+  return left.length === right.length && left.every((tip, index) => {
+    const other = right[index];
+    return other?.id === tip.id &&
+      other.balanceTransactionId === tip.balanceTransactionId &&
+      other.basis === tip.basis;
+  });
+}
+
 function durableIssueCode(error: unknown): FinancialIssueCode | null {
   if (!(error instanceof PermanentFinancialError)) return null;
   switch (error.safeCode) {
@@ -121,6 +250,33 @@ function durableIssueCode(error: unknown): FinancialIssueCode | null {
     default:
       return null;
   }
+}
+
+function permanentSafeCodeForOrdinaryDisputeIssue(
+  safeCode: FinancialIssueCode
+): PermanentFinancialSafeCode | null {
+  switch (safeCode) {
+    case 'allocation_mismatch':
+    case 'classification_fork':
+    case 'correction_rebase_required':
+    case 'currency_mismatch':
+    case 'immutable_mismatch':
+    case 'source_linkage_mismatch':
+      return safeCode;
+    case 'unsupported_category':
+      return 'unsupported_provider_evidence';
+    default:
+      return null;
+  }
+}
+
+function lockedReplayIssueCode(
+  safeCode: FinancialIssueCode
+): LockedDisputeProjectionReplayIssueCode | null {
+  return (LOCKED_DISPUTE_PROJECTION_REPLAY_ISSUE_CODES as readonly FinancialIssueCode[])
+    .includes(safeCode)
+    ? safeCode as LockedDisputeProjectionReplayIssueCode
+    : null;
 }
 
 function sameInstant(left: Date, right: Date): boolean {
@@ -254,6 +410,13 @@ export interface LockedDisputeProjectionReplayReplacement {
   readonly disposition: 'inserted' | 'unchanged';
 }
 
+export const LOCKED_DISPUTE_PROJECTION_REPLAY_ISSUE_CODES = [
+  'allocation_fork', 'allocation_mismatch', 'currency_mismatch',
+  'source_linkage_mismatch', 'unsupported_category'
+] as const satisfies readonly FinancialIssueCode[];
+export type LockedDisputeProjectionReplayIssueCode =
+  (typeof LOCKED_DISPUTE_PROJECTION_REPLAY_ISSUE_CODES)[number];
+
 export type LockedDisputeProjectionReplayResult =
   | {
       readonly status: 'replayed' | 'unchanged';
@@ -261,13 +424,13 @@ export type LockedDisputeProjectionReplayResult =
     }
   | {
       readonly status: 'exception';
-      readonly safeCode: FinancialIssueCode;
+      readonly safeCode: LockedDisputeProjectionReplayIssueCode;
     };
 
 class DisputeReplayRollback extends Error {
-  readonly safeCode: FinancialIssueCode;
+  readonly safeCode: LockedDisputeProjectionReplayIssueCode;
 
-  constructor(safeCode: FinancialIssueCode) {
+  constructor(safeCode: LockedDisputeProjectionReplayIssueCode) {
     super('Dispute projection replay must roll back.');
     this.name = 'DisputeReplayRollback';
     this.safeCode = safeCode;
@@ -514,6 +677,8 @@ interface ReplayStoredTip {
   readonly supersedesSetId: string | null;
   readonly classifierVersion: number;
   readonly algorithmVersion: number;
+  readonly isTargetTip?: boolean;
+  readonly isGlobalTip?: boolean;
 }
 
 interface ReplayDisputeBalance extends LockedBalance {
@@ -606,29 +771,76 @@ async function recomputeLockedDisputeFinancialProjectionForVersionInSavepoint(
         .includes(balance.classification ?? ''))) {
     return { status: 'exception', safeCode: 'source_linkage_mismatch' };
   }
-  const tips = await rows(tx, sql`
+  const candidateTips = await rows(tx, sql`
     select allocation.id, allocation.balance_transaction_id as "balanceTransactionId",
       allocation.basis, allocation.allocation_identity as "allocationIdentity",
       allocation.supersedes_set_id as "supersedesSetId",
       allocation.classifier_version as "classifierVersion",
-      allocation.algorithm_version as "algorithmVersion"
+      allocation.algorithm_version as "algorithmVersion",
+      (
+        allocation.classifier_version = ${target.classifierVersion}
+        and allocation.algorithm_version = ${target.allocationAlgorithmVersion}
+        and not exists (
+          select 1 from financial_allocation_sets successor
+          where successor.supersedes_set_id = allocation.id
+            and successor.classifier_version = allocation.classifier_version
+            and successor.algorithm_version = allocation.algorithm_version
+        )
+      ) as "isTargetTip",
+      not exists (
+        select 1 from financial_allocation_sets global_successor
+        where global_successor.supersedes_set_id = allocation.id
+      ) as "isGlobalTip"
     from financial_allocation_sets allocation
     where allocation.balance_transaction_id in (${sql.join(
       input.balanceTransactionIds.map((id) => sql`${id}::uuid`), sql`, `
-    )}) and not exists (
-      select 1 from financial_allocation_sets successor
-      where successor.supersedes_set_id = allocation.id
+    )}) and (
+      (
+        allocation.classifier_version = ${target.classifierVersion}
+        and allocation.algorithm_version = ${target.allocationAlgorithmVersion}
+        and not exists (
+          select 1 from financial_allocation_sets successor
+          where successor.supersedes_set_id = allocation.id
+            and successor.classifier_version = allocation.classifier_version
+            and successor.algorithm_version = allocation.algorithm_version
+        )
+      ) or not exists (
+        select 1 from financial_allocation_sets global_successor
+        where global_successor.supersedes_set_id = allocation.id
+      )
     )
-    order by allocation.balance_transaction_id, allocation.basis, allocation.id
+    order by allocation.balance_transaction_id, allocation.basis,
+      allocation.classifier_version, allocation.algorithm_version, allocation.id
     for update
   `) as ReplayStoredTip[];
-  if (tips.some((tip) => !UUID.test(tip.id) ||
+  if (candidateTips.some((tip) => !UUID.test(tip.id) ||
     !input.balanceTransactionIds.includes(tip.balanceTransactionId) ||
     !Number.isSafeInteger(tip.classifierVersion) || tip.classifierVersion < 1 ||
-    !Number.isSafeInteger(tip.algorithmVersion) || tip.algorithmVersion < 1) ||
-    input.balanceTransactionIds.some((id) =>
-      tips.filter((tip) => tip.balanceTransactionId === id && tip.basis === 'gross_amount').length > 1 ||
-      tips.filter((tip) => tip.balanceTransactionId === id && tip.basis === 'fee').length > 1)) {
+    !Number.isSafeInteger(tip.algorithmVersion) || tip.algorithmVersion < 1)) {
+    return { status: 'exception', safeCode: 'allocation_fork' };
+  }
+  const tips: ReplayStoredTip[] = [];
+  for (const balanceTransactionId of input.balanceTransactionIds) {
+    for (const basis of ['gross_amount', 'fee'] as const) {
+      const basisCandidates = candidateTips.filter((tip) =>
+        tip.balanceTransactionId === balanceTransactionId && tip.basis === basis);
+      const targetTips = basisCandidates.filter((tip) => tip.isTargetTip === true ||
+        (tip.isTargetTip === undefined && tip.classifierVersion === target.classifierVersion &&
+          tip.algorithmVersion === target.allocationAlgorithmVersion));
+      const fallbackTips = basisCandidates.filter((tip) =>
+        (tip.isGlobalTip === true || tip.isTargetTip === undefined) &&
+        tip.classifierVersion <= target.classifierVersion &&
+        tip.algorithmVersion <= target.allocationAlgorithmVersion &&
+        (tip.classifierVersion < target.classifierVersion ||
+          tip.algorithmVersion < target.allocationAlgorithmVersion));
+      const selected = targetTips.length > 0 ? targetTips : fallbackTips;
+      if (selected.length > 1) {
+        return { status: 'exception', safeCode: 'allocation_fork' };
+      }
+      if (selected[0]) tips.push(selected[0]);
+    }
+  }
+  if (tips.some((tip) => !UUID.test(tip.id))) {
     return { status: 'exception', safeCode: 'allocation_fork' };
   }
 
@@ -647,7 +859,6 @@ async function recomputeLockedDisputeFinancialProjectionForVersionInSavepoint(
 
   const priorEffects: BoundDisputePresentmentEffect[] = [];
   const replacements: LockedDisputeProjectionReplayReplacement[] = [];
-  let exposureChanged = false;
   for (const balance of balances) {
     const sourceDispute = input.purchaseFacts.disputes.find((candidate) =>
       candidate.stripeDisputeId === balance.sourceId);
@@ -808,25 +1019,17 @@ async function recomputeLockedDisputeFinancialProjectionForVersionInSavepoint(
       }
     }
     const savedGross = pair.find((row) => row.plan.basis === 'gross_amount');
-    if (savedGross?.disposition === 'inserted' &&
-      !samePresentmentProjection(
-        currentTargetPresentmentEffects, bundle.presentmentEffects
-      )) {
-      exposureChanged = true;
+    const presentmentProjectionMatches = samePresentmentProjection(
+      currentTargetPresentmentEffects, bundle.presentmentEffects
+    );
+    if (savedGross?.disposition === 'unchanged' && !presentmentProjectionMatches) {
+      throw new PermanentFinancialError('allocation_mismatch');
     }
     if (bundle.presentmentEffects.length > 0) {
       priorEffects.push(...await persistPresentmentEffects(tx, sourceDispute.id,
         pair[0]!.setId, pair[0]!.setId,
         bundle.presentmentEffects));
     }
-  }
-  const affectedRefundIds = exposureChanged
-    ? componentBackedSucceededRefundIds(input.purchaseFacts)
-    : [];
-  if (affectedRefundIds.length > 0) {
-    await rearmCurrentProjectionSubjectsForFinancialSources(tx, {
-      sourceKind: 'refund', sourceIds: affectedRefundIds
-    });
   }
   return replacements.some((row) => row.disposition === 'inserted')
     ? { status: 'replayed', replacements }
@@ -851,6 +1054,9 @@ export async function recomputeLockedDisputeFinancialProjectionForVersion(
     if (error instanceof DisputeReplayRollback) {
       return { status: 'exception', safeCode: error.safeCode };
     }
+    const safeCode = durableIssueCode(error);
+    const replaySafeCode = safeCode === null ? null : lockedReplayIssueCode(safeCode);
+    if (replaySafeCode) return { status: 'exception', safeCode: replaySafeCode };
     throw error;
   }
 }
@@ -947,24 +1153,14 @@ export async function reconcileDisputeFinancialSource(
     throw error;
   }
 
-  const priorBalanceRows =
-    ((
-      (await database.execute(sql`
-    select distinct allocation_set.balance_transaction_id as "balanceTransactionId",
-      allocation_set.source_internal_id as "disputeId"
-    from financial_allocation_sets allocation_set
-    join disputes dispute on dispute.id = allocation_set.source_internal_id
-    where allocation_set.source_kind = 'dispute' and dispute.payment_id = ${routing.paymentId}
-    order by allocation_set.balance_transaction_id
-  `)) as QueryResult
-    ).rows as Array<{ balanceTransactionId: string; disputeId: string }> | undefined) ?? [];
-  const priorBalanceIds = priorBalanceRows.map((row) => row.balanceTransactionId);
+  const preliminaryGraphOwners = await discoverDisputeBalanceOwners(database, routing.paymentId);
+  const graphBalanceIds = preliminaryGraphOwners.map((row) => row.balanceTransactionId);
   const sourceDisputeIdByBalance = new Map(
-    priorBalanceRows.map((row) => [row.balanceTransactionId, row.disputeId])
+    preliminaryGraphOwners.map((row) => [row.balanceTransactionId, row.disputeId])
   );
   for (const value of staged) sourceDisputeIdByBalance.set(value.internalId, routing.id);
   const sourceBalanceIds = [
-    ...new Set([...staged.map((value) => value.internalId), ...priorBalanceIds])
+    ...new Set([...staged.map((value) => value.internalId), ...graphBalanceIds])
   ].sort();
   const closureRows =
     sourceBalanceIds.length === 0
@@ -1034,21 +1230,35 @@ export async function reconcileDisputeFinancialSource(
     )
       stateChanged();
     const affectedRefundIds = componentBackedSucceededRefundIds(facts);
-    if (affectedRefundIds.length > 0) {
-      await lockFinancialProjectionEnrollment(tx);
-    }
+    await lockFinancialProjectionEnrollment(tx);
+    const lockedGraphOwners = await discoverDisputeBalanceOwners(tx, routing.paymentId);
+    if (!sameDisputeBalanceOwners(preliminaryGraphOwners, lockedGraphOwners)) stateChanged();
+    const historicallyProjectedBalanceIds =
+      await discoverHistoricallyProjectedDisputeBalanceIds(tx, routing.paymentId);
+    const discoveredActiveTips = await discoverExactActiveDisputeTips(tx, sourceBalanceIds);
     const lockRows = await lockFinancialProjectionRows(tx, {
       payoutGenerations,
       balanceTransactionIds: lockBalanceIds,
       classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
-      issueKeys: affectedDisputeIds.flatMap((resourceId) =>
-        ISSUE_CODES.map((safeCode) => ({
-          resourceType: 'dispute' as const,
-          resourceId,
-          safeCode
-        }))
-      )
+      issueKeys: [
+        ...affectedDisputeIds.flatMap((resourceId) =>
+          ISSUE_CODES.map((safeCode) => ({
+            resourceType: 'dispute' as const,
+            resourceId,
+            safeCode
+          }))
+        ),
+        ...discoveredActiveTips.flatMap((tip) =>
+          ORDINARY_DISPUTE_SET_ISSUE_CODES.map((safeCode) => ({
+            resourceType: 'allocation_set' as const,
+            resourceId: tip.id,
+            safeCode
+          }))
+        )
+      ]
     });
+    const lockedActiveTips = await discoverExactActiveDisputeTips(tx, sourceBalanceIds, true);
+    if (!sameExactActiveDisputeTips(discoveredActiveTips, lockedActiveTips)) stateChanged();
     if (staged.length === 0) {
       return recordLockedIssue(
         tx,
@@ -1076,44 +1286,33 @@ export async function reconcileDisputeFinancialSource(
           const stagedByBalanceId = new Map(
             staged.map((value) => [value.internalId, value.snapshot])
           );
-          const currentProjections =
-            (await loadCurrentEffectiveAllocationProjection(projectionTx, {
-              balanceTransactionIds: sourceBalanceIds
-            })) ?? [];
-          const currentByBalanceBasis = new Map(
-            currentProjections.map((projection) => [
-              `${projection.balanceTransactionId}:${projection.basis}`,
-              projection
-            ])
-          );
+          const currentTipByBalanceBasis = new Map<string, ExactActiveDisputeTip>();
+          for (const tip of lockedActiveTips) {
+            const key = `${tip.balanceTransactionId}:${tip.basis}`;
+            if (currentTipByBalanceBasis.has(key)) {
+              throw new PermanentFinancialError('classification_fork');
+            }
+            currentTipByBalanceBasis.set(key, tip);
+          }
           for (const balanceId of sourceBalanceIds) {
             for (const basis of ['gross_amount', 'fee'] as const) {
-              const projection = currentByBalanceBasis.get(`${balanceId}:${basis}`);
+              const tip = currentTipByBalanceBasis.get(`${balanceId}:${basis}`);
               failingDisputeId = sourceDisputeIdByBalance.get(balanceId) ?? routing.id;
-              if (!projection) {
-                if (priorBalanceIds.includes(balanceId)) {
+              if (!tip) {
+                if (historicallyProjectedBalanceIds.includes(balanceId)) {
                   throw new PermanentFinancialError('allocation_mismatch');
                 }
                 continue;
               }
-              if (projection.status !== 'complete') {
-                if (!priorBalanceIds.includes(balanceId)) continue;
-                throw new PermanentFinancialError(
-                  projection?.status === 'exception' &&
-                    projection.safeCode === 'correction_rebase_required'
-                    ? 'correction_rebase_required'
-                    : 'allocation_mismatch'
-                );
-              }
               const plan = await loadStoredPlan(
-                projectionTx, projection.baseSetId, basis
+                projectionTx, tip.id, basis
               );
-              planBySetId.set(projection.baseSetId, plan);
+              planBySetId.set(tip.id, plan);
               if (basis === 'gross_amount') {
                 causalRootByGrossSet.set(
-                  projection.baseSetId,
+                  tip.id,
                   (await loadCausalRootPlan(
-                    projectionTx, projection.baseSetId, basis, planBySetId
+                    projectionTx, tip.id, basis, planBySetId
                   )).setId
                 );
               }
@@ -1300,11 +1499,8 @@ export async function reconcileDisputeFinancialSource(
             );
             const grossKey = `${balance.id}:gross_amount`;
             const feeKey = `${balance.id}:fee`;
-            const currentGross = currentByBalanceBasis.get(grossKey);
-            const currentFee = currentByBalanceBasis.get(feeKey);
-            const currentGrossSetId =
-              currentGross?.status === 'complete' ? currentGross.baseSetId : null;
-            const currentFeeSetId = currentFee?.status === 'complete' ? currentFee.baseSetId : null;
+            const currentGrossSetId = currentTipByBalanceBasis.get(grossKey)?.id ?? null;
+            const currentFeeSetId = currentTipByBalanceBasis.get(feeKey)?.id ?? null;
             const exactOutstandingPresentment =
               outstandingGrossSetId === null
                 ? null
@@ -1402,10 +1598,14 @@ export async function reconcileDisputeFinancialSource(
               activeSetByBalanceBasis.set(`${balance.id}:${plan.basis}`, saved.setId);
             }
             const savedGross = pair[0];
-            if (savedGross?.disposition === 'inserted' &&
-              !samePresentmentProjection(
-                currentPresentmentEffects, bundle.presentmentEffects
-              )) {
+            const presentmentProjectionMatches = samePresentmentProjection(
+              currentPresentmentEffects, bundle.presentmentEffects
+            );
+            if (savedGross?.disposition === 'unchanged' &&
+              !presentmentProjectionMatches) {
+              throw new PermanentFinancialError('allocation_mismatch');
+            }
+            if (savedGross?.disposition === 'inserted' && !presentmentProjectionMatches) {
               exposureChanged = true;
             }
             persisted.push(
@@ -1425,6 +1625,19 @@ export async function reconcileDisputeFinancialSource(
                       bundle.presentmentEffects
                     ))
               );
+            }
+          }
+          let allocationSetIssueTransitioned = false;
+          for (const tip of lockedActiveTips) {
+            for (const safeCode of ORDINARY_DISPUTE_SET_ISSUE_CODES) {
+              const resolved = await resolveFinancialIssueAfterRecompute(projectionTx, {
+                resourceType: 'allocation_set', resourceId: tip.id, safeCode,
+                proof: { status: 'resolved', resourceType: 'allocation_set',
+                  resourceId: tip.id, safeCode },
+                actor: ACTOR,
+                correlationId: input.correlationId
+              });
+              allocationSetIssueTransitioned ||= resolved !== null;
             }
           }
           const projections = await loadCurrentEffectiveAllocationProjection(projectionTx, {
@@ -1447,11 +1660,11 @@ export async function reconcileDisputeFinancialSource(
               failingDisputeId =
                 sourceDisputeIdByBalance.get(failedBalanceId) ?? routing.id;
             }
-            throw new PermanentFinancialError(
-              failure?.status === 'exception' && failure.safeCode === 'correction_rebase_required'
-                ? 'correction_rebase_required'
-                : 'allocation_mismatch'
-            );
+            const safeCode = failure?.status === 'exception'
+              ? permanentSafeCodeForOrdinaryDisputeIssue(failure.safeCode) ??
+                'allocation_mismatch'
+              : 'allocation_mismatch';
+            throw new PermanentFinancialError(safeCode);
           }
           return {
             persisted,
@@ -1466,23 +1679,42 @@ export async function reconcileDisputeFinancialSource(
               allocationItemCount:
                 projection.status === 'complete' ? projection.items.length : 0
             })),
-            exposureChanged
+            exposureChanged,
+            allocationSetIssueTransitioned
           };
         });
         return { kind: 'complete' as const, value };
       } catch (error) {
         const safeCode = durableIssueCode(error);
         if (!safeCode) throw error;
+        if ((ORDINARY_DISPUTE_SET_ISSUE_CODES as readonly FinancialIssueCode[])
+          .includes(safeCode)) {
+          for (const tip of lockedActiveTips) {
+            await observeFinancialIssue(tx, {
+              resourceType: 'allocation_set', resourceId: tip.id, safeCode,
+              impact: 'exception', actor: ACTOR, correlationId: input.correlationId
+            });
+          }
+        }
+        const result = await recordLockedIssue(
+          tx,
+          failingDisputeId,
+          input.correlationId,
+          safeCode,
+          'exception',
+          signal
+        );
+        await rearmCurrentProjectionSubjectsForFinancialSources(tx, {
+          sourceKind: 'dispute', sourceIds: affectedDisputeIds
+        });
+        if (affectedRefundIds.length > 0) {
+          await rearmCurrentProjectionSubjectsForFinancialSources(tx, {
+            sourceKind: 'refund', sourceIds: affectedRefundIds
+          });
+        }
         return {
           kind: 'issue' as const,
-          result: await recordLockedIssue(
-            tx,
-            failingDisputeId,
-            input.correlationId,
-            safeCode,
-            'exception',
-            signal
-          )
+          result
         };
       }
     })();
@@ -1577,7 +1809,7 @@ export async function reconcileDisputeFinancialSource(
         }
       });
     }
-    if (outcome.value.exposureChanged) {
+    if (outcome.value.exposureChanged || outcome.value.allocationSetIssueTransitioned) {
       if (affectedRefundIds.length > 0) {
         await rearmCurrentProjectionSubjectsForFinancialSources(tx, {
           sourceKind: 'refund', sourceIds: affectedRefundIds

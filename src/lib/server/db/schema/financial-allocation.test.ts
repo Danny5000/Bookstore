@@ -240,20 +240,43 @@ describe('financial allocation schema declarations', () => {
     expect(query).toMatch(
       /when parent_decision_count = 0[\s\S]+?parent_unknown_count > 0[\s\S]+?base_count = 0/u
     );
-    expect(query).toMatch(
-      /issue\.resource_type = 'balance_transaction'[\s\S]+?issue\.safe_code = 'correction_rebase_required'/u
+    expect(query).not.toContain('open_correction_rebase_issues');
+    expect(query).not.toContain('correction_rebase_issue_count');
+    const classificationForkIssues = query.slice(
+      query.indexOf('open_classification_fork_issues'),
+      query.indexOf('open_allocation_set_issues')
     );
-    expect(query).toMatch(
-      /when correction_rebase_issue_count > 0 then 'correction_rebase_required'/u
-    );
-    expect(query).toMatch(
-      /issue\.safe_code = 'classification_fork'[\s\S]+?issue\.resource_type = 'balance_transaction'/u
-    );
-    expect(query).toMatch(
-      /issue\.safe_code = 'classification_fork'[\s\S]+?issue\.resource_type = 'fee_detail'/u
-    );
+    expect(classificationForkIssues).toContain("issue.resource_type = 'balance_transaction'");
+    expect(classificationForkIssues).not.toContain("issue.resource_type = 'fee_detail'");
     expect(query).toMatch(
       /when classification_fork_issue_count > 0 then 'classification_fork'/u
+    );
+    expect(query).toMatch(
+      /when selected_set_issue_count > 0 then selected_set_issue_code[\s\S]+?when classification_fork_issue_count > 0 then 'classification_fork'/u
+    );
+    expect(query).toMatch(
+      /open_allocation_set_issues[\s\S]+?issue\.resource_type = 'allocation_set'[\s\S]+?issue\.state = 'open'[\s\S]+?issue\.impact <> 'informational'/u
+    );
+    expect(query).toMatch(
+      /array_agg\(issue\.safe_code order by[\s\S]+?issue\.impact = 'exception' then 0 else 1 end[\s\S]+?issue\.safe_code collate "C", issue\.id/u
+    );
+    expect(query).toMatch(
+      /selected_set_issue\.allocation_set_id = base\.base_set_id/u
+    );
+    expect(query).toMatch(
+      /selected_set_issue_count = 0[\s\S]+?as is_complete/u
+    );
+    expect(query).toMatch(
+      /when selected_set_issue_count > 0 then selected_set_issue_code/u
+    );
+    expect(query).toMatch(
+      /active_classification_job_markers[\s\S]+?classification_job\.deduplication_key\s*=\s*'financial:classification:'[\s\S]+?classification_job\.status <> 'succeeded'/u
+    );
+    expect(query).toMatch(
+      /selected_set_issue_count = 0 and active_job_marker_count = 0[\s\S]+?as is_complete/u
+    );
+    expect(query).toMatch(
+      /when selected_set_issue_count > 0 then selected_set_issue_code[\s\S]+?when active_job_marker_count > 0 then 'missing_source'/u
     );
   });
 

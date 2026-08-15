@@ -224,7 +224,7 @@ export async function appendClassificationDecisionLocked(
     insert into audit_events
       (actor_type, actor_id, action, outcome, resource_type, resource_id, correlation_id, after)
     values ('system', 'financial-worker', 'financial.classification.appended', 'succeeded',
-      'financial_classification', ${input.subjectId}, ${input.correlationId},
+      'financial_classification', ${inserted.id}, ${input.correlationId},
       ${JSON.stringify({ subjectType: input.subjectType, classification: input.decision.classification, classifierVersion: input.classifierVersion })}::jsonb)
   `);
   return inserted;

@@ -4,7 +4,7 @@ import { PermanentFinancialError, RetryableFinancialError } from './errors';
 import type { FinancialIssueCode } from './types';
 
 export interface FinancialIssueLockKey {
-  readonly resourceType: 'payment' | 'refund' | 'dispute' | 'payout' | 'payout_import_run' | 'balance_transaction' | 'fee_detail' | 'allocation_set' | 'correction_set' | 'financial_scan_run';
+  readonly resourceType: 'payment' | 'refund' | 'dispute' | 'payout' | 'payout_import_run' | 'balance_transaction' | 'fee_detail' | 'allocation_set' | 'correction_set' | 'financial_classification' | 'financial_scan_run';
   readonly resourceId: string;
   readonly safeCode: FinancialIssueCode;
 }
@@ -65,7 +65,8 @@ const FINANCIAL_ISSUE_CODES = (Object.keys({
 const SAFE_CODES = new Set<FinancialIssueCode>(FINANCIAL_ISSUE_CODES);
 const RESOURCE_TYPES = new Set<FinancialIssueLockKey['resourceType']>([
   'payment', 'refund', 'dispute', 'payout', 'payout_import_run', 'balance_transaction',
-  'fee_detail', 'allocation_set', 'correction_set', 'financial_scan_run'
+  'fee_detail', 'allocation_set', 'correction_set', 'financial_classification',
+  'financial_scan_run'
 ]);
 
 type SqlResult = { rows?: unknown[] };

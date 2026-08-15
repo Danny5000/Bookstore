@@ -258,6 +258,39 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     ]);
   };
 
+  const unknownBalanceId = '09000000-0000-4000-8000-000000000001';
+  const unknownClassificationId = '09000000-0000-4000-8000-000000000002';
+  const unknownFingerprint = '9'.repeat(64);
+  await pool.query(`
+    insert into stripe_balance_transactions (
+      id, provider_id, live_mode, source_family, source_id, raw_type,
+      reporting_category, balance_type, amount_minor, fee_minor, net_minor,
+      currency, status, provider_created_at, available_at, fingerprint_sha256
+    ) values (
+      $1, 'txn_restore_unknown_issue', false, 'unknown', null, 'future_type',
+      'future_category', 'adjustment', 1, 0, 1, 'USD', 'available', now(), now(), $2
+    )
+  `, [unknownBalanceId, unknownFingerprint]);
+  await pool.query(`
+    insert into financial_classification_versions (
+      id, subject_type, subject_id, classifier_version, classification,
+      source_fingerprint_sha256
+    ) values ($1, 'balance_transaction', $2, 1, 'unknown', $3)
+  `, [unknownClassificationId, unknownBalanceId, unknownFingerprint]);
+  await expectRejection(
+    'unknown classification without its immutable issue',
+    'financial_unknown_classification_issue=1'
+  );
+  await pool.query(`
+    insert into financial_reconciliation_issues (
+      resource_type, resource_id, safe_code, impact, correlation_id
+    ) values (
+      'financial_classification', $1, 'unsupported_category', 'exception',
+      'restore-unknown-classification-witness'
+    )
+  `, [unknownClassificationId]);
+  await expectPass('unknown classification exact issue repair', true);
+
   await pool.query('delete from financial_payout_discovery_state');
   await expectRejection(
     'missing payout discovery singleton',
@@ -889,7 +922,7 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     throw new Error(`[restore-verifier] invariant witness failures: ${failures.join('; ')}`);
   }
   console.info(
-    '[restore-verifier] payout, replay-child, refund-component, and combined-chronology witnesses passed'
+    '[restore-verifier] classification, payout, replay-child, refund-component, and combined-chronology witnesses passed'
   );
 }
 

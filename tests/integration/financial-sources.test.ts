@@ -8,7 +8,10 @@ import { reconcilePaymentFinancialSource } from '$lib/server/commerce/financial/
 import { reconcileRefundFinancialSource } from '$lib/server/commerce/financial/sources/refund';
 import { reconcileDisputeFinancialSource } from '$lib/server/commerce/financial/sources/dispute';
 import { stageBalanceTransaction } from '$lib/server/commerce/financial/ledger';
-import { observeFinancialIssue } from '$lib/server/commerce/financial/issues';
+import {
+  observeFinancialIssue,
+  resolveFinancialIssueAfterRecompute
+} from '$lib/server/commerce/financial/issues';
 import { replayFinancialClassification } from '$lib/server/commerce/financial/rebase';
 import {
   commitFinancialScanPage,
@@ -802,7 +805,38 @@ describe('refund and dispute financial sources', () => {
     };
   }
 
-  it('reconciles a finalized refund exactly once without projecting access, grants, or outbox', async () => {
+  async function resolveGlobalClassificationFork(balanceTransactionId: string, correlationId: string) {
+    await databaseClient.db.transaction((tx) => resolveFinancialIssueAfterRecompute(tx, {
+      resourceType: 'balance_transaction', resourceId: balanceTransactionId,
+      safeCode: 'classification_fork',
+      proof: {
+        status: 'resolved', resourceType: 'balance_transaction',
+        resourceId: balanceTransactionId, safeCode: 'classification_fork'
+      },
+      actor: { type: 'system', id: 'financial-worker' }, correlationId
+    }));
+  }
+
+  async function markActiveClassificationSucceeded(balanceTransactionId: string) {
+    const [balance] = await databaseClient.db.select().from(stripeBalanceTransactions).where(
+      eq(stripeBalanceTransactions.id, balanceTransactionId)
+    );
+    if (!balance) throw new Error('Expected active classification balance');
+    const spec = createFinancialClassificationSubjectJob({
+      subjectType: 'balance_transaction', subjectId: balance.id,
+      sourceFingerprintSha256: balance.fingerprintSha256,
+      classifierVersion: 1, allocationAlgorithmVersion: 1
+    });
+    const updated = await databaseClient.db.update(jobs).set({
+      status: 'succeeded', attempts: 1, completedAt: new Date(),
+      lockedAt: null, lockedBy: null, lastError: null
+    }).where(and(
+      eq(jobs.type, spec.type), eq(jobs.deduplicationKey, spec.deduplicationKey)
+    )).returning({ id: jobs.id });
+    expect(updated).toHaveLength(1);
+  }
+
+  it('reconciles a finalized refund idempotently, then fails closed and recovers', async () => {
     const fixture = await purchase();
     const refundCreatedAt = new Date('2026-08-10T13:00:00.000Z');
     const providerRefundId = `re_financial_${fixture.suffix}`;
@@ -861,6 +895,54 @@ describe('refund and dispute financial sources', () => {
       eq(financialAllocationSets.sourceKind, 'refund'),
       eq(financialAllocationSets.sourceInternalId, refund.id)
     ));
+    const refundBalanceTransactionId = sets[0]?.balanceTransactionId;
+    if (!refundBalanceTransactionId) throw new Error('Expected refund allocation balance');
+    await databaseClient.db.transaction((tx) => observeFinancialIssue(tx, {
+      resourceType: 'balance_transaction', resourceId: refundBalanceTransactionId,
+      safeCode: 'classification_fork', impact: 'exception',
+      actor: { type: 'system', id: 'financial-worker' },
+      correlationId: `refund-global-fork-${fixture.suffix}`
+    }));
+    await expect(reconcileRefundFinancialSource(databaseClient.db, stripe.gateway, {
+      refundId: refund.id, correlationId: `refund-blocked-${fixture.suffix}`
+    }, new AbortController().signal)).resolves.toMatchObject({
+      status: 'exception', safeCode: 'classification_fork'
+    });
+    const blockedSetIssues = await databaseClient.db.select().from(financialReconciliationIssues)
+      .where(and(
+        eq(financialReconciliationIssues.resourceType, 'allocation_set'),
+        inArray(financialReconciliationIssues.resourceId, sets.map((set) => set.id)),
+        eq(financialReconciliationIssues.safeCode, 'classification_fork')
+      ));
+    expect(blockedSetIssues).toHaveLength(2);
+    expect(blockedSetIssues.every((issue) => issue.state === 'open')).toBe(true);
+    const blockedHeads = await databaseClient.pool.query<{
+      is_complete: boolean; proposed_issue_code: string | null;
+    }>(`select is_complete, proposed_issue_code
+        from current_financial_projection_heads
+        where balance_transaction_id=$1
+        order by basis`, [refundBalanceTransactionId]);
+    expect(blockedHeads.rows).toHaveLength(2);
+    expect(blockedHeads.rows.every((head) => !head.is_complete &&
+      head.proposed_issue_code === 'classification_fork')).toBe(true);
+
+    await resolveGlobalClassificationFork(
+      refundBalanceTransactionId, `refund-resolve-global-${fixture.suffix}`
+    );
+    await markActiveClassificationSucceeded(refundBalanceTransactionId);
+    await expect(reconcileRefundFinancialSource(databaseClient.db, stripe.gateway, {
+      refundId: refund.id, correlationId: `refund-recover-${fixture.suffix}`
+    }, new AbortController().signal)).resolves.toMatchObject({
+      status: 'reconciled', financialEvidenceStatus: 'fee_reconciled'
+    });
+    expect(await databaseClient.db.select().from(financialReconciliationIssues).where(and(
+      eq(financialReconciliationIssues.resourceType, 'allocation_set'),
+      inArray(financialReconciliationIssues.resourceId, sets.map((set) => set.id)),
+      eq(financialReconciliationIssues.safeCode, 'classification_fork')
+    ))).toEqual(expect.arrayContaining([
+      expect.objectContaining({ state: 'resolved' }),
+      expect.objectContaining({ state: 'resolved' })
+    ]));
     const effects = await databaseClient.db.select({ effectMinor: financialItemAllocations.effectMinor })
       .from(financialItemAllocations).innerJoin(financialAllocationSets, eq(
         financialAllocationSets.id, financialItemAllocations.allocationSetId
@@ -873,7 +955,7 @@ describe('refund and dispute financial sources', () => {
     expect(await databaseClient.db.select().from(auditEvents).where(and(
       eq(auditEvents.action, 'financial.refund_reconciled'),
       eq(auditEvents.resourceId, refund.id)
-    ))).toHaveLength(1);
+    ))).toHaveLength(2);
     expect(await accessSnapshot(fixture)).toEqual(before);
   });
 
@@ -1052,7 +1134,7 @@ describe('refund and dispute financial sources', () => {
     ]));
   });
 
-  it('reconciles a dispute withdrawal exactly once without projecting access, grants, or outbox', async () => {
+  it('reconciles a dispute withdrawal idempotently, then fails closed and recovers', async () => {
     const fixture = await purchase();
     const disputeCreatedAt = new Date('2026-08-10T14:00:00.000Z');
     const providerDisputeId = `dp_financial_${fixture.suffix}`;
@@ -1068,7 +1150,7 @@ describe('refund and dispute financial sources', () => {
     stripe.harness.setDispute(disputeSnapshotFixture({
       providerDisputeId, paymentIntentId: fixture.provider.paymentIntentId,
       chargeId: fixture.provider.chargeId, amountMinor: 600,
-      providerCreatedAt: disputeCreatedAt, balanceTransactionIds: [providerBalanceId]
+      providerCreatedAt: disputeCreatedAt, balanceTransactionIds: []
     }));
     stripe.harness.setPayment(paymentSnapshotFixture({
       paymentIntentId: fixture.provider.paymentIntentId, metadataOrderId: fixture.orderId,
@@ -1086,6 +1168,21 @@ describe('refund and dispute financial sources', () => {
       feeDetails: [{ ordinal: 0, rawType: 'stripe_fee', amountMinor: 15, currency: 'USD' }]
     }));
 
+    const zeroTransaction = await reconcileDisputeFinancialSource(databaseClient.db, stripe.gateway, {
+      disputeId: dispute.id, correlationId: `dispute-zero-${fixture.suffix}`
+    }, new AbortController().signal);
+    expect(zeroTransaction).toMatchObject({
+      status: 'pending', safeCode: 'missing_source', issueId: expect.any(String)
+    });
+    expect(await databaseClient.db.select().from(financialAllocationSets).where(and(
+      eq(financialAllocationSets.sourceKind, 'dispute'),
+      eq(financialAllocationSets.sourceInternalId, dispute.id)
+    ))).toHaveLength(0);
+    stripe.harness.setDispute(disputeSnapshotFixture({
+      providerDisputeId, paymentIntentId: fixture.provider.paymentIntentId,
+      chargeId: fixture.provider.chargeId, amountMinor: 600,
+      providerCreatedAt: disputeCreatedAt, balanceTransactionIds: [providerBalanceId]
+    }));
     const first = await reconcileDisputeFinancialSource(databaseClient.db, stripe.gateway, {
       disputeId: dispute.id, correlationId: `dispute-first-${fixture.suffix}`
     }, new AbortController().signal);
@@ -1095,11 +1192,73 @@ describe('refund and dispute financial sources', () => {
     }, new AbortController().signal);
     expect(second).toEqual({ status: 'unchanged', sourceKind: 'dispute', sourceId: dispute.id,
       financialEvidenceStatus: 'fee_reconciled' });
-
+    const resolvedMissingSource = await databaseClient.db.select().from(financialReconciliationIssues)
+      .where(and(
+        eq(financialReconciliationIssues.resourceType, 'dispute'),
+        eq(financialReconciliationIssues.resourceId, dispute.id),
+        eq(financialReconciliationIssues.safeCode, 'missing_source')
+      ));
+    expect(resolvedMissingSource).toEqual([expect.objectContaining({
+      id: zeroTransaction.status === 'pending' ? zeroTransaction.issueId : undefined,
+      state: 'resolved', occurrenceCount: 1
+    })]);
     const sets = await databaseClient.db.select().from(financialAllocationSets).where(and(
       eq(financialAllocationSets.sourceKind, 'dispute'),
       eq(financialAllocationSets.sourceInternalId, dispute.id)
     ));
+    expect(await databaseClient.db.select().from(financialReconciliationIssues).where(and(
+      eq(financialReconciliationIssues.resourceType, 'allocation_set'),
+      inArray(financialReconciliationIssues.resourceId, sets.map((set) => set.id)),
+      eq(financialReconciliationIssues.safeCode, 'missing_source')
+    ))).toHaveLength(0);
+    const disputeBalanceTransactionId = sets[0]?.balanceTransactionId;
+    if (!disputeBalanceTransactionId) throw new Error('Expected dispute allocation balance');
+    await databaseClient.db.transaction((tx) => observeFinancialIssue(tx, {
+      resourceType: 'balance_transaction', resourceId: disputeBalanceTransactionId,
+      safeCode: 'classification_fork', impact: 'exception',
+      actor: { type: 'system', id: 'financial-worker' },
+      correlationId: `dispute-global-fork-${fixture.suffix}`
+    }));
+    await expect(reconcileDisputeFinancialSource(databaseClient.db, stripe.gateway, {
+      disputeId: dispute.id, correlationId: `dispute-blocked-${fixture.suffix}`
+    }, new AbortController().signal)).resolves.toMatchObject({
+      status: 'exception', safeCode: 'classification_fork'
+    });
+    const blockedSetIssues = await databaseClient.db.select().from(financialReconciliationIssues)
+      .where(and(
+        eq(financialReconciliationIssues.resourceType, 'allocation_set'),
+        inArray(financialReconciliationIssues.resourceId, sets.map((set) => set.id)),
+        eq(financialReconciliationIssues.safeCode, 'classification_fork')
+      ));
+    expect(blockedSetIssues).toHaveLength(2);
+    expect(blockedSetIssues.every((issue) => issue.state === 'open')).toBe(true);
+    const blockedHeads = await databaseClient.pool.query<{
+      is_complete: boolean; proposed_issue_code: string | null;
+    }>(`select is_complete, proposed_issue_code
+        from current_financial_projection_heads
+        where balance_transaction_id=$1
+        order by basis`, [disputeBalanceTransactionId]);
+    expect(blockedHeads.rows).toHaveLength(2);
+    expect(blockedHeads.rows.every((head) => !head.is_complete &&
+      head.proposed_issue_code === 'classification_fork')).toBe(true);
+
+    await resolveGlobalClassificationFork(
+      disputeBalanceTransactionId, `dispute-resolve-global-${fixture.suffix}`
+    );
+    await markActiveClassificationSucceeded(disputeBalanceTransactionId);
+    await expect(reconcileDisputeFinancialSource(databaseClient.db, stripe.gateway, {
+      disputeId: dispute.id, correlationId: `dispute-recover-${fixture.suffix}`
+    }, new AbortController().signal)).resolves.toMatchObject({
+      status: 'reconciled', financialEvidenceStatus: 'fee_reconciled'
+    });
+    expect(await databaseClient.db.select().from(financialReconciliationIssues).where(and(
+      eq(financialReconciliationIssues.resourceType, 'allocation_set'),
+      inArray(financialReconciliationIssues.resourceId, sets.map((set) => set.id)),
+      eq(financialReconciliationIssues.safeCode, 'classification_fork')
+    ))).toEqual(expect.arrayContaining([
+      expect.objectContaining({ state: 'resolved' }),
+      expect.objectContaining({ state: 'resolved' })
+    ]));
     const effects = await databaseClient.db.select({ effectMinor: financialItemAllocations.effectMinor })
       .from(financialItemAllocations).innerJoin(financialAllocationSets, eq(
         financialAllocationSets.id, financialItemAllocations.allocationSetId
@@ -1114,8 +1273,100 @@ describe('refund and dispute financial sources', () => {
     expect(await databaseClient.db.select().from(auditEvents).where(and(
       eq(auditEvents.action, 'financial.dispute_reconciled'),
       eq(auditEvents.resourceId, dispute.id)
-    ))).toHaveLength(1);
+    ))).toHaveLength(2);
     expect(await accessSnapshot(fixture)).toEqual(before);
+  });
+
+  it('retries when a sibling dispute balance joins the graph before authority enrollment', async () => {
+    const fixture = await purchase();
+    const primaryAt = new Date('2026-08-10T14:10:00.000Z');
+    const siblingAt = new Date('2026-08-10T14:11:00.000Z');
+    const primaryProviderDisputeId = `dp_graph_primary_${fixture.suffix}`;
+    const siblingProviderDisputeId = `dp_graph_sibling_${fixture.suffix}`;
+    const primaryProviderBalanceId = `txn_graph_primary_${fixture.suffix}`;
+    const siblingProviderBalanceId = `txn_graph_sibling_${fixture.suffix}`;
+    const [primary, sibling] = await databaseClient.db.insert(disputes).values([
+      {
+        paymentId: fixture.payment.id, stripeDisputeId: primaryProviderDisputeId,
+        status: 'open', amountMinor: 100, currency: 'USD', reason: 'fraudulent',
+        providerCreatedAt: primaryAt, providerUpdatedAt: primaryAt
+      },
+      {
+        paymentId: fixture.payment.id, stripeDisputeId: siblingProviderDisputeId,
+        status: 'open', amountMinor: 100, currency: 'USD', reason: 'fraudulent',
+        providerCreatedAt: siblingAt, providerUpdatedAt: siblingAt
+      }
+    ]).returning();
+    if (!primary || !sibling) throw new Error('Expected graph-race disputes');
+    const stripe = createFixtureStripeGateway();
+    stripe.harness.setDispute(disputeSnapshotFixture({
+      providerDisputeId: primaryProviderDisputeId,
+      paymentIntentId: fixture.provider.paymentIntentId,
+      chargeId: fixture.provider.chargeId, amountMinor: 100,
+      providerCreatedAt: primaryAt, balanceTransactionIds: [primaryProviderBalanceId]
+    }));
+    stripe.harness.setPayment(paymentSnapshotFixture({
+      paymentIntentId: fixture.provider.paymentIntentId, metadataOrderId: fixture.orderId,
+      latestChargeId: fixture.provider.chargeId, amountMinor: 1400, paidAt: fixture.paidAt
+    }));
+    stripe.harness.setCharge(chargeSnapshotFixture({
+      id: fixture.provider.chargeId, paymentIntentId: fixture.provider.paymentIntentId,
+      amountMinor: 1400, currency: 'USD', balanceTransactionId: `txn_charge_${fixture.suffix}`,
+      createdAt: fixture.paidAt
+    }));
+    stripe.harness.setBalanceTransaction(balanceTransactionSnapshotFixture({
+      id: primaryProviderBalanceId, sourceId: primaryProviderDisputeId,
+      sourceFamily: 'dispute', rawType: 'adjustment', reportingCategory: 'dispute',
+      amountMinor: -100, feeMinor: 0, netMinor: -100, currency: 'USD',
+      createdAt: primaryAt, feeDetails: []
+    }));
+
+    const mainTransactionEntered = deferred<void>();
+    const releaseMainTransaction = deferred<void>();
+    let transactionCount = 0;
+    const pausedDatabase = new Proxy(databaseClient.db, {
+      get(target, property, receiver) {
+        if (property === 'transaction') {
+          return async (work: Parameters<Database['transaction']>[0]) => {
+            transactionCount += 1;
+            if (transactionCount === 2) {
+              mainTransactionEntered.resolve();
+              await releaseMainTransaction.promise;
+            }
+            return target.transaction(work);
+          };
+        }
+        const value = Reflect.get(target, property, receiver) as unknown;
+        return typeof value === 'function' ? value.bind(target) : value;
+      }
+    }) as Database;
+    const running = reconcileDisputeFinancialSource(pausedDatabase, stripe.gateway, {
+      disputeId: primary.id, correlationId: `dispute-graph-race-${fixture.suffix}`
+    }, new AbortController().signal);
+
+    await mainTransactionEntered.promise;
+    try {
+      await stageBalanceTransaction(databaseClient.db, balanceTransactionSnapshotFixture({
+        id: siblingProviderBalanceId, sourceId: siblingProviderDisputeId,
+        sourceFamily: 'dispute', rawType: 'adjustment', reportingCategory: 'dispute',
+        amountMinor: -100, feeMinor: 0, netMinor: -100, currency: 'USD',
+        createdAt: siblingAt, feeDetails: []
+      }), { correlationId: `dispute-graph-sibling-stage-${fixture.suffix}` });
+    } finally {
+      releaseMainTransaction.resolve();
+    }
+
+    await expect(running).rejects.toMatchObject({
+      name: 'RetryableFinancialError', safeCode: 'state_changed'
+    });
+    expect(transactionCount).toBe(2);
+    expect(await databaseClient.db.select().from(financialAllocationSets).where(and(
+      eq(financialAllocationSets.sourceKind, 'dispute'),
+      inArray(financialAllocationSets.sourceInternalId, [primary.id, sibling.id])
+    ))).toHaveLength(0);
+    expect(await databaseClient.db.select().from(stripeBalanceTransactions).where(inArray(
+      stripeBalanceTransactions.providerId, [primaryProviderBalanceId, siblingProviderBalanceId]
+    ))).toHaveLength(2);
   });
 
   it('persists a dispute fee credit as a gross-basis tip without a cross-basis reversal', async () => {

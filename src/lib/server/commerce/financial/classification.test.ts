@@ -185,6 +185,8 @@ describe('appendClassificationDecisionLocked', () => {
     expect(rendered(database.calls[2]!).sql).toContain('for update');
     const audit = rendered(database.calls[4]!);
     expect(audit.sql).toContain('financial.classification.appended');
+    expect(audit.params).toContain(row().id);
+    expect(audit.params).not.toContain(SUBJECT_ID);
     expect(audit.params).not.toContain(FINGERPRINT);
     expect(audit.params).toContain(JSON.stringify({ subjectType: 'balance_transaction', classification: 'charge', classifierVersion: 1 }));
   });

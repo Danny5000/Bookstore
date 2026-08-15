@@ -330,5 +330,12 @@ describe('job claim policy', () => {
       '2',
       '3'
     ]));
+    expect(claim.sql).not.toContain('active_predecessor_job');
+    expect(claim.sql).toMatch(
+      /financial_projection_versions cleanup_authority[\s\S]+?cleanup_authority\.classifier_version[\s\S]+?cleanup_authority\.allocation_algorithm_version/u
+    );
+    expect(claim.sql).toMatch(
+      /cleanup_authority\.classifier_version\s*=\s*\$\d+[\s\S]+?cleanup_authority\.pending_classifier_version\s*=\s*\$\d+/u
+    );
   });
 });

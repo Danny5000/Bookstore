@@ -46,13 +46,6 @@ export function createFinancialClassificationHandler(
         throw new PermanentFinancialError('invalid_job_payload');
       }
       payload = identity.payload;
-      if (
-        payload.classifierVersion !== replayDependencies.targetClassifierVersion ||
-        payload.allocationAlgorithmVersion !==
-          replayDependencies.targetAllocationAlgorithmVersion
-      ) {
-        throw new PermanentFinancialError('invalid_job_payload');
-      }
     } catch {
       throw new PermanentJobError('Invalid financial classification job payload.');
     }

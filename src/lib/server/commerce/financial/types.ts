@@ -109,6 +109,7 @@ export type CurrentEffectiveAllocationProjection =
         | 'correction_rebase_required'
         | 'currency_mismatch'
         | 'immutable_mismatch'
+        | 'source_linkage_mismatch'
         | 'unsupported_category';
     };
 
@@ -330,8 +331,15 @@ export type ClassificationReplayResult =
   | { readonly status: 'unchanged'; readonly subjectId: string }
   | { readonly status: 'replayed'; readonly subjectId: string; readonly allocationSetIds: readonly string[] }
   | {
+      readonly status: 'blocking_exception';
+      readonly subjectId: string;
+      readonly safeCode: FinancialIssueCode;
+      readonly impact: 'pending' | 'exception';
+      readonly issueId: string | null;
+    }
+  | {
       readonly status: 'exception';
       readonly subjectId: string;
       readonly safeCode: 'classification_fork' | 'correction_rebase_required';
-      readonly issueId: string;
+      readonly issueId: string | null;
     };

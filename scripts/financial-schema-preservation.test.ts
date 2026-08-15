@@ -264,6 +264,8 @@ describe('Plan 6B financial schema preservation', () => {
 
   it('keeps every durable financial-history guard attached in migration 0007', () => {
     const migration = source('../drizzle/0007_plan6b_financial_reconciliation.sql');
+    const schema = source('../src/lib/server/db/schema/financial-allocation.ts');
+    const snapshot = source('../drizzle/meta/0007_snapshot.json');
 
     expect(migration).toMatch(/create\s+(?:or\s+replace\s+)?function/iu);
     expect(migration).toMatch(/raise\s+exception[\s\S]+?errcode\s*=\s*'55000'/iu);
@@ -281,8 +283,41 @@ describe('Plan 6B financial schema preservation', () => {
     expect(migration).toMatch(/occurrence_count/iu);
     expect(migration).toMatch(/resolved_at/iu);
     expect(migration).toContain('CREATE FUNCTION "public"."resolve_financial_reconciliation_issue"');
-    expect(migration).toContain("set_config('pale_orbit.financial_issue_resolution', p_issue_id::text, true)");
+    const resolver = migration.slice(
+      migration.indexOf('CREATE FUNCTION "public"."resolve_financial_reconciliation_issue"'),
+      migration.indexOf('CREATE FUNCTION "public"."plan6b_validate_issue_transition"')
+    );
+    expect(resolver).toMatch(
+      /p_issue_id uuid,\s+p_resolved_by_admin_id uuid,\s+p_actor_type "public"\."audit_actor_type",\s+p_actor_id text,\s+p_correlation_id text/iu
+    );
+    expect(resolver).toContain('FROM "public"."financial_reconciliation_issues" issue');
+    expect(resolver).toContain('UPDATE "public"."financial_reconciliation_issues"');
+    expect(resolver).toContain('INSERT INTO "public"."audit_events"');
+    expect(resolver).toContain("char_length(p_actor_id) NOT BETWEEN 1 AND 100");
+    expect(resolver).toContain("char_length(p_correlation_id) NOT BETWEEN 1 AND 100");
+    expect(resolver.indexOf("immutable classification diagnostics cannot be resolved"))
+      .toBeLessThan(resolver.indexOf("set_config('pale_orbit.financial_issue_resolution'"));
+    expect(resolver.indexOf('UPDATE "public"."financial_reconciliation_issues"'))
+      .toBeLessThan(resolver.indexOf('INSERT INTO "public"."audit_events"'));
+    expect(resolver).toContain("'financial.issue.resolved'");
+    expect(resolver).toContain("'financial_issue'");
+    expect(resolver).toContain("set_config('pale_orbit.financial_issue_resolution', p_issue_id::text, true)");
     expect(migration).toContain("current_setting('pale_orbit.financial_issue_resolution', true) IS DISTINCT FROM OLD.id::text");
+    expect(migration).toContain('GET DIAGNOSTICS call_context = PG_CONTEXT');
+    expect(migration).toContain(
+      "call_context !~ E'(^|\\\\n)PL/pgSQL function resolve_financial_reconciliation_issue\\\\(uuid,uuid,audit_actor_type,text,text\\\\) line [0-9]+ at SQL statement($|\\\\n)'"
+    );
+    expect(migration).toContain('CREATE FUNCTION "public"."plan6b_validate_issue_insert"');
+    expect(migration).toMatch(
+      /CREATE TRIGGER "financial_reconciliation_issues_validate_insert" BEFORE INSERT ON "financial_reconciliation_issues"/u
+    );
+    expect(migration).toContain('financial_reconciliation_issues_immutable_classification_open');
+    expect(schema).toMatch(
+      /table\.resourceType[^\n]+financial_classification[^\n]+table\.safeCode[^\n]+unsupported_category[^\n]+table\.state[^\n]+open/u
+    );
+    expect(snapshot).toMatch(
+      /resource_type[^\n]+financial_classification[^\n]+safe_code[^\n]+unsupported_category[^\n]+state[^\n]+open/iu
+    );
   });
 
   it('binds every dispute presentment row to its exact dispute gross allocation set', () => {

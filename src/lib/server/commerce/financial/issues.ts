@@ -7,7 +7,7 @@ import { sql, type SQL } from 'drizzle-orm';
 export type FinancialIssueResourceType =
   | 'payment' | 'refund' | 'dispute' | 'payout' | 'payout_import_run'
   | 'balance_transaction' | 'fee_detail' | 'allocation_set' | 'correction_set'
-  | 'financial_scan_run';
+  | 'financial_classification' | 'financial_scan_run';
 
 export type FinancialIssueActor = Extract<Actor, { type: 'system' | 'user' }>;
 
@@ -43,7 +43,8 @@ export interface ResolveFinancialIssueInput extends FinancialIssueIdentity {
 
 const RESOURCE_TYPES = new Set<FinancialIssueResourceType>([
   'payment', 'refund', 'dispute', 'payout', 'payout_import_run', 'balance_transaction',
-  'fee_detail', 'allocation_set', 'correction_set', 'financial_scan_run'
+  'fee_detail', 'allocation_set', 'correction_set', 'financial_classification',
+  'financial_scan_run'
 ]);
 const SAFE_CODES = new Set<FinancialIssueCode>([
   'allocation_fork', 'allocation_incomplete', 'allocation_mismatch', 'classification_fork',
@@ -204,6 +205,10 @@ export async function resolveFinancialIssueAfterRecompute(
   input: ResolveFinancialIssueInput
 ): Promise<FinancialIssueRow | null> {
   assertResolveInput(input);
+  if (input.resourceType === 'financial_classification' &&
+    input.safeCode === 'unsupported_category' && input.proof.status === 'resolved') {
+    unsupportedEvidence();
+  }
   if (input.proof.status === 'still_open') return null;
   const current = await lockCurrentOpen(tx, input);
   if (!current) return null;
@@ -213,10 +218,10 @@ export async function resolveFinancialIssueAfterRecompute(
       state, impact, first_observed_at as "firstObservedAt", last_observed_at as "lastObservedAt",
       occurrence_count as "occurrenceCount", correlation_id as "correlationId",
       resolved_by_admin_id as "resolvedByAdminId", resolved_at as "resolvedAt"
-    from "public"."resolve_financial_reconciliation_issue"(${current.id}, ${resolvedByAdminId})
+    from "public"."resolve_financial_reconciliation_issue"(
+      ${current.id}, ${resolvedByAdminId}, ${input.actor.type}, ${input.actor.id}, ${input.correlationId}
+    )
   `);
   if (!updated[0]) return null;
-  const row = issueRow(updated[0]);
-  await appendIssueAudit(tx, input.actor, 'financial.issue.resolved', row, input.correlationId);
-  return row;
+  return issueRow(updated[0]);
 }

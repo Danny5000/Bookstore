@@ -918,7 +918,7 @@ async function expectMutationRejected(
 }
 
 async function expectConstraintRejected(
-  pool: Pool,
+  pool: Pool | PoolClient,
   statement: string,
   values: unknown[],
   label: string
@@ -970,6 +970,27 @@ async function seedGuardRows(pool: Pool, fixture: LegacyFixture): Promise<Record
        values ('balance_transaction', $1, 1, 'charge', repeat('d', 64))
        returning id`,
       [transaction.id]
+    )
+  ).id;
+  ids.unknownClassification = (
+    await one<{ id: string }>(
+      pool,
+      `insert into financial_classification_versions
+         (subject_type, subject_id, classifier_version, classification,
+          source_fingerprint_sha256)
+       values ('fee_detail', $1, 1, 'unknown', repeat('e', 64))
+       returning id`,
+      [ids.feeDetail]
+    )
+  ).id;
+  ids.immutableIssue = (
+    await one<{ id: string }>(
+      pool,
+      `insert into financial_reconciliation_issues
+         (resource_type, resource_id, safe_code, impact, correlation_id)
+       values ('financial_classification', $1, 'unsupported_category', 'exception', $2)
+       returning id`,
+      [ids.unknownClassification, randomUUID()]
     )
   ).id;
   ids.allocationSet = (
@@ -1249,10 +1270,68 @@ async function assertHistoryGuards(pool: Pool, fixture: LegacyFixture): Promise<
     [ids.issue],
     'issues cannot bypass the guarded resolver'
   );
-  await pool.query(
-    `select * from resolve_financial_reconciliation_issue($1, $2)`,
-    [ids.issue, fixture.userId]
+  await expectMutationRejected(
+    pool,
+    `select * from public.resolve_financial_reconciliation_issue($1, $2, $3, $4, $5)`,
+    [ids.immutableIssue, fixture.userId, 'user', fixture.userId,
+      'migration-immutable-resolution'],
+    'immutable classification issues cannot use the resolver'
   );
+  await expectMutationRejected(
+    pool,
+    `insert into financial_reconciliation_issues
+       (resource_type, resource_id, safe_code, state, impact, occurrence_count,
+        correlation_id, resolved_at)
+     values ('financial_scan_run', $1, 'missing_source', 'resolved', 'pending', 1, $2,
+       clock_timestamp())`,
+    [randomUUID(), 'migration-resolved-insert'],
+    'issues cannot be inserted resolved'
+  );
+  const replica = await pool.connect();
+  try {
+    await replica.query('begin');
+    await replica.query('set local session_replication_role = replica');
+    await expectConstraintRejected(
+      replica,
+      `update financial_reconciliation_issues
+       set state = 'resolved', resolved_at = clock_timestamp()
+       where id = $1`,
+      [ids.immutableIssue],
+      'the immutable classification CHECK survives disabled triggers'
+    );
+    await replica.query('rollback');
+  } finally {
+    replica.release();
+  }
+  const resolutionCorrelationId = 'migration-direct-resolution';
+  await pool.query(
+    `select * from public.resolve_financial_reconciliation_issue($1, $2, $3, $4, $5)`,
+    [ids.issue, fixture.userId, 'user', fixture.userId, resolutionCorrelationId]
+  );
+  const resolvedAudit = await one<{
+    actor_type: string;
+    actor_id: string;
+    resource_type: string;
+    resource_id: string;
+    correlation_id: string;
+    after: Record<string, unknown>;
+  }>(
+    pool,
+    `select actor_type, actor_id, resource_type, resource_id, correlation_id, after
+     from audit_events
+     where action = 'financial.issue.resolved' and resource_id = $1`,
+    [ids.issue]
+  );
+  equal(resolvedAudit.actor_type, 'user', 'direct resolver audit preserves the actor type');
+  equal(resolvedAudit.actor_id, fixture.userId, 'direct resolver audit preserves the actor ID');
+  equal(resolvedAudit.resource_type, 'financial_issue', 'direct resolver audit uses the canonical resource');
+  equal(resolvedAudit.resource_id, ids.issue, 'direct resolver audit names the resolved issue');
+  equal(resolvedAudit.correlation_id, resolutionCorrelationId,
+    'direct resolver audit preserves the correlation ID');
+  equal(resolvedAudit.after, {
+    state: 'resolved', impact: 'pending', safeCode: 'missing_source',
+    resourceId: fixture.paymentIds.reconciled, resourceType: 'payment', occurrenceCount: 2
+  }, 'direct resolver audit contains only canonical safe issue fields');
   await expectMutationRejected(
     pool,
     `delete from financial_reconciliation_issues where id = $1`,

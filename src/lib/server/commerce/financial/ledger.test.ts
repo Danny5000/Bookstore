@@ -251,6 +251,26 @@ describe('stageBalanceTransaction orchestration', () => {
     expect(audit!.params).not.toContain('txn_test_ledger_101');
   });
 
+  it('keys unsupported evidence to the immutable classification row', async () => {
+    const classificationId = '44444444-4444-4444-8444-444444444444';
+    collaborators.appendClassificationDecisionLocked.mockResolvedValue({ id: classificationId });
+    collaborators.observeFinancialIssue.mockResolvedValue({ id: 'issue' });
+    const fake = database([[], [], [{ id: PARENT_ID }], [{ id: 'fee-0' }],
+      [{ id: 'fee-1' }], []]);
+
+    await expect(stageBalanceTransaction(fake.database, snapshot({
+      reportingCategory: 'future'
+    }), { correlationId: 'ledger-unknown-classification-row' }))
+      .resolves.toMatchObject({ disposition: 'inserted' });
+
+    expect(collaborators.observeFinancialIssue).toHaveBeenCalledWith(fake.tx, {
+      resourceType: 'financial_classification', resourceId: classificationId,
+      safeCode: 'unsupported_category', impact: 'exception',
+      actor: { type: 'system', id: 'financial-worker' },
+      correlationId: 'ledger-unknown-classification-row'
+    });
+  });
+
   it('returns unchanged exact evidence but advances only pending to available', async () => {
     const stored = { id: PARENT_ID, providerId: 'txn_test_ledger_101', liveMode: false, sourceFamily: 'charge', sourceId: 'ch_test_ledger_101', rawType: 'charge', reportingCategory: 'charge', balanceType: 'payments', amountMinor: 1403, feeMinor: 71, netMinor: 1332, currency: 'USD', status: 'pending', providerCreatedAt: new Date('2026-08-01T00:00:00.000Z'), availableAt: new Date('2026-08-03T00:00:00.000Z'), exchangeRate: '1.23', exchangeSourceCurrency: 'EUR', exchangeTargetCurrency: 'USD', fingerprintSha256: fingerprintBalanceTransaction(snapshot()) };
     collaborators.appendClassificationDecisionLocked.mockResolvedValue({ id: 'classification' });

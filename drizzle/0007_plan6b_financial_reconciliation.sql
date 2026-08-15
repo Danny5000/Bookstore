@@ -107,6 +107,7 @@ CREATE TABLE "financial_reconciliation_issues" (
 	"resolved_at" timestamp with time zone,
 	CONSTRAINT "financial_reconciliation_issues_occurrence_positive" CHECK ("financial_reconciliation_issues"."occurrence_count" > 0),
 	CONSTRAINT "financial_reconciliation_issues_resolution_consistent" CHECK (("financial_reconciliation_issues"."state" = 'resolved') = ("financial_reconciliation_issues"."resolved_at" is not null) and ("financial_reconciliation_issues"."resolved_by_admin_id" is null or "financial_reconciliation_issues"."state" = 'resolved')),
+	CONSTRAINT "financial_reconciliation_issues_immutable_classification_open" CHECK ("financial_reconciliation_issues"."resource_type" <> 'financial_classification' or "financial_reconciliation_issues"."safe_code" <> 'unsupported_category' or "financial_reconciliation_issues"."state" = 'open'),
 	CONSTRAINT "financial_reconciliation_issues_safe_vocabulary" CHECK ("financial_reconciliation_issues"."resource_type" ~ '^[a-z0-9_]{1,50}$' and "financial_reconciliation_issues"."safe_code" ~ '^[a-z0-9_]{1,100}$' and char_length("financial_reconciliation_issues"."correlation_id") between 1 and 100),
 	CONSTRAINT "financial_reconciliation_issues_observation_order" CHECK ("financial_reconciliation_issues"."last_observed_at" >= "financial_reconciliation_issues"."first_observed_at")
 );
@@ -967,6 +968,20 @@ CREATE VIEW "public"."current_financial_projection_heads" AS (
     select classifier_version, allocation_algorithm_version
     from "financial_projection_versions"
     where singleton = true
+  ), active_classification_job_markers as (
+    select bt.id as balance_transaction_id,
+      count(classification_job.id)::integer as marker_count
+    from "stripe_balance_transactions" bt
+    cross join active_projection_version
+    left join "jobs" classification_job
+      on classification_job.type = 'commerce.financial-classification'
+      and classification_job.deduplication_key =
+        'financial:classification:' || active_projection_version.classifier_version::text ||
+        ':' || active_projection_version.allocation_algorithm_version::text ||
+        ':balance_transaction:' || bt.id::text || ':' || bt.fingerprint_sha256
+      and classification_job.status <> 'succeeded'
+    group by bt.id, active_projection_version.classifier_version,
+      active_projection_version.allocation_algorithm_version
   ), current_parent_classification_candidates as (
     select
       bt.id as balance_transaction_id,
@@ -1387,33 +1402,26 @@ CREATE VIEW "public"."current_financial_projection_heads" AS (
     join "financial_allocation_sets" source on source.id = item.source_allocation_set_id
     where item.domain = 'settlement'
     group by item.source_allocation_set_id, item.correction_set_id
-  ), open_correction_rebase_issues as (
+  ), open_classification_fork_issues as (
     select issue.resource_id as balance_transaction_id, count(*)::integer as issue_count
     from "financial_reconciliation_issues" issue
-    where issue.resource_type = 'balance_transaction'
-      and issue.safe_code = 'correction_rebase_required'
+    where issue.safe_code = 'classification_fork'
+      and issue.resource_type = 'balance_transaction'
       and issue.state = 'open'
       and issue.impact = 'exception'
     group by issue.resource_id
-  ), open_classification_fork_issues as (
-    select affected.balance_transaction_id, count(*)::integer as issue_count
-    from (
-      select issue.resource_id as balance_transaction_id
-      from "financial_reconciliation_issues" issue
-      where issue.safe_code = 'classification_fork'
-        and issue.resource_type = 'balance_transaction'
-        and issue.state = 'open'
-        and issue.impact = 'exception'
-      union all
-      select detail.balance_transaction_id
-      from "financial_reconciliation_issues" issue
-      join "stripe_balance_transaction_fee_details" detail on detail.id = issue.resource_id
-      where issue.safe_code = 'classification_fork'
-        and issue.resource_type = 'fee_detail'
-        and issue.state = 'open'
-        and issue.impact = 'exception'
-    ) affected
-    group by affected.balance_transaction_id
+  ), open_allocation_set_issues as (
+    select issue.resource_id as allocation_set_id,
+      count(*)::integer as issue_count,
+      (array_agg(issue.safe_code order by
+        case when issue.impact = 'exception' then 0 else 1 end,
+        issue.safe_code collate "C", issue.id))[1]::varchar(100)
+        as issue_code
+    from "financial_reconciliation_issues" issue
+    where issue.resource_type = 'allocation_set'
+      and issue.state = 'open'
+      and issue.impact <> 'informational'
+    group by issue.resource_id
   ), resolved as (
     select
       base.*,
@@ -1427,8 +1435,10 @@ CREATE VIEW "public"."current_financial_projection_heads" AS (
       coalesce(correction_items.item_count, 0) as correction_item_count,
       coalesce(correction_items.item_effect_sum, 0::bigint) as correction_item_effect_sum,
       coalesce(correction_items.currency_mismatch_count, 0) as correction_item_currency_mismatch_count,
-      coalesce(rebase_issue.issue_count, 0) as correction_rebase_issue_count,
-      coalesce(classification_issue.issue_count, 0) as classification_fork_issue_count
+      coalesce(classification_issue.issue_count, 0) as classification_fork_issue_count,
+      coalesce(selected_set_issue.issue_count, 0) as selected_set_issue_count,
+      selected_set_issue.issue_code as selected_set_issue_code,
+      coalesce(active_job.marker_count, 0) as active_job_marker_count
     from base_rollup base
     left join base_item_rollup items on items.base_set_id = base.base_set_id
     left join correction_status correction
@@ -1437,32 +1447,40 @@ CREATE VIEW "public"."current_financial_projection_heads" AS (
     left join correction_item_rollup correction_items
       on correction_items.base_set_id = base.base_set_id
       and correction_items.correction_set_id = correction.correction_tip_id
-    left join open_correction_rebase_issues rebase_issue
-      on rebase_issue.balance_transaction_id = base.balance_transaction_id
     left join open_classification_fork_issues classification_issue
       on classification_issue.balance_transaction_id = base.balance_transaction_id
+    left join open_allocation_set_issues selected_set_issue
+      on selected_set_issue.allocation_set_id = base.base_set_id
+    left join active_classification_job_markers active_job
+      on active_job.balance_transaction_id = base.balance_transaction_id
   )
   select
     balance_transaction_id,
     basis,
-    case when base_count = 1 and correction_rebase_issue_count = 0 and
-      classification_fork_issue_count = 0
+    case when base_count = 1 and classification_fork_issue_count = 0 and
+      selected_set_issue_count = 0 and
+      active_job_marker_count = 0
       then base_set_id else null::uuid end as base_set_id,
-    case when base_count = 1 and correction_rebase_issue_count = 0 and
-      classification_fork_issue_count = 0 and
+    case when base_count = 1 and classification_fork_issue_count = 0 and
+      selected_set_issue_count = 0 and
+      active_job_marker_count = 0 and
       correction_count = 1 and correction_is_compatible
       then correction_tip_id else null::uuid end as compatible_correction_tip_id,
-    case when base_count = 1 and correction_rebase_issue_count = 0 and
-      classification_fork_issue_count = 0
+    case when base_count = 1 and classification_fork_issue_count = 0 and
+      selected_set_issue_count = 0 and
+      active_job_marker_count = 0
       then scope else null::financial_allocation_scope end as scope,
-    case when base_count = 1 and correction_rebase_issue_count = 0 and
-      classification_fork_issue_count = 0
+    case when base_count = 1 and classification_fork_issue_count = 0 and
+      selected_set_issue_count = 0 and
+      active_job_marker_count = 0
       then currency else null::varchar(3) end as currency,
-    case when base_count = 1 and correction_rebase_issue_count = 0 and
-      classification_fork_issue_count = 0
+    case when base_count = 1 and classification_fork_issue_count = 0 and
+      selected_set_issue_count = 0 and
+      active_job_marker_count = 0
       then expected_effect_minor else null::integer end as expected_effect_minor,
     (
-      correction_rebase_issue_count = 0 and classification_fork_issue_count = 0 and
+      classification_fork_issue_count = 0 and selected_set_issue_count = 0 and
+      active_job_marker_count = 0 and
       base_count = 1 and
       scope <> 'unresolved'::financial_allocation_scope and
       parent_decision_count = 1 and parent_unknown_count = 0 and
@@ -1484,8 +1502,9 @@ CREATE VIEW "public"."current_financial_projection_heads" AS (
         )
       )
     )::boolean as is_complete,
-    case when correction_rebase_issue_count > 0 then 1
+    case when selected_set_issue_count > 0 then 1
     when classification_fork_issue_count > 0 then 1
+    when active_job_marker_count > 0 then 1
     when
       base_count = 1 and scope <> 'unresolved'::financial_allocation_scope and
       parent_decision_count = 1 and parent_unknown_count = 0 and
@@ -1507,8 +1526,9 @@ CREATE VIEW "public"."current_financial_projection_heads" AS (
         )
       ) then 0 else 1 end::integer as missing_source_count,
     case
-      when correction_rebase_issue_count > 0 then 'correction_rebase_required'::varchar(100)
+      when selected_set_issue_count > 0 then selected_set_issue_code
       when classification_fork_issue_count > 0 then 'classification_fork'::varchar(100)
+      when active_job_marker_count > 0 then 'missing_source'::varchar(100)
       when parent_decision_count = 0 then 'missing_source'::varchar(100)
       when parent_decision_count > 1 then 'classification_fork'::varchar(100)
       when parent_unknown_count > 0 then 'unsupported_category'::varchar(100)
@@ -1778,33 +1798,88 @@ $$;--> statement-breakpoint
 CREATE TRIGGER "refund_allocation_draft_items_validate_insert" BEFORE INSERT ON "refund_allocation_draft_items" FOR EACH ROW EXECUTE FUNCTION "public"."plan6b_validate_refund_draft_item_insert"();--> statement-breakpoint
 CREATE FUNCTION "public"."resolve_financial_reconciliation_issue"(
   p_issue_id uuid,
-  p_resolved_by_admin_id uuid
+  p_resolved_by_admin_id uuid,
+  p_actor_type "public"."audit_actor_type",
+  p_actor_id text,
+  p_correlation_id text
 ) RETURNS SETOF "public"."financial_reconciliation_issues"
 LANGUAGE plpgsql AS $$
+DECLARE
+  current_issue "public"."financial_reconciliation_issues"%ROWTYPE;
+  resolved_issue "public"."financial_reconciliation_issues"%ROWTYPE;
 BEGIN
+  IF p_actor_type IS NULL OR p_actor_type NOT IN ('system', 'user') OR
+    p_actor_id IS NULL OR char_length(p_actor_id) NOT BETWEEN 1 AND 100 OR
+    p_correlation_id IS NULL OR char_length(p_correlation_id) NOT BETWEEN 1 AND 100 OR
+    (p_actor_type = 'user' AND (
+      p_resolved_by_admin_id IS NULL OR p_actor_id IS DISTINCT FROM p_resolved_by_admin_id::text
+    )) OR
+    (p_actor_type = 'system' AND p_resolved_by_admin_id IS NOT NULL) THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'invalid financial issue resolver actor';
+  END IF;
+  SELECT * INTO current_issue
+  FROM "public"."financial_reconciliation_issues" issue
+  WHERE issue.id = p_issue_id
+  FOR UPDATE;
+  IF NOT FOUND OR current_issue.state <> 'open' THEN
+    RETURN;
+  END IF;
+  IF current_issue.resource_type = 'financial_classification'
+    AND current_issue.safe_code = 'unsupported_category' THEN
+    RAISE EXCEPTION USING ERRCODE = '55000',
+      MESSAGE = 'immutable classification diagnostics cannot be resolved';
+  END IF;
   PERFORM set_config('pale_orbit.financial_issue_resolution', p_issue_id::text, true);
-  RETURN QUERY
-  UPDATE "financial_reconciliation_issues"
+  UPDATE "public"."financial_reconciliation_issues"
   SET "state" = 'resolved', "resolved_at" = now(), "resolved_by_admin_id" = p_resolved_by_admin_id
   WHERE "id" = p_issue_id AND "state" = 'open'
-  RETURNING *;
+  RETURNING * INTO resolved_issue;
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+  INSERT INTO "public"."audit_events" (
+    actor_type, actor_id, action, outcome, resource_type, resource_id, correlation_id, after
+  ) VALUES (
+    p_actor_type, p_actor_id, 'financial.issue.resolved', 'succeeded', 'financial_issue',
+    resolved_issue.id::text, p_correlation_id,
+    jsonb_build_object(
+      'resourceType', resolved_issue.resource_type,
+      'resourceId', resolved_issue.resource_id,
+      'safeCode', resolved_issue.safe_code,
+      'impact', resolved_issue.impact,
+      'state', resolved_issue.state,
+      'occurrenceCount', resolved_issue.occurrence_count
+    )
+  );
+  RETURN NEXT resolved_issue;
+  RETURN;
 END;
 $$;--> statement-breakpoint
 CREATE FUNCTION "public"."plan6b_validate_issue_transition"() RETURNS trigger
 LANGUAGE plpgsql AS $$
+DECLARE
+  call_context text;
 BEGIN
   IF TG_OP = 'DELETE' THEN
     RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'financial issue history cannot be deleted';
   END IF;
+  IF OLD.resource_type = 'financial_classification'
+    AND OLD.safe_code = 'unsupported_category'
+    AND NEW.state <> 'open' THEN
+    RAISE EXCEPTION USING ERRCODE = '55000',
+      MESSAGE = 'immutable classification diagnostics cannot be resolved';
+  END IF;
   IF OLD.state = 'resolved' THEN
     RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'resolved financial issue history is immutable';
   END IF;
-  IF NEW.state = 'resolved' AND (
-    current_setting('pale_orbit.financial_issue_resolution', true) IS DISTINCT FROM OLD.id::text OR
-    NEW.resolved_at IS NULL OR NEW.occurrence_count <> OLD.occurrence_count OR
-    NEW.last_observed_at IS DISTINCT FROM OLD.last_observed_at
-  ) THEN
-    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'financial issue resolution requires the guarded resolver';
+  IF NEW.state = 'resolved' THEN
+    GET DIAGNOSTICS call_context = PG_CONTEXT;
+    IF current_setting('pale_orbit.financial_issue_resolution', true) IS DISTINCT FROM OLD.id::text OR
+      call_context !~ E'(^|\\n)PL/pgSQL function resolve_financial_reconciliation_issue\\(uuid,uuid,audit_actor_type,text,text\\) line [0-9]+ at SQL statement($|\\n)' OR
+      NEW.resolved_at IS NULL OR NEW.occurrence_count <> OLD.occurrence_count OR
+      NEW.last_observed_at IS DISTINCT FROM OLD.last_observed_at THEN
+      RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'financial issue resolution requires the guarded resolver';
+    END IF;
   END IF;
   IF NEW.id IS DISTINCT FROM OLD.id OR NEW.resource_type IS DISTINCT FROM OLD.resource_type OR
      NEW.resource_id IS DISTINCT FROM OLD.resource_id OR NEW.safe_code IS DISTINCT FROM OLD.safe_code OR
@@ -1817,6 +1892,16 @@ BEGIN
   RETURN NEW;
 END;
 $$;--> statement-breakpoint
+CREATE FUNCTION "public"."plan6b_validate_issue_insert"() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.state <> 'open' OR NEW.resolved_at IS NOT NULL OR NEW.resolved_by_admin_id IS NOT NULL THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'financial issues must be inserted open';
+  END IF;
+  RETURN NEW;
+END;
+$$;--> statement-breakpoint
+CREATE TRIGGER "financial_reconciliation_issues_validate_insert" BEFORE INSERT ON "financial_reconciliation_issues" FOR EACH ROW EXECUTE FUNCTION "public"."plan6b_validate_issue_insert"();--> statement-breakpoint
 CREATE TRIGGER "financial_reconciliation_issues_narrow_update" BEFORE UPDATE OR DELETE ON "financial_reconciliation_issues" FOR EACH ROW EXECUTE FUNCTION "public"."plan6b_validate_issue_transition"();--> statement-breakpoint
 CREATE FUNCTION "public"."plan6b_validate_finalization_effect_insert"() RETURNS trigger
 LANGUAGE plpgsql AS $$

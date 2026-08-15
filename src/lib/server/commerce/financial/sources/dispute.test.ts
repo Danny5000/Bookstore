@@ -315,7 +315,7 @@ function gateway(trace: string[]): StripeCommerceGateway {
 describe('versioned locked dispute projection replay', () => {
   beforeEach(() => vi.resetAllMocks());
 
-  it('rearms refunds when an identical withdrawal first joins the target replay pair', async () => {
+  it('reports when an identical withdrawal first joins the target replay pair', async () => {
     const fingerprint = 'a'.repeat(64);
     const oldGross = '00000000-0000-4000-8000-000000000319';
     const insertedGross = '00000000-0000-4000-8000-000000000320';
@@ -417,18 +417,99 @@ describe('versioned locked dispute projection replay', () => {
       algorithmVersion: 3, effect: 'withdrawal', sourceFingerprint: fingerprint
     }));
     expect(persistFinancialAllocationReplayPlanLocked).toHaveBeenCalledTimes(2);
-    expect(rearmCurrentProjectionSubjectsForFinancialSources).toHaveBeenCalledWith(tx, {
-      sourceKind: 'refund', sourceIds: [refundId]
-    });
+    expect(rearmCurrentProjectionSubjectsForFinancialSources).not.toHaveBeenCalled();
     expect(render(execute.mock.calls[0]?.[0]).sql).toMatch(
       /order by balance\.provider_created_at, balance\.provider_id collate "C", balance\.id/iu
     );
+    expect(render(execute.mock.calls[1]?.[0]).sql).toMatch(
+      /allocation\.classifier_version\s*=\s*\$\d+[\s\S]*allocation\.algorithm_version\s*=\s*\$\d+[\s\S]*successor\.classifier_version\s*=\s*allocation\.classifier_version[\s\S]*successor\.algorithm_version\s*=\s*allocation\.algorithm_version/iu
+    );
+    expect(render(execute.mock.calls[1]?.[0]).params).toEqual(expect.arrayContaining([2, 3]));
     expect(tx.transaction).toHaveBeenCalledOnce();
     for (const [, persistInput, version] of
       vi.mocked(persistFinancialAllocationReplayPlanLocked).mock.calls) {
       expect(persistInput.classificationVersion).toBe(2);
       expect(version).toEqual({ classifierVersion: 2, allocationAlgorithmVersion: 3 });
     }
+  });
+
+  it('rolls back an unchanged target plan whose stored presentment membership diverges', async () => {
+    const fingerprint = 'a'.repeat(64);
+    const grossIdentity = `dispute:${disputeId}:${balanceId}:replay:c2-a3:gross`;
+    const feeIdentity = `dispute:${disputeId}:${balanceId}:replay:c2-a3:fee`;
+    const plans = [
+      { allocationIdentity: grossIdentity, balanceTransactionId: balanceId,
+        basis: 'gross_amount', scope: 'title', currency: 'USD', expectedEffectMinor: -100,
+        algorithmVersion: 3, sourceFingerprint: fingerprint, supersedesSetId: null,
+        reversalOfSetId: null, items: [] },
+      { allocationIdentity: feeIdentity, balanceTransactionId: balanceId,
+        basis: 'fee', scope: 'title', currency: 'USD', expectedEffectMinor: 0,
+        algorithmVersion: 3, sourceFingerprint: fingerprint, supersedesSetId: null,
+        reversalOfSetId: null, items: [] }
+    ] as never;
+    vi.mocked(buildDisputeAllocationPlan).mockReturnValue({ plans,
+      presentmentEffects: [{
+        allocationId: `dispute:${disputeId}:${balanceId}:presentment:${orderItemId}`,
+        withdrawalSetId: null, disputeId, providerCreatedAt: createdAt.toISOString(),
+        providerTransactionId: 'txn_dispute', orderItemId,
+        subtotalMinor: -90, taxMinor: -10, presentmentCurrency: 'USD',
+        effect: 'withdrawal', reversalOfAllocationId: null
+      }] } as never);
+    vi.mocked(persistFinancialAllocationReplayPlanLocked)
+      .mockResolvedValueOnce({ setId: grossSetId, disposition: 'unchanged' })
+      .mockResolvedValueOnce({ setId: feeSetId, disposition: 'unchanged' });
+    const execute = vi.fn()
+      .mockResolvedValueOnce({ rows: [{ id: balanceId, providerId: 'txn_dispute',
+        sourceId: 'dp_dispute_trace', amountMinor: -100, feeMinor: 0,
+        netMinor: -100, currency: 'USD', fingerprintSha256: fingerprint,
+        providerCreatedAt: createdAt, classification: 'dispute_withdrawal' }] })
+      .mockResolvedValueOnce({ rows: [
+        { id: grossSetId, balanceTransactionId: balanceId, basis: 'gross_amount',
+          allocationIdentity: grossIdentity, supersedesSetId: null,
+          classifierVersion: 2, algorithmVersion: 3, isTargetTip: true,
+          isGlobalTip: true },
+        { id: feeSetId, balanceTransactionId: balanceId, basis: 'fee',
+          allocationIdentity: feeIdentity, supersedesSetId: null,
+          classifierVersion: 2, algorithmVersion: 3, isTargetTip: true,
+          isGlobalTip: true }
+      ] })
+      .mockResolvedValueOnce({ rows: [{ id: grossSetId,
+        balanceTransactionId: balanceId, allocationIdentity: grossIdentity,
+        expectedEffectMinor: -100, currency: 'USD', algorithmVersion: 3,
+        sourceFingerprint: fingerprint, supersedesSetId: null,
+        reversalOfSetId: null, scope: 'title' }] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ id: feeSetId,
+        balanceTransactionId: balanceId, allocationIdentity: feeIdentity,
+        expectedEffectMinor: 0, currency: 'USD', algorithmVersion: 3,
+        sourceFingerprint: fingerprint, supersedesSetId: null,
+        reversalOfSetId: null, scope: 'title' }] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] });
+    let rolledBack = false;
+    const tx = { execute, transaction: vi.fn() } as unknown as DatabaseTransaction;
+    vi.mocked(tx.transaction).mockImplementation(async (work) => {
+      try {
+        return await work(tx);
+      } catch (error) {
+        rolledBack = true;
+        throw error;
+      }
+    });
+    const facts = { ...lockedFacts(), payment: { id: paymentId, orderId } } as never;
+    const projectionLocks = projectionLockRows({
+      balanceTransactions: [{ id: balanceId, fingerprintSha256: fingerprint }]
+    });
+
+    await expect(recomputeLockedDisputeFinancialProjectionForVersion(tx, {
+      orderId, paymentId, balanceTransactionIds: [balanceId], purchaseFacts: facts,
+      projectionLocks, correlationId: 'dispute-unchanged-presentment-mismatch'
+    }, { classifierVersion: 2, allocationAlgorithmVersion: 3, replayId: 'c2-a3' }))
+      .resolves.toEqual({ status: 'exception', safeCode: 'allocation_mismatch' });
+
+    expect(rolledBack).toBe(true);
+    expect(persistFinancialAllocationReplayPlanLocked).toHaveBeenCalledTimes(2);
+    expect(rearmCurrentProjectionSubjectsForFinancialSources).not.toHaveBeenCalled();
   });
 
   it('rolls back earlier sibling writes when a later replay subject fails safely', async () => {
@@ -487,6 +568,48 @@ describe('versioned locked dispute projection replay', () => {
       .resolves.toEqual({ status: 'exception', safeCode: 'source_linkage_mismatch' });
 
     expect(persistFinancialAllocationReplayPlanLocked).toHaveBeenCalledTimes(2);
+    expect(rolledBack).toBe(true);
+  });
+
+  it('rolls back and returns a durable exception when allocation construction throws', async () => {
+    const fingerprint = 'a'.repeat(64);
+    const actual = await vi.importActual<typeof import('../allocations/dispute')>(
+      '../allocations/dispute'
+    );
+    vi.mocked(buildDisputeAllocationPlan).mockImplementationOnce(
+      actual.buildDisputeAllocationPlan
+    );
+    const execute = vi.fn()
+      .mockResolvedValueOnce({ rows: [{
+        id: balanceId, providerId: 'txn_dispute', sourceId: 'dp_dispute_trace',
+        amountMinor: -101, feeMinor: 0, netMinor: -101, currency: 'USD',
+        fingerprintSha256: fingerprint, providerCreatedAt: createdAt,
+        classification: 'dispute_withdrawal'
+      }] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] });
+    let rolledBack = false;
+    const tx = { execute, transaction: vi.fn() } as unknown as DatabaseTransaction;
+    vi.mocked(tx.transaction).mockImplementation(async (work) => {
+      try {
+        return await work(tx);
+      } catch (error) {
+        rolledBack = true;
+        throw error;
+      }
+    });
+    const baseFacts = lockedFacts();
+    const facts = { ...baseFacts, payment: { id: paymentId, orderId },
+      disputes: baseFacts.disputes.map((dispute) => ({ ...dispute, amountMinor: 101 })) } as never;
+
+    await expect(recomputeLockedDisputeFinancialProjectionForVersion(tx, {
+      orderId, paymentId, balanceTransactionIds: [balanceId], purchaseFacts: facts,
+      projectionLocks: projectionLockRows({ balanceTransactions: [
+        { id: balanceId, fingerprintSha256: fingerprint }
+      ] }), correlationId: 'dispute-replay-durable-allocation-error'
+    }, { classifierVersion: 2, allocationAlgorithmVersion: 3, replayId: 'c2-a3' }))
+      .resolves.toEqual({ status: 'exception', safeCode: 'allocation_mismatch' });
+
     expect(rolledBack).toBe(true);
   });
 });
@@ -661,7 +784,7 @@ describe('reconcileDisputeFinancialSource', () => {
       balanceTransactionIds: []
     });
     const tx = {
-      execute: vi.fn(),
+      execute: vi.fn().mockResolvedValue({ rows: [] }),
       ...updateChain()
     } as unknown as DatabaseTransaction;
     vi.mocked(database.transaction).mockImplementation(async (work) => work(tx));
@@ -700,7 +823,7 @@ describe('reconcileDisputeFinancialSource', () => {
     );
     const rendered = mockedDatabaseExecute(database).mock.calls.map(([query]) => render(query).sql);
     expect(rendered).toHaveLength(1);
-    expect(rendered[0]).toContain('from financial_allocation_sets allocation_set');
+    expect(rendered[0]).toContain('from stripe_balance_transactions balance');
     expect(rendered.join('\n')).not.toMatch(/\bin\s*\(\s*\)/iu);
   });
 
@@ -708,8 +831,11 @@ describe('reconcileDisputeFinancialSource', () => {
     const database = routingDatabase([]);
     mockedDatabaseExecute(database).mockImplementation(async (query: unknown) => {
       const text = render(query).sql;
-      return text.includes('from financial_allocation_sets allocation_set')
-        ? { rows: [] }
+      return text.includes('join disputes dispute on dispute.stripe_dispute_id')
+        ? { rows: [{
+            balanceTransactionId: balanceId, disputeId,
+            providerSourceId: 'dp_dispute_trace', fingerprintSha256: 'a'.repeat(64)
+          }] }
         : {
             rows: [
               { payoutId, expectedGeneration: 7, balanceTransactionId: balanceId },
@@ -721,7 +847,18 @@ describe('reconcileDisputeFinancialSource', () => {
       balanceTransactionId: balanceId,
       disposition: 'inserted'
     });
-    const tx = { execute: vi.fn(), ...updateChain() } as unknown as DatabaseTransaction;
+    const tx = {
+      execute: vi.fn(async (query: SQL) => {
+        const text = render(query).sql;
+        return text.includes('join disputes dispute on dispute.stripe_dispute_id')
+          ? { rows: [{
+              balanceTransactionId: balanceId, disputeId,
+              providerSourceId: 'dp_dispute_trace', fingerprintSha256: 'a'.repeat(64)
+            }] }
+          : { rows: [] };
+      }),
+      ...updateChain()
+    } as unknown as DatabaseTransaction;
     vi.mocked(database.transaction).mockImplementation(async (work) => work(tx));
     vi.mocked(lockCanonicalPaymentPurchaseFacts).mockResolvedValue({
       ...lockedFacts(),
@@ -770,9 +907,58 @@ describe('reconcileDisputeFinancialSource', () => {
       .toBeLessThan(vi.mocked(lockFinancialProjectionRows).mock.invocationCallOrder[0]!);
   });
 
-  it('replays an already persisted transaction without treating its own presentment rows as prior chronology', async () => {
+  it('retries when the dispute balance-owner closure changes after authority enrollment', async () => {
+    const database = routingDatabase([]);
+    mockedDatabaseExecute(database).mockImplementation(async (query: unknown) => {
+      const text = render(query).sql;
+      if (text.includes('join disputes dispute')) {
+        return { rows: [{
+          balanceTransactionId: balanceId, disputeId,
+          providerSourceId: 'dp_dispute_trace', fingerprintSha256: 'a'.repeat(64)
+        }] };
+      }
+      return { rows: [] };
+    });
+    vi.mocked(stageBalanceTransaction).mockResolvedValue({
+      balanceTransactionId: balanceId,
+      disposition: 'unchanged'
+    });
+    const tx = {
+      execute: vi.fn(async (query: SQL) => {
+        const text = render(query).sql;
+        if (text.includes('join disputes dispute')) {
+          return { rows: [
+            { balanceTransactionId: balanceId, disputeId,
+              providerSourceId: 'dp_dispute_trace', fingerprintSha256: 'a'.repeat(64) },
+            { balanceTransactionId: siblingBalanceId, disputeId: siblingDisputeId,
+              providerSourceId: 'dp_sibling', fingerprintSha256: 'b'.repeat(64) }
+          ] };
+        }
+        return { rows: [] };
+      }),
+      ...updateChain()
+    } as unknown as DatabaseTransaction;
+    vi.mocked(database.transaction).mockImplementation(async (work) => work(tx));
+    vi.mocked(lockCanonicalPaymentPurchaseFacts).mockResolvedValue(lockedFacts() as never);
+    vi.mocked(lockFinancialProjectionRows).mockRejectedValue(
+      new Error('financial-lock-should-not-be-reached')
+    );
+
+    await expect(reconcileDisputeFinancialSource(
+      database,
+      oneTransactionGateway(),
+      { disputeId, correlationId: 'dispute-owner-closure-drift' },
+      new AbortController().signal
+    )).rejects.toMatchObject({ name: 'RetryableFinancialError', safeCode: 'state_changed' });
+
+    expect(lockFinancialProjectionEnrollment).toHaveBeenCalledWith(tx);
+    expect(lockFinancialProjectionRows).not.toHaveBeenCalled();
+  });
+
+  it('fails an unchanged ordinary target closed when stored presentment diverges', async () => {
     const allocationIdentity = `dispute:${disputeId}:${balanceId}:presentment:${orderItemId}`;
-    const facts = lockedFacts({
+    const facts = {
+      ...lockedFacts({
       financialEvidenceStatus: 'fee_reconciled',
       disputeItemAllocations: [
         {
@@ -783,18 +969,31 @@ describe('reconcileDisputeFinancialSource', () => {
           orderItemId,
           effect: 'withdrawal',
           reversesAllocationId: null,
-          subtotalEffectMinor: -90,
+          subtotalEffectMinor: -80,
           taxEffectMinor: -10,
-          totalEffectMinor: -100,
+          totalEffectMinor: -90,
           currency: 'USD'
         }
       ]
-    });
+      }),
+      refunds: [{
+        id: refundId, status: 'succeeded', stripeRefundId: 're_after_dispute',
+        providerCreatedAt: new Date(createdAt.getTime() + 1000)
+      }],
+      refundComponents: [{
+        refundId,
+        refundAllocationId: '00000000-0000-4000-8000-000000000314',
+        orderItemId, subtotalMinor: 1, taxMinor: 0, currency: 'USD'
+      }]
+    };
     const database = routingDatabase([]);
     mockedDatabaseExecute(database).mockImplementation(async (query: unknown) => {
       const text = render(query).sql;
-      return text.includes('from financial_allocation_sets allocation_set')
-        ? { rows: [{ balanceTransactionId: balanceId }] }
+      return text.includes('join disputes dispute on dispute.stripe_dispute_id')
+        ? { rows: [{
+            balanceTransactionId: balanceId, disputeId,
+            providerSourceId: 'dp_dispute_trace', fingerprintSha256: 'a'.repeat(64)
+          }] }
         : { rows: [] };
     });
     vi.mocked(stageBalanceTransaction).mockResolvedValue({
@@ -803,6 +1002,21 @@ describe('reconcileDisputeFinancialSource', () => {
     });
     const txExecute = vi.fn(async (query: SQL) => {
       const text = render(query).sql;
+      if (text.includes('join disputes dispute on dispute.stripe_dispute_id')) {
+        return { rows: [{
+          balanceTransactionId: balanceId, disputeId,
+          providerSourceId: 'dp_dispute_trace', fingerprintSha256: 'a'.repeat(64)
+        }] };
+      }
+      if (text.includes('select distinct allocation_set.balance_transaction_id')) {
+        return { rows: [{ balanceTransactionId: balanceId }] };
+      }
+      if (text.includes('from financial_allocation_sets target_set')) {
+        return { rows: [
+          { id: feeSetId, balanceTransactionId: balanceId, basis: 'fee' },
+          { id: grossSetId, balanceTransactionId: balanceId, basis: 'gross_amount' }
+        ] };
+      }
       if (text.includes('select id, provider_id as "providerId", provider_created_at')) {
         return {
           rows: [
@@ -854,7 +1068,7 @@ describe('reconcileDisputeFinancialSource', () => {
               orderItemId,
               effect: 'withdrawal',
               reversesAllocationId: null,
-              subtotalMinor: -90,
+              subtotalMinor: -80,
               taxMinor: -10,
               currency: 'USD'
             }
@@ -935,10 +1149,12 @@ describe('reconcileDisputeFinancialSource', () => {
         new AbortController().signal
       )
     ).resolves.toEqual({
-      status: 'unchanged',
+      status: 'exception',
       sourceKind: 'dispute',
       sourceId: disputeId,
-      financialEvidenceStatus: 'fee_reconciled'
+      financialEvidenceStatus: 'exception',
+      safeCode: 'allocation_mismatch',
+      issueId
     });
 
     expect(buildDisputeAllocationPlan).toHaveBeenCalledWith(
@@ -947,8 +1163,22 @@ describe('reconcileDisputeFinancialSource', () => {
         priorPresentmentEffects: []
       })
     );
+    expect(observeFinancialIssue).toHaveBeenCalledWith(
+      tx,
+      expect.objectContaining({
+        resourceType: 'allocation_set',
+        resourceId: grossSetId,
+        safeCode: 'allocation_mismatch',
+        impact: 'exception'
+      })
+    );
     expect(appendAuditEvent).not.toHaveBeenCalled();
-    expect(rearmCurrentProjectionSubjectsForFinancialSources).not.toHaveBeenCalled();
+    expect(rearmCurrentProjectionSubjectsForFinancialSources).toHaveBeenCalledWith(tx, {
+      sourceKind: 'dispute', sourceIds: [disputeId]
+    });
+    expect(rearmCurrentProjectionSubjectsForFinancialSources).toHaveBeenCalledWith(tx, {
+      sourceKind: 'refund', sourceIds: [refundId]
+    });
   });
 
   it('binds a classified dispute fee credit to the exact outstanding withdrawal fee set', async () => {
@@ -1006,8 +1236,13 @@ describe('reconcileDisputeFinancialSource', () => {
     const database = routingDatabase([]);
     mockedDatabaseExecute(database).mockImplementation(async (query: unknown) => {
       const text = render(query).sql;
-      return text.includes('from financial_allocation_sets allocation_set')
-        ? { rows: [{ balanceTransactionId: siblingBalanceId }] }
+      return text.includes('join disputes dispute on dispute.stripe_dispute_id')
+        ? { rows: [
+            { balanceTransactionId: balanceId, disputeId,
+              providerSourceId: 'dp_dispute_trace', fingerprintSha256: 'b'.repeat(64) },
+            { balanceTransactionId: siblingBalanceId, disputeId,
+              providerSourceId: 'dp_dispute_trace', fingerprintSha256: 'c'.repeat(64) }
+          ] }
         : { rows: [] };
     });
     vi.mocked(stageBalanceTransaction).mockResolvedValue({
@@ -1017,6 +1252,25 @@ describe('reconcileDisputeFinancialSource', () => {
     const priorCreatedAt = new Date(createdAt.getTime() - 1000);
     const txExecute = vi.fn(async (query: SQL) => {
       const rendered = render(query);
+      if (rendered.sql.includes('join disputes dispute on dispute.stripe_dispute_id')) {
+        return { rows: [
+          { balanceTransactionId: balanceId, disputeId,
+            providerSourceId: 'dp_dispute_trace', fingerprintSha256: 'b'.repeat(64) },
+          { balanceTransactionId: siblingBalanceId, disputeId,
+            providerSourceId: 'dp_dispute_trace', fingerprintSha256: 'c'.repeat(64) }
+        ] };
+      }
+      if (rendered.sql.includes('select distinct allocation_set.balance_transaction_id')) {
+        return { rows: [{ balanceTransactionId: siblingBalanceId }] };
+      }
+      if (rendered.sql.includes('from financial_allocation_sets target_set')) {
+        return {
+          rows: [
+            { id: feeSetId, balanceTransactionId: siblingBalanceId, basis: 'fee' },
+            { id: grossSetId, balanceTransactionId: siblingBalanceId, basis: 'gross_amount' }
+          ]
+        };
+      }
       if (rendered.sql.includes('fee_minor as "feeMinor"') &&
         rendered.params[0] === siblingBalanceId) {
         return {
@@ -1251,8 +1505,13 @@ describe('reconcileDisputeFinancialSource', () => {
     const database = routingDatabase([]);
     mockedDatabaseExecute(database).mockImplementation(async (query: unknown) => {
       const text = render(query).sql;
-      return text.includes('from financial_allocation_sets allocation_set')
-        ? { rows: [{ balanceTransactionId: siblingBalanceId }] }
+      return text.includes('join disputes dispute on dispute.stripe_dispute_id')
+        ? { rows: [
+            { balanceTransactionId: balanceId, disputeId,
+              providerSourceId: 'dp_dispute_trace', fingerprintSha256: 'd'.repeat(64) },
+            { balanceTransactionId: siblingBalanceId, disputeId,
+              providerSourceId: 'dp_dispute_trace', fingerprintSha256: 'c'.repeat(64) }
+          ] }
         : { rows: [] };
     });
     vi.mocked(stageBalanceTransaction).mockResolvedValue({
@@ -1262,6 +1521,25 @@ describe('reconcileDisputeFinancialSource', () => {
     const priorCreatedAt = new Date(createdAt.getTime() - 1000);
     const txExecute = vi.fn(async (query: SQL) => {
       const rendered = render(query);
+      if (rendered.sql.includes('join disputes dispute on dispute.stripe_dispute_id')) {
+        return { rows: [
+          { balanceTransactionId: balanceId, disputeId,
+            providerSourceId: 'dp_dispute_trace', fingerprintSha256: 'd'.repeat(64) },
+          { balanceTransactionId: siblingBalanceId, disputeId,
+            providerSourceId: 'dp_dispute_trace', fingerprintSha256: 'c'.repeat(64) }
+        ] };
+      }
+      if (rendered.sql.includes('select distinct allocation_set.balance_transaction_id')) {
+        return { rows: [{ balanceTransactionId: siblingBalanceId }] };
+      }
+      if (rendered.sql.includes('from financial_allocation_sets target_set')) {
+        return {
+          rows: [
+            { id: feeSetId, balanceTransactionId: siblingBalanceId, basis: 'fee' },
+            { id: grossSetId, balanceTransactionId: siblingBalanceId, basis: 'gross_amount' }
+          ]
+        };
+      }
       if (rendered.sql.includes('fee_minor as "feeMinor"') &&
         rendered.params[0] === siblingBalanceId) {
         return {
@@ -1456,12 +1734,31 @@ describe('reconcileDisputeFinancialSource', () => {
       feeDetails: []
     });
     const database = routingDatabase([]);
+    mockedDatabaseExecute(database).mockImplementation(async (query: unknown) => {
+      const text = render(query).sql;
+      return text.includes('join disputes dispute on dispute.stripe_dispute_id')
+        ? { rows: [{
+            balanceTransactionId: balanceId, disputeId,
+            providerSourceId: 'dp_dispute_trace', fingerprintSha256: 'e'.repeat(64)
+          }] }
+        : { rows: [] };
+    });
     vi.mocked(stageBalanceTransaction).mockResolvedValue({
       balanceTransactionId: balanceId,
       disposition: 'inserted'
     });
     const txExecute = vi.fn(async (query: SQL) => {
       const text = render(query).sql;
+      if (text.includes('join disputes dispute on dispute.stripe_dispute_id')) {
+        return { rows: [{
+          balanceTransactionId: balanceId, disputeId,
+          providerSourceId: 'dp_dispute_trace', fingerprintSha256: 'e'.repeat(64)
+        }] };
+      }
+      if (text.includes('select distinct allocation_set.balance_transaction_id')) {
+        return { rows: [] };
+      }
+      if (text.includes('from financial_allocation_sets target_set')) return { rows: [] };
       if (text.includes('fee_minor as "feeMinor"')) {
         return {
           rows: [
@@ -1543,12 +1840,31 @@ describe('reconcileDisputeFinancialSource', () => {
 
   it('records a classified unknown transaction as unsupported_category rather than immutable evidence', async () => {
     const database = routingDatabase([]);
+    mockedDatabaseExecute(database).mockImplementation(async (query: unknown) => {
+      const text = render(query).sql;
+      return text.includes('join disputes dispute on dispute.stripe_dispute_id')
+        ? { rows: [{
+            balanceTransactionId: balanceId, disputeId,
+            providerSourceId: 'dp_dispute_trace', fingerprintSha256: 'f'.repeat(64)
+          }] }
+        : { rows: [] };
+    });
     vi.mocked(stageBalanceTransaction).mockResolvedValue({
       balanceTransactionId: balanceId,
       disposition: 'inserted'
     });
     const txExecute = vi.fn(async (query: SQL) => {
       const text = render(query).sql;
+      if (text.includes('join disputes dispute on dispute.stripe_dispute_id')) {
+        return { rows: [{
+          balanceTransactionId: balanceId, disputeId,
+          providerSourceId: 'dp_dispute_trace', fingerprintSha256: 'f'.repeat(64)
+        }] };
+      }
+      if (text.includes('select distinct allocation_set.balance_transaction_id')) {
+        return { rows: [] };
+      }
+      if (text.includes('from financial_allocation_sets target_set')) return { rows: [] };
       if (text.includes('fee_minor as "feeMinor"')) {
         return {
           rows: [
@@ -1615,16 +1931,29 @@ describe('reconcileDisputeFinancialSource', () => {
 
   it('attributes a prior sibling projection failure to the sibling dispute', async () => {
     const database = routingDatabase([]);
-    mockedDatabaseExecute(database)
-      .mockResolvedValueOnce({
-        rows: [{ balanceTransactionId: siblingBalanceId, disputeId: siblingDisputeId }]
-      })
-      .mockResolvedValueOnce({ rows: [] });
+    const ownerRows = [
+      { balanceTransactionId: balanceId, disputeId,
+        providerSourceId: 'dp_dispute_trace', fingerprintSha256: 'a'.repeat(64) },
+      { balanceTransactionId: siblingBalanceId, disputeId: siblingDisputeId,
+        providerSourceId: 'dp_sibling', fingerprintSha256: 'b'.repeat(64) }
+    ];
+    mockedDatabaseExecute(database).mockImplementation(async (query: unknown) => ({
+      rows: render(query).sql.includes('join disputes dispute on dispute.stripe_dispute_id')
+        ? ownerRows
+        : []
+    }));
     vi.mocked(stageBalanceTransaction).mockResolvedValue({
       balanceTransactionId: balanceId,
       disposition: 'inserted'
     });
     const tx = {
+      execute: vi.fn(async (query: SQL) => ({
+        rows: render(query).sql.includes('join disputes dispute on dispute.stripe_dispute_id')
+          ? ownerRows
+          : render(query).sql.includes('select distinct allocation_set.balance_transaction_id')
+            ? [{ balanceTransactionId: siblingBalanceId }]
+            : []
+      })),
       transaction: vi.fn(),
       ...updateChain()
     } as unknown as DatabaseTransaction;
@@ -1663,7 +1992,7 @@ describe('reconcileDisputeFinancialSource', () => {
     ).resolves.toMatchObject({
       status: 'exception',
       sourceId: siblingDisputeId,
-      safeCode: 'correction_rebase_required'
+      safeCode: 'allocation_mismatch'
     });
 
     expect(observeFinancialIssue).toHaveBeenCalledWith(
@@ -1671,7 +2000,7 @@ describe('reconcileDisputeFinancialSource', () => {
       expect.objectContaining({
         resourceType: 'dispute',
         resourceId: siblingDisputeId,
-        safeCode: 'correction_rebase_required'
+        safeCode: 'allocation_mismatch'
       })
     );
   });

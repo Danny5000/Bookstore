@@ -10,7 +10,11 @@ import {
   classifyBalanceTransaction,
   classifyFeeDetail
 } from './classification';
-import { PermanentFinancialError, RetryableFinancialError } from './errors';
+import {
+  PermanentFinancialError,
+  RetryableFinancialError,
+  type PermanentFinancialSafeCode
+} from './errors';
 import {
   observeFinancialIssue,
   resolveFinancialIssueAfterRecompute
@@ -25,16 +29,22 @@ import {
   lockPaymentPurchaseFacts,
   type PaymentPurchaseFacts
 } from '$lib/server/commerce/reconciliation';
+import { rearmProjectionSubjectsForFinancialSourcesAtVersion } from './ledger';
 import type { OrderRow, PaymentRow } from '$lib/server/db/schema';
 import {
+  LOCKED_REFUND_PROJECTION_REPLAY_ISSUE_CODES,
   recomputeLockedRefundFinancialProjectionForVersion
 } from './sources/refund';
-import { recomputeLockedDisputeFinancialProjectionForVersion } from './sources/dispute';
+import {
+  LOCKED_DISPUTE_PROJECTION_REPLAY_ISSUE_CODES,
+  recomputeLockedDisputeFinancialProjectionForVersion
+} from './sources/dispute';
 import type {
   ClassificationReplayResult,
   CorrectionRebaseInput,
   FinancialAllocationPlan,
   FinancialClassificationDecision,
+  FinancialIssueCode,
   LockedRefundProjectionInput
 } from './types';
 
@@ -43,6 +53,12 @@ const UUID_PATTERN =
 const FINGERPRINT_PATTERN = /^[a-f0-9]{64}$/u;
 const CURRENCY_PATTERN = /^[A-Z]{3}$/u;
 const SAFE_MONEY_MAX = 99_999_999;
+const GLOBAL_CLASSIFICATION_ISSUE_CODES = [
+  'classification_fork'
+] as const satisfies readonly FinancialIssueCode[];
+const TARGET_CLASSIFICATION_ISSUE_CODES = [
+  'classification_fork'
+] as const satisfies readonly FinancialIssueCode[];
 
 type QueryResult = { rows?: unknown[] };
 
@@ -62,6 +78,30 @@ function safeMoney(value: unknown): value is number {
 
 function invalid(): never {
   throw new PermanentFinancialError('source_linkage_mismatch');
+}
+
+function blockingReplayFailureSafeCode(
+  safeCode: FinancialIssueCode
+): PermanentFinancialSafeCode {
+  switch (safeCode) {
+    case 'allocation_mismatch':
+    case 'classification_fork':
+    case 'correction_rebase_required':
+    case 'currency_mismatch':
+    case 'generation_exhausted':
+    case 'immutable_mismatch':
+    case 'payout_membership_conflict':
+    case 'source_linkage_mismatch':
+      return safeCode;
+    case 'unsupported_category':
+      return 'unsupported_provider_evidence';
+    case 'allocation_fork':
+    case 'allocation_incomplete':
+    case 'missing_source':
+    case 'payout_incomplete':
+    case 'payout_reversal_incomplete':
+      return 'allocation_mismatch';
+  }
 }
 
 function assertCorrectionRebaseInput(
@@ -378,7 +418,7 @@ async function rebaseFailed(
   input: CorrectionRebaseInput
 ): Promise<{ status: 'exception'; issueId: string }> {
   const issue = await observeFinancialIssue(transaction, {
-    resourceType: 'balance_transaction', resourceId: input.balanceTransactionId,
+    resourceType: 'allocation_set', resourceId: input.replacementAllocationSetId,
     safeCode: 'correction_rebase_required', impact: 'exception',
     actor: { type: 'system', id: 'financial-worker' }, correlationId: input.correlationId
   });
@@ -418,17 +458,52 @@ async function appendCorrectionRebaseFailedAudit(
 
 async function resolveCorrectionRebaseIssue(
   transaction: DatabaseTransaction,
-  input: Pick<CorrectionRebaseInput, 'balanceTransactionId' | 'correlationId'>
+  input: Pick<CorrectionRebaseInput, 'replacementAllocationSetId' | 'correlationId'>
 ): Promise<void> {
   await resolveFinancialIssueAfterRecompute(transaction, {
-    resourceType: 'balance_transaction', resourceId: input.balanceTransactionId,
+    resourceType: 'allocation_set', resourceId: input.replacementAllocationSetId,
     safeCode: 'correction_rebase_required',
-    proof: { status: 'resolved', resourceType: 'balance_transaction',
-      resourceId: input.balanceTransactionId,
+    proof: { status: 'resolved', resourceType: 'allocation_set',
+      resourceId: input.replacementAllocationSetId,
       safeCode: 'correction_rebase_required' },
     actor: { type: 'system', id: 'financial-worker' },
     correlationId: input.correlationId
   });
+}
+
+async function observeCorrectionRebaseIssues(
+  transaction: DatabaseTransaction,
+  input: Pick<ClassificationReplayLockedInput, 'correlationId'>,
+  allocationSetIds: readonly string[]
+): Promise<string | null> {
+  let firstIssueId: string | null = null;
+  for (const resourceId of [...new Set(allocationSetIds)].sort()) {
+    const issue = await observeFinancialIssue(transaction, {
+      resourceType: 'allocation_set', resourceId,
+      safeCode: 'correction_rebase_required', impact: 'exception',
+      actor: { type: 'system', id: 'financial-worker' },
+      correlationId: input.correlationId
+    });
+    firstIssueId ??= issue.id;
+  }
+  return firstIssueId;
+}
+
+async function resolveCorrectionRebaseIssues(
+  transaction: DatabaseTransaction,
+  input: Pick<ClassificationReplayLockedInput, 'correlationId'>,
+  allocationSetIds: readonly string[]
+): Promise<void> {
+  for (const resourceId of [...new Set(allocationSetIds)].sort()) {
+    await resolveFinancialIssueAfterRecompute(transaction, {
+      resourceType: 'allocation_set', resourceId,
+      safeCode: 'correction_rebase_required',
+      proof: { status: 'resolved', resourceType: 'allocation_set', resourceId,
+        safeCode: 'correction_rebase_required' },
+      actor: { type: 'system', id: 'financial-worker' },
+      correlationId: input.correlationId
+    });
+  }
 }
 
 export interface FinancialClassificationReplayDependencies {
@@ -888,10 +963,160 @@ function predecessorForReplay(
     : current.id;
 }
 
+function isExactReplayTargetTip(
+  tip: ReplayAllocationTipRow,
+  input: Pick<ClassificationReplayLockedInput, 'classifierVersion' |
+    'allocationAlgorithmVersion'>
+): boolean {
+  return tip.classifierVersion === input.classifierVersion &&
+    tip.algorithmVersion === input.allocationAlgorithmVersion;
+}
+
+function selectReplayPredecessorTip(
+  targetTips: readonly ReplayAllocationTipRow[],
+  globalTips: readonly ReplayAllocationTipRow[],
+  balanceTransactionId: string,
+  basis: ReplayAllocationTipRow['basis'],
+  input: Pick<ClassificationReplayLockedInput, 'classifierVersion' |
+    'allocationAlgorithmVersion'>
+): ReplayAllocationTipRow | undefined {
+  const belongsToBasis = (tip: ReplayAllocationTipRow): boolean =>
+    (tip.balanceTransactionId ?? balanceTransactionId) === balanceTransactionId &&
+    tip.basis === basis;
+  const exactTarget = targetTips.filter((tip) =>
+    belongsToBasis(tip) && isExactReplayTargetTip(tip, input));
+  if (exactTarget.length > 1) invalid();
+  if (exactTarget[0]) return exactTarget[0];
+  const olderGlobal = globalTips.filter((tip) =>
+    belongsToBasis(tip) &&
+    tip.classifierVersion <= input.classifierVersion &&
+    tip.algorithmVersion <= input.allocationAlgorithmVersion &&
+    (tip.classifierVersion < input.classifierVersion ||
+      tip.algorithmVersion < input.allocationAlgorithmVersion));
+  if (olderGlobal.length > 1) invalid();
+  return olderGlobal[0];
+}
+
+async function observeBlockingReplaySetIssues(
+  transaction: DatabaseTransaction,
+  input: ClassificationReplayLockedInput,
+  tips: readonly ReplayAllocationTipRow[],
+  subjectBalanceTransactionId: string,
+  safeCode: FinancialIssueCode,
+  impact: 'pending' | 'exception'
+): Promise<{ readonly subjectIssueId: string | null }> {
+  const tipBalanceId = (tip: ReplayAllocationTipRow): string =>
+    tip.balanceTransactionId ?? subjectBalanceTransactionId;
+  let subjectIssueId: string | null = null;
+  let firstIssueId: string | null = null;
+  const targetTips = tips.filter((tip) => isExactReplayTargetTip(tip, input))
+    .sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
+  for (const tip of targetTips) {
+    const issue = await observeFinancialIssue(transaction, {
+      resourceType: 'allocation_set', resourceId: tip.id, safeCode, impact,
+      actor: { type: 'system', id: 'financial-worker' },
+      correlationId: input.correlationId
+    });
+    firstIssueId ??= issue.id;
+    if (tipBalanceId(tip) === subjectBalanceTransactionId && tip.basis === 'gross_amount') {
+      subjectIssueId = issue.id;
+    }
+  }
+  return { subjectIssueId: subjectIssueId ?? firstIssueId };
+}
+
+async function resolveValidatedBlockingReplaySetIssues(
+  transaction: DatabaseTransaction,
+  input: ClassificationReplayLockedInput,
+  tips: readonly ReplayAllocationTipRow[],
+  replacements: readonly { readonly previousSetId: string | null;
+    readonly replacementSetId: string }[],
+  safeCodes: readonly FinancialIssueCode[]
+): Promise<boolean> {
+  const validatedIds = new Set(replacements.flatMap((replacement) => [
+    replacement.replacementSetId,
+    ...(replacement.previousSetId === null ? [] : [replacement.previousSetId])
+  ]));
+  const validatedTips = tips.filter((tip) => validatedIds.has(tip.id) &&
+    isExactReplayTargetTip(tip, input))
+    .sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
+  let issueTransitioned = false;
+  for (const tip of validatedTips) {
+    for (const safeCode of safeCodes) {
+      const resolved = await resolveFinancialIssueAfterRecompute(transaction, {
+        resourceType: 'allocation_set', resourceId: tip.id, safeCode,
+        proof: { status: 'resolved', resourceType: 'allocation_set',
+          resourceId: tip.id, safeCode },
+        actor: { type: 'system', id: 'financial-worker' },
+        correlationId: input.correlationId
+      });
+      issueTransitioned ||= resolved !== null;
+    }
+  }
+  return issueTransitioned;
+}
+
+async function resolveValidatedAllocationSetIssues(
+  transaction: DatabaseTransaction,
+  input: Pick<ClassificationReplayLockedInput, 'correlationId'>,
+  allocationSetIds: readonly string[],
+  safeCodes: readonly FinancialIssueCode[]
+): Promise<void> {
+  for (const resourceId of [...new Set(allocationSetIds)].sort()) {
+    for (const safeCode of safeCodes) {
+      await resolveFinancialIssueAfterRecompute(transaction, {
+        resourceType: 'allocation_set', resourceId, safeCode,
+        proof: { status: 'resolved', resourceType: 'allocation_set', resourceId, safeCode },
+        actor: { type: 'system', id: 'financial-worker' },
+        correlationId: input.correlationId
+      });
+    }
+  }
+}
+
+async function resolveGlobalClassificationForkIssues(
+  transaction: DatabaseTransaction,
+  input: Pick<ClassificationReplayLockedInput, 'correlationId'>,
+  balanceTransactionIds: readonly string[]
+): Promise<void> {
+  for (const resourceId of [...new Set(balanceTransactionIds)].sort()) {
+    await resolveFinancialIssueAfterRecompute(transaction, {
+      resourceType: 'balance_transaction', resourceId,
+      safeCode: 'classification_fork',
+      proof: { status: 'resolved', resourceType: 'balance_transaction', resourceId,
+        safeCode: 'classification_fork' },
+      actor: { type: 'system', id: 'financial-worker' },
+      correlationId: input.correlationId
+    });
+  }
+}
+
 function hasComponentBackedSucceededRefund(facts: PaymentPurchaseFacts): boolean {
   const componentRefundIds = new Set(facts.refundComponents.map((row) => row.refundId));
   return facts.refunds.some((row) =>
     row.status === 'succeeded' && componentRefundIds.has(row.id));
+}
+
+function componentBackedSucceededRefundIds(facts: PaymentPurchaseFacts): string[] {
+  const componentRefundIds = new Set(facts.refundComponents.map((row) => row.refundId));
+  return facts.refunds.filter((row) =>
+    row.status === 'succeeded' && componentRefundIds.has(row.id)
+  ).map((row) => row.id).sort();
+}
+
+async function rearmComponentBackedSucceededRefunds(
+  transaction: DatabaseTransaction,
+  facts: PaymentPurchaseFacts,
+  target: { readonly classifierVersion: number; readonly allocationAlgorithmVersion: number }
+): Promise<void> {
+  const affectedRefundIds = componentBackedSucceededRefundIds(facts);
+  if (affectedRefundIds.length === 0) return;
+  await rearmProjectionSubjectsForFinancialSourcesAtVersion(transaction, {
+    sourceKind: 'refund', sourceIds: affectedRefundIds
+  }, {
+    classifierVersion: target.classifierVersion,
+    allocationAlgorithmVersion: target.allocationAlgorithmVersion
+  });
 }
 
 export async function replayFinancialClassificationLocked(
@@ -915,8 +1140,8 @@ export async function replayFinancialClassificationLocked(
     reportingCategory: discovered.reportingCategory, amountMinor: discovered.amountMinor
   });
   const graph = await lockReplayGraph(transaction, discovered);
-  if (graph.sourceKind === 'dispute' &&
-    hasComponentBackedSucceededRefund(graph.purchaseFacts)) {
+  if (requiredActivePredecessor !== null || graph.sourceKind === 'refund' ||
+    graph.sourceKind === 'dispute' && hasComponentBackedSucceededRefund(graph.purchaseFacts)) {
     await lockFinancialProjectionEnrollment(transaction);
   }
   const sourceBalances = await discoverReplaySourceBalances(transaction, discovered, graph);
@@ -974,20 +1199,51 @@ export async function replayFinancialClassificationLocked(
     !closureBalanceTransactionIds.includes(detail.balanceTransactionId)) ||
     new Set(discoveredFeeDetails.map((detail) => detail.id)).size !==
       discoveredFeeDetails.length) invalid();
+  const discoveredTargetTips = await rows(transaction, sql`
+    select allocation.id,
+      allocation.balance_transaction_id as "balanceTransactionId", allocation.basis
+    from financial_allocation_sets allocation
+    where allocation.balance_transaction_id in (${sql.join(
+      sourceBalanceIds.map((id) => sql`${id}::uuid`), sql`, `
+    )})
+      and allocation.classifier_version = ${input.classifierVersion}
+      and allocation.algorithm_version = ${input.allocationAlgorithmVersion}
+      and not exists (
+        select 1 from financial_allocation_sets successor
+        where successor.supersedes_set_id = allocation.id
+          and successor.classifier_version = allocation.classifier_version
+          and successor.algorithm_version = allocation.algorithm_version
+      )
+    order by allocation.balance_transaction_id, allocation.basis, allocation.id
+  `) as Array<{
+    id: string;
+    balanceTransactionId: string;
+    basis: 'gross_amount' | 'fee';
+  }>;
+  if (discoveredTargetTips.some((tip) => !UUID_PATTERN.test(tip.id) ||
+    !sourceBalanceIds.includes(tip.balanceTransactionId) ||
+    (tip.basis !== 'gross_amount' && tip.basis !== 'fee')) ||
+    new Set(discoveredTargetTips.map((tip) => tip.id)).size !==
+      discoveredTargetTips.length) invalid();
   const issueKeys: FinancialIssueLockKey[] = sourceBalanceIds.flatMap((resourceId) =>
-    ['classification_fork', 'correction_rebase_required', 'unsupported_category'].map(
-      (safeCode) => ({
+    GLOBAL_CLASSIFICATION_ISSUE_CODES.map((safeCode) => ({
         resourceType: 'balance_transaction' as const,
         resourceId,
         safeCode: safeCode as FinancialIssueLockKey['safeCode']
-      })
-    ));
-  issueKeys.push(...discoveredFeeDetails.flatMap((detail) => [
-    { resourceType: 'fee_detail' as const, resourceId: detail.id,
-      safeCode: 'classification_fork' as const },
-    { resourceType: 'fee_detail' as const, resourceId: detail.id,
-      safeCode: 'unsupported_category' as const }
-  ]));
+      })));
+  const targetSetIssueCodes: readonly FinancialIssueCode[] = graph.sourceKind === 'refund'
+    ? [...TARGET_CLASSIFICATION_ISSUE_CODES, 'correction_rebase_required',
+        ...LOCKED_REFUND_PROJECTION_REPLAY_ISSUE_CODES]
+    : graph.sourceKind === 'dispute'
+      ? [...TARGET_CLASSIFICATION_ISSUE_CODES,
+          ...LOCKED_DISPUTE_PROJECTION_REPLAY_ISSUE_CODES]
+      : TARGET_CLASSIFICATION_ISSUE_CODES;
+  issueKeys.push(...discoveredTargetTips.flatMap((tip) =>
+    targetSetIssueCodes.map((safeCode) => ({
+      resourceType: 'allocation_set' as const,
+      resourceId: tip.id,
+      safeCode
+    }))));
   const lockedProjection = await lockFinancialProjectionRows(transaction, {
     payoutGenerations,
     balanceTransactionIds: closureBalanceTransactionIds,
@@ -1034,38 +1290,81 @@ export async function replayFinancialClassificationLocked(
     where allocation.balance_transaction_id in (${sql.join(
       sourceBalanceIds.map((id) => sql`${id}::uuid`), sql`, `
     )})
-      and not exists (select 1 from financial_allocation_sets successor
-        where successor.supersedes_set_id = allocation.id)
-    order by allocation.basis, allocation.id for update
+      and allocation.classifier_version = ${input.classifierVersion}
+      and allocation.algorithm_version = ${input.allocationAlgorithmVersion}
+      and not exists (
+        select 1 from financial_allocation_sets successor
+        where successor.supersedes_set_id = allocation.id
+          and successor.classifier_version = allocation.classifier_version
+          and successor.algorithm_version = allocation.algorithm_version
+      )
+    order by allocation.balance_transaction_id, allocation.basis, allocation.id
+    for update of allocation
   `) as ReplayAllocationTipRow[];
   const tipBalanceId = (tip: ReplayAllocationTipRow): string =>
     tip.balanceTransactionId ?? balance.id;
   if (tips.some((tip) => !UUID_PATTERN.test(tip.id) ||
     !sourceBalanceIds.includes(tipBalanceId(tip)) ||
     (tip.basis !== 'gross_amount' && tip.basis !== 'fee') ||
+    tip.classifierVersion !== input.classifierVersion ||
+    tip.algorithmVersion !== input.allocationAlgorithmVersion)) invalid();
+  const discoveredTargetTipIds = discoveredTargetTips.map((tip) => tip.id).sort();
+  const lockedTargetTipIds = tips.map((tip) => tip.id).sort();
+  if (lockedTargetTipIds.length !== discoveredTargetTipIds.length ||
+    lockedTargetTipIds.some((id, index) => id !== discoveredTargetTipIds[index])) {
+    throw new RetryableFinancialError('state_changed');
+  }
+  const globalTips = await rows(transaction, sql`
+    select allocation.id, allocation.balance_transaction_id as "balanceTransactionId",
+      allocation.basis,
+      allocation.allocation_identity as "allocationIdentity",
+      allocation.supersedes_set_id as "supersedesSetId",
+      allocation.reversal_of_set_id as "reversalOfSetId",
+      allocation.classifier_version as "classifierVersion",
+      allocation.algorithm_version as "algorithmVersion"
+    from financial_allocation_sets allocation
+    where allocation.balance_transaction_id in (${sql.join(
+      sourceBalanceIds.map((id) => sql`${id}::uuid`), sql`, `
+    )})
+      and not exists (
+        select 1 from financial_allocation_sets successor
+        where successor.supersedes_set_id = allocation.id
+      )
+    order by allocation.balance_transaction_id, allocation.basis, allocation.id
+    for update of allocation
+  `) as ReplayAllocationTipRow[];
+  if (globalTips.some((tip) => !UUID_PATTERN.test(tip.id) ||
+    !sourceBalanceIds.includes(tipBalanceId(tip)) ||
+    (tip.basis !== 'gross_amount' && tip.basis !== 'fee') ||
     !positiveInt32(tip.classifierVersion) || !positiveInt32(tip.algorithmVersion)) ||
     sourceBalanceIds.some((id) =>
-      tips.filter((tip) => tipBalanceId(tip) === id && tip.basis === 'gross_amount').length > 1 ||
-      tips.filter((tip) => tipBalanceId(tip) === id && tip.basis === 'fee').length > 1)) {
+      globalTips.filter((tip) => tipBalanceId(tip) === id &&
+        tip.basis === 'gross_amount').length > 1 ||
+      globalTips.filter((tip) => tipBalanceId(tip) === id && tip.basis === 'fee').length > 1)) {
     const issue = await observeFinancialIssue(transaction, {
       resourceType: 'balance_transaction', resourceId: balance.id,
       safeCode: 'classification_fork', impact: 'exception',
       actor: { type: 'system', id: 'financial-worker' },
       correlationId: input.correlationId
     });
+    if (graph.sourceKind === 'dispute') {
+      await rearmComponentBackedSucceededRefunds(transaction, graph.purchaseFacts, input);
+    }
     return { status: 'exception', subjectId: input.subjectId,
       safeCode: 'classification_fork', issueId: issue.id };
   }
-  const supersedingTips = tips.filter((tip) =>
+  const supersedingTips = globalTips.filter((tip) =>
     tip.classifierVersion >= input.classifierVersion &&
     tip.algorithmVersion >= input.allocationAlgorithmVersion &&
     (tip.classifierVersion > input.classifierVersion ||
       tip.algorithmVersion > input.allocationAlgorithmVersion));
-  if (supersedingTips.length > 0) {
-    if (supersedingTips.length !== tips.length) invalid();
+  const chronologySource = graph.sourceKind === 'refund' || graph.sourceKind === 'dispute';
+  if (!chronologySource && supersedingTips.length > 0) {
+    if (supersedingTips.length !== globalTips.length) invalid();
     return { status: 'unchanged', subjectId: input.subjectId };
   }
-  if (tips.some((tip) => tip.classifierVersion > input.classifierVersion ||
+  if (!chronologySource && globalTips.some((tip) =>
+    tip.classifierVersion > input.classifierVersion ||
     tip.algorithmVersion > input.allocationAlgorithmVersion)) invalid();
   const allDetails = await rows(transaction, sql`
     select id, balance_transaction_id as "balanceTransactionId",
@@ -1095,69 +1394,35 @@ export async function replayFinancialClassificationLocked(
     invalid();
   }
   if (requiredActivePredecessor !== null) {
-    const hasActiveTips = (balanceTransactionId: string): boolean =>
-      (['gross_amount', 'fee'] as const).every((basis) => tips.some((tip) =>
-        tipBalanceId(tip) === balanceTransactionId && tip.basis === basis &&
-        tip.classifierVersion >= requiredActivePredecessor.classifierVersion &&
-        tip.algorithmVersion >= requiredActivePredecessor.allocationAlgorithmVersion));
-    const missingActiveTips = sourceBalanceIds.filter((id) => !hasActiveTips(id));
-    if (missingActiveTips.length > 0) {
-      const activeDecisions = await rows(transaction, sql`
-        select subject_type as "subjectType", subject_id as "subjectId",
-          classifier_version as "classifierVersion",
-          source_fingerprint_sha256 as "sourceFingerprintSha256", classification
-        from financial_classification_versions
-        where classifier_version = ${requiredActivePredecessor.classifierVersion}
-          and ((subject_type = 'balance_transaction' and subject_id in (${sql.join(
-            sourceBalanceIds.map((id) => sql`${id}::uuid`), sql`, `
-          )}))
-          ${allDetails.length === 0 ? sql`` : sql`or
-            (subject_type = 'fee_detail' and subject_id in (${sql.join(
-              allDetails.map((detail) => sql`${detail.id}::uuid`), sql`, `
-            )}))`})
-        order by subject_type, subject_id
-      `) as Array<{
-        subjectType: 'balance_transaction' | 'fee_detail';
-        subjectId: string;
-        classifierVersion: number;
-        sourceFingerprintSha256: string;
-        classification: string;
-      }>;
-      const expectedSubjects = new Map<string, {
-        fingerprint: string;
-        balanceTransactionId: string;
-      }>();
-      for (const source of lockedSourceBalances) {
-        expectedSubjects.set(`balance_transaction:${source.id}`, {
-          fingerprint: source.fingerprintSha256, balanceTransactionId: source.id
-        });
-      }
-      for (const detail of allDetails) {
-        expectedSubjects.set(`fee_detail:${detail.id}`, {
-          fingerprint: detail.fingerprintSha256,
-          balanceTransactionId: detailBalanceId(detail)
-        });
-      }
-      const unknownBalances = new Set<string>();
-      const seenSubjects = new Set<string>();
-      for (const decision of activeDecisions) {
-        const key = `${decision.subjectType}:${decision.subjectId}`;
-        const expected = expectedSubjects.get(key);
-        if (!expected || seenSubjects.has(key) ||
-          decision.classifierVersion !== requiredActivePredecessor.classifierVersion ||
-          decision.sourceFingerprintSha256 !== expected.fingerprint) {
-          throw new RetryableFinancialError('state_changed');
-        }
-        seenSubjects.add(key);
-        if (decision.classification === 'unknown') {
-          unknownBalances.add(expected.balanceTransactionId);
-        }
-      }
-      if (seenSubjects.size !== expectedSubjects.size || missingActiveTips.some((id) =>
-        !unknownBalances.has(id))) {
-        throw new RetryableFinancialError('state_changed');
-      }
-    }
+    const activeTips = await rows(transaction, sql`
+      select allocation.id,
+        allocation.balance_transaction_id as "balanceTransactionId", allocation.basis,
+        allocation.allocation_identity as "allocationIdentity",
+        allocation.supersedes_set_id as "supersedesSetId",
+        allocation.reversal_of_set_id as "reversalOfSetId",
+        allocation.classifier_version as "classifierVersion",
+        allocation.algorithm_version as "algorithmVersion"
+      from financial_allocation_sets allocation
+      where allocation.balance_transaction_id in (${sql.join(
+        sourceBalanceIds.map((id) => sql`${id}::uuid`), sql`, `
+      )})
+        and allocation.classifier_version = ${requiredActivePredecessor.classifierVersion}
+        and allocation.algorithm_version =
+          ${requiredActivePredecessor.allocationAlgorithmVersion}
+        and not exists (
+          select 1 from financial_allocation_sets successor
+          where successor.supersedes_set_id = allocation.id
+            and successor.classifier_version = allocation.classifier_version
+            and successor.algorithm_version = allocation.algorithm_version
+        )
+      order by allocation.balance_transaction_id, allocation.basis, allocation.id
+      for update of allocation
+    `) as ReplayAllocationTipRow[];
+    if (activeTips.some((tip) => !UUID_PATTERN.test(tip.id) ||
+      !sourceBalanceIds.includes(tipBalanceId(tip)) ||
+      (tip.basis !== 'gross_amount' && tip.basis !== 'fee') ||
+      tip.classifierVersion !== requiredActivePredecessor.classifierVersion ||
+      tip.algorithmVersion !== requiredActivePredecessor.allocationAlgorithmVersion)) invalid();
   }
   const details = allDetails.filter((detail) => detailBalanceId(detail) === balance.id);
 
@@ -1173,61 +1438,73 @@ export async function replayFinancialClassificationLocked(
     parentClassification: balanceDecisions.get(detailBalanceId(detail))!.classification,
     rawType: detail.rawType, amountMinor: detail.amountMinor
   })]));
-  let failingClassificationIdentity: {
-    resourceType: 'balance_transaction' | 'fee_detail';
-    resourceId: string;
-  } = { resourceType: 'balance_transaction', resourceId: balance.id };
+  const appendedClassificationIds = new Map<string, string>();
+  const classificationIdentity = (
+    subjectType: 'balance_transaction' | 'fee_detail',
+    subjectId: string
+  ): string => `${subjectType}:${subjectId}`;
   try {
     for (const source of lockedSourceBalances) {
-      failingClassificationIdentity = {
-        resourceType: 'balance_transaction', resourceId: source.id
-      };
-      await appendClassificationDecisionLocked(transaction, {
+      const parentClassification = await appendClassificationDecisionLocked(transaction, {
         subjectType: 'balance_transaction', subjectId: source.id,
         classifierVersion: input.classifierVersion,
         sourceFingerprint: source.fingerprintSha256,
         decision: balanceDecisions.get(source.id)!, correlationId: input.correlationId
       });
+      if (!UUID_PATTERN.test(parentClassification.id)) invalid();
+      appendedClassificationIds.set(
+        classificationIdentity('balance_transaction', source.id), parentClassification.id
+      );
       for (const detail of allDetails.filter((candidate) =>
         detailBalanceId(candidate) === source.id)) {
-        failingClassificationIdentity = {
-          resourceType: 'fee_detail', resourceId: detail.id
-        };
-        await appendClassificationDecisionLocked(transaction, {
+        const detailClassification = await appendClassificationDecisionLocked(transaction, {
           subjectType: 'fee_detail', subjectId: detail.id,
           classifierVersion: input.classifierVersion,
           sourceFingerprint: detail.fingerprintSha256,
           decision: detailDecisions.get(detail.id)!, correlationId: input.correlationId
         });
+        if (!UUID_PATTERN.test(detailClassification.id)) invalid();
+        appendedClassificationIds.set(
+          classificationIdentity('fee_detail', detail.id), detailClassification.id
+        );
       }
     }
   } catch (error) {
     if (!(error instanceof PermanentFinancialError) ||
       error.safeCode !== 'classification_fork') throw error;
-    const issue = await observeFinancialIssue(transaction, {
-      ...failingClassificationIdentity,
-      safeCode: 'classification_fork', impact: 'exception',
-      actor: { type: 'system', id: 'financial-worker' },
-      correlationId: input.correlationId
-    });
+    const issues = await observeBlockingReplaySetIssues(
+      transaction, input, tips, balance.id, 'classification_fork', 'exception'
+    );
+    if (graph.sourceKind === 'dispute') {
+      await rearmComponentBackedSucceededRefunds(transaction, graph.purchaseFacts, input);
+    }
     return { status: 'exception', subjectId: input.subjectId,
-      safeCode: 'classification_fork', issueId: issue.id };
+      safeCode: 'classification_fork', issueId: issues.subjectIssueId };
   }
   const unknowns = [
     ...lockedSourceBalances.flatMap((source) =>
       balanceDecisions.get(source.id)!.status === 'unknown'
-        ? [{ resourceType: 'balance_transaction' as const, resourceId: source.id }]
+        ? [{ resourceId: appendedClassificationIds.get(
+            classificationIdentity('balance_transaction', source.id)
+          ) }]
         : []),
     ...allDetails.flatMap((detail) => detailDecisions.get(detail.id)!.status === 'unknown'
-      ? [{ resourceType: 'fee_detail' as const, resourceId: detail.id }] : [])
+      ? [{ resourceId: appendedClassificationIds.get(
+          classificationIdentity('fee_detail', detail.id)
+        ) }] : [])
   ];
   if (unknowns.length > 0) {
     for (const unknown of unknowns) {
+      if (!unknown.resourceId || !UUID_PATTERN.test(unknown.resourceId)) invalid();
       await observeFinancialIssue(transaction, {
-        ...unknown, safeCode: 'unsupported_category', impact: 'exception',
+        resourceType: 'financial_classification', resourceId: unknown.resourceId,
+        safeCode: 'unsupported_category', impact: 'exception',
         actor: { type: 'system', id: 'financial-worker' },
         correlationId: input.correlationId
       });
+    }
+    if (graph.sourceKind === 'dispute') {
+      await rearmComponentBackedSucceededRefunds(transaction, graph.purchaseFacts, input);
     }
     return { status: 'unchanged', subjectId: input.subjectId };
   }
@@ -1278,13 +1555,11 @@ export async function replayFinancialClassificationLocked(
       }
     );
     if (replay.status === 'exception') {
-      await observeFinancialIssue(transaction, {
-        resourceType: 'balance_transaction', resourceId: balance.id,
-        safeCode: replay.safeCode, impact: replay.impact,
-        actor: { type: 'system', id: 'financial-worker' },
-        correlationId: input.correlationId
-      });
-      return { status: 'unchanged', subjectId: input.subjectId };
+      const issues = await observeBlockingReplaySetIssues(
+        transaction, input, tips, balance.id, replay.safeCode, replay.impact
+      );
+      return { status: 'blocking_exception', subjectId: input.subjectId,
+        safeCode: replay.safeCode, impact: replay.impact, issueId: issues.subjectIssueId };
     }
     for (const replacement of replay.replacements) {
       if (replacement.disposition !== 'inserted') continue;
@@ -1302,6 +1577,11 @@ export async function replayFinancialClassificationLocked(
             allocationAlgorithmVersion: input.allocationAlgorithmVersion })}::jsonb)
       `);
     }
+    await resolveValidatedBlockingReplaySetIssues(
+      transaction, input, tips, replay.replacements,
+      [...TARGET_CLASSIFICATION_ISSUE_CODES,
+        ...LOCKED_REFUND_PROJECTION_REPLAY_ISSUE_CODES]
+    );
     const correctionTips = graph.purchaseFacts.correctionSets.filter((correction) =>
       correction.refundId === refund.id && !graph.purchaseFacts.correctionSets.some(
         (successor) => successor.predecessorCorrectionSetId === correction.id
@@ -1319,25 +1599,27 @@ export async function replayFinancialClassificationLocked(
       const currentReplacementIds = new Set(replay.replacements.map(
         (replacement) => replacement.replacementSetId
       ));
+      // A refund correction is selected once for every visible base belonging to that refund.
+      // If preserving it fails, every exact target replacement must fail closed, including fee
+      // bases and presentment-only corrections that have no settlement source IDs to map.
+      const correctionTargetSetIds = replay.replacements.map(
+        (replacement) => replacement.replacementSetId
+      );
       const alreadyCompatible = currentAnchor !== undefined &&
         [...correctedPreviousIds].every((sourceId) => currentReplacementIds.has(sourceId));
       if (alreadyCompatible) {
-        await resolveCorrectionRebaseIssue(transaction, {
-          balanceTransactionId: currentAnchor.balanceTransactionId,
-          correlationId: input.correlationId
-        });
+        await resolveCorrectionRebaseIssues(
+          transaction, input, correctionTargetSetIds
+        );
       } else {
         const anchor = replay.replacements.find((replacement) =>
           replacement.previousSetId === correction.baseAllocationSetId);
         const allMapped = [...correctedPreviousIds].every((previousId) =>
           replay.replacements.some((replacement) => replacement.previousSetId === previousId));
         if (!anchor || !allMapped || anchor.previousSetId === null) {
-          const issue = await observeFinancialIssue(transaction, {
-            resourceType: 'balance_transaction', resourceId: balance.id,
-            safeCode: 'correction_rebase_required', impact: 'exception',
-            actor: { type: 'system', id: 'financial-worker' },
-            correlationId: input.correlationId
-          });
+          const issueId = await observeCorrectionRebaseIssues(
+            transaction, input, correctionTargetSetIds
+          );
           await appendCorrectionRebaseFailedAudit(transaction, {
             balanceTransactionId: anchor?.balanceTransactionId ?? balance.id,
             approvedCorrectionSetId: correction.id,
@@ -1346,7 +1628,7 @@ export async function replayFinancialClassificationLocked(
             correlationId: input.correlationId
           });
           return { status: 'exception', subjectId: input.subjectId,
-            safeCode: 'correction_rebase_required', issueId: issue.id };
+            safeCode: 'correction_rebase_required', issueId };
         }
         const rebased = await rebaseApprovedCorrectionDistributionLocked(transaction, {
           balanceTransactionId: anchor.balanceTransactionId,
@@ -1358,26 +1640,20 @@ export async function replayFinancialClassificationLocked(
           correlationId: input.correlationId
         });
         if (rebased.status === 'exception') {
+          const otherIssueId = await observeCorrectionRebaseIssues(
+            transaction, input, correctionTargetSetIds.filter((id) =>
+              id !== anchor.replacementSetId)
+          );
           return { status: 'exception', subjectId: input.subjectId,
-            safeCode: 'correction_rebase_required', issueId: rebased.issueId };
+            safeCode: 'correction_rebase_required',
+            issueId: rebased.issueId ?? otherIssueId };
         }
+        await resolveCorrectionRebaseIssues(transaction, input, correctionTargetSetIds);
       }
     }
-    for (const identity of [
-      ...lockedSourceBalances.map((source) => ({ resourceType: 'balance_transaction' as const,
-        resourceId: source.id })),
-      ...allDetails.map((detail) => ({ resourceType: 'fee_detail' as const,
-        resourceId: detail.id }))
-    ]) {
-      for (const safeCode of ['classification_fork', 'unsupported_category'] as const) {
-        await resolveFinancialIssueAfterRecompute(transaction, {
-          ...identity, safeCode,
-          proof: { status: 'resolved', ...identity, safeCode },
-          actor: { type: 'system', id: 'financial-worker' },
-          correlationId: input.correlationId
-        });
-      }
-    }
+    await resolveGlobalClassificationForkIssues(
+      transaction, input, sourceBalanceIds
+    );
     const allocationSetIds = replay.replacements.map((row) => row.replacementSetId);
     return replay.status === 'unchanged'
       ? { status: 'unchanged', subjectId: input.subjectId }
@@ -1397,13 +1673,12 @@ export async function replayFinancialClassificationLocked(
       replayId: input.replayId
     });
     if (replay.status === 'exception') {
-      await observeFinancialIssue(transaction, {
-        resourceType: 'balance_transaction', resourceId: balance.id,
-        safeCode: replay.safeCode, impact: 'exception',
-        actor: { type: 'system', id: 'financial-worker' },
-        correlationId: input.correlationId
-      });
-      return { status: 'unchanged', subjectId: input.subjectId };
+      const issues = await observeBlockingReplaySetIssues(
+        transaction, input, tips, balance.id, replay.safeCode, 'exception'
+      );
+      await rearmComponentBackedSucceededRefunds(transaction, graph.purchaseFacts, input);
+      return { status: 'blocking_exception', subjectId: input.subjectId,
+        safeCode: replay.safeCode, impact: 'exception', issueId: issues.subjectIssueId };
     }
     for (const replacement of replay.replacements) {
       if (replacement.disposition !== 'inserted') continue;
@@ -1421,21 +1696,15 @@ export async function replayFinancialClassificationLocked(
             allocationAlgorithmVersion: input.allocationAlgorithmVersion })}::jsonb)
       `);
     }
-    for (const identity of [
-      ...lockedSourceBalances.map((source) => ({ resourceType: 'balance_transaction' as const,
-        resourceId: source.id })),
-      ...allDetails.map((detail) => ({ resourceType: 'fee_detail' as const,
-        resourceId: detail.id }))
-    ]) {
-      for (const safeCode of ['classification_fork', 'unsupported_category'] as const) {
-        await resolveFinancialIssueAfterRecompute(transaction, {
-          ...identity, safeCode,
-          proof: { status: 'resolved', ...identity, safeCode },
-          actor: { type: 'system', id: 'financial-worker' },
-          correlationId: input.correlationId
-        });
-      }
-    }
+    await resolveValidatedBlockingReplaySetIssues(
+      transaction, input, tips, replay.replacements,
+      [...TARGET_CLASSIFICATION_ISSUE_CODES,
+        ...LOCKED_DISPUTE_PROJECTION_REPLAY_ISSUE_CODES]
+    );
+    await rearmComponentBackedSucceededRefunds(transaction, graph.purchaseFacts, input);
+    await resolveGlobalClassificationForkIssues(
+      transaction, input, sourceBalanceIds
+    );
     const allocationSetIds = replay.replacements.map((row) => row.replacementSetId);
     return replay.status === 'unchanged'
       ? { status: 'unchanged', subjectId: input.subjectId }
@@ -1445,9 +1714,12 @@ export async function replayFinancialClassificationLocked(
     (await loadReplayRoutingRows(transaction, balance)).length !== 0) {
     throw new RetryableFinancialError('state_changed');
   }
-  const currentGross = tips.find((tip) => tipBalanceId(tip) === balance.id &&
-    tip.basis === 'gross_amount');
-  const currentFee = tips.find((tip) => tipBalanceId(tip) === balance.id && tip.basis === 'fee');
+  const currentGross = selectReplayPredecessorTip(
+    tips, globalTips, balance.id, 'gross_amount', input
+  );
+  const currentFee = selectReplayPredecessorTip(
+    tips, globalTips, balance.id, 'fee', input
+  );
   let plans: readonly FinancialAllocationPlan[];
   if (graph.sourceKind === 'payment' && parentDecision.classification === 'charge') {
     const prefix = `payment:${graph.sourceId}:${balance.id}:replay:${input.replayId}`;
@@ -1522,20 +1794,11 @@ export async function replayFinancialClassificationLocked(
           allocationAlgorithmVersion: input.allocationAlgorithmVersion })}::jsonb)
     `);
   }
-  for (const identity of [
-    { resourceType: 'balance_transaction' as const, resourceId: balance.id },
-    ...details.map((detail) => ({ resourceType: 'fee_detail' as const,
-      resourceId: detail.id }))
-  ]) {
-    for (const safeCode of ['classification_fork', 'unsupported_category'] as const) {
-      await resolveFinancialIssueAfterRecompute(transaction, {
-        ...identity, safeCode,
-        proof: { status: 'resolved', ...identity, safeCode },
-        actor: { type: 'system', id: 'financial-worker' },
-        correlationId: input.correlationId
-      });
-    }
-  }
+  await resolveValidatedAllocationSetIssues(
+    transaction, input, persisted.map((saved) => saved.setId),
+    TARGET_CLASSIFICATION_ISSUE_CODES
+  );
+  await resolveGlobalClassificationForkIssues(transaction, input, sourceBalanceIds);
   return persisted.every((saved) => saved.disposition === 'unchanged')
     ? { status: 'unchanged', subjectId: input.subjectId }
     : { status: 'replayed', subjectId: input.subjectId,
@@ -1557,14 +1820,29 @@ export async function replayFinancialClassification(
   if (input.signal.aborted) {
     throw new DOMException('Financial classification replay was aborted.', 'AbortError');
   }
-  if (input.payload.classifierVersion !== dependencies.targetClassifierVersion ||
-    input.payload.allocationAlgorithmVersion !==
-      dependencies.targetAllocationAlgorithmVersion) invalid();
-  await dependencies.database.transaction(async (transaction) => {
+  const result = await dependencies.database.transaction(async (transaction) => {
     if (input.signal.aborted) {
       throw new DOMException('Financial classification replay was aborted.', 'AbortError');
     }
     const authority = await lockFinancialProjectionAuthority(transaction);
+    const payloadMatchesDeployed = input.payload.classifierVersion ===
+      dependencies.targetClassifierVersion && input.payload.allocationAlgorithmVersion ===
+        dependencies.targetAllocationAlgorithmVersion;
+    const deployedMatchesActive = dependencies.targetClassifierVersion ===
+      authority.classifierVersion && dependencies.targetAllocationAlgorithmVersion ===
+        authority.allocationAlgorithmVersion;
+    const deployedMatchesPending = dependencies.targetClassifierVersion ===
+      authority.pendingClassifierVersion && dependencies.targetAllocationAlgorithmVersion ===
+        authority.pendingAllocationAlgorithmVersion && authority.pendingScanRunId !== null;
+    const payloadStrictlyPrecedesActive = input.payload.classifierVersion <=
+      authority.classifierVersion && input.payload.allocationAlgorithmVersion <=
+        authority.allocationAlgorithmVersion && (input.payload.classifierVersion <
+          authority.classifierVersion || input.payload.allocationAlgorithmVersion <
+            authority.allocationAlgorithmVersion);
+    if (!payloadMatchesDeployed) {
+      if (payloadStrictlyPrecedesActive && (deployedMatchesActive || deployedMatchesPending)) return;
+      invalid();
+    }
     const targetsActive = authority.classifierVersion === input.payload.classifierVersion &&
       authority.allocationAlgorithmVersion === input.payload.allocationAlgorithmVersion;
     const targetsRegisteredPending = authority.pendingClassifierVersion ===
@@ -1584,12 +1862,11 @@ export async function replayFinancialClassification(
         if (superseded) return;
         if (authority.pendingScanRunId !== null || !advancesActive) invalid();
       }
-    } else if (!targetsPending &&
-      !(targetsActive && authority.pendingScanRunId === null)) {
+    } else if (!targetsPending && !targetsActive) {
       if (superseded) return;
       invalid();
     }
-    await replayFinancialClassificationLocked(transaction, {
+    const replay = await replayFinancialClassificationLocked(transaction, {
       subjectType: input.payload.subjectType, subjectId: input.payload.subjectId,
       sourceFingerprintSha256: input.payload.sourceFingerprintSha256,
       classifierVersion: input.payload.classifierVersion,
@@ -1602,7 +1879,14 @@ export async function replayFinancialClassification(
     if (input.signal.aborted) {
       throw new DOMException('Financial classification replay was aborted.', 'AbortError');
     }
+    return replay;
   });
+  if (result?.status === 'blocking_exception') {
+    if (result.impact === 'pending') {
+      throw new RetryableFinancialError('state_changed');
+    }
+    throw new PermanentFinancialError(blockingReplayFailureSafeCode(result.safeCode));
+  }
 }
 
 export async function rebaseApprovedCorrectionDistributionLocked(

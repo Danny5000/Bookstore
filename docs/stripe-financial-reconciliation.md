@@ -115,8 +115,8 @@ Never add unlike currencies or treat one domain as a converted equivalent of the
 | `allocation_fork` | More than one allocation-chain tip is visible. Keep read-only and investigate replay/version history. |
 | `allocation_incomplete` | Expected attribution is not finalized, commonly an ambiguous refund. Wait for the named 6B-II refund workflow. |
 | `allocation_mismatch` | Signed totals, capacities, or persisted allocation shape do not conserve. Treat as an exception. |
-| `classification_fork` | One immutable subject/version/fingerprint has contradictory decisions. Treat as an exception. |
-| `correction_rebase_required` | A preserved reporting correction is incompatible with a newer projection tip. Wait for the named correction workflow. |
+| `classification_fork` | Multiple global allocation tips exist for a Balance Transaction, or an exact replay target contradicts immutable classification evidence on its selected allocation set. Treat as an exception. |
+| `correction_rebase_required` | A preserved reporting correction is incompatible with an exact replacement allocation set. Wait for the named correction workflow. |
 | `currency_mismatch` | Currency domains or linked rows disagree. Do not convert or rewrite values. |
 | `generation_exhausted` | A payout reached the bounded generation ceiling. Keep closed and escalate as a software/data incident. |
 | `immutable_mismatch` | Canonical evidence collides with an existing immutable fact. Compare minimized lineage; never overwrite it. |
@@ -125,7 +125,7 @@ Never add unlike currencies or treat one domain as a converted equivalent of the
 | `payout_membership_conflict` | One Balance Transaction was claimed by competing supported payouts. Treat as an exception. |
 | `payout_reversal_incomplete` | A failed/canceled payout lacks complete reversal evidence. Wait for canonical recovery. |
 | `source_linkage_mismatch` | Canonical provider evidence cannot be proven to belong to the expected local source. Treat as an exception. |
-| `unsupported_category` | The active classifier cannot safely classify immutable raw evidence. Wait for a reviewed classifier deployment. |
+| `unsupported_category` | One immutable classification-version row records evidence that its classifier could not safely classify. The row-specific diagnostic remains historical and open; use the active-only query below to decide whether it is a current blocker. |
 
 Inspect only minimized operational fields:
 
@@ -135,6 +135,55 @@ select id, resource_type, resource_id, safe_code, state, impact,
 from financial_reconciliation_issues
 where state = 'open'
 order by last_observed_at desc, id
+limit 100;
+
+with active as (
+  select classifier_version, allocation_algorithm_version
+  from financial_projection_versions
+  where singleton = true
+), active_classifications as (
+  select classification.id
+  from financial_classification_versions classification
+  cross join active
+  left join stripe_balance_transactions balance
+    on classification.subject_type = 'balance_transaction'
+   and balance.id = classification.subject_id
+   and balance.fingerprint_sha256 = classification.source_fingerprint_sha256
+  left join stripe_balance_transaction_fee_details detail
+    on classification.subject_type = 'fee_detail'
+   and detail.id = classification.subject_id
+   and detail.fingerprint_sha256 = classification.source_fingerprint_sha256
+  where classification.classifier_version = active.classifier_version
+    and (balance.id is not null or detail.id is not null)
+), active_allocation_tips as (
+  select allocation.id
+  from financial_allocation_sets allocation
+  cross join active
+  where allocation.classifier_version = active.classifier_version
+    and allocation.algorithm_version = active.allocation_algorithm_version
+    and not exists (
+      select 1
+      from financial_allocation_sets successor
+      where successor.supersedes_set_id = allocation.id
+        and successor.classifier_version = allocation.classifier_version
+        and successor.algorithm_version = allocation.algorithm_version
+    )
+)
+select issue.id, issue.resource_type, issue.resource_id, issue.safe_code,
+  issue.state, issue.impact, issue.first_observed_at, issue.last_observed_at,
+  issue.occurrence_count, issue.correlation_id, issue.resolved_at
+from financial_reconciliation_issues issue
+where issue.state = 'open'
+  and (
+    issue.resource_type not in ('financial_classification', 'allocation_set')
+    or (issue.resource_type = 'financial_classification' and exists (
+      select 1 from active_classifications active where active.id = issue.resource_id
+    ))
+    or (issue.resource_type = 'allocation_set' and exists (
+      select 1 from active_allocation_tips active where active.id = issue.resource_id
+    ))
+  )
+order by issue.last_observed_at desc, issue.id
 limit 100;
 
 select id, type, status, attempts, max_attempts, run_at, completed_at, updated_at
@@ -149,9 +198,11 @@ order by updated_at desc, id
 limit 100;
 ```
 
+The first query is a historical inventory: a retired classifier's immutable `unsupported_category` fact remains open and is not a current blocker merely because a newer classifier is active. The second query is the current operational queue. It retains non-versioned issue resources, but includes a classification-row issue only when that row belongs to the active classifier and the subject's current raw fingerprint, and includes an allocation-set issue only when that exact set is a raw tip under the active classifier/allocation pair. It deliberately derives raw tips rather than trusting `current_financial_projection_heads.base_set_id`, because an issue on the selected set makes that view hide the ID. The orphan check below proves every historical unknown row owns its exact permanent issue; the active decision diagnostic independently proves current unknown-to-issue cardinality.
+
 Do not select job payloads, provider IDs for support output, raw events, provider messages, descriptions, metadata, customer identity, emails, card/billing/address data, receipt URLs, action URLs, secrets, or request/response bodies. Do not enable Stripe SDK HTTP logging.
 
-There is no generic Resolve action. An issue resolves only in the same transaction where canonical recomputation proves its exact invariant after new provider evidence, a reviewed classifier replay, refund finalization, or a validated reporting correction. Acknowledgment alone cannot advance state. Direct database edits, deleting history, editing issue state, blessing a classifier row, assigning payout membership, or resetting a failed job are unsupported repair paths.
+There is no generic Resolve action. An issue resolves only in the same transaction where canonical recomputation proves its exact invariant after new provider evidence, a reviewed classifier replay, refund finalization, or a validated reporting correction. An `unsupported_category` issue on a `financial_classification` resource is different: it is the immutable truth about that exact historical row and never resolves; a later classifier writes a different row and only the active row participates in current triage. Acknowledgment alone cannot advance state. Direct database edits, deleting history, editing issue state, blessing a classifier row, assigning payout membership, or resetting a failed job are unsupported repair paths.
 
 ## Coordinated backup and restore
 
@@ -188,7 +239,7 @@ Restore first into a collision-resistant isolated Compose project only after a f
 
 ### Post-restore orphan check
 
-This query checks both declared relationships and the bounded polymorphic subject/resource links. It returns only failed check names and counts; an empty result is required.
+This query checks both declared relationships and the bounded polymorphic subject/resource links. Because a cross-table constraint cannot require a companion issue row, `financial_unknown_classification_issue` also proves that every immutable `unknown` classification row has its exact open exception-impact `unsupported_category` issue, including rows from retired classifiers. It returns only failed check names and counts; an empty result is required.
 
 ```sql
 with orphan_counts as (
@@ -349,7 +400,7 @@ with orphan_counts as (
   where i.resource_type not in (
     'payment', 'refund', 'dispute', 'payout', 'payout_import_run',
     'balance_transaction', 'fee_detail', 'allocation_set', 'correction_set',
-    'financial_scan_run'
+    'financial_classification', 'financial_scan_run'
   ) or i.safe_code not in (
     'allocation_fork', 'allocation_incomplete', 'allocation_mismatch',
     'classification_fork', 'correction_rebase_required', 'currency_mismatch',
@@ -375,6 +426,8 @@ with orphan_counts as (
     on i.resource_type = 'allocation_set' and fas.id = i.resource_id
   left join refund_reporting_correction_sets cs
     on i.resource_type = 'correction_set' and cs.id = i.resource_id
+  left join financial_classification_versions fc
+    on i.resource_type = 'financial_classification' and fc.id = i.resource_id
   left join financial_scan_runs sr
     on i.resource_type = 'financial_scan_run' and sr.id = i.resource_id
   left join "user" resolver on resolver.id = i.resolved_by_admin_id
@@ -387,8 +440,29 @@ with orphan_counts as (
      or (i.resource_type = 'fee_detail' and fd.id is null)
      or (i.resource_type = 'allocation_set' and fas.id is null)
      or (i.resource_type = 'correction_set' and cs.id is null)
+     or (i.resource_type = 'financial_classification' and (
+       fc.id is null
+       or i.safe_code <> 'unsupported_category'
+       or fc.classification <> 'unknown'
+       or i.impact <> 'exception'
+       or i.state <> 'open'
+     ))
+     or (i.resource_type in ('balance_transaction', 'fee_detail')
+       and i.safe_code = 'unsupported_category')
      or (i.resource_type = 'financial_scan_run' and sr.id is null)
      or (i.resolved_by_admin_id is not null and resolver.id is null)
+
+  union all
+  select 'financial_unknown_classification_issue', count(*)::bigint
+  from financial_classification_versions classification
+  left join financial_reconciliation_issues issue
+    on issue.resource_type = 'financial_classification'
+   and issue.resource_id = classification.id
+   and issue.safe_code = 'unsupported_category'
+   and issue.state = 'open'
+   and issue.impact = 'exception'
+  where classification.classification = 'unknown'
+    and issue.id is null
 
   union all
   select 'refund_allocation_component_graph', count(*)::bigint
@@ -834,7 +908,7 @@ order by check_name;
 
 ### Post-restore classifier and projection-tip check
 
-The projection singleton query must return `active_row_count = 1`, and the payout-discovery singleton structural query must return `violation_count = 0`. A missing payout-discovery singleton loses the durable provider-coverage high-water and blocks restore acceptance; do not recreate it by hand. The following decision query lists missing, ambiguous, or still-unknown active decisions using only internal IDs. Missing decisions can be legitimate staged/pending work and unknown decisions can match an open `unsupported_category` issue; multiple decisions are never legitimate. Do not insert a decision by hand.
+The projection singleton query must return `active_row_count = 1`, and the payout-discovery singleton structural query must return `violation_count = 0`. A missing payout-discovery singleton loses the durable provider-coverage high-water and blocks restore acceptance; do not recreate it by hand. The following decision query lists missing, ambiguous, or still-unknown active decisions using only internal IDs. Missing decisions can be legitimate staged/pending work. Every active unknown decision must have exactly one open exception-impact `unsupported_category` issue keyed to that exact classification-row ID; historical unknown rows for retired classifiers are intentionally excluded. Multiple decisions are never legitimate. Do not insert a decision or issue by hand.
 
 ```sql
 select count(*)::bigint as active_row_count,
@@ -862,7 +936,9 @@ with active as (
 ), decision_counts as (
   select s.subject_type, s.subject_id,
     count(c.id)::bigint as decision_count,
-    count(c.id) filter (where c.classification = 'unknown')::bigint as unknown_count
+    count(c.id) filter (where c.classification = 'unknown')::bigint as unknown_count,
+    count(i.id) filter (where c.classification = 'unknown')::bigint
+      as unsupported_issue_count
   from subjects s
   cross join active a
   left join financial_classification_versions c
@@ -870,11 +946,19 @@ with active as (
    and c.subject_id = s.subject_id
    and c.source_fingerprint_sha256 = s.source_fingerprint_sha256
    and c.classifier_version = a.classifier_version
+  left join financial_reconciliation_issues i
+    on i.resource_type = 'financial_classification'
+   and i.resource_id = c.id
+   and i.safe_code = 'unsupported_category'
+   and i.state = 'open'
+   and i.impact = 'exception'
   group by s.subject_type, s.subject_id
 )
-select subject_type, subject_id, decision_count, unknown_count
+select subject_type, subject_id, decision_count, unknown_count, unsupported_issue_count
 from decision_counts
-where decision_count <> 1 or unknown_count <> 0
+where decision_count <> 1
+   or unknown_count <> 0
+   or (unknown_count = 1 and unsupported_issue_count <> 1)
 order by subject_type, subject_id;
 
 select balance_transaction_id, basis, base_set_id,

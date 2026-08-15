@@ -159,6 +159,124 @@ describe('financial reconciliation operations guide', () => {
     })]);
   });
 
+  it('reports every unknown immutable classification row that lacks its exact open issue', async () => {
+    const blocks = await sqlBlocks();
+    const balanceTransactionId = randomUUID();
+    const classificationId = randomUUID();
+    const fingerprint = '9'.repeat(64);
+    await databaseClient.db.execute(sql`
+      insert into stripe_balance_transactions (
+        id, provider_id, live_mode, source_family, source_id, raw_type,
+        reporting_category, balance_type, amount_minor, fee_minor, net_minor,
+        currency, status, provider_created_at, available_at, fingerprint_sha256
+      ) values (
+        ${balanceTransactionId}, ${`txn_restore_unknown_${balanceTransactionId}`}, false,
+        'unknown', null, 'future_type', 'future_category', 'adjustment', 1, 0, 1,
+        'USD', 'available', now(), now(), ${fingerprint}
+      )
+    `);
+    await databaseClient.db.execute(sql`
+      insert into financial_classification_versions (
+        id, subject_type, subject_id, classifier_version, classification,
+        source_fingerprint_sha256
+      ) values (
+        ${classificationId}, 'balance_transaction', ${balanceTransactionId}, 1,
+        'unknown', ${fingerprint}
+      )
+    `);
+
+    const missing = await databaseClient.db.execute<{
+      check_name: string;
+      violation_count: number | string;
+    }>(sql.raw(blocks[2]!));
+    expect(new Map(missing.rows.map((row) => [row.check_name, Number(row.violation_count)]))
+      .get('financial_unknown_classification_issue')).toBe(1);
+
+    await databaseClient.db.execute(sql`
+      insert into financial_reconciliation_issues (
+        resource_type, resource_id, safe_code, impact, correlation_id
+      ) values (
+        'financial_classification', ${classificationId}, 'unsupported_category',
+        'exception', 'operations-unknown-classification'
+      )
+    `);
+    const repaired = await databaseClient.db.execute<{
+      check_name: string;
+      violation_count: number | string;
+    }>(sql.raw(blocks[2]!));
+    expect(new Map(repaired.rows.map((row) => [row.check_name, Number(row.violation_count)]))
+      .has('financial_unknown_classification_issue')).toBe(false);
+  });
+
+  it('filters the operational issue queue to active classifications and raw active allocation tips', async () => {
+    const blocks = await sqlBlocks();
+    const activeIssueQuery = blocks[1]!
+      .split(/;\s*/u)
+      .find((statement) => statement.includes('active_classifications'));
+    expect(activeIssueQuery).toBeDefined();
+    const balanceTransactionId = randomUUID();
+    const activeClassificationId = randomUUID();
+    const inactiveClassificationId = randomUUID();
+    const activeSetId = randomUUID();
+    const inactiveSetId = randomUUID();
+    const fingerprint = '8'.repeat(64);
+    await databaseClient.db.execute(sql`
+      insert into stripe_balance_transactions (
+        id, provider_id, live_mode, source_family, source_id, raw_type,
+        reporting_category, balance_type, amount_minor, fee_minor, net_minor,
+        currency, status, provider_created_at, available_at, fingerprint_sha256
+      ) values (
+        ${balanceTransactionId}, ${`txn_operator_active_${balanceTransactionId}`}, false,
+        'adjustment', null, 'adjustment', 'other_adjustment', 'adjustment', 1, 0, 1,
+        'USD', 'available', now(), now(), ${fingerprint}
+      )
+    `);
+    await databaseClient.db.execute(sql`
+      insert into financial_classification_versions (
+        id, subject_type, subject_id, classifier_version, classification,
+        source_fingerprint_sha256
+      ) values
+        (${activeClassificationId}, 'balance_transaction', ${balanceTransactionId}, 1,
+          'other', ${fingerprint}),
+        (${inactiveClassificationId}, 'balance_transaction', ${balanceTransactionId}, 2,
+          'unknown', ${fingerprint})
+    `);
+    await databaseClient.db.execute(sql`
+      insert into financial_allocation_sets (
+        id, allocation_identity, balance_transaction_id, source_kind,
+        source_internal_id, basis, scope, expected_effect_minor, currency,
+        algorithm_version, classifier_version, source_fingerprint_sha256,
+        supersedes_set_id
+      ) values
+        (${activeSetId}, ${`adjustment:${balanceTransactionId}:operator-active`},
+          ${balanceTransactionId}, 'adjustment', ${balanceTransactionId}, 'gross_amount',
+          'account', 1, 'USD', 1, 1, ${fingerprint}, null),
+        (${inactiveSetId}, ${`adjustment:${balanceTransactionId}:operator-inactive`},
+          ${balanceTransactionId}, 'adjustment', ${balanceTransactionId}, 'gross_amount',
+          'account', 1, 'USD', 1, 2, ${fingerprint}, ${activeSetId})
+    `);
+    await databaseClient.db.execute(sql`
+      insert into financial_reconciliation_issues (
+        resource_type, resource_id, safe_code, impact, correlation_id
+      ) values
+        ('financial_classification', ${inactiveClassificationId}, 'unsupported_category',
+          'exception', 'operator-inactive-classification'),
+        ('allocation_set', ${inactiveSetId}, 'missing_source', 'pending',
+          'operator-inactive-allocation'),
+        ('allocation_set', ${activeSetId}, 'missing_source', 'pending',
+          'operator-active-allocation')
+    `);
+
+    const result = await databaseClient.db.execute<{
+      resource_id: string;
+      resource_type: string;
+    }>(sql.raw(activeIssueQuery!));
+    expect(result.rows.map((row) => ({
+      resourceId: row.resource_id,
+      resourceType: row.resource_type
+    }))).toEqual([{ resourceId: activeSetId, resourceType: 'allocation_set' }]);
+  });
+
   it('reports a completed classification replay that never reached its finalizer phase', async () => {
     const blocks = await sqlBlocks();
     await databaseClient.db.execute(sql`

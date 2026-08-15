@@ -569,6 +569,44 @@ export function createPostgresJobRepository(
           ${String(classificationImplementation.allocationAlgorithmVersion)}
     )
     or (
+      type = ${FINANCIAL_CLASSIFICATION_JOB}
+      and exists (
+        select 1 from financial_projection_versions cleanup_authority
+        where cleanup_authority.singleton = true
+          and case when
+            jobs.payload ->> 'classifierVersion' ~ '^[1-9][0-9]{0,9}$'
+            and jobs.payload ->> 'allocationAlgorithmVersion' ~ '^[1-9][0-9]{0,9}$'
+          then
+            (jobs.payload ->> 'classifierVersion')::bigint <=
+              cleanup_authority.classifier_version
+            and (jobs.payload ->> 'allocationAlgorithmVersion')::bigint <=
+              cleanup_authority.allocation_algorithm_version
+            and (
+              (jobs.payload ->> 'classifierVersion')::bigint <
+                cleanup_authority.classifier_version
+              or (jobs.payload ->> 'allocationAlgorithmVersion')::bigint <
+                cleanup_authority.allocation_algorithm_version
+            )
+          else false end
+          and (
+            (
+              cleanup_authority.classifier_version =
+                ${classificationImplementation.classifierVersion}
+              and cleanup_authority.allocation_algorithm_version =
+                ${classificationImplementation.allocationAlgorithmVersion}
+            )
+            or (
+              cleanup_authority.pending_classifier_version =
+                ${classificationImplementation.classifierVersion}
+              and cleanup_authority.pending_allocation_algorithm_version =
+                ${classificationImplementation.allocationAlgorithmVersion}
+              and cleanup_authority.pending_replay_id is not null
+              and cleanup_authority.pending_scan_run_id is not null
+            )
+          )
+      )
+    )
+    or (
       type = ${FINANCIAL_SCAN_JOB}
       and payload ->> 'kind' = 'continuation'
       and payload ->> 'phase' in (

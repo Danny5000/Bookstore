@@ -106,6 +106,21 @@ describe('financial issue lifecycle', () => {
     expect(audit.params).toContain(JSON.stringify({ resourceType: 'payment', resourceId: RESOURCE_ID, safeCode: 'missing_source', impact: 'pending', state: 'open', occurrenceCount: 1 }));
   });
 
+  it('accepts immutable classification rows as version-exact issue resources', async () => {
+    const classificationIssue = issue({
+      resourceType: 'financial_classification', safeCode: 'unsupported_category',
+      impact: 'exception'
+    });
+    const database = executor([[], [], [classificationIssue], []]);
+    await expect(observeFinancialIssue(database.tx, observe({
+      resourceType: 'financial_classification', safeCode: 'unsupported_category',
+      impact: 'exception'
+    }))).resolves.toEqual(classificationIssue);
+    expect(rendered(database.calls[0]!).params).toContain(
+      `pale-orbit:financial:issue:financial_classification:${RESOURCE_ID}:unsupported_category`
+    );
+  });
+
   it('increments a matching open issue without audit and clamps its occurrence count', async () => {
     const current = issue({ occurrenceCount: 2_147_483_647, correlationId: 'first-observation', resolvedByAdminId: USER_ID });
     const updated = issue({ occurrenceCount: 2_147_483_647, correlationId: 'first-observation', resolvedByAdminId: USER_ID, lastObservedAt: new Date('2026-08-12T00:01:00.000Z') });
@@ -140,6 +155,22 @@ describe('financial issue lifecycle', () => {
     expect(invalid.calls).toHaveLength(0);
   });
 
+  it('does not resolve the immutable fact that a classification row was unsupported', async () => {
+    const database = executor([]);
+    await expect(resolveFinancialIssueAfterRecompute(database.tx, resolve('resolved', {
+      resourceType: 'financial_classification', safeCode: 'unsupported_category',
+      proof: { status: 'resolved', resourceType: 'financial_classification',
+        resourceId: RESOURCE_ID, safeCode: 'unsupported_category' }
+    }))).rejects.toMatchObject({ safeCode: 'unsupported_provider_evidence' });
+    expect(database.calls).toHaveLength(0);
+
+    await expect(resolveFinancialIssueAfterRecompute(database.tx, resolve('still_open', {
+      resourceType: 'financial_classification', safeCode: 'unsupported_category',
+      proof: { status: 'still_open', resourceType: 'financial_classification',
+        resourceId: RESOURCE_ID, safeCode: 'unsupported_category' }
+    }))).resolves.toBeNull();
+  });
+
   it('treats still_open proof as a no-op', async () => {
     const database = executor([]);
     await expect(resolveFinancialIssueAfterRecompute(database.tx, resolve('still_open'))).resolves.toBeNull();
@@ -148,25 +179,26 @@ describe('financial issue lifecycle', () => {
 
   it('resolves an open issue for a user actor and atomically audits it', async () => {
     const resolved = issue({ state: 'resolved', resolvedByAdminId: USER_ID, resolvedAt: new Date('2026-08-12T00:02:00.000Z') });
-    const database = executor([[], [issue()], [resolved], []]);
+    const database = executor([[], [issue()], [resolved]]);
     await expect(resolveFinancialIssueAfterRecompute(database.tx, resolve('resolved', {
       actor: { type: 'user', id: USER_ID, roles: ['customer', 'admin'] }
     }))).resolves.toEqual(resolved);
-    expect(database.calls).toHaveLength(4);
+    expect(database.calls).toHaveLength(3);
     const transition = rendered(database.calls[2]!);
     expect(transition.sql).toContain('resolve_financial_reconciliation_issue');
     expect(transition.sql).not.toContain('update financial_reconciliation_issues');
-    expect(transition.params).toContain(USER_ID);
-    const audit = rendered(database.calls[3]!);
-    expect(audit.params).toContain('financial.issue.resolved');
-    expect(audit.params).toContain(JSON.stringify({ resourceType: 'payment', resourceId: RESOURCE_ID, safeCode: 'missing_source', impact: 'pending', state: 'resolved', occurrenceCount: 1 }));
+    expect(transition.params).toEqual([
+      ISSUE_ID, USER_ID, 'user', USER_ID, 'resolve-1'
+    ]);
   });
 
   it('resolves for a system actor without an administrator id and is idempotent for absent opens', async () => {
     const resolved = issue({ state: 'resolved', resolvedAt: new Date('2026-08-12T00:02:00.000Z') });
-    const system = executor([[], [issue()], [resolved], []]);
+    const system = executor([[], [issue()], [resolved]]);
     await expect(resolveFinancialIssueAfterRecompute(system.tx, resolve('resolved'))).resolves.toEqual(resolved);
-    expect(rendered(system.calls[2]!).params).toContain(null);
+    expect(rendered(system.calls[2]!).params).toEqual([
+      ISSUE_ID, null, 'system', 'financial-worker', 'resolve-1'
+    ]);
 
     const missing = executor([[], []]);
     await expect(resolveFinancialIssueAfterRecompute(missing.tx, resolve('resolved'))).resolves.toBeNull();

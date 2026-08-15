@@ -314,6 +314,23 @@ describe('financial allocation repository', () => {
     expect(result[1]).toEqual({ status: 'missing', balanceTransactionId: ID, basis: 'fee', safeCode: 'missing_source' });
   });
 
+  it('preserves a selected-set source linkage exception from the current view', async () => {
+    const setId = '33333333-3333-4333-8333-333333333333';
+    const db = executor([[
+      { balanceTransactionId: ID, basis: 'gross_amount', baseSetId: setId,
+        compatibleCorrectionTipId: null, scope: null, currency: null,
+        expectedEffectMinor: null, isComplete: false, missingSourceCount: 1,
+        proposedIssueCode: 'source_linkage_mismatch' }
+    ], []]);
+
+    await expect(loadCurrentEffectiveAllocationProjection(db as never, {
+      balanceTransactionIds: [ID]
+    })).resolves.toContainEqual({
+      status: 'exception', balanceTransactionId: ID, basis: 'gross_amount',
+      safeCode: 'source_linkage_mismatch'
+    });
+  });
+
   it('accepts a complete zero-effect title head with no items', async () => {
     const setId = '33333333-3333-4333-8333-333333333333';
     const db = executor([[{ balanceTransactionId: ID, basis: 'fee', baseSetId: setId,

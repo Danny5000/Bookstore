@@ -12,7 +12,7 @@ const FP = /^[a-f0-9]{64}$/u;
 const CURRENCY = /^[A-Z]{3}$/u;
 const SAFE_MONEY = 99_999_999;
 const COMPONENTS = new Set<FinancialComponent>(['sale_subtotal','sale_tax','processing_fee','refund_subtotal','refund_tax','refund_fee','refund_failure_reversal','dispute_subtotal','dispute_tax','dispute_fee','dispute_reinstatement','provider_fee_tax','fee_credit','other']);
-const ISSUE_CODES = new Set(['missing_source','allocation_incomplete','allocation_fork','allocation_mismatch','classification_fork','correction_rebase_required','currency_mismatch','immutable_mismatch','unsupported_category']);
+const ISSUE_CODES = new Set(['missing_source','allocation_incomplete','allocation_fork','allocation_mismatch','classification_fork','correction_rebase_required','currency_mismatch','immutable_mismatch','source_linkage_mismatch','unsupported_category']);
 
 type Result = { rows?: unknown[] };
 async function rows(executor: DatabaseExecutor, query: SQL): Promise<unknown[]> {

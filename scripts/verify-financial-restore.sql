@@ -258,7 +258,7 @@ with orphan_counts as (
   where i.resource_type not in (
     'payment', 'refund', 'dispute', 'payout', 'payout_import_run',
     'balance_transaction', 'fee_detail', 'allocation_set', 'correction_set',
-    'financial_scan_run'
+    'financial_classification', 'financial_scan_run'
   ) or i.safe_code not in (
     'allocation_fork', 'allocation_incomplete', 'allocation_mismatch',
     'classification_fork', 'correction_rebase_required', 'currency_mismatch',
@@ -284,6 +284,8 @@ with orphan_counts as (
     on i.resource_type = 'allocation_set' and fas.id = i.resource_id
   left join refund_reporting_correction_sets cs
     on i.resource_type = 'correction_set' and cs.id = i.resource_id
+  left join financial_classification_versions fc
+    on i.resource_type = 'financial_classification' and fc.id = i.resource_id
   left join financial_scan_runs sr
     on i.resource_type = 'financial_scan_run' and sr.id = i.resource_id
   left join "user" resolver on resolver.id = i.resolved_by_admin_id
@@ -296,8 +298,29 @@ with orphan_counts as (
      or (i.resource_type = 'fee_detail' and fd.id is null)
      or (i.resource_type = 'allocation_set' and fas.id is null)
      or (i.resource_type = 'correction_set' and cs.id is null)
+     or (i.resource_type = 'financial_classification' and (
+       fc.id is null
+       or i.safe_code <> 'unsupported_category'
+       or fc.classification <> 'unknown'
+       or i.impact <> 'exception'
+       or i.state <> 'open'
+     ))
+     or (i.resource_type in ('balance_transaction', 'fee_detail')
+       and i.safe_code = 'unsupported_category')
      or (i.resource_type = 'financial_scan_run' and sr.id is null)
      or (i.resolved_by_admin_id is not null and resolver.id is null)
+
+  union all
+  select 'financial_unknown_classification_issue', count(*)::bigint
+  from financial_classification_versions classification
+  left join financial_reconciliation_issues issue
+    on issue.resource_type = 'financial_classification'
+   and issue.resource_id = classification.id
+   and issue.safe_code = 'unsupported_category'
+   and issue.state = 'open'
+   and issue.impact = 'exception'
+  where classification.classification = 'unknown'
+    and issue.id is null
 
   union all
   select 'refund_allocation_component_graph', count(*)::bigint

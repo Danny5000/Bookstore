@@ -1618,13 +1618,14 @@ describe('financial reconciliation acceptance', () => {
       fingerprintSha256: fingerprint
     }).returning();
     if (!balance) throw new Error('Expected a replay balance fixture.');
-    await databaseClient.db.insert(financialClassificationVersions).values({
+    const [unknownClassification] = await databaseClient.db.insert(financialClassificationVersions).values({
       subjectType: 'balance_transaction',
       subjectId: balance.id,
       classifierVersion: 1,
       classification: 'unknown',
       sourceFingerprintSha256: fingerprint
-    });
+    }).returning();
+    if (!unknownClassification) throw new Error('Expected an immutable unknown classification fixture.');
     const oldSets = await databaseClient.db.insert(financialAllocationSets).values([
       {
         allocationIdentity: `adjustment:${balance.id}:${balance.id}:replay:c1-a1:gross`,
@@ -1654,8 +1655,8 @@ describe('financial reconciliation acceptance', () => {
       }
     ]).returning();
     await databaseClient.db.insert(financialReconciliationIssues).values({
-      resourceType: 'balance_transaction',
-      resourceId: balance.id,
+      resourceType: 'financial_classification',
+      resourceId: unknownClassification.id,
       safeCode: 'unsupported_category',
       impact: 'exception',
       correlationId: `unknown-v1-${suffix}`
@@ -1725,11 +1726,34 @@ describe('financial reconciliation acceptance', () => {
         basis: 'fee', scope: 'account', expectedEffectMinor: 0, isComplete: true
       })
     ]);
-    expect((await databaseClient.db.select().from(financialReconciliationIssues)
-      .where(eq(financialReconciliationIssues.resourceId, balance.id)))[0]).toMatchObject({
-      safeCode: 'unsupported_category',
-      state: 'resolved'
-    });
+    expect(await databaseClient.db.select().from(financialReconciliationIssues)
+      .where(eq(financialReconciliationIssues.resourceId, unknownClassification.id)))
+      .toEqual([expect.objectContaining({
+        resourceType: 'financial_classification', safeCode: 'unsupported_category',
+        state: 'open', impact: 'exception'
+      })]);
+    const activeUnsupported = await databaseClient.db.execute(sql`
+      with active as (
+        select classifier_version
+        from financial_projection_versions
+        where singleton = true
+      )
+      select issue.id
+      from financial_reconciliation_issues issue
+      join financial_classification_versions classification
+        on classification.id = issue.resource_id
+      cross join active
+      join stripe_balance_transactions balance
+        on classification.subject_type = 'balance_transaction'
+       and balance.id = classification.subject_id
+       and balance.fingerprint_sha256 = classification.source_fingerprint_sha256
+      where issue.resource_type = 'financial_classification'
+        and issue.safe_code = 'unsupported_category'
+        and issue.state = 'open'
+        and issue.impact = 'exception'
+        and classification.classifier_version = active.classifier_version
+    `) as { rows?: unknown[] };
+    expect(activeUnsupported.rows ?? []).toEqual([]);
     expect(await databaseClient.db.select().from(auditEvents).where(and(
       eq(auditEvents.action, 'financial.allocation.superseded'),
       inArray(auditEvents.resourceId, allSets

@@ -746,6 +746,7 @@ describe('commerce operations contract', () => {
       'financial_payout_discovery_singleton',
       'financial_projection_tip_ambiguity',
       'financial_classification_decision_ambiguity',
+      'financial_unknown_classification_issue',
       'pending_replay_child_count_mismatch',
       'pending_replay_child_version_mismatch',
       'pending_replay_child_incomplete',
@@ -768,6 +769,15 @@ describe('commerce operations contract', () => {
     )[0];
     expect(verifierConservationSql).toBeDefined();
     expect(documentedConservationSql?.trim()).toBe(verifierConservationSql?.trim());
+    const verifierStructuralSql = financialVerifier.match(
+      /with orphan_counts as \([\s\S]*?from orphan_counts\s+where violation_count <> 0\s+order by check_name;/u
+    )?.[0];
+    const documentedStructuralSql = fencedCodeBlocks(
+      markdownSection(financialRunbook, 'Post-restore orphan check'),
+      'sql'
+    )[0];
+    expect(verifierStructuralSql).toBeDefined();
+    expect(documentedStructuralSql?.trim()).toBe(verifierStructuralSql?.trim());
     expect(financialVerifier).toMatch(
       /combined_refund_events[\s\S]*r\.status = 'succeeded'[\s\S]*r\.allocation_status in \('finalized', 'exception'\)/u
     );
@@ -970,7 +980,7 @@ describe('commerce operations contract', () => {
     expect(malformedPort.stderr).not.toContain('ECONNREFUSED');
   }, 20_000);
 
-  it('executes payout, replay-child, refund-component, and combined-chronology verifier witnesses in PostgreSQL', () => {
+  it('executes classification, payout, replay-child, refund-component, and combined-chronology verifier witnesses in PostgreSQL', () => {
     const result = spawnSync(
       process.execPath,
       [
@@ -991,7 +1001,7 @@ describe('commerce operations contract', () => {
       }
     );
     expect(`${result.stdout}${result.stderr}`).toContain(
-      '[restore-verifier] payout, replay-child, refund-component, and combined-chronology witnesses passed'
+      '[restore-verifier] classification, payout, replay-child, refund-component, and combined-chronology witnesses passed'
     );
     expect(result.status).toBe(0);
   }, 130_000);

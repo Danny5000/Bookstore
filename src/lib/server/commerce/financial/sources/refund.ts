@@ -45,7 +45,11 @@ import {
   lockActiveFinancialProjectionImplementation,
   lockFinancialProjectionRows
 } from '../locks';
-import { stageBalanceTransaction } from '../ledger';
+import {
+  rearmCurrentProjectionSubjectsForFinancialSources,
+  stageBalanceTransaction
+} from '../ledger';
+import { lockFinancialProjectionEnrollment } from '../rebase';
 import type {
   FinancialAllocationPlan,
   FinancialIssueCode,
@@ -65,6 +69,7 @@ const ISSUE_CODES: readonly FinancialIssueCode[] = [
   'correction_rebase_required', 'currency_mismatch', 'immutable_mismatch', 'missing_source',
   'source_linkage_mismatch', 'unsupported_category'
 ];
+const ORDINARY_REFUND_SET_ISSUE_CODES: readonly FinancialIssueCode[] = ISSUE_CODES;
 const LOCKED_REFUND_KEYS = [
   'orderId', 'paymentId', 'refundId', 'providerStatus', 'allocationStatus', 'amountMinor',
   'currency', 'balanceTransactionIds', 'orderItems', 'finalizedAllocations',
@@ -127,6 +132,12 @@ interface StoredPlan {
   readonly plan: FinancialAllocationPlan;
 }
 
+interface ExactActiveRefundTip {
+  readonly id: string;
+  readonly balanceTransactionId: string;
+  readonly basis: 'gross_amount' | 'fee';
+}
+
 export interface LockedRefundProjectionReplayVersion {
   readonly classifierVersion: number;
   readonly allocationAlgorithmVersion: number;
@@ -142,6 +153,13 @@ export interface LockedRefundProjectionReplayReplacement {
   readonly disposition: 'inserted' | 'unchanged';
 }
 
+export const LOCKED_REFUND_PROJECTION_REPLAY_ISSUE_CODES = [
+  'allocation_mismatch', 'currency_mismatch', 'missing_source',
+  'source_linkage_mismatch', 'unsupported_category'
+] as const satisfies readonly FinancialIssueCode[];
+export type LockedRefundProjectionReplayIssueCode =
+  (typeof LOCKED_REFUND_PROJECTION_REPLAY_ISSUE_CODES)[number];
+
 export type LockedRefundProjectionReplayResult =
   | {
       readonly status: 'replayed' | 'unchanged';
@@ -151,8 +169,8 @@ export type LockedRefundProjectionReplayResult =
   | {
       readonly status: 'exception';
       readonly refundId: string;
-      readonly safeCode: FinancialIssueCode;
-      readonly impact: FinancialIssueImpact;
+      readonly safeCode: LockedRefundProjectionReplayIssueCode;
+      readonly impact: Exclude<FinancialIssueImpact, 'informational'>;
     };
 
 interface RefundProjectionVersionTarget {
@@ -171,11 +189,29 @@ interface PersistedRefundProjectionPlan {
 class RefundProjectionIssue extends Error {
   constructor(
     readonly safeCode: FinancialIssueCode,
-    readonly impact: FinancialIssueImpact
+    readonly impact: Exclude<FinancialIssueImpact, 'informational'>
   ) {
     super('The locked refund projection requires a durable issue.');
     this.name = 'RefundProjectionIssue';
   }
+}
+
+interface ResolvedOrdinaryRefundSetIssue {
+  readonly id: string;
+  readonly safeCode: FinancialIssueCode;
+  readonly impact: FinancialIssueImpact;
+}
+
+function compareResolvedSetIssuePriority(
+  left: ResolvedOrdinaryRefundSetIssue,
+  right: ResolvedOrdinaryRefundSetIssue
+): number {
+  const impactRank = (impact: FinancialIssueImpact): number =>
+    impact === 'exception' ? 0 : impact === 'pending' ? 1 : 2;
+  const rank = impactRank(left.impact) - impactRank(right.impact);
+  if (rank !== 0) return rank;
+  if (left.safeCode !== right.safeCode) return left.safeCode < right.safeCode ? -1 : 1;
+  return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
 }
 
 function exactObject(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
@@ -363,6 +399,50 @@ async function rows(executor: DatabaseTransaction, query: SQL): Promise<unknown[
   return ((await executor.execute(query)) as QueryResult).rows ?? [];
 }
 
+async function discoverExactActiveRefundTips(
+  transaction: DatabaseTransaction,
+  balanceTransactionIds: readonly string[],
+  lockRows = false
+): Promise<ExactActiveRefundTip[]> {
+  if (balanceTransactionIds.length === 0) return [];
+  const tips = await rows(transaction, sql`
+    select target_set.id,
+      target_set.balance_transaction_id as "balanceTransactionId", target_set.basis
+    from financial_allocation_sets target_set
+    where target_set.balance_transaction_id in (${sql.join(
+      balanceTransactionIds.map((id) => sql`${id}::uuid`), sql`, `
+    )})
+      and target_set.classifier_version = ${FINANCIAL_CLASSIFIER_VERSION}
+      and target_set.algorithm_version = ${FINANCIAL_ALLOCATION_ALGORITHM_VERSION}
+      and not exists (
+        select 1 from financial_allocation_sets successor
+        where successor.supersedes_set_id = target_set.id
+          and successor.classifier_version = target_set.classifier_version
+          and successor.algorithm_version = target_set.algorithm_version
+      )
+    order by target_set.balance_transaction_id, target_set.basis, target_set.id
+    ${lockRows ? sql`for update` : sql``}
+  `) as ExactActiveRefundTip[];
+  if (tips.some((tip) => !UUID.test(tip.id) ||
+    !balanceTransactionIds.includes(tip.balanceTransactionId) ||
+    (tip.basis !== 'gross_amount' && tip.basis !== 'fee'))) {
+    throw new PermanentFinancialError('source_linkage_mismatch');
+  }
+  return tips;
+}
+
+function sameExactActiveRefundTips(
+  left: readonly ExactActiveRefundTip[],
+  right: readonly ExactActiveRefundTip[]
+): boolean {
+  return left.length === right.length && left.every((tip, index) => {
+    const other = right[index];
+    return other?.id === tip.id &&
+      other.balanceTransactionId === tip.balanceTransactionId &&
+      other.basis === tip.basis;
+  });
+}
+
 function invalidLockedInput(): never {
   throw new PermanentFinancialError('invalid_job_payload');
 }
@@ -488,6 +568,15 @@ function durableIssueCode(error: unknown): FinancialIssueCode | null {
   }
 }
 
+function lockedReplayIssueCode(
+  safeCode: FinancialIssueCode
+): LockedRefundProjectionReplayIssueCode | null {
+  return (LOCKED_REFUND_PROJECTION_REPLAY_ISSUE_CODES as readonly FinancialIssueCode[])
+    .includes(safeCode)
+    ? safeCode as LockedRefundProjectionReplayIssueCode
+    : null;
+}
+
 function classificationComponent(value: string | null): ClassifiedFeeDetail['component'] {
   switch (value) {
     case 'refund_fee': return 'refund_fee';
@@ -524,7 +613,9 @@ async function loadFeeDetails(
 async function loadCurrentStoredPlans(
   transaction: DatabaseTransaction,
   refundId: string,
-  balanceTransactionId: string
+  balanceTransactionId: string,
+  target: Pick<RefundProjectionVersionTarget,
+    'classifierVersion' | 'allocationAlgorithmVersion'>
 ): Promise<ReadonlyMap<'gross_amount' | 'fee', StoredPlan>> {
   const sets = await rows(transaction, sql`
     select allocation.id, allocation.allocation_identity as "allocationIdentity",
@@ -533,31 +624,77 @@ async function loadCurrentStoredPlans(
       allocation.source_internal_id as "sourceId",
       allocation.scope, allocation.currency,
       allocation.expected_effect_minor as "expectedEffectMinor",
+      allocation.classifier_version as "classifierVersion",
       allocation.algorithm_version as "algorithmVersion",
       allocation.source_fingerprint_sha256 as "sourceFingerprint",
       allocation.supersedes_set_id as "supersedesSetId",
-      allocation.reversal_of_set_id as "reversalOfSetId"
+      allocation.reversal_of_set_id as "reversalOfSetId",
+      (
+        allocation.classifier_version = ${target.classifierVersion}
+        and allocation.algorithm_version = ${target.allocationAlgorithmVersion}
+        and not exists (
+          select 1 from financial_allocation_sets successor
+          where successor.supersedes_set_id = allocation.id
+            and successor.classifier_version = allocation.classifier_version
+            and successor.algorithm_version = allocation.algorithm_version
+        )
+      ) as "isTargetTip",
+      not exists (
+        select 1 from financial_allocation_sets global_successor
+        where global_successor.supersedes_set_id = allocation.id
+      ) as "isGlobalTip"
     from financial_allocation_sets allocation
     where allocation.balance_transaction_id = ${balanceTransactionId}
-      and not exists (
-        select 1 from financial_allocation_sets successor
-        where successor.supersedes_set_id = allocation.id
+      and (
+        (
+          allocation.classifier_version = ${target.classifierVersion}
+          and allocation.algorithm_version = ${target.allocationAlgorithmVersion}
+          and not exists (
+            select 1 from financial_allocation_sets successor
+            where successor.supersedes_set_id = allocation.id
+              and successor.classifier_version = allocation.classifier_version
+              and successor.algorithm_version = allocation.algorithm_version
+          )
+        ) or not exists (
+          select 1 from financial_allocation_sets global_successor
+          where global_successor.supersedes_set_id = allocation.id
+        )
       )
-    order by allocation.basis
+    order by allocation.basis, allocation.classifier_version, allocation.algorithm_version,
+      allocation.id
     for update
   `) as Array<{
     id: string; allocationIdentity: string; balanceTransactionId: string;
     sourceKind: string; sourceId: string;
     basis: 'gross_amount' | 'fee'; scope: 'title' | 'account' | 'unresolved';
-    currency: string; expectedEffectMinor: number; algorithmVersion: number;
+    currency: string; expectedEffectMinor: number; classifierVersion?: number;
+    algorithmVersion: number;
     sourceFingerprint: string; supersedesSetId: string | null; reversalOfSetId: string | null;
+    isTargetTip?: boolean; isGlobalTip?: boolean;
   }>;
   const result = new Map<'gross_amount' | 'fee', StoredPlan>();
-  for (const set of sets) {
+  for (const basis of ['gross_amount', 'fee'] as const) {
+    const basisSets = sets.filter((set) => set.basis === basis);
+    const targetSets = basisSets.filter((set) => set.isTargetTip === true ||
+      (set.isTargetTip === undefined && set.classifierVersion === target.classifierVersion &&
+        set.algorithmVersion === target.allocationAlgorithmVersion));
+    const fallbackSets = basisSets.filter((set) =>
+      (set.isGlobalTip === true || set.isTargetTip === undefined) &&
+      (set.classifierVersion === undefined ||
+        (set.classifierVersion <= target.classifierVersion &&
+          set.algorithmVersion <= target.allocationAlgorithmVersion &&
+          (set.classifierVersion < target.classifierVersion ||
+            set.algorithmVersion < target.allocationAlgorithmVersion))));
+    const selected = targetSets.length > 0 ? targetSets : fallbackSets;
+    if (selected.length > 1) {
+      throw new PermanentFinancialError('source_linkage_mismatch');
+    }
+    const set = selected[0];
+    if (!set) continue;
     const expectedOwner = set.sourceKind === 'refund' && set.sourceId === refundId;
     const balanceFallback = set.sourceKind === 'adjustment' &&
       set.sourceId === balanceTransactionId;
-    if ((!expectedOwner && !balanceFallback) || result.has(set.basis)) {
+    if (!expectedOwner && !balanceFallback) {
       throw new PermanentFinancialError('source_linkage_mismatch');
     }
     const items = await rows(transaction, sql`
@@ -566,7 +703,7 @@ async function loadCurrentStoredPlans(
       from financial_item_allocations where allocation_set_id = ${set.id}
       order by tie_break_key, order_item_id, component
     `) as FinancialAllocationPlan['items'];
-    result.set(set.basis, {
+    result.set(basis, {
       id: set.id,
       plan: {
         allocationIdentity: set.allocationIdentity,
@@ -671,9 +808,15 @@ async function loadRefundRouting(database: Database, refundId: string): Promise<
 async function recomputeLockedRefundFinancialProjectionAtVersion(
   transaction: DatabaseTransaction,
   input: LockedRefundProjectionInput,
-  target: RefundProjectionVersionTarget
+  target: RefundProjectionVersionTarget,
+  ordinarySelectedSetIds: readonly string[] = []
 ): Promise<RefundFinancialRecomputeResult | LockedRefundProjectionReplayResult> {
   assertLockedRefundProjectionInput(input);
+  if (ordinarySelectedSetIds.some((id) => !UUID.test(id)) ||
+    new Set(ordinarySelectedSetIds).size !== ordinarySelectedSetIds.length ||
+    (target.mode === 'replay' && ordinarySelectedSetIds.length > 0)) {
+    invalidLockedInput();
+  }
   const [localState] = await rows(transaction, sql`
     select financial_evidence_status as "financialEvidenceStatus"
     from refunds where id = ${input.refundId} for update
@@ -716,12 +859,23 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
             on allocation_set.id = allocation.gross_allocation_set_id
           join stripe_balance_transactions balance
             on balance.id = allocation_set.balance_transaction_id
+          join financial_classification_versions decision
+            on decision.subject_type = 'balance_transaction'
+            and decision.subject_id = balance.id
+            and decision.classifier_version = ${target.classifierVersion}
+            and decision.source_fingerprint_sha256 = balance.fingerprint_sha256
           left join dispute_item_allocations original
             on original.id = allocation.reverses_allocation_id
           where dispute.payment_id = ${input.paymentId}
             and allocation_set.basis = 'gross_amount'
             and allocation_set.classifier_version = ${target.classifierVersion}
             and allocation_set.algorithm_version = ${target.allocationAlgorithmVersion}
+            and (
+              decision.classification = 'dispute_withdrawal'
+                and allocation.effect = 'withdrawal'
+              or decision.classification = 'dispute_reinstatement'
+                and allocation.effect = 'reinstatement'
+            )
             and not exists (
               select 1 from financial_allocation_sets successor
               where successor.supersedes_set_id = allocation_set.id
@@ -758,6 +912,147 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
             hasFinalizedAttribution) ||
           (input.providerStatus === 'succeeded' && input.allocationStatus === 'exception')) {
           throw new PermanentFinancialError('allocation_mismatch');
+        }
+        const finalizedChronology = (() => {
+          if (!hasFinalizedAttribution) return null;
+          const providerCreatedAt = currentHistory[0]?.providerCreatedAt;
+          const providerRefundId = currentHistory[0]?.providerRefundId;
+          if (!providerCreatedAt || !providerRefundId || currentHistory.some((row) =>
+            row.providerRefundId !== providerRefundId ||
+            !sameInstant(new Date(row.providerCreatedAt), new Date(providerCreatedAt)))) {
+            throw new PermanentFinancialError('source_linkage_mismatch');
+          }
+          return { providerCreatedAt: new Date(providerCreatedAt), providerRefundId };
+        })();
+        if (finalizedChronology) {
+          const incompleteEarlierDisputes = await rows(projectionTx, sql`
+            select dispute_balance.id as "balanceTransactionId"
+            from stripe_balance_transactions dispute_balance
+            join disputes dispute
+              on dispute.stripe_dispute_id = dispute_balance.source_id
+            left join financial_classification_versions decision
+              on decision.subject_type = 'balance_transaction'
+              and decision.subject_id = dispute_balance.id
+              and decision.classifier_version = ${target.classifierVersion}
+              and decision.source_fingerprint_sha256 = dispute_balance.fingerprint_sha256
+            where dispute.payment_id = ${input.paymentId}
+              and dispute_balance.source_family = 'dispute'
+              and row(
+                dispute_balance.provider_created_at,
+                dispute_balance.provider_id collate "C",
+                dispute.id
+              ) < row(
+                ${finalizedChronology.providerCreatedAt},
+                ${finalizedChronology.providerRefundId} collate "C",
+                ${input.refundId}::uuid
+              )
+              and (
+                decision.id is null
+                or decision.classification is null
+                or decision.classification not in (
+                  'dispute_withdrawal', 'dispute_reinstatement', 'fee_credit'
+                )
+                or exists (
+                  select 1 from financial_reconciliation_issues classification_issue
+                  where classification_issue.resource_type = 'balance_transaction'
+                    and classification_issue.resource_id = dispute_balance.id
+                    and classification_issue.safe_code = 'classification_fork'
+                    and classification_issue.state = 'open'
+                    and classification_issue.impact = 'exception'
+                )
+                or (
+                  decision.classification in ('dispute_withdrawal', 'dispute_reinstatement')
+                  and (
+                    select count(*)
+                    from financial_allocation_sets raw_exposure_set
+                    where raw_exposure_set.balance_transaction_id = dispute_balance.id
+                      and raw_exposure_set.basis = 'gross_amount'
+                      and raw_exposure_set.classifier_version = ${target.classifierVersion}
+                      and raw_exposure_set.algorithm_version =
+                        ${target.allocationAlgorithmVersion}
+                      and not exists (
+                        select 1 from financial_allocation_sets raw_successor
+                        where raw_successor.supersedes_set_id = raw_exposure_set.id
+                          and raw_successor.classifier_version =
+                            raw_exposure_set.classifier_version
+                          and raw_successor.algorithm_version =
+                            raw_exposure_set.algorithm_version
+                      )
+                  ) <> 1
+                )
+                or (
+                  decision.classification in ('dispute_withdrawal', 'dispute_reinstatement')
+                  and (
+                    select count(*)
+                    from financial_allocation_sets valid_exposure_set
+                    where valid_exposure_set.balance_transaction_id = dispute_balance.id
+                      and valid_exposure_set.source_kind = 'dispute'
+                      and valid_exposure_set.source_internal_id = dispute.id
+                      and valid_exposure_set.basis = 'gross_amount'
+                      and valid_exposure_set.scope = 'title'
+                      and valid_exposure_set.classifier_version = ${target.classifierVersion}
+                      and valid_exposure_set.algorithm_version =
+                        ${target.allocationAlgorithmVersion}
+                      and valid_exposure_set.source_fingerprint_sha256 =
+                        dispute_balance.fingerprint_sha256
+                      and not exists (
+                        select 1 from financial_allocation_sets valid_successor
+                        where valid_successor.supersedes_set_id = valid_exposure_set.id
+                          and valid_successor.classifier_version =
+                            valid_exposure_set.classifier_version
+                          and valid_successor.algorithm_version =
+                            valid_exposure_set.algorithm_version
+                      )
+                      and not exists (
+                        select 1 from financial_reconciliation_issues exposure_issue
+                        where exposure_issue.resource_type = 'allocation_set'
+                          and exposure_issue.resource_id = valid_exposure_set.id
+                          and exposure_issue.state = 'open'
+                          and exposure_issue.impact <> 'informational'
+                      )
+                      and exists (
+                        select 1 from dispute_item_allocations presentment
+                        where presentment.gross_allocation_set_id = valid_exposure_set.id
+                          and presentment.dispute_id = dispute.id
+                          and (
+                            decision.classification = 'dispute_withdrawal'
+                              and presentment.effect = 'withdrawal'
+                            or decision.classification = 'dispute_reinstatement'
+                              and presentment.effect = 'reinstatement'
+                          )
+                      )
+                  ) <> 1
+                )
+                or (
+                  decision.classification = 'fee_credit'
+                  and exists (
+                    select 1
+                    from financial_allocation_sets fee_credit_set
+                    join dispute_item_allocations fee_credit_presentment
+                      on fee_credit_presentment.gross_allocation_set_id = fee_credit_set.id
+                    where fee_credit_set.balance_transaction_id = dispute_balance.id
+                      and fee_credit_set.basis = 'gross_amount'
+                      and fee_credit_set.classifier_version = ${target.classifierVersion}
+                      and fee_credit_set.algorithm_version =
+                        ${target.allocationAlgorithmVersion}
+                      and fee_credit_presentment.dispute_id = dispute.id
+                      and not exists (
+                        select 1 from financial_allocation_sets fee_credit_successor
+                        where fee_credit_successor.supersedes_set_id = fee_credit_set.id
+                          and fee_credit_successor.classifier_version =
+                            fee_credit_set.classifier_version
+                          and fee_credit_successor.algorithm_version =
+                            fee_credit_set.algorithm_version
+                      )
+                  )
+                )
+              )
+            order by dispute_balance.provider_created_at,
+              dispute_balance.provider_id collate "C", dispute.id, dispute_balance.id
+          `) as Array<{ balanceTransactionId: string }>;
+          if (incompleteEarlierDisputes.length > 0) {
+            throw new RefundProjectionIssue('missing_source', 'pending');
+          }
         }
 
         const balances = await rows(projectionTx, sql`
@@ -814,7 +1109,9 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
         const primaryFeeDetails = await loadFeeDetails(
           projectionTx, primary.id, target.classifierVersion
         );
-        const primaryCurrent = await loadCurrentStoredPlans(projectionTx, input.refundId, primary.id);
+        const primaryCurrent = await loadCurrentStoredPlans(
+          projectionTx, input.refundId, primary.id, target
+        );
         const primaryMode = hasFinalizedAttribution ? 'finalized' : failure ? 'account' : 'unresolved';
         const replaySuffix = `:replay:${target.replayId}`;
         const primaryPrefix = `refund:${input.refundId}:${primary.id}:${primaryMode}${replaySuffix}`;
@@ -836,13 +1133,8 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
         };
         let primaryPlans: readonly [FinancialAllocationPlan, FinancialAllocationPlan];
         if (hasFinalizedAttribution) {
-          const currentCreatedAt = currentHistory[0]?.providerCreatedAt;
-          const currentProviderRefundId = currentHistory[0]?.providerRefundId;
-          if (!currentCreatedAt || !currentProviderRefundId || currentHistory.some((row) =>
-            row.providerRefundId !== currentProviderRefundId ||
-            !sameInstant(new Date(row.providerCreatedAt), new Date(currentCreatedAt)))) {
-            throw new PermanentFinancialError('source_linkage_mismatch');
-          }
+          const currentCreatedAt = finalizedChronology!.providerCreatedAt;
+          const currentProviderRefundId = finalizedChronology!.providerRefundId;
           const currentChronology = {
             refundId: input.refundId,
             providerRefundId: currentProviderRefundId,
@@ -976,7 +1268,9 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
           const failureFeeDetails = await loadFeeDetails(
             projectionTx, failure.id, target.classifierVersion
           );
-          const failureCurrent = await loadCurrentStoredPlans(projectionTx, input.refundId, failure.id);
+          const failureCurrent = await loadCurrentStoredPlans(
+            projectionTx, input.refundId, failure.id, target
+          );
           const failurePrefix = `refund:${input.refundId}:${failure.id}:failure${replaySuffix}`;
           const failurePlans = buildFailedRefundAllocationPlan({
             sourceKind: 'refund', sourceId: input.refundId,
@@ -1023,6 +1317,24 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
           return { kind: 'replay' as const, persisted };
         }
 
+        const resolvedAllocationSetIssues: ResolvedOrdinaryRefundSetIssue[] = [];
+        const validatedSelectedSetIds = [...new Set(persisted.flatMap((row) => [
+          row.setId,
+          ...(row.plan.supersedesSetId === null ? [] : [row.plan.supersedesSetId])
+        ]).filter((id) => ordinarySelectedSetIds.includes(id)))].sort();
+        for (const resourceId of validatedSelectedSetIds) {
+          for (const safeCode of ORDINARY_REFUND_SET_ISSUE_CODES) {
+            const resolved = await resolveFinancialIssueAfterRecompute(projectionTx, {
+              resourceType: 'allocation_set', resourceId, safeCode,
+              proof: { status: 'resolved', resourceType: 'allocation_set',
+                resourceId, safeCode },
+              actor: ACTOR, correlationId: input.correlationId
+            });
+            if (resolved) resolvedAllocationSetIssues.push({
+              id: resolved.id, safeCode: resolved.safeCode, impact: resolved.impact
+            });
+          }
+        }
         const projections = await loadCurrentEffectiveAllocationProjection(projectionTx, {
           balanceTransactionIds: input.balanceTransactionIds
         });
@@ -1031,12 +1343,22 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
         }
         const failureProjection = projections.find((projection) => projection.status !== 'complete');
         if (failureProjection) {
+          const resolvedBlockingIssue = [...resolvedAllocationSetIssues]
+            .sort(compareResolvedSetIssuePriority)
+            .find((issue) => issue.impact !== 'informational');
+          if (resolvedBlockingIssue) {
+            const impact = resolvedBlockingIssue.impact;
+            if (impact === 'informational') throw new PermanentFinancialError('immutable_mismatch');
+            throw new RefundProjectionIssue(resolvedBlockingIssue.safeCode, impact);
+          }
           if (failureProjection.status === 'missing') {
-            const expectedAmbiguity = !failure && !hasFinalizedAttribution &&
-              failureProjection.safeCode === 'allocation_incomplete';
+            const expectedAmbiguity = !failure && !hasFinalizedAttribution;
+            const safeCode = expectedAmbiguity
+              ? 'allocation_incomplete' as const
+              : 'missing_source' as const;
             return {
               kind: 'pending' as const,
-              safeCode: expectedAmbiguity ? 'allocation_incomplete' as const : 'missing_source' as const,
+              safeCode,
               persisted
             };
           }
@@ -1051,7 +1373,12 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
             throw new PermanentFinancialError('allocation_mismatch');
           }
         }
-        return { kind: 'complete' as const, persisted, projections };
+        return {
+          kind: 'complete' as const,
+          persisted,
+          projections,
+          resolvedAllocationSetIssueIds: resolvedAllocationSetIssues.map((issue) => issue.id)
+        };
       });
       return value;
     } catch (error) {
@@ -1085,18 +1412,38 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
   }
   if (target.mode === 'replay') {
     if (outcome.kind === 'pending') {
+      const safeCode = lockedReplayIssueCode(outcome.safeCode);
+      if (safeCode === null) throw new PermanentFinancialError('source_linkage_mismatch');
       return {
         status: 'exception', refundId: input.refundId,
-        safeCode: outcome.safeCode, impact: 'pending'
+        safeCode, impact: 'pending'
       };
     }
     if (outcome.kind === 'issue') {
+      const safeCode = lockedReplayIssueCode(outcome.safeCode);
+      if (safeCode === null) throw new PermanentFinancialError('source_linkage_mismatch');
       return {
         status: 'exception', refundId: input.refundId,
-        safeCode: outcome.safeCode, impact: outcome.impact
+        safeCode, impact: outcome.impact
       };
     }
     throw new PermanentFinancialError('source_linkage_mismatch');
+  }
+  if (outcome.kind === 'pending' || outcome.kind === 'issue') {
+    const safeCode = outcome.safeCode;
+    const impact = outcome.kind === 'pending' ? 'pending' : outcome.impact;
+    if ((ORDINARY_REFUND_SET_ISSUE_CODES as readonly FinancialIssueCode[])
+      .includes(safeCode)) {
+      for (const resourceId of ordinarySelectedSetIds) {
+        await observeFinancialIssue(transaction, {
+          resourceType: 'allocation_set', resourceId, safeCode, impact,
+          actor: ACTOR, correlationId: input.correlationId
+        });
+      }
+    }
+    await rearmCurrentProjectionSubjectsForFinancialSources(transaction, {
+      sourceKind: 'refund', sourceIds: [input.refundId]
+    });
   }
   if (outcome.kind === 'pending') {
     return recordLockedRefundIssue(transaction, input, outcome.safeCode, 'pending');
@@ -1104,7 +1451,7 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
   if (outcome.kind === 'issue') {
     return recordLockedRefundIssue(transaction, input, outcome.safeCode, outcome.impact);
   }
-  const resolvedIssueIds: string[] = [];
+  const resolvedIssueIds: string[] = [...outcome.resolvedAllocationSetIssueIds];
   for (const safeCode of ISSUE_CODES) {
     const resolved = await resolveFinancialIssueAfterRecompute(transaction, {
       resourceType: 'refund', resourceId: input.refundId, safeCode,
@@ -1155,14 +1502,15 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
 
 export async function recomputeLockedRefundFinancialProjection(
   transaction: DatabaseTransaction,
-  input: LockedRefundProjectionInput
+  input: LockedRefundProjectionInput,
+  ordinarySelectedSetIds: readonly string[] = []
 ): Promise<RefundFinancialRecomputeResult> {
   return recomputeLockedRefundFinancialProjectionAtVersion(transaction, input, {
     classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
     allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
     replayId: FINANCIAL_REPLAY_ID,
     mode: 'ordinary'
-  }) as Promise<RefundFinancialRecomputeResult>;
+  }, ordinarySelectedSetIds) as Promise<RefundFinancialRecomputeResult>;
 }
 
 /**
@@ -1300,16 +1648,35 @@ export async function reconcileRefundFinancialSource(
       !sameInstant(current.providerCreatedAt, refund.providerCreatedAt)) {
       throw new RetryableFinancialError('state_changed');
     }
+    await lockFinancialProjectionEnrollment(transaction);
+    const discoveredActiveTips = await discoverExactActiveRefundTips(
+      transaction, stagedIds
+    );
     await lockFinancialProjectionRows(transaction, {
       payoutGenerations,
       balanceTransactionIds: lockBalanceTransactionIds,
       classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
-      issueKeys: ISSUE_CODES.map((safeCode) => ({
-        resourceType: 'refund' as const,
-        resourceId: routing.id,
-        safeCode
-      }))
+      issueKeys: [
+        ...ISSUE_CODES.map((safeCode) => ({
+          resourceType: 'refund' as const,
+          resourceId: routing.id,
+          safeCode
+        })),
+        ...discoveredActiveTips.flatMap((tip) =>
+          ORDINARY_REFUND_SET_ISSUE_CODES.map((safeCode) => ({
+            resourceType: 'allocation_set' as const,
+            resourceId: tip.id,
+            safeCode
+          }))
+        )
+      ]
     });
+    const lockedActiveTips = await discoverExactActiveRefundTips(
+      transaction, stagedIds, true
+    );
+    if (!sameExactActiveRefundTips(discoveredActiveTips, lockedActiveTips)) {
+      throw new RetryableFinancialError('state_changed');
+    }
     throwIfFinancialSourceAborted(signal);
     const recomputed = await recomputeLockedRefundFinancialProjection(transaction, {
       orderId: routing.orderId,
@@ -1344,7 +1711,7 @@ export async function reconcileRefundFinancialSource(
           currency: component.currency
         })),
       correlationId: input.correlationId
-    });
+    }, lockedActiveTips.map((tip) => tip.id));
     throwIfFinancialSourceAborted(signal);
     switch (recomputed.status) {
       case 'unchanged':

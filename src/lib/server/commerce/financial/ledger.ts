@@ -304,25 +304,27 @@ async function ensureClassifications(
   correlationId: string,
   classifierVersion: number
 ): Promise<void> {
-  await appendClassificationDecisionLocked(tx, {
+  const parentClassification = await appendClassificationDecisionLocked(tx, {
     subjectType: 'balance_transaction', subjectId: balanceTransactionId, classifierVersion,
     sourceFingerprint: evidence.fingerprint, decision: evidence.parentDecision, correlationId
   });
   if (evidence.parentDecision.status === 'unknown') {
     await observeFinancialIssue(tx, {
-      resourceType: 'balance_transaction', resourceId: balanceTransactionId, safeCode: 'unsupported_category',
+      resourceType: 'financial_classification', resourceId: parentClassification.id,
+      safeCode: 'unsupported_category',
       impact: 'exception', actor: { type: 'system', id: 'financial-worker' }, correlationId
     });
   }
   for (const [index, detailId] of detailIds.entries()) {
     const decision = evidence.detailDecisions[index]!;
-    await appendClassificationDecisionLocked(tx, {
+    const detailClassification = await appendClassificationDecisionLocked(tx, {
       subjectType: 'fee_detail', subjectId: detailId, classifierVersion,
       sourceFingerprint: evidence.detailFingerprints[index]!, decision, correlationId
     });
     if (decision.status === 'unknown') {
       await observeFinancialIssue(tx, {
-        resourceType: 'fee_detail', resourceId: detailId, safeCode: 'unsupported_category',
+        resourceType: 'financial_classification', resourceId: detailClassification.id,
+        safeCode: 'unsupported_category',
         impact: 'exception', actor: { type: 'system', id: 'financial-worker' }, correlationId
       });
     }
@@ -472,20 +474,42 @@ export async function enqueueCurrentAccountProjectionsForPayout(
   await rearmProjectionSubjects(tx, candidates);
 }
 
+interface ProjectionSubject {
+  readonly subjectType: 'balance_transaction' | 'fee_detail';
+  readonly id: string;
+  readonly fingerprintSha256: string;
+}
+
+interface ProjectionRearmTarget extends FinancialProjectionImplementationVersion {
+  readonly scanRunId?: string;
+}
+
+async function rearmProjectionSubjectsAtTarget(
+  tx: DatabaseTransaction,
+  subjects: readonly ProjectionSubject[],
+  target: ProjectionRearmTarget
+): Promise<void> {
+  for (const candidate of subjects) {
+    const spec = createFinancialClassificationSubjectJob({
+      subjectType: candidate.subjectType, subjectId: candidate.id,
+      sourceFingerprintSha256: candidate.fingerprintSha256,
+      classifierVersion: target.classifierVersion,
+      allocationAlgorithmVersion: target.allocationAlgorithmVersion,
+      ...(target.scanRunId === undefined ? {} : { scanRunId: target.scanRunId })
+    });
+    await rearmFinancialClassificationJob(tx, spec);
+  }
+}
+
 async function rearmProjectionSubjects(
   tx: DatabaseTransaction,
-  subjects: readonly {
-    subjectType: 'balance_transaction' | 'fee_detail';
-    id: string;
-    fingerprintSha256: string;
-  }[]
+  subjects: readonly ProjectionSubject[]
 ): Promise<void> {
   if (subjects.length === 0) return;
   const authority = await loadFinancialProjectionAuthority(tx);
-  const targets = [{
+  const targets: ProjectionRearmTarget[] = [{
     classifierVersion: authority.classifierVersion,
-    allocationAlgorithmVersion: authority.allocationAlgorithmVersion,
-    scanRunId: undefined as string | undefined
+    allocationAlgorithmVersion: authority.allocationAlgorithmVersion
   }];
   if (authority.pendingClassifierVersion !== null &&
     authority.pendingAllocationAlgorithmVersion !== null &&
@@ -496,53 +520,39 @@ async function rearmProjectionSubjects(
       scanRunId: authority.pendingScanRunId
     });
   }
-  for (const candidate of subjects) {
-    for (const target of targets) {
-      const spec = createFinancialClassificationSubjectJob({
-        subjectType: candidate.subjectType, subjectId: candidate.id,
-        sourceFingerprintSha256: candidate.fingerprintSha256,
-        classifierVersion: target.classifierVersion,
-        allocationAlgorithmVersion: target.allocationAlgorithmVersion,
-        ...(target.scanRunId === undefined ? {} : { scanRunId: target.scanRunId })
-      });
-      await rearmFinancialClassificationJob(tx, spec);
-    }
+  for (const target of targets) {
+    await rearmProjectionSubjectsAtTarget(tx, subjects, target);
   }
 }
 
-export async function rearmCurrentProjectionSubjectsForFinancialSource(
-  tx: DatabaseTransaction,
-  input: { readonly sourceKind: 'payment' | 'refund' | 'dispute'; readonly sourceId: string }
-): Promise<void> {
-  if (!input || typeof input !== 'object' || Reflect.ownKeys(input).length !== 2 ||
-    !['payment', 'refund', 'dispute'].includes(input.sourceKind) ||
-    typeof input.sourceId !== 'string' || !UUID_PATTERN.test(input.sourceId)) {
-    incompatibleProjectionVersion();
-  }
-  await rearmCurrentProjectionSubjectsForFinancialSources(tx, {
-    sourceKind: input.sourceKind,
-    sourceIds: [input.sourceId]
-  });
+interface FinancialSourceSelection {
+  readonly sourceKind: 'payment' | 'refund' | 'dispute';
+  readonly sourceIds: readonly string[];
 }
 
-export async function rearmCurrentProjectionSubjectsForFinancialSources(
-  tx: DatabaseTransaction,
-  input: {
-    readonly sourceKind: 'payment' | 'refund' | 'dispute';
-    readonly sourceIds: readonly string[];
-  }
-): Promise<void> {
+function canonicalFinancialSourceSelection(input: FinancialSourceSelection): {
+  readonly sourceKind: FinancialSourceSelection['sourceKind'];
+  readonly sourceIds: readonly string[];
+} {
   if (!input || typeof input !== 'object' || Reflect.ownKeys(input).length !== 2 ||
     !['payment', 'refund', 'dispute'].includes(input.sourceKind) ||
     !Array.isArray(input.sourceIds) || input.sourceIds.some((sourceId) =>
       typeof sourceId !== 'string' || !UUID_PATTERN.test(sourceId))) {
     incompatibleProjectionVersion();
   }
-  const sourceIds = [...new Set(input.sourceIds.map((sourceId) => sourceId.toLowerCase()))].sort();
-  await lockFinancialProjectionEnrollment(tx);
-  if (sourceIds.length === 0) return;
-  const sourceIdArray = `{${sourceIds.join(',')}}`;
-  const subjects = await rows(tx, sql`
+  return {
+    sourceKind: input.sourceKind,
+    sourceIds: [...new Set(input.sourceIds.map((sourceId) => sourceId.toLowerCase()))].sort()
+  };
+}
+
+async function loadProjectionSubjectsForFinancialSources(
+  tx: DatabaseTransaction,
+  input: ReturnType<typeof canonicalFinancialSourceSelection>
+): Promise<ProjectionSubject[]> {
+  if (input.sourceIds.length === 0) return [];
+  const sourceIdArray = `{${input.sourceIds.join(',')}}`;
+  return await rows(tx, sql`
     with candidate_balances as (
       select balance.id, balance.fingerprint_sha256 as "fingerprintSha256"
       from stripe_balance_transactions balance
@@ -568,12 +578,59 @@ export async function rearmCurrentProjectionSubjectsForFinancialSources(
     from stripe_balance_transaction_fee_details detail
     join candidate_balances candidate on candidate.id = detail.balance_transaction_id
     order by "subjectType", id
-  `) as Array<{
-    subjectType: 'balance_transaction' | 'fee_detail';
-    id: string;
-    fingerprintSha256: string;
-  }>;
+  `) as ProjectionSubject[];
+}
+
+export async function rearmCurrentProjectionSubjectsForFinancialSource(
+  tx: DatabaseTransaction,
+  input: { readonly sourceKind: 'payment' | 'refund' | 'dispute'; readonly sourceId: string }
+): Promise<void> {
+  if (!input || typeof input !== 'object' || Reflect.ownKeys(input).length !== 2 ||
+    !['payment', 'refund', 'dispute'].includes(input.sourceKind) ||
+    typeof input.sourceId !== 'string' || !UUID_PATTERN.test(input.sourceId)) {
+    incompatibleProjectionVersion();
+  }
+  await rearmCurrentProjectionSubjectsForFinancialSources(tx, {
+    sourceKind: input.sourceKind,
+    sourceIds: [input.sourceId]
+  });
+}
+
+export async function rearmCurrentProjectionSubjectsForFinancialSources(
+  tx: DatabaseTransaction,
+  input: FinancialSourceSelection
+): Promise<void> {
+  const selection = canonicalFinancialSourceSelection(input);
+  await lockFinancialProjectionEnrollment(tx);
+  const subjects = await loadProjectionSubjectsForFinancialSources(tx, selection);
   await rearmProjectionSubjects(tx, subjects);
+}
+
+export async function rearmProjectionSubjectsForFinancialSourcesAtVersion(
+  tx: DatabaseTransaction,
+  input: FinancialSourceSelection,
+  untrustedTarget: FinancialProjectionImplementationVersion
+): Promise<void> {
+  const selection = canonicalFinancialSourceSelection(input);
+  const target = projectionImplementationVersion(untrustedTarget);
+  await lockFinancialProjectionEnrollment(tx);
+  const authority = await loadFinancialProjectionAuthority(tx);
+  const targetsActive = target.classifierVersion === authority.classifierVersion &&
+    target.allocationAlgorithmVersion === authority.allocationAlgorithmVersion;
+  const targetsPending = target.classifierVersion === authority.pendingClassifierVersion &&
+    target.allocationAlgorithmVersion === authority.pendingAllocationAlgorithmVersion &&
+    authority.pendingScanRunId !== null;
+  const preRegistrationTarget = authority.pendingScanRunId === null &&
+    target.classifierVersion >= authority.classifierVersion &&
+    target.allocationAlgorithmVersion >= authority.allocationAlgorithmVersion;
+  if (!targetsActive && !targetsPending && !preRegistrationTarget) {
+    incompatibleProjectionVersion();
+  }
+  const subjects = await loadProjectionSubjectsForFinancialSources(tx, selection);
+  await rearmProjectionSubjectsAtTarget(tx, subjects, {
+    ...target,
+    ...(targetsPending ? { scanRunId: authority.pendingScanRunId! } : {})
+  });
 }
 
 export async function stageBalanceTransaction(
