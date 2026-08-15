@@ -15,6 +15,7 @@ import {
   type OwnedRunManifest,
   type OwnedRuntimeObservation
 } from './with-plan6b-upgrade-database';
+import { withoutStripeProviderSecrets } from './test-environment';
 
 const manifest = (): OwnedRunManifest => ({
   version: 1,
@@ -167,6 +168,32 @@ function partialStartupDocker(owned: OwnedRunManifest, state: FakeDockerState): 
 }
 
 describe('Plan 6B disposable upgrade database ownership', () => {
+  it('scrubs ambient Stripe secrets and forces provider execution off for child commands', async () => {
+    const source = await readFile(
+      new URL('./with-plan6b-upgrade-database.ts', import.meta.url),
+      'utf8'
+    );
+    const childEnvironmentSource = source.match(
+      /function childEnvironment\(owned: OwnedRunManifest\): NodeJS\.ProcessEnv \{[\s\S]*?\n\}/u
+    )?.[0];
+
+    expect(childEnvironmentSource).toBeDefined();
+    expect(childEnvironmentSource).not.toContain('...process.env');
+    expect(childEnvironmentSource).toContain('...withoutStripeProviderSecrets(process.env)');
+    expect(childEnvironmentSource).toContain("STRIPE_ENABLED: 'false'");
+    expect(childEnvironmentSource).toContain("STRIPE_TEST_FIXTURE_MODE: 'false'");
+    expect(childEnvironmentSource).toContain("STRIPE_LIVE_MODE: 'false'");
+    expect(childEnvironmentSource).toContain("STRIPE_AUTOMATIC_TAX_ENABLED: 'false'");
+
+    expect(withoutStripeProviderSecrets({
+      PATH: 'safe-path',
+      sTrIpE_sEcReT_kEy: 'sk_live_canary',
+      STRIPE_secret_KEY_file: '/run/secrets/stripe-key-canary',
+      stripe_WEBHOOK_secret: 'whsec_canary',
+      Stripe_Webhook_Secret_File: '/run/secrets/stripe-webhook-canary'
+    })).toEqual({ PATH: 'safe-path' });
+  });
+
   it('publishes the preselected ephemeral port explicitly on loopback', () => {
     const source = renderOwnedCompose(manifest());
 

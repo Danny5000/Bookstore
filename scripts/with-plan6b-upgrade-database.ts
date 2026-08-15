@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { Pool } from 'pg';
+import { withoutStripeProviderSecrets } from './test-environment';
 
 const RUN_PREFIX = 'pale-orbit-plan6b-';
 const DATABASE_PREFIX = 'plan6b_';
@@ -724,7 +725,7 @@ async function applyLegacyMigrations(owned: OwnedRunManifest): Promise<void> {
 
 function childEnvironment(owned: OwnedRunManifest): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {
-    ...process.env,
+    ...withoutStripeProviderSecrets(process.env),
     APP_ENV: 'test',
     APPLICATION_MODE: 'prototype',
     DATABASE_HOST: owned.host,
@@ -736,6 +737,10 @@ function childEnvironment(owned: OwnedRunManifest): NodeJS.ProcessEnv {
     DATABASE_CONNECTION_TIMEOUT_MS: '5000',
     DATABASE_STATEMENT_TIMEOUT_MS: '30000',
     DATABASE_READINESS_TIMEOUT_MS: '2000',
+    STRIPE_ENABLED: 'false',
+    STRIPE_TEST_FIXTURE_MODE: 'false',
+    STRIPE_LIVE_MODE: 'false',
+    STRIPE_AUTOMATIC_TAX_ENABLED: 'false',
     PLAN6B_UPGRADE_PHASE: 'legacy',
     PLAN6B_UPGRADE_RUN_ID: owned.runId,
     PLAN6B_UPGRADE_OWNED_DATABASE: 'true',
