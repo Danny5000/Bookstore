@@ -1799,7 +1799,7 @@ Ask reviewers to inspect the entire Plan 6B-I base-to-head diff, not only the la
 
 Each reviewer must report ordered Critical/Important/Minor findings with exact file/line evidence or explicitly clear the diff. Give every reviewer the same implementation base commit and current candidate HEAD, and require inspection of that committed `BASE..HEAD` range. No reviewer edits files during this pass.
 
-- [x] **Step 6: Apply review feedback, rerun the full gate, and commit final evidence**
+- [ ] **Step 6: Apply review feedback, rerun the full gate, and commit final evidence**
 
 Use the receiving-code-review workflow. Reproduce every accepted behavior issue with a RED test before changing production behavior. Preserve unrelated work and reject suggestions that contradict the approved design with concrete evidence. For each bounded review-fix batch, inspect `git status --short`, stage only the literal file paths recorded in the review ledger (never `git add .`), run `git diff --cached --check`, inspect `git diff --cached`, and commit with `fix: harden financial reconciliation review findings` (or a more specific bounded message).
 

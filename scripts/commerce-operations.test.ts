@@ -747,6 +747,8 @@ describe('commerce operations contract', () => {
       'financial_projection_tip_ambiguity',
       'financial_classification_decision_ambiguity',
       'financial_unknown_classification_issue',
+      'financial_item_allocation_parent',
+      'dispute_presentment_child_cardinality',
       'pending_replay_child_count_mismatch',
       'pending_replay_child_version_mismatch',
       'pending_replay_child_incomplete',
@@ -828,6 +830,70 @@ describe('commerce operations contract', () => {
       'remaining_tax_minor not between 0 and original_tax_minor'
     );
     expect(financialVerifier).toContain("'allocation_set_parent_or_chain'");
+    expect(financialVerifier).toMatch(
+      /financial_item_allocation_parent[\s\S]*s\.scope <> 'title'[\s\S]*i\.currency <> s\.currency[\s\S]*payment_source\.order_id[\s\S]*refund_payment\.order_id[\s\S]*dispute_payment\.order_id/u
+    );
+    for (const providerSourceRule of [
+      "s.source_fingerprint_sha256 is distinct from source_bt.fingerprint_sha256",
+      "payment_source.stripe_latest_charge_id is null",
+      "source_bt.source_family is distinct from 'charge'",
+      'source_bt.source_id is distinct from payment_source.stripe_latest_charge_id',
+      "source_bt.source_family is distinct from 'refund'",
+      'source_bt.source_id is distinct from refund_source.stripe_refund_id',
+      "source_bt.source_family is distinct from 'dispute'",
+      'source_bt.source_id is distinct from dispute_source.stripe_dispute_id',
+      "source_bt.source_family is distinct from 'payout'",
+      'source_bt.source_id is distinct from payout_source.provider_id',
+      's.source_internal_id <> s.balance_transaction_id'
+    ]) {
+      expect(financialVerifier, providerSourceRule).toContain(providerSourceRule);
+    }
+    expect(financialVerifier).toMatch(
+      /s\.source_kind = 'payout'[\s\S]*?source_bt\.source_family is distinct from 'payout'[\s\S]*?source_bt\.source_id is distinct from payout_source\.provider_id[\s\S]*?s\.scope <> 'account'/u
+    );
+    expect(financialVerifier).toMatch(
+      /s\.source_kind = 'adjustment'[\s\S]*?s\.source_internal_id <> s\.balance_transaction_id[\s\S]*?s\.scope <> 'account'/u
+    );
+    expect(financialVerifier).toMatch(
+      /dispute_presentment_child_cardinality[\s\S]*dispute_withdrawal[\s\S]*dispute_reinstatement[\s\S]*fee_credit[\s\S]*financial_item_allocations/u
+    );
+    expect(financialVerifier).toContain("s.scope <> 'title'");
+    expect(financialVerifier).toContain('select distinct settlement.order_item_id');
+    expect(financialVerifier).toContain("presentment.effect <> 'withdrawal'");
+    expect(financialVerifier).toContain("presentment.effect <> 'reinstatement'");
+    expect(financialVerifier).toContain('presentment.reverses_allocation_id is not null');
+    expect(financialVerifier).toContain('presentment.reverses_allocation_id is null');
+    expect(financialVerifier).toContain(
+      's.reversal_of_set_id is distinct from reversal.gross_allocation_set_id'
+    );
+    expect(financialVerifier).toContain(
+      'candidate_reversal.reverses_allocation_id = a.reverses_allocation_id'
+    );
+    expect(financialVerifier).toContain(
+      'oi.order_id is distinct from dispute_payment.order_id'
+    );
+    expect(financialVerifier).toMatch(
+      /dispute_item_allocation_graph[\s\S]*?s\.source_kind <> 'dispute'[\s\S]*?s\.basis <> 'gross_amount'[\s\S]*?s\.scope <> 'title'/u
+    );
+    expect(financialVerifier).toContain('a.currency is distinct from d.currency');
+    expect(financialVerifier).toMatch(
+      /s\.currency = a\.currency[\s\S]*?sum\(settlement\.effect_minor\)::bigint[\s\S]*?settlement\.order_item_id = a\.order_item_id[\s\S]*?a\.total_effect_minor/u
+    );
+    expect(financialVerifier).toMatch(
+      /s\.currency <> a\.currency[\s\S]*?a\.effect = 'withdrawal'[\s\S]*?sum\(presentment\.total_effect_minor\)[\s\S]*?<> -d\.amount_minor/u
+    );
+    expect(financialVerifier).toContain(
+      'a.subtotal_effect_minor > -reversal.subtotal_effect_minor'
+    );
+    expect(financialVerifier).toContain(
+      'a.tax_effect_minor > -reversal.tax_effect_minor'
+    );
+    expect(financialVerifier).toMatch(
+      /classification\.classification in \('dispute_withdrawal', 'fee_credit'\)[\s\S]*?s\.reversal_of_set_id is not null[\s\S]*?classification\.classification = 'dispute_reinstatement'[\s\S]*?s\.reversal_of_set_id is null/u
+    );
+    expect(financialVerifier).toContain('presentment.total_effect_minor >= 0');
+    expect(financialVerifier).toContain('presentment.total_effect_minor <= 0');
+    expect(financialVerifier).toContain('event.total_delta_minor >= 0');
     expect(financialVerifier).toContain('not coalesce((');
     expect(financialVerifier).toContain('parent_classification.id is not null');
     expect(financialVerifier).not.toContain('on commit drop');
@@ -980,7 +1046,7 @@ describe('commerce operations contract', () => {
     expect(malformedPort.stderr).not.toContain('ECONNREFUSED');
   }, 20_000);
 
-  it('executes classification, payout, replay-child, refund-component, and combined-chronology verifier witnesses in PostgreSQL', () => {
+  it('executes classification, payout, replay-child, allocation-graph, refund-component, dispute-presentment, and combined-chronology verifier witnesses in PostgreSQL', () => {
     const result = spawnSync(
       process.execPath,
       [
@@ -1001,7 +1067,7 @@ describe('commerce operations contract', () => {
       }
     );
     expect(`${result.stdout}${result.stderr}`).toContain(
-      '[restore-verifier] classification, payout, replay-child, refund-component, and combined-chronology witnesses passed'
+      '[restore-verifier] classification, payout, replay-child, allocation-graph, refund-component, dispute-presentment, and combined-chronology witnesses passed'
     );
     expect(result.status).toBe(0);
   }, 130_000);

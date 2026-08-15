@@ -377,6 +377,75 @@ describe('buildDisputeAllocationPlan', () => {
     })), 'allocation_mismatch');
   });
 
+  it('omits zero withdrawal effects so one-cent two-weight chronology remains replayable', () => {
+    const withdrawal = build(baseInput({
+      amountMinor: -1, feeMinor: 0, netMinor: -1,
+      disputeAmountMinor: 1, presentmentAmountMinor: 1, feeDetails: [],
+      paymentItems: [
+        { orderItemId: 'item-a', subtotalMinor: 1, taxMinor: 0,
+          presentmentCurrency: 'USD' },
+        { orderItemId: 'item-b', subtotalMinor: 1, taxMinor: 0,
+          presentmentCurrency: 'USD' }
+      ],
+      finalizedRefunds: []
+    }));
+
+    expect(withdrawal.presentmentEffects).toEqual([
+      expect.objectContaining({ orderItemId: 'item-a', subtotalMinor: -1, taxMinor: 0 })
+    ]);
+    const withdrawalSetId = 'set-one-cent-withdrawal';
+    const bound: readonly BoundDisputePresentmentEffect[] =
+      withdrawal.presentmentEffects.map((effect) => {
+        if (effect.withdrawalSetId !== null) throw new Error('Expected an unbound withdrawal');
+        return { ...effect, withdrawalSetId };
+      });
+    const reinstatement = build(baseInput({
+      effect: 'reinstatement', balanceTransactionId: 'bt-one-cent-reinstatement',
+      providerTransactionId: 'txn-one-cent-reinstatement',
+      providerCreatedAt: '2026-08-02T00:00:00.000Z',
+      allocationIdentityPrefix: 'dispute:dispute-1:bt-one-cent-reinstatement',
+      amountMinor: 1, feeMinor: 0, netMinor: 1,
+      disputeAmountMinor: 1, presentmentAmountMinor: 1, feeDetails: [],
+      reversesSetId: withdrawalSetId, withdrawalSetId: null,
+      withdrawalGrossPlan: withdrawal.plans[0], priorPresentmentEffects: bound,
+      paymentItems: [
+        { orderItemId: 'item-a', subtotalMinor: 1, taxMinor: 0,
+          presentmentCurrency: 'USD' },
+        { orderItemId: 'item-b', subtotalMinor: 1, taxMinor: 0,
+          presentmentCurrency: 'USD' }
+      ],
+      finalizedRefunds: []
+    }));
+    expect(reinstatement.presentmentEffects).toEqual([
+      expect.objectContaining({
+        orderItemId: 'item-a', subtotalMinor: 1, taxMinor: 0,
+        reversalOfAllocationId: bound[0]!.allocationId
+      })
+    ]);
+
+    const later = build(baseInput({
+      balanceTransactionId: 'bt-after-one-cent-reinstatement',
+      providerTransactionId: 'txn-after-one-cent-reinstatement',
+      providerCreatedAt: '2026-08-03T00:00:00.000Z',
+      allocationIdentityPrefix: 'dispute:dispute-1:bt-after-one-cent-reinstatement',
+      amountMinor: -2, feeMinor: 0, netMinor: -2,
+      disputeAmountMinor: 2, presentmentAmountMinor: 2, feeDetails: [],
+      priorPresentmentEffects: [...bound, ...reinstatement.presentmentEffects],
+      paymentItems: [
+        { orderItemId: 'item-a', subtotalMinor: 1, taxMinor: 0,
+          presentmentCurrency: 'USD' },
+        { orderItemId: 'item-b', subtotalMinor: 1, taxMinor: 0,
+          presentmentCurrency: 'USD' }
+      ],
+      finalizedRefunds: []
+    }));
+    expect(later.presentmentEffects).toHaveLength(2);
+    expect(later.presentmentEffects.reduce(
+      (sum, effect) => sum + effect.subtotalMinor + effect.taxMinor,
+      0
+    )).toBe(-2);
+  });
+
   it('omits zero reinstatement effects so a one-cent partial result can be replayed', () => {
     const partial = build(baseInput({
       effect: 'reinstatement', balanceTransactionId: 'bt-reinstatement-cent',

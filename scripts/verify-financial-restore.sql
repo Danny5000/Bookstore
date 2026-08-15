@@ -233,24 +233,75 @@ with orphan_counts as (
   union all
   select 'allocation_set_semantic_source', count(*)::bigint
   from financial_allocation_sets s
-  left join payments p on s.source_kind = 'payment' and p.id = s.source_internal_id
-  left join refunds r on s.source_kind = 'refund' and r.id = s.source_internal_id
-  left join disputes d on s.source_kind = 'dispute' and d.id = s.source_internal_id
-  left join stripe_payouts po on s.source_kind = 'payout' and po.id = s.source_internal_id
-  left join stripe_balance_transactions bt
-    on s.source_kind = 'adjustment' and bt.id = s.source_internal_id
-  where (s.source_kind = 'payment' and p.id is null)
-     or (s.source_kind = 'refund' and r.id is null)
-     or (s.source_kind = 'dispute' and d.id is null)
-     or (s.source_kind = 'payout' and po.id is null)
-     or (s.source_kind = 'adjustment' and bt.id is null)
+  left join stripe_balance_transactions source_bt on source_bt.id = s.balance_transaction_id
+  left join payments payment_source
+    on s.source_kind = 'payment' and payment_source.id = s.source_internal_id
+  left join refunds refund_source
+    on s.source_kind = 'refund' and refund_source.id = s.source_internal_id
+  left join disputes dispute_source
+    on s.source_kind = 'dispute' and dispute_source.id = s.source_internal_id
+  left join stripe_payouts payout_source
+    on s.source_kind = 'payout' and payout_source.id = s.source_internal_id
+  left join stripe_balance_transactions adjustment_source
+    on s.source_kind = 'adjustment' and adjustment_source.id = s.source_internal_id
+  where source_bt.id is null
+     or s.source_fingerprint_sha256 is distinct from source_bt.fingerprint_sha256
+     or (s.source_kind = 'payment' and (
+       payment_source.id is null
+       or payment_source.stripe_latest_charge_id is null
+       or source_bt.source_family is distinct from 'charge'
+       or source_bt.source_id is distinct from payment_source.stripe_latest_charge_id
+     ))
+     or (s.source_kind = 'refund' and (
+       refund_source.id is null
+       or source_bt.source_family is distinct from 'refund'
+       or source_bt.source_id is distinct from refund_source.stripe_refund_id
+     ))
+     or (s.source_kind = 'dispute' and (
+       dispute_source.id is null
+       or source_bt.source_family is distinct from 'dispute'
+       or source_bt.source_id is distinct from dispute_source.stripe_dispute_id
+     ))
+     or (s.source_kind = 'payout' and (
+       payout_source.id is null
+       or source_bt.source_family is distinct from 'payout'
+       or source_bt.source_id is distinct from payout_source.provider_id
+       or s.scope <> 'account'
+     ))
+     or (s.source_kind = 'adjustment' and (
+       adjustment_source.id is null
+       or s.source_internal_id <> s.balance_transaction_id
+       or s.scope <> 'account'
+     ))
 
   union all
   select 'financial_item_allocation_parent', count(*)::bigint
   from financial_item_allocations i
   left join financial_allocation_sets s on s.id = i.allocation_set_id
   left join order_items oi on oi.id = i.order_item_id
+  left join payments payment_source
+    on s.source_kind = 'payment' and payment_source.id = s.source_internal_id
+  left join refunds refund_source
+    on s.source_kind = 'refund' and refund_source.id = s.source_internal_id
+  left join payments refund_payment on refund_payment.id = refund_source.payment_id
+  left join disputes dispute_source
+    on s.source_kind = 'dispute' and dispute_source.id = s.source_internal_id
+  left join payments dispute_payment on dispute_payment.id = dispute_source.payment_id
   where s.id is null or oi.id is null
+     or s.scope <> 'title'
+     or i.currency <> s.currency
+     or (s.source_kind = 'payment' and (
+       payment_source.id is null or oi.order_id <> payment_source.order_id
+     ))
+     or (s.source_kind = 'refund' and (
+       refund_source.id is null or refund_payment.id is null
+       or oi.order_id <> refund_payment.order_id
+     ))
+     or (s.source_kind = 'dispute' and (
+       dispute_source.id is null or dispute_payment.id is null
+       or oi.order_id <> dispute_payment.order_id
+     ))
+     or s.source_kind in ('payout', 'adjustment')
 
   union all
   select 'financial_issue_vocabulary', count(*)::bigint
@@ -335,12 +386,124 @@ with orphan_counts as (
   select 'dispute_item_allocation_graph', count(*)::bigint
   from dispute_item_allocations a
   left join disputes d on d.id = a.dispute_id
+  left join payments dispute_payment on dispute_payment.id = d.payment_id
   left join financial_allocation_sets s
     on s.id = a.gross_allocation_set_id and s.source_internal_id = a.dispute_id
   left join order_items oi on oi.id = a.order_item_id
   left join dispute_item_allocations reversal on reversal.id = a.reverses_allocation_id
-  where d.id is null or s.id is null or oi.id is null
-     or (a.reverses_allocation_id is not null and reversal.id is null)
+  where d.id is null or dispute_payment.id is null or s.id is null or oi.id is null
+     or s.source_kind <> 'dispute'
+     or s.basis <> 'gross_amount'
+     or s.scope <> 'title'
+     or oi.order_id is distinct from dispute_payment.order_id
+     or a.currency is distinct from d.currency
+     or a.currency is distinct from dispute_payment.currency
+     or a.currency is distinct from oi.currency
+     or (s.currency = a.currency and coalesce((
+       select sum(settlement.effect_minor)::bigint
+       from financial_item_allocations settlement
+       where settlement.allocation_set_id = s.id
+         and settlement.order_item_id = a.order_item_id
+     ), 0::bigint) <> a.total_effect_minor)
+     or (s.currency <> a.currency and a.effect = 'withdrawal' and (
+       select coalesce(sum(presentment.total_effect_minor), 0)::bigint
+       from dispute_item_allocations presentment
+       where presentment.gross_allocation_set_id = s.id
+     ) <> -d.amount_minor)
+     or (a.reverses_allocation_id is not null and (
+       reversal.id is null
+       or reversal.effect <> 'withdrawal'
+       or reversal.reverses_allocation_id is not null
+       or reversal.dispute_id <> a.dispute_id
+       or reversal.order_item_id <> a.order_item_id
+       or reversal.currency <> a.currency
+       or a.subtotal_effect_minor > -reversal.subtotal_effect_minor
+       or a.tax_effect_minor > -reversal.tax_effect_minor
+       or s.reversal_of_set_id is distinct from reversal.gross_allocation_set_id
+       or (
+         select count(*)
+         from dispute_item_allocations candidate_reversal
+         where candidate_reversal.reverses_allocation_id = a.reverses_allocation_id
+       ) <> 1
+     ))
+
+  union all
+  select 'dispute_presentment_child_cardinality', count(distinct s.id)::bigint
+  from financial_allocation_sets s
+  join financial_classification_versions classification
+    on classification.subject_type = 'balance_transaction'
+   and classification.subject_id = s.balance_transaction_id
+   and classification.classifier_version = s.classifier_version
+   and classification.source_fingerprint_sha256 = s.source_fingerprint_sha256
+  where s.source_kind = 'dispute'
+    and s.basis = 'gross_amount'
+    and classification.classification in (
+      'dispute_withdrawal', 'dispute_reinstatement', 'fee_credit'
+    )
+    and (
+      s.scope <> 'title'
+      or (classification.classification in ('dispute_withdrawal', 'fee_credit')
+        and s.reversal_of_set_id is not null)
+      or (classification.classification = 'dispute_reinstatement'
+        and s.reversal_of_set_id is null)
+      or (classification.classification in (
+          'dispute_withdrawal', 'dispute_reinstatement'
+        ) and (
+        not exists (
+          select 1 from dispute_item_allocations presentment
+          where presentment.gross_allocation_set_id = s.id
+        )
+        or exists (
+          select 1 from dispute_item_allocations presentment
+          where presentment.gross_allocation_set_id = s.id
+            and (
+              (classification.classification = 'dispute_withdrawal'
+                and (
+                  presentment.effect <> 'withdrawal'
+                  or presentment.reverses_allocation_id is not null
+                  or presentment.subtotal_effect_minor > 0
+                  or presentment.tax_effect_minor > 0
+                  or presentment.total_effect_minor >= 0
+                ))
+              or (classification.classification = 'dispute_reinstatement'
+                and (
+                  presentment.effect <> 'reinstatement'
+                  or presentment.reverses_allocation_id is null
+                  or presentment.subtotal_effect_minor < 0
+                  or presentment.tax_effect_minor < 0
+                  or presentment.total_effect_minor <= 0
+                ))
+            )
+        )
+        or exists (
+          select 1
+          from (
+            select distinct settlement.order_item_id
+            from financial_item_allocations settlement
+            where settlement.allocation_set_id = s.id
+          ) settlement_item
+          where not exists (
+            select 1 from dispute_item_allocations presentment
+            where presentment.gross_allocation_set_id = s.id
+              and presentment.order_item_id = settlement_item.order_item_id
+          )
+        )
+        or exists (
+          select 1
+          from dispute_item_allocations presentment
+          where presentment.gross_allocation_set_id = s.id
+            and not exists (
+              select 1 from financial_item_allocations settlement
+              where settlement.allocation_set_id = s.id
+                and settlement.order_item_id = presentment.order_item_id
+            )
+        )
+        ))
+      or (classification.classification = 'fee_credit' and exists (
+        select 1 from dispute_item_allocations presentment
+        where presentment.gross_allocation_set_id = s.id
+      ))
+    )
 
   union all
   select 'refund_allocation_draft_graph', count(*)::bigint

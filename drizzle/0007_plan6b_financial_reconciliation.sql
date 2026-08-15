@@ -471,6 +471,30 @@ DO $$
 BEGIN
   IF EXISTS (
     SELECT 1
+    FROM "refunds" refund
+    WHERE refund.amount_minor = 0
+  ) THEN
+    RAISE EXCEPTION USING ERRCODE = '23514', MESSAGE = 'Plan 6B zero-valued legacy refund amount cannot be migrated; refund amounts must be positive';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM "refund_allocations" allocation
+    WHERE allocation.amount_minor = 0
+  ) THEN
+    RAISE EXCEPTION USING ERRCODE = '23514', MESSAGE = 'Plan 6B zero-valued legacy refund allocation cannot be migrated; refund allocations must be positive';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM "disputes" dispute
+    WHERE dispute.amount_minor = 0
+  ) THEN
+    RAISE EXCEPTION USING ERRCODE = '23514', MESSAGE = 'Plan 6B zero-valued legacy dispute amount cannot be migrated; dispute amounts must be positive';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
     FROM "refund_allocations" allocation
     JOIN "refunds" refund ON refund.id = allocation.refund_id
     WHERE refund.status IN ('pending', 'failed', 'canceled')

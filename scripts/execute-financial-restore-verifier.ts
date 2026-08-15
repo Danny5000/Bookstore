@@ -161,6 +161,23 @@ async function exerciseInvariantWitnesses(): Promise<void> {
       if (!diagnostic) failures.push(`${name} did not surface ${checkName}`);
     }
   };
+  const mutateAppendOnlyFixture = async (
+    query: string,
+    parameters: readonly unknown[]
+  ): Promise<void> => {
+    const client = await pool.connect();
+    try {
+      await client.query('begin');
+      await client.query('set local session_replication_role = replica');
+      await client.query(query, [...parameters]);
+      await client.query('commit');
+    } catch (error) {
+      await client.query('rollback');
+      throw error;
+    } finally {
+      client.release();
+    }
+  };
   const insertDisputeEffect = async (input: {
     readonly allocationId: string;
     readonly disputeId: string;
@@ -671,6 +688,311 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     true
   );
 
+  const unrelatedDisputeId = '43000000-0000-4000-8000-000000000001';
+  await pool.query(`
+    insert into disputes (
+      id, payment_id, stripe_dispute_id, status, amount_minor, currency,
+      provider_created_at, provider_updated_at
+    ) values ($1, $2, 'dp_restore_unrelated_owner', 'open', 4, 'USD',
+      '2026-08-08T00:30:00.000Z', '2026-08-08T00:30:00.000Z')
+  `, [unrelatedDisputeId, paymentId]);
+  await mutateAppendOnlyFixture(`
+    update financial_allocation_sets set source_internal_id = $1 where id = $2
+  `, [unrelatedDisputeId, firstWithdrawalSetId]);
+  await expectRejection(
+    'allocation set names an unrelated existing provider source owner',
+    'allocation_set_semantic_source=1'
+  );
+  await mutateAppendOnlyFixture(`
+    update financial_allocation_sets set source_internal_id = $1 where id = $2
+  `, [combinedDisputeId, firstWithdrawalSetId]);
+  await expectPass('allocation set provider source owner repair', true);
+
+  const firstWithdrawalFinancialItemId = '40000000-0000-4000-8000-00000000000e';
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations set order_item_id = $1 where id = $2
+  `, [firstItemId, firstWithdrawalFinancialItemId]);
+  await expectRejection(
+    'allocation item belongs to an unrelated existing order graph',
+    'financial_item_allocation_parent=1'
+  );
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations set order_item_id = $1 where id = $2
+  `, [combinedFirstItemId, firstWithdrawalFinancialItemId]);
+  await expectPass('allocation item owner graph repair', true);
+
+  const feeCreditTransactionId = '41000000-0000-4000-8000-000000000001';
+  const feeCreditGrossSetId = '41000000-0000-4000-8000-000000000002';
+  const feeCreditFeeSetId = '41000000-0000-4000-8000-000000000003';
+  const feeCreditFingerprint = 'd'.repeat(64);
+  const withdrawalFeeDetailId = '41000000-0000-4000-8000-000000000005';
+  const withdrawalFeeSetId = '41000000-0000-4000-8000-000000000006';
+  const withdrawalFeeFingerprint = '1'.repeat(64);
+  await mutateAppendOnlyFixture(`
+    update stripe_balance_transactions set fee_minor = 10, net_minor = -60
+    where id = $1
+  `, [secondWithdrawalTransactionId]);
+  await pool.query(`
+    insert into stripe_balance_transaction_fee_details (
+      id, balance_transaction_id, ordinal, raw_type, amount_minor, currency,
+      fingerprint_sha256
+    ) values ($1, $2, 0, 'stripe_fee', 10, 'USD', $3)
+  `, [withdrawalFeeDetailId, secondWithdrawalTransactionId, withdrawalFeeFingerprint]);
+  await pool.query(`
+    insert into financial_classification_versions (
+      subject_type, subject_id, classifier_version, classification,
+      source_fingerprint_sha256
+    ) values ('fee_detail', $1, 1, 'dispute_fee', $2)
+  `, [withdrawalFeeDetailId, withdrawalFeeFingerprint]);
+  await pool.query(`
+    insert into financial_allocation_sets (
+      id, allocation_identity, balance_transaction_id, source_kind,
+      source_internal_id, basis, scope, expected_effect_minor, currency,
+      algorithm_version, classifier_version, source_fingerprint_sha256
+    ) values (
+      $1, 'restore:fee-credit:causal-withdrawal-fee', $2, 'dispute', $3,
+      'fee', 'title', -10, 'USD', 1, 1, repeat('8', 64)
+    )
+  `, [withdrawalFeeSetId, secondWithdrawalTransactionId, combinedDisputeId]);
+  await pool.query(`
+    insert into financial_item_allocations (
+      id, allocation_set_id, order_item_id, component, effect_minor, currency,
+      tie_break_key
+    ) values (
+      '41000000-0000-4000-8000-000000000007', $1, $2,
+      'dispute_fee', -10, 'USD', 'fee-credit:causal-withdrawal-fee'
+    )
+  `, [withdrawalFeeSetId, combinedFirstItemId]);
+  await pool.query(`
+    insert into stripe_balance_transactions (
+      id, provider_id, live_mode, source_family, source_id, raw_type,
+      reporting_category, balance_type, amount_minor, fee_minor, net_minor,
+      currency, status, provider_created_at, available_at, fingerprint_sha256
+    ) values (
+      $1, 'bt_restore_fee_credit', false, 'dispute', $2, 'stripe_fee',
+      'fee', 'payments', 10, 0, 10, 'USD', 'available',
+      '2026-08-08T01:00:00.000Z', '2026-08-08T01:00:00.000Z', $3
+    )
+  `, [feeCreditTransactionId, combinedStripeDisputeId, feeCreditFingerprint]);
+  await pool.query(`
+    insert into financial_classification_versions (
+      subject_type, subject_id, classifier_version, classification,
+      source_fingerprint_sha256
+    ) values ('balance_transaction', $1, 1, 'fee_credit', $2)
+  `, [feeCreditTransactionId, feeCreditFingerprint]);
+  await pool.query(`
+    insert into financial_allocation_sets (
+      id, allocation_identity, balance_transaction_id, source_kind,
+      source_internal_id, basis, scope, expected_effect_minor, currency,
+      algorithm_version, classifier_version, source_fingerprint_sha256
+    ) values
+      ($1, 'restore:fee-credit:gross', $3, 'dispute', $4, 'gross_amount',
+        'title', 10, 'USD', 1, 1, $5),
+      ($2, 'restore:fee-credit:fee', $3, 'dispute', $4, 'fee',
+        'title', 0, 'USD', 1, 1, $5)
+  `, [
+    feeCreditGrossSetId,
+    feeCreditFeeSetId,
+    feeCreditTransactionId,
+    combinedDisputeId,
+    feeCreditFingerprint
+  ]);
+  await pool.query(`
+    insert into financial_item_allocations (
+      id, allocation_set_id, order_item_id, component, effect_minor, currency,
+      tie_break_key
+    ) values (
+      '41000000-0000-4000-8000-000000000004', $1, $2,
+      'fee_credit', 10, 'USD', 'fee-credit:settlement'
+    )
+  `, [feeCreditGrossSetId, combinedFirstItemId]);
+  await expectPass('fee credit legitimately has no dispute presentment children', true);
+
+  const childlessDisputeId = '42000000-0000-4000-8000-000000000009';
+  const childlessStripeDisputeId = 'dp_restore_childless_presentment';
+  await pool.query(`
+    insert into disputes (
+      id, payment_id, stripe_dispute_id, status, amount_minor, currency,
+      provider_created_at, provider_updated_at
+    ) values ($1, $2, $3, 'open', 10, 'USD',
+      '2026-08-08T02:00:00.000Z', '2026-08-08T03:00:00.000Z')
+  `, [childlessDisputeId, combinedPaymentId, childlessStripeDisputeId]);
+  const childlessWithdrawalTransactionId = '42000000-0000-4000-8000-000000000001';
+  const childlessWithdrawalSetId = '42000000-0000-4000-8000-000000000002';
+  const childlessWithdrawalFinancialItemId = '42000000-0000-4000-8000-000000000003';
+  const childlessWithdrawalAllocationId = '42000000-0000-4000-8000-000000000004';
+  await insertDisputeEffect({
+    allocationId: childlessWithdrawalAllocationId,
+    disputeId: childlessDisputeId,
+    effect: 'withdrawal',
+    financialItemId: childlessWithdrawalFinancialItemId,
+    fingerprintCharacter: 'e',
+    orderItemId: combinedSecondItemId,
+    providerCreatedAt: '2026-08-08T02:00:00.000Z',
+    providerId: 'bt_restore_childless_withdrawal',
+    reversalOfSetId: null,
+    reversesAllocationId: null,
+    setId: childlessWithdrawalSetId,
+    signedSubtotalMinor: -10,
+    stripeDisputeId: childlessStripeDisputeId,
+    transactionId: childlessWithdrawalTransactionId
+  });
+  await mutateAppendOnlyFixture('delete from dispute_item_allocations where id = $1', [
+    childlessWithdrawalAllocationId
+  ]);
+  await expectRejection(
+    'withdrawal current tip has no required dispute presentment child',
+    'dispute_presentment_child_cardinality=1'
+  );
+  await pool.query(`
+    insert into dispute_item_allocations (
+      id, allocation_identity, dispute_id, gross_allocation_set_id, order_item_id,
+      effect, reverses_allocation_id, subtotal_effect_minor, tax_effect_minor,
+      total_effect_minor, currency
+    ) values ($1, $2, $3, $4, $5, 'withdrawal', null, -10, 0, -10, 'USD')
+  `, [
+    childlessWithdrawalAllocationId,
+    `restore:${childlessWithdrawalAllocationId}`,
+    childlessDisputeId,
+    childlessWithdrawalSetId,
+    combinedSecondItemId
+  ]);
+  await expectPass('withdrawal dispute presentment child repair', true);
+  await mutateAppendOnlyFixture(`
+    update dispute_item_allocations
+    set subtotal_effect_minor = 0, tax_effect_minor = 0, total_effect_minor = 0
+    where id = $1
+  `, [childlessWithdrawalAllocationId]);
+  await expectRejection(
+    'withdrawal dispute presentment child cannot have a zero effect',
+    'combined_refund_dispute_chronology_capacity=1'
+  );
+  await mutateAppendOnlyFixture(`
+    update dispute_item_allocations
+    set subtotal_effect_minor = -10, tax_effect_minor = 0, total_effect_minor = -10
+    where id = $1
+  `, [childlessWithdrawalAllocationId]);
+  await expectPass('strictly negative withdrawal presentment repair', true);
+
+  const childlessReinstatementTransactionId = '42000000-0000-4000-8000-000000000005';
+  const childlessReinstatementSetId = '42000000-0000-4000-8000-000000000006';
+  const childlessReinstatementAllocationId = '42000000-0000-4000-8000-000000000007';
+  await insertDisputeEffect({
+    allocationId: childlessReinstatementAllocationId,
+    disputeId: childlessDisputeId,
+    effect: 'reinstatement',
+    financialItemId: '42000000-0000-4000-8000-000000000008',
+    fingerprintCharacter: 'f',
+    orderItemId: combinedSecondItemId,
+    providerCreatedAt: '2026-08-08T03:00:00.000Z',
+    providerId: 'bt_restore_childless_reinstatement',
+    reversalOfSetId: childlessWithdrawalSetId,
+    reversesAllocationId: childlessWithdrawalAllocationId,
+    setId: childlessReinstatementSetId,
+    signedSubtotalMinor: 10,
+    stripeDisputeId: childlessStripeDisputeId,
+    transactionId: childlessReinstatementTransactionId
+  });
+  await mutateAppendOnlyFixture('delete from dispute_item_allocations where id = $1', [
+    childlessReinstatementAllocationId
+  ]);
+  await expectRejection(
+    'reinstatement current tip has no required dispute presentment child',
+    'dispute_presentment_child_cardinality=1'
+  );
+  await pool.query(`
+    insert into dispute_item_allocations (
+      id, allocation_identity, dispute_id, gross_allocation_set_id, order_item_id,
+      effect, reverses_allocation_id, subtotal_effect_minor, tax_effect_minor,
+      total_effect_minor, currency
+    ) values ($1, $2, $3, $4, $5, 'reinstatement', $6, 10, 0, 10, 'USD')
+  `, [
+    childlessReinstatementAllocationId,
+    `restore:${childlessReinstatementAllocationId}`,
+    childlessDisputeId,
+    childlessReinstatementSetId,
+    combinedSecondItemId,
+    childlessWithdrawalAllocationId
+  ]);
+  await expectPass('reinstatement dispute presentment child repair', true);
+  await mutateAppendOnlyFixture(`
+    update dispute_item_allocations set reverses_allocation_id = $1 where id = $2
+  `, [firstWithdrawalAllocationId, childlessReinstatementAllocationId]);
+  await expectRejection(
+    'reinstatement cannot cross an immutable withdrawal graph or reverse it twice',
+    'dispute_item_allocation_graph='
+  );
+  await mutateAppendOnlyFixture(`
+    update dispute_item_allocations set reverses_allocation_id = $1 where id = $2
+  `, [childlessWithdrawalAllocationId, childlessReinstatementAllocationId]);
+  await expectPass('reinstatement immutable reversal graph repair', true);
+
+  const crossCurrencyTransactionId = '44000000-0000-4000-8000-000000000001';
+  const crossCurrencySetId = '44000000-0000-4000-8000-000000000002';
+  const crossCurrencyFinancialItemId = '44000000-0000-4000-8000-000000000003';
+  const crossCurrencyAllocationId = '44000000-0000-4000-8000-000000000004';
+  await insertDisputeEffect({
+    allocationId: crossCurrencyAllocationId,
+    disputeId: childlessDisputeId,
+    effect: 'withdrawal',
+    financialItemId: crossCurrencyFinancialItemId,
+    fingerprintCharacter: '2',
+    orderItemId: combinedSecondItemId,
+    providerCreatedAt: '2026-08-08T04:00:00.000Z',
+    providerId: 'bt_restore_cross_currency_withdrawal',
+    reversalOfSetId: null,
+    reversesAllocationId: null,
+    setId: crossCurrencySetId,
+    signedSubtotalMinor: -10,
+    stripeDisputeId: childlessStripeDisputeId,
+    transactionId: crossCurrencyTransactionId
+  });
+  await mutateAppendOnlyFixture(`
+    update stripe_balance_transactions set currency = 'EUR' where id = $1
+  `, [crossCurrencyTransactionId]);
+  await mutateAppendOnlyFixture(`
+    update financial_allocation_sets set currency = 'EUR' where id = $1
+  `, [crossCurrencySetId]);
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations set currency = 'EUR' where id = $1
+  `, [crossCurrencyFinancialItemId]);
+  await expectPass('cross-currency withdrawal preserves exact presentment capacity', true);
+  await mutateAppendOnlyFixture(`
+    update dispute_item_allocations
+    set subtotal_effect_minor = -9, tax_effect_minor = 0, total_effect_minor = -9
+    where id = $1
+  `, [crossCurrencyAllocationId]);
+  await expectRejection(
+    'cross-currency withdrawal cannot understate its immutable presentment effect',
+    'dispute_item_allocation_graph=1'
+  );
+  await mutateAppendOnlyFixture(`
+    update dispute_item_allocations
+    set subtotal_effect_minor = -10, tax_effect_minor = 0, total_effect_minor = -10
+    where id = $1
+  `, [crossCurrencyAllocationId]);
+  await expectPass('cross-currency withdrawal presentment repair', true);
+  await mutateAppendOnlyFixture(
+    'delete from dispute_item_allocations where id = $1',
+    [crossCurrencyAllocationId]
+  );
+  await mutateAppendOnlyFixture(
+    'delete from financial_item_allocations where id = $1',
+    [crossCurrencyFinancialItemId]
+  );
+  await mutateAppendOnlyFixture(
+    'delete from financial_allocation_sets where id = $1',
+    [crossCurrencySetId]
+  );
+  await mutateAppendOnlyFixture(`
+    delete from financial_classification_versions where subject_id = $1
+  `, [crossCurrencyTransactionId]);
+  await mutateAppendOnlyFixture(
+    'delete from stripe_balance_transactions where id = $1',
+    [crossCurrencyTransactionId]
+  );
+  await expectPass('cross-currency withdrawal witness cleanup', true);
+
   const duplicateChronologyRefundComponentId =
     '40000000-0000-4000-8000-0000000000e0';
   await pool.query(`
@@ -755,7 +1077,7 @@ async function exerciseInvariantWitnesses(): Promise<void> {
       effect, subtotal_effect_minor, tax_effect_minor, total_effect_minor, currency
     ) values (
       '40000000-0000-4000-8000-0000000000d3', 'restore:pending-withdrawal-tip',
-      $1, $2, $3, 'withdrawal', -100, 0, -100, 'USD'
+      $1, $2, $3, 'withdrawal', -50, 0, -50, 'USD'
     )
   `, [combinedDisputeId, pendingWithdrawalSetId, combinedFirstItemId]);
   await insertDisputeEffect({
@@ -778,6 +1100,37 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     'pending-version successor neither leaks into nor displaces active chronology',
     true
   );
+  const pendingWithdrawalAllocationId = '40000000-0000-4000-8000-0000000000d3';
+  await mutateAppendOnlyFixture(`
+    update dispute_item_allocations
+    set subtotal_effect_minor = -100, tax_effect_minor = 0, total_effect_minor = -100
+    where id = $1
+  `, [pendingWithdrawalAllocationId]);
+  await expectRejection(
+    'pending-version same-currency presentment must equal its settlement effect',
+    'dispute_item_allocation_graph=1'
+  );
+  await mutateAppendOnlyFixture(`
+    update dispute_item_allocations
+    set subtotal_effect_minor = -50, tax_effect_minor = 0, total_effect_minor = -50
+    where id = $1
+  `, [pendingWithdrawalAllocationId]);
+  await expectPass('pending-version presentment magnitude repair', true);
+  await mutateAppendOnlyFixture(`
+    update dispute_item_allocations
+    set subtotal_effect_minor = 0, tax_effect_minor = 0, total_effect_minor = 0
+    where id = $1
+  `, [pendingWithdrawalAllocationId]);
+  await expectRejection(
+    'pending-version withdrawal history cannot contain a zero presentment effect',
+    'dispute_presentment_child_cardinality=1'
+  );
+  await mutateAppendOnlyFixture(`
+    update dispute_item_allocations
+    set subtotal_effect_minor = -50, tax_effect_minor = 0, total_effect_minor = -50
+    where id = $1
+  `, [pendingWithdrawalAllocationId]);
+  await expectPass('pending-version withdrawal presentment sign repair', true);
 
   const crossWithdrawalTransactionId = '40000000-0000-4000-8000-000000000017';
   const crossReinstatementTransactionId = '40000000-0000-4000-8000-000000000018';
@@ -922,7 +1275,7 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     throw new Error(`[restore-verifier] invariant witness failures: ${failures.join('; ')}`);
   }
   console.info(
-    '[restore-verifier] classification, payout, replay-child, refund-component, and combined-chronology witnesses passed'
+    '[restore-verifier] classification, payout, replay-child, allocation-graph, refund-component, dispute-presentment, and combined-chronology witnesses passed'
   );
 }
 

@@ -9,6 +9,9 @@ import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 
 type FixtureKind =
   | 'valid'
+  | 'zero-refund'
+  | 'zero-allocation'
+  | 'zero-dispute'
   | 'over-allocation'
   | 'currency-conflict'
   | 'partial-facts'
@@ -613,16 +616,31 @@ async function seedInvalidLegacyFixture(client: PoolClient, kind: Exclude<Fixtur
     key: kind,
     ...(kind === 'currency-conflict' ? { itemCurrencies: ['USD', 'EUR'] } : {})
   });
+  if (kind === 'zero-dispute') {
+    await insertDispute(client, graph.paymentId, {
+      key: kind,
+      amountMinor: 0,
+      reconciliation: 'exception'
+    });
+    return;
+  }
   const refundId = await insertRefund(client, graph.paymentId, {
     key: kind,
     status: invalidRefundStatus ?? 'succeeded',
-    amountMinor: kind === 'over-allocation' ? 1100 : 500,
+    amountMinor: kind === 'zero-refund' ? 0 : kind === 'over-allocation' ? 1100 : 500,
     reconciliation: invalidRefundStatus === undefined ? 'exception' : 'pending'
   });
+  if (kind === 'zero-refund') return;
   if (invalidRefundStatus !== undefined) {
     await client.query(
       `insert into refund_allocations (refund_id, order_item_id, amount_minor, source)
        values ($1, $2, 250, 'automatic'), ($1, $3, 250, 'automatic')`,
+      [refundId, graph.orderItemIds[0], graph.orderItemIds[1]]
+    );
+  } else if (kind === 'zero-allocation') {
+    await client.query(
+      `insert into refund_allocations (refund_id, order_item_id, amount_minor, source)
+       values ($1, $2, 500, 'automatic'), ($1, $3, 0, 'automatic')`,
       [refundId, graph.orderItemIds[0], graph.orderItemIds[1]]
     );
   } else if (kind === 'over-allocation') {
@@ -1399,6 +1417,9 @@ async function runInvalidFixture(
   }
   const beforeMigrations = await migrationCount(pool);
   const expectedReason = {
+    'zero-refund': /(?:zero|positive).*refund.*amount|refund.*amount.*(?:zero|positive)/iu,
+    'zero-allocation': /(?:zero|positive).*refund.*allocation|refund.*allocation.*(?:zero|positive)/iu,
+    'zero-dispute': /(?:zero|positive).*dispute.*amount|dispute.*amount.*(?:zero|positive)/iu,
     'over-allocation': /(?:over[-_ ]allocation|capacity)/iu,
     'currency-conflict': /(?:currency|cross[-_ ]currency)/iu,
     'partial-facts': /(?:partial|incomplete)[-_ ](?:allocation|facts?)/iu,
@@ -1428,6 +1449,9 @@ async function main(): Promise<void> {
     const harness = join(repositoryRoot, 'scripts', 'with-plan6b-upgrade-database.ts');
     for (const fixture of [
       'valid',
+      'zero-refund',
+      'zero-allocation',
+      'zero-dispute',
       'over-allocation',
       'currency-conflict',
       'partial-facts',
@@ -1455,6 +1479,9 @@ async function main(): Promise<void> {
   const rawFixture = process.argv[argumentIndex + 1];
   assert(
     rawFixture === 'valid' ||
+      rawFixture === 'zero-refund' ||
+      rawFixture === 'zero-allocation' ||
+      rawFixture === 'zero-dispute' ||
       rawFixture === 'over-allocation' ||
       rawFixture === 'currency-conflict' ||
       rawFixture === 'partial-facts' ||

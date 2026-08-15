@@ -84,13 +84,16 @@ function withdrawalEffects(
     else row.taxMinor += item.effectMinor;
     rows.set(item.orderItemId, row);
   }
-  return [...rows.entries()].map(([orderItemId, row]) => ({
-    allocationId: `${input.allocationIdentityPrefix}:presentment:${orderItemId}`,
-    withdrawalSetId: null, disputeId: input.disputeId,
-    providerCreatedAt: input.providerCreatedAt, providerTransactionId: input.providerTransactionId,
-    orderItemId, ...row, presentmentCurrency: input.presentmentCurrency,
-    effect: 'withdrawal', reversalOfAllocationId: null
-  }));
+  return [...rows.entries()]
+    .filter(([, row]) => row.subtotalMinor + row.taxMinor !== 0)
+    .map(([orderItemId, row]) => ({
+      allocationId: `${input.allocationIdentityPrefix}:presentment:${orderItemId}`,
+      withdrawalSetId: null, disputeId: input.disputeId,
+      providerCreatedAt: input.providerCreatedAt,
+      providerTransactionId: input.providerTransactionId,
+      orderItemId, ...row, presentmentCurrency: input.presentmentCurrency,
+      effect: 'withdrawal', reversalOfAllocationId: null
+    }));
 }
 
 function assertWithdrawalShape(input: DisputeAllocationInput): void {
