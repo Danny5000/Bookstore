@@ -1,6 +1,6 @@
 # Dependency decisions
 
-Checked against the npm registry on 2026-08-13.
+Checked against the npm registry on 2026-08-14.
 
 | Package | Selected line | Decision |
 | --- | --- | --- |
@@ -23,7 +23,7 @@ Checked against the npm registry on 2026-08-13.
 | node-postgres (`pg`) | 8.23.0 | Current stable pooled PostgreSQL driver supported by Drizzle; web, worker, and migration processes own separate bounded pools. |
 | `@types/pg` | 8.21.0 | Current node-postgres type declarations required by the strict TypeScript build. |
 | tsx | 4.23.12 | Current stable development-only TypeScript runner for worker, migration, and test orchestration entry points. Updated from 4.23.11 as a compatible patch. |
-| Better Auth | 1.6.26 exact | Authentication runtime pinned with its matching CLI. [Version 1.6.28](https://github.com/better-auth/better-auth/releases/tag/v1.6.28) prevents duplicate session requests during React Suspense retries and restores client-plugin declaration compatibility; adopt it only in a dedicated auth maintenance change that upgrades the runtime and CLI together and runs the schema and adversarial auth gates described below. |
+| Better Auth | 1.6.26 exact | Authentication runtime pinned with its matching CLI. Version 1.6.29 is current; adopt it only in a dedicated auth maintenance change that upgrades the runtime and CLI together and runs the schema and adversarial auth gates described below. |
 | Better Auth CLI | 1.6.26 exact, on demand | Schema generation must match the runtime exactly; keep it outside the installed tree until its unfixed tool-only advisory is removed. |
 | Nodemailer | 9.0.5 | Current stable SMTP implementation behind the provider-neutral email adapter. |
 | `@types/nodemailer` | 8.0.1 | Current published declarations; remove when Nodemailer ships compatible declarations directly. |
@@ -31,13 +31,13 @@ Checked against the npm registry on 2026-08-13.
 | yauzl | 3.4.0 | Current stable lazy, random-access ZIP reader; ingestion validates archive metadata and observed streams before accepting entries. |
 | `@types/yauzl` | 3.4.0 | Current published strict TypeScript declarations for yauzl. |
 | sharp | 0.35.3 | Current stable image decoder/normalizer; its platform-specific optional packages must survive production dependency pruning. |
-| `file-type` | 22.0.1 | Current stable signature detector used only as a format hint; successful decoding and domain validation remain authoritative. |
+| `file-type` | 22.0.1 | Signature detector used only as a format hint; successful decoding and domain validation remain authoritative. Version 22.0.2 is deferred to a dependency-maintenance change that reruns the bounded ingestion, hostile-file, build, and full release gates. |
 | `fast-xml-parser` | 5.10.1 | Current stable bounded XML parser; ingestion rejects document types and entities before parsing untrusted EPUB or ComicInfo metadata. |
 | fflate | 0.8.3 | Current stable test-only archive writer used to generate deterministic valid and hostile fixtures; it is not part of production ingestion. |
 | eslint-plugin-svelte | 3.22.0 | Version 3.23.0 is deferred to the next dependency-maintenance gate so Plan 6B-I does not mix financial work with lint-rule drift; remove the defer after lint and the full release gate pass on the updated plugin. |
 | globals | 17.9.0 | Direct lint-data dependency. Version 17.11.0 is deferred to the next dependency-maintenance gate so Plan 6B-I's financial boundary does not mix in unrelated lint-environment data drift; remove the defer after lint and the full release gate pass with the revised data. |
 
-TypeScript 6.0.3 remains intentional while the registry latest is 7.0.2: as checked on 2026-08-13,
+TypeScript 6.0.3 remains intentional while the registry latest is 7.0.2: as checked on 2026-08-14,
 `typescript-eslint` 8.67.0 accepts TypeScript `>=4.8.4 <6.1.0` and
 `svelte-check` 4.7.5 accepts TypeScript 5 or 6. Remove this pin when both stable
 packages support TypeScript 7.
@@ -90,7 +90,7 @@ At that 2026-08-11 preflight, both audit modes remained free of high and critica
 
 The 2026-08-13 Plan 6B-I candidate-gate rerun used the same Node 26.7.0 and npm 11.19.0 lines after pinning `@fastify/busboy` 3.2.1. `npm outdated --json` reported Better Auth 1.6.28, `eslint-plugin-svelte` 3.23.0, `globals` 17.11.0, Svelte 5.56.9, `svelte-check` 4.7.6, and the intentionally blocked TypeScript 7.0.2 line; the dated removal conditions for each defer are recorded above. Better Auth 1.6.28 was published during this gate, and its primary release notes describe React Suspense session-request and downstream client-plugin declaration fixes; the same dedicated runtime-plus-CLI auth gate remains the removal condition. The post-remediation production-tree audit reported three low and four moderate paths, while the full-tree audit reported four low and four moderate paths, with zero high or critical findings in either npm feed. These are only the accepted `cookie` and Drizzle Kit/esbuild paths above. `npm ls --depth=0` completed without missing or invalid direct dependencies and confirmed `@fastify/busboy@3.2.1` in the installed direct-dependency tree.
 
-The 2026-08-13 Plan 6B-I final-gate rerun reconfirmed the same Node 26.7.0/npm 11.19.0 runtime, six dated `npm outdated --json` defers, exact `@fastify/busboy@3.2.1` installation, and a complete direct-dependency tree. `npm ci` installed 284 packages from the lockfile; exact Better Auth schema generation was content-identical; and `npm run db:check` reported no schema drift. The production-tree audit again reported three low and four moderate paths, the full-tree audit reported four low and four moderate paths, and neither feed reported a high or critical finding.
+The 2026-08-14 Plan 6B-I final-gate rerun reconfirmed the same Node 26.7.0/npm 11.19.0 runtime, exact `@fastify/busboy@3.2.1` installation, and a complete direct-dependency tree. `npm outdated --json` reported the seven dated defers recorded above: Better Auth 1.6.29, `eslint-plugin-svelte` 3.23.0, `file-type` 22.0.2, `globals` 17.11.0, Svelte 5.56.9, `svelte-check` 4.7.6, and TypeScript 7.0.2. `npm ci` installed 284 packages from the lockfile; exact Better Auth schema generation was content-identical; and `npm run db:check` reported no schema drift. The production-tree audit again reported three low and four moderate paths, the full-tree audit reported four low and four moderate paths, and neither feed reported a high or critical finding.
 
 Stripe 22.5.0 emits one fixed, nonsecret plugin-hint line on SDK import when either `CLAUDECODE` or `CLAUDE_CODE_CHILD_SESSION` is nonempty. The installed SDK exposes no suppression setting. Production Compose explicitly enumerates container environment and forwards neither variable, so production app/worker logs are unaffected. A host-run development process launched inside Claude may emit the marker; unset both detection variables before process start when clean local stderr is required. Do not patch the installed package or pin an older SDK solely to suppress this development-only hint.
 
