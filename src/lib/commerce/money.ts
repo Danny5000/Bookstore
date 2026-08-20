@@ -53,3 +53,39 @@ export function formatMinorCurrency(amountMinor: number, currency: string): stri
   }
   return formatter.format(amountMinor / 10 ** fractionDigits);
 }
+
+export function formatSignedMinorCurrency(
+  amountMinor: number | null,
+  currency: string
+): string {
+  const normalizedCurrency = currency.trim().toUpperCase();
+  if (!isSupportedCommerceCurrency(normalizedCurrency)) {
+    throw new RangeError(`Unsupported currency minor-unit semantics: ${currency}`);
+  }
+  if (amountMinor === null) return `${normalizedCurrency} unavailable`;
+  if (!Number.isSafeInteger(amountMinor)) {
+    throw new RangeError('Minor currency amount must be a safe integer');
+  }
+  const formatter = new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: normalizedCurrency
+  });
+  const fractionDigits = formatter.resolvedOptions().maximumFractionDigits;
+  if (fractionDigits === undefined) {
+    throw new RangeError(`Unsupported currency minor-unit semantics: ${currency}`);
+  }
+  const signedMinor = BigInt(amountMinor);
+  const absoluteMinor = signedMinor < 0n ? -signedMinor : signedMinor;
+  const scale = 10n ** BigInt(fractionDigits);
+  const whole = absoluteMinor / scale;
+  const remainder = absoluteMinor % scale;
+  const groupedWhole = new Intl.NumberFormat('en-US', {
+    useGrouping: true,
+    maximumFractionDigits: 0
+  }).format(whole);
+  const fraction = fractionDigits === 0
+    ? ''
+    : `.${remainder.toString().padStart(fractionDigits, '0')}`;
+  const sign = amountMinor < 0 ? '-' : amountMinor > 0 ? '+' : '';
+  return `${sign}${normalizedCurrency}\u00a0${groupedWhole}${fraction}`;
+}
