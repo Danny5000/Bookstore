@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-20
 
-**Status:** Approved conversational design; awaiting review of this written specification
+**Status:** Approved implementation architecture; superseding implementation plan written
 
 ## 1. Purpose
 
@@ -27,7 +27,7 @@ The behavioral source of truth remains the August 11 Plan 6B design. In particul
 - route and service capability checks, audit atomicity, accessibility, and final independent review; and
 - maintenance-mode, Stripe-disabled production through Plan 6B.
 
-The existing August 11 implementation plan remains historical. The next planning step will create a dated superseding implementation plan and add a clear superseded-by pointer to the old plan. A delta addendum is rejected because implementers would have to reconcile two conflicting mutation architectures. An in-place rewrite is rejected because it would obscure why the authority model changed.
+The existing August 11 implementation plan remains historical. The executable replacement is [Backend Plan 6B-II: Admin Resolution and Reporting Refresh](../plans/2026-08-20-backend-plan-6b-ii-admin-resolution-reporting-refresh.md); the old plan carries a clear superseded-by pointer. A delta addendum is rejected because implementers would have to reconcile two conflicting mutation architectures. An in-place rewrite is rejected because it would obscure why the authority model changed.
 
 ## 3. Scope
 
@@ -129,7 +129,7 @@ Routes authorize before parsing identifiers or request bodies. After strict pars
 3. Call the command-submission routine.
 4. Insert or recover the canonical command by idempotency identity.
 5. Atomically insert the exact local-only command job.
-6. Commit and return the safe pending command reference.
+6. Commit and return the safe command reference with its actual status. A first submission is pending; an identical idempotent replay may recover an already-terminal command.
 
 Reusing an idempotency identity with the identical canonical command returns the existing command. Reusing it with a different kind or fingerprint is a conflict. Browser polling or refresh never resubmits automatically.
 
@@ -140,13 +140,14 @@ The worker maps the command job to one strict parser and handler. It does not tr
 Execution uses this prefix:
 
 1. Acquire the global administrator-role advisory lock.
-2. Reload the submitting user's current roles and require the command kind's fixed capability set.
-3. Lock and revalidate the command/idempotency row.
-4. Acquire the active financial-projection implementation authority.
-5. Enter the canonical domain lock order required by the command.
-6. Re-read every submitted version, source fingerprint, correction tip, and provenance link.
-7. Apply the domain mutation through existing TypeScript services.
-8. Commit domain effects, safe command result, financial audit, projection, entitlement, and outbox effects together.
+2. Lock and revalidate the command/idempotency row.
+3. Return a succeeded terminal replay as a no-op, or reproduce the permanent job failure for a denied/conflict/failed terminal replay, before reauthorizing a pending command.
+4. For a pending command, reload the submitting user's current roles and require the command kind's fixed capability set.
+5. For a projection-dependent finalization, correction, or recovery command, acquire the active financial-projection implementation authority.
+6. Enter the canonical domain lock order required by the command.
+7. Re-read every submitted version, source fingerprint, correction tip, and provenance link.
+8. Apply the domain mutation through existing TypeScript services.
+9. Commit domain effects, safe command result, financial audit, projection, entitlement, and outbox effects together.
 
 The role lock precedes the command row in submission, replay, and execution. This matches current role-management serialization and avoids role-revocation races and command/replay deadlocks.
 
@@ -232,11 +233,11 @@ Under locks, finalization:
 - revalidates the succeeded ambiguous refund, exact total, capacities, draft, current projection authority, and financial closure;
 - inserts immutable administrative refund allocations and components;
 - freezes the draft at the incremented version;
+- calls the current refund projection recomputation with the locked/revalidated ordinary selected-set IDs;
+- resolves every canonically satisfied allowlisted issue linked to the locked refund or selected sets, in stable issue order, through the command-bound worker resolver;
 - recomputes purchase grants and effective entitlement through the extracted canonical access reducer;
 - inserts finalization effects only after the referenced purchase grant is in its recorded after-state;
-- queues access email only when effective access changes;
-- calls the current refund projection recomputation with the locked/revalidated ordinary selected-set IDs; and
-- resolves only the canonically satisfied linked issue through the command-bound worker resolver.
+- queues access email only when effective access changes.
 
 Exact replay returns the committed safe result without duplicating any effect.
 
@@ -260,11 +261,11 @@ A database trigger plus worker-only command-bound transition routine guards any 
 
 ## 11. Lock order
 
-Projection-touching commands use this canonical order:
+Projection-dependent finalization, correction, and recovery commands use this canonical order:
 
-`administrator-role lock -> command row -> active projection implementation -> order advisory -> order -> payment -> complete refund/draft/allocation/correction/dispute/item closure -> payout generation and balance-transaction financial closure -> issue rows -> sorted entitlement scopes and grants`
+`administrator-role lock -> command row -> active projection implementation -> order advisory -> order -> payment -> complete refund/draft/allocation/correction/dispute/item closure -> projection-enrollment fence -> payout generation and balance-transaction financial closure -> issue rows -> sorted entitlement scopes and grants`
 
-`lockPaymentPurchaseFacts` is a descendant-lock helper, not the entry point; order and payment are already locked before it runs. Projection enrollment and current implementation authority are locked before purchase, payout, balance-transaction, or issue rows.
+`lockPaymentPurchaseFacts` is a descendant-lock helper, not the entry point; order and payment are already locked before it runs. Current implementation authority is locked before purchase rows. Matching the existing ordinary-refund and replay paths, projection enrollment is locked after the complete purchase graph and before payout, balance-transaction, allocation, or issue rows.
 
 Multi-row locks are sorted by stable IDs. The handler discovers without locking, enters through the canonical root, then re-reads and locks the target. It never enters through a draft, finalization effect, correction, issue, provenance row, or entitlement grant.
 
@@ -272,7 +273,7 @@ Recovery does not acquire guest-identity, claim-issuance, credential-authority, 
 
 ## 12. Errors, retries, and browser interaction
 
-Native same-origin forms perform prepare and explicit confirmation. Confirmation submits a command and returns a safe pending reference. The browser polls with bounded backoff, aborts on navigation, and announces progress and terminal outcomes through accessible live regions.
+Native same-origin forms perform prepare and explicit confirmation. Confirmation submits a command and returns a safe reference with the command's actual status; a new command is pending, while an identical idempotent replay may already be terminal. The browser polls pending commands with bounded backoff, performs one protected status read for a terminal replay, aborts on navigation, and announces progress and terminal outcomes through accessible live regions.
 
 Terminal behavior is:
 
@@ -381,4 +382,4 @@ Plan 6B-II is complete when:
 
 ## 18. Supersession and next step
 
-After this written design is reviewed, the writing-plans phase will create a new dated Plan 6B-II implementation plan. That plan will supersede, not silently rewrite, `2026-08-11-backend-plan-6b-ii-admin-resolution-reporting.md` and will include exact file paths, RED/GREEN commands, migration and role-boundary steps, release gates, and commit boundaries.
+The reviewed executable plan is [Backend Plan 6B-II: Admin Resolution and Reporting Refresh](../plans/2026-08-20-backend-plan-6b-ii-admin-resolution-reporting-refresh.md). It supersedes, without silently rewriting, `2026-08-11-backend-plan-6b-ii-admin-resolution-reporting.md` and contains the exact file paths, RED/GREEN commands, migration and role-boundary steps, release gates, and commit boundaries. The next phase is task-by-task execution of that plan from its recorded approved base.

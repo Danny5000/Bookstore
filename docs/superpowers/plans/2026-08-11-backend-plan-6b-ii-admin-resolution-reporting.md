@@ -1,5 +1,7 @@
 # Backend Plan 6B-II: Admin Resolution and Reporting Implementation Plan
 
+> **Superseded on 2026-08-20:** Do not execute this historical plan. Use [Backend Plan 6B-II: Admin Resolution and Reporting Refresh](2026-08-20-backend-plan-6b-ii-admin-resolution-reporting-refresh.md), which preserves the approved product behavior while rebasing implementation onto the hardened web/worker database-authority split.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add an administrator-only Sales experience backed entirely by the checkpoint-I local financial ledger, including exact per-title reporting, safe ambiguous-refund finalization, append-only reporting corrections, narrowly proven access recovery, payout views, and audited privacy-minimized CSV export.
