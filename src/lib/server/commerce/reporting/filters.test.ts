@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   SALES_CURSOR_MAX_DECODED_BYTES,
   SALES_CURSOR_MAX_ENCODED_LENGTH,
@@ -155,8 +155,7 @@ describe('sales overview filters', () => {
     ['bad state', 'state=resolved'],
     ['bad sort', 'sort=newest'],
     ['unsafe control value', 'presentmentCurrency=%00USD'],
-    ['extra page size', 'pageSize=5000'],
-    ['oversized cursor', `cursor=${'A'.repeat(513)}`]
+    ['extra page size', 'pageSize=5000']
   ])('rejects %s with a safe 400', (_label, query) => {
     expectSafeBadRequest(() => parseSalesOverviewFilters(salesUrl(query), NOW));
   });
@@ -245,10 +244,20 @@ describe('sales cursor codec and filter fingerprint', () => {
     expect(decodeSalesCursor(encodeSalesCursor(cursor), cursor.filterFingerprint)).toEqual(cursor);
   });
 
-  it('rejects 2,675 encoded characters at the decoder boundary', () => {
-    expectSafeBadRequest(() =>
-      decodeSalesCursor('A'.repeat(2_675), cursorFor().filterFingerprint)
-    );
+  it('rejects 2,675 encoded characters before attempting base64url decoding', () => {
+    const bufferFrom = vi.spyOn(Buffer, 'from');
+
+    try {
+      expectSafeBadRequest(() =>
+        decodeSalesCursor(
+          'A'.repeat(SALES_CURSOR_MAX_ENCODED_LENGTH + 1),
+          cursorFor().filterFingerprint
+        )
+      );
+      expect(bufferFrom).not.toHaveBeenCalled();
+    } finally {
+      bufferFrom.mockRestore();
+    }
   });
 
   it('rejects 301 UTF-16 title code units even below the encoded byte ceiling', () => {
@@ -293,19 +302,29 @@ describe('sales cursor codec and filter fingerprint', () => {
     }
   );
 
-  it.each([' Pale Orbit', 'Pale Orbit '])(
-    'rejects the noncanonical title cursor primary %j',
-    (primary) => {
+  it.each([
+    ['leading whitespace', ' Pale Orbit'],
+    ['trailing whitespace', 'Pale Orbit ']
+  ] as const)(
+    'losslessly round-trips an exact stored title with %s',
+    (_label, primary) => {
       const filters = parseSalesOverviewFilters(salesUrl('range=all&sort=title_asc'), NOW);
-      expectSafeBadRequest(() =>
-        encodeSalesCursor({
-          filterFingerprint: fingerprintSalesFilters(filters),
-          primary,
-          titleId,
-          presentmentCurrency: 'USD',
-          settlementCurrency: ''
-        })
-      );
+      const cursor: SalesCursor = {
+        filterFingerprint: fingerprintSalesFilters(filters),
+        primary,
+        titleId,
+        presentmentCurrency: 'USD',
+        settlementCurrency: ''
+      };
+      const encoded = encodeSalesCursor(cursor);
+
+      expect(decodeSalesCursor(encoded, cursor.filterFingerprint)).toEqual(cursor);
+      expect(
+        parseSalesOverviewFilters(
+          salesUrl(`range=all&sort=title_asc&cursor=${encoded}`),
+          NOW
+        ).cursor
+      ).toEqual(cursor);
     }
   );
 
@@ -376,13 +395,46 @@ describe('sales cursor codec and filter fingerprint', () => {
     expect(fingerprintSalesFilters(parsed)).toBe(fingerprint);
   });
 
-  it('fingerprints normalized filters deterministically and changes for each filter dimension', () => {
+  it.each([
+    ['range', { range: '30' }],
+    ['from', { from: new Date('2026-08-02T00:00:00.000Z') }],
+    ['to', { to: new Date('2026-08-12T00:00:00.000Z') }],
+    ['titleId', { titleId: 'abcdef00-0000-4000-8000-000000000002' }],
+    ['format', { format: 'comic' }],
+    ['presentmentCurrency', { presentmentCurrency: 'EUR' }],
+    ['settlementCurrency', { settlementCurrency: 'USD' }],
+    ['state', { state: 'payout_reconciled' }],
+    ['sort', { sort: 'title_asc' }],
+    ['pageSize', { pageSize: 51 as typeof SALES_PAGE_SIZE }]
+  ] as const)(
+    'changes the fingerprint when only %s changes',
+    (_dimension, change) => {
+      const baseline: SalesOverviewFilters = {
+        range: 'custom',
+        from: new Date('2026-08-01T00:00:00.000Z'),
+        to: new Date('2026-08-11T00:00:00.000Z'),
+        titleId,
+        format: 'prose',
+        presentmentCurrency: 'USD',
+        settlementCurrency: 'EUR',
+        state: 'fee_reconciled',
+        sort: 'gross_desc',
+        pageSize: SALES_PAGE_SIZE
+      };
+      const changed = { ...baseline, ...change } as SalesOverviewFilters;
+
+      expect(fingerprintSalesFilters(baseline)).toMatch(/^[a-f0-9]{64}$/u);
+      expect(fingerprintSalesFilters(changed)).not.toBe(fingerprintSalesFilters(baseline));
+    }
+  );
+
+  it('fingerprints equal normalized values deterministically and deliberately excludes cursor', () => {
     const baseline = baseFilters();
     const same = baseFilters();
-    const changed = parseSalesOverviewFilters(salesUrl('range=all&sort=title_asc'), NOW);
-    expect(fingerprintSalesFilters(baseline)).toMatch(/^[a-f0-9]{64}$/u);
-    expect(fingerprintSalesFilters(same)).toBe(fingerprintSalesFilters(baseline));
-    expect(fingerprintSalesFilters(changed)).not.toBe(fingerprintSalesFilters(baseline));
+    const fingerprint = fingerprintSalesFilters(baseline);
+
+    expect(fingerprintSalesFilters(same)).toBe(fingerprint);
+    expect(fingerprintSalesFilters({ ...baseline, cursor: cursorFor(baseline) })).toBe(fingerprint);
   });
 
   it.each([

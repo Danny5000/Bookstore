@@ -84,8 +84,7 @@ const fingerprintSchema = z.string().regex(/^[a-f0-9]{64}$/u);
 const canonicalTitlePrimarySchema = z
   .string()
   .min(1)
-  .max(300)
-  .refine((value) => value === value.trim());
+  .max(300);
 const cursorPrimarySchema = z.union([
   z.number().int().safe(),
   canonicalTitlePrimarySchema
