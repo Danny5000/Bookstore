@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-const source = (path: string) => readFileSync(resolve(path), 'utf8');
+const source = (path: string) => readFileSync(resolve(path), 'utf8').replace(/\r\n?/gu, '\n');
 
 const financialWorkerWriteTables = [
   'dispute_item_allocations',
