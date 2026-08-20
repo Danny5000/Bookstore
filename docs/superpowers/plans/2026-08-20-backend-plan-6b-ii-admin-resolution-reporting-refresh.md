@@ -238,6 +238,8 @@ export function decodeSalesCursor(
   expectedFilterFingerprint: string
 ): SalesCursor;
 export function fingerprintSalesFilters(filters: SalesOverviewFilters): string;
+export const SALES_CURSOR_MAX_ENCODED_LENGTH = 2_674;
+export const SALES_CURSOR_MAX_DECODED_BYTES = 2_005;
 
 export interface FinancialRequestContext {
   readonly correlationId: string;
@@ -245,7 +247,7 @@ export interface FinancialRequestContext {
 }
 ```
 
-Accept only one value for `range=7|30|90|all|custom`, `from`, `to`, canonical `titleId`, `format=prose|comic`, presentment currency, settlement currency or `pending`, `state=pending|fee_reconciled|payout_reconciled|exception`, `sort=gross_desc|title_asc`, and a canonical base64url cursor of at most 512 characters. Reject unknown, duplicate, incompatible, noncanonical, extra-key, unsafe-number, bad-currency, bad-UUID, and wrong-filter-fingerprint inputs with safe 400 errors. Path UUIDs use the existing undisclosable safe-404 convention.
+Accept only one value for `range=7|30|90|all|custom`, `from`, `to`, canonical `titleId`, `format=prose|comic`, presentment currency, settlement currency or `pending`, `state=pending|fee_reconciled|payout_reconciled|exception`, `sort=gross_desc|title_asc`, and a canonical unpadded-base64url cursor of at most 2,674 ASCII characters whose decoded UTF-8 JSON is at most 2,005 bytes. The cursor is the strict five-key JSON object `filterFingerprint`, `primary`, `titleId`, `presentmentCurrency`, `settlementCurrency` in that exact order. For `title_asc`, `primary` is the exact stored current title (1–300 UTF-16 code units) without normalization, truncation, hashing, or cursor-only character restrictions; for `gross_desc`, it is a safe integer. Reject the encoded bound before decoding and reject the decoded bound before JSON parsing. Reject unknown, duplicate, incompatible, noncanonical, extra-key, unsafe-number, bad-currency, bad-UUID, wrong-key-order, and wrong-filter-fingerprint inputs with safe 400 errors. Boundary tests must round-trip `"\u0001".repeat(300)` at exactly 2,005 decoded bytes and 2,674 encoded characters, accept it through `parseSalesOverviewFilters`, reject 2,675 encoded characters before decoding, reject a 301-code-unit title, and preserve decomposed Unicode losslessly. Path UUIDs use the existing undisclosable safe-404 convention.
 
 Use complete UTC-day half-open intervals. The default is the prior 30 complete days ending at today's `00:00Z`; 7 and 90 follow the same rule; `custom` converts inclusive dates to `[from 00:00Z, to + 1 day 00:00Z)`; `all` has no time predicate. Page size is fixed at 50. Cursor order is `sort primary -> titleId -> presentmentCurrency -> settlementCurrency-or-empty`.
 
