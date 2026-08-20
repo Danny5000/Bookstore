@@ -31,7 +31,7 @@ describe('GET /health/ready', () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({ status: 'ready' });
     expect(mocks.probeDatabase).toHaveBeenCalledWith('database-pool', 2_000);
-    expect(mocks.probeStorage).toHaveBeenCalledWith('object-storage');
+    expect(mocks.probeStorage).toHaveBeenCalledWith('object-storage', 'web');
   });
 
   it('returns only a safe not-ready response when storage fails', async () => {

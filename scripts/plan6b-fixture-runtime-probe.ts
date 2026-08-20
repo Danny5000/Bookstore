@@ -53,6 +53,7 @@ export interface FixtureProbeOperations {
   revalidatePorts(manifest: FixtureProbeManifest): Promise<void>;
   startDependencies(manifest: FixtureProbeManifest): Promise<void>;
   migrate(manifest: FixtureProbeManifest): Promise<void>;
+  provisionRoles(manifest: FixtureProbeManifest): Promise<void>;
   seedPublishedTitles(manifest: FixtureProbeManifest): Promise<void>;
   startRuntime(manifest: FixtureProbeManifest): Promise<void>;
   exerciseQuoteAndCheckout(manifest: FixtureProbeManifest): Promise<void>;
@@ -251,8 +252,6 @@ export function renderFixtureProbeOverride(manifest: FixtureProbeManifest): stri
   DATABASE_HOST: postgres
   DATABASE_PORT: "5432"
   DATABASE_NAME: pale_orbit_test
-  DATABASE_USER: pale_orbit_test
-  DATABASE_PASSWORD: pale_orbit_test_only
   DATABASE_POOL_MAX: "5"
   DATABASE_CONNECTION_TIMEOUT_MS: "5000"
   DATABASE_STATEMENT_TIMEOUT_MS: "30000"
@@ -264,7 +263,10 @@ export function renderFixtureProbeOverride(manifest: FixtureProbeManifest): stri
   WORKER_READY_FILE: /tmp/worker-ready
   WORKER_CONCURRENCY: "1"
   STORAGE_PROVIDER: local
-  STORAGE_LOCAL_ROOT: /var/lib/pale-orbit/storage
+  STORAGE_STAGING_ROOT: /var/lib/pale-orbit/staging
+  STORAGE_PUBLICATION_ROOT: /var/lib/pale-orbit/publication
+  STORAGE_COVERS_ROOT: /var/lib/pale-orbit/covers
+  STORAGE_SCRATCH_ROOT: /tmp/pale-orbit-verified
   UPLOAD_MAX_BYTES: "536870912"
   INGEST_MAX_EXPANDED_BYTES: "2147483648"
   INGEST_MAX_ENTRIES: "10000"
@@ -302,6 +304,8 @@ export function renderFixtureProbeOverride(manifest: FixtureProbeManifest): stri
 
 services:
   postgres:
+    environment:
+      POSTGRES_PASSWORD: plan6b_fixture_owner_password_0000000000
     labels:
       ${labels}
     ports: !override
@@ -339,12 +343,22 @@ services:
     image: ${manifest.imageTag}
     environment:
       <<: *fixture-environment
+      DATABASE_USER: pale_orbit_fixture_web
+      DATABASE_PASSWORD: plan6b_fixture_web_password_000000000000
+      DATABASE_OWNER_USER: ""
+      DATABASE_OWNER_PASSWORD: ""
+      DATABASE_WORKER_USER: ""
+      DATABASE_WORKER_PASSWORD: ""
+      DATABASE_STORAGE_CLEANUP_USER: ""
+      DATABASE_STORAGE_CLEANUP_PASSWORD: ""
     labels:
       ${labels}
     ports: !override
       - "${manifest.webHost}:${manifest.webPort}:3000"
     volumes:
-      - book_storage:/var/lib/pale-orbit/storage
+      - book_staging:/var/lib/pale-orbit/staging
+      - book_publication:/var/lib/pale-orbit/publication:ro
+      - book_covers:/var/lib/pale-orbit/covers
     depends_on:
       postgres:
         condition: service_healthy
@@ -363,10 +377,20 @@ services:
     command: [node, build/services/worker.js]
     environment:
       <<: *fixture-environment
+      DATABASE_WORKER_USER: pale_orbit_fixture_worker
+      DATABASE_WORKER_PASSWORD: plan6b_fixture_worker_password_0000000000
+      DATABASE_OWNER_USER: ""
+      DATABASE_OWNER_PASSWORD: ""
+      DATABASE_USER: ""
+      DATABASE_PASSWORD: ""
+      DATABASE_STORAGE_CLEANUP_USER: ""
+      DATABASE_STORAGE_CLEANUP_PASSWORD: ""
     labels:
       ${labels}
     volumes:
-      - book_storage:/var/lib/pale-orbit/storage
+      - book_staging:/var/lib/pale-orbit/staging
+      - book_publication:/var/lib/pale-orbit/publication
+      - book_covers:/var/lib/pale-orbit/covers
     depends_on:
       postgres:
         condition: service_healthy
@@ -386,6 +410,33 @@ services:
     command: [node, build/services/migrate.js]
     environment:
       <<: *fixture-environment
+      DATABASE_OWNER_USER: pale_orbit_test
+      DATABASE_OWNER_PASSWORD: plan6b_fixture_owner_password_0000000000
+      DATABASE_USER: ""
+      DATABASE_PASSWORD: ""
+      DATABASE_WORKER_USER: ""
+      DATABASE_WORKER_PASSWORD: ""
+      DATABASE_STORAGE_CLEANUP_USER: ""
+      DATABASE_STORAGE_CLEANUP_PASSWORD: ""
+    labels:
+      ${labels}
+    depends_on:
+      postgres:
+        condition: service_healthy
+  database-role-provision:
+    profiles: [tools]
+    image: ${manifest.imageTag}
+    command: [node, build/services/provision-database-roles.js]
+    environment:
+      <<: *fixture-environment
+      DATABASE_OWNER_USER: pale_orbit_test
+      DATABASE_OWNER_PASSWORD: plan6b_fixture_owner_password_0000000000
+      DATABASE_USER: pale_orbit_fixture_web
+      DATABASE_PASSWORD: plan6b_fixture_web_password_000000000000
+      DATABASE_WORKER_USER: pale_orbit_fixture_worker
+      DATABASE_WORKER_PASSWORD: plan6b_fixture_worker_password_0000000000
+      DATABASE_STORAGE_CLEANUP_USER: pale_orbit_fixture_storage_cleanup
+      DATABASE_STORAGE_CLEANUP_PASSWORD: plan6b_fixture_storage_cleanup_password_000000
     labels:
       ${labels}
     depends_on:
@@ -400,7 +451,13 @@ volumes:
   stripe_attempts:
     labels:
       ${labels}
-  book_storage:
+  book_staging:
+    labels:
+      ${labels}
+  book_publication:
+    labels:
+      ${labels}
+  book_covers:
     labels:
       ${labels}
 `;
@@ -423,6 +480,57 @@ async function captureIdentifiers(
   return result.stdout.trim().split(/\r?\n/u).filter(Boolean);
 }
 
+type DockerResourceKind = 'container' | 'network' | 'volume';
+
+function expectedExactDockerResources(
+  manifest: FixtureProbeManifest
+): ReadonlyArray<readonly [DockerResourceKind, string]> {
+  return [
+    ...['postgres', 'mailpit', 'stripe_api_canary', 'app', 'worker'].map((service) => (
+      ['container', `${manifest.project}-${service}-1`] as const
+    )),
+    ['network', `${manifest.project}_default`] as const,
+    ...['stripe_attempts', 'book_staging', 'book_publication', 'book_covers'].map((volume) => (
+      ['volume', `${manifest.project}_${volume}`] as const
+    ))
+  ];
+}
+
+function exactNameInventoryArguments(
+  resource: DockerResourceKind,
+  name: string
+): readonly string[] {
+  return resource === 'container'
+    ? ['ps', '--all', '--filter', `name=${name}`, '--format', '{{.Names}}']
+    : [resource, 'ls', '--filter', `name=${name}`, '--format', '{{.Name}}'];
+}
+
+async function exactNameExists(
+  dependencies: FixtureProbeDockerDependencies,
+  environment: NodeJS.ProcessEnv,
+  resource: DockerResourceKind,
+  name: string
+): Promise<boolean> {
+  return (await captureIdentifiers(
+    dependencies,
+    environment,
+    exactNameInventoryArguments(resource, name)
+  )).includes(name);
+}
+
+async function assertExactNamesAbsent(
+  manifest: FixtureProbeManifest,
+  dependencies: FixtureProbeDockerDependencies,
+  environment: NodeJS.ProcessEnv
+): Promise<void> {
+  for (const [resource, name] of expectedExactDockerResources(manifest)) {
+    assert(
+      !(await exactNameExists(dependencies, environment, resource, name)),
+      `foreign exact-name Docker ${resource} collides with the owned fixture run`
+    );
+  }
+}
+
 async function assertImageTagAbsentAfterInspectFailure(
   imageTag: string,
   dependencies: FixtureProbeDockerDependencies,
@@ -438,7 +546,7 @@ async function assertImageTagAbsentAfterInspectFailure(
   assert(imageInventory.stdout.trim().length === 0, `${description} could not be inspected`);
 }
 
-async function assertNoDockerCollision(
+async function assertNoComposeResourceCollision(
   manifest: FixtureProbeManifest,
   dependencies: FixtureProbeDockerDependencies,
   environment: NodeJS.ProcessEnv
@@ -453,6 +561,15 @@ async function assertNoDockerCollision(
       'owned project collides with existing Docker resources'
     );
   }
+  await assertExactNamesAbsent(manifest, dependencies, environment);
+}
+
+async function assertNoDockerCollision(
+  manifest: FixtureProbeManifest,
+  dependencies: FixtureProbeDockerDependencies,
+  environment: NodeJS.ProcessEnv
+): Promise<void> {
+  await assertNoComposeResourceCollision(manifest, dependencies, environment);
   const image = await dependencies.command.capture(
     ['image', 'inspect', manifest.imageTag],
     environment,
@@ -684,6 +801,21 @@ async function validateOwnedResources(
   }
 }
 
+async function validateExactNamedOwnedResources(
+  manifest: FixtureProbeManifest,
+  dependencies: FixtureProbeDockerDependencies,
+  environment: NodeJS.ProcessEnv
+): Promise<void> {
+  for (const [resource, name] of expectedExactDockerResources(manifest)) {
+    if (await exactNameExists(dependencies, environment, resource, name)) {
+      exactOwnershipLabels(
+        manifest,
+        await inspectLabels(dependencies, environment, resource, name)
+      );
+    }
+  }
+}
+
 async function assertNoOwnedResourcesRemain(
   manifest: FixtureProbeManifest,
   dependencies: FixtureProbeDockerDependencies,
@@ -708,20 +840,9 @@ async function assertNoOwnedResourcesRemain(
       `owned ${resource} cleanup failed`
     );
   }
-  for (const [resource, name] of [
-    ...['postgres', 'mailpit', 'stripe_api_canary', 'app', 'worker'].map((service) => (
-      ['container', `${manifest.project}-${service}-1`] as const
-    )),
-    ['network', `${manifest.project}_default`] as const,
-    ...['stripe_attempts', 'book_storage'].map((volume) => (
-      ['volume', `${manifest.project}_${volume}`] as const
-    ))
-  ]) {
-    const argumentsToCapture = resource === 'container'
-      ? ['ps', '--all', '--filter', `name=${name}`, '--format', '{{.Names}}']
-      : [resource, 'ls', '--filter', `name=${name}`, '--format', '{{.Name}}'];
+  for (const [resource, name] of expectedExactDockerResources(manifest)) {
     assert(
-      !(await captureIdentifiers(dependencies, environment, argumentsToCapture)).includes(name),
+      !(await exactNameExists(dependencies, environment, resource, name)),
       `owned ${resource} cleanup failed`
     );
   }
@@ -872,7 +993,9 @@ export function createFixtureProbeDockerOperations(
       await dependencies.assertPortAvailable(owned.webHost, owned.webPort);
       await dependencies.assertPortAvailable(owned.databaseHost, owned.databasePort);
     },
-    async startDependencies() {
+    async startDependencies(owned) {
+      validateFixtureProbeManifest(owned);
+      await assertNoComposeResourceCollision(owned, dependencies, environment);
       await dependencies.command.run([
         ...compose,
         'up',
@@ -885,7 +1008,8 @@ export function createFixtureProbeDockerOperations(
         'stripe_api_canary'
       ], environment);
     },
-    async migrate() {
+    async migrate(owned) {
+      validateFixtureProbeManifest(owned);
       await dependencies.command.run([
         ...compose,
         '--profile',
@@ -895,11 +1019,25 @@ export function createFixtureProbeDockerOperations(
         'migrate'
       ], environment);
     },
+    async provisionRoles(owned) {
+      validateFixtureProbeManifest(owned);
+      await dependencies.command.run([
+        ...compose,
+        '--profile',
+        'tools',
+        'run',
+        '--rm',
+        'database-role-provision'
+      ], environment);
+    },
     async seedPublishedTitles(owned) {
       validateFixtureProbeManifest(owned);
       await dependencies.command.run(psqlArguments(owned, seedFixtureSql(owned)), environment);
     },
-    async startRuntime() {
+    async startRuntime(owned) {
+      validateFixtureProbeManifest(owned);
+      await validateOwnedResources(owned, dependencies, environment);
+      await validateExactNamedOwnedResources(owned, dependencies, environment);
       await dependencies.command.run([
         ...compose,
         'up',
@@ -1138,6 +1276,7 @@ export function createFixtureProbeDockerOperations(
       validateFixtureProbeManifest(stored);
       assert(exactManifest(stored, owned), 'stored owned-run manifest changed');
       await validateOwnedResources(owned, dependencies, environment);
+      await validateExactNamedOwnedResources(owned, dependencies, environment);
       await dependencies.command.run([
         ...compose,
         'down',
@@ -1299,6 +1438,7 @@ export async function executeFixtureRuntimeProbe(
     await operations.revalidatePorts(manifest);
     await operations.startDependencies(manifest);
     await operations.migrate(manifest);
+    await operations.provisionRoles(manifest);
     await operations.seedPublishedTitles(manifest);
     await operations.startRuntime(manifest);
     await operations.exerciseQuoteAndCheckout(manifest);

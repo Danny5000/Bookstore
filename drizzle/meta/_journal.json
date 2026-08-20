@@ -57,6 +57,34 @@
       "when": 1786504656905,
       "tag": "0007_plan6b_financial_reconciliation",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1786766400000,
+      "tag": "0008_plan6b_worker_issue_resolution",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1786793164447,
+      "tag": "0009_plan6b_worker_authority_and_commerce_integrity",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1786810772351,
+      "tag": "0010_plan6b_guest_claim_authority",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1786823450867,
+      "tag": "0011_plan6b_storage_cleanup_authority",
+      "breakpoints": true
     }
   ]
 }

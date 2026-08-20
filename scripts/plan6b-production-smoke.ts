@@ -27,6 +27,8 @@ export interface DisabledRuntimeEvidence {
   readonly commerceStatus: number;
   readonly appStripeEnabled: boolean;
   readonly workerStripeEnabled: boolean;
+  readonly appDatabaseRoleIsWeb: boolean;
+  readonly workerDatabaseRoleIsWorker: boolean;
   readonly appFixtureMode: boolean;
   readonly workerFixtureMode: boolean;
   readonly appHasStripeSecret: boolean;
@@ -228,6 +230,14 @@ export function renderProductionSmokeOverride(manifest: ProductionSmokeManifest)
     image: ${manifest.imageTag}
     labels:
       ${labels}
+  database-role-provision:
+    image: ${manifest.imageTag}
+    labels:
+      ${labels}
+  storage-cleanup:
+    image: ${manifest.imageTag}
+    labels:
+      ${labels}
   postgres:
     labels:
       ${labels}
@@ -246,7 +256,13 @@ volumes:
   postgres_data:
     labels:
       ${labels}
-  book_storage:
+  book_staging:
+    labels:
+      ${labels}
+  book_publication:
+    labels:
+      ${labels}
+  book_covers:
     labels:
       ${labels}
   caddy_data:
@@ -387,7 +403,7 @@ function psqlArguments(manifest: ProductionSmokeManifest, query: string): string
     'postgres',
     'psql',
     '--username',
-    `plan6b_smoke_${manifest.runId}`,
+    `plan6b_smoke_owner_${manifest.runId}`,
     '--dbname',
     `plan6b_smoke_${manifest.runId}`,
     '--tuples-only',
@@ -414,7 +430,10 @@ function dockerEnvironment(
     HTTPS_BIND_ADDRESS: manifest.httpsHost,
     HTTPS_PORT: String(manifest.httpsPort),
     DATABASE_NAME: `plan6b_smoke_${manifest.runId}`,
-    DATABASE_USER: `plan6b_smoke_${manifest.runId}`,
+    DATABASE_OWNER_USER: `plan6b_smoke_owner_${manifest.runId}`,
+    DATABASE_USER: `plan6b_smoke_web_${manifest.runId}`,
+    DATABASE_WORKER_USER: `plan6b_smoke_worker_${manifest.runId}`,
+    DATABASE_STORAGE_CLEANUP_USER: `plan6b_smoke_storage_cleanup_${manifest.runId}`,
     SMTP_HOST: 'postgres',
     SMTP_PORT: '2525',
     SMTP_SECURE: 'false',
@@ -438,7 +457,62 @@ async function captureIdentifiers(
   return result.stdout.trim().split(/\r?\n/u).filter(Boolean);
 }
 
-async function assertNoCollision(
+type DockerResourceKind = 'container' | 'network' | 'volume';
+
+function expectedExactDockerResources(
+  manifest: ProductionSmokeManifest
+): ReadonlyArray<readonly [DockerResourceKind, string]> {
+  return [
+    ...['postgres', 'app', 'worker', 'caddy'].map((service) => (
+      ['container', `${manifest.project}-${service}-1`] as const
+    )),
+    ['network', `${manifest.project}_default`] as const,
+    ...[
+      'postgres_data',
+      'book_staging',
+      'book_publication',
+      'book_covers',
+      'caddy_data',
+      'caddy_config'
+    ].map((volume) => (
+      ['volume', `${manifest.project}_${volume}`] as const
+    ))
+  ];
+}
+
+function exactNameInventoryArguments(
+  resource: DockerResourceKind,
+  name: string
+): readonly string[] {
+  return resource === 'container'
+    ? ['ps', '--all', '--filter', `name=${name}`, '--format', '{{.Names}}']
+    : [resource, 'ls', '--filter', `name=${name}`, '--format', '{{.Name}}'];
+}
+
+async function exactNameExists(
+  dependencies: ProductionSmokeDockerDependencies,
+  resource: DockerResourceKind,
+  name: string
+): Promise<boolean> {
+  return (await captureIdentifiers(
+    dependencies,
+    exactNameInventoryArguments(resource, name)
+  )).includes(name);
+}
+
+async function assertExactNamesAbsent(
+  manifest: ProductionSmokeManifest,
+  dependencies: ProductionSmokeDockerDependencies
+): Promise<void> {
+  for (const [resource, name] of expectedExactDockerResources(manifest)) {
+    assert(
+      !(await exactNameExists(dependencies, resource, name)),
+      `foreign exact-name Docker ${resource} collides with the owned run`
+    );
+  }
+}
+
+async function assertNoComposeResourceCollision(
   manifest: ProductionSmokeManifest,
   dependencies: ProductionSmokeDockerDependencies
 ): Promise<void> {
@@ -453,6 +527,14 @@ async function assertNoCollision(
       'owned project collides with existing Docker resources'
     );
   }
+  await assertExactNamesAbsent(manifest, dependencies);
+}
+
+async function assertNoCollision(
+  manifest: ProductionSmokeManifest,
+  dependencies: ProductionSmokeDockerDependencies
+): Promise<void> {
+  await assertNoComposeResourceCollision(manifest, dependencies);
   const image = await dependencies.command.capture(
     [
       'image', 'ls', '--quiet', '--no-trunc',
@@ -542,6 +624,17 @@ async function validateOwnedResources(
   }
 }
 
+async function validateExactNamedOwnedResources(
+  manifest: ProductionSmokeManifest,
+  dependencies: ProductionSmokeDockerDependencies
+): Promise<void> {
+  for (const [resource, name] of expectedExactDockerResources(manifest)) {
+    if (await exactNameExists(dependencies, resource, name)) {
+      exactOwnershipLabels(manifest, await inspectLabels(dependencies, resource, name));
+    }
+  }
+}
+
 async function assertNoOwnedResourcesRemain(
   manifest: ProductionSmokeManifest,
   dependencies: ProductionSmokeDockerDependencies
@@ -565,20 +658,9 @@ async function assertNoOwnedResourcesRemain(
       `owned ${resource} cleanup failed`
     );
   }
-  for (const [resource, name] of [
-    ...['postgres', 'app', 'worker', 'caddy'].map((service) => (
-      ['container', `${manifest.project}-${service}-1`] as const
-    )),
-    ['network', `${manifest.project}_default`] as const,
-    ...['postgres_data', 'book_storage', 'caddy_data', 'caddy_config'].map((volume) => (
-      ['volume', `${manifest.project}_${volume}`] as const
-    ))
-  ]) {
-    const argumentsToCapture = resource === 'container'
-      ? ['ps', '--all', '--filter', `name=${name}`, '--format', '{{.Names}}']
-      : [resource, 'ls', '--filter', `name=${name}`, '--format', '{{.Name}}'];
+  for (const [resource, name] of expectedExactDockerResources(manifest)) {
     assert(
-      !(await captureIdentifiers(dependencies, argumentsToCapture)).includes(name),
+      !(await exactNameExists(dependencies, resource, name)),
       `owned ${resource} cleanup failed`
     );
   }
@@ -624,7 +706,9 @@ export function createProductionSmokeDockerOperations(
       await dependencies.assertPortAvailable(owned.httpHost, owned.httpPort);
       await dependencies.assertPortAvailable(owned.httpsHost, owned.httpsPort);
     },
-    async startDatabase() {
+    async startDatabase(owned) {
+      validateProductionSmokeManifest(owned);
+      await assertNoComposeResourceCollision(owned, { ...dependencies, environment });
       await dependencies.command.run(
         [...compose, 'up', '--detach', '--wait', 'postgres'],
         environment
@@ -633,6 +717,14 @@ export function createProductionSmokeDockerOperations(
     async migrate() {
       await dependencies.command.run(
         [...compose, '--profile', 'tools', 'run', '--rm', 'migrate'],
+        environment
+      );
+      await dependencies.command.run(
+        [...compose, '--profile', 'tools', 'run', '--rm', 'database-role-provision'],
+        environment
+      );
+      await dependencies.command.run(
+        [...compose, '--profile', 'tools', 'run', '--rm', 'storage-cleanup'],
         environment
       );
     },
@@ -653,7 +745,10 @@ export function createProductionSmokeDockerOperations(
         )
       )::text`);
     },
-    async startRuntime() {
+    async startRuntime(owned) {
+      validateProductionSmokeManifest(owned);
+      await validateOwnedResources(owned, { ...dependencies, environment });
+      await validateExactNamedOwnedResources(owned, { ...dependencies, environment });
       await dependencies.command.run(
         [...compose, 'up', '--detach', '--wait', 'app', 'worker', 'caddy'],
         environment
@@ -850,6 +945,12 @@ export function createProductionSmokeDockerOperations(
         ),
         appStripeEnabled: app.environment.STRIPE_ENABLED === 'true',
         workerStripeEnabled: worker.environment.STRIPE_ENABLED === 'true',
+        appDatabaseRoleIsWeb:
+          app.environment.DATABASE_USER === `plan6b_smoke_web_${owned.runId}`,
+        workerDatabaseRoleIsWorker:
+          worker.environment.DATABASE_WORKER_USER === `plan6b_smoke_worker_${owned.runId}` &&
+          worker.environment.DATABASE_USER === undefined &&
+          worker.environment.DATABASE_OWNER_USER === undefined,
         appFixtureMode: app.environment.STRIPE_TEST_FIXTURE_MODE === 'true',
         workerFixtureMode: worker.environment.STRIPE_TEST_FIXTURE_MODE === 'true',
         appHasStripeSecret: hasStripeSecret(app.environment) || app.hasStripeMount,
@@ -898,6 +999,7 @@ export function createProductionSmokeDockerOperations(
       validateProductionSmokeManifest(stored);
       assert(exactManifest(stored, owned), 'stored owned-run manifest changed');
       await validateOwnedResources(owned, { ...dependencies, environment });
+      await validateExactNamedOwnedResources(owned, { ...dependencies, environment });
       await dependencies.command.run(
         [...compose, 'down', '--volumes', '--remove-orphans'],
         environment
@@ -938,6 +1040,10 @@ function validateDisabledRuntime(evidence: DisabledRuntimeEvidence): void {
   assert(evidence.storefrontStatus === 503, 'runtime storefront is not in maintenance');
   assert(evidence.commerceStatus === 503, 'runtime commerce endpoint is not in maintenance');
   assert(!evidence.appStripeEnabled && !evidence.workerStripeEnabled, 'runtime enabled Stripe');
+  assert(
+    evidence.appDatabaseRoleIsWeb && evidence.workerDatabaseRoleIsWorker,
+    'runtime database authority roles are not isolated'
+  );
   assert(!evidence.appFixtureMode && !evidence.workerFixtureMode, 'runtime enabled fixture mode');
   assert(
     !evidence.appHasStripeSecret && !evidence.workerHasStripeSecret,
@@ -1139,7 +1245,10 @@ export async function createProductionSmokeManifest(): Promise<ProductionSmokeMa
           flag: 'wx'
         }),
         ...[
+          ['database_owner_password', 24],
           ['database_password', 24],
+          ['database_worker_password', 24],
+          ['database_storage_cleanup_password', 24],
           ['auth_secret', 32],
           ['smtp_password', 24],
           ['bootstrap_admin_password', 24]
@@ -1191,17 +1300,25 @@ export function createProductionSmokeCommandRuntime(): ProductionSmokeCommandRun
 async function createDefaultProductionSmokeOperations(
   manifest: ProductionSmokeManifest
 ): Promise<ProductionSmokeOperations> {
-  const [databasePassword, authSecret, smtpPassword, bootstrapPassword] = await Promise.all([
-    readFile(join(manifest.secretDirectory, 'database_password'), 'utf8'),
-    readFile(join(manifest.secretDirectory, 'auth_secret'), 'utf8'),
-    readFile(join(manifest.secretDirectory, 'smtp_password'), 'utf8'),
-    readFile(join(manifest.secretDirectory, 'bootstrap_admin_password'), 'utf8')
-  ]);
+  const [databaseOwnerPassword, databasePassword, databaseWorkerPassword,
+    databaseStorageCleanupPassword, authSecret, smtpPassword, bootstrapPassword] =
+    await Promise.all([
+      readFile(join(manifest.secretDirectory, 'database_owner_password'), 'utf8'),
+      readFile(join(manifest.secretDirectory, 'database_password'), 'utf8'),
+      readFile(join(manifest.secretDirectory, 'database_worker_password'), 'utf8'),
+      readFile(join(manifest.secretDirectory, 'database_storage_cleanup_password'), 'utf8'),
+      readFile(join(manifest.secretDirectory, 'auth_secret'), 'utf8'),
+      readFile(join(manifest.secretDirectory, 'smtp_password'), 'utf8'),
+      readFile(join(manifest.secretDirectory, 'bootstrap_admin_password'), 'utf8')
+    ]);
   return createProductionSmokeDockerOperations(manifest, {
     command: createProductionSmokeCommandRuntime(),
     environment: {
       ...process.env,
+      DATABASE_OWNER_PASSWORD: databaseOwnerPassword,
       DATABASE_PASSWORD: databasePassword,
+      DATABASE_WORKER_PASSWORD: databaseWorkerPassword,
+      DATABASE_STORAGE_CLEANUP_PASSWORD: databaseStorageCleanupPassword,
       AUTH_SECRET: authSecret,
       SMTP_PASSWORD: smtpPassword,
       BOOTSTRAP_ADMIN_PASSWORD: bootstrapPassword,
@@ -1224,7 +1341,10 @@ function createSetupCleanupOperations(
     command: createProductionSmokeCommandRuntime(),
     environment: {
       ...process.env,
+      DATABASE_OWNER_PASSWORD: 'plan6b-smoke-setup-cleanup-owner',
       DATABASE_PASSWORD: 'plan6b-smoke-setup-cleanup',
+      DATABASE_WORKER_PASSWORD: 'plan6b-smoke-setup-cleanup-worker',
+      DATABASE_STORAGE_CLEANUP_PASSWORD: 'plan6b-smoke-setup-cleanup-storage',
       AUTH_SECRET: 'plan6b-smoke-setup-cleanup',
       SMTP_PASSWORD: 'plan6b-smoke-setup-cleanup',
       BOOTSTRAP_ADMIN_PASSWORD: 'plan6b-smoke-setup-cleanup'

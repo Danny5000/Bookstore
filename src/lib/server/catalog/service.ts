@@ -10,6 +10,7 @@ import type { Database } from '$lib/server/db/client';
 import { withTransaction } from '$lib/server/db/transaction';
 import { parseCreateRevisionInput, type CreateRevisionInput } from './input';
 import { CatalogDomainError } from './errors';
+import { insertTitleRevision } from './title-revision-insert';
 
 export { CatalogDomainError } from './errors';
 export {
@@ -71,16 +72,17 @@ export async function createRevisionSkeleton(
       if (!parent) throw new CatalogDomainError('parent_revision_not_in_title');
     }
 
-    const [revision] = await transaction
-      .insert(titleRevisions)
-      .values({
-        titleId: input.titleId,
-        parentRevisionId: input.parentRevisionId,
-        state: 'uploaded',
-        createdByActorId: actor.id,
-        changeSummary: input.changeSummary
-      })
-      .returning();
+    const revision = await insertTitleRevision(transaction, {
+      titleId: input.titleId,
+      parentRevisionId: input.parentRevisionId,
+      createdByActorId: actor.id,
+      changeSummary: input.changeSummary,
+      stagingStorageKey: null,
+      stagingChecksumSha256: null,
+      stagingByteSize: null,
+      uploadFilename: null,
+      uploadMimeType: null
+    });
     if (!revision) throw new Error('Revision insert returned no row');
 
     await appendAuditEvent(transaction, {

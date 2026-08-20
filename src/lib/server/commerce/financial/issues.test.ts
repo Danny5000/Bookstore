@@ -62,6 +62,15 @@ function resolve(status: 'resolved' | 'still_open', overrides: Record<string, un
 describe('financial issue lifecycle', () => {
   it.each([
     observe({ resourceType: 'order' }), observe({ safeCode: 'provider_not_ready' }),
+    observe({ resourceType: 'payout', safeCode: 'classification_fork' }),
+    observe({ resourceType: 'payment', safeCode: 'payout_incomplete' }),
+    observe({ safeCode: 'missing_source', impact: 'exception' }),
+    observe({ safeCode: 'immutable_mismatch', impact: 'pending' }),
+    observe({
+      resourceType: 'financial_classification',
+      safeCode: 'unsupported_category',
+      impact: 'informational'
+    }),
     observe({ impact: 'fatal' }), observe({ resourceId: 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA' }),
     observe({ correlationId: '' }), observe({ correlationId: 'c'.repeat(101) }),
     observe({ message: 'provider detail' }), observe({ evidence: { raw: true } }),
@@ -134,8 +143,8 @@ describe('financial issue lifecycle', () => {
   });
 
   it('fails closed if an open identity is observed with a contradictory impact', async () => {
-    const database = executor([[], [issue({ impact: 'pending' })]]);
-    await expect(observeFinancialIssue(database.tx, observe({ impact: 'exception' }))).rejects.toMatchObject({ safeCode: 'immutable_mismatch' });
+    const database = executor([[], [issue({ impact: 'exception' })]]);
+    await expect(observeFinancialIssue(database.tx, observe())).rejects.toMatchObject({ safeCode: 'immutable_mismatch' });
     expect(database.calls).toHaveLength(2);
   });
 
@@ -152,12 +161,19 @@ describe('financial issue lifecycle', () => {
       proof: { status: 'resolved', resourceType: 'refund', resourceId: RESOURCE_ID, safeCode: 'missing_source' }
     }))).rejects.toMatchObject({ safeCode: 'unsupported_provider_evidence' });
     await expect(resolveFinancialIssueAfterRecompute(invalid.tx, resolve('resolved', { resolver: USER_ID }))).rejects.toMatchObject({ safeCode: 'unsupported_provider_evidence' });
+    await expect(resolveFinancialIssueAfterRecompute(invalid.tx, resolve('resolved', {
+      resourceType: 'payout', safeCode: 'classification_fork',
+      proof: { status: 'resolved', resourceType: 'payout', resourceId: RESOURCE_ID,
+        safeCode: 'classification_fork' }
+    }))).rejects.toMatchObject({ safeCode: 'unsupported_provider_evidence' });
     expect(invalid.calls).toHaveLength(0);
   });
 
   it.each([
     { label: 'customer-only', roles: ['customer'] },
-    { label: 'roleless', roles: [] }
+    { label: 'roleless', roles: [] },
+    { label: 'administrator', roles: ['admin'] },
+    { label: 'customer administrator', roles: ['customer', 'admin'] }
   ])('rejects a $label user resolver before querying', async ({ roles }) => {
     const database = executor([]);
     await expect(resolveFinancialIssueAfterRecompute(database.tx, resolve('resolved', {
@@ -188,28 +204,15 @@ describe('financial issue lifecycle', () => {
     expect(database.calls).toHaveLength(0);
   });
 
-  it('resolves an open issue for a user actor and atomically audits it', async () => {
-    const resolved = issue({ state: 'resolved', resolvedByAdminId: USER_ID, resolvedAt: new Date('2026-08-12T00:02:00.000Z') });
-    const database = executor([[], [issue()], [resolved]]);
-    await expect(resolveFinancialIssueAfterRecompute(database.tx, resolve('resolved', {
-      actor: { type: 'user', id: USER_ID, roles: ['customer', 'admin'] }
-    }))).resolves.toEqual(resolved);
-    expect(database.calls).toHaveLength(3);
-    const transition = rendered(database.calls[2]!);
-    expect(transition.sql).toContain('resolve_financial_reconciliation_issue');
-    expect(transition.sql).not.toContain('update financial_reconciliation_issues');
-    expect(transition.params).toEqual([
-      ISSUE_ID, USER_ID, 'user', USER_ID, 'resolve-1'
-    ]);
-  });
-
-  it('resolves for a system actor without an administrator id and is idempotent for absent opens', async () => {
+  it('uses only the worker-only database transition and is idempotent for absent opens', async () => {
     const resolved = issue({ state: 'resolved', resolvedAt: new Date('2026-08-12T00:02:00.000Z') });
     const system = executor([[], [issue()], [resolved]]);
     await expect(resolveFinancialIssueAfterRecompute(system.tx, resolve('resolved'))).resolves.toEqual(resolved);
-    expect(rendered(system.calls[2]!).params).toEqual([
-      ISSUE_ID, null, 'system', 'financial-worker', 'resolve-1'
-    ]);
+    const transition = rendered(system.calls[2]!);
+    expect(transition.sql).toContain('resolve_financial_issue_after_worker_recompute');
+    expect(transition.sql).not.toContain('resolve_financial_reconciliation_issue');
+    expect(transition.sql).not.toContain('update financial_reconciliation_issues');
+    expect(transition.params).toEqual([ISSUE_ID, 'resolve-1']);
 
     const missing = executor([[], []]);
     await expect(resolveFinancialIssueAfterRecompute(missing.tx, resolve('resolved'))).resolves.toBeNull();

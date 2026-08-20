@@ -14,7 +14,7 @@ import {
   enqueueActiveEntityJob,
   enqueueJob
 } from '$lib/server/jobs/repository';
-import { applicationConfig, databaseClient } from './database';
+import { applicationConfig, workerDatabaseClient as databaseClient } from './database';
 
 const SOURCE_ID = '00000000-0000-4000-8000-000000001621';
 const SCAN_RUN_ID = '00000000-0000-4000-8000-000000001622';

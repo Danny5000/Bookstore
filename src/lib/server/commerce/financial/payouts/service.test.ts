@@ -144,6 +144,41 @@ describe('financial payout service', () => {
     expect(repository.persist).not.toHaveBeenCalled();
   });
 
+  it('rejects a payout-filter page whose settlement currency differs from the payout', async () => {
+    const gateway = {
+      retrievePayout: vi.fn(async () => payoutSnapshotFixture({
+        balanceTransactionId: null,
+        currency: 'USD'
+      })),
+      listBalanceTransactionsForPayout: vi.fn(async () => ({
+        data: [
+          balanceTransactionSnapshotFixture({ id: 'txn_test_payout_page_usd_401' }),
+          balanceTransactionSnapshotFixture({
+            id: 'txn_test_payout_page_eur_401',
+            currency: 'EUR',
+            feeDetails: [
+              { ordinal: 0, rawType: 'stripe_fee', amountMinor: 71, currency: 'EUR' }
+            ]
+          })
+        ],
+        hasMore: false,
+        nextStartingAfter: null
+      }))
+    } as unknown as StripeCommerceGateway;
+
+    await expect(reconcileFinancialPayout({ database: {} as Database, gateway }, {
+      payload: eventPayload(),
+      correlationId: 'payout-service-page-currency',
+      signal: new AbortController().signal
+    })).rejects.toMatchObject({
+      name: 'PermanentFinancialError',
+      safeCode: 'currency_mismatch'
+    });
+    expect(ledger.stage).not.toHaveBeenCalled();
+    expect(repository.persist).not.toHaveBeenCalled();
+    expect(repository.publish).not.toHaveBeenCalled();
+  });
+
   it('rejects a stale continuation identity before requesting another page', async () => {
     const gateway = {
       retrievePayout: vi.fn(async () => payoutSnapshotFixture({ balanceTransactionId: null })),

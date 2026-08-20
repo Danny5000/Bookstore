@@ -68,8 +68,14 @@ $env:APP_IMAGE = 'registry.example.com/pale-orbit@sha256:<immutable-digest>'
 $env:ORIGIN = 'https://books.example.com'
 $env:SITE_ADDRESS = 'books.example.com'
 $env:DATABASE_NAME = 'pale_orbit'
-$env:DATABASE_USER = 'pale_orbit'
+$env:DATABASE_OWNER_USER = 'pale_orbit_owner'
+$env:DATABASE_OWNER_PASSWORD = '<from-secret-manager>'
+$env:DATABASE_USER = 'pale_orbit_web'
 $env:DATABASE_PASSWORD = '<from-secret-manager>'
+$env:DATABASE_WORKER_USER = 'pale_orbit_worker'
+$env:DATABASE_WORKER_PASSWORD = '<from-secret-manager>'
+$env:DATABASE_STORAGE_CLEANUP_USER = 'pale_orbit_storage_cleanup_login'
+$env:DATABASE_STORAGE_CLEANUP_PASSWORD = '<from-secret-manager>'
 $env:AUTH_SECRET = '<generated-auth-secret>'
 $env:SMTP_HOST = 'smtp.example.com'
 $env:SMTP_PORT = '587'
@@ -89,14 +95,21 @@ Validate the exported values, migrate, bootstrap once, and then start the long-r
 
 ```powershell
 docker compose --file compose.prod.yaml config --quiet
+docker compose --file compose.prod.yaml --profile tools stop app worker storage-cleanup
 docker compose --file compose.prod.yaml --profile tools run --rm migrate
+docker compose --file compose.prod.yaml --profile tools run --rm database-role-provision
+docker compose --file compose.prod.yaml --profile tools run --rm storage-cleanup
 docker compose --file compose.prod.yaml --profile tools run --rm bootstrap-admin
 docker compose --file compose.prod.yaml up --detach --wait
 ```
 
-Use `SMTP_SECURE=true` with `SMTP_REQUIRE_TLS=false` for implicit TLS, normally on port 465. For submission using STARTTLS, set `SMTP_SECURE=false` and `SMTP_REQUIRE_TLS=true`, normally on port 587. Production requires `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, and `SMTP_FROM`; connection, greeting, and socket timeouts have documented Compose defaults.
+The migration must install the cleanup capability before role provisioning binds its dedicated login. When upgrading a release whose cleanup command used the web credential, supply a fresh `DATABASE_PASSWORD` to the provisioning run, keep all old cleanup processes stopped, and deploy that rotated web secret only after provisioning and the dedicated cleanup dry-run succeed. This invalidates the web credential held by any retired cleanup process.
+
+Use `SMTP_SECURE=true` with `SMTP_REQUIRE_TLS=false` for implicit TLS, normally on port 465. For submission using STARTTLS, set `SMTP_SECURE=false` and `SMTP_REQUIRE_TLS=true`, normally on port 587. Production requires `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, and `SMTP_FROM`; connection, greeting, and socket timeouts have documented Compose defaults. Only the worker loads `SMTP_USER` and `SMTP_PASSWORD` or mounts the SMTP password secret, because only the worker sends messages. The web process retains non-secret delivery policy needed by shared request validation but cannot authenticate to SMTP; migration and bootstrap receive no SMTP or auth secret.
 
 The public `ORIGIN` must be the exact HTTPS origin served by Caddy. Better Auth accepts only trusted-origin requests, uses HTTP-only database-backed session cookies, and enables secure cookies in production. Session and verification lifetimes and PostgreSQL-backed endpoint rate limits are controlled by the `AUTH_*_SECONDS` and `AUTH_*_RATE_LIMIT_*` settings. Changing the auth secret invalidates signed state and should be treated as a coordinated credential rotation.
+
+Native verification, reset, and magic-link action URLs carry one-use bearer tokens in their request targets: reset places its token in the URL path, while verification and magic-link actions use query strings. Caddy's default runtime logger filters `request>uri` by deleting it, and Caddy access logging remains disabled so the edge does not retain those URLs. Access logs must not be enabled without an equivalent URI filter that deletes `request>uri` or replaces it with `REDACTED`; application-side no-secret logging rules remain required as defense in depth.
 
 Production remains in maintenance mode after Plan 6A. Catalog, storage, commerce, guest claims, customer libraries, full entitled reading, and original downloads are durable; Plan 6B financial reporting and the Plan 7 launch gate remain prerequisites before storefront activation is considered.
 

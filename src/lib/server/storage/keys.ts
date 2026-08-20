@@ -2,6 +2,8 @@ declare const storageKeyBrand: unique symbol;
 
 export type StorageKey = string & { readonly [storageKeyBrand]: true };
 
+export const publicationReadinessSentinelValue = 'pale-orbit-publication-ready-v1';
+
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
 export class StorageKeyError extends Error {
@@ -14,6 +16,13 @@ export class StorageKeyError extends Error {
 function requireUuid(value: string): string {
   if (!uuidPattern.test(value)) throw new StorageKeyError();
   return value;
+}
+
+function requireGeneration(value: number): string {
+  if (!Number.isInteger(value) || value < 0 || value > 2_147_483_647) {
+    throw new StorageKeyError();
+  }
+  return String(value);
 }
 
 function containsControlCharacter(value: string): boolean {
@@ -70,33 +79,46 @@ export function revisionDerivedPrefix(titleId: string, revisionId: string): Stor
   );
 }
 
+export function revisionGenerationDerivedPrefix(
+  titleId: string,
+  revisionId: string,
+  generation: number
+): StorageKey {
+  return parseStorageKey(
+    `${revisionDerivedPrefix(titleId, revisionId)}/generations/${requireGeneration(generation)}`
+  );
+}
+
 export function revisionProseImageKey(
   titleId: string,
   revisionId: string,
+  generation: number,
   imageId: string
 ): StorageKey {
   return parseStorageKey(
-    `${revisionDerivedPrefix(titleId, revisionId)}/prose-images/${requireUuid(imageId)}.webp`
+    `${revisionGenerationDerivedPrefix(titleId, revisionId, generation)}/prose-images/${requireUuid(imageId)}.webp`
   );
 }
 
 export function revisionComicPageKey(
   titleId: string,
   revisionId: string,
+  generation: number,
   pageId: string
 ): StorageKey {
   return parseStorageKey(
-    `${revisionDerivedPrefix(titleId, revisionId)}/comic-pages/${requireUuid(pageId)}.webp`
+    `${revisionGenerationDerivedPrefix(titleId, revisionId, generation)}/comic-pages/${requireUuid(pageId)}.webp`
   );
 }
 
 export function revisionCoverSuggestionKey(
   titleId: string,
   revisionId: string,
+  generation: number,
   suggestionId: string
 ): StorageKey {
   return parseStorageKey(
-    `${revisionDerivedPrefix(titleId, revisionId)}/cover-suggestions/${requireUuid(suggestionId)}.webp`
+    `${revisionGenerationDerivedPrefix(titleId, revisionId, generation)}/cover-suggestions/${requireUuid(suggestionId)}.webp`
   );
 }
 
@@ -114,4 +136,8 @@ export function healthProbesPrefix(): StorageKey {
 
 export function healthProbeKey(probeId: string): StorageKey {
   return parseStorageKey(`${healthProbesPrefix()}/${requireUuid(probeId)}`);
+}
+
+export function publicationReadinessSentinelKey(): StorageKey {
+  return parseStorageKey('health/publication/readiness-v1');
 }

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { count, eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import type { Actor } from '$lib/server/auth/admin-policy';
-import { createCommerceClaimAuthorization } from '$lib/server/auth/commerce-claim-authorization';
+import { createCommerceClaimAuthorization } from './commerce-claim-capability';
 import { findOrCreateGuestIdentity } from '$lib/server/auth/identity';
 import { claimGuestPurchases } from '$lib/server/commerce/claims';
 import {
@@ -12,7 +12,10 @@ import {
   PermanentCommerceError
 } from '$lib/server/commerce/errors';
 import { attachCheckoutSession, createAcceptedOrder } from '$lib/server/commerce/orders';
-import { quoteCart } from '$lib/server/commerce/quote';
+import {
+  checkoutProviderStartDeadline,
+  quoteCart
+} from '$lib/server/commerce/quote';
 import { setPreservedGrantState } from '$lib/server/commerce/grants';
 import { matchesOrderStatusToken } from '$lib/server/commerce/status-cookie';
 import { getAuthorizedOrderStatus } from '$lib/server/commerce/status';
@@ -30,7 +33,7 @@ import {
   titles,
   user
 } from '$lib/server/db/schema';
-import { databaseClient } from './database';
+import { databaseClient, ownerDatabaseClient, workerDatabaseClient } from './database';
 
 async function createCustomer(label: string): Promise<Extract<Actor, { type: 'user' }>> {
   const id = randomUUID();
@@ -44,7 +47,7 @@ async function createCustomer(label: string): Promise<Extract<Actor, { type: 'us
 }
 
 async function createOrderTitle(label: string, priceMinor = 1000) {
-  const [title] = await databaseClient.db.insert(titles).values({
+  const [title] = await ownerDatabaseClient.db.insert(titles).values({
     slug: `order-${randomUUID()}`,
     title: label,
     description: `${label} description`,
@@ -55,21 +58,21 @@ async function createOrderTitle(label: string, priceMinor = 1000) {
     visibility: 'public'
   }).returning();
   if (!title) throw new Error('Expected title');
-  const [revision] = await databaseClient.db.insert(titleRevisions).values({
+  const [revision] = await ownerDatabaseClient.db.insert(titleRevisions).values({
     titleId: title.id,
     state: 'active',
     createdByActorId: 'system:test',
     changeSummary: 'Order fixture'
   }).returning();
   if (!revision) throw new Error('Expected revision');
-  const [section] = await databaseClient.db.insert(proseSections).values({
+  const [section] = await ownerDatabaseClient.db.insert(proseSections).values({
     revisionId: revision.id,
     ordinal: 0,
     label: 'Chapter',
     sourceReference: 'EPUB/chapter.xhtml'
   }).returning();
   if (!section) throw new Error('Expected section');
-  const [block] = await databaseClient.db.insert(proseBlocks).values({
+  const [block] = await ownerDatabaseClient.db.insert(proseBlocks).values({
     revisionId: revision.id,
     sectionId: section.id,
     ordinal: 0,
@@ -78,24 +81,24 @@ async function createOrderTitle(label: string, priceMinor = 1000) {
     imageId: null
   }).returning();
   if (!block) throw new Error('Expected block');
-  await databaseClient.db.insert(revisionPresentations).values({
+  await ownerDatabaseClient.db.insert(revisionPresentations).values({
     revisionId: revision.id,
     state: 'published',
     previewProseSectionId: section.id,
     previewProseBlockId: block.id,
     previewComicPageId: null
   });
-  await databaseClient.db.update(titles)
+  await ownerDatabaseClient.db.update(titles)
     .set({ activeRevisionId: revision.id })
     .where(eq(titles.id, title.id));
   return title;
 }
 
 async function createPaidGuestPurchase(email: string, titleId: string): Promise<void> {
-  const identity = await findOrCreateGuestIdentity(databaseClient.db, email);
+  const identity = await findOrCreateGuestIdentity(workerDatabaseClient.db, email);
   const orderId = randomUUID();
   const itemId = randomUUID();
-  await databaseClient.db.insert(orders).values({
+  await ownerDatabaseClient.db.insert(orders).values({
     id: orderId,
     status: 'paid',
     initiatingUserId: null,
@@ -112,7 +115,7 @@ async function createPaidGuestPurchase(email: string, titleId: string): Promise<
     checkoutExpiresAt: new Date('2026-08-10T12:30:00.000Z'),
     paidAt: new Date('2026-08-10T12:05:00.000Z')
   });
-  await databaseClient.db.insert(orderItems).values({
+  await ownerDatabaseClient.db.insert(orderItems).values({
     id: itemId,
     orderId,
     titleId,
@@ -125,7 +128,7 @@ async function createPaidGuestPurchase(email: string, titleId: string): Promise<
     totalMinor: 1000,
     stripeLineItemId: `li_test_${itemId}`
   });
-  await databaseClient.db.insert(payments).values({
+  await ownerDatabaseClient.db.insert(payments).values({
     orderId,
     stripePaymentIntentId: `pi_test_${orderId}`,
     stripeLatestChargeId: `ch_test_${orderId}`,
@@ -135,7 +138,7 @@ async function createPaidGuestPurchase(email: string, titleId: string): Promise<
     paymentMethodCategory: 'card',
     paidAt: new Date('2026-08-10T12:05:00.000Z')
   });
-  await databaseClient.db.insert(entitlementGrants).values({
+  await ownerDatabaseClient.db.insert(entitlementGrants).values({
     titleId,
     userId: null,
     source: 'purchase',
@@ -236,7 +239,8 @@ describe('durable accepted commerce orders', () => {
     const title = await createOrderTitle('Changing Order Title');
     const quote = await quoteCart(databaseClient.db, { type: 'anonymous' }, [title.id]);
     const staleInput = orderInput({ type: 'anonymous' }, [title.id], quote.fingerprint);
-    await databaseClient.db.update(titles).set({ priceMinor: 1500 }).where(eq(titles.id, title.id));
+    await ownerDatabaseClient.db.update(titles).set({ priceMinor: 1500 })
+      .where(eq(titles.id, title.id));
 
     const before = await databaseClient.db.select({ value: count() }).from(orders);
     const staleError = await createAcceptedOrder(databaseClient.db, staleInput)
@@ -258,7 +262,8 @@ describe('durable accepted commerce orders', () => {
     const title = await createOrderTitle('Throttled Stale Order Title');
     const actor: Actor = { type: 'anonymous' };
     const quote = await quoteCart(databaseClient.db, actor, [title.id]);
-    await databaseClient.db.update(titles).set({ priceMinor: 1700 }).where(eq(titles.id, title.id));
+    await ownerDatabaseClient.db.update(titles).set({ priceMinor: 1700 })
+      .where(eq(titles.id, title.id));
     const common = {
       requestIp: '203.0.113.249',
       rateLimit: { windowSeconds: 60, maxAttempts: 1 },
@@ -348,14 +353,13 @@ describe('durable accepted commerce orders', () => {
   it('resumes its own pending attempt and never releases ambiguous states on elapsed local time', async () => {
     const customer = await createCustomer('Reservation Lifetime Customer');
     const title = await createOrderTitle('Reservation Lifetime Title');
-    const createdAt = new Date('2026-08-10T12:00:00.000Z');
     const checkoutAttemptId = randomUUID();
     const quote = await quoteCart(databaseClient.db, customer, [title.id], checkoutAttemptId);
     const input = orderInput(customer, [title.id], quote.fingerprint, {
-      checkoutAttemptId,
-      now: createdAt
+      checkoutAttemptId
     });
     const accepted = await createAcceptedOrder(databaseClient.db, input);
+    const createdAt = accepted.order.createdAt;
 
     await expect(quoteCart(
       databaseClient.db,
@@ -368,7 +372,7 @@ describe('durable accepted commerce orders', () => {
       reservedTitleIds: []
     });
 
-    const atProviderDeadline = new Date(createdAt.getTime() + 30_000);
+    const atProviderDeadline = checkoutProviderStartDeadline(createdAt);
     await expect(createAcceptedOrder(databaseClient.db, {
       ...input,
       now: atProviderDeadline
@@ -384,7 +388,7 @@ describe('durable accepted commerce orders', () => {
       reservedTitleIds: []
     });
 
-    const afterPendingDeadline = new Date(createdAt.getTime() + 30_001);
+    const afterPendingDeadline = new Date(atProviderDeadline.getTime() + 1);
     await expect(createAcceptedOrder(databaseClient.db, {
       ...input,
       now: afterPendingDeadline
@@ -416,7 +420,7 @@ describe('durable accepted commerce orders', () => {
       items: [{ titleId: title.id }],
       reservedTitleIds: []
     });
-    await databaseClient.db.update(orders).set({ status: 'payment_pending' })
+    await ownerDatabaseClient.db.update(orders).set({ status: 'payment_pending' })
       .where(eq(orders.id, accepted.order.id));
     await expect(quoteCart(
       databaseClient.db,
@@ -432,7 +436,8 @@ describe('durable accepted commerce orders', () => {
     for (const status of [
       'checkout_pending', 'checkout_open', 'payment_pending', 'failed', 'exception'
     ] as const) {
-      await databaseClient.db.update(orders).set({ status }).where(eq(orders.id, accepted.order.id));
+      await ownerDatabaseClient.db.update(orders).set({ status })
+        .where(eq(orders.id, accepted.order.id));
       await expect(quoteCart(
         databaseClient.db,
         customer,
@@ -482,7 +487,7 @@ describe('durable accepted commerce orders', () => {
       reused: true,
       order: { id: first.order.id }
     });
-    await databaseClient.db.update(orders).set({ status: 'expired' })
+    await ownerDatabaseClient.db.update(orders).set({ status: 'expired' })
       .where(eq(orders.id, reservation.order.id));
     await expect(createAcceptedOrder(databaseClient.db, partialInput)).rejects.toMatchObject({
       code: 'CHECKOUT_ATTEMPT_CONFLICT'
@@ -496,7 +501,7 @@ describe('durable accepted commerce orders', () => {
     const quote = await quoteCart(databaseClient.db, customer, [title.id], checkoutAttemptId);
     const input = orderInput(customer, [title.id], quote.fingerprint, { checkoutAttemptId });
     await createAcceptedOrder(databaseClient.db, input);
-    await databaseClient.db.transaction((transaction) => setPreservedGrantState(transaction, {
+    await workerDatabaseClient.db.transaction((transaction) => setPreservedGrantState(transaction, {
       userId: customer.id,
       titleId: title.id,
       active: true,
@@ -555,7 +560,7 @@ describe('durable accepted commerce orders', () => {
     const quote = await quoteCart(databaseClient.db, actor, [title.id]);
     const input = orderInput(actor, [title.id], quote.fingerprint);
     const accepted = await createAcceptedOrder(databaseClient.db, input);
-    await databaseClient.db
+    await ownerDatabaseClient.db
       .update(orders)
       .set({ status: 'expired', updatedAt: new Date() })
       .where(eq(orders.id, accepted.order.id));
@@ -661,7 +666,8 @@ describe('durable accepted commerce orders', () => {
         now: new Date('2026-08-10T12:00:00.000Z')
       })
     );
-    const expiresAt = new Date('2026-08-10T12:31:00.000Z');
+    const responseAt = new Date(Math.max(Date.now(), accepted.order.createdAt.getTime()));
+    const expiresAt = new Date(responseAt.getTime() - 1);
 
     await expect(attachCheckoutSession(databaseClient.db, {
       orderId: accepted.order.id,
@@ -669,7 +675,7 @@ describe('durable accepted commerce orders', () => {
       checkoutExpiresAt: expiresAt,
       actor,
       correlationId: `attach-${randomUUID()}`,
-      now: new Date('2026-08-10T12:31:01.000Z')
+      now: responseAt
     })).rejects.toBeInstanceOf(PermanentCommerceError);
 
     await expect(databaseClient.db.select().from(orders)
@@ -694,7 +700,7 @@ describe('durable accepted commerce orders', () => {
     );
     const providerSessionId = 'cs_test_webhook_before_attach_101';
     const checkoutExpiresAt = new Date(accepted.order.createdAt.getTime() + 1_860_000);
-    await databaseClient.db.update(orders).set({
+    await ownerDatabaseClient.db.update(orders).set({
       status: terminalStatus,
       stripeCheckoutSessionId: providerSessionId,
       checkoutExpiresAt,

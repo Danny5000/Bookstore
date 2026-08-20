@@ -22,7 +22,10 @@ const VALID_DEVELOPMENT_ENVIRONMENT: EnvironmentValues = {
   WORKER_READY_FILE: '.worker-ready',
   WORKER_CONCURRENCY: '1',
   STORAGE_PROVIDER: 'local',
-  STORAGE_LOCAL_ROOT: '.data/storage',
+  STORAGE_STAGING_ROOT: '.data/storage-staging',
+  STORAGE_PUBLICATION_ROOT: '.data/storage-publication',
+  STORAGE_COVERS_ROOT: '.data/storage-covers',
+  STORAGE_SCRATCH_ROOT: 'C:\\Temp\\pale-orbit-storage-scratch',
   UPLOAD_MAX_BYTES: '536870912',
   INGEST_MAX_EXPANDED_BYTES: '2147483648',
   INGEST_MAX_ENTRIES: '10000',
@@ -86,7 +89,10 @@ describe('loadApplicationConfig', () => {
       },
       storage: {
         provider: 'local',
-        localRoot: '.data/storage',
+        stagingRoot: '.data/storage-staging',
+        publicationRoot: '.data/storage-publication',
+        coversRoot: '.data/storage-covers',
+        scratchRoot: 'C:\\Temp\\pale-orbit-storage-scratch',
         stagingRetentionHours: 24,
         orphanRetentionHours: 168
       },
@@ -162,7 +168,10 @@ describe('loadApplicationConfig', () => {
     });
     expect(config.storage).toEqual({
       provider: 'local',
-      localRoot: '.data/storage',
+      stagingRoot: '.data/storage-staging',
+      publicationRoot: '.data/storage-publication',
+      coversRoot: '.data/storage-covers',
+      scratchRoot: 'C:\\Temp\\pale-orbit-storage-scratch',
       stagingRetentionHours: 24,
       orphanRetentionHours: 168
     });
@@ -174,6 +183,19 @@ describe('loadApplicationConfig', () => {
       maxImagePixels: 100000000,
       maxCompressionRatio: 200,
       timeoutMs: 900000
+    });
+  });
+
+  it('accepts claim email lifetimes only through the database capability ceiling', () => {
+    const config = loadApplicationConfig({
+      ...VALID_DEVELOPMENT_ENVIRONMENT,
+      AUTH_RESET_EXPIRES_SECONDS: '86400',
+      AUTH_MAGIC_EXPIRES_SECONDS: '86400'
+    });
+
+    expect(config.auth).toMatchObject({
+      resetExpiresIn: 86_400,
+      magicExpiresIn: 86_400
     });
   });
 
@@ -336,7 +358,9 @@ describe('loadApplicationConfig', () => {
     ['WORKER_CONCURRENCY', '17'],
     ['UPLOAD_MAX_BYTES', '0'],
     ['INGEST_MAX_ENTRIES', '100001'],
-    ['INGEST_MAX_COMPRESSION_RATIO', '0']
+    ['INGEST_MAX_COMPRESSION_RATIO', '0'],
+    ['AUTH_RESET_EXPIRES_SECONDS', '86401'],
+    ['AUTH_MAGIC_EXPIRES_SECONDS', '86401']
   ])('rejects invalid operational setting %s=%s', (key, value) => {
     expect(() =>
       loadApplicationConfig({ ...VALID_DEVELOPMENT_ENVIRONMENT, [key]: value })
@@ -378,21 +402,27 @@ describe('loadApplicationConfig', () => {
     ).toThrow(/STORAGE_ORPHAN_RETENTION_HOURS: must be at least STORAGE_STAGING_RETENTION_HOURS/);
   });
 
-  it('requires a local root only for local storage', () => {
-    const withoutLocalRoot: EnvironmentValues = {
+  it('requires all persistent roots only for local storage', () => {
+    const withoutLocalRoots: EnvironmentValues = {
       ...VALID_DEVELOPMENT_ENVIRONMENT,
-      STORAGE_LOCAL_ROOT: undefined
+      STORAGE_STAGING_ROOT: undefined,
+      STORAGE_PUBLICATION_ROOT: undefined,
+      STORAGE_COVERS_ROOT: undefined,
+      STORAGE_SCRATCH_ROOT: undefined
     };
 
-    expect(() => loadApplicationConfig(withoutLocalRoot)).toThrow(
-      /STORAGE_LOCAL_ROOT: is required for local storage/
+    expect(() => loadApplicationConfig(withoutLocalRoots)).toThrow(
+      /STORAGE_STAGING_ROOT: is required for local storage/
     );
 
     expect(
-      loadApplicationConfig({ ...withoutLocalRoot, STORAGE_PROVIDER: 's3' }).storage
+      loadApplicationConfig({ ...withoutLocalRoots, STORAGE_PROVIDER: 's3' }).storage
     ).toEqual({
       provider: 's3',
-      localRoot: undefined,
+      stagingRoot: undefined,
+      publicationRoot: undefined,
+      coversRoot: undefined,
+      scratchRoot: undefined,
       stagingRetentionHours: 24,
       orphanRetentionHours: 168
     });
@@ -412,7 +442,7 @@ describe('loadApplicationConfig', () => {
         SMTP_USER: 'mailer',
         SMTP_PASSWORD: 'smtp-secret'
       })
-    ).toThrow(/STORAGE_LOCAL_ROOT: must be absolute in production/);
+    ).toThrow(/STORAGE_STAGING_ROOT: must be absolute/);
   });
 
   it('loads the database password from a production secret file', () => {
@@ -424,7 +454,10 @@ describe('loadApplicationConfig', () => {
       DATABASE_HOST: 'postgres',
       DATABASE_PASSWORD: undefined,
       DATABASE_PASSWORD_FILE: '/run/secrets/database_password',
-      STORAGE_LOCAL_ROOT: 'C:\\pale-orbit-storage',
+      STORAGE_STAGING_ROOT: 'C:\\pale-orbit-storage-staging',
+      STORAGE_PUBLICATION_ROOT: 'C:\\pale-orbit-storage-publication',
+      STORAGE_COVERS_ROOT: 'C:\\pale-orbit-storage-covers',
+      STORAGE_SCRATCH_ROOT: 'C:\\Temp\\pale-orbit-storage-scratch',
       SMTP_USER: 'mailer',
       SMTP_PASSWORD: 'smtp-secret'
     };

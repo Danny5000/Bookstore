@@ -4,16 +4,16 @@ import {
   bootstrapFirstAdministrator
 } from '$lib/server/auth/bootstrap-admin';
 import { loadBootstrapAdminConfig } from '$lib/server/auth/bootstrap-config';
-import { loadApplicationConfig } from '$lib/server/config/load';
+import { loadDatabaseConfig } from '$lib/server/config/load';
 import { ConfigurationError } from '$lib/server/config/read-setting';
 import { createDatabaseClient, type DatabaseClient } from '$lib/server/db/client';
 
 let databaseClient: DatabaseClient | undefined;
 
 try {
-  const config = loadApplicationConfig(process.env);
+  const database = loadDatabaseConfig(process.env);
   const bootstrapConfig = loadBootstrapAdminConfig(process.env);
-  databaseClient = createDatabaseClient(config.database);
+  databaseClient = createDatabaseClient(database);
   const result = await bootstrapFirstAdministrator({
     database: databaseClient.db,
     ...bootstrapConfig,

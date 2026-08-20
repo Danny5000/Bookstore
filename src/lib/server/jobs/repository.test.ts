@@ -6,7 +6,13 @@ import {
   createFinancialPayoutContinuationJob,
   createFinancialSourceScanJob
 } from '$lib/server/commerce/financial/jobs';
-import { createPostgresJobRepository, enqueueActiveEntityJob } from './repository';
+import * as jobRepository from './repository';
+import {
+  createPostgresJobRepository,
+  enqueueActiveEntityJob,
+  enqueueJob,
+  jobInsertQuery
+} from './repository';
 
 const SOURCE_ID = '00000000-0000-4000-8000-000000001611';
 const NOW = new Date('2026-08-12T12:00:00.000Z');
@@ -79,6 +85,84 @@ function rendered(query: SQL): { sql: string; params: unknown[] } {
     escapeString: (value) => `'${value}'`
   });
 }
+
+describe('job enqueue insert authority', () => {
+  it('targets only the five runtime-granted columns and preserves defaults', async () => {
+    const query = rendered(jobInsertQuery({
+      type: 'commerce.email',
+      payload: { purpose: 'test' },
+      deduplicationKey: 'email:test:v1',
+      maxAttempts: 7
+    }));
+    const normalized = query.sql.replace(/\s+/gu, ' ').trim();
+    expect(normalized).toMatch(
+      /^insert into "public"\."jobs" \(\s*"type", "payload", "deduplication_key", "run_at", "max_attempts"\s*\) values /u
+    );
+    expect(normalized).toContain('on conflict ("deduplication_key") do nothing returning');
+    expect(normalized).toMatch(/returning "id"$/u);
+    expect(normalized).toContain('coalesce($4::timestamptz, pg_catalog.now())');
+    expect(normalized).not.toContain('pg_catalog.coalesce(');
+    expect(normalized.slice(0, normalized.indexOf(' values '))).not.toMatch(
+      /"(?:id|status|attempts|locked_at|locked_by|last_error|rerun_requested_at|completed_at|created_at|updated_at)"/u
+    );
+    expect(query.params).toEqual([
+      'commerce.email',
+      JSON.stringify({ purpose: 'test' }),
+      'email:test:v1',
+      null,
+      7
+    ]);
+
+    const inserted = jobRow({
+      type: 'commerce.email',
+      payload: { purpose: 'test' },
+      deduplicationKey: 'email:test:v1',
+      maxAttempts: 7
+    });
+    const execute = vi.fn(async () => ({ rows: [{ id: inserted.id }] }));
+    const select = vi.fn(() => ({
+      from: () => ({
+        where: () => ({ limit: async () => [inserted] })
+      })
+    }));
+    const result = await enqueueJob({ execute, select } as never, {
+      type: 'commerce.email',
+      payload: { purpose: 'test' },
+      deduplicationKey: 'email:test:v1',
+      maxAttempts: 7
+    });
+    expect(result).toEqual(inserted);
+    expect(result.createdAt).toBeInstanceOf(Date);
+    expect(execute).toHaveBeenCalledOnce();
+    expect(select).toHaveBeenCalledOnce();
+  });
+});
+
+describe('Stripe event job rearm authority', () => {
+  it('delegates one Stripe event id to the owner-defined database routine', async () => {
+    const calls: SQL[] = [];
+    const database = {
+      execute: vi.fn(async (query: SQL) => {
+        calls.push(query);
+        return { rows: [{ rearmed: true }] };
+      })
+    };
+    const rearm = (jobRepository as unknown as Record<string, unknown>)
+      .rearmPendingStripeEventJob;
+
+    expect(typeof rearm).toBe('function');
+    if (typeof rearm !== 'function') return;
+    await expect((rearm as (
+      database: unknown,
+      stripeEventId: string
+    ) => Promise<boolean>)(database, SOURCE_ID)).resolves.toBe(true);
+
+    expect(calls).toHaveLength(1);
+    const query = rendered(calls[0]!);
+    expect(query.sql).toContain('rearm_pending_stripe_event_job');
+    expect(query.params).toEqual([SOURCE_ID]);
+  });
+});
 
 describe('active entity jobs', () => {
   async function expectSafeInvalid(input: unknown): Promise<void> {

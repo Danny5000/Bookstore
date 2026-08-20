@@ -73,6 +73,9 @@ export const titles = pgTable(
   (table): PgTableExtraConfigValue[] => [
     uniqueIndex('titles_slug_unique').on(table.slug),
     index('titles_visibility_created_idx').on(table.visibility, table.createdAt),
+    index('titles_cover_storage_key_idx')
+      .on(table.coverStorageKey)
+      .where(sql`${table.coverStorageKey} is not null`),
     foreignKey({
       name: 'titles_active_revision_same_title_fk',
       columns: [table.id, table.activeRevisionId],
@@ -142,6 +145,12 @@ export const titleRevisions = pgTable(
   (table) => [
     index('title_revisions_title_created_idx').on(table.titleId, table.createdAt),
     index('title_revisions_state_created_idx').on(table.state, table.createdAt),
+    index('title_revisions_staging_storage_key_idx')
+      .on(table.stagingStorageKey)
+      .where(sql`${table.stagingStorageKey} is not null`),
+    index('title_revisions_original_storage_key_idx')
+      .on(table.originalStorageKey)
+      .where(sql`${table.originalStorageKey} is not null`),
     unique('title_revisions_title_id_id_unique').on(table.titleId, table.id),
     uniqueIndex('title_revisions_one_active_per_title')
       .on(table.titleId)

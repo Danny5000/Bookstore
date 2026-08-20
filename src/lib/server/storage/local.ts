@@ -1,6 +1,14 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { constants, createReadStream, createWriteStream, lstatSync, mkdirSync } from 'node:fs';
+import {
+  constants,
+  createReadStream,
+  createWriteStream,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync
+} from 'node:fs';
 import {
   copyFile,
   lstat,
@@ -11,6 +19,7 @@ import {
   unlink
 } from 'node:fs/promises';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
+import { tmpdir } from 'node:os';
 import { Transform, type Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { parseStorageKey, type StorageKey } from './keys';
@@ -22,11 +31,24 @@ import type {
 } from './types';
 
 const maximumListPageSize = 1_000;
+const defaultScratchRoot = mkdtempSync(
+  join(resolve(tmpdir()), `pale-orbit-local-storage-scratch-${process.pid}-`)
+);
+process.once('exit', () => {
+  rmSync(defaultScratchRoot, { recursive: true, force: true });
+});
 
 export class StorageLimitError extends Error {
   constructor() {
     super('Storage write exceeded the configured byte limit');
     this.name = 'StorageLimitError';
+  }
+}
+
+export class StorageIntegrityError extends Error {
+  constructor() {
+    super('Storage write did not match the expected byte count');
+    this.name = 'StorageIntegrityError';
   }
 }
 
@@ -55,11 +77,22 @@ function storedObjectStat(value: { size: number; mtime: Date }): StoredObjectSta
 class LocalObjectStorage implements ObjectStorage {
   readonly #root: string;
   readonly #rootPrefix: string;
+  readonly #scratchRoot: string;
 
-  constructor(configuredRoot: string) {
+  constructor(configuredRoot: string, configuredScratchRoot: string) {
     this.#root = resolve(configuredRoot);
+    this.#scratchRoot = resolve(configuredScratchRoot);
+    if (
+      this.#scratchRoot === this.#root ||
+      this.#scratchRoot.startsWith(`${this.#root}${sep}`) ||
+      this.#root.startsWith(`${this.#scratchRoot}${sep}`)
+    ) {
+      throw new StorageSymlinkError();
+    }
     mkdirSync(this.#root, { recursive: true });
+    mkdirSync(this.#scratchRoot, { recursive: true });
     if (lstatSync(this.#root).isSymbolicLink()) throw new StorageSymlinkError();
+    if (lstatSync(this.#scratchRoot).isSymbolicLink()) throw new StorageSymlinkError();
     this.#rootPrefix = `${this.#root}${sep}`;
   }
 
@@ -111,9 +144,17 @@ class LocalObjectStorage implements ObjectStorage {
   async write(
     key: StorageKey,
     body: Readable,
-    options: { maxBytes: number }
+    options: { maxBytes: number; expectedBytes?: number }
   ): Promise<StoredObjectStat> {
-    if (!Number.isSafeInteger(options.maxBytes) || options.maxBytes < 1) {
+    if (
+      !Number.isSafeInteger(options.maxBytes) ||
+      options.maxBytes < 0 ||
+      (options.expectedBytes !== undefined && (
+        !Number.isSafeInteger(options.expectedBytes) ||
+        options.expectedBytes < 0 ||
+        options.expectedBytes > options.maxBytes
+      ))
+    ) {
       throw new StorageLimitError();
     }
 
@@ -135,6 +176,9 @@ class LocalObjectStorage implements ObjectStorage {
       });
       const output = handle.createWriteStream({ autoClose: false });
       await pipeline(body, limiter, output);
+      if (options.expectedBytes !== undefined && byteSize !== options.expectedBytes) {
+        throw new StorageIntegrityError();
+      }
       await handle.sync();
       const outputClosed = once(output, 'close');
       output.destroy();
@@ -196,10 +240,8 @@ class LocalObjectStorage implements ObjectStorage {
     const object = await this.#regularFileStat(target);
     if (!object || object.byteSize !== expected.byteSize) return null;
 
-    const snapshotDirectory = join(this.#root, '.verified-downloads');
-    await this.#prepareDestination(snapshotDirectory);
-    await mkdir(snapshotDirectory, { recursive: true });
-    const snapshot = join(snapshotDirectory, randomUUID());
+    if (lstatSync(this.#scratchRoot).isSymbolicLink()) throw new StorageSymlinkError();
+    const snapshot = join(this.#scratchRoot, randomUUID());
     const digest = createHash('sha256');
     let byteSize = 0;
     const verifier = new Transform({
@@ -334,7 +376,7 @@ class LocalObjectStorage implements ObjectStorage {
 
     const walk = async (directory: string): Promise<void> => {
       const entries = (await readdir(directory, { withFileTypes: true })).sort((left, right) =>
-        left.name.localeCompare(right.name, 'en')
+        left.name < right.name ? -1 : left.name > right.name ? 1 : 0
       );
       for (const entry of entries) {
         if (objects.length > options.limit) return;
@@ -378,5 +420,12 @@ class LocalObjectStorage implements ObjectStorage {
 }
 
 export function createLocalObjectStorage(root: string): ObjectStorage {
-  return new LocalObjectStorage(root);
+  return new LocalObjectStorage(root, defaultScratchRoot);
+}
+
+export function createLocalObjectStorageWithScratch(
+  root: string,
+  scratchRoot: string
+): ObjectStorage {
+  return new LocalObjectStorage(root, scratchRoot);
 }

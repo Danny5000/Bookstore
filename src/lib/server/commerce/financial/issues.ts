@@ -41,18 +41,37 @@ export interface ResolveFinancialIssueInput extends FinancialIssueIdentity {
   readonly correlationId: string;
 }
 
-const RESOURCE_TYPES = new Set<FinancialIssueResourceType>([
-  'payment', 'refund', 'dispute', 'payout', 'payout_import_run', 'balance_transaction',
-  'fee_detail', 'allocation_set', 'correction_set', 'financial_classification',
-  'financial_scan_run'
-]);
-const SAFE_CODES = new Set<FinancialIssueCode>([
+const SOURCE_AND_SET_ISSUE_CODES = new Set<FinancialIssueCode>([
   'allocation_fork', 'allocation_incomplete', 'allocation_mismatch', 'classification_fork',
-  'correction_rebase_required', 'currency_mismatch', 'generation_exhausted', 'immutable_mismatch',
-  'missing_source', 'payout_incomplete', 'payout_membership_conflict',
-  'payout_reversal_incomplete', 'source_linkage_mismatch', 'unsupported_category'
+  'correction_rebase_required', 'currency_mismatch', 'immutable_mismatch', 'missing_source',
+  'source_linkage_mismatch', 'unsupported_category'
 ]);
-const IMPACTS = new Set<FinancialIssueImpact>(['pending', 'exception', 'informational']);
+const ISSUE_CODES_BY_RESOURCE: Readonly<Record<
+  FinancialIssueResourceType,
+  ReadonlySet<FinancialIssueCode>
+>> = {
+  payment: SOURCE_AND_SET_ISSUE_CODES,
+  refund: SOURCE_AND_SET_ISSUE_CODES,
+  dispute: SOURCE_AND_SET_ISSUE_CODES,
+  allocation_set: SOURCE_AND_SET_ISSUE_CODES,
+  payout: new Set([
+    'currency_mismatch', 'generation_exhausted', 'immutable_mismatch',
+    'payout_membership_conflict', 'payout_reversal_incomplete'
+  ]),
+  balance_transaction: new Set(['classification_fork', 'immutable_mismatch']),
+  financial_classification: new Set(['unsupported_category']),
+  payout_import_run: new Set(),
+  fee_detail: new Set(),
+  correction_set: new Set(),
+  financial_scan_run: new Set()
+};
+const RESOURCE_TYPES = new Set<FinancialIssueResourceType>(
+  Object.keys(ISSUE_CODES_BY_RESOURCE) as FinancialIssueResourceType[]
+);
+const PENDING_ISSUE_CODES = new Set<FinancialIssueCode>([
+  'allocation_incomplete',
+  'missing_source'
+]);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const MAX_OCCURRENCES = 2_147_483_647;
 
@@ -75,7 +94,8 @@ function assertIdentity(value: unknown): asserts value is FinancialIssueIdentity
   if (!hasExactKeys(value, ['resourceType', 'resourceId', 'safeCode']) ||
     !RESOURCE_TYPES.has(value.resourceType as FinancialIssueResourceType) ||
     !UUID_PATTERN.test(value.resourceId as string) ||
-    !SAFE_CODES.has(value.safeCode as FinancialIssueCode)) unsupportedEvidence();
+    !ISSUE_CODES_BY_RESOURCE[value.resourceType as FinancialIssueResourceType]
+      .has(value.safeCode as FinancialIssueCode)) unsupportedEvidence();
 }
 
 function assertActor(value: unknown): asserts value is FinancialIssueActor {
@@ -93,7 +113,10 @@ function assertActor(value: unknown): asserts value is FinancialIssueActor {
 function assertObserveInput(value: unknown): asserts value is ObserveFinancialIssueInput {
   if (!hasExactKeys(value, ['resourceType', 'resourceId', 'safeCode', 'impact', 'actor', 'correlationId'])) unsupportedEvidence();
   assertIdentity({ resourceType: value.resourceType, resourceId: value.resourceId, safeCode: value.safeCode });
-  if (!IMPACTS.has(value.impact as FinancialIssueImpact) || !validText(value.correlationId, 100)) unsupportedEvidence();
+  const expectedImpact: FinancialIssueImpact = PENDING_ISSUE_CODES.has(value.safeCode as FinancialIssueCode)
+    ? 'pending'
+    : 'exception';
+  if (value.impact !== expectedImpact || !validText(value.correlationId, 100)) unsupportedEvidence();
   assertActor(value.actor);
 }
 
@@ -102,7 +125,7 @@ function assertResolveInput(value: unknown): asserts value is ResolveFinancialIs
   assertIdentity({ resourceType: value.resourceType, resourceId: value.resourceId, safeCode: value.safeCode });
   if (!validText(value.correlationId, 100)) unsupportedEvidence();
   assertActor(value.actor);
-  if (value.actor.type === 'user' && !value.actor.roles.includes('admin')) unsupportedEvidence();
+  if (value.actor.type !== 'system') unsupportedEvidence();
   if (!hasExactKeys(value.proof, ['status', 'resourceType', 'resourceId', 'safeCode']) ||
     (value.proof.status !== 'resolved' && value.proof.status !== 'still_open')) unsupportedEvidence();
   assertIdentity({ resourceType: value.proof.resourceType, resourceId: value.proof.resourceId, safeCode: value.proof.safeCode });
@@ -213,14 +236,13 @@ export async function resolveFinancialIssueAfterRecompute(
   if (input.proof.status === 'still_open') return null;
   const current = await lockCurrentOpen(tx, input);
   if (!current) return null;
-  const resolvedByAdminId = input.actor.type === 'user' ? input.actor.id : null;
   const updated = await rows(tx, sql`
     select id, resource_type as "resourceType", resource_id as "resourceId", safe_code as "safeCode",
       state, impact, first_observed_at as "firstObservedAt", last_observed_at as "lastObservedAt",
       occurrence_count as "occurrenceCount", correlation_id as "correlationId",
       resolved_by_admin_id as "resolvedByAdminId", resolved_at as "resolvedAt"
-    from "public"."resolve_financial_reconciliation_issue"(
-      ${current.id}, ${resolvedByAdminId}, ${input.actor.type}, ${input.actor.id}, ${input.correlationId}
+    from "public"."resolve_financial_issue_after_worker_recompute"(
+      ${current.id}, ${input.correlationId}
     )
   `);
   if (!updated[0]) return null;

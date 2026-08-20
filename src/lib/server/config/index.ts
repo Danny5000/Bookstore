@@ -1,8 +1,13 @@
 import { env } from '$env/dynamic/private';
-import { loadApplicationConfig } from './load';
+import { loadWebApplicationConfig } from './load';
 import type { ApplicationConfig } from './schema';
 
-export { loadApplicationConfig } from './load';
+export {
+  loadApplicationConfig,
+  loadDatabaseConfig,
+  loadWebApplicationConfig,
+  loadWorkerApplicationConfig
+} from './load';
 export type {
   ApplicationConfig,
   ApplicationMode,
@@ -19,6 +24,6 @@ export type {
 let cachedConfiguration: ApplicationConfig | undefined;
 
 export function getApplicationConfig(): ApplicationConfig {
-  cachedConfiguration ??= loadApplicationConfig(env);
+  cachedConfiguration ??= loadWebApplicationConfig(env);
   return cachedConfiguration;
 }

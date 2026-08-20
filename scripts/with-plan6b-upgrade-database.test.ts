@@ -168,6 +168,20 @@ function partialStartupDocker(owned: OwnedRunManifest, state: FakeDockerState): 
 }
 
 describe('Plan 6B disposable upgrade database ownership', () => {
+  it('refuses a foreign exact-name volume before Compose can mount or mutate it', async () => {
+    const owned = { ...manifest(), containerId: '' };
+    const exactVolume = `${owned.project}_postgres-data`;
+    const docker: DockerCommandRuntime = {
+      run: vi.fn(() => { throw new Error('Docker mutation must not run'); }),
+      capture: vi.fn((args) => (
+        args[0] === 'volume' && args.includes(`name=${exactVolume}`) ? exactVolume : ''
+      ))
+    };
+
+    await expect(startOwnedDatabase(owned, docker)).rejects.toThrow(/exact-name|collid/iu);
+    expect(docker.run).not.toHaveBeenCalled();
+  });
+
   it('scrubs ambient Stripe secrets and forces provider execution off for child commands', async () => {
     const source = await readFile(
       new URL('./with-plan6b-upgrade-database.ts', import.meta.url),

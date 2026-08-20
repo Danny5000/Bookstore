@@ -6,6 +6,8 @@ Drizzle schema files under `src/lib/server/db/schema/` are the database model so
 
 The web process, migration command, worker, and storage-cleanup command each own a bounded node-postgres pool. The web process uses PostgreSQL for readiness. The worker claims durable jobs from PostgreSQL, dispatches transactional outbox messages, ingests revision sources from private object storage, reduces accepted `stripe_events`, prepares guest-claim email, and runs bounded financial source, payout, scan, and classification work. PostgreSQL owns the queue, durable cursors, version checkpoint, locks, financial issues, and immutable ledger history; Redis is not part of the current topology.
 
+Plan 6B financial relations are read-only to the web. The financial worker alone receives the exact `INSERT` and `UPDATE` privileges used by source, payout, scan, classification, allocation, correction, and issue publication; neither runtime role receives `DELETE`. The same boundary covers canonical `payments`, `refunds`, `refund_allocations`, and `disputes`. Webhook intake can append only the immutable provider-identity columns of `stripe_events`; database defaults create pending/unprocessed state and only the worker can update completion. New public tables receive SELECT-only default privileges for the web role, so adding a financial table requires an explicit reviewed worker grant rather than silently inheriting web writes.
+
 ## Local schema changes
 
 Start from an up-to-date branch and a developer-owned ignored `.env`:
@@ -27,11 +29,16 @@ If Drizzle generated unexpected destructive SQL, fix the TypeScript schema and r
 
 ## Host-run development
 
+The environment carries four pairwise-distinct credential pairs: `DATABASE_OWNER_USER`/`DATABASE_OWNER_PASSWORD` for PostgreSQL ownership and migrations, `DATABASE_USER`/`DATABASE_PASSWORD` for the web runtime and ordinary tools, `DATABASE_WORKER_USER`/`DATABASE_WORKER_PASSWORD` for the financial worker, and `DATABASE_STORAGE_CLEANUP_USER`/`DATABASE_STORAGE_CLEANUP_PASSWORD` for storage cleanup. Host-run development loads one developer-owned `.env` into each launched process, so it is a convenience workflow rather than a credential-isolation boundary; use development-only secrets. Production and fully containerized development provide the process boundary described below.
+
+For an existing pre-split development volume, move the current `DATABASE_USER` and `DATABASE_PASSWORD` values to `DATABASE_OWNER_USER` and `DATABASE_OWNER_PASSWORD`, then choose distinct new web, worker, and storage-cleanup credentials. If owner, web, and worker are already split, preserve them and add only the cleanup pair. Stop any host-run web, worker, and storage-cleanup processes before migration or role provisioning. Old cleanup code still uses the web login and must not race installation of its dedicated database capability.
+
 Start PostgreSQL and Mailpit, apply migrations, then run web and worker in separate terminals:
 
 ```powershell
 docker compose --env-file .env --file compose.dev.yaml up postgres mailpit --detach --wait
 npm run db:migrate
+npm run db:provision-roles
 npm run admin:bootstrap
 npm run dev
 ```
@@ -51,12 +58,16 @@ docker compose --env-file .env --file compose.dev.yaml down
 Run the explicit migration profile before long-running services:
 
 ```powershell
+docker compose --env-file .env --file compose.dev.yaml stop app worker storage-cleanup
 docker compose --env-file .env --file compose.dev.yaml --profile tools run --rm migrate
+docker compose --env-file .env --file compose.dev.yaml --profile tools run --rm database-role-provision
 docker compose --env-file .env --file compose.dev.yaml --profile tools run --rm bootstrap-admin
 docker compose --env-file .env --file compose.dev.yaml up --build --wait
 ```
 
 The web service is at `http://localhost:5173`; Mailpit is at `http://localhost:8025`. The worker has no published port. Its Compose health check requires a non-empty `/tmp/worker-ready` file written only after the initial database probe succeeds.
+
+The long-running app and worker receive only their own database credentials. Compose also mounts the deliberately empty [`deploy/container.env`](../deploy/container.env) over `/app/.env`, so the source-tree bind mount cannot expose the host `.env` to either process. Migration, role provisioning, bootstrap, and cleanup remain bounded one-shot services with only the credentials each command requires.
 
 ## Tests
 
@@ -79,15 +90,40 @@ npm run test:plan6b-upgrade
 
 ## Production deployment order
 
-Production configuration comes from the invoking process environment; no production `.env` file is used. With the new immutable `APP_IMAGE` available, run:
+Production configuration comes from the invoking process environment; no production `.env` file is used. When upgrading an existing PostgreSQL data volume created by the former single-login topology, set `DATABASE_OWNER_USER` to the existing database owner (and use its existing secret); you must not reuse that owner name for `DATABASE_USER`, `DATABASE_WORKER_USER`, or `DATABASE_STORAGE_CLEANUP_USER`. Choose three new login names and secrets for web, worker, and cleanup. An already-split owner/web/worker deployment preserves those pairs and adds the fourth cleanup pair. Role provisioning deliberately rejects a proposed runtime login that owns the database or public application objects, or that inherits unexpected roles, instead of silently weakening the boundary.
+
+With the new immutable `APP_IMAGE` available, first quiesce the old app, worker, and every host-run or containerized storage-cleanup process. This is mandatory for a persistent volume created by the former single-login topology: those processes can retain an old privileged credential or the web cleanup path and race migration or role provisioning.
 
 ```powershell
+docker compose --file compose.prod.yaml --profile tools stop app worker storage-cleanup
 docker compose --file compose.prod.yaml --profile tools run --rm migrate
+docker compose --file compose.prod.yaml --profile tools run --rm database-role-provision
+```
+
+Before cleanup, bootstrap, or startup, resolve the storage-layout gate. On the first rollout from the legacy `book_storage` volume, complete the [split-volume upgrade](storage-ingestion-and-publication.md#split-volume-upgrade) and retain its verified report:
+
+```powershell
+docker compose --file compose.prod.yaml --profile tools rm --force app worker storage-cleanup
+$env:STORAGE_MIGRATION_HELPER_IMAGE = 'registry.example.invalid/approved-storage-helper@sha256:<audited-digest>'
+npm run storage:migrate-volumes -- --project <exact-project> --report <restricted-absolute-report-path>
+```
+
+Skip that migration command for an already-split deployment only when its current three-volume layout and prior migration report were verified. A brand-new installation may also skip only after the exact legacy `book_storage` volume is verified absent and the freshly initialized database is verified to contain no storage-referencing application data; establish this before bootstrap, uploads, or publication. An empty new volume or a readiness sentinel is not migration evidence. You must not run `storage-cleanup`, bootstrap, or either long-running process until the legacy migration report succeeds or one of those two verified exceptions is established.
+
+Then provision/verify the sentinel through the cleanup dry-run and create the required current-v2 atomic checkpoint before bootstrap or startup. Use the exact [deployment checkpoint procedure](storage-ingestion-and-publication.md#current-atomic-split-volume-backup-and-restore); a failed capture keeps production stopped:
+
+```powershell
+docker compose --file compose.prod.yaml --profile tools run --rm storage-cleanup
+$env:STORAGE_BACKUP_HELPER_IMAGE = 'registry.example.invalid/pale-orbit@sha256:<audited-digest>'
+npm run deployment:checkpoint -- capture --project <exact-project> --root <empty-restricted-absolute-backup-directory> --context <approved-context> --engine-id <expected-engine-id> --backup-id <32-lowercase-hex-id>
+npm run deployment:checkpoint -- rehearse --root <exact-restricted-absolute-backup-directory> --context <approved-distinct-restore-context> --engine-id <expected-distinct-restore-engine-id> --backup-id <same-32-lowercase-hex-id>
 docker compose --file compose.prod.yaml --profile tools run --rm bootstrap-admin
 docker compose --file compose.prod.yaml up --detach --wait
 ```
 
-Do not start the new web or worker containers if migration exits nonzero. Re-running the same committed migration set is safe because Drizzle records applied migrations in `drizzle.__drizzle_migrations`. The administrator bootstrap is also idempotent and must use the bootstrap-only process secret documented in [authentication and email operations](authentication-and-email.md).
+For a rollout from the former web-backed cleanup command, give this provisioning run a fresh `DATABASE_PASSWORD`; successful provisioning rotates the web login and invalidates the credential retained by any retired cleanup process. After provisioning and the dedicated cleanup dry-run succeed, rotate the formerly shared owner password through the managed PostgreSQL control plane and update `database_owner_password` in the secret manager before starting the new containers. Keep the web, worker, and cleanup passwords pairwise distinct from it and from each other; each rotation is deployed through only its scoped secret.
+
+Do not start the new web or worker containers if migration exits nonzero. The resolver lockdown is committed before the remaining migrations, so a later migration failure is intentionally **forward-fix-only**: do not restart the old worker, inspect the migration/preflight diagnostic, correct the database condition, and rerun the same immutable image. Re-running the same committed migration set is safe because Drizzle records applied migrations in `drizzle.__drizzle_migrations`. The administrator bootstrap is also idempotent and must use the bootstrap-only process secret documented in [authentication and email operations](authentication-and-email.md).
 
 Check the deployment:
 

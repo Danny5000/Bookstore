@@ -80,6 +80,7 @@ function operations(trace: string[], failAt: string | null = null): FixtureProbe
     revalidatePorts: vi.fn(() => step('ports', undefined)),
     startDependencies: vi.fn(() => step('dependencies', undefined)),
     migrate: vi.fn(() => step('migrate', undefined)),
+    provisionRoles: vi.fn(() => step('provision', undefined)),
     seedPublishedTitles: vi.fn(() => step('seed', undefined)),
     startRuntime: vi.fn(() => step('runtime', undefined)),
     exerciseQuoteAndCheckout: vi.fn(() => step('checkout', undefined)),
@@ -102,7 +103,7 @@ describe('Plan 6B fixture runtime probe ownership', () => {
   it('renders a no-egress fixture runtime using the same unique image for app and worker', () => {
     const source = renderFixtureProbeOverride(manifest());
     expect(source).toContain('internal: true');
-    expect(source.match(/pale-orbit:plan6b-i-fixture-1234567890abcdef/gu)).toHaveLength(4);
+    expect(source.match(/pale-orbit:plan6b-i-fixture-1234567890abcdef/gu)).toHaveLength(5);
     expect(source).toContain('APP_ENV: test');
     expect(source).toContain('APPLICATION_MODE: prototype');
     expect(source).toContain('STRIPE_ENABLED: "false"');
@@ -110,7 +111,55 @@ describe('Plan 6B fixture runtime probe ownership', () => {
     expect(source).toContain('STRIPE_LIVE_MODE: "false"');
     expect(source).toContain('STRIPE_AUTOMATIC_TAX_ENABLED: "false"');
     expect(source).toContain('DATABASE_HOST: postgres');
-    expect(source).toContain('DATABASE_PASSWORD: pale_orbit_test_only');
+    expect(source).toContain('DATABASE_OWNER_USER: pale_orbit_test');
+    expect(source).toContain('DATABASE_OWNER_PASSWORD: plan6b_fixture_owner_password_0000000000');
+    expect(source).toContain('DATABASE_USER: pale_orbit_fixture_web');
+    expect(source).toContain('DATABASE_PASSWORD: plan6b_fixture_web_password_000000000000');
+    expect(source).toContain('DATABASE_WORKER_USER: pale_orbit_fixture_worker');
+    expect(source).toContain('DATABASE_WORKER_PASSWORD: plan6b_fixture_worker_password_0000000000');
+    expect(source).toContain(
+      'DATABASE_STORAGE_CLEANUP_USER: pale_orbit_fixture_storage_cleanup'
+    );
+    expect(source).toContain(
+      'DATABASE_STORAGE_CLEANUP_PASSWORD: plan6b_fixture_storage_cleanup_password_000000'
+    );
+    expect(source).toContain('database-role-provision:');
+    expect(source).toContain('command: [node, build/services/provision-database-roles.js]');
+    const app = source.slice(source.indexOf('  app:'), source.indexOf('  worker:'));
+    const worker = source.slice(source.indexOf('  worker:'), source.indexOf('  migrate:'));
+    const migrate = source.slice(
+      source.indexOf('  migrate:'),
+      source.indexOf('  database-role-provision:')
+    );
+    const provisionIndex = source.indexOf('  database-role-provision:');
+    const provision = source.slice(provisionIndex, source.indexOf('\nnetworks:', provisionIndex));
+    expect(app).toContain('DATABASE_USER: pale_orbit_fixture_web');
+    expect(app).toContain('DATABASE_PASSWORD: plan6b_fixture_web_password_000000000000');
+    expect(app).toContain('DATABASE_OWNER_USER: ""');
+    expect(app).toContain('DATABASE_WORKER_USER: ""');
+    expect(app).toContain('DATABASE_STORAGE_CLEANUP_USER: ""');
+    expect(app).toContain('DATABASE_STORAGE_CLEANUP_PASSWORD: ""');
+    expect(worker).toContain('DATABASE_WORKER_USER: pale_orbit_fixture_worker');
+    expect(worker).toContain('DATABASE_WORKER_PASSWORD: plan6b_fixture_worker_password_0000000000');
+    expect(worker).toContain('DATABASE_OWNER_USER: ""');
+    expect(worker).toContain('DATABASE_USER: ""');
+    expect(worker).toContain('DATABASE_STORAGE_CLEANUP_USER: ""');
+    expect(worker).toContain('DATABASE_STORAGE_CLEANUP_PASSWORD: ""');
+    expect(migrate).toContain('DATABASE_OWNER_USER: pale_orbit_test');
+    expect(migrate).toContain('DATABASE_OWNER_PASSWORD: plan6b_fixture_owner_password_0000000000');
+    expect(migrate).toContain('DATABASE_USER: ""');
+    expect(migrate).toContain('DATABASE_WORKER_USER: ""');
+    expect(migrate).toContain('DATABASE_STORAGE_CLEANUP_USER: ""');
+    expect(migrate).toContain('DATABASE_STORAGE_CLEANUP_PASSWORD: ""');
+    expect(provision).toContain('DATABASE_OWNER_USER: pale_orbit_test');
+    expect(provision).toContain('DATABASE_USER: pale_orbit_fixture_web');
+    expect(provision).toContain('DATABASE_WORKER_USER: pale_orbit_fixture_worker');
+    expect(provision).toContain(
+      'DATABASE_STORAGE_CLEANUP_USER: pale_orbit_fixture_storage_cleanup'
+    );
+    expect(provision).toContain(
+      'DATABASE_STORAGE_CLEANUP_PASSWORD: plan6b_fixture_storage_cleanup_password_000000'
+    );
     expect(source).toContain('AUTH_SECRET: plan6b-fixture-auth-secret-0000000000000000');
     expect(source).toContain('SMTP_HOST: mailpit');
     expect(source).toContain('SMTP_PORT: "1025"');
@@ -147,18 +196,20 @@ describe('Plan 6B fixture runtime probe ownership', () => {
     expect(source).toContain('stripe_attempts:\n    labels:');
   });
 
-  it('migrates, seeds, exercises the actual web path, inspects the worker, and cleans up', async () => {
+  it('migrates, provisions roles, seeds, exercises the actual web path, inspects the worker, and cleans up', async () => {
     const trace: string[] = [];
     await expect(executeFixtureRuntimeProbe(manifest(), lease(), operations(trace))).resolves.toEqual(
       safeEvidence()
     );
     expect(trace).toEqual([
-      'image', 'ports', 'dependencies', 'migrate', 'seed', 'runtime', 'checkout', 'inspect',
+      'image', 'ports', 'dependencies', 'migrate', 'provision', 'seed', 'runtime', 'checkout', 'inspect',
       'cleanup'
     ]);
   });
 
-  it.each(['image', 'ports', 'dependencies', 'migrate', 'seed', 'runtime', 'checkout', 'inspect'])(
+  it.each([
+    'image', 'ports', 'dependencies', 'migrate', 'provision', 'seed', 'runtime', 'checkout', 'inspect'
+  ])(
     'cleans the exact fixture run when %s fails',
     async (failAt) => {
       const trace: string[] = [];
@@ -496,6 +547,60 @@ describe('Plan 6B fixture runtime probe ownership', () => {
     expect(command.run).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['container', (owned: ReturnType<typeof manifest>) => `${owned.project}-postgres-1`],
+    ['network', (owned: ReturnType<typeof manifest>) => `${owned.project}_default`],
+    ['volume', (owned: ReturnType<typeof manifest>) => `${owned.project}_stripe_attempts`]
+  ] as const)('refuses a foreign exact-name %s before the first fixture mutation', async (
+    resource,
+    expectedName
+  ) => {
+    const owned = manifest();
+    const name = expectedName(owned);
+    const command: FixtureProbeCommandRuntime = {
+      run: vi.fn(async () => undefined),
+      capture: vi.fn(async (args) => ({
+        status: 0,
+        stdout: args[0] === (resource === 'container' ? 'ps' : resource) &&
+          args.includes(`name=${name}`) ? `${name}\n` : ''
+      }))
+    };
+    const docker = createFixtureProbeDockerOperations(owned, {
+      command,
+      environment: { PATH: 'safe-path' },
+      assertPortAvailable: vi.fn(async () => undefined),
+      postJson: vi.fn(),
+      wait: vi.fn(async () => undefined)
+    });
+
+    await expect(docker.acquireImage(owned, lease())).rejects.toThrow(/exact-name|collid/iu);
+    expect(command.run).not.toHaveBeenCalled();
+  });
+
+  it('rechecks exact-name collisions immediately before fixture Compose startup', async () => {
+    const owned = manifest();
+    const exactVolumeName = `${owned.project}_stripe_attempts`;
+    const command: FixtureProbeCommandRuntime = {
+      run: vi.fn(async () => undefined),
+      capture: vi.fn(async (args) => ({
+        status: 0,
+        stdout: args[0] === 'volume' && args.includes(`name=${exactVolumeName}`)
+          ? `${exactVolumeName}\n`
+          : ''
+      }))
+    };
+    const docker = createFixtureProbeDockerOperations(owned, {
+      command,
+      environment: { PATH: 'safe-path' },
+      assertPortAvailable: vi.fn(async () => undefined),
+      postJson: vi.fn(),
+      wait: vi.fn(async () => undefined)
+    });
+
+    await expect(docker.startDependencies(owned)).rejects.toThrow(/exact-name|collid/iu);
+    expect(command.run).not.toHaveBeenCalled();
+  });
+
   it('fails closed when Docker inventory cannot be captured before building', async () => {
     const command: FixtureProbeCommandRuntime = {
       run: vi.fn(async () => undefined),
@@ -792,6 +897,7 @@ describe('Plan 6B fixture runtime probe ownership', () => {
     await docker.revalidatePorts(owned);
     await docker.startDependencies(owned);
     await docker.migrate(owned);
+    await docker.provisionRoles(owned);
     await docker.seedPublishedTitles(owned);
     await docker.startRuntime(owned);
     await docker.exerciseQuoteAndCheckout(owned);
@@ -811,14 +917,17 @@ describe('Plan 6B fixture runtime probe ownership', () => {
     expect(calls[1]?.args).toEqual([
       ...compose, '--profile', 'tools', 'run', '--rm', 'migrate'
     ]);
-    expect(calls[2]?.args.slice(0, compose.length + 7)).toEqual([
+    expect(calls[2]?.args).toEqual([
+      ...compose, '--profile', 'tools', 'run', '--rm', 'database-role-provision'
+    ]);
+    expect(calls[3]?.args.slice(0, compose.length + 7)).toEqual([
       ...compose, 'exec', '-T', 'postgres', 'psql', '--username', 'pale_orbit_test',
       '--dbname'
     ]);
-    expect(calls[2]?.args.at(-1)).toContain('insert into titles');
-    expect(calls[2]?.args.at(-1)).toContain('insert into "user"');
-    expect(calls[2]?.args.at(-1)).toContain('insert into user_roles');
-    expect(calls[3]?.args).toEqual([
+    expect(calls[3]?.args.at(-1)).toContain('insert into titles');
+    expect(calls[3]?.args.at(-1)).toContain('insert into "user"');
+    expect(calls[3]?.args.at(-1)).toContain('insert into user_roles');
+    expect(calls[4]?.args).toEqual([
       ...compose, 'up', '--detach', '--wait', '--wait-timeout', '120', 'app', 'worker'
     ]);
     expect(postJson).toHaveBeenCalledTimes(2);
@@ -1178,7 +1287,7 @@ describe('Plan 6B fixture runtime probe ownership', () => {
     }
   });
 
-  it('fails cleanup when an exact-name volume remains without project labels', async () => {
+  it('refuses cleanup before Compose down when an exact-name volume has foreign labels', async () => {
     const owned = await createFixtureProbeManifest();
     const exactVolumeName = `${owned.project}_stripe_attempts`;
     let downCalled = false;
@@ -1187,12 +1296,13 @@ describe('Plan 6B fixture runtime probe ownership', () => {
         if (args[0] === 'compose' && args.includes('down')) downCalled = true;
       }),
       capture: vi.fn(async (args) => {
-        if (
-          downCalled &&
-          args[0] === 'volume' &&
-          args[1] === 'ls' &&
-          args.includes(`name=${exactVolumeName}`)
-        ) return { status: 0, stdout: `${exactVolumeName}\n` };
+        if (args[0] === 'volume' && args[1] === 'ls' &&
+          args.includes(`name=${exactVolumeName}`)) {
+          return { status: 0, stdout: `${exactVolumeName}\n` };
+        }
+        if (args[0] === 'volume' && args[1] === 'inspect') {
+          return { status: 0, stdout: JSON.stringify({}) };
+        }
         return { status: 0, stdout: '' };
       })
     };
@@ -1205,8 +1315,8 @@ describe('Plan 6B fixture runtime probe ownership', () => {
     });
 
     try {
-      await expect(docker.cleanup(owned, lease())).rejects.toThrow(/volume|cleanup/u);
-      expect(downCalled).toBe(true);
+      await expect(docker.cleanup(owned, lease())).rejects.toThrow(/foreign|volume|cleanup/u);
+      expect(downCalled).toBe(false);
       expect(await readFile(owned.manifestFile, 'utf8')).toContain(owned.project);
     } finally {
       await rm(owned.tempDirectory, { recursive: true, force: true });

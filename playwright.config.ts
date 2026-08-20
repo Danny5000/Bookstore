@@ -1,5 +1,12 @@
 import { defineConfig, devices } from '@playwright/test';
-import { withoutStripeProviderSecrets } from './scripts/test-environment';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  assertIsolatedTestDatabaseEnvironment,
+  withoutStripeProviderSecrets
+} from './scripts/test-environment';
+
+assertIsolatedTestDatabaseEnvironment(process.env);
 
 const inheritedEnvironment = Object.fromEntries(
   Object.entries(withoutStripeProviderSecrets(process.env)).filter(
@@ -53,7 +60,15 @@ export default defineConfig({
       WORKER_READY_FILE: process.env.WORKER_READY_FILE ?? '.worker-ready-test',
       WORKER_CONCURRENCY: process.env.WORKER_CONCURRENCY ?? '1',
       STORAGE_PROVIDER: process.env.STORAGE_PROVIDER ?? 'local',
-      STORAGE_LOCAL_ROOT: process.env.STORAGE_LOCAL_ROOT ?? '.data/test-e2e-storage',
+      STORAGE_STAGING_ROOT:
+        process.env.STORAGE_STAGING_ROOT ?? '.data/test-e2e-storage-staging',
+      STORAGE_PUBLICATION_ROOT:
+        process.env.STORAGE_PUBLICATION_ROOT ?? '.data/test-e2e-storage-publication',
+      STORAGE_COVERS_ROOT:
+        process.env.STORAGE_COVERS_ROOT ?? '.data/test-e2e-storage-covers',
+      STORAGE_SCRATCH_ROOT:
+        process.env.STORAGE_SCRATCH_ROOT ??
+        join(tmpdir(), `pale-orbit-e2e-storage-scratch-${process.pid}`),
       UPLOAD_MAX_BYTES: process.env.UPLOAD_MAX_BYTES ?? '1048576',
       INGEST_MAX_EXPANDED_BYTES: process.env.INGEST_MAX_EXPANDED_BYTES ?? '4194304',
       INGEST_MAX_ENTRIES: process.env.INGEST_MAX_ENTRIES ?? '1000',

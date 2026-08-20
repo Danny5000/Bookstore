@@ -1,5 +1,6 @@
 import { and, eq, isNull, sql } from 'drizzle-orm';
 import { AuthorizationError, type Actor } from '$lib/server/auth/admin-policy';
+import { lockEntitlementScopes } from '$lib/server/commerce/lock';
 import {
   entitlements,
   revisionPresentations,
@@ -53,6 +54,7 @@ export async function lockReaderTitle(
   await transaction.execute(
     sql`select pg_advisory_xact_lock(hashtextextended(${stateLockKey}, 0))`
   );
+  await lockEntitlementScopes(transaction, [{ userId: actor.id, titleId }]);
 
   await requirePersistedUser(transaction, actor.id);
   const [title] = await transaction
@@ -72,7 +74,6 @@ export async function lockReaderTitle(
         isNull(entitlements.revokedAt)
       )
     )
-    .for('update')
     .limit(1);
   if (!entitlement) throw new ReaderStateNotFoundError();
   const [publication] = await transaction

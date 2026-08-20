@@ -25,15 +25,14 @@ import type { IngestionLimits } from '$lib/server/ingestion/limits';
 import { PermanentJobError } from '$lib/server/jobs/runner';
 import type { JobRecord } from '$lib/server/jobs/types';
 import { parseStorageKey, stagingUploadKey } from '$lib/server/storage/keys';
-import { createLocalObjectStorage } from '$lib/server/storage/local';
+import { storage } from './storage';
 import type { ObjectStorage } from '$lib/server/storage/types';
 import { validComicFixture, validEpubFixture } from '../fixtures/publications';
-import { databaseClient } from './database';
+import { databaseClient, ownerDatabaseClient, workerDatabaseClient } from './database';
 
 const admin: Actor = { type: 'user', id: 'admin-1', roles: ['admin'] };
 const customer: Actor = { type: 'user', id: 'customer-1', roles: ['customer'] };
 const checksum = 'a'.repeat(64);
-const storage = createLocalObjectStorage(process.env.STORAGE_LOCAL_ROOT!);
 const ingestionLimits: IngestionLimits = {
   maxUploadBytes: 10 * 1024 * 1024,
   maxExpandedBytes: 50 * 1024 * 1024,
@@ -224,7 +223,7 @@ describe('revision upload acceptance', () => {
       const title = await createTitle('prose', `rollback-${table.replace('_', '-')}`);
       const functionName = `reject_plan4_${table}`;
       const triggerName = `reject_plan4_${table}_trigger`;
-      await databaseClient.pool.query(`
+      await ownerDatabaseClient.pool.query(`
         create function ${functionName}() returns trigger language plpgsql as $$
         begin raise exception 'forced ${table} failure'; end $$;
         create trigger ${triggerName} before insert on ${table}
@@ -240,8 +239,8 @@ describe('revision upload acceptance', () => {
           })
         ).rejects.toThrow();
       } finally {
-        await databaseClient.pool.query(`drop trigger ${triggerName} on ${table}`);
-        await databaseClient.pool.query(`drop function ${functionName}()`);
+        await ownerDatabaseClient.pool.query(`drop trigger ${triggerName} on ${table}`);
+        await ownerDatabaseClient.pool.query(`drop function ${functionName}()`);
       }
 
       const [revisionCount] = await databaseClient.db
@@ -270,7 +269,7 @@ describe('revision ingestion handler', () => {
     ['comic', validComicFixture(), 'book.cbz']
   ] as const)('ingests a valid %s candidate for review without publishing it', async (format, bytes, filename) => {
     const candidate = await stageAcceptedRevision(format, bytes, filename);
-    const handler = createRevisionIngestionHandler(databaseClient.db, storage, ingestionLimits);
+    const handler = createRevisionIngestionHandler(workerDatabaseClient.db, storage, ingestionLimits);
 
     await handler(candidate.job, new AbortController().signal);
 
@@ -356,8 +355,8 @@ describe('revision ingestion handler', () => {
 
   it('retries deterministically after a pre-commit database failure without duplicate rows', async () => {
     const candidate = await stageAcceptedRevision('comic', validComicFixture(), 'retry.cbz');
-    const handler = createRevisionIngestionHandler(databaseClient.db, storage, ingestionLimits);
-    await databaseClient.pool.query(`
+    const handler = createRevisionIngestionHandler(workerDatabaseClient.db, storage, ingestionLimits);
+    await ownerDatabaseClient.pool.query(`
       create function reject_plan4_ready_revision() returns trigger language plpgsql as $$
       begin
         if new.state = 'ready_for_review' then raise exception 'forced pre-commit failure'; end if;
@@ -369,8 +368,10 @@ describe('revision ingestion handler', () => {
     try {
       await expect(handler(candidate.job, new AbortController().signal)).rejects.toThrow();
     } finally {
-      await databaseClient.pool.query('drop trigger reject_plan4_ready_revision_trigger on title_revisions');
-      await databaseClient.pool.query('drop function reject_plan4_ready_revision()');
+      await ownerDatabaseClient.pool.query(
+        'drop trigger reject_plan4_ready_revision_trigger on title_revisions'
+      );
+      await ownerDatabaseClient.pool.query('drop function reject_plan4_ready_revision()');
     }
 
     expect(
@@ -407,7 +408,7 @@ describe('revision ingestion handler', () => {
 
   it('treats a stale generation as a successful no-op', async () => {
     const candidate = await stageAcceptedRevision('prose', validEpubFixture(), 'stale.epub');
-    const handler = createRevisionIngestionHandler(databaseClient.db, storage, ingestionLimits);
+    const handler = createRevisionIngestionHandler(workerDatabaseClient.db, storage, ingestionLimits);
 
     await handler(
       { ...candidate.job, payload: { revisionId: candidate.revision.id, generation: 1 } },
@@ -425,7 +426,7 @@ describe('revision ingestion handler', () => {
   it('marks a permanent validation error failed with only safe details', async () => {
     const bytes = Buffer.from('not an archive');
     const candidate = await stageAcceptedRevision('prose', bytes, 'broken.epub');
-    const handler = createRevisionIngestionHandler(databaseClient.db, storage, ingestionLimits);
+    const handler = createRevisionIngestionHandler(workerDatabaseClient.db, storage, ingestionLimits);
 
     await expect(handler(candidate.job, new AbortController().signal)).rejects.toBeInstanceOf(PermanentJobError);
     const [revision] = await databaseClient.db
@@ -444,7 +445,11 @@ describe('revision ingestion handler', () => {
   it('leaves a transient candidate processing before the final attempt and fails it on the final attempt', async () => {
     const first = await stageAcceptedRevision('comic', validComicFixture(), 'transient.cbz', 'transient-first');
     const final = await stageAcceptedRevision('comic', validComicFixture(), 'final.cbz', 'transient-final');
-    const handler = createRevisionIngestionHandler(databaseClient.db, storageFailingCopy(), ingestionLimits);
+    const handler = createRevisionIngestionHandler(
+      workerDatabaseClient.db,
+      storageFailingCopy(),
+      ingestionLimits
+    );
 
     await expect(handler(first.job, new AbortController().signal)).rejects.toThrow();
     await expect(

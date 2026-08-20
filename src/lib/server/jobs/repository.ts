@@ -1,4 +1,4 @@
-import { and, eq, gte, sql, type SQL } from 'drizzle-orm';
+import { and, eq, sql, type SQL } from 'drizzle-orm';
 import type { JobConfig } from '$lib/server/config/schema';
 import type { Database } from '$lib/server/db/client';
 import { jobs, type JsonObject, type JsonValue, type JobRow } from '$lib/server/db/schema';
@@ -291,19 +291,20 @@ export async function enqueueJob(
   database: DatabaseExecutor,
   input: EnqueueJobInput
 ): Promise<JobRow> {
-  const [inserted] = await database
-    .insert(jobs)
-    .values({
-      type: input.type,
-      payload: input.payload,
-      deduplicationKey: input.deduplicationKey ?? null,
-      runAt: input.runAt,
-      maxAttempts: input.maxAttempts ?? 5
-    })
-    .onConflictDoNothing({ target: jobs.deduplicationKey })
-    .returning();
+  const insertedResult = await database.execute<{ id: string }>(
+    jobInsertQuery(input)
+  );
+  const insertedId = insertedResult.rows[0]?.id;
 
-  if (inserted) return inserted;
+  if (insertedId) {
+    const [inserted] = await database
+      .select()
+      .from(jobs)
+      .where(eq(jobs.id, insertedId))
+      .limit(1);
+    if (!inserted) throw new Error('Inserted job could not be loaded');
+    return inserted;
+  }
   if (!input.deduplicationKey) throw new Error('Job insert returned no row');
 
   const [existing] = await database
@@ -313,6 +314,23 @@ export async function enqueueJob(
     .limit(1);
   if (!existing) throw new Error('Deduplicated job could not be loaded');
   return existing;
+}
+
+export function jobInsertQuery(input: EnqueueJobInput): SQL {
+  const canonicalPayload = JSON.stringify(input.payload);
+  return sql`
+    insert into "public"."jobs" (
+      "type", "payload", "deduplication_key", "run_at", "max_attempts"
+    ) values (
+      ${input.type}::text,
+      ${canonicalPayload}::jsonb,
+      ${input.deduplicationKey ?? null}::text,
+      coalesce(${input.runAt ?? null}::timestamptz, pg_catalog.now()),
+      ${input.maxAttempts ?? 5}::integer
+    )
+    on conflict ("deduplication_key") do nothing
+    returning "id"
+  `;
 }
 
 function sameClassificationSubject(
@@ -433,13 +451,6 @@ export async function rearmFinancialClassificationJob(
   return enqueueFinancialClassificationJobInternal(transaction, input, true);
 }
 
-export interface RearmExhaustedJobInput {
-  type: string;
-  payload: JsonObject;
-  deduplicationKey: string;
-  maxAttempts: number;
-}
-
 export type JobClaimPolicy = 'all' | 'local-only';
 
 export interface FinancialClassificationImplementationVersion {
@@ -447,32 +458,16 @@ export interface FinancialClassificationImplementationVersion {
   readonly allocationAlgorithmVersion: number;
 }
 
-export async function rearmExhaustedJob(
+export async function rearmPendingStripeEventJob(
   database: DatabaseExecutor,
-  input: RearmExhaustedJobInput
-): Promise<JobRow | null> {
-  const [rearmed] = await database
-    .update(jobs)
-    .set({
-      status: 'pending',
-      attempts: 0,
-      maxAttempts: input.maxAttempts,
-      lockedAt: null,
-      lockedBy: null,
-      completedAt: null,
-      updatedAt: new Date()
-    })
-    .where(
-      and(
-        eq(jobs.type, input.type),
-        eq(jobs.payload, input.payload),
-        eq(jobs.deduplicationKey, input.deduplicationKey),
-        eq(jobs.status, 'failed'),
-        gte(jobs.attempts, jobs.maxAttempts)
-      )
-    )
-    .returning();
-  return rearmed ?? null;
+  stripeEventId: string
+): Promise<boolean> {
+  const result = await database.execute<{ rearmed: boolean }>(sql`
+    select "public"."rearm_pending_stripe_event_job"(${stripeEventId}::uuid) as "rearmed"
+  `);
+  const rearmed = result.rows[0]?.rearmed;
+  if (typeof rearmed !== 'boolean') throw new Error('Stripe event job rearm returned no result');
+  return rearmed;
 }
 
 interface ClaimedJobRow extends Record<string, unknown> {

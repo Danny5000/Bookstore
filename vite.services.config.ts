@@ -23,6 +23,18 @@ export default defineConfig({
         'bootstrap-admin': resolve(import.meta.dirname, 'src/bootstrap-admin.ts'),
         'cleanup-storage': resolve(import.meta.dirname, 'src/cleanup-storage.ts'),
         migrate: resolve(import.meta.dirname, 'src/migrate.ts'),
+        'provision-database-roles': resolve(
+          import.meta.dirname,
+          'src/provision-database-roles.ts'
+        ),
+        'storage-volume-migration-helper': resolve(
+          import.meta.dirname,
+          'src/storage-volume-migration-entry.ts'
+        ),
+        'storage-volume-backup-helper': resolve(
+          import.meta.dirname,
+          'src/storage-volume-backup-entry.ts'
+        ),
         worker: resolve(import.meta.dirname, 'src/worker.ts')
       },
       output: {

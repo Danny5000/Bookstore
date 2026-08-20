@@ -282,7 +282,13 @@ export async function lockCanonicalPaymentPurchaseFacts(
 ): Promise<PaymentPurchaseFacts> {
   const canonical = parseCanonicalPaymentPurchaseLockInput(input);
   await lockOrder(tx, canonical.orderId);
-  const [order] = await tx.select().from(orders).where(eq(orders.id, canonical.orderId)).limit(1).for('update');
+  const [order] = await tx.select({
+    id: orders.id,
+    status: orders.status,
+    currency: orders.currency,
+    totalMinor: orders.totalMinor,
+    paidAt: orders.paidAt
+  }).from(orders).where(eq(orders.id, canonical.orderId)).limit(1).for('update');
   const [payment] = await tx.select().from(payments).where(and(
     eq(payments.id, canonical.paymentId), eq(payments.orderId, canonical.orderId)
   )).limit(1).for('update');
@@ -300,7 +306,13 @@ export async function lockCanonicalPaymentPurchaseFacts(
 
 async function lockRoutingPurchaseFacts(tx: DatabaseTransaction, routing: RoutingFacts): Promise<PaymentPurchaseFacts> {
   await lockOrder(tx, routing.orderId);
-  const [order] = await tx.select().from(orders).where(eq(orders.id, routing.orderId)).limit(1).for('update');
+  const [order] = await tx.select({
+    id: orders.id,
+    status: orders.status,
+    currency: orders.currency,
+    totalMinor: orders.totalMinor,
+    paidAt: orders.paidAt
+  }).from(orders).where(eq(orders.id, routing.orderId)).limit(1).for('update');
   const [payment] = await tx.select().from(payments).where(eq(payments.id, routing.id)).limit(1).for('update');
   if (!order || !payment || payment.orderId !== routing.orderId || order.id !== routing.orderId ||
     payment.stripePaymentIntentId !== routing.stripePaymentIntentId ||

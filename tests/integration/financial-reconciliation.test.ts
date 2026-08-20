@@ -74,7 +74,12 @@ import { paymentSnapshotFixture } from '../fixtures/stripe/payment';
 import { payoutSnapshotFixture } from '../fixtures/stripe/payout';
 import { refundSnapshotFixture } from '../fixtures/stripe/refund';
 import { disputeSnapshotFixture } from '../fixtures/stripe/dispute';
-import { applicationConfig, databaseClient } from './database';
+import {
+  applicationConfig,
+  ownerDatabaseClient,
+  workerDatabaseClient,
+  workerDatabaseClient as databaseClient
+} from './database';
 
 const FAR_FUTURE = new Date('2099-01-01T00:00:00.000Z');
 
@@ -110,7 +115,7 @@ async function createPaidPurchase(settlementCurrency: 'USD' | 'EUR'): Promise<Pu
   const suffix = token();
   const orderId = randomUUID();
   const paidAt = new Date('2026-08-10T12:01:00.000Z');
-  const [guest] = await databaseClient.db.insert(guestIdentities).values({
+  const [guest] = await ownerDatabaseClient.db.insert(guestIdentities).values({
     email: `financial-reconciliation-${suffix}@example.com`
   }).returning();
   if (!guest) throw new Error('Expected a guest fixture.');
@@ -119,7 +124,7 @@ async function createPaidPurchase(settlementCurrency: 'USD' | 'EUR'): Promise<Pu
     { id: randomUUID(), titleId: randomUUID(), subtotalMinor: 800, taxMinor: 80 },
     { id: randomUUID(), titleId: randomUUID(), subtotalMinor: 450, taxMinor: 70 }
   ];
-  await databaseClient.db.insert(titles).values(itemFacts.map((item, index) => ({
+  await ownerDatabaseClient.db.insert(titles).values(itemFacts.map((item, index) => ({
     id: item.titleId,
     slug: `financial-reconciliation-${index}-${suffix}`,
     title: `Financial reconciliation ${index}`,
@@ -130,7 +135,7 @@ async function createPaidPurchase(settlementCurrency: 'USD' | 'EUR'): Promise<Pu
     currency: 'USD',
     visibility: 'private' as const
   })));
-  await databaseClient.db.insert(orders).values({
+  await ownerDatabaseClient.db.insert(orders).values({
     id: orderId,
     status: 'paid',
     guestIdentityId: guest.id,
@@ -146,7 +151,7 @@ async function createPaidPurchase(settlementCurrency: 'USD' | 'EUR'): Promise<Pu
     checkoutExpiresAt: new Date('2026-08-10T12:30:00.000Z'),
     paidAt
   });
-  await databaseClient.db.insert(orderItems).values(itemFacts.map((item, index) => ({
+  await ownerDatabaseClient.db.insert(orderItems).values(itemFacts.map((item, index) => ({
     id: item.id,
     orderId,
     titleId: item.titleId,
@@ -165,7 +170,7 @@ async function createPaidPurchase(settlementCurrency: 'USD' | 'EUR'): Promise<Pu
     chargeId: `ch_reconciliation_${suffix}`,
     balanceTransactionId: `txn_reconciliation_${suffix}`
   };
-  const [payment] = await databaseClient.db.insert(payments).values({
+  const [payment] = await ownerDatabaseClient.db.insert(payments).values({
     orderId,
     stripePaymentIntentId: provider.paymentIntentId,
     stripeLatestChargeId: provider.chargeId,
@@ -542,7 +547,7 @@ async function reconcileSourceThroughEventAndScan(
 
 async function seedActivePurchaseAccess(fixture: PurchaseFixture): Promise<void> {
   const userId = randomUUID();
-  await databaseClient.db.insert(user).values({
+  await ownerDatabaseClient.db.insert(user).values({
     id: userId,
     name: 'Financial acceptance reader',
     email: `financial-acceptance-${token()}@example.com`,
@@ -552,7 +557,7 @@ async function seedActivePurchaseAccess(fixture: PurchaseFixture): Promise<void>
     id: orderItems.id,
     titleId: orderItems.titleId
   }).from(orderItems).where(inArray(orderItems.id, fixture.orderItemIds)).orderBy(asc(orderItems.id));
-  await databaseClient.db.insert(entitlementGrants).values(items.map((item) => ({
+  await ownerDatabaseClient.db.insert(entitlementGrants).values(items.map((item) => ({
     titleId: item.titleId,
     userId,
     source: 'purchase' as const,
@@ -561,7 +566,7 @@ async function seedActivePurchaseAccess(fixture: PurchaseFixture): Promise<void>
     stateReason: 'payment_succeeded',
     grantedAt: fixture.paidAt
   })));
-  await databaseClient.db.insert(entitlements).values(items.map((item) => ({
+  await ownerDatabaseClient.db.insert(entitlements).values(items.map((item) => ({
     userId,
     titleId: item.titleId,
     grantedAt: fixture.paidAt
@@ -1541,7 +1546,7 @@ describe('financial reconciliation acceptance', () => {
 
     const triggerName = `payout_audit_fail_${suffix}`;
     const functionName = `${triggerName}_fn`;
-    await databaseClient.db.execute(sql.raw(`
+    await ownerDatabaseClient.db.execute(sql.raw(`
       create function ${functionName}() returns trigger language plpgsql as $$
       begin
         if new.action = 'financial.payout.membership_published' then
@@ -1551,20 +1556,20 @@ describe('financial reconciliation acceptance', () => {
       end;
       $$
     `));
-    await databaseClient.db.execute(sql.raw(`
+    await ownerDatabaseClient.db.execute(sql.raw(`
       create trigger ${triggerName} before insert on audit_events
       for each row execute function ${functionName}()
     `));
     try {
-      await expect(publishPayoutMembership(databaseClient.db, {
+      await expect(publishPayoutMembership(workerDatabaseClient.db, {
         payoutId: stagedPayout.payoutId,
         runId: run.id,
         expectedGeneration: 0,
         correlationId: `rollback-publish-${suffix}`
       })).rejects.toThrow();
     } finally {
-      await databaseClient.db.execute(sql.raw(`drop trigger ${triggerName} on audit_events`));
-      await databaseClient.db.execute(sql.raw(`drop function ${functionName}()`));
+      await ownerDatabaseClient.db.execute(sql.raw(`drop trigger ${triggerName} on audit_events`));
+      await ownerDatabaseClient.db.execute(sql.raw(`drop function ${functionName}()`));
     }
 
     expect(await databaseClient.db.select().from(stripePayoutBalanceTransactions)).toHaveLength(0);
@@ -1618,13 +1623,24 @@ describe('financial reconciliation acceptance', () => {
       fingerprintSha256: fingerprint
     }).returning();
     if (!balance) throw new Error('Expected a replay balance fixture.');
-    const [unknownClassification] = await databaseClient.db.insert(financialClassificationVersions).values({
-      subjectType: 'balance_transaction',
-      subjectId: balance.id,
-      classifierVersion: 1,
-      classification: 'unknown',
-      sourceFingerprintSha256: fingerprint
-    }).returning();
+    const unknownClassification = await databaseClient.db.transaction(async (tx) => {
+      const [classification] = await tx.insert(financialClassificationVersions).values({
+        subjectType: 'balance_transaction',
+        subjectId: balance.id,
+        classifierVersion: 1,
+        classification: 'unknown',
+        sourceFingerprintSha256: fingerprint
+      }).returning();
+      if (!classification) throw new Error('Expected an immutable unknown classification fixture.');
+      await tx.insert(financialReconciliationIssues).values({
+        resourceType: 'financial_classification',
+        resourceId: classification.id,
+        safeCode: 'unsupported_category',
+        impact: 'exception',
+        correlationId: `unknown-v1-${suffix}`
+      });
+      return classification;
+    });
     if (!unknownClassification) throw new Error('Expected an immutable unknown classification fixture.');
     const oldSets = await databaseClient.db.insert(financialAllocationSets).values([
       {
@@ -1654,13 +1670,6 @@ describe('financial reconciliation acceptance', () => {
         sourceFingerprintSha256: fingerprint
       }
     ]).returning();
-    await databaseClient.db.insert(financialReconciliationIssues).values({
-      resourceType: 'financial_classification',
-      resourceId: unknownClassification.id,
-      safeCode: 'unsupported_category',
-      impact: 'exception',
-      correlationId: `unknown-v1-${suffix}`
-    });
     const oldRowsBefore = await databaseClient.db.select().from(financialAllocationSets)
       .where(inArray(financialAllocationSets.id, oldSets.map((row) => row.id)))
       .orderBy(asc(financialAllocationSets.id));

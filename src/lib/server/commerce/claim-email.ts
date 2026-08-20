@@ -13,7 +13,7 @@ import type { createAuthServer } from '$lib/server/auth/options';
 import { PermanentJobError } from '$lib/server/jobs/runner';
 import type { JobHandler } from '$lib/server/jobs/types';
 import {
-  findOutboxMessageByDeduplicationKey
+  outboxMessageExistsByDeduplicationKey
 } from '$lib/server/outbox/repository';
 import type { CommerceMessageEnqueuer } from './email/enqueue';
 
@@ -48,9 +48,22 @@ export async function queueCommerceClaimEmail(
   const parsed = z.strictObject({
     orderId: z.uuid(),
     email: z.string().trim().toLowerCase().max(320).pipe(z.email()),
-    claimUrl: z.url().max(2048)
+    claimUrl: z.url().max(8192)
   }).parse(input);
   await database.transaction(async (transaction) => {
+    const [candidate] = await transaction
+      .select({ guestIdentityId: orders.guestIdentityId })
+      .from(orders)
+      .where(eq(orders.id, parsed.orderId))
+      .limit(1);
+    if (!candidate?.guestIdentityId) return;
+    const [identity] = await transaction
+      .select()
+      .from(guestIdentities)
+      .where(eq(guestIdentities.id, candidate.guestIdentityId))
+      .limit(1)
+      .for('update');
+    if (!identity || identity.email !== parsed.email) return;
     const [order] = await transaction
       .select()
       .from(orders)
@@ -61,20 +74,13 @@ export async function queueCommerceClaimEmail(
       !order ||
       order.status !== 'paid' ||
       order.initiatingUserId !== null ||
-      order.guestIdentityId === null ||
+      order.guestIdentityId !== identity.id ||
       order.purchaseEmail !== parsed.email
     ) return;
-    const [identity] = await transaction
-      .select()
-      .from(guestIdentities)
-      .where(eq(guestIdentities.id, order.guestIdentityId))
-      .limit(1)
-      .for('update');
-    if (!identity || identity.email !== parsed.email) return;
-    const receiptExists = (await findOutboxMessageByDeduplicationKey(
+    const receiptExists = await outboxMessageExistsByDeduplicationKey(
       transaction,
       commerceReceiptDeduplicationKey(order.id)
-    )) !== null;
+    );
     if (receiptExists) {
       await messages.enqueueGuestClaimReissue(transaction, order.id, parsed.claimUrl);
     } else {
@@ -83,7 +89,7 @@ export async function queueCommerceClaimEmail(
   });
 }
 
-export type ClaimEmailAccountState = 'magic-link' | 'password-recovery';
+export type ClaimEmailAccountState = 'magic-link' | 'password-recovery' | 'receipt-only';
 
 export interface ClaimEmailEligibility {
   orderId: string;
@@ -115,6 +121,9 @@ export async function loadClaimEmailEligibility(
     .where(eq(guestIdentities.id, order.guestIdentityId))
     .limit(1);
   if (!identity || identity.email !== email) return null;
+  if (identity.claimedByUserId !== null) {
+    return { orderId: order.id, email, accountState: 'receipt-only' };
+  }
 
   const [matchingUser] = await database
     .select({ id: user.id })
@@ -167,19 +176,29 @@ export function createClaimEmailHandler(
     if (!parsed.success) throw new PermanentJobError('Invalid commerce claim-email payload');
     const { orderId } = parsed.data;
     throwIfAborted(signal);
-    if ((await operations.receiptExists(orderId)) && !options.allowExistingReceipt) return;
+    const initialReceiptExists = await operations.receiptExists(orderId);
+    if (initialReceiptExists && !options.allowExistingReceipt) return;
     const eligibility = await operations.loadEligibility(orderId);
     if (!eligibility || eligibility.orderId !== orderId) {
       throw new PermanentJobError('Commerce claim-email order is not eligible');
     }
     throwIfAborted(signal);
+    if (eligibility.accountState === 'receipt-only') {
+      if (!initialReceiptExists) await operations.enqueueReceiptWithoutClaim(orderId);
+      return;
+    }
     if (eligibility.accountState === 'password-recovery') {
       await operations.requestPasswordRecovery(eligibility);
       throwIfAborted(signal);
-      await operations.enqueueReceiptWithoutClaim(orderId);
+      if (!initialReceiptExists) await operations.enqueueReceiptWithoutClaim(orderId);
       return;
     }
     await operations.requestMagicLink(eligibility);
+    throwIfAborted(signal);
+    if (!(await operations.receiptExists(orderId))) {
+      throwIfAborted(signal);
+      await operations.enqueueReceiptWithoutClaim(orderId);
+    }
   };
 }
 
@@ -195,10 +214,10 @@ export function createClaimEmailOperations(
   const headers = new Headers({ origin });
   return {
     async receiptExists(orderId) {
-      return (await findOutboxMessageByDeduplicationKey(
+      return outboxMessageExistsByDeduplicationKey(
         database,
         commerceReceiptDeduplicationKey(orderId)
-      )) !== null;
+      );
     },
     loadEligibility: (orderId) => loadClaimEmailEligibility(database, orderId),
     async requestMagicLink(input) {
@@ -217,7 +236,8 @@ export function createClaimEmailOperations(
       await auth.api.requestPasswordReset({
         body: {
           email: input.email,
-          redirectTo: '/reset-password?purpose=commerce-claim'
+          redirectTo:
+            `/reset-password?purpose=commerce-claim&orderId=${encodeURIComponent(input.orderId)}`
         },
         headers
       });

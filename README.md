@@ -10,12 +10,15 @@ Requirements: Node.js 26.7.x, npm 11.19.x, Docker, and Docker Compose 2.30 or ne
 .\scripts\start-dev.ps1
 ```
 
-The launcher creates `.env` from `.env.example` when needed, installs locked dependencies, applies committed migrations, and starts the app, worker, PostgreSQL, and Mailpit. The storefront runs at `http://localhost:5173`; Mailpit runs at `http://localhost:8025`; uploaded publications live under the ignored `.data/storage` directory.
+The launcher creates `.env` from `.env.example` when needed, installs locked dependencies, applies committed migrations, provisions distinct owner/web/financial-worker/storage-cleanup database roles, and starts the app, worker, PostgreSQL, and Mailpit. Configure pairwise-distinct `DATABASE_OWNER_USER`/`DATABASE_OWNER_PASSWORD`, `DATABASE_USER`/`DATABASE_PASSWORD`, `DATABASE_WORKER_USER`/`DATABASE_WORKER_PASSWORD`, and `DATABASE_STORAGE_CLEANUP_USER`/`DATABASE_STORAGE_CLEANUP_PASSWORD` pairs. The storefront runs at `http://localhost:5173`; Mailpit runs at `http://localhost:8025`. Local storage is split across the ignored `.data/storage-staging`, `.data/storage-publication`, and `.data/storage-covers` directories; the web process treats publication as read-only while the worker owns publication writes.
+
+For an existing pre-split development volume, move the current `DATABASE_USER` and `DATABASE_PASSWORD` values to `DATABASE_OWNER_USER` and `DATABASE_OWNER_PASSWORD`, then choose distinct new web, worker, and storage-cleanup credentials. An environment that already has the three owner/web/worker pairs needs only the new cleanup pair. Stop any host-run web, worker, and storage-cleanup processes before the commands below; the launcher and containerized sequence stop existing Compose app/worker/storage-cleanup containers before migration.
 
 Manual host-run commands:
 
 ```powershell
 npm run db:migrate
+npm run db:provision-roles
 npm run admin:bootstrap
 npm run dev
 npm run worker:watch
@@ -24,7 +27,9 @@ npm run worker:watch
 Fully containerized development:
 
 ```powershell
+docker compose --env-file .env --file compose.dev.yaml stop app worker storage-cleanup
 docker compose --env-file .env --file compose.dev.yaml --profile tools run --rm migrate
+docker compose --env-file .env --file compose.dev.yaml --profile tools run --rm database-role-provision
 docker compose --env-file .env --file compose.dev.yaml --profile tools run --rm bootstrap-admin
 docker compose --env-file .env --file compose.dev.yaml up --build --wait
 ```

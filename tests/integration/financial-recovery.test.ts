@@ -41,7 +41,11 @@ import { balanceTransactionSnapshotFixture } from '../fixtures/stripe/balance-tr
 import { chargeSnapshotFixture } from '../fixtures/stripe/charge';
 import { paymentSnapshotFixture } from '../fixtures/stripe/payment';
 import { payoutSnapshotFixture } from '../fixtures/stripe/payout';
-import { applicationConfig, databaseClient } from './database';
+import {
+  applicationConfig,
+  ownerDatabaseClient,
+  workerDatabaseClient as databaseClient
+} from './database';
 
 const STARTED_AT = new Date('2098-08-13T12:00:00.000Z');
 const RETRY_AT = new Date('2099-08-13T13:00:00.000Z');
@@ -51,11 +55,11 @@ async function createPaymentFixture() {
   const suffix = randomUUID().replaceAll('-', '');
   const orderId = randomUUID();
   const titleId = randomUUID();
-  const [guest] = await databaseClient.db.insert(guestIdentities).values({
+  const [guest] = await ownerDatabaseClient.db.insert(guestIdentities).values({
     email: `financial-recovery-${suffix}@example.com`
   }).returning();
   if (!guest) throw new Error('Expected recovery guest fixture.');
-  await databaseClient.db.insert(titles).values({
+  await ownerDatabaseClient.db.insert(titles).values({
     id: titleId,
     slug: `financial-recovery-${suffix}`,
     title: 'Financial recovery fixture',
@@ -66,7 +70,7 @@ async function createPaymentFixture() {
     currency: 'USD',
     visibility: 'private'
   });
-  await databaseClient.db.insert(orders).values({
+  await ownerDatabaseClient.db.insert(orders).values({
     id: orderId,
     status: 'paid',
     guestIdentityId: guest.id,
@@ -82,7 +86,7 @@ async function createPaymentFixture() {
     checkoutExpiresAt: new Date('2026-08-13T12:30:00.000Z'),
     paidAt: STARTED_AT
   });
-  await databaseClient.db.insert(orderItems).values({
+  await ownerDatabaseClient.db.insert(orderItems).values({
     orderId,
     titleId,
     titleSnapshot: 'Financial recovery fixture',
@@ -97,7 +101,7 @@ async function createPaymentFixture() {
   const paymentIntentId = `pi_recovery_${suffix}`;
   const chargeId = `ch_recovery_${suffix}`;
   const balanceTransactionId = `txn_recovery_${suffix}`;
-  const [payment] = await databaseClient.db.insert(payments).values({
+  const [payment] = await ownerDatabaseClient.db.insert(payments).values({
     orderId,
     stripePaymentIntentId: paymentIntentId,
     stripeLatestChargeId: chargeId,

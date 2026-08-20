@@ -1,9 +1,26 @@
 import { randomUUID } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
+import { wrapCommerceClaimActionUrl } from '$lib/server/auth/commerce-claim-capability';
 import { parseCommerceEmailPayload } from './payload';
 import { renderCommerceEmail } from './render';
 
 const origin = 'https://books.example.com';
+
+function claimUrl(): string {
+  const orderId = randomUUID();
+  const action = new URL('/api/auth/magic-link/verify', origin);
+  action.searchParams.set('token', 'native-token');
+  action.searchParams.set('callbackURL', '/claim/complete');
+  action.searchParams.set('errorCallbackURL', '/claim/complete?error=magic-link');
+  action.searchParams.set('newUserCallbackURL', '/claim/complete');
+  return wrapCommerceClaimActionUrl({
+    actionUrl: action.toString(),
+    claimProofToken: 'c'.repeat(43),
+    anchorOrderId: orderId,
+    kind: 'commerce-magic',
+    trustedOrigin: origin
+  });
+}
 
 function receipt(template: 'commerce.account-receipt' | 'commerce.guest-receipt-claim') {
   return parseCommerceEmailPayload({
@@ -24,7 +41,7 @@ function receipt(template: 'commerce.account-receipt' | 'commerce.guest-receipt-
     }],
     ...(template === 'commerce.guest-receipt-claim'
       ? {
-          claimUrl: `${origin}/api/auth/magic-link/verify?token=safe&callbackURL=%2Fclaim%2Fcomplete`
+          claimUrl: claimUrl()
         }
       : {})
   }, origin);
@@ -45,8 +62,8 @@ describe('commerce email rendering', () => {
   it('renders the claim action only for a guest receipt', () => {
     const account = renderCommerceEmail(receipt('commerce.account-receipt'));
     const guest = renderCommerceEmail(receipt('commerce.guest-receipt-claim'));
-    expect(account.text).not.toContain('/api/auth/magic-link/verify');
-    expect(guest.text).toContain('/api/auth/magic-link/verify');
+    expect(account.text).not.toContain('/claim/authorize');
+    expect(guest.text).toContain('/claim/authorize#');
     expect(guest.html).toContain('Claim your purchase');
   });
 

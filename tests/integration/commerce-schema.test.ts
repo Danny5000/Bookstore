@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { databaseClient } from './database';
+import { ownerDatabaseClient as databaseClient } from './database';
 
 let sequence = 0;
 

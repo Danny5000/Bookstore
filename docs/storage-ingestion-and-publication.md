@@ -2,9 +2,15 @@
 
 ## Safety boundaries
 
-Publication files are private application data. `STORAGE_PROVIDER=local` stores them beneath `STORAGE_LOCAL_ROOT`; development uses the ignored `.data/storage` directory and production mounts the private `book_storage` volume at `/var/lib/pale-orbit/storage`. Caddy never receives that volume. Browser data and audit summaries never contain storage keys or the local root.
+Publication files are private application data. `STORAGE_PROVIDER=local` routes each complete logical key to exactly one persistent root: staging uploads and transient health probes use `STORAGE_STAGING_ROOT`; immutable originals, derived publications, and the fixed publication readiness sentinel use `STORAGE_PUBLICATION_ROOT`; title covers use `STORAGE_COVERS_ROOT`. Development uses the ignored `.data/storage-staging`, `.data/storage-publication`, and `.data/storage-covers` directories. Production mounts the private `book_staging`, `book_publication`, and `book_covers` volumes. The web process has read-write access to staging and covers but read-only access to publication; the worker and bounded cleanup process have read-write access to all three. Caddy receives none of these volumes. Browser data and audit summaries never contain storage keys or physical roots.
+
+Storage readiness preserves those capability boundaries. The web round-trips a transient canonical health key in staging and an unreferenced canonical title-cover key in covers, then reads and byte-compares the fixed `health/publication/readiness-v1` sentinel through its read-only publication mount. The worker and bounded cleanup process atomically provision and verify the sentinel before transiently round-tripping canonical keys in all three roots. Each transient round-trip verifies 32 random bytes and deletes its exact key in `finally`; if the process crashes first, ordinary retention cleanup recognizes the remnant as a health probe, unreferenced generated derivative, or unreferenced cover rather than an immutable original. The sentinel is deliberately outside cleanup candidate grammar and is required and preserved by current publication capture, restore preflight, and restore verification.
+
+Verified-read scratch files use a separate per-process directory under the absolute `STORAGE_SCRATCH_ROOT` when configured, or a newly owned directory beneath the operating-system temporary directory on host runs. Scratch is never any persistent storage root, is never backed up, and is removed on failure and normal process exit.
 
 The storage interface owns opaque keys. `staging/uploads/...` objects are temporary, `titles/.../derived/v1/...` objects are reproducible, `titles/.../covers/...` objects are explicit title covers, and every `titles/.../revisions/.../original` object is immutable retained source material. Cleanup categorically refuses to delete originals. `STORAGE_PROVIDER=s3` is a deliberate fail-at-startup stub; no AWS SDK or partial S3 implementation is installed.
+
+New derived writes use `derived/v1/generations/<canonical 0..2147483647>/<class>/<uuid>.webp` beneath the owning revision. The legacy `derived/v1/<class>/<uuid>.webp` form remains readable, migratable, and backuppable, and this rollout requires no backfill. Cleanup protects an active legacy derived key conservatively; for the generated form it protects the exact revision ID and generation recorded by the database.
 
 ## Development and upload operations
 
@@ -26,6 +32,7 @@ For fully containerized development:
 
 ```powershell
 docker compose --env-file .env --file compose.dev.yaml --profile tools run --rm migrate
+docker compose --env-file .env --file compose.dev.yaml --profile tools run --rm database-role-provision
 docker compose --env-file .env --file compose.dev.yaml --profile tools run --rm bootstrap-admin
 docker compose --env-file .env --file compose.dev.yaml up --build --wait
 ```
@@ -52,34 +59,109 @@ Metadata saves on a public title are explicit and become public after the succes
 
 ## Cleanup and disk capacity
 
-Always review a dry run before apply. Output is aggregate JSON only; object keys are never logged.
+Always review a dry run before apply. Output is aggregate JSON only; object keys are never logged. Migration and role provisioning must succeed first because cleanup uses only `DATABASE_STORAGE_CLEANUP_USER`/`DATABASE_STORAGE_CLEANUP_PASSWORD` and its bounded database capability.
+
+Apply is unsupported while an app or worker can write. Random staging and cover keys still have a bounded external-write-to-database-registration window; generation fencing closes deterministic derived-key reuse, not that fresh-key pause. Before attesting `--writers-quiesced`, stop every host-run and containerized app, worker, and old cleanup process. The all-state consumer check must list running, restarting, and stopped Compose containers and every other container attached to the exact staging, publication, or covers volume; confirm that no listed container is running or restarting. If that cannot be proven, run dry-run only.
 
 Host-run development:
 
 ```powershell
 npm run storage:cleanup
-npm run storage:cleanup -- --apply
+# Stop host-run web, worker, and cleanup processes, then verify no writer remains.
+npm run storage:cleanup:apply
 ```
 
 Compose development:
 
 ```powershell
 docker compose --env-file .env --file compose.dev.yaml --profile tools run --rm storage-cleanup
-docker compose --env-file .env --file compose.dev.yaml --profile tools run --rm storage-cleanup npm run storage:cleanup:raw -- --apply
+docker compose --env-file .env --file compose.dev.yaml --profile tools stop app worker storage-cleanup
+docker compose --env-file .env --file compose.dev.yaml --profile tools ps --all app worker storage-cleanup
+docker ps --all --filter volume=/var/lib/pale-orbit/staging
+docker ps --all --filter volume=/var/lib/pale-orbit/publication
+docker ps --all --filter volume=/var/lib/pale-orbit/covers
+docker compose --env-file .env --file compose.dev.yaml --profile tools run --rm storage-cleanup npm run storage:cleanup:raw -- --apply --writers-quiesced
 ```
 
-Production, using the already-exported deployment environment (never a production `.env` file):
+Docker's `volume` filter accepts a named volume or the container-side mount destination, so the three development queries use the exact routed destinations and include stopped containers. Every returned container must be stopped and dispositioned; a running or restarting result blocks apply. If any nonstandard container could mount the same bind source at another destination, inspect every all-state container's `.Mounts[].Source` and compare it with the three resolved `.data` paths; any matching running or restarting consumer also blocks apply.
+
+Production, using the already-exported deployment environment (never a production `.env` file). Replace `<project>` with the exact Compose project name supplied by `--project-name`/`COMPOSE_PROJECT_NAME`, or with Compose's normalized directory default after confirming it with `docker compose ls --all`:
 
 ```powershell
 docker compose --file compose.prod.yaml --profile tools run --rm storage-cleanup
-docker compose --file compose.prod.yaml --profile tools run --rm storage-cleanup node build/services/cleanup-storage.js --apply
+docker compose --file compose.prod.yaml --profile tools stop app worker storage-cleanup
+docker compose --file compose.prod.yaml --profile tools ps --all app worker storage-cleanup
+docker ps --all --filter volume=<project>_book_staging
+docker ps --all --filter volume=<project>_book_publication
+docker ps --all --filter volume=<project>_book_covers
+docker compose --file compose.prod.yaml --profile tools run --rm storage-cleanup node build/services/cleanup-storage.js --apply --writers-quiesced
 ```
 
-Cleanup scans in pages of at most 500. It deletes only staging objects older than `STORAGE_STAGING_RETENTION_HOURS` that have no uploaded/processing revision or active job, and derived/cover objects older than `STORAGE_ORPHAN_RETENTION_HOURS` that have no database reference. Any storage or database error stops the run.
+Cleanup scans in pages of at most 500. It deletes only staging objects older than `STORAGE_STAGING_RETENTION_HOURS` that have no uploaded/processing revision or active job, canonical non-authoritative health probes older than `STORAGE_STAGING_RETENTION_HOURS`, and derived/cover objects older than `STORAGE_ORPHAN_RETENTION_HOURS` that have no database reference. Malformed probe keys remain untouched for operator disposition. Any storage or database error stops the run.
 
-Monitor the Docker data filesystem with `Get-PSDrive`/`df -h` and the volume with the same approved immutable helper used by backup, for example `docker run --rm --pull never --network none --read-only --cap-drop ALL --cap-add DAC_OVERRIDE --security-opt no-new-privileges -v <project>_book_storage:/data:ro "$BACKUP_HELPER_IMAGE" du -sh /data`. Alert at 75% filesystem use. At 85%, stop new uploads before continuing: announce the maintenance window and stop `app` if an upload-specific edge rule is unavailable, allow the worker to finish current work, run cleanup dry-run/apply, expand storage, and verify headroom before restarting. Do not let the filesystem reach 90%.
+Monitor the Docker data filesystem with `Get-PSDrive`/`df -h` and each persistent volume with the same approved immutable helper used by backup, for example `docker run --rm --pull never --network none --read-only --cap-drop ALL --cap-add DAC_OVERRIDE --security-opt no-new-privileges -v <project>_book_publication:/data:ro "$BACKUP_HELPER_IMAGE" du -sh /data`. Repeat for `book_staging` and `book_covers`. Alert at 75% filesystem use. At 85%, stop new uploads before continuing: announce the maintenance window, quiesce app and worker, complete the all-state consumer check above, run cleanup dry-run and the attested apply, expand storage, and verify headroom before restarting. Do not let the filesystem reach 90%.
+
+## Split-volume upgrade
+
+This is the only supported migration from the legacy single `book_storage` volume to the current three-volume layout. Schedule a maintenance window, export the exact Compose project name, and keep the app, worker, and storage cleanup process stopped for the entire preflight, copy, verification, and deployment switch:
+
+```powershell
+docker compose --file compose.prod.yaml --profile tools stop app worker storage-cleanup
+docker compose --file compose.prod.yaml --profile tools rm --force app worker storage-cleanup
+$env:STORAGE_MIGRATION_HELPER_IMAGE = 'registry.example.invalid/approved-storage-helper@sha256:<audited-digest>'
+npm run storage:migrate-volumes -- --project <exact-project> --report <restricted-absolute-report-path>
+```
+
+`STORAGE_MIGRATION_HELPER_IMAGE` must be an already-present, immutable image reference containing `@sha256:`. The migration command reserves the exact new report file with exclusive mode before its first Docker call, refuses a collision or unsafe parent, and removes that empty reservation only if it still owns the same file after a failed migration. It refuses an unpinned image, pulls nothing, and launches its helper with `--pull never --network none`, a read-only container filesystem, no capabilities, and `no-new-privileges`.
+
+Before the helper starts, the command resolves the exact generated volumes `<project>_book_storage`, `<project>_book_staging`, `<project>_book_publication`, and `<project>_book_covers`. The legacy volume must already exist with exact Compose project/volume labels. For an absent new root, the command uses `docker volume create` with the exact generated name and exact `com.docker.compose.project` and `com.docker.compose.volume` labels; an existing new root must already have those labels. It rejects ambiguity, foreign labels, or a nonempty new volume. The new volumes are mounted at the image's pre-created, `node`-owned `/var/lib/pale-orbit/staging`, `/var/lib/pale-orbit/publication`, and `/var/lib/pale-orbit/covers` directories so Docker's empty-volume copy-up initializes ownership without a root helper or broad capability. The digest-pinned helper runs as `node`; a real migration containing at least one object in every class must prove that identity can write every new root. It rechecks that `app`, `worker`, and `storage-cleanup` remain stopped before migration, between verification and copy, and after the helper exits. No running or stopped container may mount the legacy or any new exact storage volume during migration. The orchestrator queries all container states for each exact volume before the empty-volume verification and again before the copy helper; disposition a stale or unrelated consumer rather than bypassing that fence.
+
+The legacy volume is mounted read-only. The helper rejects unknown legacy entries, symbolic links, and special files, and classifies each recognized full logical key into exactly one new root. Legacy transient `health/probes/...` markers and `.verified-downloads/...` scratch files are recognized as non-authoritative and are deliberately not copied; an existing fixed `health/publication/readiness-v1` sentinel is copied byte-for-byte as publication data. Any other unclassified key stops the migration for operator disposition instead of being skipped. The migration report records per-class count, byte, and SHA-256 evidence and is accepted only when source and destination evidence match exactly. A failed run clears only partial files it created in otherwise new roots; the legacy volume remains unchanged. Keep the legacy volume untouched through verification, the first current-format backup, and the complete rollback window.
+
+After a successful report, keep the app and general worker stopped and run the current bounded `storage-cleanup` dry-run against the three-root settings; its writer probe provisions and verifies the publication sentinel when the legacy layout did not contain one. Then create a current-v2 checkpoint with `deployment:checkpoint capture` and successfully run `deployment:checkpoint rehearse` on a separately approved Docker engine. The exhaustive restored database-reference inventory and authenticated split manifests replace impossible maintenance-mode UI reads. Do not bootstrap, start app/worker/Caddy, accept uploads, or permit background work until both commands succeed.
+
+For rollback, stop `app`, `worker`, and `storage-cleanup`, restore the previous release and Compose definition, point it only at the still-retained legacy `book_storage` volume, and repeat the authenticated read checks before allowing traffic. Do not attempt rollback after accepting writes into the new volumes without an explicit reconciliation procedure. After the documented retention window, a second verified current-format backup, and an approved rollback-disposition record, remove or archive the legacy volume with an exact-name operation; never let a broad Compose cleanup select it implicitly.
+
+## Current atomic split-volume backup and restore
+
+A current backup is one indivisible application checkpoint containing the database plus all three authoritative storage classes. Scratch files and transient health probes are non-authoritative and must not appear in a backup or restore manifest; the transient keys use the `health/probes/...` grammar. The fixed publication readiness sentinel is authoritative readiness data and must appear exactly once with its expected bytes in every publication capture and restore manifest. Keep `app`, `worker`, and `storage-cleanup` stopped from before the database dump until every archive and manifest is sealed.
+
+Create these artifacts in one newly created, access-restricted directory:
+
+- `database.dump`
+- `staging.tar.gz` and `staging.manifest.json`
+- `publication.tar.gz` and `publication.manifest.json`
+- `covers.tar.gz` and `covers.manifest.json`
+- `migration-journal.csv`, `application-image.json`, `restore-row-counts.csv`, `storage-samples.csv`, `source-docker-engine.json`, `financial-operational-diagnostics.csv`, and `verify-financial-restore.sql`
+
+Use the single current-format checkpoint command. The root must already exist, be empty, canonical, and access restricted. `APP_IMAGE`, `POSTGRES_IMAGE`, and `STORAGE_BACKUP_HELPER_IMAGE` must be locally present digest-pinned images; the helper must contain `build/services/storage-volume-backup-helper.js` and declare `USER node`. Stop and remove every app, worker, cleanup, migration, provision, and bootstrap container before capture. The command binds the exact Docker engine and running PostgreSQL container, captures the database and all evidence, archives all three volumes, authenticates every database storage reference against the correct manifest, and seals bundle v2 last. It never restarts production:
+
+```powershell
+$env:STORAGE_BACKUP_HELPER_IMAGE = 'registry.example.invalid/pale-orbit@sha256:<audited-digest>'
+npm run deployment:checkpoint -- capture --project <exact-project> --root <exact-restricted-backup-directory> --context <approved-context> --engine-id <expected-engine-id> --backup-id <32-lowercase-hex-id>
+```
+
+No running or stopped container may mount any exact `<project>_book_staging`, `<project>_book_publication`, or `<project>_book_covers` volume while capture or restore is in progress. The orchestrator queries all container states for each exact volume and refuses every consumer before every helper launch; remove or disposition any named stale or unrelated consumer instead of bypassing that fence. It also revalidates the exact Docker engine, stopped-process fence, local image digest/non-root user, and exact Compose volume labels before every class. Each volume is mounted read-only into a `--pull never --network none --read-only --cap-drop ALL` container. The helper rejects symbolic links, special files, unknown keys, and keys routed to the wrong class. It retains the full logical key, writes a deterministic gzip-compressed tar plus a raw-code-point-ordered per-object manifest, and streams every object twice: once for live evidence and once into the archive. It then rereads the archive and proves exact per-object digest/byte evidence, giving explicit archive-to-live volume equality. Transient staging health probes are counted as ignored evidence but are not archived; the publication sentinel is required, hashed, archived, and restored; scratch is not mounted.
+
+Do not reuse a directory containing any artifact. A failed class removes only its owned partial archive and manifest, preserves every live source object, and invalidates the checkpoint. The command rechecks the quiescence and volume-consumer fences immediately before writing `backup-bundle.json`, then verifies the sealed bundle. Encrypt and transfer the entire directory as a unit; never copy a subset as a usable backup.
+
+Rehearse from the retained bundle on a separately approved Docker context and engine whose ID differs from the authenticated source-engine record:
+
+```powershell
+npm run deployment:checkpoint -- rehearse --root <exact-restricted-backup-directory> --context <approved-restore-context> --engine-id <expected-restore-engine-id> --backup-id <exact-32-lowercase-hex-id>
+```
+
+The command verifies the selected bundle ID first, copies the authenticated artifacts into an owned private snapshot anchored to the initially verified manifest, and consumes only that snapshot. It generates a collision-safe absent project and synthetic credentials, disables implicit `.env` loading, verifies all pinned images, and starts only PostgreSQL, one-shot tools, and the maintenance app health service. It never starts the worker or Caddy.
+
+The restore orchestrator requires `app`, `worker`, and `storage-cleanup` stopped. It safely creates each missing `<project>_book_staging`, `<project>_book_publication`, and `<project>_book_covers` volume with exact Compose labels, or accepts only an existing exact-owned volume. It mounts the backup directory read-only and each destination at the corresponding image-owned path. Before writing any class, a read-only preflight proves that all three destinations are empty and that all three archives match their manifests. The non-root helper then rechecks the destination before its first write, validates the sealed manifest and every tar header, extracts each object to a same-directory temporary file with bounded streaming and `fsync` before rename, and deletes only its partial restore on failure. A final independent scan proves restored volume-to-manifest equality for every key, count, byte total, and SHA-256 aggregate. This real restore is also the required ownership witness that empty-volume copy-up allows the image's `node` user to write without adding a root capability.
+
+The rehearsal pre-migrates, restores `database.dump` with ownership suppressed but authenticated ACLs preserved, post-migrates, provisions roles, restores the split volumes, and exact-compares the migration journal, all table row counts, exhaustive storage-reference inventory, and financial verifier output. It proves every restored database reference still matches the authenticated bytes and digest in its routed manifest, runs storage cleanup in dry-run mode, and checks maintenance liveness/readiness only after those proofs. The source bundle remains unchanged.
+
+Any missing, extra, empty, mismatched, or unverifiable artifact invalidates the whole checkpoint. The finally path removes only checkpoint-labeled helpers, removes the temporary database copy, runs `down --volumes --remove-orphans` for the generated project, proves exact-name and label absence, and deletes the private snapshot while preserving the sealed source directory for investigation. Database-only or partial-volume restore is unsupported.
 
 ## Coordinated backup
+
+> **Legacy rollback procedure only.** The remainder of this section documents the pre-split single-volume `book_storage` format so an explicitly retained legacy checkpoint can be rehearsed during the rollback window. It is prohibited for backups of the current three-volume runtime; use **Current atomic split-volume backup and restore** above.
 
 Use a maintenance window so the database and private volume represent the same application point. Keep both `app` and the general `worker` stopped from the first dump through every authenticated source baseline. The operator must supply an explicit Compose project, approved Docker context, expected engine ID, exact application image digest, audited plaintext-disposition wrapper, and audited seal/transfer wrapper. Never infer a production Docker target from the current CLI context.
 
@@ -340,7 +422,7 @@ try {
   try {
     $containerDumpCreated = $true
     Assert-SourceDockerEngineBinding
-    & docker --context $sourceDockerContext compose --project-name $project --file compose.prod.yaml exec -T postgres pg_dump -U $env:DATABASE_USER -d $env:DATABASE_NAME --format=custom --file=/tmp/pale-orbit.dump
+    & docker --context $sourceDockerContext compose --project-name $project --file compose.prod.yaml exec -T postgres pg_dump -U $env:DATABASE_OWNER_USER -d $env:DATABASE_NAME --format=custom --file=/tmp/pale-orbit.dump
     Assert-NativeSuccess 'create PostgreSQL logical dump'
     Assert-SourceDockerEngineBinding
     & docker --context $sourceDockerContext cp "${postgres}:/tmp/pale-orbit.dump" (Join-Path $backup 'database.dump')
@@ -354,26 +436,26 @@ try {
     }
   }
 
-  $migrationJournal = @(& docker --context $sourceDockerContext compose --project-name $project --file compose.prod.yaml exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 -U $env:DATABASE_USER -d $env:DATABASE_NAME -c 'copy (select * from drizzle.__drizzle_migrations order by id) to stdout with (format csv, header true)')
+  $migrationJournal = @(& docker --context $sourceDockerContext compose --project-name $project --file compose.prod.yaml exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 -U $env:DATABASE_OWNER_USER -d $env:DATABASE_NAME -c 'copy (select * from drizzle.__drizzle_migrations order by id) to stdout with (format csv, header true)')
   Assert-NativeSuccess 'capture migration journal'
   $migrationText = ConvertTo-CanonicalBackupText -Lines $migrationJournal -Header 'id,hash,created_at'
   [System.IO.File]::WriteAllText((Join-Path $backup 'migration-journal.csv'), $migrationText, $utf8NoBom)
 
   $rowCountSql = Get-Content -LiteralPath 'scripts/capture-restore-row-counts.sql' -Raw -ErrorAction Stop
-  $rowCountOutput = @($rowCountSql | & docker --context $sourceDockerContext compose --project-name $project --file compose.prod.yaml exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet -U $env:DATABASE_USER -d $env:DATABASE_NAME)
+  $rowCountOutput = @($rowCountSql | & docker --context $sourceDockerContext compose --project-name $project --file compose.prod.yaml exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet -U $env:DATABASE_OWNER_USER -d $env:DATABASE_NAME)
   Assert-NativeSuccess 'capture complete source row counts'
   $rowCountText = ConvertTo-CanonicalBackupText -Lines $rowCountOutput -Header 'schema_name,table_name,row_count'
   [System.IO.File]::WriteAllText((Join-Path $backup 'restore-row-counts.csv'), $rowCountText, $utf8NoBom)
 
   $storageSampleSql = Get-Content -LiteralPath 'scripts/capture-storage-samples.sql' -Raw -ErrorAction Stop
-  $storageSampleOutput = @($storageSampleSql | & docker --context $sourceDockerContext compose --project-name $project --file compose.prod.yaml exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet -U $env:DATABASE_USER -d $env:DATABASE_NAME)
+  $storageSampleOutput = @($storageSampleSql | & docker --context $sourceDockerContext compose --project-name $project --file compose.prod.yaml exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet -U $env:DATABASE_OWNER_USER -d $env:DATABASE_NAME)
   Assert-NativeSuccess 'capture source storage samples'
   $storageSampleText = ConvertTo-CanonicalBackupText -Lines $storageSampleOutput -Header 'sample_kind,storage_key,checksum_sha256'
   [System.IO.File]::WriteAllText((Join-Path $backup 'storage-samples.csv'), $storageSampleText, $utf8NoBom)
 
   Copy-Item -LiteralPath 'scripts/verify-financial-restore.sql' -Destination (Join-Path $backup 'verify-financial-restore.sql') -ErrorAction Stop
   $sourceVerifierSql = Get-Content -LiteralPath (Join-Path $backup 'verify-financial-restore.sql') -Raw -ErrorAction Stop # psql ON_ERROR_STOP source verifier
-  $sourceVerifierOutput = @($sourceVerifierSql | & docker --context $sourceDockerContext compose --project-name $project --file compose.prod.yaml exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet --csv -U $env:DATABASE_USER -d $env:DATABASE_NAME)
+  $sourceVerifierOutput = @($sourceVerifierSql | & docker --context $sourceDockerContext compose --project-name $project --file compose.prod.yaml exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet --csv -U $env:DATABASE_OWNER_USER -d $env:DATABASE_NAME)
   Assert-NativeSuccess 'verify source credential and financial invariants'
   $sourceFinancialDiagnostics = ConvertTo-FinancialOperationalDiagnostics -Lines $sourceVerifierOutput
   [System.IO.File]::WriteAllText(
@@ -691,21 +773,21 @@ assert_source_postgres_image_binding "$postgres" || exit 1
 
 container_dump_created=1
 assert_source_engine_binding || exit 1
-compose_prod exec -T postgres pg_dump -U "$DATABASE_USER" -d "$DATABASE_NAME" --format=custom --file=/tmp/pale-orbit.dump || exit 1
+compose_prod exec -T postgres pg_dump -U "$DATABASE_OWNER_USER" -d "$DATABASE_NAME" --format=custom --file=/tmp/pale-orbit.dump || exit 1
 assert_source_engine_binding || exit 1
 source_docker cp "${postgres}:/tmp/pale-orbit.dump" "$backup/database.dump" || exit 1
 cleanup_container_dump || exit 1
 
-migration_journal="$(compose_prod exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 -U "$DATABASE_USER" -d "$DATABASE_NAME" -c 'copy (select * from drizzle.__drizzle_migrations order by id) to stdout with (format csv, header true)')" || exit 1
+migration_journal="$(compose_prod exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 -U "$DATABASE_OWNER_USER" -d "$DATABASE_NAME" -c 'copy (select * from drizzle.__drizzle_migrations order by id) to stdout with (format csv, header true)')" || exit 1
 canonicalize_backup_output 'id,hash,created_at' "$migration_journal" > "$backup/migration-journal.csv" || exit 1
-row_counts="$(compose_prod exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet -U "$DATABASE_USER" -d "$DATABASE_NAME" < scripts/capture-restore-row-counts.sql)" || exit 1
+row_counts="$(compose_prod exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet -U "$DATABASE_OWNER_USER" -d "$DATABASE_NAME" < scripts/capture-restore-row-counts.sql)" || exit 1
 canonicalize_backup_output 'schema_name,table_name,row_count' "$row_counts" > "$backup/restore-row-counts.csv" || exit 1
-storage_samples="$(compose_prod exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet -U "$DATABASE_USER" -d "$DATABASE_NAME" < scripts/capture-storage-samples.sql)" || exit 1
+storage_samples="$(compose_prod exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet -U "$DATABASE_OWNER_USER" -d "$DATABASE_NAME" < scripts/capture-storage-samples.sql)" || exit 1
 canonicalize_backup_output 'sample_kind,storage_key,checksum_sha256' "$storage_samples" > "$backup/storage-samples.csv" || exit 1
 
 cp -- scripts/verify-financial-restore.sql "$backup/verify-financial-restore.sql" || exit 1
 # verify-financial-restore.sql is executed by psql with ON_ERROR_STOP from the authenticated backup copy.
-source_verifier_output="$(compose_prod exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet --csv -U "$DATABASE_USER" -d "$DATABASE_NAME" < "$backup/verify-financial-restore.sql")" || exit 1
+source_verifier_output="$(compose_prod exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet --csv -U "$DATABASE_OWNER_USER" -d "$DATABASE_NAME" < "$backup/verify-financial-restore.sql")" || exit 1
 source_financial_diagnostics="$(canonicalize_financial_operational_diagnostics "$source_verifier_output")" || exit 1
 printf '%s\n' "$source_financial_diagnostics" > "$backup/financial-operational-diagnostics.csv" || exit 1
 if report_financial_operational_disposition "$source_financial_diagnostics"; then
@@ -1027,6 +1109,8 @@ A header check or source-side authentication is insufficient: every plaintext by
 
 Never restore over production first. The isolated host requires a separately approved Docker context and engine ID, and that engine ID must differ from the authenticated production engine record. The exact `APP_IMAGE`, `POSTGRES_IMAGE`, and `BACKUP_HELPER_IMAGE` digests must match the authenticated application-image record and inspect successfully on the bound restore engine before any container or volume is created. The rehearsal sets the Compose default network to internal before PostgreSQL starts, so none of these containers receives an egress-capable network.
 
+Run committed migrations once against the empty target before `pg_restore` so the cluster-global `pale_orbit_*` group roles referenced by dump ACLs exist. Restore the authenticated dump with ACLs intact, run committed migrations again against the restored journal/schema, and only then run `database-role-provision` to bind the four distinct login roles. The authenticated restore verifier derives its protected migration range from journal entries with `idx >= 7` through current, compares the versioned exact catalog contract (including shape, definitions, owners, and direct ACLs), and separately rejects any excess effective authority inherited by the normalized `STORAGE_CLEANUP_LOGIN`. Do not replace this sequence with `--no-acl`: a restored journal can make migrations no-op and silently lose required grants. Keep the worker stopped throughout both migration passes, restore, role provisioning, and verification.
+
 On Windows PowerShell, invoke the verified-session wrapper defined above. It creates and verifies the plaintext only after this synchronous callback starts, and its outer `finally` disposes the workspace after the callback's restore teardown succeeds or fails:
 
 ```powershell
@@ -1075,8 +1159,14 @@ function New-RehearsalSecret {
 # Do not import the production .env file. Compose interpolation receives only
 # synthetic rehearsal values, and SMTP is deliberately confined to container loopback.
 $env:DATABASE_NAME = 'restore_rehearsal'
-$env:DATABASE_USER = 'restore_rehearsal'
+$env:DATABASE_OWNER_USER = 'restore_rehearsal_owner'
+$env:DATABASE_OWNER_PASSWORD = New-RehearsalSecret
+$env:DATABASE_USER = 'restore_rehearsal_web'
 $env:DATABASE_PASSWORD = New-RehearsalSecret
+$env:DATABASE_WORKER_USER = 'restore_rehearsal_worker'
+$env:DATABASE_WORKER_PASSWORD = New-RehearsalSecret
+$env:DATABASE_STORAGE_CLEANUP_USER = 'restore_rehearsal_storage_cleanup'
+$env:DATABASE_STORAGE_CLEANUP_PASSWORD = New-RehearsalSecret
 $env:AUTH_SECRET = New-RehearsalSecret
 $env:SMTP_PASSWORD = New-RehearsalSecret
 $env:BOOTSTRAP_ADMIN_PASSWORD = New-RehearsalSecret
@@ -1097,13 +1187,30 @@ Remove-Item -Path Env:STRIPE_SECRET_KEY, Env:STRIPE_WEBHOOK_SECRET,
   Env:STRIPE_SECRET_KEY_FILE, Env:STRIPE_WEBHOOK_SECRET_FILE -ErrorAction SilentlyContinue
 
 function Assert-RehearsalEnvironment {
-  foreach ($secretName in @('DATABASE_PASSWORD', 'AUTH_SECRET', 'SMTP_PASSWORD', 'BOOTSTRAP_ADMIN_PASSWORD')) {
+  foreach ($secretName in @('DATABASE_OWNER_PASSWORD', 'DATABASE_PASSWORD', 'DATABASE_WORKER_PASSWORD', 'DATABASE_STORAGE_CLEANUP_PASSWORD', 'AUTH_SECRET', 'SMTP_PASSWORD', 'BOOTSTRAP_ADMIN_PASSWORD')) {
     if ([Environment]::GetEnvironmentVariable($secretName) -notmatch '^[0-9a-f]{64}$') {
       throw "$secretName is not a synthetic rehearsal secret"
     }
   }
+  $databaseRoleNames = @(
+    $env:DATABASE_OWNER_USER,
+    $env:DATABASE_USER,
+    $env:DATABASE_WORKER_USER,
+    $env:DATABASE_STORAGE_CLEANUP_USER
+  )
+  $databaseRolePasswords = @(
+    $env:DATABASE_OWNER_PASSWORD,
+    $env:DATABASE_PASSWORD,
+    $env:DATABASE_WORKER_PASSWORD,
+    $env:DATABASE_STORAGE_CLEANUP_PASSWORD
+  )
   if ($env:DATABASE_NAME -ne 'restore_rehearsal' -or
-      $env:DATABASE_USER -ne 'restore_rehearsal' -or
+      $env:DATABASE_OWNER_USER -ne 'restore_rehearsal_owner' -or
+      $env:DATABASE_USER -ne 'restore_rehearsal_web' -or
+      $env:DATABASE_WORKER_USER -ne 'restore_rehearsal_worker' -or
+      $env:DATABASE_STORAGE_CLEANUP_USER -ne 'restore_rehearsal_storage_cleanup' -or
+      ($databaseRoleNames | Sort-Object -Unique).Count -ne 4 -or
+      ($databaseRolePasswords | Sort-Object -Unique).Count -ne 4 -or
       $env:ORIGIN -ne 'https://restore.invalid' -or
       $env:SITE_ADDRESS -ne 'restore.invalid' -or
       $env:SMTP_HOST -ne '127.0.0.1' -or
@@ -1264,6 +1371,36 @@ function Get-RestoreProjectInventory {
   Assert-NativeSuccess 'inventory restore networks'
   $volumes = @(& docker --context $restoreDockerContext volume ls --quiet --filter $projectNameFilter)
   Assert-NativeSuccess 'inventory restore volumes'
+  $exactContainerNames = @(
+    "${restoreProject}-postgres-1", "${restoreProject}-app-1",
+    "${restoreProject}-worker-1", "${restoreProject}-migrate-1",
+    "${restoreProject}-database-role-provision-1",
+    "${restoreProject}-bootstrap-admin-1", "${restoreProject}-storage-cleanup-1",
+    "${restoreProject}-caddy-1"
+  )
+  $exactNetworkNames = @("${restoreProject}_default")
+  $exactVolumeNames = @(
+    "${restoreProject}_postgres_data", "${restoreProject}_book_storage",
+    "${restoreProject}_caddy_data", "${restoreProject}_caddy_config"
+  )
+  foreach ($exactName in $exactContainerNames) {
+    $matches = @(& docker --context $restoreDockerContext container ls --all --filter "name=$exactName" --format '{{.Names}}')
+    Assert-NativeSuccess 'inventory exact-name restore container'
+    $containers += @($matches | Where-Object { $_ -ceq $exactName })
+  }
+  foreach ($exactName in $exactNetworkNames) {
+    $matches = @(& docker --context $restoreDockerContext network ls --filter "name=$exactName" --format '{{.Name}}')
+    Assert-NativeSuccess 'inventory exact-name restore network'
+    $networks += @($matches | Where-Object { $_ -ceq $exactName })
+  }
+  foreach ($exactName in $exactVolumeNames) {
+    $matches = @(& docker --context $restoreDockerContext volume ls --filter "name=$exactName" --format '{{.Name}}')
+    Assert-NativeSuccess 'inventory exact-name restore volume'
+    $volumes += @($matches | Where-Object { $_ -ceq $exactName })
+  }
+  $containers = @($containers | Sort-Object -Unique)
+  $networks = @($networks | Sort-Object -Unique)
+  $volumes = @($volumes | Sort-Object -Unique)
   [pscustomobject]@{
     Containers = $containers
     Networks = $networks
@@ -1282,12 +1419,12 @@ function Assert-RestoreWorkerStopped {
 }
 function Invoke-RestoreSql {
   param([Parameter(Mandatory)][string]$Sql)
-  $output = @($Sql | & docker --context $restoreDockerContext compose --project-name $restoreProject --file compose.prod.yaml exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet -U $env:DATABASE_USER -d $env:DATABASE_NAME)
+  $output = @($Sql | & docker --context $restoreDockerContext compose --project-name $restoreProject --file compose.prod.yaml exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet -U $env:DATABASE_OWNER_USER -d $env:DATABASE_NAME)
   Assert-NativeSuccess 'execute isolated restore SQL'
   return $output
 }
 function Assert-RestoreMigrationJournal {
-  $journal = @(& docker --context $restoreDockerContext compose --project-name $restoreProject --file compose.prod.yaml exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 -U $env:DATABASE_USER -d $env:DATABASE_NAME -c 'copy (select * from drizzle.__drizzle_migrations order by id) to stdout with (format csv, header true)')
+  $journal = @(& docker --context $restoreDockerContext compose --project-name $restoreProject --file compose.prod.yaml exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 -U $env:DATABASE_OWNER_USER -d $env:DATABASE_NAME -c 'copy (select * from drizzle.__drizzle_migrations order by id) to stdout with (format csv, header true)')
   Assert-NativeSuccess 'capture restored migration journal'
   $actual = ConvertTo-CanonicalBackupText -Lines $journal -Header 'id,hash,created_at'
   $expected = (Get-Content -LiteralPath (Join-Path $verifiedRestore 'migration-journal.csv') -Raw -ErrorAction Stop).Replace([char]13, '')
@@ -1321,7 +1458,7 @@ function Assert-RestoredStorageSamples {
 function Invoke-FinancialRestoreVerifier {
   $verifiedSqlPath = Join-Path $verifiedRestore 'verify-financial-restore.sql'
   $verifiedSql = Get-Content -LiteralPath $verifiedSqlPath -Raw -ErrorAction Stop
-  $verifierOutput = @($verifiedSql | & docker --context $restoreDockerContext compose --project-name $restoreProject --file compose.prod.yaml exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet --csv -U $env:DATABASE_USER -d $env:DATABASE_NAME)
+  $verifierOutput = @($verifiedSql | & docker --context $restoreDockerContext compose --project-name $restoreProject --file compose.prod.yaml exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet --csv -U $env:DATABASE_OWNER_USER -d $env:DATABASE_NAME)
   Assert-NativeSuccess 'verify restored credential and financial invariants'
   $actualDiagnostics = ConvertTo-FinancialOperationalDiagnostics -Lines $verifierOutput
   $expectedDiagnosticPath = Join-Path $verifiedRestore 'financial-operational-diagnostics.csv'
@@ -1358,6 +1495,12 @@ $projectNameFilter = "name=${restoreProject}_"
   & docker --context $restoreDockerContext compose --project-name $restoreProject --file compose.prod.yaml up --detach --wait postgres
   Assert-NativeSuccess 'start isolated restore PostgreSQL'
   Assert-RestoreWorkerStopped
+  Assert-RestoreDockerEngineBinding
+  Assert-RehearsalEnvironment
+  Assert-RestoreWorkerStopped
+  & docker --context $restoreDockerContext compose --project-name $restoreProject --file compose.prod.yaml --profile tools run --rm migrate
+  Assert-NativeSuccess 'bootstrap target database roles before ACL restore'
+  Assert-RestoreWorkerStopped
 
   $restorePostgresIds = @(& docker --context $restoreDockerContext compose --project-name $restoreProject --file compose.prod.yaml ps -q postgres)
   Assert-NativeSuccess 'locate isolated restore PostgreSQL container'
@@ -1370,7 +1513,7 @@ $projectNameFilter = "name=${restoreProject}_"
   & docker --context $restoreDockerContext cp (Join-Path $verifiedRestore 'database.dump') "${restorePostgres}:/tmp/database.dump"
   Assert-NativeSuccess 'copy verified database dump into isolated restore'
   Assert-RestoreDockerEngineBinding
-  & docker --context $restoreDockerContext compose --project-name $restoreProject --file compose.prod.yaml exec -T postgres pg_restore -U $env:DATABASE_USER -d $env:DATABASE_NAME --clean --if-exists --no-owner /tmp/database.dump
+  & docker --context $restoreDockerContext compose --project-name $restoreProject --file compose.prod.yaml exec -T postgres pg_restore -U $env:DATABASE_OWNER_USER -d $env:DATABASE_NAME --clean --if-exists --no-owner /tmp/database.dump
   Assert-NativeSuccess 'restore verified PostgreSQL dump'
   Assert-RestoreWorkerStopped
 
@@ -1387,6 +1530,10 @@ $projectNameFilter = "name=${restoreProject}_"
   Assert-RestoreDockerEngineBinding
   & docker --context $restoreDockerContext compose --project-name $restoreProject --file compose.prod.yaml --profile tools run --rm migrate
   Assert-NativeSuccess 'run committed migrations in isolated restore'
+  Assert-RestoreWorkerStopped
+  Assert-RestoreDockerEngineBinding
+  & docker --context $restoreDockerContext compose --project-name $restoreProject --file compose.prod.yaml --profile tools run --rm database-role-provision
+  Assert-NativeSuccess 'provision isolated database roles'
   Assert-RestoreWorkerStopped
 
   Assert-RestoreMigrationJournal
@@ -1482,13 +1629,23 @@ new_rehearsal_secret() {
 # Do not source the production .env file. These are synthetic rehearsal-only
 # values, and SMTP can reach only loopback inside the maintenance app container.
 DATABASE_NAME=restore_rehearsal
-DATABASE_USER=restore_rehearsal
+DATABASE_OWNER_USER=restore_rehearsal_owner
+DATABASE_OWNER_PASSWORD="$(new_rehearsal_secret)" || exit 1
+DATABASE_USER=restore_rehearsal_web
 DATABASE_PASSWORD="$(new_rehearsal_secret)" || exit 1
+DATABASE_WORKER_USER=restore_rehearsal_worker
+DATABASE_WORKER_PASSWORD="$(new_rehearsal_secret)" || exit 1
+DATABASE_STORAGE_CLEANUP_USER=restore_rehearsal_storage_cleanup
+DATABASE_STORAGE_CLEANUP_PASSWORD="$(new_rehearsal_secret)" || exit 1
 AUTH_SECRET="$(new_rehearsal_secret)" || exit 1
 SMTP_PASSWORD="$(new_rehearsal_secret)" || exit 1
 BOOTSTRAP_ADMIN_PASSWORD="$(new_rehearsal_secret)" || exit 1
-export DATABASE_NAME DATABASE_USER
+export DATABASE_NAME DATABASE_OWNER_USER DATABASE_USER DATABASE_WORKER_USER
+export DATABASE_STORAGE_CLEANUP_USER
+export DATABASE_OWNER_PASSWORD
 export DATABASE_PASSWORD
+export DATABASE_WORKER_PASSWORD
+export DATABASE_STORAGE_CLEANUP_PASSWORD
 export AUTH_SECRET
 export SMTP_PASSWORD
 export BOOTSTRAP_ADMIN_PASSWORD
@@ -1511,11 +1668,26 @@ export COMPOSE_DEFAULT_NETWORK_INTERNAL
 unset STRIPE_SECRET_KEY STRIPE_WEBHOOK_SECRET STRIPE_SECRET_KEY_FILE STRIPE_WEBHOOK_SECRET_FILE
 
 assert_rehearsal_environment() {
-  for secret_value in "$DATABASE_PASSWORD" "$AUTH_SECRET" "$SMTP_PASSWORD" "$BOOTSTRAP_ADMIN_PASSWORD"; do
+  for secret_value in "$DATABASE_OWNER_PASSWORD" "$DATABASE_PASSWORD" "$DATABASE_WORKER_PASSWORD" "$DATABASE_STORAGE_CLEANUP_PASSWORD" "$AUTH_SECRET" "$SMTP_PASSWORD" "$BOOTSTRAP_ADMIN_PASSWORD"; do
     printf '%s\n' "$secret_value" | grep -Eq '^[0-9a-f]{64}$' || return 1
   done
   [ "$DATABASE_NAME" = restore_rehearsal ] || return 1
-  [ "$DATABASE_USER" = restore_rehearsal ] || return 1
+  [ "$DATABASE_OWNER_USER" = restore_rehearsal_owner ] || return 1
+  [ "$DATABASE_USER" = restore_rehearsal_web ] || return 1
+  [ "$DATABASE_WORKER_USER" = restore_rehearsal_worker ] || return 1
+  [ "$DATABASE_STORAGE_CLEANUP_USER" = restore_rehearsal_storage_cleanup ] || return 1
+  [ "$DATABASE_OWNER_USER" != "$DATABASE_USER" ] || return 1
+  [ "$DATABASE_OWNER_USER" != "$DATABASE_WORKER_USER" ] || return 1
+  [ "$DATABASE_USER" != "$DATABASE_WORKER_USER" ] || return 1
+  [ "$DATABASE_OWNER_USER" != "$DATABASE_STORAGE_CLEANUP_USER" ] || return 1
+  [ "$DATABASE_USER" != "$DATABASE_STORAGE_CLEANUP_USER" ] || return 1
+  [ "$DATABASE_WORKER_USER" != "$DATABASE_STORAGE_CLEANUP_USER" ] || return 1
+  [ "$DATABASE_OWNER_PASSWORD" != "$DATABASE_PASSWORD" ] || return 1
+  [ "$DATABASE_OWNER_PASSWORD" != "$DATABASE_WORKER_PASSWORD" ] || return 1
+  [ "$DATABASE_PASSWORD" != "$DATABASE_WORKER_PASSWORD" ] || return 1
+  [ "$DATABASE_OWNER_PASSWORD" != "$DATABASE_STORAGE_CLEANUP_PASSWORD" ] || return 1
+  [ "$DATABASE_PASSWORD" != "$DATABASE_STORAGE_CLEANUP_PASSWORD" ] || return 1
+  [ "$DATABASE_WORKER_PASSWORD" != "$DATABASE_STORAGE_CLEANUP_PASSWORD" ] || return 1
   [ "$ORIGIN" = https://restore.invalid ] || return 1
   [ "$SITE_ADDRESS" = restore.invalid ] || return 1
   [ "$SMTP_HOST" = 127.0.0.1 ] || return 1
@@ -1543,6 +1715,28 @@ get_restore_project_inventory() {
   restore_containers="$(restore_docker container ls --all --quiet --filter "$project_label")" || return 1
   restore_networks="$(restore_docker network ls --quiet --filter "$project_name_filter")" || return 1
   restore_volumes="$(restore_docker volume ls --quiet --filter "$project_name_filter")" || return 1
+  for exact_name in \
+    "${restore_project}-postgres-1" "${restore_project}-app-1" \
+    "${restore_project}-worker-1" "${restore_project}-migrate-1" \
+    "${restore_project}-database-role-provision-1" \
+    "${restore_project}-bootstrap-admin-1" "${restore_project}-storage-cleanup-1" \
+    "${restore_project}-caddy-1"; do
+    exact_matches="$(restore_docker container ls --all --filter "name=$exact_name" --format '{{.Names}}')" || return 1
+    exact_match="$(printf '%s\n' "$exact_matches" | awk -v expected="$exact_name" '$0 == expected')" || return 1
+    restore_containers="$(printf '%s\n%s\n' "$restore_containers" "$exact_match" | awk 'NF' | sort -u)" || return 1
+  done
+  for exact_name in "${restore_project}_default"; do
+    exact_matches="$(restore_docker network ls --filter "name=$exact_name" --format '{{.Name}}')" || return 1
+    exact_match="$(printf '%s\n' "$exact_matches" | awk -v expected="$exact_name" '$0 == expected')" || return 1
+    restore_networks="$(printf '%s\n%s\n' "$restore_networks" "$exact_match" | awk 'NF' | sort -u)" || return 1
+  done
+  for exact_name in \
+    "${restore_project}_postgres_data" "${restore_project}_book_storage" \
+    "${restore_project}_caddy_data" "${restore_project}_caddy_config"; do
+    exact_matches="$(restore_docker volume ls --filter "name=$exact_name" --format '{{.Name}}')" || return 1
+    exact_match="$(printf '%s\n' "$exact_matches" | awk -v expected="$exact_name" '$0 == expected')" || return 1
+    restore_volumes="$(printf '%s\n%s\n' "$restore_volumes" "$exact_match" | awk 'NF' | sort -u)" || return 1
+  done
   printf '%s\n%s\n%s\n' "$restore_containers" "$restore_networks" "$restore_volumes" | awk 'NF'
 }
 assert_restore_project_absent() {
@@ -1572,12 +1766,12 @@ assert_restore_image_binding() {
   printf '%s\n' "$restore_postgres_repo_digests" | grep -F -x "$POSTGRES_IMAGE" >/dev/null || return 1
 }
 compare_migration_journal() {
-  restored_journal="$(compose_restore exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 -U "$DATABASE_USER" -d "$DATABASE_NAME" -c 'copy (select * from drizzle.__drizzle_migrations order by id) to stdout with (format csv, header true)')" || return 1
+  restored_journal="$(compose_restore exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 -U "$DATABASE_OWNER_USER" -d "$DATABASE_NAME" -c 'copy (select * from drizzle.__drizzle_migrations order by id) to stdout with (format csv, header true)')" || return 1
   expected_journal="$(tr -d '\r' < "$verified_restore/migration-journal.csv")" || return 1
   [ "$(printf '%s\n' "$restored_journal" | tr -d '\r')" = "$expected_journal" ] || return 1
 }
 compare_restore_row_counts() {
-  restored_counts="$(compose_restore exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet -U "$DATABASE_USER" -d "$DATABASE_NAME" < scripts/capture-restore-row-counts.sql)" || return 1
+  restored_counts="$(compose_restore exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet -U "$DATABASE_OWNER_USER" -d "$DATABASE_NAME" < scripts/capture-restore-row-counts.sql)" || return 1
   expected_counts="$(tr -d '\r' < "$verified_restore/restore-row-counts.csv")" || return 1
   [ "$(printf '%s\n' "$restored_counts" | tr -d '\r')" = "$expected_counts" ] || return 1
 }
@@ -1657,7 +1851,7 @@ verify_restored_storage_samples() {
   } < "$verified_restore/storage-samples.csv" || return 1
 }
 run_financial_restore_verifier() {
-  restore_verifier_output="$(compose_restore exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet --csv -U "$DATABASE_USER" -d "$DATABASE_NAME" < "$verified_restore/verify-financial-restore.sql")" || return 1
+  restore_verifier_output="$(compose_restore exec -T postgres psql -X --no-psqlrc --set ON_ERROR_STOP=1 --quiet --csv -U "$DATABASE_OWNER_USER" -d "$DATABASE_NAME" < "$verified_restore/verify-financial-restore.sql")" || return 1
   actual_financial_diagnostics="$(canonicalize_financial_operational_diagnostics "$restore_verifier_output")" || return 1
   authenticated_financial_output="$(cat -- "$verified_restore/financial-operational-diagnostics.csv")" || return 1
   expected_financial_diagnostics="$(canonicalize_financial_operational_diagnostics "$authenticated_financial_output")" || return 1
@@ -1735,6 +1929,11 @@ assert_rehearsal_environment || exit 1
 assert_restore_worker_stopped || exit 1
 compose_restore up --detach --wait postgres || exit 1
 assert_restore_worker_stopped || exit 1
+assert_restore_engine_binding || exit 1
+assert_rehearsal_environment || exit 1
+assert_restore_worker_stopped || exit 1
+compose_restore --profile tools run --rm migrate || exit 1
+assert_restore_worker_stopped || exit 1
 
 restore_postgres="$(compose_restore ps -q postgres)" || exit 1
 [ -n "$restore_postgres" ] || exit 1
@@ -1743,7 +1942,7 @@ restore_dump_present=1
 assert_restore_engine_binding || exit 1
 restore_docker cp "$verified_restore/database.dump" "${restore_postgres}:/tmp/database.dump" || exit 1
 assert_restore_engine_binding || exit 1
-compose_restore exec -T postgres pg_restore -U "$DATABASE_USER" -d "$DATABASE_NAME" --clean --if-exists --no-owner /tmp/database.dump || exit 1
+compose_restore exec -T postgres pg_restore -U "$DATABASE_OWNER_USER" -d "$DATABASE_NAME" --clean --if-exists --no-owner /tmp/database.dump || exit 1
 assert_restore_worker_stopped || exit 1
 
 assert_restore_engine_binding || exit 1
@@ -1755,6 +1954,9 @@ assert_restore_engine_binding || exit 1
 restore_docker run --rm --pull never --network none --read-only --cap-drop ALL --cap-add DAC_OVERRIDE --security-opt no-new-privileges -v "${restore_project}_book_storage:/restore:ro" "$BACKUP_HELPER_IMAGE" sh -eu -c 'unsafe="$(find /restore -xdev ! -type d ! -type f -print -quit)" || exit 1; test -z "$unsafe"' || exit 1
 assert_restore_engine_binding || exit 1
 compose_restore --profile tools run --rm migrate || exit 1
+assert_restore_worker_stopped || exit 1
+assert_restore_engine_binding || exit 1
+compose_restore --profile tools run --rm database-role-provision || exit 1
 assert_restore_worker_stopped || exit 1
 
 compare_migration_journal || exit 1

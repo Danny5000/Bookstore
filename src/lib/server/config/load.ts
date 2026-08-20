@@ -4,7 +4,25 @@ import {
   type EnvironmentValues,
   type SecretFileReader
 } from './read-setting';
-import { parseApplicationConfig, type ApplicationConfig } from './schema';
+import {
+  parseApplicationConfig,
+  parseDatabaseConfig,
+  type ApplicationConfig,
+  type ApplicationConfigScope,
+  type DatabaseConfig
+} from './schema';
+
+const DATABASE_SETTINGS = [
+  'DATABASE_HOST',
+  'DATABASE_PORT',
+  'DATABASE_NAME',
+  'DATABASE_USER',
+  'DATABASE_PASSWORD',
+  'DATABASE_POOL_MAX',
+  'DATABASE_CONNECTION_TIMEOUT_MS',
+  'DATABASE_STATEMENT_TIMEOUT_MS',
+  'DATABASE_READINESS_TIMEOUT_MS'
+] as const;
 
 const REQUIRED_SETTINGS = [
   'APP_ENV',
@@ -65,15 +83,20 @@ const REQUIRED_SETTINGS = [
 const OPTIONAL_SETTINGS = [
   'SMTP_USER',
   'SMTP_PASSWORD',
-  'STORAGE_LOCAL_ROOT',
+  'STORAGE_STAGING_ROOT',
+  'STORAGE_PUBLICATION_ROOT',
+  'STORAGE_COVERS_ROOT',
+  'STORAGE_SCRATCH_ROOT',
   'STRIPE_SECRET_KEY',
   'STRIPE_WEBHOOK_SECRET',
   'STRIPE_TAX_CODE_PROSE',
   'STRIPE_TAX_CODE_COMIC'
 ] as const;
 
-export function loadApplicationConfig(
+function loadScopedApplicationConfig(
   source: EnvironmentValues,
+  scope: ApplicationConfigScope,
+  optionalSettings: readonly (typeof OPTIONAL_SETTINGS)[number][],
   readSecretFile?: SecretFileReader
 ): ApplicationConfig {
   return parseApplicationConfig(
@@ -82,10 +105,53 @@ export function loadApplicationConfig(
         name,
         readRequiredSetting(source, name, readSecretFile)
       ]),
-      ...OPTIONAL_SETTINGS.map((name) => [
+      ...optionalSettings.map((name) => [
         name,
         readOptionalSetting(source, name, readSecretFile)
       ])
-    ])
+    ]),
+    scope
+  );
+}
+
+export function loadApplicationConfig(
+  source: EnvironmentValues,
+  readSecretFile?: SecretFileReader
+): ApplicationConfig {
+  return loadScopedApplicationConfig(source, 'full', OPTIONAL_SETTINGS, readSecretFile);
+}
+
+export function loadWebApplicationConfig(
+  source: EnvironmentValues,
+  readSecretFile?: SecretFileReader
+): ApplicationConfig {
+  return loadScopedApplicationConfig(
+    source,
+    'web',
+    OPTIONAL_SETTINGS.filter((name) => name !== 'SMTP_USER' && name !== 'SMTP_PASSWORD'),
+    readSecretFile
+  );
+}
+
+export function loadWorkerApplicationConfig(
+  source: EnvironmentValues,
+  readSecretFile?: SecretFileReader
+): ApplicationConfig {
+  return loadScopedApplicationConfig(
+    source,
+    'worker',
+    OPTIONAL_SETTINGS.filter((name) => name !== 'STRIPE_WEBHOOK_SECRET'),
+    readSecretFile
+  );
+}
+
+export function loadDatabaseConfig(
+  source: EnvironmentValues,
+  readSecretFile?: SecretFileReader
+): DatabaseConfig {
+  return parseDatabaseConfig(
+    Object.fromEntries(
+      DATABASE_SETTINGS.map((name) => [name, readRequiredSetting(source, name, readSecretFile)])
+    )
   );
 }

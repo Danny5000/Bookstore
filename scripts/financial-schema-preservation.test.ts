@@ -322,6 +322,123 @@ describe('Plan 6B financial schema preservation', () => {
     );
   });
 
+  it('ships a fail-closed worker-only issue-resolution authority boundary after migration 0007', () => {
+    const lockdown = source('../drizzle/0008_plan6b_worker_issue_resolution.sql');
+    const migration = source('../drizzle/0009_plan6b_worker_authority_and_commerce_integrity.sql');
+
+    expect(lockdown).toContain('pg_catalog.to_regprocedure(');
+    expect(lockdown).toContain(
+      'public.resolve_financial_reconciliation_issue(uuid,uuid,public.audit_actor_type,text,text)'
+    );
+    expect(lockdown).toContain("function_row.prokind = 'f'");
+    expect(lockdown).not.toContain('pronargs');
+    expect(lockdown).toContain("'DROP FUNCTION %s'");
+    expect(lockdown).not.toContain('resolve_financial_issue_after_worker_recompute');
+    expect(migration).toContain('CREATE ROLE "pale_orbit_runtime" NOLOGIN');
+    expect(migration).toContain('CREATE ROLE "pale_orbit_financial_worker" NOLOGIN');
+    expect(migration).toContain(
+      'ALTER ROLE "pale_orbit_runtime" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS'
+    );
+    expect(migration).toContain(
+      'ALTER ROLE "pale_orbit_financial_worker" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS'
+    );
+    expect(migration).toContain('FROM pg_catalog.pg_auth_members membership');
+    expect(migration).toContain('pg_catalog.aclexplode');
+    expect(migration).toContain('pg_catalog.pg_parameter_acl');
+    expect(migration).toContain('pg_catalog.pg_default_acl');
+    expect(migration).toContain('pg_catalog.pg_db_role_setting');
+    expect(migration).toContain('pg_catalog.pg_shdepend');
+    expect(migration).toContain('WITH ADMIN FALSE, INHERIT TRUE, SET FALSE');
+    expect(migration).toContain('unsafe pre-existing Plan 6B database authority roles');
+    expect(migration).toContain('financial_reconciliation_issues_semantic_identity');
+    expect(migration).toContain('invalid legacy financial issue resource/code identity');
+    expect(migration).toContain('financial_reconciliation_issues_semantic_impact');
+    expect(migration).toContain('invalid legacy financial issue impact');
+    expect(migration).toContain('invalid legacy financial issue resource identity');
+    expect(migration).toContain('missing legacy unknown classification issue');
+    expect(migration).toContain('invalid legacy financial issue resolution audit provenance');
+    expect(migration).toContain("audit.actor_id = 'commerce-worker'");
+    expect(migration).toMatch(
+      /resource_type = 'dispute'[\s\S]*resource_type = 'allocation_set'[\s\S]*'allocation_mismatch'[\s\S]*'unsupported_category'/u
+    );
+    expect(migration).toMatch(
+      /resource_type in \('payment', 'refund', 'dispute', 'allocation_set'\)[\s\S]*safe_code in \([\s\S]*'allocation_fork'[\s\S]*'unsupported_category'[\s\S]*resource_type = 'payout'[\s\S]*'payout_membership_conflict'[\s\S]*resource_type = 'balance_transaction'[\s\S]*'classification_fork'[\s\S]*resource_type = 'financial_classification'[\s\S]*safe_code = 'unsupported_category'/u
+    );
+    expect(migration).toMatch(
+      /safe_code in \('allocation_incomplete', 'missing_source'\)[\s\S]*impact = 'pending'[\s\S]*impact = 'exception'/u
+    );
+    expect(migration).toContain(
+      'CREATE OR REPLACE FUNCTION "public"."plan6b_validate_issue_insert"'
+    );
+    expect(migration).toContain('FOR KEY SHARE');
+    expect(migration).toContain(
+      'CREATE FUNCTION "public"."plan6b_validate_unknown_classification_issue"'
+    );
+    expect(migration).toContain('financial_classification_versions_unknown_issue_required');
+    expect(migration).toContain(
+      'CREATE FUNCTION "public"."plan6b_guard_financial_issue_subject_mutation"'
+    );
+    for (const trigger of [
+      'payments_financial_issue_subject_guard',
+      'refunds_financial_issue_subject_guard',
+      'disputes_financial_issue_subject_guard'
+    ]) expect(migration).toContain(trigger);
+    expect(migration).toContain('REVOKE ALL ON SCHEMA "public" FROM PUBLIC');
+    expect(migration).toContain(
+      'CREATE FUNCTION "public"."resolve_financial_issue_after_worker_recompute"'
+    );
+    expect(migration).toContain('SECURITY DEFINER');
+    expect(migration).toContain("SET search_path = 'pg_catalog'");
+    expect(migration).toContain("'system'::\"public\".\"audit_actor_type\"");
+    expect(migration).toContain("'financial-worker'");
+    expect(migration).toContain(
+      'REVOKE ALL ON FUNCTION "public"."resolve_financial_issue_after_worker_recompute"(uuid,text) FROM PUBLIC'
+    );
+    expect(migration).toContain(
+      'GRANT EXECUTE ON FUNCTION "public"."resolve_financial_issue_after_worker_recompute"(uuid,text) TO "pale_orbit_financial_worker"'
+    );
+    expect(migration).toContain('current_user IS DISTINCT FROM');
+    expect(migration).toContain(
+      "'public.resolve_financial_issue_after_worker_recompute(uuid,text)'::pg_catalog.regprocedure"
+    );
+    expect(migration).not.toContain('PG_CONTEXT');
+    expect(migration).not.toContain('p_actor_type');
+    expect(migration).not.toContain('p_actor_id');
+    expect(migration).not.toContain('p_resolved_by_admin_id');
+  });
+
+  it('locks and rejects contradictory legacy payout membership and source-principal evidence before 0009', () => {
+    const migration = source('../drizzle/0009_plan6b_worker_authority_and_commerce_integrity.sql');
+    const lockStatement = migration.match(/(?:^|\r?\n)LOCK TABLE[\s\S]*?IN SHARE ROW EXCLUSIVE MODE;/u)?.[0];
+    const principalPreflight = migration.match(
+      /IF EXISTS \([\s\S]*?invalid legacy fee-reconciled source principal parity[\s\S]*?END IF;/u
+    )?.[0];
+
+    expect(lockStatement).toBeDefined();
+    expect(lockStatement).toContain('"stripe_payout_balance_transactions"');
+    expect(migration).toContain('invalid legacy payout membership currency');
+    expect(migration).toMatch(
+      /stripe_payout_balance_transactions[\s\S]*?stripe_payouts[\s\S]*?stripe_balance_transactions[\s\S]*?balance\.currency is distinct from payout\.currency/iu
+    );
+    expect(principalPreflight).toBeDefined();
+    expect(principalPreflight).toContain('first_dispute_withdrawal_balance');
+    expect(principalPreflight).toMatch(
+      /balance\.source_family = 'charge'[\s\S]*?balance\.source_id = payment\.stripe_latest_charge_id[\s\S]*?balance\.reporting_category = 'charge'[\s\S]*?payment\.financial_evidence_status = 'fee_reconciled'[\s\S]*?balance\.currency = payment\.currency[\s\S]*?balance\.amount_minor <> payment\.amount_minor/u
+    );
+    expect(principalPreflight).toMatch(
+      /balance\.source_family = 'refund'[\s\S]*?balance\.source_id = refund\.stripe_refund_id[\s\S]*?balance\.reporting_category = 'refund'[\s\S]*?refund\.financial_evidence_status = 'fee_reconciled'[\s\S]*?balance\.currency = refund\.currency[\s\S]*?balance\.amount_minor <> -refund\.amount_minor/u
+    );
+    expect(principalPreflight).toMatch(
+      /first_dispute_withdrawal_balance[\s\S]*?reporting_category = 'dispute'[\s\S]*?provider_created_at[\s\S]*?provider_id collate "C"[\s\S]*?classification = 'dispute_withdrawal'[\s\S]*?sum\(presentment\.total_effect_minor\)[\s\S]*?<>\s*-first_withdrawal\.amount_minor/iu
+    );
+    expect(principalPreflight).not.toMatch(
+      /reporting_category = 'dispute_reversal'[\s\S]*?amount_minor <> -dispute\.amount_minor/u
+    );
+    expect(principalPreflight).not.toMatch(
+      /reporting_category = 'fee'[\s\S]*?amount_minor <> -dispute\.amount_minor/u
+    );
+  });
+
   it('binds every dispute presentment row to its exact dispute gross allocation set', () => {
     const migration = source('../drizzle/0007_plan6b_financial_reconciliation.sql');
 

@@ -163,7 +163,7 @@ export async function lockCanonicalPaymentOrder(
 
 export interface PaymentPurchaseFacts {
   payment: PaymentRow;
-  order: OrderRow;
+  order: PaymentPurchaseOrderRow;
   refunds: readonly RefundRow[];
   refundDrafts: readonly RefundAllocationDraftRow[];
   refundDraftItems: readonly RefundAllocationDraftItemRow[];
@@ -176,6 +176,11 @@ export interface PaymentPurchaseFacts {
   orderItems: readonly OrderItemRow[];
 }
 
+export type PaymentPurchaseOrderRow = Pick<
+  OrderRow,
+  'id' | 'status' | 'currency' | 'totalMinor' | 'paidAt'
+>;
+
 /**
  * Once operation-local event or identity rows are locked, every commerce mutation follows the
  * same purchase-graph order: order, payment, refunds, refund drafts/items, finalized refund
@@ -185,7 +190,7 @@ export interface PaymentPurchaseFacts {
 export async function lockPaymentPurchaseFacts(
   transaction: DatabaseTransaction,
   payment: PaymentRow,
-  order: OrderRow
+  order: PaymentPurchaseOrderRow
 ): Promise<PaymentPurchaseFacts> {
   const lockedRefunds = await transaction
     .select()

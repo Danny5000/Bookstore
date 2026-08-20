@@ -150,11 +150,11 @@ describe('commerce schema declarations', () => {
       expect.arrayContaining(['payments_amount_nonnegative', 'payments_currency_iso'])
     );
     expect(checkNames(refunds)).toEqual(
-      expect.arrayContaining(['refunds_amount_nonnegative', 'refunds_currency_iso'])
+      expect.arrayContaining(['refunds_amount_positive', 'refunds_currency_iso'])
     );
-    expect(checkNames(refundAllocations)).toContain('refund_allocations_amount_nonnegative');
+    expect(checkNames(refundAllocations)).toContain('refund_allocations_amount_positive');
     expect(checkNames(disputes)).toEqual(
-      expect.arrayContaining(['disputes_amount_nonnegative', 'disputes_currency_iso'])
+      expect.arrayContaining(['disputes_amount_positive', 'disputes_currency_iso'])
     );
     expect(checkNames(entitlementGrants)).toEqual(
       expect.arrayContaining([

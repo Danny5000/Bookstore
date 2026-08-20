@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { sql } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
-import { databaseClient } from './database';
+import { ownerDatabaseClient as databaseClient } from './database';
 
 const FINANCIAL_TABLES = [
   'financial_projection_versions',
@@ -1174,9 +1174,17 @@ describe('Plan 6B financial schema', () => {
     const unknownDetail = mixedDetails.rows.find((detail) => detail.ordinal === 0);
     expect(unknownDetail).toBeDefined();
     await databaseClient.pool.query(
-      `insert into financial_classification_versions
-         (subject_type, subject_id, classifier_version, classification, source_fingerprint_sha256)
-       values ('fee_detail', $1, 1, 'unknown', repeat('1', 64))`,
+      `with classification as (
+         insert into financial_classification_versions
+           (subject_type, subject_id, classifier_version, classification, source_fingerprint_sha256)
+         values ('fee_detail', $1, 1, 'unknown', repeat('1', 64))
+         returning id
+       )
+       insert into financial_reconciliation_issues
+         (resource_type, resource_id, safe_code, impact, correlation_id)
+       select 'financial_classification', id, 'unsupported_category', 'exception',
+         'schema-mixed-unknown-fee'
+       from classification`,
       [unknownDetail!.id]
     );
     const mixedUnknownHead = await databaseClient.pool.query<ProjectionHead>(
@@ -1556,9 +1564,17 @@ describe('Plan 6B financial schema', () => {
   it('selects current classifier and allocation versions exactly in the presence of future history', async () => {
     const current = await createCorrectionProjectionFixture('current-with-future');
     await databaseClient.pool.query(
-      `insert into financial_classification_versions
-         (subject_type, subject_id, classifier_version, classification, source_fingerprint_sha256)
-       values ('balance_transaction', $1, 2, 'unknown', repeat('c', 64))`,
+      `with classification as (
+         insert into financial_classification_versions
+           (subject_type, subject_id, classifier_version, classification, source_fingerprint_sha256)
+         values ('balance_transaction', $1, 2, 'unknown', repeat('c', 64))
+         returning id
+       )
+       insert into financial_reconciliation_issues
+         (resource_type, resource_id, safe_code, impact, correlation_id)
+       select 'financial_classification', id, 'unsupported_category', 'exception',
+         'schema-future-unknown-classification'
+       from classification`,
       [current.balanceTransactionId]
     );
     const futureSuccessor = await expectSingleRow(

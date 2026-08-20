@@ -32,6 +32,7 @@ export interface IngestEpubInput {
   sourceKey: StorageKey;
   titleId: string;
   revisionId: string;
+  generation: number;
   limits: IngestionLimits;
   signal: AbortSignal;
 }
@@ -448,7 +449,12 @@ export async function ingestEpub(input: IngestEpubInput): Promise<EpubIngestionR
       const normalized = await normalizeImage({
         storage: input.storage,
         source: await archive.read(requireEntry(entries, path, 'epub_content')),
-        destination: revisionProseImageKey(input.titleId, input.revisionId, imageId),
+        destination: revisionProseImageKey(
+          input.titleId,
+          input.revisionId,
+          input.generation,
+          imageId
+        ),
         profile: 'epub',
         limits: input.limits,
         signal: input.signal
@@ -513,6 +519,7 @@ export async function ingestEpub(input: IngestEpubInput): Promise<EpubIngestionR
         destination: revisionCoverSuggestionKey(
           input.titleId,
           input.revisionId,
+          input.generation,
           suggestionId
         ),
         profile: 'epub',

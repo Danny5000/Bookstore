@@ -1,9 +1,10 @@
-import { loadApplicationConfig } from '$lib/server/config/load';
+import { loadDatabaseConfig } from '$lib/server/config/load';
 import { createDatabaseClient } from '$lib/server/db/client';
+import { databaseEnvironmentForRole } from '$lib/server/db/database-role-provision';
 import { migrateDatabase } from '$lib/server/db/migrate';
 
-const config = loadApplicationConfig(process.env);
-const databaseClient = createDatabaseClient(config.database);
+const database = loadDatabaseConfig(databaseEnvironmentForRole(process.env, 'owner'));
+const databaseClient = createDatabaseClient(database);
 
 try {
   await migrateDatabase(databaseClient.db);

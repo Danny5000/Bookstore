@@ -17,6 +17,7 @@ import type { IngestionLimits } from './limits';
 
 const titleId = '018f0000-0000-7000-8000-000000000010';
 const revisionId = '018f0000-0000-7000-8000-000000000011';
+const generation = 4;
 const limits: IngestionLimits = Object.freeze({
   maxUploadBytes: 20_000_000,
   maxExpandedBytes: 30_000_000,
@@ -59,6 +60,7 @@ describe('comic archive ingestion', () => {
       sourceKey,
       titleId,
       revisionId,
+      generation,
       limits,
       signal: AbortSignal.timeout(5_000)
     });
@@ -74,6 +76,9 @@ describe('comic archive ingestion', () => {
     ]);
     expect(result.pages.every((page) => page.mediaType === 'image/webp')).toBe(true);
     expect(result.pages.every((page) => page.width === 1 && page.height === 1)).toBe(true);
+    expect(result.pages.every((page) =>
+      page.storageKey.includes('/derived/v1/generations/4/comic-pages/')
+    )).toBe(true);
     expect(
       result.pages.every(
         (page) =>
@@ -90,6 +95,8 @@ describe('comic archive ingestion', () => {
       width: 1,
       height: 1
     });
+    expect(result.coverSuggestion.storageKey)
+      .toContain('/derived/v1/generations/4/cover-suggestions/');
     expect(result.warnings).toEqual([]);
   });
 
@@ -184,6 +191,7 @@ describe('comic archive ingestion', () => {
         sourceKey,
         titleId,
         revisionId,
+        generation,
         limits: { ...limits, maxImagePixels: 1_000 },
         signal: AbortSignal.timeout(5_000)
       })

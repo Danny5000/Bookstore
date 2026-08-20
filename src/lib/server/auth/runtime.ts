@@ -26,6 +26,10 @@ export function getAuthServer(): ReturnType<typeof createAuthServer> {
     canSendMagicLink: (email) => canSendMagicLink(database, email),
     canSendCommerceMagicLink: (email) => canSendCommerceMagicLink(database, email),
     onUserCreated: (userId) => ensureCustomerRole(database, userId),
+    readCommerceClaimProof: (cookieName) =>
+      getRequestEvent().cookies.get(cookieName) ?? null,
+    clearCommerceClaimProof: (cookieName) =>
+      getRequestEvent().cookies.delete(cookieName, { path: '/' }),
     additionalPlugins: [sveltekitCookies(getRequestEvent)]
   });
   return authServer;

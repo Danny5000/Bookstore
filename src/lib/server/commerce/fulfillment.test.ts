@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import type { OrderItemRow, OrderRow } from '$lib/server/db/schema';
+import type { GuestIdentityRow, OrderItemRow, OrderRow } from '$lib/server/db/schema';
 import {
   checkoutSnapshotFixture,
   FIXTURE_ORDER_ID,
@@ -8,7 +8,7 @@ import {
 } from '../../../../tests/fixtures/stripe/checkout';
 import { paymentSnapshotFixture } from '../../../../tests/fixtures/stripe/payment';
 import { PermanentCommerceError } from './errors';
-import { validateFulfillmentCommand } from './fulfillment';
+import { resolvePaidFulfillmentOwnership, validateFulfillmentCommand } from './fulfillment';
 
 const createdAt = new Date('2026-08-10T12:00:00.000Z');
 const accountUserId = randomUUID();
@@ -66,6 +66,51 @@ function validate(overrides: Record<string, unknown> = {}) {
 }
 
 describe('canonical fulfillment validation', () => {
+  it('routes an already-claimed guest purchase directly to its exact verified owner', () => {
+    const claimantId = randomUUID();
+    const identity: GuestIdentityRow = {
+      id: randomUUID(),
+      email: 'reader@example.com',
+      claimedByUserId: claimantId,
+      claimedAt: createdAt,
+      createdAt,
+      updatedAt: createdAt
+    };
+    expect(resolvePaidFulfillmentOwnership(
+      order({ initiatingUserId: null, guestIdentityId: null, purchaseEmail: null }),
+      'reader@example.com',
+      identity,
+      { id: claimantId, email: 'reader@example.com', emailVerified: true }
+    )).toEqual({
+      guestIdentityId: identity.id,
+      grantUserId: claimantId,
+      message: 'guest-receipt-without-claim'
+    });
+    expect(resolvePaidFulfillmentOwnership(
+      order({ initiatingUserId: null, guestIdentityId: null, purchaseEmail: null }),
+      'reader@example.com',
+      { ...identity, claimedByUserId: null, claimedAt: null },
+      undefined
+    )).toEqual({
+      guestIdentityId: identity.id,
+      grantUserId: null,
+      message: 'guest-claim-preparation'
+    });
+    for (const claimant of [
+      undefined,
+      { id: claimantId, email: 'reader@example.com', emailVerified: false },
+      { id: claimantId, email: 'other@example.com', emailVerified: true },
+      { id: randomUUID(), email: 'reader@example.com', emailVerified: true }
+    ]) {
+      expect(() => resolvePaidFulfillmentOwnership(
+        order({ initiatingUserId: null, guestIdentityId: null, purchaseEmail: null }),
+        'reader@example.com',
+        identity,
+        claimant
+      )).toThrow(PermanentCommerceError);
+    }
+  });
+
   it('returns a paid account command using only the stored verified email snapshot', () => {
     expect(validate()).toEqual({
       state: 'paid',

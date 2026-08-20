@@ -1,8 +1,9 @@
 import { readFile, readdir } from 'node:fs/promises';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
-import { execFile, spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { execFile, spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -16,6 +17,510 @@ const restoreVerifierWitnessPath = fileURLToPath(
   new URL('./execute-financial-restore-verifier.ts', import.meta.url)
 );
 const withTestDatabasePath = fileURLToPath(new URL('./with-test-database.ts', import.meta.url));
+const databaseRoleProvisionUrl = new URL(
+  '../src/lib/server/db/database-role-provision.ts',
+  import.meta.url
+).href;
+const ownerRestoreVerifierLauncher = `
+import { spawnSync } from 'node:child_process';
+import { databaseEnvironmentForRole } from ${JSON.stringify(databaseRoleProvisionUrl)};
+const [verifierPath, ...verifierArguments] = process.argv.slice(1);
+const result = spawnSync(
+  process.execPath,
+  ['--import', 'tsx', verifierPath, ...verifierArguments],
+  { env: databaseEnvironmentForRole(process.env, 'owner'), stdio: 'inherit' }
+);
+process.exit(result.status ?? 1);
+`;
+// Keep the harness itself on direct Node. On Windows, `npx tsx` consumes nested
+// child Node flags, while the harness also needs npm_execpath inherited from Vitest.
+
+function directNodeHarnessEnvironment(): NodeJS.ProcessEnv {
+  if (process.platform === 'win32' && !process.env.npm_execpath?.trim()) {
+    throw new Error('npm_execpath is required for the direct Node test-database harness');
+  }
+  return process.env;
+}
+
+const financialWitnessHarnessTimeoutMs = 600_000;
+const financialWitnessCloseGraceMs = 15_000;
+const financialWitnessTestTimeoutMs = 900_000;
+const testDatabaseProjectPattern = /^pale-orbit-test-[0-9a-f]{16}$/u;
+const testStorageDirectoryPattern = /^pale-orbit-test-storage-[A-Za-z0-9_-]+$/u;
+const composeTestFilePath = resolve(
+  fileURLToPath(new URL('../compose.test.yaml', import.meta.url))
+);
+
+type TestDockerResourceKind = 'container' | 'network' | 'volume';
+
+interface FinancialHarnessDockerResource {
+  readonly id: string;
+  readonly kind: TestDockerResourceKind;
+  readonly labels: Readonly<Record<string, string>>;
+}
+
+interface BoundedFinancialWitnessHarnessResult {
+  readonly cleanup: string | null;
+  readonly signal: NodeJS.Signals | null;
+  readonly status: number | null;
+  readonly stderr: string;
+  readonly stdout: string;
+  readonly timedOut: boolean;
+}
+
+interface FinancialWitnessHarnessClose {
+  readonly signal: NodeJS.Signals | null;
+  readonly status: number | null;
+}
+
+async function waitForFinancialWitnessHarnessClose(
+  close: Promise<FinancialWitnessHarnessClose>,
+  timeoutMs: number
+): Promise<FinancialWitnessHarnessClose | null> {
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      close,
+      new Promise<null>((resolveTimeout) => {
+        timeout = setTimeout(() => resolveTimeout(null), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+function identifiers(output: string): string[] {
+  return output.split(/\r?\n/u).map((value) => value.trim()).filter(Boolean);
+}
+
+function financialHarnessDockerCommand(
+  arguments_: readonly string[],
+  timeout = 15_000
+): string {
+  const result = spawnSync('docker', [...arguments_], {
+    cwd: new URL('.', root),
+    encoding: 'utf8',
+    timeout
+  });
+  if (result.status !== 0) {
+    const detail = `${result.stdout}${result.stderr}`.trim();
+    throw new Error(
+      `docker ${arguments_.join(' ')} exited with ${result.status ?? 'no status'}${
+        detail ? `: ${detail}` : ''
+      }`
+    );
+  }
+  return result.stdout.trim();
+}
+
+function financialHarnessResourceIds(
+  kind: TestDockerResourceKind,
+  project?: string
+): string[] {
+  const filter = project
+    ? `label=com.docker.compose.project=${project}`
+    : 'label=com.docker.compose.project';
+  const arguments_ = kind === 'container'
+    ? ['ps', '--all', '--quiet', '--filter', filter]
+    : [kind, 'ls', '--quiet', '--filter', filter];
+  return identifiers(financialHarnessDockerCommand(arguments_));
+}
+
+function financialHarnessExactResourceIds(
+  kind: TestDockerResourceKind,
+  name: string
+): string[] {
+  const filter = kind === 'container' ? `name=^/${name}$` : `name=^${name}$`;
+  const arguments_ = kind === 'container'
+    ? ['ps', '--all', '--quiet', '--filter', filter]
+    : [kind, 'ls', '--quiet', '--filter', filter];
+  return identifiers(financialHarnessDockerCommand(arguments_));
+}
+
+function financialHarnessResourceLabels(
+  kind: TestDockerResourceKind,
+  id: string
+): Readonly<Record<string, string>> {
+  const labels = kind === 'container' ? '.Config.Labels' : '.Labels';
+  const serialized = financialHarnessDockerCommand([
+    kind,
+    'inspect',
+    '--format',
+    `{{ json ${labels} }}`,
+    id
+  ]);
+  const parsed = JSON.parse(serialized) as unknown;
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`invalid Docker labels for ${kind} ${id}`);
+  }
+  return parsed as Record<string, string>;
+}
+
+function financialHarnessDockerSnapshot(): Map<string, FinancialHarnessDockerResource> {
+  const resources = new Map<string, FinancialHarnessDockerResource>();
+  for (const kind of ['container', 'network', 'volume'] as const) {
+    for (const id of financialHarnessResourceIds(kind)) {
+      resources.set(`${kind}:${id}`, {
+        id,
+        kind,
+        labels: financialHarnessResourceLabels(kind, id)
+      });
+    }
+  }
+  return resources;
+}
+
+function testStorageDirectories(): Set<string> {
+  const temporaryRoot = resolve(tmpdir());
+  return new Set(
+    readdirSync(tmpdir(), { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && testStorageDirectoryPattern.test(entry.name))
+      .map((entry) => resolve(temporaryRoot, entry.name))
+  );
+}
+
+function exactNewFinancialHarnessProject(
+  baseline: ReadonlyMap<string, FinancialHarnessDockerResource>,
+  current: ReadonlyMap<string, FinancialHarnessDockerResource>
+): string {
+  const newProjects = new Set<string>();
+  for (const [key, resource] of current) {
+    if (baseline.has(key)) continue;
+    const project = resource.labels['com.docker.compose.project'];
+    if (project && testDatabaseProjectPattern.test(project)) newProjects.add(project);
+  }
+  if (newProjects.size !== 1) {
+    throw new Error(
+      `expected exactly one new test project, found ${newProjects.size}: ${
+        [...newProjects].join(', ')
+      }`
+    );
+  }
+  return [...newProjects][0]!;
+}
+
+function exactNewFinancialHarnessStorageDirectory(
+  baseline: ReadonlySet<string>,
+  current: ReadonlySet<string>
+): string | null {
+  const added = [...current].filter((path) => !baseline.has(path));
+  if (added.length > 1) {
+    throw new Error(`refusing ambiguous new test storage directories: ${added.join(', ')}`);
+  }
+  return added[0] ?? null;
+}
+
+function dockerLabelsFingerprint(labels: Readonly<Record<string, string>>): string {
+  return JSON.stringify(Object.entries(labels).sort(([left], [right]) =>
+    left.localeCompare(right, 'en')
+  ));
+}
+
+function assertFinancialHarnessProjectOwned(
+  project: string,
+  baseline: ReadonlyMap<string, FinancialHarnessDockerResource>
+): void {
+  if (!testDatabaseProjectPattern.test(project)) {
+    throw new Error(`refusing invalid test database project ${project}`);
+  }
+  const projectResources = (['container', 'network', 'volume'] as const).flatMap(
+    (kind) => financialHarnessResourceIds(kind, project).map((id) => ({ id, kind }))
+  );
+  if (projectResources.length === 0) {
+    throw new Error(`refusing empty test database project snapshot for ${project}`);
+  }
+  for (const { id, kind } of projectResources) {
+    const key = `${kind}:${id}`;
+    if (baseline.has(key)) {
+      throw new Error(`refusing baseline ${kind} ${id} while cleaning ${project}`);
+    }
+    const labels = financialHarnessResourceLabels(kind, id);
+    if (labels['com.docker.compose.project'] !== project) {
+      throw new Error(`refusing foreign ${kind} ${id} while cleaning ${project}`);
+    }
+  }
+  const exactResources: ReadonlyArray<readonly [TestDockerResourceKind, string]> = [
+    ['container', `${project}-postgres-1`],
+    ['container', `${project}-mailpit-1`],
+    ['network', `${project}_default`]
+  ];
+  for (const [kind, name] of exactResources) {
+    const ids = financialHarnessExactResourceIds(kind, name);
+    if (ids.length > 1) {
+      throw new Error(`expected at most one exact-name ${kind} ${name}, found ${ids.length}`);
+    }
+    for (const id of ids) {
+      const key = `${kind}:${id}`;
+      if (baseline.has(key)) {
+        throw new Error(`refusing baseline exact-name ${kind} ${name}`);
+      }
+      const labels = financialHarnessResourceLabels(kind, id);
+      if (labels['com.docker.compose.project'] !== project) {
+        throw new Error(`refusing foreign exact-name ${kind} ${name}`);
+      }
+      if (kind === 'container') {
+        const configFiles = labels['com.docker.compose.project.config_files']
+          ?.split(',')
+          .map((value) => value.trim())
+          .filter(Boolean) ?? [];
+        if (
+          configFiles.length !== 1 ||
+          resolve(configFiles[0]!) !== composeTestFilePath
+        ) {
+          throw new Error(
+            `refusing ${kind} ${name} with unexpected Compose config path ${
+              configFiles.join(', ') || '<missing>'
+            }`
+          );
+        }
+      }
+    }
+  }
+}
+
+function cleanupTimedOutFinancialWitnessHarness(
+  baselineResources: ReadonlyMap<string, FinancialHarnessDockerResource>,
+  baselineStorageDirectories: ReadonlySet<string>,
+  harnessOutput: string
+): string {
+  const cleanupActions: string[] = [];
+  const cleanupFailures: string[] = [];
+  try {
+    const currentResources = financialHarnessDockerSnapshot();
+    const project = exactNewFinancialHarnessProject(baselineResources, currentResources);
+    const outputProjects = new Set(
+      harnessOutput.match(/pale-orbit-test-[0-9a-f]{16}/gu) ?? []
+    );
+    if (
+      outputProjects.size > 0 &&
+      !outputProjects.has(project)
+    ) {
+      throw new Error(
+        `new test project ${project} is absent from the supervised harness output`
+      );
+    }
+    assertFinancialHarnessProjectOwned(project, baselineResources);
+    financialHarnessDockerCommand([
+      'compose',
+      '--project-name',
+      project,
+      '--file',
+      composeTestFilePath,
+      'down', '--volumes', '--remove-orphans'
+    ], 60_000);
+    const remaining = (['container', 'network', 'volume'] as const)
+      .flatMap((kind) => financialHarnessResourceIds(kind, project));
+    if (remaining.length > 0) {
+      throw new Error(`test project ${project} remained after timeout cleanup`);
+    }
+    for (const [kind, name] of [
+      ['container', `${project}-postgres-1`],
+      ['container', `${project}-mailpit-1`],
+      ['network', `${project}_default`]
+    ] as const) {
+      if (financialHarnessExactResourceIds(kind, name).length > 0) {
+        throw new Error(`exact-name ${kind} ${name} remained after timeout cleanup`);
+      }
+    }
+    const afterCleanup = financialHarnessDockerSnapshot();
+    for (const [key, baselineResource] of baselineResources) {
+      const survivingResource = afterCleanup.get(key);
+      if (
+        !survivingResource ||
+        dockerLabelsFingerprint(survivingResource.labels) !==
+          dockerLabelsFingerprint(baselineResource.labels)
+      ) {
+        throw new Error(`baseline Docker resource ${key} changed during timeout cleanup`);
+      }
+    }
+    cleanupActions.push(`removed exact Compose project ${project}`);
+  } catch (error) {
+    cleanupFailures.push(error instanceof Error ? error.message : String(error));
+  }
+
+  try {
+    const storagePath = exactNewFinancialHarnessStorageDirectory(
+      baselineStorageDirectories,
+      testStorageDirectories()
+    );
+    if (storagePath) {
+      const temporaryRoot = resolve(tmpdir());
+      const storageDirectory = storagePath.slice(temporaryRoot.length + 1);
+      if (
+        dirname(storagePath) !== temporaryRoot ||
+        !testStorageDirectoryPattern.test(storageDirectory)
+      ) {
+        throw new Error(`refusing unexpected test storage path ${storagePath}`);
+      }
+      rmSync(storagePath, { force: true, recursive: true });
+      if (existsSync(storagePath)) {
+        throw new Error(`test storage directory ${storagePath} remained after timeout cleanup`);
+      }
+      cleanupActions.push(`removed exact test storage directory ${storageDirectory}`);
+    }
+  } catch (error) {
+    cleanupFailures.push(error instanceof Error ? error.message : String(error));
+  }
+
+  if (cleanupFailures.length > 0) {
+    throw new Error(`financial witness timeout cleanup failed: ${cleanupFailures.join('; ')}`);
+  }
+  return cleanupActions.length > 0
+    ? cleanupActions.join('; ')
+    : 'no new exact test resources remained';
+}
+
+function terminateFinancialWitnessHarnessProcessTree(processId: number): string | null {
+  try {
+    if (process.platform === 'win32') {
+      const result = spawnSync(
+        'taskkill.exe',
+        ['/pid', String(processId), '/T', '/F'],
+        { encoding: 'utf8', timeout: 30_000, windowsHide: true }
+      );
+      if (result.status !== 0) {
+        return `taskkill exited with ${result.status ?? 'no status'}: ${
+          `${result.stdout}${result.stderr}`.trim()
+        }`;
+      }
+      return null;
+    }
+    process.kill(-processId, 'SIGKILL');
+    return null;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+}
+
+async function runBoundedFinancialWitnessHarness(): Promise<BoundedFinancialWitnessHarnessResult> {
+  const baselineResources = financialHarnessDockerSnapshot();
+  const baselineStorageDirectories = testStorageDirectories();
+  const child = spawn(
+    process.execPath,
+    [
+      '--import',
+      'tsx',
+      withTestDatabasePath,
+      process.execPath,
+      '--import',
+      'tsx',
+      '--input-type=module',
+      '--eval',
+      ownerRestoreVerifierLauncher,
+      restoreVerifierWitnessPath,
+      '--exercise-financial-invariant-witnesses'
+    ],
+    {
+      cwd: new URL('.', root),
+      detached: process.platform !== 'win32',
+      env: directNodeHarnessEnvironment(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true
+    }
+  );
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (chunk: string) => {
+    stdout += chunk;
+    process.stdout.write(chunk);
+  });
+  child.stderr.on('data', (chunk: string) => {
+    stderr += chunk;
+    process.stderr.write(chunk);
+  });
+
+  const close = new Promise<FinancialWitnessHarnessClose>((resolveClose, rejectClose) => {
+    child.once('error', rejectClose);
+    child.once('close', (status, signal) => resolveClose({ signal, status }));
+  });
+  const closedBeforeDeadline = await waitForFinancialWitnessHarnessClose(
+    close,
+    financialWitnessHarnessTimeoutMs
+  );
+  if (closedBeforeDeadline) {
+    return {
+      ...closedBeforeDeadline,
+      cleanup: null,
+      stderr,
+      stdout,
+      timedOut: false
+    };
+  }
+
+  const terminationFailures: string[] = [];
+  let treeKillSucceeded = false;
+  if (child.pid === undefined) {
+    terminationFailures.push('supervised harness has no process id');
+  } else {
+    const treeKillFailure = terminateFinancialWitnessHarnessProcessTree(child.pid);
+    if (treeKillFailure) terminationFailures.push(`process-tree kill: ${treeKillFailure}`);
+    else treeKillSucceeded = true;
+  }
+  let closedAfterTermination = await waitForFinancialWitnessHarnessClose(
+    close,
+    financialWitnessCloseGraceMs
+  );
+  if (!closedAfterTermination) {
+    if (child.pid !== undefined) {
+      const retryFailure = terminateFinancialWitnessHarnessProcessTree(child.pid);
+      if (retryFailure) terminationFailures.push(`process-tree kill retry: ${retryFailure}`);
+      else treeKillSucceeded = true;
+    }
+    try {
+      if (!child.kill('SIGKILL')) {
+        terminationFailures.push('direct fallback kill did not signal the harness');
+      }
+    } catch (error) {
+      terminationFailures.push(
+        `direct fallback kill: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+    closedAfterTermination = await waitForFinancialWitnessHarnessClose(
+      close,
+      financialWitnessCloseGraceMs
+    );
+  }
+
+  const refuseTimeoutCleanup = (reason: string): BoundedFinancialWitnessHarnessResult => {
+    child.stdout.destroy();
+    child.stderr.destroy();
+    child.unref();
+    return {
+      cleanup: `timeout cleanup refused because ${reason}${
+        terminationFailures.length > 0 ? `; ${terminationFailures.join('; ')}` : ''
+      }`,
+      signal: null,
+      status: null,
+      stderr,
+      stdout,
+      timedOut: true
+    };
+  };
+  if (!closedAfterTermination) {
+    return refuseTimeoutCleanup('the supervised harness did not close');
+  }
+  if (!treeKillSucceeded) {
+    return refuseTimeoutCleanup('exact process-tree termination was not confirmed');
+  }
+
+  let cleanup: string;
+  try {
+    cleanup = cleanupTimedOutFinancialWitnessHarness(
+      baselineResources,
+      baselineStorageDirectories,
+      `${stdout}${stderr}`
+    );
+  } catch (error) {
+    cleanup = error instanceof Error ? error.message : String(error);
+  }
+  if (terminationFailures.length > 0) {
+    cleanup = `${cleanup}; ${terminationFailures.join('; ')}`;
+  }
+  return { ...closedAfterTermination, cleanup, stderr, stdout, timedOut: true };
+}
 
 function runStripePreflight(overrides: NodeJS.ProcessEnv = {}) {
   const environment = { ...process.env };
@@ -76,6 +581,88 @@ interface ComposeConfiguration {
 
 async function source(path: string): Promise<string> {
   return readFile(new URL(path, root), 'utf8');
+}
+
+interface MigrationJournal {
+  readonly entries: readonly {
+    readonly idx: number;
+    readonly tag: string;
+  }[];
+}
+
+async function protectedPlan6bMigrationFiles(): Promise<string[]> {
+  const journal = JSON.parse(
+    await source('drizzle/meta/_journal.json')
+  ) as MigrationJournal;
+  return journal.entries
+    .filter((entry) => entry.idx >= 7)
+    .sort((left, right) => left.idx - right.idx)
+    .map((entry) => `${entry.tag}.sql`);
+}
+
+function quotedSqlIdentifiers(value: string | undefined): string[] {
+  return Array.from(
+    value?.matchAll(/'(?<value>[a-z][a-z0-9_]*)'/gu) ?? [],
+    (match) => match.groups?.value ?? ''
+  ).filter(Boolean);
+}
+
+function migrationFinancialIssuePairs(migration: string): string[] {
+  const expression = migration.match(
+    /add constraint "financial_reconciliation_issues_semantic_identity" check \((?<expression>[\s\S]*?)\);--> statement-breakpoint/iu
+  )?.groups?.expression;
+  if (!expression) throw new Error('Financial issue semantic identity constraint was not found');
+  const pairs = Array.from(
+    expression.matchAll(
+      /"financial_reconciliation_issues"\."resource_type"\s*(?:in\s*\((?<resources>[^)]*)\)|=\s*'(?<resource>[a-z][a-z0-9_]*)')\s+and\s+"financial_reconciliation_issues"\."safe_code"\s*(?:in\s*\((?<codes>[^)]*)\)|=\s*'(?<code>[a-z][a-z0-9_]*)')/giu
+    ),
+    (match) => {
+      const resources = match.groups?.resource
+        ? [match.groups.resource]
+        : quotedSqlIdentifiers(match.groups?.resources);
+      const codes = match.groups?.code
+        ? [match.groups.code]
+        : quotedSqlIdentifiers(match.groups?.codes);
+      return resources.flatMap((resource) => codes.map((code) => `${resource}:${code}`));
+    }
+  ).flat();
+  return [...new Set(pairs)].sort();
+}
+
+function expectedFinancialIssueTriples(pairs: readonly string[]): string[] {
+  return pairs.map((pair) => {
+    const safeCode = pair.slice(pair.indexOf(':') + 1);
+    const impact = ['allocation_incomplete', 'missing_source'].includes(safeCode)
+      ? 'pending'
+      : 'exception';
+    return `${pair}:${impact}`;
+  }).sort();
+}
+
+function verifierFinancialIssueTriples(sql: string): string[] {
+  const values = sql.match(
+    /allowed_issue_triples\s*\(\s*resource_type\s*,\s*safe_code\s*,\s*impact\s*\)\s+as\s*\(\s*values(?<values>[\s\S]*?)\r?\n\s*\),\s*orphan_counts\s+as\s*\(/iu
+  )?.groups?.values ?? '';
+  const triples = Array.from(
+    values.matchAll(
+      /\(\s*'(?<resource>[a-z][a-z0-9_]*)'\s*,\s*'(?<code>[a-z][a-z0-9_]*)'\s*,\s*'(?<impact>[a-z][a-z0-9_]*)'\s*\)/gu
+    ),
+    (match) => `${match.groups?.resource}:${match.groups?.code}:${match.groups?.impact}`
+  );
+  return [...new Set(triples)].sort();
+}
+
+function legacyCommerceWorkerIssuePairs(sql: string): string[] {
+  const values = sql.match(
+    /legacy_commerce_worker_issue_pairs\s*\(\s*resource_type\s*,\s*safe_code\s*\)\s+as\s*\(\s*values(?<values>[\s\S]*?)\r?\n\s*\),\s*canonical_resolved_audits\s+as\s*\(/iu
+  )?.groups?.values ?? '';
+  const pairs = Array.from(
+    values.matchAll(
+      /\(\s*'(?<resource>[a-z][a-z0-9_]*)'\s*,\s*'(?<code>[a-z][a-z0-9_]*)'\s*\)/gu
+    ),
+    (match) => `${match.groups?.resource}:${match.groups?.code}`
+  );
+  return [...new Set(pairs)].sort();
 }
 
 function markdownSection(document: string, heading: string): string {
@@ -172,7 +759,10 @@ async function composeConfiguration(...files: string[]): Promise<ComposeConfigur
         APP_IMAGE: 'registry.invalid/pale-orbit@sha256:validation-only',
         ORIGIN: 'https://bookstore.invalid',
         DATABASE_NAME: 'validation_database',
-        DATABASE_USER: 'validation_user',
+        DATABASE_OWNER_USER: 'validation_owner',
+        DATABASE_USER: 'validation_web',
+        DATABASE_WORKER_USER: 'validation_worker',
+        DATABASE_STORAGE_CLEANUP_USER: 'validation_storage_cleanup',
         SMTP_HOST: 'smtp.invalid',
         SMTP_PORT: '587',
         SMTP_SECURE: 'false',
@@ -266,7 +856,7 @@ describe('commerce operations contract', () => {
 
   it('keeps every production application process disabled and maintenance-only', async () => {
     const compose = await composeConfiguration('compose.prod.yaml');
-    for (const name of ['app', 'worker', 'migrate', 'bootstrap-admin']) {
+    for (const name of ['app', 'worker']) {
       expect(compose.services[name]?.environment, name).toMatchObject({
         APPLICATION_MODE: 'maintenance',
         STRIPE_ENABLED: 'false',
@@ -293,7 +883,7 @@ describe('commerce operations contract', () => {
     }
   });
 
-  it('enables and mounts Stripe secrets only in app and worker after merging the overlay', async () => {
+  it('scopes Stripe API and webhook secrets to their exact app and worker consumers', async () => {
     const baseline = await composeConfiguration('compose.prod.yaml');
     const merged = await composeConfiguration('compose.prod.yaml', 'compose.stripe.yaml');
     const stripeServices = ['app', 'worker'];
@@ -301,35 +891,47 @@ describe('commerce operations contract', () => {
       .filter(([, service]) => service.environment?.STRIPE_ENABLED === 'true')
       .map(([name]) => name)
       .sort()).toEqual(stripeServices);
-    for (const fileSetting of ['STRIPE_SECRET_KEY_FILE', 'STRIPE_WEBHOOK_SECRET_FILE']) {
-      expect(Object.entries(merged.services)
-        .filter(([, service]) => service.environment?.[fileSetting] !== undefined)
-        .map(([name]) => name)
-        .sort()).toEqual(stripeServices);
-    }
-    for (const stripeSecret of ['stripe_secret_key', 'stripe_webhook_secret']) {
-      expect(Object.entries(merged.services)
-        .filter(([, service]) => mountedSecretSources(service).includes(stripeSecret))
-        .map(([name]) => name)
-        .sort()).toEqual(stripeServices);
-    }
+    expect(Object.entries(merged.services)
+      .filter(([, service]) => service.environment?.STRIPE_SECRET_KEY_FILE !== undefined)
+      .map(([name]) => name)
+      .sort()).toEqual(stripeServices);
+    expect(Object.entries(merged.services)
+      .filter(([, service]) => service.environment?.STRIPE_WEBHOOK_SECRET_FILE !== undefined)
+      .map(([name]) => name)
+      .sort()).toEqual(['app']);
+    expect(Object.entries(merged.services)
+      .filter(([, service]) => mountedSecretSources(service).includes('stripe_secret_key'))
+      .map(([name]) => name)
+      .sort()).toEqual(stripeServices);
+    expect(Object.entries(merged.services)
+      .filter(([, service]) => mountedSecretSources(service).includes('stripe_webhook_secret'))
+      .map(([name]) => name)
+      .sort()).toEqual(['app']);
     for (const name of stripeServices) {
       expect(merged.services[name]?.environment, name).toMatchObject({
         APPLICATION_MODE: 'maintenance',
         STRIPE_ENABLED: 'true',
         STRIPE_TEST_FIXTURE_MODE: 'false',
         STRIPE_LIVE_MODE: 'false',
-        STRIPE_SECRET_KEY_FILE: '/run/secrets/stripe_secret_key',
-        STRIPE_WEBHOOK_SECRET_FILE: '/run/secrets/stripe_webhook_secret'
+        STRIPE_SECRET_KEY_FILE: '/run/secrets/stripe_secret_key'
       });
-      expect(mountedSecretSources(merged.services[name]!)).toEqual([
+      expect(mountedSecretSources(merged.services[name]!)).toEqual(name === 'app' ? [
         'auth_secret',
         'database_password',
-        'smtp_password',
         'stripe_secret_key',
         'stripe_webhook_secret'
+      ] : [
+        'auth_secret',
+        'database_worker_password',
+        'smtp_password',
+        'stripe_secret_key'
       ]);
     }
+    expect(merged.services.app?.environment).toHaveProperty(
+      'STRIPE_WEBHOOK_SECRET_FILE',
+      '/run/secrets/stripe_webhook_secret'
+    );
+    expect(merged.services.worker?.environment).not.toHaveProperty('STRIPE_WEBHOOK_SECRET_FILE');
     for (const name of ['migrate', 'bootstrap-admin', 'storage-cleanup', 'caddy', 'postgres']) {
       expect(merged.services[name]?.environment, name).not.toHaveProperty('STRIPE_ENABLED', 'true');
       expect(merged.services[name]?.environment, name).not.toHaveProperty('STRIPE_SECRET_KEY_FILE');
@@ -345,6 +947,9 @@ describe('commerce operations contract', () => {
     }
     expect(merged.secrets).toMatchObject({
       database_password: { environment: 'DATABASE_PASSWORD' },
+      database_storage_cleanup_password: {
+        environment: 'DATABASE_STORAGE_CLEANUP_PASSWORD'
+      },
       auth_secret: { environment: 'AUTH_SECRET' },
       smtp_password: { environment: 'SMTP_PASSWORD' },
       stripe_secret_key: { environment: 'STRIPE_SECRET_KEY' },
@@ -657,11 +1262,18 @@ describe('commerce operations contract', () => {
   });
 
   it('ships executable deterministic row-count, storage-sample, and financial verifiers', async () => {
-    const [rowCounts, storageSamples, financialVerifier, financialRunbook] = await Promise.all([
+    const [
+      rowCounts,
+      storageSamples,
+      financialVerifier,
+      financialRunbook,
+      restoreVerifierWitness
+    ] = await Promise.all([
       source('scripts/capture-restore-row-counts.sql'),
       source('scripts/capture-storage-samples.sql'),
       source('scripts/verify-financial-restore.sql'),
-      source('docs/stripe-financial-reconciliation.md')
+      source('docs/stripe-financial-reconciliation.md'),
+      source('scripts/execute-financial-restore-verifier.ts')
     ]);
 
     for (const script of [rowCounts, storageSamples, financialVerifier]) {
@@ -746,6 +1358,7 @@ describe('commerce operations contract', () => {
       'financial_payout_discovery_singleton',
       'financial_projection_tip_ambiguity',
       'financial_classification_decision_ambiguity',
+      'financial_schema_object_manifest',
       'financial_unknown_classification_issue',
       'allocation_set_detail_classification',
       'financial_item_allocation_parent',
@@ -755,6 +1368,7 @@ describe('commerce operations contract', () => {
       'refund_reporting_correction_item_semantics',
       'refund_reporting_correction_history_semantics',
       'dispute_presentment_child_cardinality',
+      'dispute_first_withdrawal_source_principal',
       'pending_replay_child_count_mismatch',
       'pending_replay_child_version_mismatch',
       'pending_replay_child_incomplete',
@@ -762,7 +1376,11 @@ describe('commerce operations contract', () => {
       'pending_replay_child_permanent',
       'combined_refund_dispute_chronology_capacity',
       'refund_component_chronology_capacity',
-      'refund_component_deterministic_split'
+      'refund_component_deterministic_split',
+      'payout_membership_currency',
+      'source_evidence_projection_parity',
+      'financial_title_allocation_determinism',
+      'resolved_issue_audit_provenance'
     ]) {
       expect(financialVerifier).toContain(`'${checkName}'`);
     }
@@ -778,7 +1396,7 @@ describe('commerce operations contract', () => {
     expect(verifierConservationSql).toBeDefined();
     expect(documentedConservationSql?.trim()).toBe(verifierConservationSql?.trim());
     const verifierStructuralSql = financialVerifier.match(
-      /with orphan_counts as \([\s\S]*?from orphan_counts\s+where violation_count <> 0\s+order by check_name;/u
+      /with allowed_issue_triples\(resource_type, safe_code, impact\) as \(values[\s\S]*?from orphan_counts\s+where violation_count <> 0\s+order by check_name;/u
     )?.[0];
     const documentedStructuralSql = fencedCodeBlocks(
       markdownSection(financialRunbook, 'Post-restore orphan check'),
@@ -795,6 +1413,46 @@ describe('commerce operations contract', () => {
     )[0];
     expect(verifierScanSql).toBeDefined();
     expect(documentedScanSql?.trim()).toBe(verifierScanSql?.trim());
+    for (const [marker, heading] of [
+      ['financial_schema_object_manifest', 'Post-restore executable schema-object check'],
+      ['source_evidence_projection_parity', 'Post-restore source evidence projection check'],
+      ['financial_title_allocation_determinism', 'Post-restore deterministic title allocation check'],
+      ['resolved_issue_audit_provenance', 'Post-restore resolved issue audit check']
+    ] as const) {
+      const verifierBlock = financialVerifier.match(
+        new RegExp(`-- BEGIN ${marker}\\r?\\n(?<sql>[\\s\\S]*?)\\r?\\n-- END ${marker}`, 'u')
+      )?.groups?.sql;
+      const documentedBlock = fencedCodeBlocks(
+        markdownSection(financialRunbook, heading),
+        'sql'
+      )[0];
+      expect(verifierBlock, marker).toBeDefined();
+      expect(documentedBlock?.trim(), heading).toBe(verifierBlock?.trim());
+    }
+    for (const requiredObject of [
+      'current_financial_projection_heads',
+      'current_financial_projection_items',
+      'plan6b_reject_history_mutation',
+      'plan6b_validate_unknown_classification_issue',
+      'plan6b_guard_financial_issue_subject_mutation',
+      'resolve_financial_issue_after_worker_recompute',
+      'financial_classification_versions_unknown_issue_required',
+      'payments_financial_issue_subject_guard',
+      'refunds_financial_issue_subject_guard',
+      'disputes_financial_issue_subject_guard',
+      'financial_allocation_sets_immutable',
+      'stripe_payouts_narrow_update',
+      'financial_reconciliation_issues_semantic_impact',
+      'financial_reconciliation_issues_immutable_classification_open',
+      'financial_allocation_sets_supersedes_graph_fk',
+      'financial_item_allocations_set_item_component_unique'
+    ]) {
+      expect(financialVerifier, requiredObject).toContain(`'${requiredObject}'`);
+    }
+    expect(financialVerifier).toContain('pg_catalog.pg_trigger');
+    expect(financialVerifier).toContain('pg_catalog.pg_proc');
+    expect(financialVerifier).toContain('pg_catalog.pg_constraint');
+    expect(financialVerifier).toContain('pg_catalog.pg_index');
     const runningScanResumeSql = verifierScanSql?.match(
       /select 'running_scan_resume_job_missing'[\s\S]*?(?=\s+union all\s+select 'running_scan_cursor_integrity')/u
     )?.[0];
@@ -944,6 +1602,49 @@ describe('commerce operations contract', () => {
     expect(financialVerifier).toMatch(
       /allocation_set_semantic_source[\s\S]*source_bt\.exchange_rate[\s\S]*source_bt\.exchange_source_currency[\s\S]*source_bt\.exchange_target_currency[\s\S]*payment_source\.currency[\s\S]*refund_source\.currency[\s\S]*dispute_source\.currency/u
     );
+    const providerSourceSql = financialVerifier.match(
+      /select 'allocation_set_semantic_source'[\s\S]*?(?=\s+union all\s+select 'financial_item_allocation_parent')/u
+    )?.[0];
+    expect(providerSourceSql).toBeDefined();
+    expect(providerSourceSql).toMatch(
+      /source_classification\.classification is distinct from 'charge'[\s\S]*?payment_source\.currency = source_bt\.currency[\s\S]*?source_bt\.amount_minor <> payment_source\.amount_minor/u
+    );
+    expect(providerSourceSql).toMatch(
+      /source_classification\.classification not in \('refund', 'refund_failure'\)[\s\S]*?source_classification\.classification = 'refund'[\s\S]*?refund_source\.currency = source_bt\.currency[\s\S]*?source_bt\.amount_minor <> -refund_source\.amount_minor/u
+    );
+    expect(providerSourceSql).not.toMatch(
+      /source_classification\.classification = 'refund_failure'[\s\S]*?source_bt\.amount_minor <> -refund_source\.amount_minor/u
+    );
+    const firstDisputePrincipalSql = financialVerifier.match(
+      /select 'dispute_first_withdrawal_source_principal'[\s\S]*?(?=\s+union all\s+select 'refund_allocation_draft_graph')/u
+    )?.[0];
+    expect(firstDisputePrincipalSql).toBeDefined();
+    expect(firstDisputePrincipalSql).toContain("classification.classification = 'dispute_withdrawal'");
+    expect(firstDisputePrincipalSql).toContain('earlier_balance.provider_created_at');
+    expect(firstDisputePrincipalSql).toContain('earlier_balance.provider_id collate "C"');
+    expect(firstDisputePrincipalSql).toContain('sum(presentment.total_effect_minor)');
+    expect(firstDisputePrincipalSql).toMatch(/<>\s+-dispute\.amount_minor/u);
+    expect(firstDisputePrincipalSql).not.toContain("'dispute_reinstatement'");
+    expect(firstDisputePrincipalSql).not.toContain("'fee_credit'");
+    const sourceParitySql = financialVerifier.match(
+      /-- BEGIN source_evidence_projection_parity\r?\n(?<sql>[\s\S]*?)\r?\n-- END source_evidence_projection_parity/u
+    )?.groups?.sql;
+    expect(sourceParitySql).toBeDefined();
+    expect(sourceParitySql).toContain('direct_source_principal_state as materialized');
+    expect(sourceParitySql).toContain('first_dispute_withdrawal_balance as materialized');
+    expect(sourceParitySql).toContain('current_dispute_principal_state as materialized');
+    expect(sourceParitySql).toContain('all_source_principals_consistent');
+    expect(sourceParitySql).toContain('has_canonical_source_principal');
+    expect(sourceParitySql).not.toMatch(
+      /reporting_category = 'dispute_reversal'[\s\S]*?source_amount_minor/u
+    );
+    expect(sourceParitySql).not.toMatch(/reporting_category = 'fee'[\s\S]*?source_amount_minor/u);
+    for (const witness of [
+      'same-currency payment source-principal corruption',
+      'same-currency primary-refund source-principal corruption',
+      'first dispute withdrawal presentment/source-principal corruption',
+      'later dispute withdrawal settlement remains independent'
+    ]) expect(restoreVerifierWitness, witness).toContain(witness);
     expect(financialVerifier).toMatch(
       /source_classification\.classification = 'fee_credit'\s+and source_bt\.reporting_category = 'fee'\s+and source_bt\.raw_type in \('stripe_fee', 'stripe_fx_fee'\)\s+and source_bt\.amount_minor > 0\s+and \([\s\S]*source_bt\.exchange_rate is null[\s\S]*source_bt\.exchange_source_currency = dispute_source\.currency[\s\S]*source_bt\.exchange_target_currency = source_bt\.currency/u
     );
@@ -979,11 +1680,15 @@ describe('commerce operations contract', () => {
       /dispute_item_allocation_graph[\s\S]*?s\.source_kind <> 'dispute'[\s\S]*?s\.basis <> 'gross_amount'[\s\S]*?s\.scope <> 'title'/u
     );
     expect(financialVerifier).toContain('a.currency is distinct from d.currency');
-    expect(financialVerifier).toMatch(
-      /s\.currency = a\.currency[\s\S]*?sum\(settlement\.effect_minor\)::bigint[\s\S]*?settlement\.order_item_id = a\.order_item_id[\s\S]*?a\.total_effect_minor/u
+    const disputeItemGraphSql = financialVerifier.match(
+      /select 'dispute_item_allocation_graph'[\s\S]*?(?=\s+union all\s+select 'dispute_presentment_child_cardinality')/u
+    )?.[0];
+    expect(disputeItemGraphSql).toBeDefined();
+    expect(disputeItemGraphSql).not.toMatch(
+      /s\.currency = a\.currency[\s\S]*?settlement\.effect_minor/u
     );
-    expect(financialVerifier).toMatch(
-      /s\.currency <> a\.currency[\s\S]*?a\.effect = 'withdrawal'[\s\S]*?sum\(presentment\.total_effect_minor\)[\s\S]*?<> -d\.amount_minor/u
+    expect(disputeItemGraphSql).toMatch(
+      /s\.currency <> a\.currency[\s\S]*?a\.effect = 'withdrawal'[\s\S]*?sum\(presentment\.total_effect_minor\)[\s\S]*?<>\s*-d\.amount_minor/u
     );
     expect(financialVerifier).toContain(
       's.expected_effect_minor is distinct from -reversed_set.expected_effect_minor'
@@ -1026,15 +1731,63 @@ describe('commerce operations contract', () => {
     const migrations = (
       await Promise.all(migrationFiles.map((name) => source(`drizzle/${name}`)))
     ).join('\n');
+    const financialSchemaManifest = financialVerifier.match(
+      /-- BEGIN financial_schema_object_manifest\r?\n(?<sql>[\s\S]*?)\r?\n-- END financial_schema_object_manifest/u
+    )?.groups?.sql;
+    expect(financialSchemaManifest).toBeDefined();
+    const protectedMigrationFiles = await protectedPlan6bMigrationFiles();
+    expect(protectedMigrationFiles).toEqual([
+      '0007_plan6b_financial_reconciliation.sql',
+      '0008_plan6b_worker_issue_resolution.sql',
+      '0009_plan6b_worker_authority_and_commerce_integrity.sql',
+      '0010_plan6b_guest_claim_authority.sql',
+      '0011_plan6b_storage_cleanup_authority.sql'
+    ]);
+    const plan6bSchemaMigrations = (
+      await Promise.all(
+        protectedMigrationFiles.map((name) => source(`drizzle/${name}`))
+      )
+    ).join('\n');
+    const requiredFinancialSchemaObjects = new Set(
+      Array.from(
+        plan6bSchemaMigrations.matchAll(
+          /(?:create (?:or replace )?function\s+(?:(?:"public"\.)?)|create (?:constraint )?trigger\s+|create view\s+"public"\.|create (?:unique )?index\s+|add constraint\s+)"(?<name>[a-z_][a-z0-9_]*)"/giu
+        ),
+        (match) => match.groups?.name ?? ''
+      ).filter((name) => name && (
+        name.startsWith('financial_') ||
+        name.startsWith('plan6b_') ||
+        name.startsWith('refund_') ||
+        name.startsWith('stripe_') ||
+        name.startsWith('dispute_') ||
+        name.startsWith('payout_') ||
+        name.startsWith('entitlement_grants_') ||
+        name === 'grants_source_consistent' ||
+        name === 'jobs_rerun_requires_running' ||
+        name === 'enforce_financial_allocation_supersession_lineage' ||
+        name === 'current_financial_projection_heads' ||
+        name === 'current_financial_projection_items' ||
+        name === 'resolve_financial_reconciliation_issue' ||
+        name === 'resolve_financial_issue_after_worker_recompute'
+      ))
+    );
+    for (const objectName of requiredFinancialSchemaObjects) {
+      expect(financialSchemaManifest, objectName).toContain(`'${objectName}'`);
+    }
+    expect(financialSchemaManifest).toMatch(
+      /unexpected_protected_objects as \([\s\S]*?routine\.proname = 'resolve_financial_reconciliation_issue'/u
+    );
     const physicalTables = new Set(
       Array.from(
-        migrations.matchAll(/create table\s+(?:"public"\.)?"(?<name>[a-z_][a-z0-9_]*)"/giu),
+        migrations.matchAll(/create (?:table|view)\s+(?:"public"\.)?"(?<name>[a-z_][a-z0-9_]*)"/giu),
         (match) => match.groups?.name ?? ''
       ).filter(Boolean)
     );
     const cteNames = new Set(
       Array.from(
-        financialVerifier.matchAll(/(?:\bwith|,)\s*(?<name>[a-z_][a-z0-9_]*)\s+as\s*\(/giu),
+        financialVerifier.matchAll(
+          /(?:\bwith|,)\s*(?<name>[a-z_][a-z0-9_]*)(?:\([^)]*\))?\s+as\s+(?:materialized\s+)?\(/giu
+        ),
         (match) => match.groups?.name ?? ''
       ).filter(Boolean)
     );
@@ -1047,11 +1800,830 @@ describe('commerce operations contract', () => {
       (name) =>
         name &&
         !cteNames.has(name) &&
-        !['lateral', 'restore_financial_checks'].includes(name)
+        !['lateral', 'pg_catalog', 'restore_financial_checks'].includes(name)
     );
     expect(
       [...new Set(relationReferences.filter((name) => !physicalTables.has(name)))].sort()
     ).toEqual([]);
+  });
+
+  it('pins one versioned exact catalog contract for every protected financial object kind', async () => {
+    const [financialVerifier, financialRunbook, verifierWitness, contractTestSource] =
+      await Promise.all([
+        source('scripts/verify-financial-restore.sql'),
+        source('docs/stripe-financial-reconciliation.md'),
+        source('scripts/execute-financial-restore-verifier.ts'),
+        source('scripts/commerce-operations.test.ts')
+      ]);
+    const financialSchemaManifest = financialVerifier.match(
+      /-- BEGIN financial_schema_object_manifest\r?\n(?<sql>[\s\S]*?)\r?\n-- END financial_schema_object_manifest/u
+    )?.groups?.sql ?? '';
+    const documentedManifest = fencedCodeBlocks(
+      markdownSection(financialRunbook, 'Post-restore executable schema-object check'),
+      'sql'
+    )[0] ?? '';
+    const plan6bMigrationFiles = await protectedPlan6bMigrationFiles();
+    const plan6bMigrations = (
+      await Promise.all(plan6bMigrationFiles.map((name) => source(`drizzle/${name}`)))
+    ).join('\n');
+    const requiredEnumLabels = new Map(
+      Array.from(
+        plan6bMigrations.matchAll(
+          /create type\s+(?:(?:"public"\.)?)"(?<name>[a-z_][a-z0-9_]*)"\s+as enum\((?<labels>[^;]+)\)/giu
+        ),
+        (match) => [
+          match.groups?.name ?? '',
+          Array.from(
+            (match.groups?.labels ?? '').matchAll(/'(?<label>[^']+)'/gu),
+            (labelMatch) => labelMatch.groups?.label ?? ''
+          ).filter(Boolean)
+        ] as const
+      ).filter(([name]) => Boolean(name))
+    );
+    const requiredLegacyColumnKeys = new Set([
+      ...Array.from(
+        plan6bMigrations.matchAll(
+          /alter table\s+(?:(?:"public"\.)?)"(?<table>[a-z_][a-z0-9_]*)"\s+add column\s+"(?<column>[a-z_][a-z0-9_]*)"/giu
+        ),
+        (match) => `${match.groups?.table ?? ''}:${match.groups?.column ?? ''}`
+      ),
+      ...Array.from(
+        plan6bMigrations.matchAll(
+          /alter table\s+(?:(?:"public"\.)?)"(?<table>[a-z_][a-z0-9_]*)"\s+alter column\s+"(?<column>[a-z_][a-z0-9_]*)"/giu
+        ),
+        (match) => `${match.groups?.table ?? ''}:${match.groups?.column ?? ''}`
+      )
+    ].filter((key) => key !== ':'));
+    const forbiddenLegacyColumnKeys = new Set(
+      Array.from(
+        plan6bMigrations.matchAll(
+          /alter table\s+(?:(?:"public"\.)?)"(?<table>[a-z_][a-z0-9_]*)"\s+drop column\s+"(?<column>[a-z_][a-z0-9_]*)"/giu
+        ),
+        (match) => `${match.groups?.table ?? ''}:${match.groups?.column ?? ''}`
+      ).filter((key) => key !== ':')
+    );
+    const forbiddenRetiredTypeNames = new Set(
+      Array.from(
+        plan6bMigrations.matchAll(
+          /drop type\s+(?:(?:"public"\.)?)"(?<name>[a-z_][a-z0-9_]*)"/giu
+        ),
+        (match) => match.groups?.name ?? ''
+      ).filter(Boolean)
+    );
+    const requiredTableNames = new Set(
+      Array.from(
+        plan6bMigrations.matchAll(
+          /create table\s+(?:(?:"public"\.)?)"(?<name>[a-z_][a-z0-9_]*)"/giu
+        ),
+        (match) => match.groups?.name ?? ''
+      ).filter(Boolean)
+    );
+    const requiredFunctionNames = new Set(
+      Array.from(
+        plan6bMigrations.matchAll(
+        /create (?:or replace )?function\s+(?:(?:"public"\.)?)"(?<name>[a-z_][a-z0-9_]*)"\s*\(/giu
+        ),
+        (match) => match.groups?.name ?? ''
+      ).filter((name) => name && name !== 'resolve_financial_reconciliation_issue')
+    );
+    const requiredTriggerKeys = new Set(
+      Array.from(
+        plan6bMigrations.matchAll(
+          /create (?:constraint )?trigger\s+"(?<name>[a-z_][a-z0-9_]*)"(?<body>[\s\S]*?);--> statement-breakpoint/giu
+        ),
+        (match) => {
+          const parent = match.groups?.body.match(
+            /\bon\s+(?:(?:"public"\.)?)"(?<name>[a-z_][a-z0-9_]*)"/iu
+          )?.groups?.name;
+          return parent && match.groups?.name ? `${parent}:${match.groups.name}` : '';
+        }
+      ).filter(Boolean)
+    );
+
+    expect(documentedManifest.trim()).toBe(financialSchemaManifest.trim());
+    expect(financialSchemaManifest).toMatch(
+      /catalog_contract_version\s*\(\s*contract_version\s*\)\s+as\s*\(\s*values\s*\(\s*'plan6b-financial-catalog-v1'\s*\)/iu
+    );
+    expect(financialSchemaManifest).toMatch(
+      /required_catalog_objects\s*\(\s*object_kind\s*,\s*schema_name\s*,\s*parent_name\s*,\s*object_name\s*,\s*identity_arguments\s*,\s*expected_fingerprint_sha256\s*,\s*expected_catalog\s*\)/iu
+    );
+    for (const catalogPrimitive of [
+      'pg_get_viewdef',
+      'pg_attribute',
+      'reloptions',
+      'pg_get_userbyid',
+      'aclexplode',
+      'pg_get_functiondef',
+      'pg_get_function_identity_arguments',
+      'proconfig',
+      'pg_get_triggerdef',
+      'pg_get_indexdef',
+      'indisvalid',
+      'indisready',
+      'pg_get_constraintdef',
+      'convalidated',
+      'condeferrable',
+      'condeferred',
+      'duplicate_contract_objects',
+      'duplicate_truncated_constraint_keys',
+      'duplicate_actual_objects',
+      'missing_or_mismatched_objects',
+      'unexpected_protected_objects',
+      'unexpected_protected_routine_kinds',
+      'catalog_table_object_inventory',
+      'catalog_column_descriptors',
+      'catalog_type_acl',
+      'disabled_protected_constraint_triggers',
+      'forbidden_retired_types',
+      'unexpected_forbidden_types',
+      'forbidden_retired_columns',
+      'unexpected_forbidden_columns',
+      'conindid',
+      'conenforced',
+      'confrelid',
+      'pg_enum',
+      'pg_rewrite',
+      'pg_get_ruledef',
+      'pg_inherits',
+      'inhdetachpending',
+      'relispartition',
+      'relpersistence',
+      'relrowsecurity',
+      'relforcerowsecurity'
+    ]) {
+      expect(financialSchemaManifest, catalogPrimitive).toContain(catalogPrimitive);
+    }
+    for (const catalogField of [
+      "'definition'",
+      "'columns'",
+      "'relkind'",
+      "'persistence'",
+      "'row_security'",
+      "'force_row_security'",
+      "'is_partition'",
+      "'constraints'",
+      "'referencing_foreign_keys'",
+      "'explicit_indexes'",
+      "'triggers'",
+      "'rules'",
+      "'inheritance_edges'",
+      "'internal_trigger_modes'",
+      "'labels'",
+      "'primary_key'",
+      "'reloptions'",
+      "'owner'",
+      "'acl'",
+      "'identity_arguments'",
+      "'config'",
+      "'enabled'",
+      "'valid'",
+      "'ready'",
+      "'validated'",
+      "'enforced'",
+      "'deferrable'",
+      "'initially_deferred'",
+      "'DATABASE_OWNER'"
+    ]) {
+      expect(financialSchemaManifest, catalogField).toContain(catalogField);
+    }
+
+    const catalogRows = Array.from(
+      financialSchemaManifest.matchAll(
+        /\(\s*'(?<kind>table|view|function|trigger|index|constraint|column|enum|sensitive_relation_state)'\s*,\s*'public'\s*,\s*(?<parent>null|'[a-z_][a-z0-9_]*')\s*,\s*'(?<name>[a-z_][a-z0-9_]*)'\s*,\s*(?<arguments>null|'[^']*')\s*,\s*'(?<fingerprint>[0-9a-f]{64})'\s*,\s*\$catalog\$(?<catalog>[\s\S]*?)\$catalog\$::jsonb\s*\)/gu
+      ),
+      (match) => ({
+        arguments: match.groups?.arguments ?? '',
+        catalog: match.groups?.catalog ?? '',
+        fingerprint: match.groups?.fingerprint ?? '',
+        kind: match.groups?.kind ?? '',
+        name: match.groups?.name ?? '',
+        parent: match.groups?.parent ?? ''
+      })
+    );
+    expect(catalogRows.length).toBeGreaterThan(100);
+    expect(new Set(catalogRows.map((row) =>
+      `${row.kind}:${row.parent}:${row.name}:${row.arguments}`
+    )).size).toBe(catalogRows.length);
+    expect(catalogRows.every((row) => /^[0-9a-f]{64}$/u.test(row.fingerprint))).toBe(true);
+    expect(catalogRows.some((row) => /^0{64}$/u.test(row.fingerprint))).toBe(false);
+    expect(catalogRows.some((row) => row.catalog === '{}')).toBe(false);
+    expect(catalogRows.every((row) =>
+      createHash('sha256').update(row.catalog, 'utf8').digest('hex') === row.fingerprint
+    )).toBe(true);
+    for (const relationRow of catalogRows.filter((row) =>
+      row.kind === 'table' || row.kind === 'view'
+    )) {
+      const descriptor = JSON.parse(relationRow.catalog) as Record<string, unknown>;
+      expect(descriptor.relkind, relationRow.name).toBe(
+        relationRow.kind === 'table' ? 'r' : 'v'
+      );
+      expect(descriptor.persistence, relationRow.name).toBe('p');
+      expect(descriptor.row_security, relationRow.name).toBe(false);
+      expect(descriptor.force_row_security, relationRow.name).toBe(false);
+      if (relationRow.kind === 'table') {
+        expect(descriptor.is_partition, relationRow.name).toBe(false);
+        expect(Array.isArray(descriptor.constraints), relationRow.name).toBe(true);
+        expect(Array.isArray(descriptor.referencing_foreign_keys), relationRow.name).toBe(true);
+        expect(Array.isArray(descriptor.explicit_indexes), relationRow.name).toBe(true);
+        expect(Array.isArray(descriptor.triggers), relationRow.name).toBe(true);
+        expect(Array.isArray(descriptor.rules), relationRow.name).toBe(true);
+        expect(Array.isArray(descriptor.inheritance_edges), relationRow.name).toBe(true);
+        const constraintInventory = descriptor.constraints as Array<Record<string, unknown>>;
+        expect(constraintInventory.length, relationRow.name).toBeGreaterThan(0);
+        expect(
+          constraintInventory.every((constraint) => constraint.enforced === true),
+          relationRow.name
+        ).toBe(true);
+        for (const inventory of [
+          constraintInventory,
+          descriptor.explicit_indexes as Array<Record<string, unknown>>,
+          descriptor.triggers as Array<Record<string, unknown>>
+        ]) {
+          const names = inventory.map((entry) => entry.name);
+          expect(names.every((name) => typeof name === 'string'), relationRow.name).toBe(true);
+          expect(names, relationRow.name).toEqual([...names].sort());
+        }
+        if (relationRow.name === 'commerce_claim_issuances') {
+          expect(descriptor.explicit_indexes).toHaveLength(3);
+          expect(descriptor.triggers).toHaveLength(0);
+        }
+        expect(descriptor.primary_key, relationRow.name).toEqual(expect.objectContaining({
+          deferrable: false,
+          definition: expect.stringMatching(/^PRIMARY KEY \(.+\)$/u),
+          enforced: true,
+          initially_deferred: false,
+          name: expect.stringMatching(/_pkey$/u),
+          validated: true
+        }));
+      } else {
+        expect(descriptor, relationRow.name).not.toHaveProperty('primary_key');
+      }
+    }
+    expect((financialSchemaManifest.match(
+      /order by\s+\w+_row\.\w+\s+collate\s+"C"/gu
+    ) ?? []).length).toBeGreaterThanOrEqual(4);
+    expect(financialSchemaManifest).toMatch(
+      /constraint_row\.conname\s*=\s*pg_catalog\.left\(required\.object_name,\s*63\)/u
+    );
+    expect(financialSchemaManifest).toMatch(
+      /disabled_protected_constraint_triggers[\s\S]*trigger_row\.tgconstraint\s*<>\s*0[\s\S]*trigger_row\.tgenabled\s*<>\s*'O'/u
+    );
+    expect(new Set(catalogRows.map((row) => row.kind))).toEqual(
+      new Set([
+        'table',
+        'view',
+        'function',
+        'trigger',
+        'index',
+        'constraint',
+        'column',
+        'enum',
+        'sensitive_relation_state'
+      ])
+    );
+    expect(Object.fromEntries(
+      [
+        'table',
+        'view',
+        'function',
+        'trigger',
+        'index',
+        'constraint',
+        'column',
+        'enum',
+        'sensitive_relation_state'
+      ].map((kind) => [kind, catalogRows.filter((row) => row.kind === kind).length])
+    )).toEqual({
+      table: requiredTableNames.size,
+      view: 2,
+      function: requiredFunctionNames.size,
+      trigger: requiredTriggerKeys.size,
+      index: 59,
+      constraint: 64,
+      column: requiredLegacyColumnKeys.size,
+      enum: requiredEnumLabels.size,
+      sensitive_relation_state: 4
+    });
+    expect(requiredTableNames.size).toBe(21);
+    expect(requiredFunctionNames.size).toBe(30);
+    expect(requiredTriggerKeys.size).toBe(34);
+    expect(requiredLegacyColumnKeys.size).toBe(7);
+    expect(requiredEnumLabels.size).toBe(23);
+    expect(forbiddenLegacyColumnKeys).toEqual(new Set([
+      'disputes:reconciliation_status',
+      'payments:reconciliation_status',
+      'refunds:reconciliation_status'
+    ]));
+    expect(forbiddenRetiredTypeNames).toEqual(new Set([
+      'entitlement_grant_source_legacy',
+      'financial_reconciliation_status'
+    ]));
+    expect(catalogRows.filter((row) =>
+      row.kind === 'constraint' && row.parent === "'commerce_claim_issuances'"
+    )).toHaveLength(10);
+    expect(catalogRows.filter((row) =>
+      row.kind === 'index' && row.parent === "'commerce_claim_issuances'"
+    )).toHaveLength(3);
+    for (const claimMigrationTrigger of [
+      'guest_identities:guest_identities_plan6b_update_guard',
+      'payout_import_run_entries:payout_import_run_entries_immutable'
+    ]) {
+      expect(catalogRows.some((row) =>
+        row.kind === 'trigger' && `${row.parent.slice(1, -1)}:${row.name}` ===
+          claimMigrationTrigger
+      ), claimMigrationTrigger).toBe(true);
+    }
+    for (const tableName of requiredTableNames) {
+      expect(
+        catalogRows.some((row) => row.kind === 'table' && row.name === tableName),
+        tableName
+      ).toBe(true);
+    }
+    for (const [enumName, labels] of requiredEnumLabels) {
+      const enumRow = catalogRows.find((row) =>
+        row.kind === 'enum' && row.name === enumName
+      );
+      expect(enumRow, enumName).toBeDefined();
+      expect(JSON.parse(enumRow?.catalog ?? '{}'), enumName).toEqual(expect.objectContaining({
+        acl: expect.any(Array),
+        labels,
+        owner: 'DATABASE_OWNER'
+      }));
+    }
+    for (const legacyColumnKey of requiredLegacyColumnKeys) {
+      const [tableName, columnName] = legacyColumnKey.split(':');
+      expect(catalogRows.some((row) =>
+        row.kind === 'column' && row.parent === `'${tableName}'` && row.name === columnName
+      ), legacyColumnKey).toBe(true);
+    }
+    for (const relationName of [
+      'outbox_messages',
+      'guest_identities',
+      'entitlement_grants',
+      'entitlements'
+    ]) {
+      const relationStateRow = catalogRows.find((row) =>
+        row.kind === 'sensitive_relation_state' && row.name === relationName
+      );
+      expect(relationStateRow, relationName).toBeDefined();
+      expect(JSON.parse(relationStateRow?.catalog ?? '{}'), relationName).toEqual({
+        force_row_security: false,
+        persistence: 'p',
+        relkind: 'r',
+        row_security: false
+      });
+    }
+    for (const functionName of requiredFunctionNames) {
+      expect(
+        catalogRows.some((row) => row.kind === 'function' && row.name === functionName),
+        functionName
+      ).toBe(true);
+    }
+    for (const triggerKey of requiredTriggerKeys) {
+      expect(
+        catalogRows.some((row) =>
+          row.kind === 'trigger' && `${row.parent.slice(1, -1)}:${row.name}` === triggerKey
+        ),
+        triggerKey
+      ).toBe(true);
+    }
+
+    expect(financialSchemaManifest).toMatch(
+      /\(\s*'table'\s*,\s*'public'\s*,\s*null\s*,\s*'commerce_claim_issuances'/u
+    );
+    for (const claimColumn of [
+      'claim_proof_sha256',
+      'auth_token_sha256',
+      'normalized_email',
+      'anchor_order_id',
+      'kind',
+      'state',
+      'authorized_user_id',
+      'issued_at',
+      'expires_at',
+      'authorized_at',
+      'consumed_at',
+      'result_disposition',
+      'result_changed',
+      'result_order_count',
+      'result_title_count'
+    ]) {
+      expect(financialSchemaManifest, claimColumn).toContain(`'${claimColumn}'`);
+    }
+    for (const claimObject of [
+      'commerce_claim_issuances_pkey',
+      'commerce_claim_issuances_claim_proof_sha256_valid',
+      'commerce_claim_issuances_auth_token_sha256_valid',
+      'commerce_claim_issuances_email_normalized',
+      'commerce_claim_issuances_kind_valid',
+      'commerce_claim_issuances_lifecycle_consistent',
+      'commerce_claim_issuances_result_valid',
+      'commerce_claim_issuances_timestamp_order',
+      'commerce_claim_issuances_anchor_order_id_orders_id_fk',
+      'commerce_claim_issuances_authorized_user_id_user_id_fk',
+      'commerce_claim_issuances_auth_token_sha256_unique',
+      'commerce_claim_issuances_live_email_idx',
+      'commerce_claim_issuances_retention_idx'
+    ]) {
+      expect(financialSchemaManifest, claimObject).toContain(`'${claimObject}'`);
+    }
+    expect(financialSchemaManifest).toContain(
+      'Constraint-owned indexes are represented by their constraints'
+    );
+    expect(financialSchemaManifest).not.toMatch(
+      /\(\s*'index'\s*,\s*'public'\s*,\s*'commerce_claim_issuances'\s*,\s*'commerce_claim_issuances_pkey'/u
+    );
+    for (const cleanupObject of [
+      'title_revisions_staging_storage_key_idx',
+      'title_revisions_original_storage_key_idx',
+      'titles_cover_storage_key_idx',
+      'jobs_active_ingest_revision_identity_idx',
+      'storage_cleanup_referenced_keys'
+    ]) {
+      expect(financialSchemaManifest, cleanupObject).toContain(`'${cleanupObject}'`);
+    }
+    for (const authorityPrimitive of [
+      'expected_direct_acl',
+      'actual_direct_acl',
+      'grantor_name',
+      'expected_lock_only_worker_columns',
+      'STORAGE_CLEANUP_LOGIN',
+      'pale_orbit_storage_cleanup',
+      'pg_database_owner',
+      'datdba',
+      'pg_auth_members',
+      'admin_option',
+      'inherit_option',
+      'set_option',
+      'has_schema_privilege',
+      'has_table_privilege',
+      'has_any_column_privilege',
+      'has_function_privilege',
+      'storage_cleanup_effective_authority'
+    ]) {
+      expect(financialSchemaManifest, authorityPrimitive).toContain(authorityPrimitive);
+    }
+    expect(verifierWitness).toContain('--print-financial-catalog-contract');
+    expect(verifierWitness).toContain(
+      'alter table public.entitlement_grants disable trigger all'
+    );
+    expect(verifierWitness).toContain(
+      'alter table public.entitlement_grants enable trigger all'
+    );
+    expect(contractTestSource).toContain('directNodeHarnessEnvironment()');
+    const boundedHarnessTimeout = ['financial', 'WitnessHarnessTimeoutMs'].join('');
+    const boundedHarnessRunner = ['runBounded', 'FinancialWitnessHarness'].join('');
+    const timeoutCleanup = ['cleanupTimedOut', 'FinancialWitnessHarness'].join('');
+    const timeoutLiteral = ['600', '_000'].join('');
+    expect(contractTestSource).toContain(`const ${boundedHarnessTimeout} = ${timeoutLiteral}`);
+    expect(contractTestSource).toContain(`async function ${boundedHarnessRunner}`);
+    expect(contractTestSource).toContain(`function ${timeoutCleanup}`);
+    expect(contractTestSource).toContain(['task', 'kill.exe'].join(''));
+    expect(contractTestSource).toContain(
+      ["'down'", "'--volumes'", "'--remove-orphans'"].join(', ')
+    );
+    expect(contractTestSource).toContain(['pale-orbit-test-', 'storage-'].join(''));
+    expect(contractTestSource).toContain(
+      'npm_execpath is required for the direct Node test-database harness'
+    );
+    const lockOnlyWorkerColumns = Array.from(
+      financialSchemaManifest.matchAll(
+        /\(\s*'pale_orbit_financial_worker'\s*,\s*'(?<table>[a-z_][a-z0-9_]*)'\s*,\s*'id'\s*,\s*'UPDATE'\s*\)/gu
+      ),
+      (match) => match.groups?.table ?? ''
+    ).filter(Boolean);
+    expect(new Set(lockOnlyWorkerColumns).size).toBe(13);
+    expect(financialSchemaManifest).toMatch(
+      /actual_direct_acl[\s\S]*acl\.privilege_type = 'UPDATE'[\s\S]*expected_lock_only_worker_columns/u
+    );
+    expect(financialSchemaManifest).toMatch(
+      /expected_direct_acl[\s\S]*'DATABASE_OWNER'[\s\S]*actual_direct_acl[\s\S]*grantor\.role_label/u
+    );
+    for (const databaseGroup of [
+      'pale_orbit_runtime',
+      'pale_orbit_financial_worker',
+      'pale_orbit_storage_cleanup'
+    ]) {
+      expect(financialSchemaManifest, `${databaseGroup} database CONNECT`).toMatch(
+        new RegExp(
+          `'database'\\s*,\\s*null\\s*,\\s*null\\s*,\\s*'CURRENT_DATABASE'\\s*,\\s*null\\s*,\\s*null\\s*,\\s*'${databaseGroup}'\\s*,\\s*'CONNECT'\\s*,\\s*false`,
+          'u'
+        )
+      );
+    }
+    expect(financialSchemaManifest).toMatch(
+      /actual_direct_acl[\s\S]*pg_catalog\.pg_database[\s\S]*pg_catalog\.aclexplode\(database_row\.datacl\)[\s\S]*database_row\.datname = pg_catalog\.current_database\(\)[\s\S]*grantee_role\.rolname in \(\s*'pale_orbit_runtime',\s*'pale_orbit_financial_worker',\s*'pale_orbit_storage_cleanup'\s*\)/u
+    );
+    expect(financialSchemaManifest).toMatch(
+      /database_direct_acl_count_mismatch[\s\S]*actual_direct_acl[\s\S]*object_kind = 'database'[\s\S]*<> 3/u
+    );
+    expect(financialSchemaManifest).toMatch(
+      /missing-cleanup-connect[\s\S]*has_database_privilege\([\s\S]*pg_catalog\.current_database\(\)[\s\S]*'CONNECT'/u
+    );
+    expect(financialSchemaManifest).toMatch(
+      /cleanup-login-direct-database-acl[\s\S]*pg_catalog\.pg_database[\s\S]*pg_catalog\.aclexplode\(database_row\.datacl\)[\s\S]*database_row\.datname = pg_catalog\.current_database\(\)[\s\S]*acl\.grantee = login\.oid/u
+    );
+    expect(financialSchemaManifest).toMatch(
+      /relation_row\.relname in \(\s*'guest_identities',\s*'outbox_messages',\s*'entitlement_grants',\s*'entitlements'\s*\)/u
+    );
+    for (const forbiddenTypeName of forbiddenRetiredTypeNames) {
+      expect(financialSchemaManifest, forbiddenTypeName).toContain(`'${forbiddenTypeName}'`);
+    }
+    for (const forbiddenColumnKey of forbiddenLegacyColumnKeys) {
+      const [tableName, columnName] = forbiddenColumnKey.split(':');
+      expect(financialSchemaManifest, forbiddenColumnKey).toMatch(
+        new RegExp(`'${tableName}'\\s*,\\s*'${columnName}'`, 'u')
+      );
+    }
+    for (const columnName of [
+      'id',
+      'topic',
+      'payload',
+      'deduplication_key',
+      'dispatch_job_id'
+    ]) {
+      expect(financialSchemaManifest, `runtime outbox INSERT ${columnName}`).toMatch(
+        new RegExp(
+          `'outbox_messages'\\s*,\\s*'outbox_messages'\\s*,\\s*null\\s*,\\s*'${columnName}'\\s*,\\s*'pale_orbit_runtime'\\s*,\\s*'INSERT'`,
+          'u'
+        )
+      );
+    }
+    for (const columnName of ['status', 'last_error', 'delivered_at', 'updated_at']) {
+      expect(financialSchemaManifest, `worker outbox UPDATE ${columnName}`).toMatch(
+        new RegExp(
+          `'outbox_messages'\\s*,\\s*'outbox_messages'\\s*,\\s*null\\s*,\\s*'${columnName}'\\s*,\\s*'pale_orbit_financial_worker'\\s*,\\s*'UPDATE'`,
+          'u'
+        )
+      );
+    }
+
+    for (const constraintName of [
+      'financial_reconciliation_issues_occurrence_positive',
+      'financial_reconciliation_issues_resolution_consistent',
+      'financial_reconciliation_issues_safe_vocabulary',
+      'financial_reconciliation_issues_observation_order'
+    ]) {
+      expect(financialSchemaManifest, constraintName).toMatch(
+        new RegExp(
+          `\\(\\s*'constraint'\\s*,\\s*'public'\\s*,\\s*'financial_reconciliation_issues'\\s*,\\s*'${constraintName}'`,
+          'u'
+        )
+      );
+      expect(verifierWitness, constraintName).toContain(constraintName);
+    }
+    for (const witnessLabel of [
+      'column-compatible false required view',
+      'required view definition repair',
+      'required function definition mismatch',
+      'required function definition repair',
+      'unexpected protected function overload',
+      'unexpected protected function overload repair',
+      'required trigger definition mismatch',
+      'required trigger definition repair',
+      'required index definition mismatch',
+      'required index definition repair',
+      'omitted financial issue constraint definition mismatch',
+      'omitted financial issue constraint definition repair',
+      'claim function definition mismatch',
+      'claim function definition repair',
+      'claim function direct ACL mismatch',
+      'claim function direct ACL repair',
+      'database fixed-group CONNECT grant option mismatch',
+      'database fixed-group CONNECT grant option repair',
+      'unexpected fixed-group database TEMPORARY ACL',
+      'unexpected fixed-group database TEMPORARY ACL repair',
+      'unexpected claim function overload',
+      'unexpected claim function overload repair',
+      'claim constraint definition mismatch',
+      'claim constraint definition repair',
+      'claim index definition mismatch',
+      'claim index definition repair',
+      'sensitive relation direct ACL mismatch',
+      'sensitive relation direct ACL repair',
+      'active ingest index definition mismatch',
+      'active ingest index definition repair',
+      'PUBLIC cleanup function execute',
+      'PUBLIC cleanup function execute repair',
+      'missing cleanup group schema USAGE',
+      'cleanup group schema USAGE repair',
+      'cleanup login direct grantable CONNECT',
+      'cleanup login direct grantable CONNECT repair',
+      'cleanup login direct TEMPORARY',
+      'cleanup login direct TEMPORARY repair',
+      'unsafe cleanup membership flags',
+      'cleanup membership flags repair',
+      'unsafe cleanup role attributes',
+      'cleanup role attributes repair',
+      'inherited cleanup relation authority via PUBLIC SELECT',
+      'inherited cleanup relation authority repair',
+      'unexpected protected constraint',
+      'unexpected protected constraint repair',
+      'unexpected protected explicit index',
+      'unexpected protected explicit index repair',
+      'unexpected protected trigger',
+      'unexpected protected trigger repair',
+      'protected table RLS drift',
+      'protected table RLS drift repair',
+      'disabled protected constraint triggers',
+      'disabled protected constraint triggers repair',
+      'enum label inventory drift',
+      'enum label inventory drift repair',
+      'touched legacy column descriptor drift',
+      'touched legacy column descriptor drift repair',
+      'forbidden retired type',
+      'forbidden retired type repair',
+      'forbidden retired column',
+      'forbidden retired column repair',
+      'sensitive relation physical state drift',
+      'sensitive relation physical state drift repair',
+      'inbound protected foreign key',
+      'inbound protected foreign key repair',
+      'protected table rule inventory drift',
+      'protected table rule inventory drift repair',
+      'protected table inheritance edge',
+      'protected table inheritance edge repair',
+      'missing runtime outbox INSERT ACL',
+      'missing runtime outbox INSERT ACL repair',
+      'excess worker outbox UPDATE ACL',
+      'excess worker outbox UPDATE ACL repair'
+    ]) {
+      expect(verifierWitness, witnessLabel).toContain(witnessLabel);
+    }
+  });
+
+  it('mirrors the exact financial issue resource, code, and impact triples into restore checks', async () => {
+    const [migration, financialVerifier, financialRunbook, verifierWitness] = await Promise.all([
+      source('drizzle/0009_plan6b_worker_authority_and_commerce_integrity.sql'),
+      source('scripts/verify-financial-restore.sql'),
+      source('docs/stripe-financial-reconciliation.md'),
+      source('scripts/execute-financial-restore-verifier.ts')
+    ]);
+    const migrationPairs = migrationFinancialIssuePairs(migration);
+    const expectedTriples = expectedFinancialIssueTriples(migrationPairs);
+    const verifierTriples = verifierFinancialIssueTriples(financialVerifier);
+    const documentedOrphanSql = fencedCodeBlocks(
+      markdownSection(financialRunbook, 'Post-restore orphan check'),
+      'sql'
+    )[0];
+    const semanticImpactConstraint = migration.match(
+      /add constraint "financial_reconciliation_issues_semantic_impact" check \((?<expression>[\s\S]*?)\);--> statement-breakpoint/iu
+    )?.groups?.expression;
+
+    expect(migrationPairs).toHaveLength(48);
+    expect(expectedTriples).toHaveLength(48);
+    expect(expectedTriples.filter((triple) => triple.endsWith(':pending'))).toHaveLength(8);
+    expect(expectedTriples.filter((triple) => triple.endsWith(':exception'))).toHaveLength(40);
+    expect(expectedTriples.some((triple) => triple.endsWith(':informational'))).toBe(false);
+    expect(verifierTriples).toEqual(expectedTriples);
+    expect(verifierFinancialIssueTriples(documentedOrphanSql ?? '')).toEqual(expectedTriples);
+    expect(semanticImpactConstraint).toBeDefined();
+    expect(semanticImpactConstraint).toContain("'allocation_incomplete'");
+    expect(semanticImpactConstraint).toContain("'missing_source'");
+    expect(semanticImpactConstraint).toContain("'pending'");
+    expect(semanticImpactConstraint).toContain("'exception'");
+    expect(semanticImpactConstraint).not.toContain("'informational'");
+    const financialSchemaManifest = financialVerifier.match(
+      /-- BEGIN financial_schema_object_manifest\r?\n(?<sql>[\s\S]*?)\r?\n-- END financial_schema_object_manifest/u
+    )?.groups?.sql;
+    for (const constraintName of [
+      'financial_reconciliation_issues_semantic_identity',
+      'financial_reconciliation_issues_semantic_impact',
+      'financial_reconciliation_issues_immutable_classification_open'
+    ]) {
+      expect(financialSchemaManifest, constraintName).toMatch(
+        new RegExp(
+          `\\(\\s*'constraint'\\s*,\\s*'public'\\s*,\\s*'financial_reconciliation_issues'\\s*,\\s*'${constraintName}'`,
+          'u'
+        )
+      );
+    }
+    for (const objectName of [
+      'plan6b_validate_unknown_classification_issue',
+      'plan6b_guard_financial_issue_subject_mutation',
+      'financial_classification_versions_unknown_issue_required',
+      'payments_financial_issue_subject_guard',
+      'refunds_financial_issue_subject_guard',
+      'disputes_financial_issue_subject_guard'
+    ]) {
+      expect(financialSchemaManifest, objectName).toContain(`'${objectName}'`);
+    }
+    for (const objectName of [
+      'plan6b_validate_unknown_classification_issue',
+      'plan6b_guard_financial_issue_subject_mutation',
+      'financial_classification_versions_unknown_issue_required',
+      'payments_financial_issue_subject_guard'
+    ]) {
+      expect(verifierWitness, objectName).toContain(objectName);
+    }
+    for (const witnessLabel of [
+      'missing unknown-classification companion trigger',
+      'unknown-classification companion trigger repair',
+      'missing payment financial issue subject guard',
+      'payment financial issue subject guard repair',
+      'impossible financial issue impact',
+      'financial issue semantic impact repair'
+    ]) {
+      expect(verifierWitness, witnessLabel).toContain(witnessLabel);
+    }
+  });
+
+  it('accepts only the bounded legacy commerce-worker resolved-audit provenance', async () => {
+    const [financialVerifier, financialRunbook, verifierWitness] = await Promise.all([
+      source('scripts/verify-financial-restore.sql'),
+      source('docs/stripe-financial-reconciliation.md'),
+      source('scripts/execute-financial-restore-verifier.ts')
+    ]);
+    const verifierAuditSql = financialVerifier.match(
+      /-- BEGIN resolved_issue_audit_provenance\r?\n(?<sql>[\s\S]*?)\r?\n-- END resolved_issue_audit_provenance/u
+    )?.groups?.sql ?? '';
+    const documentedAuditSql = fencedCodeBlocks(
+      markdownSection(financialRunbook, 'Post-restore resolved issue audit check'),
+      'sql'
+    )[0] ?? '';
+    const expectedLegacyPairs = [
+      'allocation_set:allocation_mismatch',
+      'allocation_set:classification_fork',
+      'allocation_set:correction_rebase_required',
+      'allocation_set:currency_mismatch',
+      'allocation_set:immutable_mismatch',
+      'allocation_set:source_linkage_mismatch',
+      'allocation_set:unsupported_category',
+      'dispute:allocation_fork',
+      'dispute:allocation_incomplete',
+      'dispute:allocation_mismatch',
+      'dispute:classification_fork',
+      'dispute:correction_rebase_required',
+      'dispute:currency_mismatch',
+      'dispute:immutable_mismatch',
+      'dispute:missing_source',
+      'dispute:source_linkage_mismatch',
+      'dispute:unsupported_category'
+    ].sort();
+
+    expect(legacyCommerceWorkerIssuePairs(verifierAuditSql)).toEqual(expectedLegacyPairs);
+    expect(legacyCommerceWorkerIssuePairs(documentedAuditSql)).toEqual(expectedLegacyPairs);
+    expect(verifierAuditSql).toContain("audit.actor_id = 'financial-worker'");
+    expect(verifierAuditSql).toContain("audit.actor_id = 'commerce-worker'");
+    for (const witnessLabel of [
+      'legacy commerce-worker dispute resolution audit',
+      'legacy commerce-worker allocation-set resolution audit',
+      'commerce-worker cannot resolve a payout issue',
+      'commerce-worker cannot resolve an unrelated allocation-set issue',
+      'legacy commerce-worker audit witness repair'
+    ]) {
+      expect(verifierWitness, witnessLabel).toContain(witnessLabel);
+    }
+  });
+
+  it('rejects foreign exact-name restore resources before any Compose or volume mutation', async () => {
+    const storageRunbook = await source('docs/storage-ingestion-and-publication.md');
+    const restoreSection = markdownSection(storageRunbook, 'Isolated restore rehearsal');
+    const restorePowerShell = fencedCodeBlocks(restoreSection, 'powershell').join('\n');
+    const restoreShell = fencedCodeBlocks(restoreSection, 'sh').join('\n');
+
+    for (const service of [
+      'postgres',
+      'app',
+      'worker',
+      'migrate',
+      'database-role-provision',
+      'bootstrap-admin',
+      'storage-cleanup',
+      'caddy'
+    ]) {
+      expect(restorePowerShell).toContain(`\${restoreProject}-${service}-1`);
+      expect(restoreShell).toContain(`\${restore_project}-${service}-1`);
+    }
+    for (const resource of [
+      'default',
+      'postgres_data',
+      'book_storage',
+      'caddy_data',
+      'caddy_config'
+    ]) {
+      expect(restorePowerShell).toContain(`\${restoreProject}_${resource}`);
+      expect(restoreShell).toContain(`\${restore_project}_${resource}`);
+    }
+    expect(restorePowerShell).toContain("--filter \"name=$exactName\"");
+    expect(restorePowerShell).toContain("--format '{{.Names}}'");
+    expect(restorePowerShell).toContain("--format '{{.Name}}'");
+    expect(restoreShell).toContain('--filter "name=$exact_name"');
+    expect(restoreShell).toContain("--format '{{.Names}}'");
+    expect(restoreShell).toContain("--format '{{.Name}}'");
+
+    const powerShellPreflight = restorePowerShell.indexOf(
+      '$preflightInventory = Get-RestoreProjectInventory'
+    );
+    const shellPreflight = restoreShell.indexOf(
+      'preflight_inventory="$(get_restore_project_inventory)"'
+    );
+    expect(powerShellPreflight).toBeGreaterThan(-1);
+    expect(shellPreflight).toBeGreaterThan(-1);
+    expect(powerShellPreflight).toBeLessThan(restorePowerShell.indexOf('up --detach --wait postgres'));
+    expect(shellPreflight).toBeLessThan(restoreShell.indexOf('compose_restore up --detach --wait postgres'));
+    expect(powerShellPreflight).toBeLessThan(restorePowerShell.indexOf('_book_storage:/restore'));
+    expect(shellPreflight).toBeLessThan(restoreShell.indexOf('_book_storage:/restore'));
   });
 
   it('authenticates deterministic source baselines and checks source invariants while quiesced', async () => {
@@ -1155,31 +2727,275 @@ describe('commerce operations contract', () => {
     expect(malformedPort.stderr).not.toContain('ECONNREFUSED');
   }, 20_000);
 
-  it('executes classification, payout, replay-child, allocation-graph, refund-component, dispute-presentment, and combined-chronology verifier witnesses in PostgreSQL', () => {
-    const result = spawnSync(
-      process.execPath,
-      [
-        '--import',
-        'tsx',
-        withTestDatabasePath,
-        process.execPath,
-        '--import',
-        'tsx',
-        restoreVerifierWitnessPath,
-        '--exercise-financial-invariant-witnesses'
-      ],
-      {
-        cwd: new URL('.', root),
-        encoding: 'utf8',
-        env: process.env,
-        timeout: 120_000
-      }
+  it('times and scopes every verifier expectation on one transaction-recovered session', async () => {
+    const [verifierWitness, financialVerifier] = await Promise.all([
+      source('scripts/execute-financial-restore-verifier.ts'),
+      source('scripts/verify-financial-restore.sql')
+    ]);
+    const verifierOutcomeSource = verifierWitness.match(
+      /async function verifierOutcome[\s\S]*?\n\}\n\nfunction financialCatalogCalibrationSql/u
+    )?.[0] ?? '';
+    expect(verifierOutcomeSource).not.toContain('new Pool(');
+    expect(verifierOutcomeSource).toContain('persistentVerifierClient()');
+    expect(verifierOutcomeSource).toContain("client.query('rollback')");
+    expect(verifierOutcomeSource).toContain(
+      "client.query('drop table if exists pg_temp.restore_financial_checks')"
     );
-    expect(`${result.stdout}${result.stderr}`).toContain(
-      '[restore-verifier] classification, payout, replay-child, allocation-graph, refund-component, dispute-presentment, and combined-chronology witnesses passed'
+    expect(verifierOutcomeSource.indexOf("client.query('rollback')")).toBeLessThan(
+      verifierOutcomeSource.indexOf(
+        "client.query('drop table if exists pg_temp.restore_financial_checks')"
+      )
+    );
+    expect(verifierWitness).toContain('[restore-verifier] BEGIN expectation');
+    expect(verifierWitness).toContain('[restore-verifier] END expectation');
+    expect(verifierWitness.match(/verifierOutcome\(name, scope\)/gu)).toHaveLength(4);
+    expect(verifierWitness).toContain('release(true)');
+    expect(verifierWitness).toMatch(
+      /Each verifier transaction uses READ COMMITTED[\s\S]*committed witness mutations/u
+    );
+
+    const beginMarker = '-- BEGIN financial_schema_object_manifest';
+    const endMarker = '-- END financial_schema_object_manifest';
+    expect(financialVerifier.split(beginMarker)).toHaveLength(2);
+    expect(financialVerifier.split(endMarker)).toHaveLength(2);
+    const manifestBegin = financialVerifier.indexOf(beginMarker);
+    const manifestEnd = financialVerifier.indexOf(endMarker) + endMarker.length;
+    const formatterStart = financialVerifier.indexOf('do $restore_verifier$');
+    expect(manifestBegin).toBeGreaterThan(-1);
+    expect(manifestEnd).toBeGreaterThan(manifestBegin);
+    expect(formatterStart).toBeGreaterThan(manifestEnd);
+    const prelude = financialVerifier.slice(0, manifestBegin);
+    const manifest = financialVerifier.slice(manifestBegin, manifestEnd);
+    const nonCatalogBody = financialVerifier.slice(manifestEnd, formatterStart);
+    const formatter = financialVerifier.slice(formatterStart);
+    const checkNames = (sql: string) => Array.from(
+      sql.matchAll(/^\s*select\s+'(?<name>[a-z_][a-z0-9_]*)'\s*,/gimu),
+      (match) => match.groups?.name ?? ''
+    ).filter(Boolean);
+    const nonCatalogChecks = checkNames(nonCatalogBody);
+    expect(nonCatalogChecks.length).toBeGreaterThan(20);
+    expect(new Set(checkNames(`${prelude}\n${nonCatalogBody}\n${formatter}`))).toEqual(
+      new Set(nonCatalogChecks)
+    );
+    expect(manifest).toContain("select 'financial_schema_object_manifest'");
+    expect(manifest).toContain("select 'storage_cleanup_effective_authority'");
+    for (const diagnostic of [
+      'failed_running_scan_permanent',
+      'failed_running_scan_retry_exhausted',
+      'pending_replay_child_incomplete',
+      'pending_replay_child_permanent',
+      'pending_replay_child_retry_exhausted'
+    ]) {
+      expect(formatter, diagnostic).toContain(`'${diagnostic}'`);
+    }
+    expect(formatter.trimEnd()).toMatch(/rollback;$/u);
+    expect(verifierWitness).toContain('catalogOnlyVerifierSql');
+    expect(verifierWitness).toContain('dataOnlyVerifierSql');
+    expect(verifierWitness).toContain('zeroCatalogChecksSql');
+    expect(verifierWitness).toContain('zeroOperationalDiagnosticsSql');
+    for (const fullExpectation of [
+      'fresh financial schema-object manifest',
+      'payment financial issue subject guard repair',
+      'known but impossible financial issue identity',
+      'financial issue semantic identity repair',
+      'impossible financial issue impact',
+      'financial issue semantic impact repair',
+      'refund component violates the deterministic two-bucket split'
+    ]) {
+      expect(verifierWitness, fullExpectation).toMatch(
+        new RegExp(`${fullExpectation.replaceAll(' ', '\\s+')}[\\s\\S]{0,300}?'full'`, 'u')
+      );
+    }
+    for (const [witnessName, expectedCount] of [
+      ['missing financial transition trigger', 2],
+      ['required trigger definition mismatch', 2],
+      ['missing financial lookup index', 2],
+      ['required index definition mismatch', 2],
+      ['claim constraint definition mismatch', 2],
+      ['claim index definition mismatch', 2],
+      ['database fixed-group CONNECT grant option mismatch', 1],
+      ['unexpected fixed-group database TEMPORARY ACL', 2],
+      ['cleanup login direct grantable CONNECT', 1],
+      ['cleanup login direct TEMPORARY', 1],
+      ['disabled protected constraint triggers', 3],
+      ['enum label inventory drift', 4],
+      ['sensitive relation direct ACL mismatch', 2],
+      ['unsafe cleanup membership flags', 3],
+      ['missing unknown-classification companion trigger', 2],
+      ['known but impossible financial issue identity', 2],
+      ['impossible financial issue impact', 2]
+    ] as const) {
+      expect(verifierWitness, witnessName).toMatch(
+        new RegExp(
+          `${witnessName.replaceAll(' ', '\\s+')}[\\s\\S]{0,300}?(?:financial_schema_object_manifest|storage_cleanup_effective_authority)=${expectedCount}`,
+          'u'
+        )
+      );
+    }
+    expect(verifierWitness).toMatch(
+      /omitted financial issue constraint definition mismatch[\s\S]{0,300}?financial_schema_object_manifest=2/u
+    );
+    expect(verifierWitness).toMatch(
+      /set safe_code = 'payout_membership_conflict'[\s\S]{0,500}?drop constraint financial_reconciliation_issues_semantic_identity[\s\S]{0,300}?pool\.query\(semanticIdentityConstraintStatement\)[\s\S]{0,300}?financial issue semantic identity repair/u
+    );
+    expect(verifierWitness).toMatch(
+      /set impact = 'exception'[\s\S]{0,500}?drop constraint financial_reconciliation_issues_semantic_impact[\s\S]{0,300}?pool\.query\(semanticImpactConstraintStatement\)[\s\S]{0,300}?financial issue semantic impact repair/u
+    );
+    expect(verifierWitness).not.toMatch(
+      /validate constraint financial_reconciliation_issues_semantic_(?:identity|impact)/u
+    );
+    expect(verifierWitness).toMatch(
+      /payment financial issue subject guard repair[\s\S]{0,200}?verifierScope = 'data'/u
+    );
+    expect(verifierWitness).toMatch(
+      /if \(outcome\.error\) await client\.query\('rollback'\)[\s\S]*?drop table if exists pg_temp\.restore_financial_checks/u
+    );
+    expect(verifierWitness).toMatch(
+      /if \(verifierClient === client\) verifierClient = null;[\s\S]*?client\.release\(true\)/u
+    );
+    expect(verifierWitness).toMatch(
+      /verifierClient\.release\(\);[\s\S]*?Promise\.all\(\[pool\.end\(\), verifierPool\.end\(\)\]\)/u
+    );
+    expect(verifierWitness).toMatch(
+      /verifierOutcome\([\s\S]{0,200}?'clean executable restore check'[\s\S]{0,100}?'full'/u
+    );
+  });
+
+  it('restores semantic constraints only from their canonical 0009 source statements', async () => {
+    const [verifierWitness, migration] = await Promise.all([
+      source('scripts/execute-financial-restore-verifier.ts'),
+      source('drizzle/0009_plan6b_worker_authority_and_commerce_integrity.sql')
+    ]);
+    const constraintNames = [
+      'financial_reconciliation_issues_semantic_identity',
+      'financial_reconciliation_issues_semantic_impact'
+    ] as const;
+    for (const constraintName of constraintNames) {
+      const matches = Array.from(migration.matchAll(new RegExp(
+        `ALTER TABLE "financial_reconciliation_issues" ADD CONSTRAINT "${constraintName}" CHECK \\([\\s\\S]*?\\);--> statement-breakpoint`,
+        'gu'
+      )));
+      expect(matches, constraintName).toHaveLength(1);
+    }
+    expect(verifierWitness).toContain(
+      'drizzle/0009_plan6b_worker_authority_and_commerce_integrity.sql'
+    );
+    expect(verifierWitness).toContain('requiredMigrationCheckConstraintStatement');
+    expect(verifierWitness).toContain('semanticIdentityConstraintStatement');
+    expect(verifierWitness).toContain('semanticImpactConstraintStatement');
+    const semanticWitnessRegion = verifierWitness.match(
+      /const resolvedIssueId[\s\S]*?resolve_financial_issue_after_worker_recompute/u
+    )?.[0] ?? '';
+    expect(semanticWitnessRegion).not.toContain('pg_get_constraintdef');
+    expect(semanticWitnessRegion).toContain('${semanticIdentityConstraintStatement} not valid');
+    expect(semanticWitnessRegion).toContain('pool.query(semanticIdentityConstraintStatement)');
+    expect(semanticWitnessRegion).toContain('${semanticImpactConstraintStatement} not valid');
+    expect(semanticWitnessRegion).toContain('pool.query(semanticImpactConstraintStatement)');
+    for (const forbiddenDiagnosticSymbol of [
+      ['financialCatalogMismatch', 'DiagnosticSql'].join(''),
+      ['semantic constraint catalog', ' diagnostic'].join(''),
+      ['--diagnose', 'semantic-constraint-repair'].join('-')
+    ]) {
+      expect(verifierWitness).not.toContain(forbiddenDiagnosticSymbol);
+    }
+  });
+
+  it('refuses ambiguous financial witness timeout cleanup targets', () => {
+    expect(
+      financialWitnessTestTimeoutMs - financialWitnessHarnessTimeoutMs
+    ).toBeGreaterThanOrEqual(120_000);
+    expect(assertFinancialHarnessProjectOwned.toString()).toContain(
+      'projectResources.length === 0'
+    );
+    expect(assertFinancialHarnessProjectOwned.toString()).toContain('ids.length > 1');
+    const resource = (
+      id: string,
+      project: string
+    ): FinancialHarnessDockerResource => ({
+      id,
+      kind: 'container',
+      labels: { 'com.docker.compose.project': project }
+    });
+    const baseline = new Map<string, FinancialHarnessDockerResource>([
+      ['container:baseline', resource('baseline', 'unrelated-project')]
+    ]);
+    const oneProject = new Map(baseline);
+    oneProject.set(
+      'container:new-one',
+      resource('new-one', 'pale-orbit-test-1111111111111111')
+    );
+    expect(exactNewFinancialHarnessProject(baseline, oneProject)).toBe(
+      'pale-orbit-test-1111111111111111'
+    );
+
+    const noProject = new Map(baseline);
+    expect(() => exactNewFinancialHarnessProject(baseline, noProject)).toThrow(
+      'expected exactly one new test project, found 0'
+    );
+    const twoProjects = new Map(oneProject);
+    twoProjects.set(
+      'container:new-two',
+      resource('new-two', 'pale-orbit-test-2222222222222222')
+    );
+    expect(() => exactNewFinancialHarnessProject(baseline, twoProjects)).toThrow(
+      'expected exactly one new test project, found 2'
+    );
+
+    const baselineStorage = new Set(['C:\\temp\\pale-orbit-test-storage-baseline']);
+    expect(exactNewFinancialHarnessStorageDirectory(
+      baselineStorage,
+      new Set([...baselineStorage, 'C:\\temp\\pale-orbit-test-storage-one'])
+    )).toBe('C:\\temp\\pale-orbit-test-storage-one');
+    expect(() => exactNewFinancialHarnessStorageDirectory(
+      baselineStorage,
+      new Set([
+        ...baselineStorage,
+        'C:\\temp\\pale-orbit-test-storage-one',
+        'C:\\temp\\pale-orbit-test-storage-two'
+      ])
+    )).toThrow('refusing ambiguous new test storage directories');
+  });
+
+  it('bounds financial witness process-tree termination before timeout cleanup', async () => {
+    const closed: FinancialWitnessHarnessClose = { signal: null, status: 0 };
+    await expect(waitForFinancialWitnessHarnessClose(
+      Promise.resolve(closed),
+      50
+    )).resolves.toEqual(closed);
+    await expect(waitForFinancialWitnessHarnessClose(
+      new Promise<FinancialWitnessHarnessClose>(() => undefined),
+      1
+    )).resolves.toBeNull();
+
+    const supervisor = runBoundedFinancialWitnessHarness.toString();
+    expect(supervisor.match(/terminateFinancialWitnessHarnessProcessTree/gmu)).toHaveLength(2);
+    expect(supervisor).toMatch(/child\.kill\(["']SIGKILL["']\)/u);
+    expect(supervisor).toContain('!treeKillSucceeded');
+    expect(supervisor).toContain('exact process-tree termination was not confirmed');
+    expect(supervisor.indexOf('closedAfterTermination')).toBeLessThan(
+      supervisor.indexOf('cleanupTimedOutFinancialWitnessHarness')
+    );
+    expect(supervisor.indexOf('!treeKillSucceeded')).toBeLessThan(
+      supervisor.indexOf('cleanupTimedOutFinancialWitnessHarness')
+    );
+    expect(financialWitnessTestTimeoutMs - financialWitnessHarnessTimeoutMs)
+      .toBeGreaterThanOrEqual(240_000);
+  });
+
+  it('executes schema-object, source-parity, deterministic-allocation, audit, payout, and chronology verifier witnesses in PostgreSQL', async () => {
+    const result = await runBoundedFinancialWitnessHarness();
+    const output = `${result.stdout}${result.stderr}`;
+    expect(
+      result.timedOut,
+      `financial witness harness exceeded ${financialWitnessHarnessTimeoutMs}ms; ${
+        result.cleanup ?? 'timeout cleanup was not attempted'
+      }\n${output.slice(-20_000)}`
+    ).toBe(false);
+    expect(output).toContain(
+      '[restore-verifier] schema-object, issue-identity, source-parity, deterministic-allocation, audit, classification, payout, replay-child, allocation-graph, refund-component, dispute-presentment, and combined-chronology witnesses passed'
     );
     expect(result.status).toBe(0);
-  }, 130_000);
+  }, financialWitnessTestTimeoutMs);
 
   it('allows only inert fail-closed psql meta-commands in executable restore SQL', async () => {
     const scripts = await Promise.all([
@@ -1415,9 +3231,26 @@ describe('commerce operations contract', () => {
     const shellBeforeStart = restoreShell.slice(0, restoreShell.indexOf('up --detach --wait postgres'));
 
     expect(powerShellBeforeStart).toContain('function New-RehearsalSecret');
-    expect(powerShellBeforeStart.match(/\$env:(?:DATABASE_PASSWORD|AUTH_SECRET|SMTP_PASSWORD|BOOTSTRAP_ADMIN_PASSWORD) = New-RehearsalSecret/gmu)).toHaveLength(4);
+    expect(
+      powerShellBeforeStart.match(
+        /\$env:(?:DATABASE_OWNER_PASSWORD|DATABASE_PASSWORD|DATABASE_WORKER_PASSWORD|DATABASE_STORAGE_CLEANUP_PASSWORD|AUTH_SECRET|SMTP_PASSWORD|BOOTSTRAP_ADMIN_PASSWORD) = New-RehearsalSecret/gmu
+      )
+    ).toHaveLength(7);
     expect(powerShellBeforeStart).toContain("$env:DATABASE_NAME = 'restore_rehearsal'");
-    expect(powerShellBeforeStart).toContain("$env:DATABASE_USER = 'restore_rehearsal'");
+    expect(powerShellBeforeStart).toContain(
+      "$env:DATABASE_OWNER_USER = 'restore_rehearsal_owner'"
+    );
+    expect(powerShellBeforeStart).toContain("$env:DATABASE_USER = 'restore_rehearsal_web'");
+    expect(powerShellBeforeStart).toContain(
+      "$env:DATABASE_WORKER_USER = 'restore_rehearsal_worker'"
+    );
+    expect(powerShellBeforeStart).toContain(
+      "$env:DATABASE_STORAGE_CLEANUP_USER = 'restore_rehearsal_storage_cleanup'"
+    );
+    expect(powerShellBeforeStart).toContain('Sort-Object -Unique).Count -ne 4');
+    expect(powerShellBeforeStart).toContain(
+      '($databaseRolePasswords | Sort-Object -Unique).Count -ne 4'
+    );
     expect(powerShellBeforeStart).toContain("$env:ORIGIN = 'https://restore.invalid'");
     expect(powerShellBeforeStart).toContain("$env:SITE_ADDRESS = 'restore.invalid'");
     expect(powerShellBeforeStart).toContain("$env:SMTP_HOST = '127.0.0.1'");
@@ -1427,7 +3260,10 @@ describe('commerce operations contract', () => {
 
     expect(shellBeforeStart).toContain('new_rehearsal_secret()');
     for (const secret of [
+      'DATABASE_OWNER_PASSWORD',
       'DATABASE_PASSWORD',
+      'DATABASE_WORKER_PASSWORD',
+      'DATABASE_STORAGE_CLEANUP_PASSWORD',
       'AUTH_SECRET',
       'SMTP_PASSWORD',
       'BOOTSTRAP_ADMIN_PASSWORD'
@@ -1436,7 +3272,44 @@ describe('commerce operations contract', () => {
       expect(shellBeforeStart).toContain(`export ${secret}`);
     }
     expect(shellBeforeStart).toContain('DATABASE_NAME=restore_rehearsal');
-    expect(shellBeforeStart).toContain('DATABASE_USER=restore_rehearsal');
+    expect(shellBeforeStart).toContain('DATABASE_OWNER_USER=restore_rehearsal_owner');
+    expect(shellBeforeStart).toContain('DATABASE_USER=restore_rehearsal_web');
+    expect(shellBeforeStart).toContain('DATABASE_WORKER_USER=restore_rehearsal_worker');
+    expect(shellBeforeStart).toContain(
+      'DATABASE_STORAGE_CLEANUP_USER=restore_rehearsal_storage_cleanup'
+    );
+    expect(shellBeforeStart).toContain('[ "$DATABASE_OWNER_USER" != "$DATABASE_USER" ]');
+    expect(shellBeforeStart).toContain(
+      '[ "$DATABASE_OWNER_USER" != "$DATABASE_WORKER_USER" ]'
+    );
+    expect(shellBeforeStart).toContain('[ "$DATABASE_USER" != "$DATABASE_WORKER_USER" ]');
+    expect(shellBeforeStart).toContain(
+      '[ "$DATABASE_OWNER_USER" != "$DATABASE_STORAGE_CLEANUP_USER" ]'
+    );
+    expect(shellBeforeStart).toContain(
+      '[ "$DATABASE_USER" != "$DATABASE_STORAGE_CLEANUP_USER" ]'
+    );
+    expect(shellBeforeStart).toContain(
+      '[ "$DATABASE_WORKER_USER" != "$DATABASE_STORAGE_CLEANUP_USER" ]'
+    );
+    expect(shellBeforeStart).toContain(
+      '[ "$DATABASE_OWNER_PASSWORD" != "$DATABASE_PASSWORD" ]'
+    );
+    expect(shellBeforeStart).toContain(
+      '[ "$DATABASE_OWNER_PASSWORD" != "$DATABASE_WORKER_PASSWORD" ]'
+    );
+    expect(shellBeforeStart).toContain(
+      '[ "$DATABASE_PASSWORD" != "$DATABASE_WORKER_PASSWORD" ]'
+    );
+    expect(shellBeforeStart).toContain(
+      '[ "$DATABASE_OWNER_PASSWORD" != "$DATABASE_STORAGE_CLEANUP_PASSWORD" ]'
+    );
+    expect(shellBeforeStart).toContain(
+      '[ "$DATABASE_PASSWORD" != "$DATABASE_STORAGE_CLEANUP_PASSWORD" ]'
+    );
+    expect(shellBeforeStart).toContain(
+      '[ "$DATABASE_WORKER_PASSWORD" != "$DATABASE_STORAGE_CLEANUP_PASSWORD" ]'
+    );
     expect(shellBeforeStart).toContain('ORIGIN=https://restore.invalid');
     expect(shellBeforeStart).toContain('SITE_ADDRESS=restore.invalid');
     expect(shellBeforeStart).toContain('SMTP_HOST=127.0.0.1');
@@ -1448,6 +3321,57 @@ describe('commerce operations contract', () => {
       expect(beforeStart).not.toMatch(/smtp\.(?:sendgrid|mailgun|amazonaws)\./iu);
     }
     expect(restoreSection).toContain('No production SMTP or provider credential may be present');
+  });
+
+  it('uses owner credentials for database administration and provisions runtime roles before app health', async () => {
+    const storageRunbook = await source('docs/storage-ingestion-and-publication.md');
+    const backupSection = markdownSection(storageRunbook, 'Coordinated backup');
+    const restoreSection = markdownSection(storageRunbook, 'Isolated restore rehearsal');
+    const commandSets = [
+      {
+        body: [backupSection, restoreSection]
+          .flatMap((section) => fencedCodeBlocks(section, 'powershell'))
+          .join('\n'),
+        ownerCredential: '$env:DATABASE_OWNER_USER'
+      },
+      {
+        body: [backupSection, restoreSection]
+          .flatMap((section) => fencedCodeBlocks(section, 'sh'))
+          .join('\n'),
+        ownerCredential: '"$DATABASE_OWNER_USER"'
+      }
+    ];
+
+    for (const { body, ownerCredential } of commandSets) {
+      const databaseAdministrationCommands = body
+        .split(/\r?\n/u)
+        .filter((line) => /\bpostgres\b[^\n]*\b(?:pg_dump|pg_restore|psql)\b/u.test(line));
+      expect(databaseAdministrationCommands.length, ownerCredential).toBeGreaterThan(0);
+      for (const command of databaseAdministrationCommands) {
+        expect(command, command).toContain(`-U ${ownerCredential}`);
+      }
+    }
+
+    for (const script of [
+      fencedCodeBlocks(restoreSection, 'powershell').join('\n'),
+      fencedCodeBlocks(restoreSection, 'sh').join('\n')
+    ]) {
+      const roleBootstrapMigrateIndex = script.indexOf('run --rm migrate');
+      const restoreIndex = script.indexOf('pg_restore');
+      const restoredStateMigrateIndex = script.indexOf(
+        'run --rm migrate',
+        roleBootstrapMigrateIndex + 1
+      );
+      const provisionIndex = script.indexOf('run --rm database-role-provision');
+      const appStartIndex = script.indexOf('up --detach --wait app');
+      const appHealthIndex = script.indexOf("fetch('http://127.0.0.1:3000'+path)");
+      expect(roleBootstrapMigrateIndex).toBeGreaterThan(-1);
+      expect(restoreIndex).toBeGreaterThan(roleBootstrapMigrateIndex);
+      expect(restoredStateMigrateIndex).toBeGreaterThan(restoreIndex);
+      expect(provisionIndex).toBeGreaterThan(restoredStateMigrateIndex);
+      expect(appStartIndex).toBeGreaterThan(provisionIndex);
+      expect(appHealthIndex).toBeGreaterThan(provisionIndex);
+    }
   });
 
   it('revalidates the bound Docker engine before every documented mutation', async () => {
@@ -1473,7 +3397,7 @@ describe('commerce operations contract', () => {
       {
         body: fencedCodeBlocks(restoreSection, 'sh').join('\n'),
         assertion: 'assert_restore_engine_binding',
-        mutation: /(?:^compose_restore (?:up|create)\b|^restore_docker cp\b|\bpg_restore\b|^restore_docker run --rm\b|\brun --rm (?:migrate|storage-cleanup)\b|\brm -f \/tmp\/database\.dump|\bdown --volumes\b)/u
+        mutation: /(?:^compose_restore (?:up|create)\b|^restore_docker cp\b|\bpg_restore\b|^restore_docker run --rm\b|\brun --rm (?:migrate|database-role-provision|storage-cleanup)\b|\brm -f \/tmp\/database\.dump|\bdown --volumes\b)/u
       }
     ];
 

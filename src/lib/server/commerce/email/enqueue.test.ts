@@ -8,9 +8,26 @@ import {
   type ReceiptSnapshot
 } from './enqueue';
 import { COMMERCE_CLAIM_EMAIL_JOB } from '../claim-email';
+import { wrapCommerceClaimActionUrl } from '$lib/server/auth/commerce-claim-capability';
 
 const origin = 'https://books.example.com';
 const transaction = {} as DatabaseTransaction;
+
+function commerceClaimBridgeUrl(trustedOrigin = origin): string {
+  const orderId = randomUUID();
+  const action = new URL('/api/auth/magic-link/verify', trustedOrigin);
+  action.searchParams.set('token', 'native-token');
+  action.searchParams.set('callbackURL', '/claim/complete');
+  action.searchParams.set('errorCallbackURL', '/claim/complete?error=magic-link');
+  action.searchParams.set('newUserCallbackURL', '/claim/complete');
+  return wrapCommerceClaimActionUrl({
+    actionUrl: action.toString(),
+    claimProofToken: 'b'.repeat(43),
+    anchorOrderId: orderId,
+    kind: 'commerce-magic',
+    trustedOrigin
+  });
+}
 
 function snapshot(overrides: Partial<ReceiptSnapshot> = {}): ReceiptSnapshot {
   const orderId = randomUUID();
@@ -113,7 +130,7 @@ describe('transactional commerce email enqueue', () => {
   it('deduplicates a replacement claim message by a digest of its one-use action', async () => {
     const initial = snapshot({ ownerType: 'guest' });
     const test = harness(initial);
-    const claimUrl = `${origin}/api/auth/magic-link/verify?token=replacement-safe&callbackURL=%2Fclaim%2Fcomplete`;
+    const claimUrl = commerceClaimBridgeUrl();
     await test.enqueuer.enqueueGuestClaimReissue(transaction, initial.orderId, claimUrl);
     await test.enqueuer.enqueueGuestClaimReissue(transaction, initial.orderId, claimUrl);
 
@@ -129,6 +146,24 @@ describe('transactional commerce email enqueue', () => {
       messageId: initial.orderId,
       claimUrl
     });
+  });
+
+  it('rejects malformed and off-origin claim bridges through the production enqueuer', async () => {
+    const initial = snapshot({ ownerType: 'guest' });
+    const test = harness(initial);
+    const malformed = new URL(commerceClaimBridgeUrl());
+    malformed.hash = 'proof=' + 'b'.repeat(43);
+    const offOrigin = new URL(commerceClaimBridgeUrl());
+    offOrigin.hostname = 'evil.example';
+
+    for (const claimUrl of [malformed.toString(), offOrigin.toString()]) {
+      await expect(test.enqueuer.enqueueGuestClaimReissue(
+        transaction,
+        initial.orderId,
+        claimUrl
+      )).rejects.toThrow();
+    }
+    expect(test.enqueueOutboxMessage).not.toHaveBeenCalled();
   });
 
   it('uses the internal event UUID for idempotent access-change mail', async () => {

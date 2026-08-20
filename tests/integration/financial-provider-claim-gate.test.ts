@@ -25,7 +25,11 @@ import {
   titles
 } from '$lib/server/db/schema';
 import { createPostgresJobRepository, enqueueJob } from '$lib/server/jobs/repository';
-import { applicationConfig, databaseClient } from './database';
+import {
+  applicationConfig,
+  ownerDatabaseClient,
+  workerDatabaseClient as databaseClient
+} from './database';
 
 const PROVIDER_SNAPSHOT = {
   livemode: false,
@@ -54,11 +58,11 @@ async function providerProjectionFixture() {
   const paymentIntentId = `pi_claim_gate_${suffix}`;
   const chargeId = `ch_claim_gate_${suffix}`;
   const providerTransactionId = `txn_claim_gate_${suffix}`;
-  const [guest] = await databaseClient.db.insert(guestIdentities).values({
+  const [guest] = await ownerDatabaseClient.db.insert(guestIdentities).values({
     email: `claim-gate-${suffix}@example.com`
   }).returning();
   if (!guest) throw new Error('Expected provider claim-gate guest');
-  await databaseClient.db.insert(titles).values({
+  await ownerDatabaseClient.db.insert(titles).values({
     id: titleId,
     slug: `claim-gate-${suffix}`,
     title: 'Claim gate title',
@@ -69,7 +73,7 @@ async function providerProjectionFixture() {
     currency: 'USD',
     visibility: 'private'
   });
-  await databaseClient.db.insert(orders).values({
+  await ownerDatabaseClient.db.insert(orders).values({
     id: orderId,
     status: 'paid',
     guestIdentityId: guest.id,
@@ -85,7 +89,7 @@ async function providerProjectionFixture() {
     checkoutExpiresAt: new Date('2026-08-14T12:30:00.000Z'),
     paidAt: PROVIDER_SNAPSHOT.createdAt
   });
-  await databaseClient.db.insert(orderItems).values({
+  await ownerDatabaseClient.db.insert(orderItems).values({
     id: orderItemId,
     orderId,
     titleId,
@@ -98,7 +102,7 @@ async function providerProjectionFixture() {
     totalMinor: 100,
     stripeLineItemId: `li_claim_gate_${suffix}`
   });
-  const [payment] = await databaseClient.db.insert(payments).values({
+  const [payment] = await ownerDatabaseClient.db.insert(payments).values({
     orderId,
     stripePaymentIntentId: paymentIntentId,
     stripeLatestChargeId: chargeId,
@@ -170,7 +174,7 @@ async function providerProjectionFixture() {
       }
     });
   });
-  await databaseClient.db.delete(jobs);
+  await ownerDatabaseClient.db.delete(jobs);
   return {
     orderId,
     orderItemId,

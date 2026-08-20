@@ -19,14 +19,14 @@ import {
   user,
   userRoles
 } from '$lib/server/db/schema';
-import { databaseClient } from './database';
+import { databaseClient, ownerDatabaseClient, workerDatabaseClient } from './database';
 
 const uuid = (value: number): string =>
   `00000000-0000-4000-8000-${value.toString().padStart(12, '0')}`;
 
 async function createCustomer(): Promise<Extract<Actor, { type: 'user' }>> {
   const id = randomUUID();
-  await databaseClient.db.insert(user).values({
+  await ownerDatabaseClient.db.insert(user).values({
     id,
     name: 'Quote Customer',
     email: `${id}@example.com`,
@@ -45,11 +45,11 @@ async function createPurchaseFact(input: {
 }) {
   const guestIdentity = input.initiatingUserId
     ? null
-    : await findOrCreateGuestIdentity(databaseClient.db, input.purchaseEmail);
+    : await findOrCreateGuestIdentity(workerDatabaseClient.db, input.purchaseEmail);
   const orderId = randomUUID();
   const itemId = randomUUID();
   const paid = (input.orderStatus ?? 'paid') === 'paid';
-  await databaseClient.db.insert(orders).values({
+  await ownerDatabaseClient.db.insert(orders).values({
     id: orderId,
     status: input.orderStatus ?? 'paid',
     initiatingUserId: input.initiatingUserId ?? null,
@@ -66,7 +66,7 @@ async function createPurchaseFact(input: {
     checkoutExpiresAt: paid ? new Date('2026-08-10T12:30:00.000Z') : null,
     paidAt: paid ? new Date('2026-08-10T12:05:00.000Z') : null
   });
-  await databaseClient.db.insert(orderItems).values({
+  await ownerDatabaseClient.db.insert(orderItems).values({
     id: itemId,
     orderId,
     titleId: input.titleId,
@@ -79,7 +79,7 @@ async function createPurchaseFact(input: {
     totalMinor: paid ? 1000 : null,
     stripeLineItemId: paid ? `li_test_${itemId}` : null
   });
-  await databaseClient.db.insert(entitlementGrants).values({
+  await ownerDatabaseClient.db.insert(entitlementGrants).values({
     titleId: input.titleId,
     userId: input.grantUserId ?? null,
     source: 'purchase',
@@ -99,13 +99,13 @@ async function createPurchaseFact(input: {
 
 async function createAdministrator(): Promise<Extract<Actor, { type: 'user' }>> {
   const id = randomUUID();
-  await databaseClient.db.insert(user).values({
+  await ownerDatabaseClient.db.insert(user).values({
     id,
     name: 'Quote Administrator',
     email: `${id}@example.com`,
     emailVerified: true
   });
-  await databaseClient.db.insert(userRoles).values({ userId: id, role: 'admin' });
+  await ownerDatabaseClient.db.insert(userRoles).values({ userId: id, role: 'admin' });
   return { type: 'user', id, roles: ['admin'] };
 }
 
@@ -120,7 +120,7 @@ interface QuoteTitleOptions {
 }
 
 async function createQuoteTitle(options: QuoteTitleOptions) {
-  const [title] = await databaseClient.db
+  const [title] = await ownerDatabaseClient.db
     .insert(titles)
     .values({
       slug: `quote-${randomUUID()}`,
@@ -134,7 +134,7 @@ async function createQuoteTitle(options: QuoteTitleOptions) {
     })
     .returning();
   if (!title) throw new Error('Expected quote title');
-  const [revision] = await databaseClient.db
+  const [revision] = await ownerDatabaseClient.db
     .insert(titleRevisions)
     .values({
       titleId: title.id,
@@ -150,7 +150,7 @@ async function createQuoteTitle(options: QuoteTitleOptions) {
     ? 'published'
     : options.presentationState;
   if (presentationState === 'published') {
-    const [section] = await databaseClient.db
+    const [section] = await ownerDatabaseClient.db
       .insert(proseSections)
       .values({
         revisionId: revision.id,
@@ -160,7 +160,7 @@ async function createQuoteTitle(options: QuoteTitleOptions) {
       })
       .returning();
     if (!section) throw new Error('Expected quote section');
-    const [block] = await databaseClient.db
+    const [block] = await ownerDatabaseClient.db
       .insert(proseBlocks)
       .values({
         revisionId: revision.id,
@@ -172,7 +172,7 @@ async function createQuoteTitle(options: QuoteTitleOptions) {
       })
       .returning();
     if (!block) throw new Error('Expected quote block');
-    const [presentation] = await databaseClient.db
+    const [presentation] = await ownerDatabaseClient.db
       .insert(revisionPresentations)
       .values({
         revisionId: revision.id,
@@ -184,7 +184,7 @@ async function createQuoteTitle(options: QuoteTitleOptions) {
       .returning({ id: revisionPresentations.id });
     presentationId = presentation?.id ?? null;
   } else if (presentationState === 'draft') {
-    const [presentation] = await databaseClient.db
+    const [presentation] = await ownerDatabaseClient.db
       .insert(revisionPresentations)
       .values({ revisionId: revision.id, state: 'draft' })
       .returning({ id: revisionPresentations.id });
@@ -192,7 +192,7 @@ async function createQuoteTitle(options: QuoteTitleOptions) {
   }
 
   if (options.activePointer ?? true) {
-    await databaseClient.db
+    await ownerDatabaseClient.db
       .update(titles)
       .set({ activeRevisionId: revision.id })
       .where(eq(titles.id, title.id));
@@ -291,7 +291,7 @@ describe('authoritative commerce quotes', () => {
     const customer = await createCustomer();
     const owned = await createQuoteTitle({ label: 'Owned Quote Title' });
     const revoked = await createQuoteTitle({ label: 'Revoked Quote Title' });
-    await databaseClient.db.transaction((transaction) =>
+    await workerDatabaseClient.db.transaction((transaction) =>
       setPreservedGrantState(transaction, {
         userId: customer.id,
         titleId: owned.title.id,
@@ -299,7 +299,7 @@ describe('authoritative commerce quotes', () => {
         stateReason: 'test_quote_owned'
       })
     );
-    await databaseClient.db.transaction(async (transaction) => {
+    await workerDatabaseClient.db.transaction(async (transaction) => {
       await setPreservedGrantState(transaction, {
         userId: customer.id,
         titleId: revoked.title.id,
@@ -371,7 +371,7 @@ describe('authoritative commerce quotes', () => {
       .where(eq(user.id, customer.id));
     if (!account) throw new Error('Expected customer');
     const fixture = await createQuoteTitle({ label: 'Overlapping Purchase Facts' });
-    await databaseClient.db.transaction((transaction) => setPreservedGrantState(transaction, {
+    await workerDatabaseClient.db.transaction((transaction) => setPreservedGrantState(transaction, {
       userId: customer.id,
       titleId: fixture.title.id,
       active: true,
@@ -505,7 +505,7 @@ describe('authoritative commerce quotes', () => {
     const locked = new Promise<void>((resolve) => {
       signalLocked = resolve;
     });
-    const entitlementChange = databaseClient.db.transaction(async (transaction) => {
+    const entitlementChange = workerDatabaseClient.db.transaction(async (transaction) => {
       await setPreservedGrantState(transaction, {
         userId: customer.id,
         titleId: fixture.title.id,

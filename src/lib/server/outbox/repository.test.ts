@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
+import type { SQL } from 'drizzle-orm';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { JsonObject, OutboxMessageRow } from '$lib/server/db/schema';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
@@ -15,9 +16,19 @@ vi.mock('$lib/server/jobs/repository', () => ({
 
 import {
   enqueueOutboxMessage,
+  outboxMessageInsertQuery,
   OutboxDeduplicationInvariantError,
   type EnqueueOutboxMessageInput
 } from './repository';
+
+function rendered(query: SQL): { sql: string; params: unknown[] } {
+  return query.toQuery({
+    casing: {} as never,
+    escapeName: (name) => `"${name}"`,
+    escapeParam: (index) => `$${index + 1}`,
+    escapeString: (value) => `'${value}'`
+  });
+}
 
 interface InsertValue {
   id: string;
@@ -29,40 +40,65 @@ interface InsertValue {
 
 class FakeOutboxTransaction {
   readonly messages: OutboxMessageRow[] = [];
-  private attempted: InsertValue | null = null;
-  private selectCount = 0;
+  advisoryLockCount = 0;
+  safeSelectCount = 0;
+  private requested: EnqueueOutboxMessageInput | null = null;
+  private executeCount = 0;
 
-  insert(): unknown {
+  expectRequest(input: EnqueueOutboxMessageInput): void {
+    this.requested = input;
+    this.executeCount = 0;
+  }
+
+  async execute(query: SQL): Promise<{ rows: unknown[] }> {
+    const statement = rendered(query);
+    if (statement.sql.includes('pg_advisory_xact_lock')) {
+      this.advisoryLockCount += 1;
+      return { rows: [{}] };
+    }
+    if (statement.sql.includes('insert into "public"."outbox_messages"')) {
+      const [id, topic, rawPayload, deduplicationKey, dispatchJobId] = statement.params;
+      const value: InsertValue = {
+        id: String(id),
+        topic: String(topic),
+        payload: JSON.parse(String(rawPayload)) as JsonObject,
+        deduplicationKey: deduplicationKey === null ? null : String(deduplicationKey),
+        dispatchJobId: String(dispatchJobId)
+      };
+      const conflict = value.deduplicationKey
+        ? this.messages.find(
+            (message) => message.deduplicationKey === value.deduplicationKey
+          )
+        : undefined;
+      if (conflict) return { rows: [] };
+
+      const now = new Date('2026-08-10T12:00:00.000Z');
+      const message: OutboxMessageRow = {
+        ...value,
+        deduplicationKey: value.deduplicationKey ?? null,
+        status: 'pending',
+        lastError: null,
+        deliveredAt: null,
+        createdAt: now,
+        updatedAt: now
+      };
+      this.messages.push(message);
+      return { rows: [{ id: message.id }] };
+    }
+    this.executeCount += 1;
+    const requested = this.requested;
+    if (!requested?.deduplicationKey) return { rows: [] };
+    const existing = this.messages.find(
+      (message) => message.deduplicationKey === requested.deduplicationKey
+    );
+    if (this.executeCount % 2 === 0) return { rows: [{ exists: existing !== undefined }] };
+    if (
+      !existing ||
+      existing.topic !== requested.topic ||
+      !isDeepStrictEqual(existing.payload, requested.payload)
+    ) return { rows: [] };
     return {
-      values: (value: InsertValue) => {
-        this.attempted = value;
-        this.selectCount = 0;
-        const query = {
-          onConflictDoNothing: () => query,
-          returning: async () => {
-            const conflict = value.deduplicationKey
-              ? this.messages.find(
-                  (message) => message.deduplicationKey === value.deduplicationKey
-                )
-              : undefined;
-            if (conflict) return [];
-
-            const now = new Date('2026-08-10T12:00:00.000Z');
-            const message: OutboxMessageRow = {
-              ...value,
-              deduplicationKey: value.deduplicationKey ?? null,
-              status: 'pending',
-              lastError: null,
-              deliveredAt: null,
-              createdAt: now,
-              updatedAt: now
-            };
-            this.messages.push(message);
-            return [message];
-          }
-        };
-        return query;
-      }
+      rows: [{ id: existing.id }]
     };
   }
 
@@ -71,26 +107,36 @@ class FakeOutboxTransaction {
       from: () => ({
         where: () => ({
           limit: async () => {
-            const attempted = this.attempted;
-            if (!attempted?.deduplicationKey) return [];
-            const existing = this.messages.find(
-              (message) => message.deduplicationKey === attempted.deduplicationKey
-            );
-            if (!existing) return [];
-
-            this.selectCount += 1;
-            if (this.selectCount === 1) {
-              return existing.topic === attempted.topic &&
-                isDeepStrictEqual(existing.payload, attempted.payload)
-                ? [existing]
-                : [];
-            }
-            return [existing];
+            this.safeSelectCount += 1;
+            const requestedKey = this.requested?.deduplicationKey;
+            const message = requestedKey
+              ? this.messages.find((candidate) => candidate.deduplicationKey === requestedKey)
+              : this.messages.at(-1);
+            if (!message) return [];
+            return [{
+              id: message.id,
+              topic: message.topic,
+              deduplicationKey: message.deduplicationKey,
+              dispatchJobId: message.dispatchJobId,
+              status: message.status,
+              lastError: message.lastError,
+              deliveredAt: message.deliveredAt,
+              createdAt: message.createdAt,
+              updatedAt: message.updatedAt
+            }];
           }
         })
       })
     };
   }
+}
+
+async function enqueue(
+  transaction: FakeOutboxTransaction,
+  input: EnqueueOutboxMessageInput
+): Promise<OutboxMessageRow> {
+  transaction.expectRequest(input);
+  return enqueueOutboxMessage(transaction as unknown as DatabaseTransaction, input);
 }
 
 function stableInput(
@@ -115,26 +161,51 @@ describe('enqueueOutboxMessage stable deduplication', () => {
     });
   });
 
+  it('targets only the five runtime-granted outbox insert columns', () => {
+    const query = rendered(outboxMessageInsertQuery({
+      id: '00000000-0000-4000-8000-000000000001',
+      topic: 'commerce.receipt',
+      payload: { orderId: '00000000-0000-4000-8000-000000000002' },
+      deduplicationKey: 'commerce:receipt:test:v1',
+      dispatchJobId: '00000000-0000-4000-8000-000000000003'
+    }, true));
+    const normalized = query.sql.replace(/\s+/gu, ' ').trim();
+    expect(normalized).toMatch(
+      /^insert into "public"\."outbox_messages" \(\s*"id", "topic", "payload", "deduplication_key", "dispatch_job_id"\s*\) values /u
+    );
+    expect(normalized).toContain('on conflict do nothing returning');
+    expect(normalized).toMatch(/returning "id"$/u);
+    expect(normalized.slice(0, normalized.indexOf(' values '))).not.toMatch(
+      /"(?:status|last_error|delivered_at|created_at|updated_at)"/u
+    );
+  });
+
   it('returns one logical outbox row and job for retries with the same stable key', async () => {
     const transaction = new FakeOutboxTransaction();
     const key = 'commerce:receipt:order:order-1:v1';
 
-    const first = await enqueueOutboxMessage(
-      transaction as unknown as DatabaseTransaction,
+    const first = await enqueue(
+      transaction,
       stableInput(key, 'commerce.receipt', { orderId: 'order-1', version: 1 })
     );
-    const second = await enqueueOutboxMessage(
-      transaction as unknown as DatabaseTransaction,
+    const second = await enqueue(
+      transaction,
       stableInput(key, 'commerce.receipt', { version: 1, orderId: 'order-1' })
     );
 
     expect(second.id).toBe(first.id);
+    expect(first.createdAt).toBeInstanceOf(Date);
+    expect(second.createdAt).toBeInstanceOf(Date);
     expect(transaction.messages).toHaveLength(1);
+    expect(transaction.safeSelectCount).toBe(2);
     expect(jobMock.rows).toHaveLength(1);
+    expect(jobMock.enqueue).toHaveBeenCalledTimes(1);
+    expect(transaction.advisoryLockCount).toBe(2);
     expect(jobMock.enqueue).toHaveBeenLastCalledWith(
       expect.anything(),
       expect.objectContaining({
-        deduplicationKey: `outbox-key:${createHash('sha256').update(key).digest('hex')}`
+        deduplicationKey: `outbox-key:${createHash('sha256').update(key).digest('hex')}`,
+        maxAttempts: 8
       })
     );
   });
@@ -142,12 +213,12 @@ describe('enqueueOutboxMessage stable deduplication', () => {
   it('keeps different stable keys distinct', async () => {
     const transaction = new FakeOutboxTransaction();
 
-    const first = await enqueueOutboxMessage(
-      transaction as unknown as DatabaseTransaction,
+    const first = await enqueue(
+      transaction,
       stableInput('commerce:receipt:order:order-1:v1')
     );
-    const second = await enqueueOutboxMessage(
-      transaction as unknown as DatabaseTransaction,
+    const second = await enqueue(
+      transaction,
       stableInput('commerce:receipt:order:order-2:v1', 'commerce.receipt', {
         orderId: 'order-2',
         version: 1
@@ -162,20 +233,20 @@ describe('enqueueOutboxMessage stable deduplication', () => {
   it('rejects reuse of a stable key for a different topic or canonical payload', async () => {
     const transaction = new FakeOutboxTransaction();
     const key = 'commerce:receipt:order:order-1:v1';
-    await enqueueOutboxMessage(
-      transaction as unknown as DatabaseTransaction,
+    await enqueue(
+      transaction,
       stableInput(key)
     );
 
     await expect(
-      enqueueOutboxMessage(
-        transaction as unknown as DatabaseTransaction,
+      enqueue(
+        transaction,
         stableInput(key, 'commerce.access-changed')
       )
     ).rejects.toBeInstanceOf(OutboxDeduplicationInvariantError);
     await expect(
-      enqueueOutboxMessage(
-        transaction as unknown as DatabaseTransaction,
+      enqueue(
+        transaction,
         stableInput(key, 'commerce.receipt', { orderId: 'order-2', version: 1 })
       )
     ).rejects.toBeInstanceOf(OutboxDeduplicationInvariantError);

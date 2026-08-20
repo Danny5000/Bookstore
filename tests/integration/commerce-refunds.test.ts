@@ -48,7 +48,12 @@ import { balanceTransactionSnapshotFixture } from '../fixtures/stripe/balance-tr
 import { chargeSnapshotFixture } from '../fixtures/stripe/charge';
 import { paymentSnapshotFixture } from '../fixtures/stripe/payment';
 import { refundSnapshotFixture } from '../fixtures/stripe/refund';
-import { applicationConfig, databaseClient } from './database';
+import {
+  applicationConfig,
+  databaseClient,
+  ownerDatabaseClient,
+  workerDatabaseClient
+} from './database';
 
 const now = new Date('2026-08-10T14:00:00.000Z');
 const FAR_FUTURE = new Date('2099-01-01T00:00:00.000Z');
@@ -77,14 +82,14 @@ async function createPurchase(
   let guestIdentityId: string | null = null;
   if (owner === 'account') {
     userId = randomUUID();
-    await databaseClient.db.insert(user).values({
+    await ownerDatabaseClient.db.insert(user).values({
       id: userId,
       name: 'Refund reader',
       email,
       emailVerified: true
     });
   } else {
-    const [identity] = await databaseClient.db.insert(guestIdentities)
+    const [identity] = await ownerDatabaseClient.db.insert(guestIdentities)
       .values({ email })
       .returning();
     if (!identity) throw new Error('Expected identity');
@@ -93,7 +98,7 @@ async function createPurchase(
 
   const totalMinor = totals.reduce((sum, value) => sum + value, 0);
   const taxMinor = taxes.reduce((sum, value) => sum + value, 0);
-  await databaseClient.db.insert(orders).values({
+  await ownerDatabaseClient.db.insert(orders).values({
     id: orderId,
     status: 'paid',
     initiatingUserId: userId,
@@ -116,7 +121,7 @@ async function createPurchase(
     const itemTax = taxes[index]!;
     const titleId = randomUUID();
     const itemId = randomUUID();
-    await databaseClient.db.insert(titles).values({
+    await ownerDatabaseClient.db.insert(titles).values({
       id: titleId,
       slug: `refund-title-${titleId}`,
       title: `Private refund title ${index}`,
@@ -127,7 +132,7 @@ async function createPurchase(
       currency: 'USD',
       visibility: 'private'
     });
-    await databaseClient.db.insert(orderItems).values({
+    await ownerDatabaseClient.db.insert(orderItems).values({
       id: itemId,
       orderId,
       titleId,
@@ -140,7 +145,7 @@ async function createPurchase(
       totalMinor: itemTotal,
       stripeLineItemId: `li_test_${itemId}`
     });
-    await databaseClient.db.insert(entitlementGrants).values({
+    await ownerDatabaseClient.db.insert(entitlementGrants).values({
       titleId,
       userId,
       source: 'purchase',
@@ -153,7 +158,7 @@ async function createPurchase(
   }
 
   const paymentIntentId = `pi_test_${orderId}`;
-  const [payment] = await databaseClient.db.insert(payments).values({
+  const [payment] = await ownerDatabaseClient.db.insert(payments).values({
     orderId,
     stripePaymentIntentId: paymentIntentId,
     stripeLatestChargeId: `ch_test_${orderId}`,
@@ -165,7 +170,7 @@ async function createPurchase(
   }).returning();
   if (!payment) throw new Error('Expected payment');
   if (userId) {
-    await databaseClient.db.transaction(async (transaction) => {
+    await workerDatabaseClient.db.transaction(async (transaction) => {
       for (const item of items) {
         await projectEffectiveEntitlement(transaction, userId!, item.titleId, now);
       }
@@ -175,7 +180,7 @@ async function createPurchase(
 }
 
 async function createRefundEvent(providerRefundId: string, sequence = 1) {
-  const [event] = await databaseClient.db.insert(stripeEvents).values({
+  const [event] = await ownerDatabaseClient.db.insert(stripeEvents).values({
     providerEventId: `evt_refund_${sequence}_${randomUUID()}`,
     eventType: 'refund.updated',
     objectId: providerRefundId,
@@ -236,17 +241,17 @@ function dependencies(
 
 async function drainRefundFinancialJobs(gateway: StripeCommerceGateway): Promise<void> {
   const repository = createPostgresJobRepository(
-    databaseClient.db,
+    workerDatabaseClient.db,
     applicationConfig.jobs,
     () => FAR_FUTURE
   );
   const handlers = new Map<string, JobHandler>([
     [FINANCIAL_SOURCE_JOB, createFinancialSourceHandler({
-      database: databaseClient.db,
+      database: workerDatabaseClient.db,
       gateway
     })],
     [FINANCIAL_CLASSIFICATION_JOB, createFinancialClassificationHandler({
-      database: databaseClient.db,
+      database: workerDatabaseClient.db,
       targetClassifierVersion: 1,
       targetAllocationAlgorithmVersion: 1
     })],
@@ -269,7 +274,7 @@ describe('canonical refund fulfillment', () => {
     const fixture = await createPurchase([1403]);
     const event = await createRefundEvent(`re_test_${randomUUID()}`);
     await fulfillRefundEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       snapshots(fixture, event, 500),
       dependencies()
     );
@@ -305,7 +310,7 @@ describe('canonical refund fulfillment', () => {
     const fixture = await createPurchase([1403]);
     const first = await createRefundEvent(`re_test_${randomUUID()}`, 1);
     await fulfillRefundEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       snapshots(fixture, first, 500, 'succeeded', 1),
       dependencies()
     );
@@ -314,11 +319,11 @@ describe('canonical refund fulfillment', () => {
     ]);
     expect((await databaseClient.db.select().from(entitlementGrants))[0]?.state).toBe('active');
     expect((await databaseClient.db.select().from(entitlements))[0]?.revokedAt).toBeNull();
-    expect(await databaseClient.db.select().from(outboxMessages)).toHaveLength(0);
+    expect(await ownerDatabaseClient.db.select().from(outboxMessages)).toHaveLength(0);
 
     const second = await createRefundEvent(`re_test_${randomUUID()}`, 2);
     await fulfillRefundEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       snapshots(fixture, second, 903, 'succeeded', 2),
       dependencies()
     );
@@ -331,7 +336,7 @@ describe('canonical refund fulfillment', () => {
     });
     expect((await databaseClient.db.select().from(entitlements))[0]?.revokedAt)
       .toEqual(expect.any(Date));
-    const mail = await databaseClient.db.select().from(outboxMessages);
+    const mail = await ownerDatabaseClient.db.select().from(outboxMessages);
     expect(mail).toHaveLength(1);
     expect(parseCommerceEmailPayload(mail[0]?.payload, applicationConfig.origin)).toMatchObject({
       template: 'commerce.refund-access-changed',
@@ -339,12 +344,12 @@ describe('canonical refund fulfillment', () => {
     });
 
     await fulfillRefundEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       snapshots(fixture, second, 903, 'succeeded', 2),
       dependencies()
     );
     expect(await databaseClient.db.select().from(refundAllocations)).toHaveLength(2);
-    expect(await databaseClient.db.select().from(outboxMessages)).toHaveLength(1);
+    expect(await ownerDatabaseClient.db.select().from(outboxMessages)).toHaveLength(1);
   });
 
   it('keeps both reconciled refunds current on a distinct exact no-op event', async () => {
@@ -353,23 +358,23 @@ describe('canonical refund fulfillment', () => {
     const secondProviderId = `re_test_${randomUUID()}`;
     const first = await createRefundEvent(firstProviderId, 1);
     await fulfillRefundEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       snapshots(fixture, first, 500, 'succeeded', 1),
       dependencies()
     );
     const second = await createRefundEvent(secondProviderId, 2);
     await fulfillRefundEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       snapshots(fixture, second, 903, 'succeeded', 2),
       dependencies()
     );
-    await databaseClient.db.update(refunds).set({
+    await ownerDatabaseClient.db.update(refunds).set({
       financialEvidenceStatus: 'fee_reconciled'
     });
 
     const distinctNoop = await createRefundEvent(secondProviderId, 3);
     await fulfillRefundEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       snapshots(fixture, distinctNoop, 903, 'succeeded', 2),
       dependencies()
     );
@@ -388,14 +393,14 @@ describe('canonical refund fulfillment', () => {
   it('deterministically allocates one full multi-title refund and sends one aggregate change', async () => {
     const fixture = await createPurchase([1000, 1500]);
     const event = await createRefundEvent(`re_test_${randomUUID()}`);
-    await fulfillRefundEvent(databaseClient.db, snapshots(fixture, event, 2500), dependencies());
+    await fulfillRefundEvent(workerDatabaseClient.db, snapshots(fixture, event, 2500), dependencies());
     expect((await databaseClient.db.select().from(refundAllocations))
       .map((allocation) => allocation.amountMinor).sort((a, b) => a - b))
       .toEqual([1000, 1500]);
     expect((await databaseClient.db.select().from(entitlementGrants))
       .every((grant) => grant.state === 'revoked')).toBe(true);
     expect(parseCommerceEmailPayload(
-      (await databaseClient.db.select().from(outboxMessages))[0]?.payload,
+      (await ownerDatabaseClient.db.select().from(outboxMessages))[0]?.payload,
       applicationConfig.origin
     )).toMatchObject({ affectedTitleCount: 2 });
   });
@@ -403,7 +408,7 @@ describe('canonical refund fulfillment', () => {
   it('stores ambiguous partial multi-title refunds as inspectable exceptions without guessing', async () => {
     const fixture = await createPurchase([1000, 1500]);
     const event = await createRefundEvent(`re_test_${randomUUID()}`);
-    await fulfillRefundEvent(databaseClient.db, snapshots(fixture, event, 800), dependencies());
+    await fulfillRefundEvent(workerDatabaseClient.db, snapshots(fixture, event, 800), dependencies());
     expect(await databaseClient.db.select().from(refundAllocations)).toHaveLength(0);
     expect((await databaseClient.db.select().from(refunds))[0]).toMatchObject({
       status: 'succeeded',
@@ -428,14 +433,14 @@ describe('canonical refund fulfillment', () => {
     })]);
     expect((await databaseClient.db.select().from(entitlementGrants))
       .every((grant) => grant.state === 'active')).toBe(true);
-    expect(await databaseClient.db.select().from(outboxMessages)).toHaveLength(0);
+    expect(await ownerDatabaseClient.db.select().from(outboxMessages)).toHaveLength(0);
   });
 
   it('persists deterministic subtotal and tax components that financial replay can consume', async () => {
     const fixture = await createPurchase([100], 'account', [20]);
     const event = await createRefundEvent(`re_test_${randomUUID()}`, 1);
     await fulfillRefundEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       snapshots(fixture, event, 50, 'succeeded', 1),
       dependencies()
     );
@@ -447,7 +452,7 @@ describe('canonical refund fulfillment', () => {
       })
     ]);
 
-    const staged = await stageBalanceTransaction(databaseClient.db, {
+    const staged = await stageBalanceTransaction(workerDatabaseClient.db, {
       id: `txn_refund_components_${randomUUID()}`, livemode: false,
       sourceFamily: 'refund', sourceId: refund!.stripeRefundId,
       rawType: 'refund', reportingCategory: 'refund', balanceType: 'payments',
@@ -460,14 +465,14 @@ describe('canonical refund fulfillment', () => {
       'select fingerprint_sha256 from stripe_balance_transactions where id=$1',
       [staged.balanceTransactionId]
     ).then((result) => result.rows);
-    await expect(databaseClient.db.transaction((tx) =>
+    await expect(workerDatabaseClient.db.transaction((tx) =>
       replayFinancialClassificationLocked(tx, {
         subjectType: 'balance_transaction', subjectId: staged.balanceTransactionId,
         sourceFingerprintSha256: balance!.fingerprint_sha256,
         classifierVersion: 1, allocationAlgorithmVersion: 1, replayId: 'c1-a1',
         correlationId: 'refund-components-replay'
       }))).resolves.toMatchObject({ status: 'replayed' });
-    await expect(loadCurrentEffectiveAllocationProjection(databaseClient.db, {
+    await expect(loadCurrentEffectiveAllocationProjection(workerDatabaseClient.db, {
       balanceTransactionIds: [staged.balanceTransactionId]
     })).resolves.toEqual([
       expect.objectContaining({
@@ -492,7 +497,7 @@ describe('canonical refund fulfillment', () => {
       id: '00000000-0000-4000-8000-000000000001',
       providerId: `re_z_${randomUUID()}`
     };
-    await databaseClient.db.insert(refunds).values([
+    await ownerDatabaseClient.db.insert(refunds).values([
       {
         id: providerFirst.id,
         paymentId: fixture.paymentId,
@@ -519,7 +524,7 @@ describe('canonical refund fulfillment', () => {
     const event = await createRefundEvent(providerSecond.providerId, 1);
 
     await fulfillRefundEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       snapshots(fixture, event, 1, 'succeeded', 1),
       dependencies()
     );
@@ -545,7 +550,7 @@ describe('canonical refund fulfillment', () => {
     const fixture = await createPurchase([2], 'account', [1]);
     const later = await createRefundEvent(`re_test_${randomUUID()}`, 2);
     await fulfillRefundEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       snapshots(fixture, later, 1, 'succeeded', 2),
       dependencies()
     );
@@ -557,7 +562,7 @@ describe('canonical refund fulfillment', () => {
 
     const earlier = await createRefundEvent(`re_test_${randomUUID()}`, 1);
     await fulfillRefundEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       snapshots(fixture, earlier, 1, 'succeeded', 1),
       dependencies()
     );
@@ -585,7 +590,7 @@ describe('canonical refund fulfillment', () => {
       id: '00000000-0000-4000-8000-000000000002',
       providerId: `re_z_${randomUUID()}`
     };
-    await databaseClient.db.insert(refunds).values([
+    await ownerDatabaseClient.db.insert(refunds).values([
       {
         id: providerEarlier.id,
         paymentId: fixture.paymentId,
@@ -609,14 +614,14 @@ describe('canonical refund fulfillment', () => {
         allocationStatus: 'finalized'
       }
     ]);
-    const [laterAllocation] = await databaseClient.db.insert(refundAllocations).values({
+    const [laterAllocation] = await ownerDatabaseClient.db.insert(refundAllocations).values({
       refundId: providerLater.id,
       orderItemId: fixture.items[0]!.id,
       amountMinor: 1,
       source: 'automatic',
       createdAt: now
     }).returning();
-    await databaseClient.db.insert(refundAllocationComponents).values({
+    await ownerDatabaseClient.db.insert(refundAllocationComponents).values({
       refundAllocationId: laterAllocation!.id,
       refundId: providerLater.id,
       orderItemId: fixture.items[0]!.id,
@@ -631,7 +636,7 @@ describe('canonical refund fulfillment', () => {
     const componentsBefore = await databaseClient.db.select().from(refundAllocationComponents);
 
     await fulfillRefundEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       snapshots(fixture, event, 1, 'succeeded', 1),
       dependencies()
     );
@@ -651,7 +656,7 @@ describe('canonical refund fulfillment', () => {
     const fixture = await createPurchase([1000, 1500]);
     const firstProviderRefundId = `re_test_${randomUUID()}`;
     const secondProviderRefundId = `re_test_${randomUUID()}`;
-    const seededRefunds = await databaseClient.db.insert(refunds).values([
+    const seededRefunds = await ownerDatabaseClient.db.insert(refunds).values([
       {
         paymentId: fixture.paymentId,
         stripeRefundId: firstProviderRefundId,
@@ -676,7 +681,7 @@ describe('canonical refund fulfillment', () => {
     const refundsByProviderId = new Map(
       seededRefunds.map((refund) => [refund.stripeRefundId, refund])
     );
-    await databaseClient.db.insert(refundAllocations).values([
+    await ownerDatabaseClient.db.insert(refundAllocations).values([
       {
         refundId: refundsByProviderId.get(firstProviderRefundId)!.id,
         orderItemId: fixture.items[0]!.id,
@@ -693,7 +698,7 @@ describe('canonical refund fulfillment', () => {
     const event = await createRefundEvent(firstProviderRefundId, 1);
 
     await fulfillRefundEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       snapshots(fixture, event, 800, 'succeeded', 1),
       dependencies()
     );
@@ -719,7 +724,7 @@ describe('canonical refund fulfillment', () => {
     const fixture = await createPurchase(totals, 'account', taxes);
     const stable = await createRefundEvent(`re_test_${randomUUID()}`, 1);
     await fulfillRefundEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       snapshots(fixture, stable, 500, 'succeeded', 1),
       dependencies()
     );
@@ -727,7 +732,7 @@ describe('canonical refund fulfillment', () => {
       eq(refunds.stripeRefundId, stable.objectId)
     );
     if (!stableRefund) throw new Error('Expected stable refund');
-    const [stableAllocation] = await databaseClient.db.insert(refundAllocations).values({
+    const [stableAllocation] = await ownerDatabaseClient.db.insert(refundAllocations).values({
       refundId: stableRefund.id,
       orderItemId: fixture.items[0]!.id,
       amountMinor: 500,
@@ -735,7 +740,7 @@ describe('canonical refund fulfillment', () => {
       createdAt: now
     }).returning();
     if (!stableAllocation) throw new Error('Expected stable allocation');
-    await databaseClient.db.insert(refundAllocationComponents).values({
+    await ownerDatabaseClient.db.insert(refundAllocationComponents).values({
       refundAllocationId: stableAllocation.id,
       refundId: stableRefund.id,
       orderItemId: fixture.items[0]!.id,
@@ -745,7 +750,7 @@ describe('canonical refund fulfillment', () => {
       currency: 'USD',
       createdAt: now
     });
-    await databaseClient.db.update(refunds).set({
+    await ownerDatabaseClient.db.update(refunds).set({
       allocationStatus: 'finalized',
       financialEvidenceStatus: 'fee_reconciled'
     })
@@ -753,7 +758,7 @@ describe('canonical refund fulfillment', () => {
 
     const ambiguous = await createRefundEvent(`re_test_${randomUUID()}`, 2);
     await fulfillRefundEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       snapshots(fixture, ambiguous, 800, 'succeeded', 2),
       dependencies()
     );
@@ -762,7 +767,7 @@ describe('canonical refund fulfillment', () => {
     );
     if (!ambiguousRefund) throw new Error('Expected ambiguous refund');
     const priorBalanceProviderId = `txn_prior_refund_rearm_${randomUUID()}`;
-    const staged = await stageBalanceTransaction(databaseClient.db, {
+    const staged = await stageBalanceTransaction(workerDatabaseClient.db, {
       id: priorBalanceProviderId, livemode: false,
       sourceFamily: 'refund', sourceId: ambiguousRefund.stripeRefundId,
       rawType: 'refund', reportingCategory: 'refund', balanceType: 'payments',
@@ -782,12 +787,12 @@ describe('canonical refund fulfillment', () => {
     const [existingProjectionJob] = (await databaseClient.db.select().from(jobs)).filter((job) =>
       job.type === projectionSpec.type && job.deduplicationKey === projectionSpec.deduplicationKey
     );
-    const projectionJobId = existingProjectionJob?.id ?? (await databaseClient.db.insert(jobs)
+    const projectionJobId = existingProjectionJob?.id ?? (await ownerDatabaseClient.db.insert(jobs)
       .values({
         type: projectionSpec.type, payload: projectionSpec.payload as never,
         deduplicationKey: projectionSpec.deduplicationKey, maxAttempts: projectionSpec.maxAttempts
       }).returning({ id: jobs.id }))[0]!.id;
-    await databaseClient.db.update(jobs).set({
+    await workerDatabaseClient.db.update(jobs).set({
       status: 'succeeded', attempts: 1, completedAt: now, lastError: null
     }).where(eq(jobs.id, projectionJobId));
     for (const sourceId of [stableRefund.id, ambiguousRefund.id]) {
@@ -796,14 +801,14 @@ describe('canonical refund fulfillment', () => {
         (job.payload as { sourceId?: unknown }).sourceId === sourceId
       );
       if (!sourceJob) throw new Error('Expected prior source job');
-      await databaseClient.db.update(jobs).set({
+      await workerDatabaseClient.db.update(jobs).set({
         status: 'succeeded', attempts: 1, completedAt: now, lastError: null
       }).where(eq(jobs.id, sourceJob.id));
     }
 
     const current = await createRefundEvent(`re_test_${randomUUID()}`, 3);
     const currentInput = snapshots(fixture, current, 1700, 'succeeded', 3);
-    await fulfillRefundEvent(databaseClient.db, currentInput, dependencies());
+    await fulfillRefundEvent(workerDatabaseClient.db, currentInput, dependencies());
     const beforeDrain = await databaseClient.db.select().from(refunds);
     const [currentRefund] = beforeDrain.filter((refund) =>
       refund.stripeRefundId === current.objectId
@@ -953,7 +958,7 @@ describe('canonical refund fulfillment', () => {
     )).toBe(true);
 
     const jobsBeforeExactReplay = await databaseClient.db.select().from(jobs);
-    await fulfillRefundEvent(databaseClient.db, currentInput, dependencies());
+    await fulfillRefundEvent(workerDatabaseClient.db, currentInput, dependencies());
     expect(await databaseClient.db.select().from(jobs)).toEqual(jobsBeforeExactReplay);
     expect((await databaseClient.db.select().from(entitlementGrants))
       .every((grant) => grant.state === 'revoked')).toBe(true);
@@ -965,7 +970,7 @@ describe('canonical refund fulfillment', () => {
       const fixture = await createPurchase([1403]);
       const event = await createRefundEvent(`re_test_${randomUUID()}`);
       await fulfillRefundEvent(
-        databaseClient.db,
+        workerDatabaseClient.db,
         snapshots(fixture, event, 1403, state),
         dependencies()
       );
@@ -983,18 +988,18 @@ describe('canonical refund fulfillment', () => {
   it('revokes an unclaimed guest grant without creating access or sending mail', async () => {
     const fixture = await createPurchase([1403], 'guest');
     const event = await createRefundEvent(`re_test_${randomUUID()}`);
-    await fulfillRefundEvent(databaseClient.db, snapshots(fixture, event, 1403), dependencies());
+    await fulfillRefundEvent(workerDatabaseClient.db, snapshots(fixture, event, 1403), dependencies());
     expect((await databaseClient.db.select().from(entitlementGrants))[0]).toMatchObject({
       userId: null,
       state: 'revoked'
     });
     expect(await databaseClient.db.select().from(entitlements)).toHaveLength(0);
-    expect(await databaseClient.db.select().from(outboxMessages)).toHaveLength(0);
+    expect(await ownerDatabaseClient.db.select().from(outboxMessages)).toHaveLength(0);
   });
 
   it('keeps effective access when another preserved grant remains active', async () => {
     const fixture = await createPurchase([1403]);
-    await databaseClient.db.insert(entitlementGrants).values({
+    await ownerDatabaseClient.db.insert(entitlementGrants).values({
       userId: fixture.userId!,
       titleId: fixture.items[0]!.titleId,
       source: 'preserved',
@@ -1003,26 +1008,26 @@ describe('canonical refund fulfillment', () => {
       grantedAt: now
     });
     const event = await createRefundEvent(`re_test_${randomUUID()}`);
-    await fulfillRefundEvent(databaseClient.db, snapshots(fixture, event, 1403), dependencies());
+    await fulfillRefundEvent(workerDatabaseClient.db, snapshots(fixture, event, 1403), dependencies());
     expect((await databaseClient.db.select().from(entitlements))[0]?.revokedAt).toBeNull();
-    expect(await databaseClient.db.select().from(outboxMessages)).toHaveLength(0);
+    expect(await ownerDatabaseClient.db.select().from(outboxMessages)).toHaveLength(0);
   });
 
   it('preserves succeeded refund state against an out-of-order canonical regression', async () => {
     const fixture = await createPurchase([1403]);
     const providerRefundId = `re_test_${randomUUID()}`;
     const first = await createRefundEvent(providerRefundId, 1);
-    await fulfillRefundEvent(databaseClient.db, snapshots(fixture, first, 1403), dependencies());
+    await fulfillRefundEvent(workerDatabaseClient.db, snapshots(fixture, first, 1403), dependencies());
     const replay = await createRefundEvent(providerRefundId, 2);
     await fulfillRefundEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       snapshots(fixture, replay, 1403, 'pending', 1),
       dependencies()
     );
     expect((await databaseClient.db.select().from(refunds))[0]?.status).toBe('succeeded');
     expect((await databaseClient.db.select().from(stripeEvents)
       .where(eq(stripeEvents.id, replay.id)))[0]?.status).toBe('processed');
-    expect(await databaseClient.db.select().from(outboxMessages)).toHaveLength(1);
+    expect(await ownerDatabaseClient.db.select().from(outboxMessages)).toHaveLength(1);
   });
 
   it.each(['failed', 'canceled'] as const)(
@@ -1032,13 +1037,13 @@ describe('canonical refund fulfillment', () => {
       const providerRefundId = `re_test_${randomUUID()}`;
       const terminal = await createRefundEvent(providerRefundId, 1);
       await fulfillRefundEvent(
-        databaseClient.db,
+        workerDatabaseClient.db,
         snapshots(fixture, terminal, 1403, terminalState, 1),
         dependencies()
       );
       const delayed = await createRefundEvent(providerRefundId, 2);
       await fulfillRefundEvent(
-        databaseClient.db,
+        workerDatabaseClient.db,
         snapshots(fixture, delayed, 1403, 'pending', 1),
         dependencies()
       );
@@ -1054,14 +1059,14 @@ describe('canonical refund fulfillment', () => {
     const providerRefundId = `re_test_${randomUUID()}`;
     const failed = await createRefundEvent(providerRefundId, 1);
     await fulfillRefundEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       snapshots(fixture, failed, 1403, 'failed', 1),
       dependencies()
     );
     const canceled = await createRefundEvent(providerRefundId, 2);
 
     await expect(fulfillRefundEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       snapshots(fixture, canceled, 1403, 'canceled', 1),
       dependencies()
     )).rejects.toBeInstanceOf(PermanentCommerceError);
@@ -1076,8 +1081,8 @@ describe('canonical refund fulfillment', () => {
     const first = await createRefundEvent(`re_test_${randomUUID()}`, 1);
     const second = await createRefundEvent(`re_test_${randomUUID()}`, 2);
     await Promise.all([
-      fulfillRefundEvent(databaseClient.db, snapshots(fixture, first, 800, 'succeeded', 1), dependencies()),
-      fulfillRefundEvent(databaseClient.db, snapshots(fixture, second, 800, 'succeeded', 2), dependencies())
+      fulfillRefundEvent(workerDatabaseClient.db, snapshots(fixture, first, 800, 'succeeded', 1), dependencies()),
+      fulfillRefundEvent(workerDatabaseClient.db, snapshots(fixture, second, 800, 'succeeded', 2), dependencies())
     ]);
     expect((await databaseClient.db.select().from(refundAllocations))
       .reduce((sum, allocation) => sum + allocation.amountMinor, 0)).toBe(800);
@@ -1087,12 +1092,12 @@ describe('canonical refund fulfillment', () => {
 
   it('rejects a paid order whose item aggregate no longer matches canonical payment evidence', async () => {
     const fixture = await createPurchase([1403]);
-    await databaseClient.db.update(orderItems)
+    await ownerDatabaseClient.db.update(orderItems)
       .set({ unitSubtotalMinor: 1300, totalMinor: 1300 })
       .where(eq(orderItems.id, fixture.items[0]!.id));
     const event = await createRefundEvent(`re_test_${randomUUID()}`);
     await expect(fulfillRefundEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       snapshots(fixture, event, 500),
       dependencies()
     )).rejects.toBeInstanceOf(PermanentCommerceError);
@@ -1103,7 +1108,7 @@ describe('canonical refund fulfillment', () => {
   it('rejects a purchase grant that does not belong to its immutable order item title', async () => {
     const fixture = await createPurchase([1403]);
     const otherTitleId = randomUUID();
-    await databaseClient.db.insert(titles).values({
+    await ownerDatabaseClient.db.insert(titles).values({
       id: otherTitleId,
       slug: `refund-mismatch-${otherTitleId}`,
       title: 'Mismatched title',
@@ -1114,12 +1119,12 @@ describe('canonical refund fulfillment', () => {
       currency: 'USD',
       visibility: 'private'
     });
-    await databaseClient.db.update(entitlementGrants)
+    await ownerDatabaseClient.db.update(entitlementGrants)
       .set({ titleId: otherTitleId })
       .where(eq(entitlementGrants.orderItemId, fixture.items[0]!.id));
     const event = await createRefundEvent(`re_test_${randomUUID()}`);
     await expect(fulfillRefundEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       snapshots(fixture, event, 1403),
       dependencies()
     )).rejects.toBeInstanceOf(PermanentCommerceError);
@@ -1159,7 +1164,7 @@ describe('canonical refund fulfillment', () => {
           : {})
       };
       await expect(fulfillRefundEvent(
-        databaseClient.db,
+        workerDatabaseClient.db,
         snapshots(fixture, event, 1403),
         overrides
       )).rejects.toThrow(`forced ${failure} failure`);
@@ -1170,7 +1175,7 @@ describe('canonical refund fulfillment', () => {
       expect((await databaseClient.db.select().from(entitlements))[0]?.revokedAt).toBeNull();
       expect((await databaseClient.db.select().from(stripeEvents))[0]?.status).toBe('pending');
       expect(await databaseClient.db.select().from(auditEvents)).toHaveLength(0);
-      expect(await databaseClient.db.select().from(outboxMessages)).toHaveLength(0);
+      expect(await ownerDatabaseClient.db.select().from(outboxMessages)).toHaveLength(0);
       expect(await databaseClient.db.select().from(jobs).where(eq(
         jobs.type,
         FINANCIAL_SOURCE_JOB
@@ -1184,13 +1189,13 @@ describe('canonical refund fulfillment', () => {
       const fixture = await createPurchase([1403]);
       const event = await createRefundEvent(`re_test_${randomUUID()}`);
       const input = snapshots(fixture, event, 500);
-      await fulfillRefundEvent(databaseClient.db, input, dependencies());
+      await fulfillRefundEvent(workerDatabaseClient.db, input, dependencies());
       const [queued] = await databaseClient.db.select().from(jobs).where(eq(
         jobs.type,
         FINANCIAL_SOURCE_JOB
       ));
       if (!queued) throw new Error('Expected financial refund job');
-      await databaseClient.db.update(jobs).set(status === 'running'
+      await workerDatabaseClient.db.update(jobs).set(status === 'running'
         ? {
             status,
             attempts: 1,
@@ -1209,7 +1214,7 @@ describe('canonical refund fulfillment', () => {
           }).where(eq(jobs.id, queued.id));
       const [before] = await databaseClient.db.select().from(jobs).where(eq(jobs.id, queued.id));
 
-      await fulfillRefundEvent(databaseClient.db, input, dependencies());
+      await fulfillRefundEvent(workerDatabaseClient.db, input, dependencies());
 
       expect(await databaseClient.db.select().from(jobs).where(eq(
         jobs.type,
@@ -1220,7 +1225,7 @@ describe('canonical refund fulfillment', () => {
 
   it('publishes every same-payment dispute graph edge only when refund exposure changes', async () => {
     const fixture = await createPurchase([1403]);
-    const disputeIds = (await databaseClient.db.insert(disputes).values(
+    const disputeIds = (await ownerDatabaseClient.db.insert(disputes).values(
       Array.from({ length: 101 }, (_, index) => ({
         paymentId: fixture.paymentId,
         stripeDisputeId: `dp_refund_cross_family_${index}_${randomUUID()}`,
@@ -1237,7 +1242,7 @@ describe('canonical refund fulfillment', () => {
     const queueFinancialSource = vi.fn(async () => undefined);
 
     await fulfillRefundEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       input,
       dependencies({ queueFinancialSource })
     );
@@ -1254,7 +1259,7 @@ describe('canonical refund fulfillment', () => {
 
     queueFinancialSource.mockClear();
     await fulfillRefundEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       input,
       dependencies({ queueFinancialSource })
     );
@@ -1266,7 +1271,7 @@ describe('canonical refund fulfillment', () => {
     const event = await createRefundEvent(`re_test_${randomUUID()}`);
     const clock = vi.fn(() => now);
     await fulfillRefundEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       snapshots(fixture, event, 500),
       dependencies({ now: clock })
     );

@@ -5,7 +5,7 @@ import { CommerceConflictError } from '$lib/server/commerce/errors';
 
 const dependencies = vi.hoisted(() => ({
   database: {},
-  claimGuestPurchases: vi.fn(),
+  claimGuestPurchasesAfterAuthorization: vi.fn(),
   deleteCookie: vi.fn()
 }));
 
@@ -14,7 +14,11 @@ vi.mock('$lib/server/db/runtime', () => ({
 }));
 vi.mock('$lib/server/commerce/claims', async (importOriginal) => {
   const actual = await importOriginal<typeof import('$lib/server/commerce/claims')>();
-  return { ...actual, claimGuestPurchases: dependencies.claimGuestPurchases };
+  return {
+    ...actual,
+    claimGuestPurchasesAfterAuthorization:
+      dependencies.claimGuestPurchasesAfterAuthorization
+  };
 });
 
 import { load } from './+page.server';
@@ -63,22 +67,23 @@ const claimed = {
 
 describe('/claim/complete', () => {
   beforeEach(() => {
-    dependencies.claimGuestPurchases.mockResolvedValue(claimed);
+    dependencies.claimGuestPurchasesAfterAuthorization.mockResolvedValue(claimed);
     dependencies.deleteCookie.mockReset();
   });
 
   it.each([true, false])('links to the library only after a successful or idempotent claim', async (changed) => {
-    dependencies.claimGuestPurchases.mockResolvedValueOnce({ ...claimed, changed });
+    dependencies.claimGuestPurchasesAfterAuthorization
+      .mockResolvedValueOnce({ ...claimed, changed });
     const data = await load(event({ requestId: 'claim-complete-request' }) as never);
     expect(data).toEqual({ state: 'claimed' });
-    expect(dependencies.claimGuestPurchases).toHaveBeenCalledWith(dependencies.database, {
-      userId,
+    expect(dependencies.claimGuestPurchasesAfterAuthorization)
+      .toHaveBeenCalledWith(dependencies.database, {
+      claimProof: 'A'.repeat(43),
       correlationId: 'claim-complete-request',
-      authorizationToken: 'A'.repeat(43)
     });
     expect(dependencies.deleteCookie).toHaveBeenCalledWith(
       'pale-orbit-commerce-claim',
-      { path: '/claim/complete' }
+      { path: '/' }
     );
     const { body } = render(CompletePage, { props: { data: { user: null, ...data } as never } });
     expect(body).toContain('href="/library"');
@@ -86,14 +91,14 @@ describe('/claim/complete', () => {
   });
 
   it('maps no purchase and a foreign identity conflict to the same generic result', async () => {
-    dependencies.claimGuestPurchases.mockResolvedValueOnce({
+    dependencies.claimGuestPurchasesAfterAuthorization.mockResolvedValueOnce({
       claimed: false,
       changed: false,
       claimedOrderCount: 0,
       claimedTitleCount: 0
     });
     const noPurchase = await load(event() as never);
-    dependencies.claimGuestPurchases.mockRejectedValueOnce(
+    dependencies.claimGuestPurchasesAfterAuthorization.mockRejectedValueOnce(
       new CommerceConflictError('IDENTITY_ALREADY_CLAIMED')
     );
     const conflict = await load(event() as never);
@@ -109,7 +114,7 @@ describe('/claim/complete', () => {
   it('maps an auth-link error to retry guidance without touching claim state', async () => {
     const data = await load(event({ search: '?error=private-provider-detail' }) as never);
     expect(data).toEqual({ state: 'retry' });
-    expect(dependencies.claimGuestPurchases).not.toHaveBeenCalled();
+    expect(dependencies.claimGuestPurchasesAfterAuthorization).not.toHaveBeenCalled();
     const { body } = render(CompletePage, { props: { data: { user: null, ...data } as never } });
     expect(body).toContain('Request another claim link');
     expect(body).not.toContain('private-provider-detail');
@@ -118,7 +123,7 @@ describe('/claim/complete', () => {
   it('never claims for a verified session without the one-use emailed authorization', async () => {
     const data = await load(event({ authorizationToken: null }) as never);
     expect(data).toEqual({ state: 'not_claimed' });
-    expect(dependencies.claimGuestPurchases).not.toHaveBeenCalled();
+    expect(dependencies.claimGuestPurchasesAfterAuthorization).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -138,7 +143,7 @@ describe('/claim/complete', () => {
   ])('requires a verified current session', async (locals) => {
     const data = await load(event({ locals }) as never);
     expect(data).toEqual({ state: 'sign_in' });
-    expect(dependencies.claimGuestPurchases).not.toHaveBeenCalled();
+    expect(dependencies.claimGuestPurchasesAfterAuthorization).not.toHaveBeenCalled();
     const { body } = render(CompletePage, {
       props: { data: { user: null, ...data } as never }
     });
@@ -146,7 +151,7 @@ describe('/claim/complete', () => {
   });
 
   it('renders a safe temporary state for unexpected failures', async () => {
-    dependencies.claimGuestPurchases.mockRejectedValueOnce(
+    dependencies.claimGuestPurchasesAfterAuthorization.mockRejectedValueOnce(
       new Error('database private@example.com order secret')
     );
     const data = await load(event() as never);

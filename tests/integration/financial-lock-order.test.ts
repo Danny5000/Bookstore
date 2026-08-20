@@ -28,7 +28,10 @@ import {
   user
 } from '$lib/server/db/schema';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
-import { databaseClient } from './database';
+import {
+  ownerDatabaseClient,
+  workerDatabaseClient as databaseClient
+} from './database';
 
 const fixtureTime = new Date('2026-08-01T00:00:00.000Z');
 const LOCK_PROBE_REPETITIONS = [1, 2, 3] as const;
@@ -227,13 +230,13 @@ async function createPurchaseFixture(sourceId: string): Promise<PurchaseFixture>
   const itemId = randomUUID();
   const email = `financial-lock-${orderId}@example.com`;
   const stripeRefundId = `re_lock_${randomUUID()}`;
-  await databaseClient.db.insert(user).values({
+  await ownerDatabaseClient.db.insert(user).values({
     id: userId,
     name: 'Financial lock reader',
     email,
     emailVerified: true
   });
-  await databaseClient.db.insert(titles).values({
+  await ownerDatabaseClient.db.insert(titles).values({
     id: titleId,
     slug: `financial-lock-${titleId}`,
     title: 'Financial lock title',
@@ -244,7 +247,7 @@ async function createPurchaseFixture(sourceId: string): Promise<PurchaseFixture>
     currency: 'USD',
     visibility: 'private'
   });
-  await databaseClient.db.insert(orders).values({
+  await ownerDatabaseClient.db.insert(orders).values({
     id: orderId,
     status: 'paid',
     initiatingUserId: userId,
@@ -260,7 +263,7 @@ async function createPurchaseFixture(sourceId: string): Promise<PurchaseFixture>
     checkoutExpiresAt: new Date('2026-08-01T00:30:00.000Z'),
     paidAt: fixtureTime
   });
-  await databaseClient.db.insert(orderItems).values({
+  await ownerDatabaseClient.db.insert(orderItems).values({
     id: itemId,
     orderId,
     titleId,
@@ -273,7 +276,7 @@ async function createPurchaseFixture(sourceId: string): Promise<PurchaseFixture>
     totalMinor: 100,
     stripeLineItemId: `li_lock_${randomUUID()}`
   });
-  const [payment] = await databaseClient.db.insert(payments).values({
+  const [payment] = await ownerDatabaseClient.db.insert(payments).values({
     orderId,
     stripePaymentIntentId: `pi_lock_${randomUUID()}`,
     stripeLatestChargeId: sourceId,
@@ -284,7 +287,7 @@ async function createPurchaseFixture(sourceId: string): Promise<PurchaseFixture>
     paidAt: fixtureTime
   }).returning();
   if (!payment) throw new Error('Expected payment fixture');
-  const [refund] = await databaseClient.db.insert(refunds).values({
+  const [refund] = await ownerDatabaseClient.db.insert(refunds).values({
     paymentId: payment.id,
     stripeRefundId,
     status: 'pending',
@@ -294,7 +297,7 @@ async function createPurchaseFixture(sourceId: string): Promise<PurchaseFixture>
     providerCreatedAt: fixtureTime
   }).returning();
   if (!refund) throw new Error('Expected refund fixture');
-  const [grant] = await databaseClient.db.insert(entitlementGrants).values({
+  const [grant] = await ownerDatabaseClient.db.insert(entitlementGrants).values({
     titleId,
     userId,
     source: 'purchase',
@@ -321,7 +324,7 @@ async function createPayoutFixture(
   runState: 'publishable' | 'published' = 'published'
 ): Promise<PayoutFixture> {
   const generation = 1;
-  const [payout] = await databaseClient.db.insert(stripePayouts).values({
+  const [payout] = await ownerDatabaseClient.db.insert(stripePayouts).values({
     providerId: `po_lock_${randomUUID()}`,
     liveMode: false,
     amountMinor: Math.max(90, balanceTransactionIds.length * 90),
@@ -337,7 +340,7 @@ async function createPayoutFixture(
     fingerprintSha256: 'd'.repeat(64)
   }).returning();
   if (!payout) throw new Error('Expected payout fixture');
-  const [run] = await databaseClient.db.insert(payoutImportRuns).values({
+  const [run] = await ownerDatabaseClient.db.insert(payoutImportRuns).values({
     payoutId: payout.id,
     generation,
     state: runState,
@@ -350,7 +353,7 @@ async function createPayoutFixture(
   }).returning();
   if (!run) throw new Error('Expected payout run fixture');
   if (balanceTransactionIds.length > 0) {
-    await databaseClient.db.insert(payoutImportRunEntries).values(
+    await ownerDatabaseClient.db.insert(payoutImportRunEntries).values(
       balanceTransactionIds.map((balanceTransactionId) => ({
         runId: run.id,
         balanceTransactionId
@@ -358,7 +361,7 @@ async function createPayoutFixture(
     );
   }
   if (publishMemberships && balanceTransactionIds.length > 0) {
-    await databaseClient.db.insert(stripePayoutBalanceTransactions).values(
+    await ownerDatabaseClient.db.insert(stripePayoutBalanceTransactions).values(
       balanceTransactionIds.map((balanceTransactionId) => ({
         payoutId: payout.id,
         balanceTransactionId,

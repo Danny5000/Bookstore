@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { databaseClient } from './database';
+import { ownerDatabaseClient as databaseClient } from './database';
 
 const PLAN_2_TABLES = [
   'audit_events',

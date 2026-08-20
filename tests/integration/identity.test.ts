@@ -8,7 +8,7 @@ import {
   findOrCreateGuestIdentity
 } from '$lib/server/auth/identity';
 import { account, guestIdentities, user, userRoles } from '$lib/server/db/schema';
-import { databaseClient } from './database';
+import { databaseClient, ownerDatabaseClient } from './database';
 
 async function createUser(email: string, emailVerified = false) {
   const [created] = await databaseClient.db
@@ -48,7 +48,7 @@ describe('application identities', () => {
     expect(first.id).toBe(second.id);
 
     const claimedUser = await createUser(`${randomUUID()}@example.com`, true);
-    await databaseClient.db
+    await ownerDatabaseClient.db
       .update(guestIdentities)
       .set({ claimedByUserId: claimedUser.id, claimedAt: new Date() })
       .where(eq(guestIdentities.id, first.id));

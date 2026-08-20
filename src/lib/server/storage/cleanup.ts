@@ -1,21 +1,24 @@
-import { and, eq, inArray, isNotNull, or, sql } from 'drizzle-orm';
+import { sql } from 'drizzle-orm';
 import type { Database } from '$lib/server/db/client';
-import {
-  comicPages,
-  jobs,
-  proseImages,
-  revisionCoverSuggestions,
-  titleRevisions,
-  titles
-} from '$lib/server/db/schema';
-import { INGEST_REVISION_JOB } from '$lib/server/ingestion/job';
-import { parseStorageKey, stagingUploadsPrefix } from './keys';
+import { healthProbesPrefix, parseStorageKey, stagingUploadsPrefix } from './keys';
 import type { ObjectStorage, StorageListPage } from './types';
 
 const cleanupPageSize = 500;
 const uuid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+const generation = '(?:0|[1-9][0-9]{0,9})';
+const maximumGeneration = 2_147_483_647;
+const derivedClass = '(?:prose-images|comic-pages|cover-suggestions)';
+const stagingPattern = new RegExp(`^staging/uploads/${uuid}$`, 'u');
+const healthProbePattern = new RegExp(`^health/probes/${uuid}$`, 'u');
 const originalPattern = new RegExp(`^titles/${uuid}/revisions/${uuid}/original$`, 'u');
-const derivedPattern = new RegExp(`^titles/${uuid}/revisions/${uuid}/derived/v1/.+$`, 'u');
+const legacyDerivedPattern = new RegExp(
+  `^titles/${uuid}/revisions/${uuid}/derived/v1/${derivedClass}/${uuid}\\.webp$`,
+  'u'
+);
+const generatedDerivedPattern = new RegExp(
+  `^titles/${uuid}/revisions/${uuid}/derived/v1/generations/(${generation})/${derivedClass}/${uuid}\\.webp$`,
+  'u'
+);
 const titleCoverPattern = new RegExp(`^titles/${uuid}/covers/${uuid}\\.webp$`, 'u');
 
 export interface StorageReferenceSnapshot {
@@ -39,14 +42,33 @@ export interface CleanupSummary {
 }
 
 type ListedObject = StorageListPage['objects'][number];
-type CandidateClass = 'staging' | 'derived' | 'title-cover';
+type CandidateClass = 'staging' | 'health-probe' | 'derived' | 'title-cover';
 type ReferenceLoader = (
   database: Database,
   objects: readonly ListedObject[]
 ) => Promise<StorageReferenceSnapshot>;
 
+interface StorageCleanupReferenceRow extends Record<string, unknown> {
+  storageKey: unknown;
+}
+
 function olderThan(value: Date, now: Date, hours: number): boolean {
   return value.getTime() < now.getTime() - hours * 60 * 60 * 1_000;
+}
+
+function candidateClassForKey(key: string): CandidateClass | null {
+  try {
+    parseStorageKey(key);
+  } catch {
+    return null;
+  }
+  if (stagingPattern.test(key)) return 'staging';
+  if (healthProbePattern.test(key)) return 'health-probe';
+  if (legacyDerivedPattern.test(key)) return 'derived';
+  const generated = generatedDerivedPattern.exec(key);
+  if (generated && Number(generated[1]) <= maximumGeneration) return 'derived';
+  if (titleCoverPattern.test(key)) return 'title-cover';
+  return null;
 }
 
 export function classifyStorageObject(
@@ -57,19 +79,25 @@ export function classifyStorageObject(
 ): CandidateClass | null {
   const key = object.key;
   if (originalPattern.test(key)) return null;
-  if (key.startsWith(`${stagingUploadsPrefix()}/`)) {
+  const candidateClass = candidateClassForKey(key);
+  if (candidateClass === 'staging') {
     return olderThan(object.modifiedAt, now, config.stagingRetentionHours) &&
       !references.staging.has(key)
       ? 'staging'
       : null;
   }
-  if (derivedPattern.test(key)) {
+  if (candidateClass === 'health-probe') {
+    return olderThan(object.modifiedAt, now, config.stagingRetentionHours)
+      ? 'health-probe'
+      : null;
+  }
+  if (candidateClass === 'derived') {
     return olderThan(object.modifiedAt, now, config.orphanRetentionHours) &&
       !references.derived.has(key)
       ? 'derived'
       : null;
   }
-  if (titleCoverPattern.test(key)) {
+  if (candidateClass === 'title-cover') {
     return olderThan(object.modifiedAt, now, config.orphanRetentionHours) &&
       !references.titleCovers.has(key)
       ? 'title-cover'
@@ -82,57 +110,45 @@ async function loadDatabaseReferences(
   database: Database,
   objects: readonly ListedObject[]
 ): Promise<StorageReferenceSnapshot> {
-  const stagingKeys = objects
-    .map(({ key }) => key)
-    .filter((key) => key.startsWith(`${stagingUploadsPrefix()}/`));
-  const derivedKeys = objects.map(({ key }) => key).filter((key) => derivedPattern.test(key));
-  const coverKeys = objects.map(({ key }) => key).filter((key) => titleCoverPattern.test(key));
-
-  const stagingRows = stagingKeys.length === 0
-    ? []
-    : await database
-        .selectDistinct({ key: titleRevisions.stagingStorageKey })
-        .from(titleRevisions)
-        .leftJoin(
-          jobs,
-          and(
-            eq(jobs.type, INGEST_REVISION_JOB),
-            inArray(jobs.status, ['pending', 'running']),
-            sql`${jobs.payload}->>'revisionId' = ${titleRevisions.id}::text`
-          )
-        )
-        .where(and(
-          inArray(titleRevisions.stagingStorageKey, stagingKeys),
-          or(
-            inArray(titleRevisions.state, ['uploaded', 'processing']),
-            isNotNull(jobs.id)
-          )
-        ));
-
-  const [proseRows, comicRows, suggestionRows, coverRows] = await Promise.all([
-    derivedKeys.length === 0
-      ? []
-      : database.select({ key: proseImages.storageKey }).from(proseImages)
-          .where(inArray(proseImages.storageKey, derivedKeys)),
-    derivedKeys.length === 0
-      ? []
-      : database.select({ key: comicPages.storageKey }).from(comicPages)
-          .where(inArray(comicPages.storageKey, derivedKeys)),
-    derivedKeys.length === 0
-      ? []
-      : database.select({ key: revisionCoverSuggestions.storageKey }).from(revisionCoverSuggestions)
-          .where(inArray(revisionCoverSuggestions.storageKey, derivedKeys)),
-    coverKeys.length === 0
-      ? []
-      : database.select({ key: titles.coverStorageKey }).from(titles)
-          .where(inArray(titles.coverStorageKey, coverKeys))
-  ]);
-
-  return {
-    staging: new Set(stagingRows.flatMap(({ key }) => key ? [key] : [])),
-    derived: new Set([...proseRows, ...comicRows, ...suggestionRows].map(({ key }) => key)),
-    titleCovers: new Set(coverRows.flatMap(({ key }) => key ? [key] : []))
+  const candidates = objects.flatMap(({ key }) => {
+    const storageClass = candidateClassForKey(key);
+    return storageClass === null ? [] : [{ storageClass, storageKey: key }];
+  });
+  const snapshot = {
+    staging: new Set<string>(),
+    derived: new Set<string>(),
+    titleCovers: new Set<string>()
   };
+  if (candidates.length === 0) return snapshot;
+
+  const expected = new Map<string, CandidateClass>(candidates.map((candidate) => [
+    candidate.storageKey,
+    candidate.storageClass
+  ]));
+  const result = await database.execute<StorageCleanupReferenceRow>(sql`
+    select
+      "referenced_storage_key" as "storageKey"
+    from "public"."storage_cleanup_referenced_keys"(
+      ${sql.param(candidates.map(({ storageKey }) => storageKey))}::text[]
+    )
+  `);
+  const seen = new Set<string>();
+  for (const row of result.rows) {
+    if (
+      typeof row.storageKey !== 'string' ||
+      !expected.has(row.storageKey) ||
+      seen.has(row.storageKey)
+    ) throw new Error('Storage cleanup reference result was invalid');
+    seen.add(row.storageKey);
+    const storageClass = expected.get(row.storageKey);
+    if (storageClass === undefined || storageClass === 'health-probe') {
+      throw new Error('Storage cleanup reference result was invalid');
+    }
+    if (storageClass === 'staging') snapshot.staging.add(row.storageKey);
+    else if (storageClass === 'derived') snapshot.derived.add(row.storageKey);
+    else snapshot.titleCovers.add(row.storageKey);
+  }
+  return snapshot;
 }
 
 export async function cleanupStorage(options: {
@@ -155,7 +171,11 @@ export async function cleanupStorage(options: {
     deletedBytes: 0
   };
 
-  for (const prefix of [stagingUploadsPrefix(), parseStorageKey('titles')]) {
+  for (const prefix of [
+    stagingUploadsPrefix(),
+    healthProbesPrefix(),
+    parseStorageKey('titles')
+  ]) {
     let cursor: string | undefined;
     do {
       const page = await options.storage.listPrefix(prefix, {

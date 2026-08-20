@@ -15,9 +15,15 @@ import * as schema from '$lib/server/db/schema';
 import type { QueueAuthEmailInput } from '$lib/server/email/enqueue';
 import { normalizeEmailAddress } from './identity';
 import {
+  authorizeCommerceClaimIssuance,
+  COMMERCE_CLAIM_PROOF_COOKIE,
+  commerceClaimTokenSha256,
+  createCommerceClaimProofToken,
+  wrapCommerceClaimActionUrl,
+  type RegisterCommerceClaimIssuanceInput
+} from './commerce-claim-capability';
+import {
   applyCurrentPasswordResetCredential,
-  COMMERCE_CLAIM_AUTH_COOKIE,
-  COMMERCE_CLAIM_AUTH_TTL_SECONDS,
   completePasswordResetSecurity,
   consumeAuthMagicLinkToken,
   credentialAuthorityAcceptsPassword,
@@ -47,6 +53,15 @@ export interface AuthServerDependencies {
   credentialAuthorityAcceptsPassword?: typeof credentialAuthorityAcceptsPassword;
   deleteCreatedSession?(token: string): Promise<void>;
   registerPasswordResetToken?: typeof registerPasswordResetToken;
+  createCommerceClaimProofToken?: typeof createCommerceClaimProofToken;
+  registerCommerceClaimIssuance?(input: RegisterCommerceClaimIssuanceInput): Promise<boolean>;
+  wrapCommerceClaimActionUrl?: typeof wrapCommerceClaimActionUrl;
+  authorizeCommerceClaimIssuance?(input: {
+    claimProof: string;
+    authToken: string;
+  }): Promise<boolean>;
+  readCommerceClaimProof?(cookieName: string): string | null;
+  clearCommerceClaimProof?(cookieName: string): void;
   passwordHash?: typeof hashPassword;
   additionalPlugins?: readonly BetterAuthPlugin[];
 }
@@ -67,6 +82,11 @@ interface MagicLinkRoutingDependencies {
     purpose: 'account' | 'commerce-claim';
     expiresInSeconds: number;
   }): Promise<boolean>;
+  createCommerceClaimProofToken(): string;
+  now(): Date;
+  registerCommerceClaimIssuance?(input: RegisterCommerceClaimIssuanceInput): Promise<boolean>;
+  wrapCommerceClaimActionUrl: typeof wrapCommerceClaimActionUrl;
+  trustedOrigin: string;
 }
 
 interface RoutedMagicLinkInput {
@@ -102,7 +122,19 @@ export async function sendRoutedMagicLink(
   }
   const metadata = commerceClaimMetadataSchema.safeParse(input.metadata);
   if (!metadata.success) return;
+  if (!dependencies.registerCommerceClaimIssuance) return;
   if (!(await dependencies.canSendCommerceMagicLink(email))) return;
+  const claimProofToken = dependencies.createCommerceClaimProofToken();
+  const now = dependencies.now();
+  const protectedIssuanceRegistered = await dependencies.registerCommerceClaimIssuance({
+    claimProofSha256: commerceClaimTokenSha256(claimProofToken),
+    authTokenSha256: commerceClaimTokenSha256(input.token),
+    email,
+    anchorOrderId: metadata.data.orderId,
+    kind: 'commerce-magic',
+    expiresAt: new Date(now.getTime() + expiresInSeconds * 1000)
+  });
+  if (!protectedIssuanceRegistered) return;
   const registered = await dependencies.registerMagicLink({
     token: input.token,
     email,
@@ -110,10 +142,17 @@ export async function sendRoutedMagicLink(
     expiresInSeconds
   });
   if (!registered) return;
+  const claimUrl = dependencies.wrapCommerceClaimActionUrl({
+    actionUrl: input.url,
+    claimProofToken,
+    anchorOrderId: metadata.data.orderId,
+    kind: 'commerce-magic',
+    trustedOrigin: dependencies.trustedOrigin
+  });
   await dependencies.queueCommerceClaimEmail({
     orderId: metadata.data.orderId,
     email,
-    claimUrl: input.url
+    claimUrl
   });
 }
 
@@ -121,18 +160,96 @@ function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
-function isExactCommerceResetCallback(value: string | null, trustedOrigin: string): boolean {
-  if (!value) return false;
+function commerceResetOrderId(value: string | null, trustedOrigin: string): string | null {
+  if (!value) return null;
   try {
     const destination = new URL(value, trustedOrigin);
+    const orderId = destination.searchParams.get('orderId');
     return destination.origin === trustedOrigin &&
       destination.pathname === '/reset-password' &&
-      destination.searchParams.size === 1 &&
+      destination.searchParams.size === 2 &&
       destination.searchParams.get('purpose') === 'commerce-claim' &&
-      destination.hash === '';
+      destination.hash === '' &&
+      orderId && z.uuid().safeParse(orderId).success
+      ? orderId
+      : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+interface PasswordResetRoutingDependencies {
+  queueResetEmail(input: QueueAuthEmailInput): Promise<void>;
+  registerPasswordResetToken(
+    input: Parameters<typeof registerPasswordResetToken>[1]
+  ): Promise<boolean>;
+  createCommerceClaimProofToken(): string;
+  registerCommerceClaimIssuance?(input: RegisterCommerceClaimIssuanceInput): Promise<boolean>;
+  wrapCommerceClaimActionUrl: typeof wrapCommerceClaimActionUrl;
+  trustedOrigin: string;
+  now(): Date;
+}
+
+interface RoutedPasswordResetInput {
+  user: { id: string; email: string; name?: string | null };
+  url: string;
+  token: string;
+}
+
+export async function sendRoutedPasswordReset(
+  dependencies: PasswordResetRoutingDependencies,
+  input: RoutedPasswordResetInput,
+  expiresInSeconds: number
+): Promise<void> {
+  const email = normalizeEmailAddress(input.user.email);
+  const callbackURL = new URL(input.url).searchParams.get('callbackURL');
+  const anchorOrderId = commerceResetOrderId(callbackURL, dependencies.trustedOrigin);
+  let actionUrl = input.url;
+  if (anchorOrderId) {
+    if (!dependencies.registerCommerceClaimIssuance) return;
+    const claimProofToken = dependencies.createCommerceClaimProofToken();
+    const now = dependencies.now();
+    const protectedIssuanceRegistered = await dependencies.registerCommerceClaimIssuance({
+      claimProofSha256: commerceClaimTokenSha256(claimProofToken),
+      authTokenSha256: commerceClaimTokenSha256(input.token),
+      email,
+      anchorOrderId,
+      kind: 'password-reset',
+      expiresAt: new Date(now.getTime() + expiresInSeconds * 1000)
+    });
+    if (!protectedIssuanceRegistered) return;
+    const registered = await dependencies.registerPasswordResetToken({
+      token: input.token,
+      email,
+      userId: input.user.id,
+      purpose: 'commerce-claim',
+      expiresInSeconds
+    });
+    if (!registered) return;
+    actionUrl = dependencies.wrapCommerceClaimActionUrl({
+      actionUrl: input.url,
+      claimProofToken,
+      anchorOrderId,
+      kind: 'password-reset',
+      trustedOrigin: dependencies.trustedOrigin
+    });
+  } else {
+    const registered = await dependencies.registerPasswordResetToken({
+      token: input.token,
+      email,
+      userId: input.user.id,
+      purpose: 'account',
+      expiresInSeconds
+    });
+    if (!registered) return;
+  }
+  await dependencies.queueResetEmail({
+    template: 'auth.password-reset',
+    to: email,
+    recipientName: input.user.name || input.user.email,
+    actionUrl,
+    expiresInSeconds
+  });
 }
 
 export function authHookReturnedSuccess(value: unknown): boolean {
@@ -239,29 +356,21 @@ export function createAuthServer(dependencies: AuthServerDependencies) {
       resetPasswordTokenExpiresIn: auth.resetExpiresIn,
       revokeSessionsOnPasswordReset: true,
       sendResetPassword: async ({ user, url, token }) => {
-        const callbackURL = new URL(url).searchParams.get('callbackURL');
-        const registered = await (
-          dependencies.registerPasswordResetToken ?? registerPasswordResetToken
-        )(
-          dependencies.database,
-          {
-            token,
-            email: user.email,
-            userId: user.id,
-            purpose: isExactCommerceResetCallback(callbackURL, trustedOrigin)
-              ? 'commerce-claim'
-              : 'account',
-            expiresInSeconds: auth.resetExpiresIn
-          }
-        );
-        if (!registered) return;
-        await dependencies.queueResetEmail({
-          template: 'auth.password-reset',
-          to: normalizeEmailAddress(user.email),
-          recipientName: user.name || user.email,
-          actionUrl: url,
-          expiresInSeconds: auth.resetExpiresIn
-        });
+        await sendRoutedPasswordReset({
+          queueResetEmail: dependencies.queueResetEmail,
+          registerPasswordResetToken: (input) => (
+            dependencies.registerPasswordResetToken ?? registerPasswordResetToken
+          )(dependencies.database, input),
+          createCommerceClaimProofToken:
+            dependencies.createCommerceClaimProofToken ?? createCommerceClaimProofToken,
+          ...(dependencies.registerCommerceClaimIssuance
+            ? { registerCommerceClaimIssuance: dependencies.registerCommerceClaimIssuance }
+            : {}),
+          wrapCommerceClaimActionUrl:
+            dependencies.wrapCommerceClaimActionUrl ?? wrapCommerceClaimActionUrl,
+          trustedOrigin,
+          now: () => new Date()
+        }, { user, url, token }, auth.resetExpiresIn);
       },
       onPasswordReset: async ({ user }) => {
         await passwordResetIdentity.set({
@@ -379,7 +488,7 @@ export function createAuthServer(dependencies: AuthServerDependencies) {
             headers: { 'content-type': 'application/json' }
           });
         };
-        let claimToken: string | null = null;
+        let claimAuthToken: string | null = null;
         if (context.path === '/sign-in/email') {
           const signedIn = context.context.newSession
             ? {
@@ -446,7 +555,7 @@ export function createAuthServer(dependencies: AuthServerDependencies) {
               headers: { 'content-type': 'application/json' }
             });
           }
-          claimToken = completion.claimToken;
+          if (completion.purpose === 'commerce-claim') claimAuthToken = token;
         } else if (context.path === '/magic-link/verify') {
           const token = context.query?.token;
           const createdSession = context.context.newSession;
@@ -474,16 +583,33 @@ export function createAuthServer(dependencies: AuthServerDependencies) {
               clearLocation: true
             });
           }
-          claimToken = consumed.claimToken;
+          if (consumed.purpose === 'commerce-claim') claimAuthToken = token;
         }
-        if (!claimToken) return;
-        context.setCookie(COMMERCE_CLAIM_AUTH_COOKIE, claimToken, {
-          httpOnly: true,
-          secure: environment === 'production',
-          sameSite: 'lax',
-          path: '/claim/complete',
-          maxAge: COMMERCE_CLAIM_AUTH_TTL_SECONDS
-        });
+        if (!claimAuthToken) return;
+        const claimProof = dependencies.readCommerceClaimProof?.(COMMERCE_CLAIM_PROOF_COOKIE);
+        if (!claimProof) return;
+        let authorized: boolean;
+        try {
+          authorized = await (
+            dependencies.authorizeCommerceClaimIssuance ?? ((input) =>
+              authorizeCommerceClaimIssuance(dependencies.database, input))
+          )({ claimProof, authToken: claimAuthToken });
+        } catch (error) {
+          context.context.logger.error('Commerce claim promotion failed', {
+            errorName: safeErrorName(error)
+          });
+          return new Response(JSON.stringify({
+            code: 'CLAIM_PROMOTION_UNAVAILABLE',
+            message: 'Purchase claim authorization is temporarily unavailable'
+          }), {
+            status: 503,
+            headers: { 'content-type': 'application/json' }
+          });
+        }
+        if (!authorized) {
+          dependencies.clearCommerceClaimProof?.(COMMERCE_CLAIM_PROOF_COOKIE);
+          return;
+        }
         if (context.path === '/reset-password') {
           context.context.returned = { status: true, commerceClaimReady: true };
         }
@@ -528,6 +654,15 @@ export function createAuthServer(dependencies: AuthServerDependencies) {
         sendMagicLink: ({ email, url, token, metadata }) =>
           sendRoutedMagicLink({
             ...dependencies,
+            trustedOrigin,
+            createCommerceClaimProofToken:
+              dependencies.createCommerceClaimProofToken ?? createCommerceClaimProofToken,
+            now: () => new Date(),
+            ...(dependencies.registerCommerceClaimIssuance
+              ? { registerCommerceClaimIssuance: dependencies.registerCommerceClaimIssuance }
+              : {}),
+            wrapCommerceClaimActionUrl:
+              dependencies.wrapCommerceClaimActionUrl ?? wrapCommerceClaimActionUrl,
             registerMagicLink: (input) =>
               registerAuthMagicLinkToken(dependencies.database, input)
           }, { email, url, token, metadata }, auth.magicExpiresIn)

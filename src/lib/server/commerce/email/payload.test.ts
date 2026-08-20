@@ -4,8 +4,25 @@ import {
   COMMERCE_EMAIL_TOPIC,
   parseCommerceEmailPayload
 } from './payload';
+import { wrapCommerceClaimActionUrl } from '$lib/server/auth/commerce-claim-capability';
 
 const origin = 'https://books.example.com';
+
+function commerceClaimBridgeUrl(trustedOrigin = origin): string {
+  const orderId = randomUUID();
+  const action = new URL('/api/auth/magic-link/verify', trustedOrigin);
+  action.searchParams.set('token', 'native-token');
+  action.searchParams.set('callbackURL', '/claim/complete');
+  action.searchParams.set('errorCallbackURL', '/claim/complete?error=magic-link');
+  action.searchParams.set('newUserCallbackURL', '/claim/complete');
+  return wrapCommerceClaimActionUrl({
+    actionUrl: action.toString(),
+    claimProofToken: 'a'.repeat(43),
+    anchorOrderId: orderId,
+    kind: 'commerce-magic',
+    trustedOrigin
+  });
+}
 
 function receipt(overrides: Record<string, unknown> = {}) {
   return {
@@ -55,8 +72,8 @@ describe('strict commerce email payloads', () => {
     });
   });
 
-  it('accepts only a same-origin secure or loopback claim action', () => {
-    const claimUrl = `${origin}/api/auth/magic-link/verify?token=safe&callbackURL=%2Fclaim%2Fcomplete`;
+  it('accepts only an exact same-origin secure or loopback claim bridge', () => {
+    const claimUrl = commerceClaimBridgeUrl();
     expect(parseCommerceEmailPayload(receipt({
       template: 'commerce.guest-receipt-claim',
       claimUrl
@@ -71,8 +88,25 @@ describe('strict commerce email payloads', () => {
     const loopback = 'http://127.0.0.1:5173';
     expect(() => parseCommerceEmailPayload(receipt({
       template: 'commerce.guest-receipt-claim',
-      claimUrl: `${loopback}/api/auth/magic-link/verify?token=safe`
+      claimUrl: commerceClaimBridgeUrl(loopback)
     }), loopback)).not.toThrow();
+
+    const unexpectedQuery = new URL(claimUrl);
+    unexpectedQuery.searchParams.set('leak', 'bearer');
+    const malformedFragment = new URL(claimUrl);
+    malformedFragment.hash = 'proof=' + 'a'.repeat(43);
+    const nativeAction = new URL('/api/auth/magic-link/verify', origin);
+    nativeAction.searchParams.set('token', 'native-token');
+    for (const invalid of [
+      unexpectedQuery.toString(),
+      malformedFragment.toString(),
+      nativeAction.toString()
+    ]) {
+      expect(() => parseCommerceEmailPayload(receipt({
+        template: 'commerce.guest-receipt-claim',
+        claimUrl: invalid
+      }), origin)).toThrow();
+    }
   });
 
   it('accepts minimized refund and dispute access-change payloads', () => {

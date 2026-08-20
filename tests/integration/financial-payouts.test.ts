@@ -46,7 +46,12 @@ import { balanceTransactionSnapshotFixture } from '../fixtures/stripe/balance-tr
 import { chargeSnapshotFixture } from '../fixtures/stripe/charge';
 import { paymentSnapshotFixture } from '../fixtures/stripe/payment';
 import { payoutSnapshotFixture } from '../fixtures/stripe/payout';
-import { applicationConfig, databaseClient } from './database';
+import {
+  applicationConfig,
+  ownerDatabaseClient,
+  workerDatabaseClient,
+  workerDatabaseClient as databaseClient
+} from './database';
 import type { Database } from '$lib/server/db/client';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
 import { createPostgresJobRepository } from '$lib/server/jobs/repository';
@@ -255,10 +260,10 @@ async function createPublishableGeneration(
 }
 
 async function createLateLinkedPayment(suffix: string, paidAt: Date) {
-  const [guest] = await databaseClient.db.insert(guestIdentities).values({
+  const [guest] = await ownerDatabaseClient.db.insert(guestIdentities).values({
     email: `${suffix}@example.com`
   }).returning();
-  const [title] = await databaseClient.db.insert(titles).values({
+  const [title] = await ownerDatabaseClient.db.insert(titles).values({
     slug: suffix, title: 'Late linked reversal title',
     description: 'Late linked reversal description',
     creatorName: 'Late linked reversal creator', format: 'prose',
@@ -266,20 +271,20 @@ async function createLateLinkedPayment(suffix: string, paidAt: Date) {
   }).returning();
   if (!guest || !title) throw new Error('Expected late-link purchase owners');
   const orderId = randomUUID();
-  await databaseClient.db.insert(orders).values({
+  await ownerDatabaseClient.db.insert(orders).values({
     id: orderId, status: 'paid', guestIdentityId: guest.id, purchaseEmail: guest.email,
     currency: 'USD', subtotalMinor: 100, taxMinor: 0, totalMinor: 100,
     clientCheckoutAttemptId: randomUUID(), quoteFingerprintSha256: '8'.repeat(64),
     stripeCheckoutSessionId: `cs_${suffix}`, statusTokenSha256: '9'.repeat(64),
     checkoutExpiresAt: new Date(paidAt.getTime() + 30 * 60 * 1_000), paidAt
   });
-  const [item] = await databaseClient.db.insert(orderItems).values({
+  const [item] = await ownerDatabaseClient.db.insert(orderItems).values({
     orderId, titleId: title.id, titleSnapshot: title.title,
     creatorNameSnapshot: title.creatorName, format: 'prose', currency: 'USD',
     unitSubtotalMinor: 100, taxMinor: 0, totalMinor: 100,
     stripeLineItemId: `li_${suffix}`
   }).returning();
-  const [payment] = await databaseClient.db.insert(payments).values({
+  const [payment] = await ownerDatabaseClient.db.insert(payments).values({
     orderId, stripePaymentIntentId: `pi_${suffix}`, stripeLatestChargeId: `ch_${suffix}`,
     status: 'succeeded', amountMinor: 100, currency: 'USD',
     paymentMethodCategory: 'card', paidAt
@@ -727,7 +732,7 @@ it('resolves a prior membership conflict only after a later complete set matches
     [fixture.balanceTransactionId],
     `${suffix}-exact`
   );
-  await expect(publishPayoutMembership(databaseClient.db, {
+  await expect(publishPayoutMembership(workerDatabaseClient.db, {
     payoutId: fixture.payout.payoutId,
     runId: recovered.id,
     expectedGeneration: recoveredGeneration.generation,
@@ -791,7 +796,7 @@ it('reopens a paid payout when reversal linkage appears and never treats it as c
     eq(financialReconciliationIssues.safeCode, 'payout_reversal_incomplete')
   ))).toEqual([expect.objectContaining({ state: 'open' })]);
 
-  await stagePayoutSnapshot(databaseClient.db, {
+  await stagePayoutSnapshot(workerDatabaseClient.db, {
     ...unrelatedReversal,
     originalPayoutId: published.payoutSnapshot.id
   }, { correlationId: `payout-reversal-import-${suffix}` });
@@ -840,7 +845,7 @@ it('observes a failed payout without failure evidence and resolves it when the e
     rawType: 'payout_failure',
     reportingCategory: 'payout'
   }), { correlationId: `payout-failure-evidence-balance-${suffix}` });
-  await stagePayoutSnapshot(databaseClient.db, {
+  await stagePayoutSnapshot(workerDatabaseClient.db, {
     ...snapshot,
     failureBalanceTransactionId: failureProviderId
   }, { correlationId: `payout-failure-evidence-complete-${suffix}` });
@@ -1209,7 +1214,7 @@ it('retries account fallback when a bookstore charge link appears after routing 
   await routingRead.promise;
 
   try {
-    await databaseClient.db.transaction(async (tx) => {
+    await ownerDatabaseClient.db.transaction(async (tx) => {
       const [guest] = await tx.insert(guestIdentities).values({
         email: `racing-link-${suffix}@example.com`
       }).returning();
@@ -1349,7 +1354,7 @@ it('retries account fallback when a bookstore charge link commits before routing
   await beforeRoutingRecheck.promise;
 
   try {
-    await databaseClient.db.transaction(async (tx) => {
+    await ownerDatabaseClient.db.transaction(async (tx) => {
       const [guest] = await tx.insert(guestIdentities).values({
         email: `recheck-link-${suffix}@example.com`
       }).returning();
@@ -1454,10 +1459,10 @@ it('supersedes an unrelated account allocation when a bookstore charge link arri
     expect.objectContaining({ sourceKind: 'adjustment', sourceInternalId: balance.id })
   ]));
 
-  const [guest] = await databaseClient.db.insert(guestIdentities).values({
+  const [guest] = await ownerDatabaseClient.db.insert(guestIdentities).values({
     email: `late-link-${suffix}@example.com`
   }).returning();
-  const [title] = await databaseClient.db.insert(titles).values({
+  const [title] = await ownerDatabaseClient.db.insert(titles).values({
     slug: `late-link-${suffix}`, title: 'Late linked title',
     description: 'Late linked description', creatorName: 'Late linked creator',
     format: 'prose', priceMinor: 100, currency: 'USD', visibility: 'private'
@@ -1465,7 +1470,7 @@ it('supersedes an unrelated account allocation when a bookstore charge link arri
   if (!guest || !title) throw new Error('Expected late-link owner rows');
   const orderId = randomUUID();
   const paidAt = balance.providerCreatedAt;
-  await databaseClient.db.insert(orders).values({
+  await ownerDatabaseClient.db.insert(orders).values({
     id: orderId, status: 'paid', guestIdentityId: guest.id, purchaseEmail: guest.email,
     currency: 'USD', subtotalMinor: 100, taxMinor: 0, totalMinor: 100,
     clientCheckoutAttemptId: randomUUID(), quoteFingerprintSha256: 'b'.repeat(64),
@@ -1474,13 +1479,13 @@ it('supersedes an unrelated account allocation when a bookstore charge link arri
     checkoutExpiresAt: new Date('2026-08-12T00:30:00.000Z'),
     paidAt
   });
-  await databaseClient.db.insert(orderItems).values({
+  await ownerDatabaseClient.db.insert(orderItems).values({
     orderId, titleId: title.id, titleSnapshot: title.title,
     creatorNameSnapshot: title.creatorName, format: 'prose', currency: 'USD',
     unitSubtotalMinor: 100, taxMinor: 0, totalMinor: 100,
     stripeLineItemId: `li_financial_late_link_${suffix}`
   });
-  const [payment] = await databaseClient.db.insert(payments).values({
+  const [payment] = await ownerDatabaseClient.db.insert(payments).values({
     orderId, stripePaymentIntentId: `pi_financial_late_link_${suffix}`,
     stripeLatestChargeId: providerChargeId, status: 'succeeded',
     amountMinor: 100, currency: 'USD', paymentMethodCategory: 'card',
@@ -2022,7 +2027,7 @@ it('fails a competing publication atomically and resolves it on a corrected firs
     [],
     `${second.run.id}-corrected`
   );
-  await expect(publishPayoutMembership(databaseClient.db, {
+  await expect(publishPayoutMembership(workerDatabaseClient.db, {
     payoutId: second.payout.payoutId,
     runId: corrected.id,
     expectedGeneration: correctedGeneration.generation,

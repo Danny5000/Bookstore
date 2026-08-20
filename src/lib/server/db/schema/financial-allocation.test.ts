@@ -193,7 +193,9 @@ describe('financial allocation schema declarations', () => {
       expect.arrayContaining([
         'financial_reconciliation_issues_occurrence_positive',
         'financial_reconciliation_issues_resolution_consistent',
-        'financial_reconciliation_issues_safe_vocabulary'
+        'financial_reconciliation_issues_safe_vocabulary',
+        'financial_reconciliation_issues_semantic_identity',
+        'financial_reconciliation_issues_semantic_impact'
       ])
     );
     expect(checkNames(refundAllocationComponents)).toContain(

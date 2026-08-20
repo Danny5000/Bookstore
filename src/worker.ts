@@ -1,8 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { rm, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
-import { loadApplicationConfig } from '$lib/server/config/load';
+import { loadWorkerApplicationConfig } from '$lib/server/config/load';
 import { createAuthServer } from '$lib/server/auth/options';
+import {
+  purgeCommerceClaimIssuances,
+  registerCommerceClaimIssuance
+} from '$lib/server/auth/commerce-claim-capability';
 import {
   canSendCommerceMagicLink,
   canSendMagicLink,
@@ -30,7 +34,7 @@ import {
 import { STRIPE_EVENT_JOB } from '$lib/server/commerce/job';
 import { fulfillDisputeEvent } from '$lib/server/commerce/disputes';
 import { fulfillRefundEvent } from '$lib/server/commerce/refunds';
-import { createStripeCommerceRuntime } from '$lib/server/commerce/stripe/runtime-core';
+import { createStripeWorkerRuntime } from '$lib/server/commerce/stripe/runtime-core';
 import {
   FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
   FINANCIAL_CLASSIFIER_VERSION
@@ -51,6 +55,7 @@ import {
   createFinancialScheduleEnsurer
 } from '$lib/server/commerce/financial/scans/scheduler';
 import { createDatabaseClient } from '$lib/server/db/client';
+import { databaseEnvironmentForRole } from '$lib/server/db/database-role-provision';
 import { probeDatabase } from '$lib/server/db/health';
 import { AUTH_EMAIL_TOPIC, queueAuthEmail } from '$lib/server/email/enqueue';
 import { createAuthEmailHandler } from '$lib/server/email/handler';
@@ -69,7 +74,7 @@ import { OUTBOX_DISPATCH_JOB } from '$lib/server/outbox/repository';
 import { createObjectStorage } from '$lib/server/storage/factory';
 import { probeStorage } from '$lib/server/storage/health';
 
-const config = loadApplicationConfig(process.env);
+const config = loadWorkerApplicationConfig(databaseEnvironmentForRole(process.env, 'worker'));
 const databaseClient = createDatabaseClient(config.database);
 const controller = new AbortController();
 const workerId = `${hostname()}:${process.pid}:${randomUUID()}`;
@@ -86,9 +91,11 @@ const workerAuth = createAuthServer({
     queueCommerceClaimEmail(databaseClient.db, commerceMessages, input),
   canSendMagicLink: (email) => canSendMagicLink(databaseClient.db, email),
   canSendCommerceMagicLink: (email) => canSendCommerceMagicLink(databaseClient.db, email),
-  onUserCreated: (userId) => ensureCustomerRole(databaseClient.db, userId)
+  onUserCreated: (userId) => ensureCustomerRole(databaseClient.db, userId),
+  registerCommerceClaimIssuance: (input) =>
+    registerCommerceClaimIssuance(databaseClient.db, input)
 });
-const stripeRuntime = createStripeCommerceRuntime(config);
+const stripeRuntime = createStripeWorkerRuntime(config);
 const topicHandlers = new Map<string, OutboxTopicHandler>([
   [
     AUTH_EMAIL_TOPIC,
@@ -186,6 +193,18 @@ const ensureFinancialSchedule = createFinancialScheduleEnsurer({
   classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
   allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
 });
+let nextClaimIssuancePurgeAt = 0;
+
+async function prepareWorkerPoll(
+  context: Parameters<typeof ensureFinancialSchedule>[0]
+): Promise<void> {
+  const observedAt = context.now.getTime();
+  if (observedAt >= nextClaimIssuancePurgeAt) {
+    await purgeCommerceClaimIssuances(databaseClient.db);
+    nextClaimIssuancePurgeAt = observedAt + 60_000;
+  }
+  await ensureFinancialSchedule(context);
+}
 
 function requestShutdown(): void {
   controller.abort();
@@ -196,7 +215,7 @@ process.once('SIGTERM', requestShutdown);
 
 try {
   await probeDatabase(databaseClient.pool, config.database.readinessTimeoutMs);
-  await probeStorage(storage);
+  await probeStorage(storage, 'writer');
   await writeFile(config.jobs.workerReadyFile, workerId, { encoding: 'utf8' });
   console.info('[worker] ready', { workerId });
   await runWorker({
@@ -206,7 +225,7 @@ try {
     concurrency: config.jobs.concurrency,
     pollIntervalMs: config.jobs.pollIntervalMs,
     heartbeatIntervalMs: Math.max(1, Math.floor(config.jobs.leaseMs / 3)),
-    beforePoll: ensureFinancialSchedule,
+    beforePoll: prepareWorkerPoll,
     signal: controller.signal
   });
 } catch (error: unknown) {

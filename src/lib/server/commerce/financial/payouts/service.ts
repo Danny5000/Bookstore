@@ -101,6 +101,15 @@ function assertDirectPayoutBalance(payout: PayoutSnapshot, balance: BalanceTrans
   }
 }
 
+function assertPayoutMembershipBalance(
+  payout: PayoutSnapshot,
+  balance: BalanceTransactionSnapshot
+): void {
+  if (balance.currency !== payout.currency) {
+    throw new PermanentFinancialError('currency_mismatch');
+  }
+}
+
 function cursorDigest(cursor: string | null): string {
   return createHash('sha256').update(JSON.stringify(cursor)).digest('hex');
 }
@@ -204,6 +213,9 @@ export async function reconcileFinancialPayout(
     await dependencies.gateway.listBalanceTransactionsForPayout(payout.id, request),
     (item) => parseBalanceTransactionSnapshot(item, payout.livemode)
   ));
+  for (const balance of page.data) {
+    assertPayoutMembershipBalance(payout, balance);
+  }
   const stagedPageIds: string[] = [];
   for (const balance of page.data) {
     const result = await stageBalanceTransaction(dependencies.database, balance, {

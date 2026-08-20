@@ -1,5 +1,10 @@
 {
 	admin off
+	log default {
+		format filter {
+			request>uri delete
+		}
+	}
 }
 
 :2015 {

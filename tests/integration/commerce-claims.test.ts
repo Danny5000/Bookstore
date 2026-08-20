@@ -1,20 +1,19 @@
 import { randomUUID } from 'node:crypto';
-import { eq } from 'drizzle-orm';
-import { describe, expect, it, vi } from 'vitest';
+import { eq, sql } from 'drizzle-orm';
+import { describe, expect, it } from 'vitest';
+import { commerceClaimTokenSha256 } from '$lib/server/auth/commerce-claim-capability';
 import { findOrCreateGuestIdentity } from '$lib/server/auth/identity';
-import { createCommerceClaimAuthorization } from '$lib/server/auth/commerce-claim-authorization';
+import { createCommerceClaimAuthorization } from './commerce-claim-capability';
 import {
   claimGuestPurchases,
-  requestGuestClaimEmails,
-  type ClaimGuestPurchasesDependencies
+  requestGuestClaimEmails
 } from '$lib/server/commerce/claims';
-import { PermanentCommerceError } from '$lib/server/commerce/errors';
 import { COMMERCE_CLAIM_REQUEST_JOB } from '$lib/server/commerce/claim-email';
-import { projectEffectiveEntitlement } from '$lib/server/commerce/grants';
 import {
   auditEvents,
   account,
   applicationRateLimits,
+  commerceClaimIssuances,
   disputes,
   entitlementGrants,
   entitlements,
@@ -28,7 +27,7 @@ import {
   titles,
   user
 } from '$lib/server/db/schema';
-import { databaseClient } from './database';
+import { databaseClient, ownerDatabaseClient, workerDatabaseClient } from './database';
 
 async function createUser(email: string, verified = true) {
   const [created] = await databaseClient.db.insert(user).values({
@@ -63,14 +62,14 @@ async function createGuestPurchase(input: {
   titleId?: string;
   adverse?: 'open-dispute' | 'lost-dispute' | 'full-refund' | 'permanent';
 }) {
-  const identity = await findOrCreateGuestIdentity(databaseClient.db, input.email);
+  const identity = await findOrCreateGuestIdentity(workerDatabaseClient.db, input.email);
   const title = input.titleId
     ? { id: input.titleId }
     : await createTitle(`Claim title ${randomUUID()}`);
   const orderId = randomUUID();
   const itemId = randomUUID();
   const paymentIntentId = `pi_test_${orderId}`;
-  const [order] = await databaseClient.db.insert(orders).values({
+  const [order] = await ownerDatabaseClient.db.insert(orders).values({
     id: orderId,
     status: 'paid',
     initiatingUserId: null,
@@ -88,7 +87,7 @@ async function createGuestPurchase(input: {
     paidAt: new Date('2026-08-10T12:05:00.000Z')
   }).returning();
   if (!order) throw new Error('Expected order');
-  await databaseClient.db.insert(orderItems).values({
+  await ownerDatabaseClient.db.insert(orderItems).values({
     id: itemId,
     orderId,
     titleId: title.id,
@@ -101,7 +100,7 @@ async function createGuestPurchase(input: {
     totalMinor: 1403,
     stripeLineItemId: `li_test_${itemId}`
   });
-  const [payment] = await databaseClient.db.insert(payments).values({
+  const [payment] = await ownerDatabaseClient.db.insert(payments).values({
     orderId,
     stripePaymentIntentId: paymentIntentId,
     stripeLatestChargeId: `ch_test_${orderId}`,
@@ -112,7 +111,7 @@ async function createGuestPurchase(input: {
     paidAt: new Date('2026-08-10T12:05:00.000Z')
   }).returning();
   if (!payment) throw new Error('Expected payment');
-  await databaseClient.db.insert(entitlementGrants).values({
+  await ownerDatabaseClient.db.insert(entitlementGrants).values({
     titleId: title.id,
     userId: null,
     source: 'purchase',
@@ -125,7 +124,7 @@ async function createGuestPurchase(input: {
       : null
   });
   if (input.adverse === 'full-refund') {
-    const [refund] = await databaseClient.db.insert(refunds).values({
+    const [refund] = await ownerDatabaseClient.db.insert(refunds).values({
       paymentId: payment.id,
       stripeRefundId: `re_test_${orderId}`,
       status: 'succeeded',
@@ -135,7 +134,7 @@ async function createGuestPurchase(input: {
       providerCreatedAt: new Date('2026-08-10T13:00:00.000Z')
     }).returning();
     if (!refund) throw new Error('Expected refund');
-    await databaseClient.db.insert(refundAllocations).values({
+    await ownerDatabaseClient.db.insert(refundAllocations).values({
       refundId: refund.id,
       orderItemId: itemId,
       amountMinor: 1403,
@@ -144,7 +143,7 @@ async function createGuestPurchase(input: {
   }
   if (input.adverse === 'open-dispute' || input.adverse === 'lost-dispute') {
     const state = input.adverse === 'open-dispute' ? 'open' : 'lost';
-    await databaseClient.db.insert(disputes).values({
+    await ownerDatabaseClient.db.insert(disputes).values({
       paymentId: payment.id,
       stripeDisputeId: `dp_test_${orderId}`,
       status: state,
@@ -172,6 +171,20 @@ async function command(userId: string) {
 }
 
 describe('atomic guest purchase claiming', () => {
+  it('rejects a direct web forgery of the exact aggregate claim audit shape', async () => {
+    await expect(databaseClient.pool.query(`
+      insert into audit_events (
+        actor_type, actor_id, action, outcome, resource_type, resource_id,
+        correlation_id, before, after
+      ) values (
+        'user', $1, 'commerce.guest_claimed', 'succeeded',
+        'guest_identity', $2, $3, null,
+        '{"claimedOrderCount":1,"claimedTitleCount":1}'::jsonb
+      )
+    `, [randomUUID(), randomUUID(), `forged-claim-${randomUUID()}`]))
+      .rejects.toMatchObject({ code: '42501' });
+  });
+
   it('claims every paid order, projects each unique scope once, and audits only aggregates', async () => {
     const email = ' multi-claim@example.com ';
     const claimant = await createUser(email);
@@ -181,12 +194,8 @@ describe('atomic guest purchase claiming', () => {
     await createGuestPurchase({ email });
     expect(await databaseClient.db.select().from(entitlements)).toHaveLength(0);
 
-    const project = vi.fn(projectEffectiveEntitlement);
-    const result = await claimGuestPurchases(
-      databaseClient.db,
-      { ...await command(claimant.id), correlationId: 'multi-claim@example.com' },
-      { projectEntitlement: project }
-    );
+    const claimInput = await command(claimant.id);
+    const result = await claimGuestPurchases(databaseClient.db, claimInput);
 
     expect(result).toEqual({
       claimed: true,
@@ -194,7 +203,6 @@ describe('atomic guest purchase claiming', () => {
       claimedOrderCount: 3,
       claimedTitleCount: 2
     });
-    expect(project).toHaveBeenCalledTimes(2);
     expect(await databaseClient.db.select().from(entitlementGrants)).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ userId: claimant.id, state: 'active' })
@@ -213,16 +221,29 @@ describe('atomic guest purchase claiming', () => {
       claimedOrderCount: 3,
       claimedTitleCount: 2
     });
-    expect(audits[0]?.correlationId).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(audits[0]?.correlationId).toBe(claimInput.correlationId);
     expect(JSON.stringify(audits)).not.toMatch(/multi-claim@|Private claim|pi_test|cs_test/iu);
-
-    const replay = await claimGuestPurchases(databaseClient.db, await command(claimant.id));
-    expect(replay).toEqual({
-      claimed: true,
-      changed: false,
-      claimedOrderCount: 3,
-      claimedTitleCount: 2
+    const [tombstone] = await ownerDatabaseClient.db
+      .select()
+      .from(commerceClaimIssuances)
+      .where(eq(
+        commerceClaimIssuances.claimProofSha256,
+        commerceClaimTokenSha256(claimInput.authorizationToken)
+      ));
+    expect(tombstone).toMatchObject({
+      state: 'consumed',
+      authTokenSha256: null,
+      normalizedEmail: null,
+      anchorOrderId: null,
+      authorizedUserId: null,
+      resultDisposition: 'claimed',
+      resultChanged: true,
+      resultOrderCount: 3,
+      resultTitleCount: 2
     });
+
+    const replay = await claimGuestPurchases(databaseClient.db, claimInput);
+    expect(replay).toEqual(result);
     expect(await databaseClient.db.select().from(auditEvents)
       .where(eq(auditEvents.action, 'commerce.guest_claimed'))).toHaveLength(1);
   });
@@ -249,56 +270,46 @@ describe('atomic guest purchase claiming', () => {
     ]);
   });
 
-  it('denies unverified, different-email, and foreign-claimed identities generically', async () => {
+  it('denies unverified and foreign-claimed identities generically', async () => {
     const purchase = await createGuestPurchase({ email: 'owner@example.com' });
     const unverified = await createUser('owner@example.com', false);
     await expect(claimGuestPurchases(databaseClient.db, await command(unverified.id)))
-      .rejects.toBeInstanceOf(PermanentCommerceError);
+      .rejects.toMatchObject({ code: 'CLAIM_AUTHORIZATION_REQUIRED' });
     await databaseClient.db.update(user)
-      .set({ email: 'unverified-moved@example.com' })
+      .set({ emailVerified: true })
       .where(eq(user.id, unverified.id));
-    const otherEmail = await createUser('other@example.com');
-    await expect(claimGuestPurchases(databaseClient.db, await command(otherEmail.id)))
-      .resolves.toEqual({
-        claimed: false,
-        changed: false,
-        claimedOrderCount: 0,
-        claimedTitleCount: 0
-      });
-
-    const firstClaimant = await createUser('owner@example.com');
-    await claimGuestPurchases(databaseClient.db, await command(firstClaimant.id));
-    const replacement = await createUser('replacement@example.com');
-    await databaseClient.db.update(user)
-      .set({ email: 'moved@example.com' })
-      .where(eq(user.id, firstClaimant.id));
-    await databaseClient.db.update(user)
-      .set({ email: 'owner@example.com' })
-      .where(eq(user.id, replacement.id));
-    await expect(claimGuestPurchases(databaseClient.db, await command(replacement.id)))
+    const authorization = await command(unverified.id);
+    const foreignClaimant = await createUser('foreign@example.com');
+    await ownerDatabaseClient.db.update(guestIdentities).set({
+      claimedByUserId: foreignClaimant.id,
+      claimedAt: new Date()
+    }).where(eq(guestIdentities.id, purchase.identity.id));
+    await expect(claimGuestPurchases(databaseClient.db, authorization))
       .rejects.toMatchObject({
         code: 'IDENTITY_ALREADY_CLAIMED'
       });
     expect((await databaseClient.db.select().from(entitlementGrants)
       .where(eq(entitlementGrants.orderItemId, purchase.itemId)))[0]?.userId)
-      .toBe(firstClaimant.id);
+      .toBeNull();
   });
 
-  it('serializes concurrent same-user claims to one transition and one audit', async () => {
-    const email = 'concurrent-claim@example.com';
+  it('makes the newest mailbox action win across live issuances for one email', async () => {
+    const email = 'latest-claim@example.com';
     const claimant = await createUser(email);
     await createGuestPurchase({ email });
     await createGuestPurchase({ email });
-    const [first, second] = await Promise.all([
-      claimGuestPurchases(databaseClient.db, await command(claimant.id)),
-      claimGuestPurchases(databaseClient.db, await command(claimant.id))
-    ]);
-    expect([first.changed, second.changed].sort()).toEqual([false, true]);
+    const superseded = await command(claimant.id);
+    const latest = await command(claimant.id);
+
+    await expect(claimGuestPurchases(databaseClient.db, superseded))
+      .rejects.toMatchObject({ code: 'CLAIM_AUTHORIZATION_REQUIRED' });
+    await expect(claimGuestPurchases(databaseClient.db, latest))
+      .resolves.toMatchObject({ claimed: true, changed: true });
     expect(await databaseClient.db.select().from(auditEvents)
       .where(eq(auditEvents.action, 'commerce.guest_claimed'))).toHaveLength(1);
   });
 
-  it('atomically consumes one authorization across concurrent use and exact replay', async () => {
+  it('replays one committed outcome across concurrent use and post-commit retry', async () => {
     const email = 'one-use-claim@example.com';
     const claimant = await createUser(email);
     await createGuestPurchase({ email });
@@ -312,19 +323,14 @@ describe('atomic guest purchase claiming', () => {
       authorizationToken
     };
 
-    const concurrent = await Promise.allSettled([
+    const concurrent = await Promise.all([
       claimGuestPurchases(databaseClient.db, input),
       claimGuestPurchases(databaseClient.db, input)
     ]);
-    expect(concurrent.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
-    expect(concurrent.filter((result) => result.status === 'rejected')).toEqual([
-      expect.objectContaining({
-        reason: expect.objectContaining({ code: 'CLAIM_AUTHORIZATION_REQUIRED' })
-      })
-    ]);
-    await expect(claimGuestPurchases(databaseClient.db, input)).rejects.toMatchObject({
-      code: 'CLAIM_AUTHORIZATION_REQUIRED'
-    });
+    expect(concurrent[0]).toEqual(concurrent[1]);
+    expect(concurrent[0]).toMatchObject({ claimed: true, changed: true });
+    await expect(claimGuestPurchases(databaseClient.db, input))
+      .resolves.toEqual(concurrent[0]);
     expect(await databaseClient.db.select().from(auditEvents)
       .where(eq(auditEvents.action, 'commerce.guest_claimed'))).toHaveLength(1);
     expect(await databaseClient.db.select().from(entitlements)).toHaveLength(1);
@@ -345,7 +351,7 @@ describe('atomic guest purchase claiming', () => {
     await expect(claimGuestPurchases(databaseClient.db, {
       userId: claimant.id,
       correlationId: `claim-${randomUUID()}`
-    } as never)).rejects.toBeInstanceOf(PermanentCommerceError);
+    } as never)).rejects.toMatchObject({ code: 'CLAIM_AUTHORIZATION_REQUIRED' });
 
     const magicAuthorization = await createCommerceClaimAuthorization(databaseClient.db, {
       email,
@@ -369,7 +375,7 @@ describe('atomic guest purchase claiming', () => {
     })).resolves.toMatchObject({ claimed: true, changed: true });
   });
 
-  it('rolls identity, grants, entitlements, and audit back after a mid-claim failure', async () => {
+  it('rolls identity, grants, entitlements, audit, and proof back after a mid-claim failure', async () => {
     const email = 'rollback-claim@example.com';
     const claimant = await createUser(email);
     const first = await createGuestPurchase({ email });
@@ -378,25 +384,39 @@ describe('atomic guest purchase claiming', () => {
       databaseClient.db,
       { email, kind: 'password-reset' }
     );
-    let projections = 0;
-    const dependencies: ClaimGuestPurchasesDependencies = {
-      projectEntitlement: async (...args) => {
-        projections += 1;
-        await projectEffectiveEntitlement(...args);
-        if (projections === 2) throw new Error('forced claim projection failure');
-        return { beforeActive: false, afterActive: true };
-      }
-    };
-
-    await expect(claimGuestPurchases(
-      databaseClient.db,
-      {
+    await ownerDatabaseClient.db.execute(sql`
+      create function "public"."test_reject_commerce_claim_audit"() returns trigger
+      language plpgsql set search_path = 'pg_catalog' as $$
+      begin
+        if NEW.action = 'commerce.guest_claimed' then
+          raise exception 'forced claim audit failure';
+        end if;
+        return NEW;
+      end;
+      $$
+    `);
+    await ownerDatabaseClient.db.execute(sql`
+      create trigger "audit_events_test_reject_commerce_claim"
+      before insert on "public"."audit_events"
+      for each row execute function "public"."test_reject_commerce_claim_audit"()
+    `);
+    try {
+      await expect(claimGuestPurchases(databaseClient.db, {
         userId: claimant.id,
         correlationId: `claim-${randomUUID()}`,
         authorizationToken
-      },
-      dependencies
-    )).rejects.toThrow('forced claim projection failure');
+      })).rejects.toMatchObject({
+        cause: expect.objectContaining({ message: 'forced claim audit failure' })
+      });
+    } finally {
+      await ownerDatabaseClient.db.execute(sql`
+        drop trigger if exists "audit_events_test_reject_commerce_claim"
+        on "public"."audit_events"
+      `);
+      await ownerDatabaseClient.db.execute(sql`
+        drop function if exists "public"."test_reject_commerce_claim_audit"()
+      `);
+    }
     expect((await databaseClient.db.select().from(guestIdentities)
       .where(eq(guestIdentities.id, first.identity.id)))[0]).toMatchObject({
       claimedByUserId: null,

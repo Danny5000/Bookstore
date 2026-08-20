@@ -1,11 +1,17 @@
 import { randomUUID } from 'node:crypto';
-import { eq, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { Pool, type PoolClient } from 'pg';
 import { describe, expect, it } from 'vitest';
-import { createCommerceClaimAuthorization } from '$lib/server/auth/commerce-claim-authorization';
+import {
+  createCommerceClaimAuthorization,
+  createCommerceMagicClaimBridgeFixture
+} from './commerce-claim-capability';
 import { claimGuestPurchases } from '$lib/server/commerce/claims';
+import { queueCommerceClaimEmail } from '$lib/server/commerce/claim-email';
 import { fulfillDisputeEvent } from '$lib/server/commerce/disputes';
+import { createCommerceMessageEnqueuer } from '$lib/server/commerce/email/enqueue';
+import { fulfillCheckoutEvent } from '$lib/server/commerce/fulfillment';
 import { setPreservedGrantState } from '$lib/server/commerce/grants';
 import { fulfillRefundEvent } from '$lib/server/commerce/refunds';
 import {
@@ -13,11 +19,15 @@ import {
   lockPaymentPurchaseFacts
 } from '$lib/server/commerce/reconciliation';
 import { lockOrder } from '$lib/server/commerce/lock';
+import { loadApplicationConfig } from '$lib/server/config/load';
 import type { Database } from '$lib/server/db/client';
+import { databaseEnvironmentForRole } from '$lib/server/db/database-role-provision';
 import * as commerceSchema from '$lib/server/db/schema';
 import {
+  auditEvents,
   disputes,
   entitlementGrants,
+  entitlements,
   financialAllocationSets,
   guestIdentities,
   orderItems,
@@ -36,7 +46,13 @@ import {
   titles,
   user
 } from '$lib/server/db/schema';
-import { applicationConfig, databaseClient } from './database';
+import type { CheckoutSnapshot, PaymentSnapshot } from '$lib/server/commerce/stripe/types';
+import {
+  applicationConfig,
+  databaseClient,
+  ownerDatabaseClient,
+  workerDatabaseClient
+} from './database';
 
 const paidAt = new Date('2026-08-10T12:05:00.000Z');
 const providerCreatedAt = new Date('2026-08-10T14:00:00.000Z');
@@ -57,19 +73,34 @@ interface LockFixture {
   titleId: string;
 }
 
-function createBoundedProbeDatabase(applicationName: string): {
+interface PendingGuestFulfillmentFixture {
+  orderId: string;
+  orderItemId: string;
+  stripeEventId: string;
+  titleId: string;
+  session: CheckoutSnapshot;
+  payment: PaymentSnapshot;
+}
+
+function createBoundedProbeDatabase(
+  applicationName: string,
+  role: 'runtime' | 'worker' = 'runtime'
+): {
   database: Database;
   close(): Promise<void>;
 } {
+  const config = role === 'worker'
+    ? loadApplicationConfig(databaseEnvironmentForRole(process.env, 'worker'))
+    : applicationConfig;
   const pool = new Pool({
-    host: applicationConfig.database.host,
-    port: applicationConfig.database.port,
-    database: applicationConfig.database.name,
-    user: applicationConfig.database.user,
-    password: applicationConfig.database.password,
+    host: config.database.host,
+    port: config.database.port,
+    database: config.database.name,
+    user: config.database.user,
+    password: config.database.password,
     max: 1,
-    connectionTimeoutMillis: applicationConfig.database.connectionTimeoutMs,
-    statement_timeout: applicationConfig.database.statementTimeoutMs,
+    connectionTimeoutMillis: config.database.connectionTimeoutMs,
+    statement_timeout: config.database.statementTimeoutMs,
     application_name: applicationName,
     options: '-c lock_timeout=5000'
   });
@@ -91,15 +122,19 @@ async function createLockFixture(
   const stripeDisputeId = `dp_lock_${orderId}`;
   const stripeRefundId = `re_lock_${orderId}`;
 
-  const [identity] = await databaseClient.db.insert(guestIdentities).values({ email }).returning();
-  if (!identity) throw new Error('Expected guest identity');
-  await databaseClient.db.insert(user).values({
+  await ownerDatabaseClient.db.insert(user).values({
     id: claimantId,
     name: 'Lock-order reader',
     email,
     emailVerified: true
   });
-  await databaseClient.db.insert(titles).values({
+  const [identity] = await ownerDatabaseClient.db.insert(guestIdentities).values({
+    email,
+    claimedByUserId: options.assignedPurchase ? claimantId : null,
+    claimedAt: options.assignedPurchase ? paidAt : null
+  }).returning();
+  if (!identity) throw new Error('Expected guest identity');
+  await ownerDatabaseClient.db.insert(titles).values({
     id: titleId,
     slug: `lock-order-${titleId}`,
     title: 'Private lock-order title',
@@ -110,7 +145,7 @@ async function createLockFixture(
     currency: 'USD',
     visibility: 'private'
   });
-  await databaseClient.db.insert(orders).values({
+  await ownerDatabaseClient.db.insert(orders).values({
     id: orderId,
     status: 'paid',
     initiatingUserId: null,
@@ -127,7 +162,7 @@ async function createLockFixture(
     checkoutExpiresAt: new Date('2026-08-10T12:30:00.000Z'),
     paidAt
   });
-  await databaseClient.db.insert(orderItems).values({
+  await ownerDatabaseClient.db.insert(orderItems).values({
     id: itemId,
     orderId,
     titleId,
@@ -140,7 +175,7 @@ async function createLockFixture(
     totalMinor: 1403,
     stripeLineItemId: `li_lock_${itemId}`
   });
-  const [payment] = await databaseClient.db.insert(payments).values({
+  const [payment] = await ownerDatabaseClient.db.insert(payments).values({
     orderId,
     stripePaymentIntentId: paymentIntentId,
     stripeLatestChargeId: `ch_lock_${orderId}`,
@@ -151,7 +186,7 @@ async function createLockFixture(
     paidAt
   }).returning();
   if (!payment) throw new Error('Expected payment');
-  const [grant] = await databaseClient.db.insert(entitlementGrants).values({
+  const [grant] = await ownerDatabaseClient.db.insert(entitlementGrants).values({
     titleId,
     userId: options.assignedPurchase ? claimantId : null,
     source: 'purchase',
@@ -161,7 +196,7 @@ async function createLockFixture(
     grantedAt: paidAt
   }).returning();
   if (!grant) throw new Error('Expected purchase grant');
-  const [refund] = await databaseClient.db.insert(refunds).values({
+  const [refund] = await ownerDatabaseClient.db.insert(refunds).values({
     paymentId: payment.id,
     stripeRefundId,
     status: 'pending',
@@ -171,7 +206,7 @@ async function createLockFixture(
     providerCreatedAt
   }).returning();
   if (!refund) throw new Error('Expected refund');
-  const [dispute] = await databaseClient.db.insert(disputes).values({
+  const [dispute] = await ownerDatabaseClient.db.insert(disputes).values({
     paymentId: payment.id,
     stripeDisputeId,
     status: 'open',
@@ -208,7 +243,7 @@ async function waitForBlockedRowLock(
     | 'refunds'
 ): Promise<void> {
   for (let attempt = 0; attempt < 200; attempt += 1) {
-    const result = await databaseClient.pool.query<{ blocked: boolean }>(`
+    const result = await ownerDatabaseClient.pool.query<{ blocked: boolean }>(`
       select exists (
         select 1
         from pg_stat_activity
@@ -229,7 +264,7 @@ async function waitForNamedBlockedQuery(
   expectedQueryFragment: string
 ): Promise<void> {
   for (let attempt = 0; attempt < 200; attempt += 1) {
-    const result = await databaseClient.pool.query<{
+    const result = await ownerDatabaseClient.pool.query<{
       query: string;
       wait_event_type: string | null;
     }>(`
@@ -254,6 +289,38 @@ async function waitForNamedBlockedQuery(
   throw new Error(
     `Expected ${applicationName} to wait for ${expectedQueryFragment}`
   );
+}
+
+async function backendPid(client: PoolClient): Promise<number> {
+  const result = await client.query<{ pid: number }>('select pg_backend_pid() as pid');
+  const pid = result.rows[0]?.pid;
+  if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid < 1) {
+    throw new Error('Expected blocker backend PID');
+  }
+  return pid;
+}
+
+async function waitForNamedBlockedBy(
+  applicationName: string,
+  blockerPid: number
+): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const result = await ownerDatabaseClient.pool.query<{
+      blocking_pids: number[];
+      wait_event_type: string | null;
+    }>(`
+      select pg_blocking_pids(activity.pid) as blocking_pids, activity.wait_event_type
+      from pg_stat_activity activity
+      where activity.datname = current_database()
+        and activity.application_name = $1
+        and activity.pid <> pg_backend_pid()
+    `, [applicationName]);
+    if (result.rows.some((row) =>
+      row.wait_event_type === 'Lock' && row.blocking_pids.includes(blockerPid)
+    )) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Expected ${applicationName} to wait for blocker PID ${blockerPid}`);
 }
 
 function rejectionCode(reason: unknown): string | undefined {
@@ -291,7 +358,7 @@ function assertLockProbeFulfilled(
 }
 
 async function beginBlocker(refundId: string): Promise<PoolClient> {
-  const blocker = await databaseClient.pool.connect();
+  const blocker = await workerDatabaseClient.pool.connect();
   await blocker.query('begin');
   await blocker.query("set local lock_timeout = '5s'");
   await blocker.query('select id from refunds where id = $1 for update', [refundId]);
@@ -299,7 +366,7 @@ async function beginBlocker(refundId: string): Promise<PoolClient> {
 }
 
 async function beginOrderBlocker(orderId: string): Promise<PoolClient> {
-  const blocker = await databaseClient.pool.connect();
+  const blocker = await ownerDatabaseClient.pool.connect();
   await blocker.query('begin');
   await blocker.query("set local lock_timeout = '5s'");
   await blocker.query('select id from orders where id = $1 for update', [orderId]);
@@ -307,7 +374,7 @@ async function beginOrderBlocker(orderId: string): Promise<PoolClient> {
 }
 
 async function beginGrantBlocker(grantId: string): Promise<PoolClient> {
-  const blocker = await databaseClient.pool.connect();
+  const blocker = await workerDatabaseClient.pool.connect();
   await blocker.query('begin');
   await blocker.query("set local lock_timeout = '5s'");
   await blocker.query('select id from entitlement_grants where id = $1 for update', [grantId]);
@@ -318,7 +385,7 @@ async function beginClaimCreationBlocker(
   refundId: string,
   grantId: string
 ): Promise<PoolClient> {
-  const blocker = await databaseClient.pool.connect();
+  const blocker = await workerDatabaseClient.pool.connect();
   await blocker.query('begin');
   await blocker.query("set local lock_timeout = '5s'");
   await blocker.query('select id from refunds where id = $1 for update', [refundId]);
@@ -326,16 +393,19 @@ async function beginClaimCreationBlocker(
   return blocker;
 }
 
-async function waitForBlockedLockCount(minimum: number): Promise<void> {
+async function waitForBlockedLockCount(
+  minimum: number,
+  applicationNames: readonly string[] = ['pale-orbit']
+): Promise<void> {
   for (let attempt = 0; attempt < 200; attempt += 1) {
-    const result = await databaseClient.pool.query<{ blocked: number }>(`
+    const result = await ownerDatabaseClient.pool.query<{ blocked: number }>(`
       select count(*)::int as blocked
       from pg_stat_activity
       where datname = current_database()
         and pid <> pg_backend_pid()
-        and application_name = 'pale-orbit'
+        and application_name = any($1::text[])
         and wait_event_type = 'Lock'
-    `);
+    `, [applicationNames]);
     if ((result.rows[0]?.blocked ?? 0) >= minimum) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
@@ -351,7 +421,7 @@ async function releaseBlocker(blocker: PoolClient): Promise<void> {
 }
 
 async function createDisputeEvent(fixture: LockFixture): Promise<string> {
-  const [event] = await databaseClient.db.insert(stripeEvents).values({
+  const [event] = await ownerDatabaseClient.db.insert(stripeEvents).values({
     providerEventId: `evt_lock_${randomUUID()}`,
     eventType: 'charge.dispute.updated',
     objectId: fixture.stripeDisputeId,
@@ -367,7 +437,7 @@ async function createDisputeEvent(fixture: LockFixture): Promise<string> {
 function reconcileDispute(
   fixture: LockFixture,
   stripeEventId: string,
-  database: Database = databaseClient.db
+  database: Database = workerDatabaseClient.db
 ): Promise<void> {
   return fulfillDisputeEvent(database, {
     stripeEventId,
@@ -402,7 +472,7 @@ function reconcileDispute(
 }
 
 async function createRefundEvent(fixture: LockFixture): Promise<string> {
-  const [event] = await databaseClient.db.insert(stripeEvents).values({
+  const [event] = await ownerDatabaseClient.db.insert(stripeEvents).values({
     providerEventId: `evt_lock_refund_${randomUUID()}`,
     eventType: 'refund.updated',
     objectId: fixture.stripeRefundId,
@@ -416,7 +486,7 @@ async function createRefundEvent(fixture: LockFixture): Promise<string> {
 }
 
 async function createDraftLockFixture(fixture: LockFixture): Promise<string> {
-  const [draft] = await databaseClient.db.insert(refundAllocationDrafts).values({
+  const [draft] = await ownerDatabaseClient.db.insert(refundAllocationDrafts).values({
     refundId: fixture.refundId,
     state: 'active',
     version: 1,
@@ -426,7 +496,7 @@ async function createDraftLockFixture(fixture: LockFixture): Promise<string> {
     updatedCorrelationId: `lock-order-draft-${fixture.refundId}`
   }).returning();
   if (!draft) throw new Error('Expected refund-allocation draft');
-  await databaseClient.db.insert(refundAllocationDraftItems).values({
+  await ownerDatabaseClient.db.insert(refundAllocationDraftItems).values({
     draftId: draft.id,
     orderItemId: fixture.itemId,
     proposedTotalPresentmentMinor: 1403
@@ -436,7 +506,7 @@ async function createDraftLockFixture(fixture: LockFixture): Promise<string> {
 
 async function createCorrectionLockFixture(fixture: LockFixture): Promise<string> {
   const sourceFingerprintSha256 = 'e'.repeat(64);
-  const [balanceTransaction] = await databaseClient.db
+  const [balanceTransaction] = await ownerDatabaseClient.db
     .insert(stripeBalanceTransactions)
     .values({
       providerId: `txn_correction_${fixture.refundId}`,
@@ -457,7 +527,7 @@ async function createCorrectionLockFixture(fixture: LockFixture): Promise<string
     })
     .returning();
   if (!balanceTransaction) throw new Error('Expected correction balance transaction');
-  const [allocationSet] = await databaseClient.db
+  const [allocationSet] = await ownerDatabaseClient.db
     .insert(financialAllocationSets)
     .values({
       allocationIdentity: `refund:${fixture.refundId}:gross:1`,
@@ -474,7 +544,7 @@ async function createCorrectionLockFixture(fixture: LockFixture): Promise<string
     })
     .returning();
   if (!allocationSet) throw new Error('Expected correction base allocation set');
-  const [correctionSet] = await databaseClient.db
+  const [correctionSet] = await ownerDatabaseClient.db
     .insert(refundReportingCorrectionSets)
     .values({
       refundId: fixture.refundId,
@@ -488,7 +558,7 @@ async function createCorrectionLockFixture(fixture: LockFixture): Promise<string
     })
     .returning();
   if (!correctionSet) throw new Error('Expected reporting-correction set');
-  await databaseClient.db.insert(refundReportingCorrectionItems).values({
+  await ownerDatabaseClient.db.insert(refundReportingCorrectionItems).values({
     correctionSetId: correctionSet.id,
     domain: 'settlement',
     sourceAllocationSetId: allocationSet.id,
@@ -509,7 +579,7 @@ interface PayoutLockFixture {
 }
 
 async function createPayoutLockFixture(fixture: LockFixture): Promise<PayoutLockFixture> {
-  const [balanceTransaction] = await databaseClient.db
+  const [balanceTransaction] = await ownerDatabaseClient.db
     .insert(stripeBalanceTransactions)
     .values({
       providerId: `txn_payout_lock_${fixture.paymentId}`,
@@ -530,7 +600,7 @@ async function createPayoutLockFixture(fixture: LockFixture): Promise<PayoutLock
     })
     .returning();
   if (!balanceTransaction) throw new Error('Expected payout balance transaction');
-  const [payout] = await databaseClient.db.insert(stripePayouts).values({
+  const [payout] = await ownerDatabaseClient.db.insert(stripePayouts).values({
     providerId: `po_lock_${fixture.paymentId}`,
     liveMode: false,
     amountMinor: 1360,
@@ -546,7 +616,7 @@ async function createPayoutLockFixture(fixture: LockFixture): Promise<PayoutLock
     fingerprintSha256: '1'.repeat(64)
   }).returning();
   if (!payout) throw new Error('Expected payout');
-  const [run] = await databaseClient.db.insert(payoutImportRuns).values({
+  const [run] = await ownerDatabaseClient.db.insert(payoutImportRuns).values({
     payoutId: payout.id,
     generation: 1,
     state: 'published',
@@ -558,7 +628,7 @@ async function createPayoutLockFixture(fixture: LockFixture): Promise<PayoutLock
     completedAt: eventCreatedAt
   }).returning();
   if (!run) throw new Error('Expected payout import run');
-  const [membership] = await databaseClient.db
+  const [membership] = await ownerDatabaseClient.db
     .insert(stripePayoutBalanceTransactions)
     .values({
       payoutId: payout.id,
@@ -575,8 +645,115 @@ async function createPayoutLockFixture(fixture: LockFixture): Promise<PayoutLock
   };
 }
 
+async function createPendingGuestFulfillmentFixture(
+  claimantEmail: string
+): Promise<PendingGuestFulfillmentFixture> {
+  const suffix = randomUUID();
+  const orderId = randomUUID();
+  const orderItemId = randomUUID();
+  const titleId = randomUUID();
+  const sessionId = `cs_claim_race_${suffix}`;
+  const paymentIntentId = `pi_claim_race_${suffix}`;
+  const chargeId = `ch_claim_race_${suffix}`;
+  const lineItemId = `li_claim_race_${suffix}`;
+  const checkoutExpiresAt = new Date('2026-08-10T12:30:00.000Z');
+
+  await ownerDatabaseClient.db.insert(titles).values({
+    id: titleId,
+    slug: `claim-race-${titleId}`,
+    title: 'Claim-race later purchase',
+    description: 'Private claim-race fixture',
+    creatorName: 'Private creator',
+    format: 'prose',
+    priceMinor: 1701,
+    currency: 'USD',
+    visibility: 'private'
+  });
+  await ownerDatabaseClient.db.insert(orders).values({
+    id: orderId,
+    status: 'checkout_open',
+    initiatingUserId: null,
+    guestIdentityId: null,
+    purchaseEmail: null,
+    currency: 'USD',
+    subtotalMinor: 1701,
+    clientCheckoutAttemptId: randomUUID(),
+    quoteFingerprintSha256: 'c'.repeat(64),
+    stripeCheckoutSessionId: sessionId,
+    statusTokenSha256: 'd'.repeat(64),
+    checkoutExpiresAt
+  });
+  await ownerDatabaseClient.db.insert(orderItems).values({
+    id: orderItemId,
+    orderId,
+    titleId,
+    titleSnapshot: 'Claim-race later purchase',
+    creatorNameSnapshot: 'Private creator',
+    format: 'prose',
+    currency: 'USD',
+    unitSubtotalMinor: 1701
+  });
+  const [event] = await ownerDatabaseClient.db.insert(stripeEvents).values({
+    providerEventId: `evt_claim_race_${suffix}`,
+    eventType: 'checkout.session.async_payment_succeeded',
+    objectId: sessionId,
+    liveMode: false,
+    apiVersion: '2026-07-29.dahlia',
+    providerCreatedAt,
+    rawBodySha256: 'e'.repeat(64),
+    status: 'pending'
+  }).returning();
+  if (!event) throw new Error('Expected claim-race Stripe event');
+
+  return {
+    orderId,
+    orderItemId,
+    stripeEventId: event.id,
+    titleId,
+    session: {
+      providerSessionId: sessionId,
+      clientReferenceId: orderId,
+      metadataVersion: '1',
+      metadataOrderId: orderId,
+      liveMode: false,
+      mode: 'payment',
+      status: 'complete',
+      paymentStatus: 'paid',
+      paymentIntentId,
+      latestChargeId: chargeId,
+      customerEmail: claimantEmail,
+      currency: 'usd',
+      subtotalMinor: 1701,
+      taxMinor: 0,
+      totalMinor: 1701,
+      expiresAt: checkoutExpiresAt,
+      lineItems: [{
+        providerLineItemId: lineItemId,
+        orderItemId,
+        quantity: 1,
+        currency: 'usd',
+        subtotalMinor: 1701,
+        taxMinor: 0,
+        totalMinor: 1701
+      }]
+    },
+    payment: {
+      paymentIntentId,
+      metadataVersion: '1',
+      metadataOrderId: orderId,
+      latestChargeId: chargeId,
+      liveMode: false,
+      state: 'succeeded',
+      amountMinor: 1701,
+      currency: 'usd',
+      paidAt,
+      paymentMethodCategory: 'card'
+    }
+  };
+}
+
 async function beginDraftBlocker(draftId: string): Promise<PoolClient> {
-  const blocker = await databaseClient.pool.connect();
+  const blocker = await ownerDatabaseClient.pool.connect();
   await blocker.query('begin');
   await blocker.query("set local lock_timeout = '5s'");
   await blocker.query(
@@ -590,7 +767,7 @@ async function beginCorrectionBlocker(
   correctionSetId: string,
   grantId: string
 ): Promise<PoolClient> {
-  const blocker = await databaseClient.pool.connect();
+  const blocker = await ownerDatabaseClient.pool.connect();
   await blocker.query('begin');
   await blocker.query("set local lock_timeout = '5s'");
   await blocker.query(
@@ -607,7 +784,7 @@ async function beginCorrectionBlocker(
 async function beginBalanceTransactionBlocker(
   balanceTransactionId: string
 ): Promise<PoolClient> {
-  const blocker = await databaseClient.pool.connect();
+  const blocker = await workerDatabaseClient.pool.connect();
   await blocker.query('begin');
   await blocker.query("set local lock_timeout = '5s'");
   await blocker.query(
@@ -621,7 +798,7 @@ async function lockPurchaseAccessGraph(
   fixture: LockFixture,
   applicationName: string
 ): Promise<void> {
-  await databaseClient.db.transaction(async (transaction) => {
+  await workerDatabaseClient.db.transaction(async (transaction) => {
     await transaction.execute(sql.raw("set local lock_timeout = '5s'"));
     await transaction.execute(
       sql`select set_config('application_name', ${applicationName}, true)`
@@ -648,7 +825,7 @@ async function lockPayoutAcquisition(
   fixture: PayoutLockFixture,
   applicationName: string
 ): Promise<void> {
-  const client = await databaseClient.pool.connect();
+  const client = await workerDatabaseClient.pool.connect();
   let completed = false;
   try {
     await client.query('begin');
@@ -678,7 +855,7 @@ async function lockPurchaseFinancialProjection(
   payout: PayoutLockFixture,
   applicationName: string
 ): Promise<void> {
-  await databaseClient.db.transaction(async (transaction) => {
+  await workerDatabaseClient.db.transaction(async (transaction) => {
     await transaction.execute(sql.raw("set local lock_timeout = '5s'"));
     await transaction.execute(
       sql`select set_config('application_name', ${applicationName}, true)`
@@ -713,7 +890,7 @@ async function lockPurchaseFinancialProjection(
 function reconcileRefund(
   fixture: LockFixture,
   stripeEventId: string,
-  database: Database = databaseClient.db
+  database: Database = workerDatabaseClient.db
 ): Promise<void> {
   return fulfillRefundEvent(database, {
     stripeEventId,
@@ -749,7 +926,7 @@ function reconcileRefund(
 
 async function setPreservedGrant(
   fixture: LockFixture,
-  database: Database = databaseClient.db
+  database: Database = workerDatabaseClient.db
 ): Promise<void> {
   await database.transaction(async (transaction) => {
     await setPreservedGrantState(transaction, {
@@ -764,9 +941,10 @@ async function setPreservedGrant(
 
 async function expectNoEntitlementDeadlock(
   fixture: LockFixture,
-  operation: () => Promise<unknown>
+  operation: () => Promise<unknown>,
+  claimApplicationName?: string
 ): Promise<void> {
-  await databaseClient.db.insert(entitlementGrants).values({
+  await workerDatabaseClient.db.insert(entitlementGrants).values({
     titleId: fixture.titleId,
     userId: fixture.claimantId,
     source: 'preserved',
@@ -776,15 +954,24 @@ async function expectNoEntitlementDeadlock(
   });
   const blocker = await beginGrantBlocker(fixture.grantId);
   let released = false;
-  const mutation = operation();
+  let mutation: Promise<unknown> | undefined;
   let preservation: Promise<void> | undefined;
-  void mutation.catch(() => undefined);
 
   try {
-    await waitForBlockedRowLock('entitlement_grants');
+    const blockerPid = await backendPid(blocker);
+    mutation = operation();
+    void mutation.catch(() => undefined);
+    if (claimApplicationName) {
+      await waitForNamedBlockedBy(claimApplicationName, blockerPid);
+    } else {
+      await waitForBlockedRowLock('entitlement_grants');
+    }
     preservation = setPreservedGrant(fixture);
     void preservation.catch(() => undefined);
-    await waitForBlockedLockCount(2);
+    await waitForBlockedLockCount(
+      2,
+      claimApplicationName ? ['pale-orbit', claimApplicationName] : ['pale-orbit']
+    );
     await blocker.query('commit');
     released = true;
     blocker.release();
@@ -796,30 +983,38 @@ async function expectNoEntitlementDeadlock(
     if (rejected) throw rejected.reason;
   } finally {
     if (!released) await releaseBlocker(blocker).catch(() => undefined);
-    await Promise.allSettled(preservation ? [mutation, preservation] : [mutation]);
+    await Promise.allSettled(
+      mutation === undefined ? [] : preservation ? [mutation, preservation] : [mutation]
+    );
   }
 }
 
-async function expectNoClaimCreationDeadlock(fixture: LockFixture): Promise<void> {
-  const blocker = await beginClaimCreationBlocker(fixture.refundId, fixture.grantId);
-  let released = false;
+async function expectNoClaimCreationDeadlock(
+  fixture: LockFixture,
+  claimDatabase: Database,
+  claimApplicationName: string
+): Promise<void> {
   const authorizationToken = await createCommerceClaimAuthorization(databaseClient.db, {
     email: fixture.claimantEmail,
     kind: 'password-reset'
   });
-  const claim = claimGuestPurchases(databaseClient.db, {
-    userId: fixture.claimantId,
-    correlationId: `lock-order-new-preserved-claim-${fixture.orderId}`,
-    authorizationToken
-  });
+  const blocker = await beginClaimCreationBlocker(fixture.refundId, fixture.grantId);
+  let released = false;
+  let claim: Promise<unknown> | undefined;
   let preservation: Promise<void> | undefined;
-  void claim.catch(() => undefined);
 
   try {
-    await waitForBlockedRowLock('refunds');
+    const blockerPid = await backendPid(blocker);
+    claim = claimGuestPurchases(claimDatabase, {
+      userId: fixture.claimantId,
+      correlationId: `lock-order-new-preserved-claim-${fixture.orderId}`,
+      authorizationToken
+    });
+    void claim.catch(() => undefined);
+    await waitForNamedBlockedBy(claimApplicationName, blockerPid);
     preservation = setPreservedGrant(fixture);
     void preservation.catch(() => undefined);
-    await waitForBlockedLockCount(2);
+    await preservation;
     await blocker.query('commit');
     released = true;
     blocker.release();
@@ -831,27 +1026,33 @@ async function expectNoClaimCreationDeadlock(fixture: LockFixture): Promise<void
     if (rejected) throw rejected.reason;
   } finally {
     if (!released) await releaseBlocker(blocker).catch(() => undefined);
-    await Promise.allSettled(preservation ? [claim, preservation] : [claim]);
+    await Promise.allSettled(
+      claim === undefined ? [] : preservation ? [claim, preservation] : [claim]
+    );
   }
 }
 
 describe('commerce transaction lock order', () => {
   it('lets a refund holder lock an item while a guest claim waits on the refund', async () => {
     const fixture = await createLockFixture();
-    const blocker = await beginBlocker(fixture.refundId);
     const authorizationToken = await createCommerceClaimAuthorization(databaseClient.db, {
       email: fixture.claimantEmail,
       kind: 'password-reset'
     });
-    const claim = claimGuestPurchases(databaseClient.db, {
-      userId: fixture.claimantId,
-      correlationId: `lock-order-claim-${fixture.orderId}`,
-      authorizationToken
-    });
-    void claim.catch(() => undefined);
+    const blocker = await beginBlocker(fixture.refundId);
+    const claimApplicationName = `plan6b-claim-refund-${fixture.orderId}`;
+    const claimDatabase = createBoundedProbeDatabase(claimApplicationName);
+    let claim: Promise<unknown> | undefined;
 
     try {
-      await waitForBlockedRowLock('refunds');
+      const blockerPid = await backendPid(blocker);
+      claim = claimGuestPurchases(claimDatabase.database, {
+        userId: fixture.claimantId,
+        correlationId: `lock-order-claim-${fixture.orderId}`,
+        authorizationToken
+      });
+      void claim.catch(() => undefined);
+      await waitForNamedBlockedBy(claimApplicationName, blockerPid);
       await expect(blocker.query(
         'select id from order_items where id = $1 for update',
         [fixture.itemId]
@@ -861,8 +1062,10 @@ describe('commerce transaction lock order', () => {
       blocker.release();
     } catch (error) {
       await releaseBlocker(blocker).catch(() => undefined);
-      await claim.catch(() => undefined);
+      await claim?.catch(() => undefined);
       throw error;
+    } finally {
+      await claimDatabase.close();
     }
   }, 15_000);
 
@@ -933,26 +1136,186 @@ describe('commerce transaction lock order', () => {
   }, 15_000);
 
   it('serializes guest claims with preserved-grant changes without deadlocking', async () => {
-    const fixture = await createLockFixture({ assignedPurchase: true });
+    const fixture = await createLockFixture();
     const authorizationToken = await createCommerceClaimAuthorization(databaseClient.db, {
       email: fixture.claimantEmail,
       kind: 'password-reset'
     });
 
-    await expectNoEntitlementDeadlock(
-      fixture,
-      () => claimGuestPurchases(databaseClient.db, {
-        userId: fixture.claimantId,
-        correlationId: `lock-order-preserved-claim-${fixture.orderId}`,
-        authorizationToken
-      })
-    );
+    const claimApplicationName = `plan6b-claim-preserved-${fixture.orderId}`;
+    const claimDatabase = createBoundedProbeDatabase(claimApplicationName);
+    try {
+      await expectNoEntitlementDeadlock(
+        fixture,
+        () => claimGuestPurchases(claimDatabase.database, {
+          userId: fixture.claimantId,
+          correlationId: `lock-order-preserved-claim-${fixture.orderId}`,
+          authorizationToken
+        }),
+        claimApplicationName
+      );
+    } finally {
+      await claimDatabase.close();
+    }
   }, 15_000);
 
   it('serializes guest claims with preserved-grant creation without deadlocking', async () => {
-    const fixture = await createLockFixture({ assignedPurchase: true });
+    const fixture = await createLockFixture();
+    const claimApplicationName = `plan6b-claim-creation-${fixture.orderId}`;
+    const claimDatabase = createBoundedProbeDatabase(claimApplicationName);
+    try {
+      await expectNoClaimCreationDeadlock(
+        fixture,
+        claimDatabase.database,
+        claimApplicationName
+      );
+    } finally {
+      await claimDatabase.close();
+    }
+  }, 15_000);
 
-    await expectNoClaimCreationDeadlock(fixture);
+  it('keeps claim-email delivery ahead of claims on the identity-before-order sequence', async () => {
+    const fixture = await createLockFixture();
+    const authorizationToken = await createCommerceClaimAuthorization(databaseClient.db, {
+      email: fixture.claimantEmail,
+      kind: 'password-reset'
+    });
+    const blocker = await beginOrderBlocker(fixture.orderId);
+    let blockerReleased = false;
+    const messages = createCommerceMessageEnqueuer(applicationConfig.origin);
+    const delivery = queueCommerceClaimEmail(workerDatabaseClient.db, messages, {
+      orderId: fixture.orderId,
+      email: fixture.claimantEmail,
+      claimUrl: createCommerceMagicClaimBridgeFixture(
+        fixture.orderId,
+        applicationConfig.origin
+      )
+    });
+    let claim: Promise<unknown> | undefined;
+    void delivery.catch(() => undefined);
+
+    try {
+      await waitForBlockedRowLock('orders');
+      claim = claimGuestPurchases(databaseClient.db, {
+        userId: fixture.claimantId,
+        correlationId: `lock-order-claim-email-${fixture.orderId}`,
+        authorizationToken
+      });
+      void claim.catch(() => undefined);
+      await waitForBlockedLockCount(2);
+      await blocker.query('commit');
+      blocker.release();
+      blockerReleased = true;
+
+      assertLockProbeFulfilled(
+        ['claim-email delivery', 'guest claim'],
+        await Promise.allSettled([delivery, claim])
+      );
+    } finally {
+      if (!blockerReleased) await releaseBlocker(blocker).catch(() => undefined);
+      await Promise.allSettled(claim ? [delivery, claim] : [delivery]);
+    }
+  }, 15_000);
+
+  it('keeps a later guest fulfillment behind claim and assigns it to the committed claimant', async () => {
+    const fixture = await createLockFixture();
+    const later = await createPendingGuestFulfillmentFixture(fixture.claimantEmail);
+    const authorizationToken = await createCommerceClaimAuthorization(databaseClient.db, {
+      email: fixture.claimantEmail,
+      kind: 'password-reset'
+    });
+    const blocker = await beginOrderBlocker(fixture.orderId);
+    let blockerReleased = false;
+    const claimApplicationName = `plan6b-claim-later-${fixture.orderId}`;
+    const claimDatabase = createBoundedProbeDatabase(claimApplicationName);
+    const applicationName = `plan6b-claim-fulfillment-${later.orderId}`;
+    const fulfillmentDatabase = createBoundedProbeDatabase(applicationName, 'worker');
+    const messages = {
+      accountReceipts: [] as string[],
+      guestClaimPreparations: [] as string[],
+      guestReceiptsWithoutClaim: [] as string[]
+    };
+    let claim: Promise<unknown> | undefined;
+    let fulfillment: Promise<void> | undefined;
+
+    try {
+      const blockerPid = await backendPid(blocker);
+      claim = claimGuestPurchases(claimDatabase.database, {
+        userId: fixture.claimantId,
+        correlationId: `lock-order-claim-fulfillment-${fixture.orderId}`,
+        authorizationToken
+      });
+      void claim.catch(() => undefined);
+      await waitForNamedBlockedBy(claimApplicationName, blockerPid);
+      fulfillment = fulfillCheckoutEvent(fulfillmentDatabase.database, {
+        stripeEventId: later.stripeEventId,
+        session: later.session,
+        payment: later.payment
+      }, {
+        purchaseMessages: {
+          async enqueueAccountReceipt(_transaction, orderId) {
+            messages.accountReceipts.push(orderId);
+          },
+          async enqueueGuestClaimPreparation(_transaction, orderId) {
+            messages.guestClaimPreparations.push(orderId);
+          },
+          async enqueueGuestReceiptWithoutClaim(_transaction, orderId) {
+            messages.guestReceiptsWithoutClaim.push(orderId);
+          }
+        }
+      });
+      void fulfillment.catch(() => undefined);
+      await waitForNamedBlockedQuery(applicationName, 'from "guest_identities"');
+
+      await expect(blocker.query(
+        'select id from orders where id = $1 for update',
+        [later.orderId]
+      )).resolves.toBeDefined();
+      await blocker.query('commit');
+      blocker.release();
+      blockerReleased = true;
+
+      const [claimResult] = await Promise.all([claim, fulfillment]);
+      expect(claimResult).toMatchObject({ claimed: true, changed: true });
+
+      const [storedOrder] = await ownerDatabaseClient.db.select().from(orders)
+        .where(eq(orders.id, later.orderId)).limit(1);
+      const [storedGrant] = await ownerDatabaseClient.db.select().from(entitlementGrants)
+        .where(eq(entitlementGrants.orderItemId, later.orderItemId)).limit(1);
+      const [storedEntitlement] = await ownerDatabaseClient.db.select().from(entitlements)
+        .where(and(
+          eq(entitlements.userId, fixture.claimantId),
+          eq(entitlements.titleId, later.titleId)
+        )).limit(1);
+      const [fulfillmentAudit] = await ownerDatabaseClient.db.select().from(auditEvents)
+        .where(and(
+          eq(auditEvents.action, 'commerce.fulfillment_paid'),
+          eq(auditEvents.resourceId, later.orderId)
+        )).limit(1);
+      expect(storedOrder).toMatchObject({
+        status: 'paid',
+        guestIdentityId: expect.any(String),
+        purchaseEmail: fixture.claimantEmail
+      });
+      expect(storedGrant).toMatchObject({
+        userId: fixture.claimantId,
+        state: 'active',
+        stateReason: 'payment_succeeded'
+      });
+      expect(storedEntitlement).toMatchObject({ revokedAt: null });
+      expect(fulfillmentAudit?.after).toMatchObject({ ownerType: 'account' });
+      expect(messages).toEqual({
+        accountReceipts: [],
+        guestClaimPreparations: [],
+        guestReceiptsWithoutClaim: [later.orderId]
+      });
+    } finally {
+      if (!blockerReleased) await releaseBlocker(blocker).catch(() => undefined);
+      await Promise.allSettled(
+        claim === undefined ? [] : fulfillment ? [claim, fulfillment] : [claim]
+      );
+      await Promise.allSettled([fulfillmentDatabase.close(), claimDatabase.close()]);
+    }
   }, 15_000);
 
   it('keeps refund/dispute ingestion behind a finalization-shaped purchase graph', async () => {
@@ -965,8 +1328,8 @@ describe('commerce transaction lock order', () => {
     const finalizationName = `plan6b-finalization-${fixture.orderId}`;
     const disputeName = `plan6b-dispute-ingest-${fixture.orderId}`;
     const refundName = `plan6b-refund-ingest-${fixture.orderId}`;
-    const disputeDatabase = createBoundedProbeDatabase(disputeName);
-    const refundDatabase = createBoundedProbeDatabase(refundName);
+    const disputeDatabase = createBoundedProbeDatabase(disputeName, 'worker');
+    const refundDatabase = createBoundedProbeDatabase(refundName, 'worker');
     const finalization = lockPurchaseAccessGraph(fixture, finalizationName);
     let disputeIngestion: Promise<void> | undefined;
     let refundIngestion: Promise<void> | undefined;
@@ -1012,7 +1375,7 @@ describe('commerce transaction lock order', () => {
     let blockerReleased = false;
     const correctionName = `plan6b-correction-${fixture.orderId}`;
     const projectionName = `plan6b-entitlement-${fixture.orderId}`;
-    const projectionDatabase = createBoundedProbeDatabase(projectionName);
+    const projectionDatabase = createBoundedProbeDatabase(projectionName, 'worker');
     const correction = lockPurchaseAccessGraph(fixture, correctionName);
     let projection: Promise<void> | undefined;
     void correction.catch(() => undefined);

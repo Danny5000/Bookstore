@@ -828,17 +828,9 @@ async function lockReplayGraph(
 
   await lockOrder(transaction, routing.orderId);
   const orderRows = await rows(transaction, sql`
-    select id, status, initiating_user_id as "initiatingUserId",
-      guest_identity_id as "guestIdentityId", purchase_email as "purchaseEmail",
-      currency, subtotal_minor as "subtotalMinor", tax_minor as "taxMinor",
-      total_minor as "totalMinor", client_checkout_attempt_id as "clientCheckoutAttemptId",
-      quote_fingerprint_sha256 as "quoteFingerprintSha256",
-      stripe_checkout_session_id as "stripeCheckoutSessionId",
-      status_token_sha256 as "statusTokenSha256",
-      checkout_expires_at as "checkoutExpiresAt", paid_at as "paidAt",
-      created_at as "createdAt", updated_at as "updatedAt"
+    select id, status, currency, total_minor as "totalMinor", paid_at as "paidAt"
     from orders where id = ${routing.orderId} for update
-  `) as OrderRow[];
+  `) as Array<Pick<OrderRow, 'id' | 'status' | 'currency' | 'totalMinor' | 'paidAt'>>;
   const paymentRows = await rows(transaction, sql`
     select id, order_id as "orderId",
       stripe_payment_intent_id as "stripePaymentIntentId",

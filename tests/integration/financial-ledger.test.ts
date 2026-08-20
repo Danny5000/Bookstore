@@ -17,7 +17,11 @@ import {
   stripeBalanceTransactionFeeDetails,
   stripeBalanceTransactions
 } from '$lib/server/db/schema';
-import { databaseClient } from './database';
+import {
+  ownerDatabaseClient,
+  workerDatabaseClient,
+  workerDatabaseClient as databaseClient
+} from './database';
 
 function snapshot(overrides: Partial<BalanceTransactionSnapshot> = {}): BalanceTransactionSnapshot {
   const suffix = randomUUID();
@@ -48,7 +52,7 @@ function snapshot(overrides: Partial<BalanceTransactionSnapshot> = {}): BalanceT
 }
 
 async function expectHistoryGuard(statement: string, values: unknown[] = []): Promise<void> {
-  await expect(databaseClient.pool.query(statement, values)).rejects.toMatchObject({ code: '55000' });
+  await expect(ownerDatabaseClient.pool.query(statement, values)).rejects.toMatchObject({ code: '55000' });
 }
 
 function postgresLeaf(error: unknown): unknown {
@@ -65,6 +69,61 @@ function postgresLeaf(error: unknown): unknown {
 
 function systemActor() {
   return { type: 'system' as const, id: 'financial-worker' };
+}
+
+async function installRejectingAuditTrigger(functionName: string, triggerName: string): Promise<void> {
+  await ownerDatabaseClient.db.execute(sql.raw(
+    `create function ${functionName}() returns trigger language plpgsql as $$ begin raise exception 'forced audit failure'; end; $$`
+  ));
+  await ownerDatabaseClient.db.execute(sql.raw(
+    `create trigger ${triggerName} before insert on audit_events for each row execute function ${functionName}()`
+  ));
+}
+
+async function removeRejectingAuditTrigger(functionName: string, triggerName: string): Promise<void> {
+  await ownerDatabaseClient.db.execute(sql.raw(`drop trigger if exists ${triggerName} on audit_events`));
+  await ownerDatabaseClient.db.execute(sql.raw(`drop function if exists ${functionName}()`));
+}
+
+async function seedMutableIssueSubject(
+  resourceType: 'payment' | 'refund' | 'dispute'
+): Promise<string> {
+  const orderId = randomUUID();
+  const paymentId = randomUUID();
+  const suffix = randomUUID();
+  await ownerDatabaseClient.pool.query(
+    `insert into orders
+       (id, currency, subtotal_minor, client_checkout_attempt_id,
+        quote_fingerprint_sha256, status_token_sha256)
+     values ($1, 'USD', 100, $2, $3, $3)`,
+    [orderId, randomUUID(), 'a'.repeat(64)]
+  );
+  await ownerDatabaseClient.pool.query(
+    `insert into payments
+       (id, order_id, stripe_payment_intent_id, amount_minor, currency)
+     values ($1, $2, $3, 100, 'USD')`,
+    [paymentId, orderId, `pi_issue_subject_${suffix}`]
+  );
+  if (resourceType === 'payment') return paymentId;
+
+  const resourceId = randomUUID();
+  if (resourceType === 'refund') {
+    await ownerDatabaseClient.pool.query(
+      `insert into refunds
+         (id, payment_id, stripe_refund_id, amount_minor, currency, provider_created_at)
+       values ($1, $2, $3, 50, 'USD', now())`,
+      [resourceId, paymentId, `re_issue_subject_${suffix}`]
+    );
+    return resourceId;
+  }
+  await ownerDatabaseClient.pool.query(
+    `insert into disputes
+       (id, payment_id, stripe_dispute_id, amount_minor, currency,
+        provider_created_at, provider_updated_at)
+     values ($1, $2, $3, 50, 'USD', now(), now())`,
+    [resourceId, paymentId, `dp_issue_subject_${suffix}`]
+  );
+  return resourceId;
 }
 
 describe('financial balance-transaction ledger', () => {
@@ -243,8 +302,9 @@ describe('financial balance-transaction ledger', () => {
       .orderBy(asc(stripeBalanceTransactionFeeDetails.ordinal));
     const [classification] = await databaseClient.db.select().from(financialClassificationVersions);
     await databaseClient.db.transaction((tx) => observeFinancialIssue(tx, {
-      resourceType: 'balance_transaction', resourceId: staged.balanceTransactionId, safeCode: 'missing_source',
-      impact: 'pending', actor: systemActor(), correlationId: 'ledger-guard-issue'
+      resourceType: 'balance_transaction', resourceId: staged.balanceTransactionId,
+      safeCode: 'immutable_mismatch', impact: 'exception', actor: systemActor(),
+      correlationId: 'ledger-guard-issue'
     }));
     const [issue] = await databaseClient.db.select().from(financialReconciliationIssues);
 
@@ -260,22 +320,24 @@ describe('financial balance-transaction ledger', () => {
       'update financial_reconciliation_issues set state = \'resolved\', resolved_at = now() where id = $1',
       [issue!.id]
     );
-    await expectHistoryGuard('update financial_reconciliation_issues set impact = \'exception\' where id = $1', [issue!.id]);
-    const secondResourceId = randomUUID();
+    await expectHistoryGuard('update financial_reconciliation_issues set impact = \'pending\' where id = $1', [issue!.id]);
+    const secondResourceId = staged.balanceTransactionId;
     await databaseClient.db.transaction((tx) => observeFinancialIssue(tx, {
-      resourceType: 'financial_scan_run', resourceId: secondResourceId, safeCode: 'missing_source',
-      impact: 'pending', actor: systemActor(), correlationId: 'ledger-second-guard-issue'
+      resourceType: 'balance_transaction', resourceId: secondResourceId,
+      safeCode: 'classification_fork', impact: 'exception', actor: systemActor(),
+      correlationId: 'ledger-second-guard-issue'
     }));
     const [secondIssue] = await databaseClient.db.select().from(financialReconciliationIssues)
-      .where(eq(financialReconciliationIssues.resourceId, secondResourceId));
+      .where(eq(financialReconciliationIssues.safeCode, 'classification_fork'));
     let crossIssueError: unknown;
     try {
-      await databaseClient.db.transaction(async (tx) => {
+      await workerDatabaseClient.db.transaction(async (tx) => {
         await resolveFinancialIssueAfterRecompute(tx, {
-          resourceType: 'balance_transaction', resourceId: staged.balanceTransactionId, safeCode: 'missing_source',
+          resourceType: 'balance_transaction', resourceId: staged.balanceTransactionId,
+          safeCode: 'immutable_mismatch',
           proof: {
             status: 'resolved', resourceType: 'balance_transaction', resourceId: staged.balanceTransactionId,
-            safeCode: 'missing_source'
+            safeCode: 'immutable_mismatch'
           },
           actor: systemActor(), correlationId: 'ledger-cross-issue-resolution'
         });
@@ -291,11 +353,12 @@ describe('financial balance-transaction ledger', () => {
     expect(postgresLeaf(crossIssueError)).toMatchObject({ code: '55000' });
     expect(await databaseClient.db.select().from(financialReconciliationIssues)
       .where(eq(financialReconciliationIssues.state, 'resolved'))).toHaveLength(0);
-    await databaseClient.db.transaction((tx) => resolveFinancialIssueAfterRecompute(tx, {
-      resourceType: 'balance_transaction', resourceId: staged.balanceTransactionId, safeCode: 'missing_source',
+    await workerDatabaseClient.db.transaction((tx) => resolveFinancialIssueAfterRecompute(tx, {
+      resourceType: 'balance_transaction', resourceId: staged.balanceTransactionId,
+      safeCode: 'immutable_mismatch',
       proof: {
         status: 'resolved', resourceType: 'balance_transaction', resourceId: staged.balanceTransactionId,
-        safeCode: 'missing_source'
+        safeCode: 'immutable_mismatch'
       },
       actor: systemActor(), correlationId: 'ledger-guard-resolution'
     }));
@@ -303,6 +366,89 @@ describe('financial balance-transaction ledger', () => {
       'update financial_reconciliation_issues set resolved_at = resolved_at + interval \'1 second\' where id = $1',
       [issue!.id]
     );
+  });
+
+  it('rejects a legal issue pair with the wrong impact', async () => {
+    const staged = await stageBalanceTransaction(databaseClient.db, snapshot(), {
+      correlationId: 'ledger-invalid-impact-stage'
+    });
+
+    await expect(databaseClient.pool.query(
+      `insert into financial_reconciliation_issues
+         (resource_type, resource_id, safe_code, impact, correlation_id)
+       values ('balance_transaction', $1, 'immutable_mismatch', 'pending', $2)`,
+      [staged.balanceTransactionId, 'ledger-invalid-impact']
+    )).rejects.toMatchObject({ code: '23514' });
+  });
+
+  it('rejects an issue whose polymorphic resource does not exist', async () => {
+    await expect(databaseClient.pool.query(
+      `insert into financial_reconciliation_issues
+         (resource_type, resource_id, safe_code, impact, correlation_id)
+       values ('payment', $1, 'missing_source', 'pending', $2)`,
+      [randomUUID(), 'ledger-orphan-issue']
+    )).rejects.toMatchObject({ code: '23503' });
+  });
+
+  it.each(['payment', 'refund', 'dispute'] as const)(
+    'keeps a referenced %s issue subject from being deleted or reidentified',
+    async (resourceType) => {
+      const resourceId = await seedMutableIssueSubject(resourceType);
+      await databaseClient.pool.query(
+        `insert into financial_reconciliation_issues
+           (resource_type, resource_id, safe_code, impact, correlation_id)
+         values ($1, $2, 'missing_source', 'pending', $3)`,
+        [resourceType, resourceId, `ledger-${resourceType}-subject-guard`]
+      );
+
+      await expect(ownerDatabaseClient.pool.query(
+        `update ${resourceType === 'payment' ? 'payments' : `${resourceType}s`}
+         set id = $1 where id = $2`,
+        [randomUUID(), resourceId]
+      )).rejects.toMatchObject({ code: '55000' });
+      await expect(ownerDatabaseClient.pool.query(
+        `delete from ${resourceType === 'payment' ? 'payments' : `${resourceType}s`}
+         where id = $1`,
+        [resourceId]
+      )).rejects.toMatchObject({ code: '55000' });
+    }
+  );
+
+  it('rejects an unsupported-category issue for a known classification', async () => {
+    await stageBalanceTransaction(databaseClient.db, snapshot(), {
+      correlationId: 'ledger-known-classification-stage'
+    });
+    const [known] = await databaseClient.db.select().from(financialClassificationVersions)
+      .where(eq(financialClassificationVersions.subjectType, 'balance_transaction'));
+
+    await expect(databaseClient.pool.query(
+      `insert into financial_reconciliation_issues
+         (resource_type, resource_id, safe_code, impact, correlation_id)
+       values ('financial_classification', $1, 'unsupported_category', 'exception', $2)`,
+      [known!.id, 'ledger-known-classification-issue']
+    )).rejects.toMatchObject({ code: '23514' });
+  });
+
+  it('requires every unknown classification to gain its permanent issue before commit', async () => {
+    const staged = await stageBalanceTransaction(databaseClient.db, snapshot(), {
+      correlationId: 'ledger-missing-unknown-issue-stage'
+    });
+    const [parent] = await databaseClient.db.select().from(stripeBalanceTransactions)
+      .where(eq(stripeBalanceTransactions.id, staged.balanceTransactionId));
+    const client = await databaseClient.pool.connect();
+    try {
+      await client.query('begin');
+      await client.query(
+        `insert into financial_classification_versions
+           (subject_type, subject_id, classifier_version, classification, source_fingerprint_sha256)
+         values ('balance_transaction', $1, 2, 'unknown', $2)`,
+        [staged.balanceTransactionId, parent!.fingerprintSha256]
+      );
+      await expect(client.query('commit')).rejects.toMatchObject({ code: '23514' });
+    } finally {
+      await client.query('rollback');
+      client.release();
+    }
   });
 
   it('serializes classification identities, retains versions, and rejects a fork', async () => {
@@ -333,7 +479,8 @@ describe('financial balance-transaction ledger', () => {
     const staged = await stageBalanceTransaction(databaseClient.db, source, { correlationId: 'ledger-issue-resource' });
     const open = {
       resourceType: 'balance_transaction' as const, resourceId: staged.balanceTransactionId,
-      safeCode: 'missing_source' as const, impact: 'pending' as const, actor: systemActor(), correlationId: 'ledger-issue-open'
+      safeCode: 'immutable_mismatch' as const, impact: 'exception' as const,
+      actor: systemActor(), correlationId: 'ledger-issue-open'
     };
     await databaseClient.db.transaction((tx) => observeFinancialIssue(tx, open));
     await databaseClient.db.transaction((tx) => observeFinancialIssue(tx, { ...open, correlationId: 'ledger-issue-repeat' }));
@@ -342,8 +489,8 @@ describe('financial balance-transaction ledger', () => {
       resourceType: open.resourceType, resourceId: open.resourceId, safeCode: open.safeCode,
       actor: open.actor, proof
     };
-    await databaseClient.db.transaction((tx) => resolveFinancialIssueAfterRecompute(tx, { ...resolution, correlationId: 'ledger-issue-resolve' }));
-    await databaseClient.db.transaction((tx) => resolveFinancialIssueAfterRecompute(tx, { ...resolution, correlationId: 'ledger-issue-resolve-repeat' }));
+    await workerDatabaseClient.db.transaction((tx) => resolveFinancialIssueAfterRecompute(tx, { ...resolution, correlationId: 'ledger-issue-resolve' }));
+    await workerDatabaseClient.db.transaction((tx) => resolveFinancialIssueAfterRecompute(tx, { ...resolution, correlationId: 'ledger-issue-resolve-repeat' }));
     await databaseClient.db.transaction((tx) => observeFinancialIssue(tx, { ...open, correlationId: 'ledger-issue-reopen' }));
 
     const issues = await databaseClient.db.select().from(financialReconciliationIssues)
@@ -373,182 +520,92 @@ describe('financial balance-transaction ledger', () => {
     expect(events.some((entry) => entry.action === 'financial.classification.appended')).toBe(true);
   });
 
-  it('makes the SQL resolver the sole audited transition and rejects direct resolution bypasses', async () => {
-    const resourceId = randomUUID();
+  it('makes the worker role the sole audited transition and rejects runtime-role bypasses', async () => {
+    const staged = await stageBalanceTransaction(databaseClient.db, snapshot(), {
+      correlationId: 'ledger-direct-resolver-stage'
+    });
+    const resourceId = staged.balanceTransactionId;
     await databaseClient.db.transaction((tx) => observeFinancialIssue(tx, {
-      resourceType: 'financial_scan_run', resourceId, safeCode: 'missing_source', impact: 'pending',
+      resourceType: 'balance_transaction', resourceId, safeCode: 'immutable_mismatch',
+      impact: 'exception',
       actor: systemActor(), correlationId: 'ledger-direct-resolver-open'
     }));
     const [issue] = await databaseClient.db.select().from(financialReconciliationIssues)
       .where(eq(financialReconciliationIssues.resourceId, resourceId));
 
-    await expect(databaseClient.pool.query(
-      `select * from "public"."resolve_financial_reconciliation_issue"($1, $2, $3, $4, $5)`,
-      [issue!.id, null, 'system', 'x'.repeat(101), 'ledger-direct-resolver']
-    )).rejects.toMatchObject({ code: '22023' });
-    await expect(databaseClient.pool.query(
-      `select * from "public"."resolve_financial_reconciliation_issue"($1, $2, $3, $4, $5)`,
-      [issue!.id, null, 'system', 'direct-financial-test', '']
+    await expect(workerDatabaseClient.pool.query(
+      `select * from "public"."resolve_financial_issue_after_worker_recompute"($1, $2)`,
+      [issue!.id, '']
     )).rejects.toMatchObject({ code: '22023' });
 
-    const resolved = await databaseClient.pool.query<{
-      id: string;
-      state: string;
-      resolved_by_admin_id: string | null;
-    }>(
-      `select * from "public"."resolve_financial_reconciliation_issue"($1, $2, $3, $4, $5)`,
-      [issue!.id, null, 'system', 'direct-financial-test', 'ledger-direct-resolver']
-    );
-    expect(resolved.rows).toEqual([
-      expect.objectContaining({ id: issue!.id, state: 'resolved', resolved_by_admin_id: null })
-    ]);
-    const resolvedAudits = await databaseClient.db.select().from(auditEvents)
-      .where(eq(auditEvents.action, 'financial.issue.resolved'));
-    expect(resolvedAudits).toEqual([
-      expect.objectContaining({
-        actorType: 'system', actorId: 'direct-financial-test', resourceType: 'financial_issue',
-        resourceId: issue!.id, correlationId: 'ledger-direct-resolver',
-        after: {
-          resourceType: 'financial_scan_run', resourceId, safeCode: 'missing_source',
-          impact: 'pending', state: 'resolved', occurrenceCount: 1
-        }
-      })
-    ]);
-
-    const bypassResourceId = randomUUID();
-    await databaseClient.db.transaction((tx) => observeFinancialIssue(tx, {
-      resourceType: 'financial_scan_run', resourceId: bypassResourceId,
-      safeCode: 'missing_source', impact: 'pending', actor: systemActor(),
-      correlationId: 'ledger-bypass-open'
-    }));
-    const [bypassIssue] = await databaseClient.db.select().from(financialReconciliationIssues)
-      .where(eq(financialReconciliationIssues.resourceId, bypassResourceId));
-    const client = await databaseClient.pool.connect();
+    const client = await ownerDatabaseClient.pool.connect();
     try {
       await client.query('begin');
+      await client.query('set local role "pale_orbit_runtime"');
+      await client.query('savepoint rejected_runtime_resolver');
+      await expect(client.query(
+        `select * from "public"."resolve_financial_issue_after_worker_recompute"($1, $2)`,
+        [issue!.id, 'ledger-runtime-resolver']
+      )).rejects.toMatchObject({ code: '42501' });
+      await client.query('rollback to savepoint rejected_runtime_resolver');
       await client.query(
-        `select set_config('pale_orbit.financial_issue_resolution', $1, true)`,
-        [bypassIssue!.id]
+        `select set_config('pale_orbit.financial_worker_issue_resolution', $1, true)`,
+        [issue!.id]
       );
       await expect(client.query(
-        `update financial_reconciliation_issues
+       `update financial_reconciliation_issues
          set state = 'resolved', resolved_at = clock_timestamp()
          where id = $1`,
-        [bypassIssue!.id]
-      )).rejects.toMatchObject({ code: '55000' });
-      await client.query('rollback');
+        [issue!.id]
+      )).rejects.toMatchObject({ code: '42501' });
     } finally {
+      await client.query('rollback');
       client.release();
     }
     expect(await databaseClient.db.select().from(financialReconciliationIssues)
-      .where(eq(financialReconciliationIssues.id, bypassIssue!.id)))
+      .where(eq(financialReconciliationIssues.id, issue!.id)))
       .toEqual([expect.objectContaining({ state: 'open' })]);
+
+    const worker = await workerDatabaseClient.pool.connect();
+    let resolved: { rows: Array<{ id: string; state: string; resolved_by_admin_id: string | null }> };
+    try {
+      await worker.query('begin');
+      resolved = await worker.query(
+        `select * from "public"."resolve_financial_issue_after_worker_recompute"($1, $2)`,
+        [issue!.id, 'ledger-worker-resolver']
+      );
+      await worker.query('commit');
+    } finally {
+      worker.release();
+    }
+    expect(resolved!.rows).toEqual([
+      expect.objectContaining({ id: issue!.id, state: 'resolved', resolved_by_admin_id: null })
+    ]);
+    expect(await databaseClient.db.select().from(auditEvents)
+      .where(eq(auditEvents.action, 'financial.issue.resolved'))).toEqual([
+      expect.objectContaining({
+        actorType: 'system', actorId: 'financial-worker', resourceType: 'financial_issue',
+        resourceId: issue!.id, correlationId: 'ledger-worker-resolver',
+        after: {
+          resourceType: 'balance_transaction', resourceId, safeCode: 'immutable_mismatch',
+          impact: 'exception', state: 'resolved', occurrenceCount: 1
+        }
+      })
+    ]);
+    const oldResolver = await databaseClient.pool.query<{ resolver: string | null }>(
+      `select to_regprocedure(
+        'public.resolve_financial_reconciliation_issue(uuid,uuid,audit_actor_type,text,text)'
+      )::text as resolver`
+    );
+    expect(oldResolver.rows[0]?.resolver).toBeNull();
     await expect(databaseClient.pool.query(
       `insert into financial_reconciliation_issues
        (resource_type, resource_id, safe_code, state, impact, occurrence_count,
         correlation_id, resolved_at)
-       values ('financial_scan_run', $1, 'missing_source', 'resolved', 'pending', 1, $2,
+       values ('payment', $1, 'missing_source', 'resolved', 'pending', 1, $2,
          clock_timestamp())`,
       [randomUUID(), 'ledger-resolved-insert-bypass']
     )).rejects.toMatchObject({ code: '55000' });
-  });
-
-  it('requires a persisted administrator role for direct user resolution and audits a valid admin', async () => {
-    async function createUser(role: 'customer' | 'admin' | null): Promise<string> {
-      const id = randomUUID();
-      await databaseClient.pool.query(
-        `insert into "user" (id, name, email, email_verified)
-         values ($1, $2, $3, true)`,
-        [id, `Financial ${role ?? 'Roleless'}`, `financial-${id}@example.com`]
-      );
-      if (role) {
-        await databaseClient.pool.query(
-          `insert into user_roles (user_id, role) values ($1, $2)`,
-          [id, role]
-        );
-      }
-      return id;
-    }
-
-    async function openIssue(label: string): Promise<{ issueId: string; resourceId: string }> {
-      const resourceId = randomUUID();
-      await databaseClient.db.transaction((tx) => observeFinancialIssue(tx, {
-        resourceType: 'financial_scan_run', resourceId, safeCode: 'missing_source',
-        impact: 'pending', actor: systemActor(), correlationId: `${label}-open`
-      }));
-      const [issue] = await databaseClient.db.select().from(financialReconciliationIssues)
-        .where(eq(financialReconciliationIssues.resourceId, resourceId));
-      return { issueId: issue!.id, resourceId };
-    }
-
-    async function rejectedUserResolution(
-      issueId: string,
-      userId: string,
-      correlationId: string
-    ): Promise<unknown> {
-      const client = await databaseClient.pool.connect();
-      try {
-        await client.query('begin');
-        let error: unknown;
-        try {
-          await client.query(
-            `select * from "public"."resolve_financial_reconciliation_issue"($1, $2, $3, $4, $5)`,
-            [issueId, userId, 'user', userId, correlationId]
-          );
-        } catch (candidate) {
-          error = candidate;
-        }
-        await client.query('rollback');
-        return error;
-      } finally {
-        client.release();
-      }
-    }
-
-    const customerId = await createUser('customer');
-    const rolelessId = await createUser(null);
-    const adminId = await createUser('admin');
-    const customerIssue = await openIssue('ledger-customer-resolver');
-    const rolelessIssue = await openIssue('ledger-roleless-resolver');
-    const adminIssue = await openIssue('ledger-admin-resolver');
-
-    expect(await rejectedUserResolution(
-      customerIssue.issueId, customerId, 'ledger-customer-resolver'
-    )).toMatchObject({ code: '22023' });
-    expect(await rejectedUserResolution(
-      rolelessIssue.issueId, rolelessId, 'ledger-roleless-resolver'
-    )).toMatchObject({ code: '22023' });
-
-    const resolved = await databaseClient.pool.query<{
-      id: string;
-      state: string;
-      resolved_by_admin_id: string | null;
-    }>(
-      `select * from "public"."resolve_financial_reconciliation_issue"($1, $2, $3, $4, $5)`,
-      [adminIssue.issueId, adminId, 'user', adminId, 'ledger-admin-resolver']
-    );
-    expect(resolved.rows).toEqual([
-      expect.objectContaining({
-        id: adminIssue.issueId, state: 'resolved', resolved_by_admin_id: adminId
-      })
-    ]);
-    expect(await databaseClient.db.select().from(financialReconciliationIssues)
-      .where(eq(financialReconciliationIssues.id, customerIssue.issueId)))
-      .toEqual([expect.objectContaining({ state: 'open', resolvedAt: null })]);
-    expect(await databaseClient.db.select().from(financialReconciliationIssues)
-      .where(eq(financialReconciliationIssues.id, rolelessIssue.issueId)))
-      .toEqual([expect.objectContaining({ state: 'open', resolvedAt: null })]);
-    expect(await databaseClient.db.select().from(auditEvents)
-      .where(eq(auditEvents.action, 'financial.issue.resolved'))).toEqual([
-      expect.objectContaining({
-        actorType: 'user', actorId: adminId, resourceType: 'financial_issue',
-        resourceId: adminIssue.issueId, correlationId: 'ledger-admin-resolver',
-        after: {
-          resourceType: 'financial_scan_run', resourceId: adminIssue.resourceId,
-          safeCode: 'missing_source', impact: 'pending', state: 'resolved', occurrenceCount: 1
-        }
-      })
-    ]);
   });
 
   it('does not prime resolution authorization for an absent or immutable issue', async () => {
@@ -561,28 +618,28 @@ describe('financial balance-transaction ledger', () => {
       correlationId: 'ledger-authorization-probe-stage'
     });
     const [immutableIssue] = await databaseClient.db.select().from(financialReconciliationIssues);
-    const client = await databaseClient.pool.connect();
+    const client = await workerDatabaseClient.pool.connect();
     try {
       await client.query('begin');
       const absent = await client.query(
-        `select * from "public"."resolve_financial_reconciliation_issue"($1, $2, $3, $4, $5)`,
-        [randomUUID(), null, 'system', 'authorization-probe', 'ledger-absent-resolver']
+        `select * from "public"."resolve_financial_issue_after_worker_recompute"($1, $2)`,
+        [randomUUID(), 'ledger-absent-resolver']
       );
       expect(absent.rows).toEqual([]);
       const absentAuthorization = await client.query<{ authorization: string | null }>(
-        `select nullif(current_setting('pale_orbit.financial_issue_resolution', true), '')
+        `select nullif(current_setting('pale_orbit.financial_worker_issue_resolution', true), '')
            as authorization`
       );
       expect(absentAuthorization.rows[0]?.authorization).toBeNull();
 
       await client.query('savepoint immutable_resolution');
       await expect(client.query(
-        `select * from "public"."resolve_financial_reconciliation_issue"($1, $2, $3, $4, $5)`,
-        [immutableIssue!.id, null, 'system', 'authorization-probe', 'ledger-immutable-resolver']
+        `select * from "public"."resolve_financial_issue_after_worker_recompute"($1, $2)`,
+        [immutableIssue!.id, 'ledger-immutable-resolver']
       )).rejects.toMatchObject({ code: '55000' });
       await client.query('rollback to savepoint immutable_resolution');
       const immutableAuthorization = await client.query<{ authorization: string | null }>(
-        `select nullif(current_setting('pale_orbit.financial_issue_resolution', true), '')
+        `select nullif(current_setting('pale_orbit.financial_worker_issue_resolution', true), '')
            as authorization`
       );
       expect(immutableAuthorization.rows[0]?.authorization).toBeNull();
@@ -599,63 +656,59 @@ describe('financial balance-transaction ledger', () => {
     const [parent] = await databaseClient.db.select().from(stripeBalanceTransactions);
     const triggerName = `ledger_audit_fail_${randomUUID().replaceAll('-', '')}`;
     const functionName = `${triggerName}_fn`;
-    await expect(databaseClient.db.transaction(async (tx) => {
-      await tx.execute(sql.raw(`create function ${functionName}() returns trigger language plpgsql as $$ begin raise exception 'forced audit failure'; end; $$`));
-      await tx.execute(sql.raw(`create trigger ${triggerName} before insert on audit_events for each row execute function ${functionName}()`));
-      await appendClassificationDecisionLocked(tx, {
+    await installRejectingAuditTrigger(functionName, triggerName);
+    try {
+      await expect(databaseClient.db.transaction((tx) => appendClassificationDecisionLocked(tx, {
         subjectType: 'balance_transaction', subjectId: staged.balanceTransactionId, classifierVersion: 2,
         sourceFingerprint: parent!.fingerprintSha256,
         decision: { status: 'classified', classification: 'charge', impact: 'informational' }, correlationId: 'ledger-audit-rollback-classification'
-      });
-    })).rejects.toThrow();
+      }))).rejects.toThrow();
+    } finally {
+      await removeRejectingAuditTrigger(functionName, triggerName);
+    }
     expect((await databaseClient.db.select().from(financialClassificationVersions)).filter((entry) => entry.classifierVersion === 2)).toHaveLength(0);
 
-    const resourceId = randomUUID();
-    await expect(databaseClient.db.transaction(async (tx) => {
-      await tx.execute(sql.raw(`create function ${functionName}() returns trigger language plpgsql as $$ begin raise exception 'forced audit failure'; end; $$`));
-      await tx.execute(sql.raw(`create trigger ${triggerName} before insert on audit_events for each row execute function ${functionName}()`));
-      await observeFinancialIssue(tx, {
-        resourceType: 'financial_scan_run', resourceId, safeCode: 'missing_source', impact: 'pending',
+    const resourceId = staged.balanceTransactionId;
+    await installRejectingAuditTrigger(functionName, triggerName);
+    try {
+      await expect(databaseClient.db.transaction((tx) => observeFinancialIssue(tx, {
+        resourceType: 'balance_transaction', resourceId, safeCode: 'immutable_mismatch',
+        impact: 'exception',
         actor: systemActor(), correlationId: 'ledger-audit-rollback-issue'
-      });
-    })).rejects.toThrow();
+      }))).rejects.toThrow();
+    } finally {
+      await removeRejectingAuditTrigger(functionName, triggerName);
+    }
     expect(await databaseClient.db.select().from(financialReconciliationIssues)
       .where(eq(financialReconciliationIssues.resourceId, resourceId))).toHaveLength(0);
 
-    const resolutionResourceId = randomUUID();
+    const resolutionResourceId = staged.balanceTransactionId;
     await databaseClient.db.transaction((tx) => observeFinancialIssue(tx, {
-      resourceType: 'financial_scan_run', resourceId: resolutionResourceId,
-      safeCode: 'missing_source', impact: 'pending', actor: systemActor(),
+      resourceType: 'balance_transaction', resourceId: resolutionResourceId,
+      safeCode: 'classification_fork', impact: 'exception', actor: systemActor(),
       correlationId: 'ledger-audit-rollback-resolution-open'
     }));
     const [resolutionIssue] = await databaseClient.db.select().from(financialReconciliationIssues)
-      .where(eq(financialReconciliationIssues.resourceId, resolutionResourceId));
-    await databaseClient.db.execute(sql.raw(
-      `create function ${functionName}() returns trigger language plpgsql as $$ begin raise exception 'forced audit failure'; end; $$`
-    ));
-    await databaseClient.db.execute(sql.raw(
-      `create trigger ${triggerName} before insert on audit_events for each row execute function ${functionName}()`
-    ));
-    const client = await databaseClient.pool.connect();
+      .where(eq(financialReconciliationIssues.safeCode, 'classification_fork'));
+    await installRejectingAuditTrigger(functionName, triggerName);
+    const client = await workerDatabaseClient.pool.connect();
     try {
       await client.query('begin');
       await client.query('savepoint rejected_resolution');
       await expect(client.query(
-        `select * from "public"."resolve_financial_reconciliation_issue"($1, $2, $3, $4, $5)`,
-        [resolutionIssue!.id, null, 'system', 'financial-worker',
-          'ledger-audit-rollback-resolution']
+        `select * from "public"."resolve_financial_issue_after_worker_recompute"($1, $2)`,
+        [resolutionIssue!.id, 'ledger-audit-rollback-resolution']
       )).rejects.toThrow('forced audit failure');
       await client.query('rollback to savepoint rejected_resolution');
       const authorization = await client.query<{ authorization: string | null }>(
-        `select nullif(current_setting('pale_orbit.financial_issue_resolution', true), '')
+        `select nullif(current_setting('pale_orbit.financial_worker_issue_resolution', true), '')
            as authorization`
       );
       expect(authorization.rows[0]?.authorization).toBeNull();
       await client.query('commit');
     } finally {
       client.release();
-      await databaseClient.db.execute(sql.raw(`drop trigger ${triggerName} on audit_events`));
-      await databaseClient.db.execute(sql.raw(`drop function ${functionName}()`));
+      await removeRejectingAuditTrigger(functionName, triggerName);
     }
     expect(await databaseClient.db.select().from(financialReconciliationIssues)
       .where(eq(financialReconciliationIssues.id, resolutionIssue!.id)))
@@ -680,13 +733,12 @@ describe('financial balance-transaction ledger', () => {
     expect(issues).toHaveLength(1);
     expect(issues[0]).toMatchObject({ resourceType: 'financial_classification',
       resourceId: unknown!.id, safeCode: 'unsupported_category', impact: 'exception' });
-    await expect(databaseClient.db.execute(sql`
-      select * from "public"."resolve_financial_reconciliation_issue"(
-        ${issues[0]!.id}, ${null}::uuid, 'system', 'financial-worker',
-        'ledger-unknown-direct-resolve'
+    await expect(workerDatabaseClient.db.execute(sql`
+      select * from "public"."resolve_financial_issue_after_worker_recompute"(
+        ${issues[0]!.id}, 'ledger-unknown-direct-resolve'
       )
     `)).rejects.toMatchObject({ cause: { code: '55000' } });
-    const client = await databaseClient.pool.connect();
+    const client = await ownerDatabaseClient.pool.connect();
     try {
       await client.query('begin');
       await client.query(`set local session_replication_role = replica`);

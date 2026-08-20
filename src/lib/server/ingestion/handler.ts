@@ -427,6 +427,7 @@ export function createRevisionIngestionHandler(
               sourceKey: originalKey,
               titleId: candidate.titleId,
               revisionId: candidate.id,
+              generation: candidate.generation,
               limits,
               signal
             })
@@ -438,6 +439,7 @@ export function createRevisionIngestionHandler(
               sourceKey: originalKey,
               titleId: candidate.titleId,
               revisionId: candidate.id,
+              generation: candidate.generation,
               limits,
               signal
             })

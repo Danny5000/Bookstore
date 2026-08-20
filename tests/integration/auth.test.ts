@@ -19,6 +19,7 @@ import {
 import { loadApplicationConfig } from '$lib/server/config/load';
 import {
   account,
+  commerceClaimIssuances,
   credentialAuthority,
   jobs,
   outboxMessages,
@@ -29,7 +30,7 @@ import {
 } from '$lib/server/db/schema';
 import { queueAuthEmail } from '$lib/server/email/enqueue';
 import { authEmailPayloadSchema, type AuthEmailPayload } from '$lib/server/email/payload';
-import { databaseClient } from './database';
+import { databaseClient, ownerDatabaseClient } from './database';
 
 const config = loadApplicationConfig(process.env);
 const password = 'A-secure-test-password-2026';
@@ -105,7 +106,7 @@ async function expectMagicSessionRejected(response: Response): Promise<void> {
 }
 
 async function queuedMessages(): Promise<AuthEmailPayload[]> {
-  const rows = await databaseClient.db.select().from(outboxMessages);
+  const rows = await ownerDatabaseClient.db.select().from(outboxMessages);
   return rows.map((row) => authEmailPayloadSchema.parse(row.payload));
 }
 
@@ -191,7 +192,7 @@ describe('Better Auth server', () => {
     expect(
       await databaseClient.db.select().from(session).where(eq(session.userId, registration.user.id))
     ).toHaveLength(0);
-    expect(await databaseClient.db.select().from(outboxMessages)).toEqual([
+    expect(await ownerDatabaseClient.db.select().from(outboxMessages)).toEqual([
       expect.objectContaining({ status: 'pending' })
     ]);
     expect(await databaseClient.db.select().from(verification)).toHaveLength(1);
@@ -410,21 +411,21 @@ describe('Better Auth server', () => {
     })).status).toBe(200);
   });
 
-  it('fails closed after claim-proof creation fails without preserving old credentials or sessions', async () => {
+  it('fails closed when reset-security completion fails without preserving credentials or sessions', async () => {
     const auth = createTestAuth({
       completePasswordResetSecurity: async () => {
-        throw new Error('injected claim-proof persistence failure');
+        throw new Error('injected reset-security completion failure');
       }
     });
     const { email, cookie } = await registerAndVerify(auth);
     const requested = await authRequest(auth, '/request-password-reset', {
-      body: { email, redirectTo: '/reset-password?purpose=commerce-claim' },
+      body: { email, redirectTo: '/reset-password' },
       ip: '192.0.2.44'
     });
     expect(requested.status).toBe(200);
     const resetMessage = await latestMessage('auth.password-reset', email);
     const token = new URL(resetMessage.actionUrl).pathname.split('/').at(-1);
-    if (!token) throw new Error('Expected commerce reset token');
+    if (!token) throw new Error('Expected reset token');
 
     const newPassword = 'Proof-failure-new-password-2026';
     const reset = await authRequest(auth, '/reset-password', {
@@ -444,14 +445,12 @@ describe('Better Auth server', () => {
       body: { email, password: newPassword },
       ip: '192.0.2.46'
     })).status).not.toBe(200);
-    expect((await databaseClient.db.select().from(verification)).some((row) =>
-      row.identifier.startsWith('pale-orbit:commerce-claim-authorization:')
-    )).toBe(false);
+    expect(await ownerDatabaseClient.db.select().from(commerceClaimIssuances)).toEqual([]);
 
     const recoveryAuth = createTestAuth();
     const recoveredPassword = 'Proof-failure-recovered-password-2026';
     expect((await authRequest(recoveryAuth, '/request-password-reset', {
-      body: { email, redirectTo: '/reset-password?purpose=commerce-claim' },
+      body: { email, redirectTo: '/reset-password' },
       ip: '192.0.2.47'
     })).status).toBe(200);
     const recoveryMessage = await latestMessage('auth.password-reset', email);
@@ -1043,7 +1042,7 @@ describe('Better Auth server', () => {
   }, 30_000);
 
   it.each([true, false])(
-    'rotates a pre-existing credential and session before claim recovery (verified=%s)',
+    'rotates a pre-existing credential without trusting unanchored claim metadata (verified=%s)',
     async (leaveVerified) => {
     const auth = createTestAuth();
     const email = `${randomUUID()}@example.com`;
@@ -1106,12 +1105,9 @@ describe('Better Auth server', () => {
       body: { token: resetToken, newPassword: victimPassword }
     });
     expect(reset.status).toBe(200);
-    expect(await reset.json()).toEqual({ status: true, commerceClaimReady: true });
+    expect(await reset.json()).toEqual({ status: true });
     const claimCookie = reset.headers.get('set-cookie') ?? '';
-    expect(claimCookie).toContain('pale-orbit-commerce-claim=');
-    expect(claimCookie.toLowerCase()).toContain('httponly');
-    expect(claimCookie.toLowerCase()).toContain('samesite=lax');
-    expect(claimCookie).toContain('Path=/claim/complete');
+    expect(claimCookie).not.toContain('pale-orbit-commerce-claim=');
     const staleSession = await authRequest(auth, '/get-session', { cookie: attackerCookie });
     expect(await staleSession.json()).toBeNull();
     const attackerPassword = await authRequest(auth, '/sign-in/email', {
@@ -1121,9 +1117,11 @@ describe('Better Auth server', () => {
     expect(attackerPassword.status).not.toBe(200);
 
     if (staleVerification) {
+      expect((await databaseClient.db.select({ verified: user.emailVerified }).from(user)
+        .where(eq(user.id, registeredUser.id)))[0]?.verified).toBe(false);
       const staleLink = await authRequest(auth, staleVerification.actionUrl);
       expect(staleLink.status).toBe(302);
-      expect(staleLink.headers.get('location')).toContain('error=INVALID_TOKEN');
+      expect(staleLink.headers.get('location')).not.toContain('error=INVALID_TOKEN');
       expect(staleLink.headers.get('set-cookie')).toBeNull();
     }
     expect((await databaseClient.db.select({ verified: user.emailVerified }).from(user)
@@ -1136,7 +1134,7 @@ describe('Better Auth server', () => {
     }
   );
 
-  it('preserves the server claim-readiness proof through the real Better Auth client parser', async () => {
+  it('does not manufacture claim readiness from unanchored client reset metadata', async () => {
     const auth = createTestAuth();
     const { email } = await registerAndVerify(auth);
     const requested = await authRequest(auth, '/request-password-reset', {
@@ -1167,9 +1165,9 @@ describe('Better Auth server', () => {
     });
 
     expect(result.error).toBeNull();
-    expect(result.data).toMatchObject({ status: true, commerceClaimReady: true });
+    expect(result.data).toEqual({ status: true });
     expect(captured.response?.headers.get('set-cookie') ?? '')
-      .toContain('pale-orbit-commerce-claim=');
+      .not.toContain('pale-orbit-commerce-claim=');
   });
 
   it('suppresses unsafe magic links, rate limits resends, and preserves both sign-in methods', async () => {

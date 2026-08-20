@@ -2,22 +2,61 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { sql } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
-import { databaseClient } from './database';
+import { databaseClient, ownerDatabaseClient } from './database';
 
 const guideUrl = new URL('../../docs/stripe-financial-reconciliation.md', import.meta.url);
+const restoreVerifierFragmentPrefix =
+  'insert into restore_financial_checks (check_name, violation_count)';
+
+interface DocumentedSqlBlocks {
+  all: string[];
+  restoreVerifierFragments: string[];
+  standaloneDiagnostics: string[];
+}
+
+function executableSql(block: string): string {
+  let executable = block.trimStart();
+  while (executable.startsWith('--')) {
+    const newline = executable.indexOf('\n');
+    if (newline < 0) return '';
+    executable = executable.slice(newline + 1).trimStart();
+  }
+  return executable;
+}
+
+async function documentedSqlBlocks(): Promise<DocumentedSqlBlocks> {
+  const guide = await readFile(guideUrl, 'utf8');
+  const all = [...guide.matchAll(/```sql\r?\n([\s\S]*?)\r?\n```/gu)]
+    .map((match) => match[1]!);
+  const restoreVerifierFragments = all.filter((block) =>
+    executableSql(block).startsWith(restoreVerifierFragmentPrefix)
+  );
+  const standaloneDiagnostics = all.filter((block) =>
+    !executableSql(block).startsWith(restoreVerifierFragmentPrefix)
+  );
+
+  return { all, restoreVerifierFragments, standaloneDiagnostics };
+}
 
 async function sqlBlocks(): Promise<string[]> {
-  const guide = await readFile(guideUrl, 'utf8');
-  return [...guide.matchAll(/```sql\r?\n([\s\S]*?)\r?\n```/gu)].map((match) => match[1]!);
+  return (await documentedSqlBlocks()).standaloneDiagnostics;
 }
 
 describe('financial reconciliation operations guide', () => {
-  it('keeps every documented SQL block read-only and executable against the current schema', async () => {
-    const blocks = await sqlBlocks();
-    expect(blocks).toHaveLength(7);
+  it('classifies restore fragments and keeps standalone SQL read-only and executable', async () => {
+    const { all, restoreVerifierFragments, standaloneDiagnostics } =
+      await documentedSqlBlocks();
+    expect(all).toHaveLength(11);
+    expect(standaloneDiagnostics).toHaveLength(7);
+    expect(restoreVerifierFragments).toHaveLength(4);
 
-    for (const block of blocks) {
-      expect(block.trimStart()).toMatch(/^(select|with)\b/iu);
+    for (const block of restoreVerifierFragments) {
+      expect(executableSql(block)).toMatch(
+        /^insert into restore_financial_checks \(check_name, violation_count\)/u
+      );
+    }
+    for (const block of standaloneDiagnostics) {
+      expect(executableSql(block)).toMatch(/^(select|with)\b/iu);
       expect(block).not.toMatch(/\b(insert|update|delete|truncate|alter|drop|create)\b/iu);
       await expect(databaseClient.db.execute(sql.raw(block))).resolves.toBeDefined();
     }
@@ -33,27 +72,27 @@ describe('financial reconciliation operations guide', () => {
     const checkpoint = `payment:${randomUUID()}`;
     const forgedDigest = 'a'.repeat(64);
 
-    await databaseClient.db.execute(sql`
+    await ownerDatabaseClient.db.execute(sql`
       insert into financial_scan_runs (id, root_key, kind, phase)
       values
         (${impossibleRunId}, ${`commerce.financial-scan:${impossibleHour}`}, 'hourly', 'source_page'),
         (${payoutRunId}, ${`financial:payout-impact:${payoutId}:1`}, 'payout_impact', 'payout_impact_page'),
         (${digestRunId}, 'commerce.financial-scan:initial:v1', 'initial_backfill', 'source_page')
     `);
-    await databaseClient.db.execute(sql`
+    await ownerDatabaseClient.db.execute(sql`
       update financial_scan_runs
       set checkpoint = ${checkpoint}, cursor_digest_sha256 = ${forgedDigest}
       where id = ${digestRunId}
     `);
-    await databaseClient.db.execute(sql`
+    await ownerDatabaseClient.db.execute(sql`
       update financial_scan_runs
       set classifier_version = 1, allocation_algorithm_version = 1, replay_id = 'c1-a1'
       where id = ${impossibleRunId}
     `);
-    await databaseClient.db.execute(sql`
+    await ownerDatabaseClient.db.execute(sql`
       update financial_scan_runs set phase = 'source_page' where id = ${payoutRunId}
     `);
-    await databaseClient.db.execute(sql`
+    await ownerDatabaseClient.db.execute(sql`
       insert into jobs (
         type, payload, deduplication_key, status, attempts, max_attempts, locked_at, locked_by
       ) values
@@ -92,7 +131,7 @@ describe('financial reconciliation operations guide', () => {
   it('accepts the terminal phase of a completed classification replay', async () => {
     const blocks = await sqlBlocks();
     const runId = randomUUID();
-    await databaseClient.db.execute(sql`
+    await ownerDatabaseClient.db.execute(sql`
       insert into financial_scan_runs (
         id, root_key, kind, phase, state, classifier_version,
         allocation_algorithm_version, replay_id, safe_outcome, completed_at
@@ -121,7 +160,7 @@ describe('financial reconciliation operations guide', () => {
     expect(tipQuery).toBeDefined();
 
     const balanceTransactionId = randomUUID();
-    await databaseClient.db.execute(sql`
+    await ownerDatabaseClient.db.execute(sql`
       insert into stripe_balance_transactions (
         id, provider_id, live_mode, source_family, source_id, raw_type,
         reporting_category, balance_type, amount_minor, fee_minor, net_minor,
@@ -132,7 +171,7 @@ describe('financial reconciliation operations guide', () => {
         100, 0, 100, 'USD', 'available', now(), now(), ${'a'.repeat(64)}
       )
     `);
-    await databaseClient.db.execute(sql`
+    await ownerDatabaseClient.db.execute(sql`
       insert into financial_allocation_sets (
         allocation_identity, balance_transaction_id, source_kind, source_internal_id,
         basis, scope, expected_effect_minor, currency, algorithm_version,
@@ -164,7 +203,7 @@ describe('financial reconciliation operations guide', () => {
     const balanceTransactionId = randomUUID();
     const classificationId = randomUUID();
     const fingerprint = '9'.repeat(64);
-    await databaseClient.db.execute(sql`
+    await ownerDatabaseClient.db.execute(sql`
       insert into stripe_balance_transactions (
         id, provider_id, live_mode, source_family, source_id, raw_type,
         reporting_category, balance_type, amount_minor, fee_minor, net_minor,
@@ -175,15 +214,18 @@ describe('financial reconciliation operations guide', () => {
         'USD', 'available', now(), now(), ${fingerprint}
       )
     `);
-    await databaseClient.db.execute(sql`
-      insert into financial_classification_versions (
-        id, subject_type, subject_id, classifier_version, classification,
-        source_fingerprint_sha256
-      ) values (
-        ${classificationId}, 'balance_transaction', ${balanceTransactionId}, 1,
-        'unknown', ${fingerprint}
-      )
-    `);
+    await ownerDatabaseClient.db.transaction(async (tx) => {
+      await tx.execute(sql`set local session_replication_role = replica`);
+      await tx.execute(sql`
+        insert into financial_classification_versions (
+          id, subject_type, subject_id, classifier_version, classification,
+          source_fingerprint_sha256
+        ) values (
+          ${classificationId}, 'balance_transaction', ${balanceTransactionId}, 1,
+          'unknown', ${fingerprint}
+        )
+      `);
+    });
 
     const missing = await databaseClient.db.execute<{
       check_name: string;
@@ -192,7 +234,7 @@ describe('financial reconciliation operations guide', () => {
     expect(new Map(missing.rows.map((row) => [row.check_name, Number(row.violation_count)]))
       .get('financial_unknown_classification_issue')).toBe(1);
 
-    await databaseClient.db.execute(sql`
+    await ownerDatabaseClient.db.execute(sql`
       insert into financial_reconciliation_issues (
         resource_type, resource_id, safe_code, impact, correlation_id
       ) values (
@@ -220,7 +262,7 @@ describe('financial reconciliation operations guide', () => {
     const activeSetId = randomUUID();
     const inactiveSetId = randomUUID();
     const fingerprint = '8'.repeat(64);
-    await databaseClient.db.execute(sql`
+    await ownerDatabaseClient.db.execute(sql`
       insert into stripe_balance_transactions (
         id, provider_id, live_mode, source_family, source_id, raw_type,
         reporting_category, balance_type, amount_minor, fee_minor, net_minor,
@@ -231,41 +273,43 @@ describe('financial reconciliation operations guide', () => {
         'USD', 'available', now(), now(), ${fingerprint}
       )
     `);
-    await databaseClient.db.execute(sql`
-      insert into financial_classification_versions (
-        id, subject_type, subject_id, classifier_version, classification,
-        source_fingerprint_sha256
-      ) values
-        (${activeClassificationId}, 'balance_transaction', ${balanceTransactionId}, 1,
-          'other', ${fingerprint}),
-        (${inactiveClassificationId}, 'balance_transaction', ${balanceTransactionId}, 2,
-          'unknown', ${fingerprint})
-    `);
-    await databaseClient.db.execute(sql`
-      insert into financial_allocation_sets (
-        id, allocation_identity, balance_transaction_id, source_kind,
-        source_internal_id, basis, scope, expected_effect_minor, currency,
-        algorithm_version, classifier_version, source_fingerprint_sha256,
-        supersedes_set_id
-      ) values
-        (${activeSetId}, ${`adjustment:${balanceTransactionId}:operator-active`},
-          ${balanceTransactionId}, 'adjustment', ${balanceTransactionId}, 'gross_amount',
-          'account', 1, 'USD', 1, 1, ${fingerprint}, null),
-        (${inactiveSetId}, ${`adjustment:${balanceTransactionId}:operator-inactive`},
-          ${balanceTransactionId}, 'adjustment', ${balanceTransactionId}, 'gross_amount',
-          'account', 1, 'USD', 1, 2, ${fingerprint}, ${activeSetId})
-    `);
-    await databaseClient.db.execute(sql`
-      insert into financial_reconciliation_issues (
-        resource_type, resource_id, safe_code, impact, correlation_id
-      ) values
-        ('financial_classification', ${inactiveClassificationId}, 'unsupported_category',
-          'exception', 'operator-inactive-classification'),
-        ('allocation_set', ${inactiveSetId}, 'missing_source', 'pending',
-          'operator-inactive-allocation'),
-        ('allocation_set', ${activeSetId}, 'missing_source', 'pending',
-          'operator-active-allocation')
-    `);
+    await ownerDatabaseClient.db.transaction(async (tx) => {
+      await tx.execute(sql`
+        insert into financial_classification_versions (
+          id, subject_type, subject_id, classifier_version, classification,
+          source_fingerprint_sha256
+        ) values
+          (${activeClassificationId}, 'balance_transaction', ${balanceTransactionId}, 1,
+            'other', ${fingerprint}),
+          (${inactiveClassificationId}, 'balance_transaction', ${balanceTransactionId}, 2,
+            'unknown', ${fingerprint})
+      `);
+      await tx.execute(sql`
+        insert into financial_allocation_sets (
+          id, allocation_identity, balance_transaction_id, source_kind,
+          source_internal_id, basis, scope, expected_effect_minor, currency,
+          algorithm_version, classifier_version, source_fingerprint_sha256,
+          supersedes_set_id
+        ) values
+          (${activeSetId}, ${`adjustment:${balanceTransactionId}:operator-active`},
+            ${balanceTransactionId}, 'adjustment', ${balanceTransactionId}, 'gross_amount',
+            'account', 1, 'USD', 1, 1, ${fingerprint}, null),
+          (${inactiveSetId}, ${`adjustment:${balanceTransactionId}:operator-inactive`},
+            ${balanceTransactionId}, 'adjustment', ${balanceTransactionId}, 'gross_amount',
+            'account', 1, 'USD', 1, 2, ${fingerprint}, ${activeSetId})
+      `);
+      await tx.execute(sql`
+        insert into financial_reconciliation_issues (
+          resource_type, resource_id, safe_code, impact, correlation_id
+        ) values
+          ('financial_classification', ${inactiveClassificationId}, 'unsupported_category',
+            'exception', 'operator-inactive-classification'),
+          ('allocation_set', ${inactiveSetId}, 'missing_source', 'pending',
+            'operator-inactive-allocation'),
+          ('allocation_set', ${activeSetId}, 'missing_source', 'pending',
+            'operator-active-allocation')
+      `);
+    });
 
     const result = await databaseClient.db.execute<{
       resource_id: string;
@@ -279,7 +323,7 @@ describe('financial reconciliation operations guide', () => {
 
   it('reports a completed classification replay that never reached its finalizer phase', async () => {
     const blocks = await sqlBlocks();
-    await databaseClient.db.execute(sql`
+    await ownerDatabaseClient.db.execute(sql`
       insert into financial_scan_runs (
         id, root_key, kind, phase, state, classifier_version,
         allocation_algorithm_version, replay_id, safe_outcome, completed_at
@@ -302,7 +346,7 @@ describe('financial reconciliation operations guide', () => {
   it('reports projection authority that points at no resumable replay run', async () => {
     const blocks = await sqlBlocks();
     const missingRunId = randomUUID();
-    await databaseClient.db.execute(sql`
+    await ownerDatabaseClient.db.execute(sql`
       update financial_projection_versions set
         pending_classifier_version = 7,
         pending_allocation_algorithm_version = 7,
@@ -326,7 +370,7 @@ describe('financial reconciliation operations guide', () => {
     const otherSourceId = randomUUID();
     const predecessorId = randomUUID();
     const fingerprint = 'd'.repeat(64);
-    await databaseClient.db.execute(sql`
+    await ownerDatabaseClient.db.execute(sql`
       insert into stripe_balance_transactions (
         id, provider_id, live_mode, source_family, source_id, raw_type,
         reporting_category, balance_type, amount_minor, fee_minor, net_minor,
@@ -339,7 +383,7 @@ describe('financial reconciliation operations guide', () => {
           'adjustment', null, 'adjustment', 'other_adjustment', 'adjustment',
           100, 0, 100, 'USD', 'available', now(), now(), ${'e'.repeat(64)})
     `);
-    await databaseClient.db.execute(sql`
+    await ownerDatabaseClient.db.execute(sql`
       insert into financial_classification_versions (
         subject_type, subject_id, classifier_version, classification,
         source_fingerprint_sha256
@@ -347,12 +391,12 @@ describe('financial reconciliation operations guide', () => {
         'balance_transaction', ${balanceTransactionId}, 1, 'other', ${fingerprint}
       )
     `);
-    await databaseClient.db.execute(sql.raw(
+    await ownerDatabaseClient.db.execute(sql.raw(
       'alter table financial_allocation_sets disable trigger ' +
       'financial_allocation_sets_supersession_lineage_check'
     ));
     try {
-      await databaseClient.db.execute(sql`
+      await ownerDatabaseClient.db.execute(sql`
         insert into financial_allocation_sets (
           id, allocation_identity, balance_transaction_id, source_kind,
           source_internal_id, basis, scope, expected_effect_minor, currency,
@@ -367,7 +411,7 @@ describe('financial reconciliation operations guide', () => {
             'gross_amount', 'account', 100, 'USD', 1, 1, ${fingerprint}, ${predecessorId})
       `);
     } finally {
-      await databaseClient.db.execute(sql.raw(
+      await ownerDatabaseClient.db.execute(sql.raw(
         'alter table financial_allocation_sets enable trigger ' +
         'financial_allocation_sets_supersession_lineage_check'
       ));
@@ -389,7 +433,7 @@ describe('financial reconciliation operations guide', () => {
     const paymentId = randomUUID();
     const predecessorId = randomUUID();
     const fingerprint = 'f'.repeat(64);
-    await databaseClient.db.execute(sql`
+    await ownerDatabaseClient.db.execute(sql`
       insert into stripe_balance_transactions (
         id, provider_id, live_mode, source_family, source_id, raw_type,
         reporting_category, balance_type, amount_minor, fee_minor, net_minor,
@@ -398,7 +442,7 @@ describe('financial reconciliation operations guide', () => {
         false, 'adjustment', null, 'adjustment', 'other_adjustment', 'adjustment',
         100, 0, 100, 'USD', 'available', now(), now(), ${fingerprint})
     `);
-    await databaseClient.db.execute(sql`
+    await ownerDatabaseClient.db.execute(sql`
       insert into financial_classification_versions (
         subject_type, subject_id, classifier_version, classification,
         source_fingerprint_sha256
@@ -406,25 +450,25 @@ describe('financial reconciliation operations guide', () => {
         'balance_transaction', ${balanceTransactionId}, 1, 'other', ${fingerprint}
       )
     `);
-    await databaseClient.db.execute(sql`
+    await ownerDatabaseClient.db.execute(sql`
       insert into orders (
         id, status, currency, subtotal_minor, client_checkout_attempt_id,
         quote_fingerprint_sha256, status_token_sha256
       ) values (${orderId}, 'checkout_open', 'USD', 100, ${randomUUID()},
         ${'a'.repeat(64)}, ${'b'.repeat(64)})
     `);
-    await databaseClient.db.execute(sql`
+    await ownerDatabaseClient.db.execute(sql`
       insert into payments (
         id, order_id, stripe_payment_intent_id, status, amount_minor, currency
       ) values (${paymentId}, ${orderId}, ${`pi_restore_missing_class_${paymentId}`},
         'pending', 100, 'USD')
     `);
-    await databaseClient.db.execute(sql.raw(
+    await ownerDatabaseClient.db.execute(sql.raw(
       'alter table financial_allocation_sets disable trigger ' +
       'financial_allocation_sets_supersession_lineage_check'
     ));
     try {
-      await databaseClient.db.execute(sql`
+      await ownerDatabaseClient.db.execute(sql`
         insert into financial_allocation_sets (
           id, allocation_identity, balance_transaction_id, source_kind,
           source_internal_id, basis, scope, expected_effect_minor, currency,
@@ -439,7 +483,7 @@ describe('financial reconciliation operations guide', () => {
             'gross_amount', 'title', 100, 'USD', 1, 2, ${fingerprint}, ${predecessorId})
       `);
     } finally {
-      await databaseClient.db.execute(sql.raw(
+      await ownerDatabaseClient.db.execute(sql.raw(
         'alter table financial_allocation_sets enable trigger ' +
         'financial_allocation_sets_supersession_lineage_check'
       ));

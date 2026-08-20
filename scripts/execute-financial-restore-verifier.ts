@@ -1,8 +1,9 @@
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
-import { Pool } from 'pg';
+import { Pool, type PoolClient } from 'pg';
 
 function requiredEnvironment(name: string): string {
   const value = process.env[name]?.trim();
@@ -13,7 +14,8 @@ function requiredEnvironment(name: string): string {
 const arguments_ = process.argv.slice(2);
 const supportedArguments = new Set([
   '--seed-missing-credential-authority',
-  '--exercise-financial-invariant-witnesses'
+  '--exercise-financial-invariant-witnesses',
+  '--print-financial-catalog-contract'
 ]);
 if (
   arguments_.length > 1 ||
@@ -44,7 +46,13 @@ const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
 const verifierPath = fileURLToPath(
   new URL('./verify-financial-restore.sql', import.meta.url)
 );
-const verifier = await readFile(verifierPath, 'utf8');
+const workerAuthorityMigrationPath = fileURLToPath(
+  new URL('../drizzle/0009_plan6b_worker_authority_and_commerce_integrity.sql', import.meta.url)
+);
+const [verifier, workerAuthorityMigration] = await Promise.all([
+  readFile(verifierPath, 'utf8'),
+  readFile(workerAuthorityMigrationPath, 'utf8')
+]);
 const verifierLines = verifier.split(/\r?\n/u);
 const allowedMetaCommands = ['\\set ON_ERROR_STOP on', '\\set QUIET on'];
 const metaCommands = verifierLines
@@ -62,6 +70,116 @@ const executableSql = verifierLines
 const seedMissingCredentialAuthority = arguments_[0] === '--seed-missing-credential-authority';
 const exerciseFinancialInvariantWitnesses =
   arguments_[0] === '--exercise-financial-invariant-witnesses';
+const printFinancialCatalogContract =
+  arguments_[0] === '--print-financial-catalog-contract';
+
+const financialCatalogManifestBegin = '-- BEGIN financial_schema_object_manifest';
+const financialCatalogManifestEnd = '-- END financial_schema_object_manifest';
+const financialFailureFormatterStart = 'do $restore_verifier$';
+
+function uniqueBoundary(source: string, marker: string): number {
+  const first = source.indexOf(marker);
+  if (first < 0 || source.indexOf(marker, first + marker.length) >= 0) {
+    throw new Error(`[restore-verifier] expected one ${marker} boundary`);
+  }
+  return first;
+}
+
+function requiredMigrationCheckConstraintStatement(constraintName: string): string {
+  if (!/^[a-z][a-z0-9_]*$/u.test(constraintName)) {
+    throw new Error('[restore-verifier] unsafe migration constraint name');
+  }
+  const prefix =
+    `ALTER TABLE "financial_reconciliation_issues" ADD CONSTRAINT "${constraintName}" CHECK (`;
+  const start = workerAuthorityMigration.indexOf(prefix);
+  const endMarker = ';--> statement-breakpoint';
+  const end = workerAuthorityMigration.indexOf(endMarker, start);
+  if (
+    start < 0 ||
+    end < 0 ||
+    workerAuthorityMigration.indexOf(prefix, start + prefix.length) >= 0
+  ) {
+    throw new Error(`[restore-verifier] expected one canonical ${constraintName} statement`);
+  }
+  const statement = workerAuthorityMigration.slice(start, end);
+  if (!statement.endsWith(')') || statement.includes(';')) {
+    throw new Error(`[restore-verifier] unsafe canonical ${constraintName} statement`);
+  }
+  return statement;
+}
+
+const semanticIdentityConstraintStatement = requiredMigrationCheckConstraintStatement(
+  'financial_reconciliation_issues_semantic_identity'
+);
+const semanticImpactConstraintStatement = requiredMigrationCheckConstraintStatement(
+  'financial_reconciliation_issues_semantic_impact'
+);
+
+const catalogManifestBegin = uniqueBoundary(executableSql, financialCatalogManifestBegin);
+const catalogManifestEnd = uniqueBoundary(executableSql, financialCatalogManifestEnd);
+const failureFormatterStart = uniqueBoundary(executableSql, financialFailureFormatterStart);
+if (
+  catalogManifestBegin >= catalogManifestEnd ||
+  catalogManifestEnd >= failureFormatterStart
+) {
+  throw new Error('[restore-verifier] financial catalog SQL boundaries are out of order');
+}
+const catalogManifestEndOffset = catalogManifestEnd + financialCatalogManifestEnd.length;
+const verifierPrelude = executableSql.slice(0, catalogManifestBegin);
+const catalogManifestSql = executableSql.slice(
+  catalogManifestBegin,
+  catalogManifestEndOffset
+);
+const verifierFailureFormatterSql = executableSql.slice(failureFormatterStart);
+const zeroOperationalDiagnosticsSql = `
+insert into restore_financial_checks (check_name, violation_count) values
+  ('failed_running_scan_permanent', 0),
+  ('failed_running_scan_retry_exhausted', 0),
+  ('pending_replay_child_incomplete', 0),
+  ('pending_replay_child_permanent', 0),
+  ('pending_replay_child_retry_exhausted', 0);
+`;
+const zeroCatalogChecksSql = `
+insert into restore_financial_checks (check_name, violation_count) values
+  ('financial_schema_object_manifest', 0),
+  ('storage_cleanup_effective_authority', 0);
+`;
+const catalogOnlyVerifierSql = [
+  verifierPrelude,
+  catalogManifestSql,
+  zeroOperationalDiagnosticsSql,
+  verifierFailureFormatterSql
+].join('\n');
+const dataOnlyVerifierSql = [
+  verifierPrelude,
+  zeroCatalogChecksSql,
+  executableSql.slice(catalogManifestEndOffset)
+].join('\n');
+
+type VerifierScope = 'catalog' | 'data' | 'full';
+
+const verifierSqlByScope: Readonly<Record<VerifierScope, string>> = {
+  catalog: catalogOnlyVerifierSql,
+  data: dataOnlyVerifierSql,
+  full: executableSql
+};
+
+for (const [scope, sql] of Object.entries(verifierSqlByScope)) {
+  if (
+    !sql.includes(financialFailureFormatterStart) ||
+    !sql.includes('failed_running_scan_permanent') ||
+    !sql.trimEnd().endsWith('rollback;')
+  ) {
+    throw new Error(`[restore-verifier] ${scope} verifier lost its failure contract`);
+  }
+}
+if (
+  !catalogOnlyVerifierSql.includes("'financial_schema_object_manifest'") ||
+  !catalogOnlyVerifierSql.includes("'storage_cleanup_effective_authority'") ||
+  dataOnlyVerifierSql.includes(financialCatalogManifestBegin)
+) {
+  throw new Error('[restore-verifier] financial catalog verifier split is invalid');
+}
 
 const databaseConfiguration = {
   host: databaseHost,
@@ -75,36 +193,157 @@ const databaseConfiguration = {
   application_name: 'pale-orbit-restore-verifier-witness'
 } as const;
 const pool = new Pool(databaseConfiguration);
+const verifierPool = new Pool({
+  ...databaseConfiguration,
+  application_name: 'pale-orbit-restore-verifier-execution'
+});
+let verifierClient: PoolClient | null = null;
+let verifierExpectationCount = 0;
+
+// Each verifier transaction uses READ COMMITTED and ends with rollback, so the persistent
+// session sees committed witness mutations from the separate fixture pool on its next check.
+async function persistentVerifierClient(): Promise<PoolClient> {
+  verifierClient ??= await verifierPool.connect();
+  return verifierClient;
+}
 
 interface VerifierOutcome {
   readonly error: Error | null;
   readonly rows: readonly Record<string, unknown>[];
 }
 
-async function verifierOutcome(): Promise<VerifierOutcome> {
-  const verifierPool = new Pool({
-    ...databaseConfiguration,
-    application_name: 'pale-orbit-restore-verifier-execution'
-  });
+async function verifierOutcome(
+  expectationName: string,
+  scope: VerifierScope
+): Promise<VerifierOutcome> {
+  verifierExpectationCount += 1;
+  const expectationNumber = verifierExpectationCount;
+  const startedAt = Date.now();
+  console.info(
+    `[restore-verifier] BEGIN expectation ${expectationNumber} [${scope}] ${expectationName}`
+  );
+  let client: PoolClient | null = null;
+  let outcome: VerifierOutcome;
   try {
-    const result = await verifierPool.query(executableSql);
+    client = await persistentVerifierClient();
+    const result = await client.query(verifierSqlByScope[scope]);
     const results = Array.isArray(result) ? result : [result];
-    return {
+    outcome = {
       error: null,
       rows: results.flatMap((entry) => entry.rows as Record<string, unknown>[])
     };
   } catch (error) {
-    return {
+    outcome = {
       error: error instanceof Error ? error : new Error(String(error)),
       rows: []
     };
-  } finally {
-    await verifierPool.end();
   }
+
+  if (client) {
+    try {
+      if (outcome.error) await client.query('rollback');
+      await client.query('drop table if exists pg_temp.restore_financial_checks');
+    } catch (recoveryError) {
+      if (verifierClient === client) verifierClient = null;
+      client.release(true);
+      outcome = {
+        error: new Error(
+          `[restore-verifier] verifier session recovery failed after ${expectationName}: ${
+            recoveryError instanceof Error ? recoveryError.message : String(recoveryError)
+          }`
+        ),
+        rows: []
+      };
+    }
+  }
+
+  console.info(
+    `[restore-verifier] END expectation ${expectationNumber} [${scope}] ${
+      Date.now() - startedAt
+    }ms ${outcome.error ? 'rejected' : 'passed'}`
+  );
+  return outcome;
+}
+
+function financialCatalogContractSql(): string {
+  const contractStart = executableSql.indexOf('with catalog_contract_version');
+  const contractEndMarker = '\n), duplicate_contract_objects as (';
+  const contractEnd = executableSql.indexOf(contractEndMarker, contractStart);
+  if (contractStart < 0 || contractEnd < 0) {
+    throw new Error('[restore-verifier] exact catalog contract CTE boundary is missing');
+  }
+  return `${executableSql.slice(contractStart, contractEnd)}
+)`;
+}
+
+function financialCatalogCalibrationSql(): string {
+  return `${financialCatalogContractSql()}
+select required.object_kind, required.schema_name, required.parent_name,
+  required.object_name, required.identity_arguments,
+  actual.actual_catalog::text as actual_catalog_json
+from required_catalog_objects required
+left join actual_catalog_objects actual
+  on actual.object_kind = required.object_kind
+ and actual.schema_name = required.schema_name
+ and actual.parent_name is not distinct from required.parent_name
+ and actual.object_name = required.object_name
+ and actual.identity_arguments is not distinct from required.identity_arguments
+order by required.object_kind collate "C", required.schema_name collate "C",
+  required.parent_name collate "C" nulls first,
+  required.object_name collate "C",
+  required.identity_arguments collate "C" nulls first`;
+}
+
+interface CatalogCalibrationRow {
+  readonly actual_catalog_json: string | null;
+  readonly identity_arguments: string | null;
+  readonly object_kind: string;
+  readonly object_name: string;
+  readonly parent_name: string | null;
+  readonly schema_name: string;
+}
+
+async function printCatalogContractCalibration(): Promise<void> {
+  const result = await pool.query<CatalogCalibrationRow>(financialCatalogCalibrationSql());
+  const seenKeys = new Set<string>();
+  const contract = result.rows.map((row) => {
+    const key = JSON.stringify([
+      row.object_kind,
+      row.schema_name,
+      row.parent_name,
+      row.object_name,
+      row.identity_arguments
+    ]);
+    if (seenKeys.has(key)) {
+      throw new Error(`[restore-verifier] duplicate calibrated catalog object ${key}`);
+    }
+    seenKeys.add(key);
+    if (typeof row.actual_catalog_json !== 'string') {
+      throw new Error(`[restore-verifier] missing calibrated catalog object ${key}`);
+    }
+    if (row.actual_catalog_json.includes('$catalog$')) {
+      throw new Error(`[restore-verifier] unsafe catalog delimiter in ${key}`);
+    }
+    return {
+      objectKind: row.object_kind,
+      schemaName: row.schema_name,
+      parentName: row.parent_name,
+      objectName: row.object_name,
+      identityArguments: row.identity_arguments,
+      fingerprintSha256: createHash('sha256')
+        .update(row.actual_catalog_json, 'utf8')
+        .digest('hex'),
+      catalogJson: row.actual_catalog_json
+    };
+  });
+  console.info('[restore-verifier] BEGIN exact financial catalog calibration JSON');
+  console.info(JSON.stringify(contract, null, 2));
+  console.info('[restore-verifier] END exact financial catalog calibration JSON');
 }
 
 async function exerciseInvariantWitnesses(): Promise<void> {
   const failures: string[] = [];
+  let verifierScope: VerifierScope = 'catalog';
   const operationalCheckNames = [
     'failed_running_scan_permanent',
     'failed_running_scan_retry_exhausted',
@@ -129,8 +368,12 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     }
     return true;
   };
-  const expectPass = async (name: string, expectAllZero = false) => {
-    const outcome = await verifierOutcome();
+  const expectPass = async (
+    name: string,
+    expectAllZero = false,
+    scope = verifierScope
+  ) => {
+    const outcome = await verifierOutcome(name, scope);
     if (outcome.error) {
       failures.push(`${name} unexpectedly failed: ${outcome.error.message}`);
       return;
@@ -140,15 +383,39 @@ async function exerciseInvariantWitnesses(): Promise<void> {
       failures.push(`${name} returned a nonzero operational diagnostic`);
     }
   };
-  const expectRejection = async (name: string, checkName: string) => {
-    const { error } = await verifierOutcome();
+  const expectRejection = async (
+    name: string,
+    checkName: string,
+    scope = verifierScope
+  ) => {
+    const { error } = await verifierOutcome(name, scope);
     if (!error) failures.push(`${name} unexpectedly passed`);
     else if (!error.message.includes(checkName)) {
       failures.push(`${name} failed without ${checkName}: ${error.message}`);
     }
   };
-  const expectDiagnostics = async (name: string, checkNames: readonly string[]) => {
-    const outcome = await verifierOutcome();
+  const expectRejectionChecks = async (
+    name: string,
+    checkNames: readonly string[],
+    scope = verifierScope
+  ) => {
+    const { error } = await verifierOutcome(name, scope);
+    if (!error) {
+      failures.push(`${name} unexpectedly passed`);
+      return;
+    }
+    for (const checkName of checkNames) {
+      if (!error.message.includes(checkName)) {
+        failures.push(`${name} failed without ${checkName}: ${error.message}`);
+      }
+    }
+  };
+  const expectDiagnostics = async (
+    name: string,
+    checkNames: readonly string[],
+    scope = verifierScope
+  ) => {
+    const outcome = await verifierOutcome(name, scope);
     if (outcome.error) {
       failures.push(`${name} unexpectedly failed: ${outcome.error.message}`);
       return;
@@ -177,6 +444,18 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     } finally {
       client.release();
     }
+  };
+  const requiredCatalogDefinition = async (
+    witnessName: string,
+    query: string,
+    parameters: readonly unknown[] = []
+  ): Promise<string> => {
+    const result = await pool.query<{ definition: string }>(query, [...parameters]);
+    const definition = result.rows[0]?.definition;
+    if (result.rows.length !== 1 || typeof definition !== 'string' || definition.trim() === '') {
+      throw new Error(`[restore-verifier] missing ${witnessName} catalog definition`);
+    }
+    return definition;
   };
   const insertDisputeEffect = async (input: {
     readonly allocationId: string;
@@ -275,6 +554,677 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     ]);
   };
 
+  await expectPass('fresh financial schema-object manifest', true, 'full');
+
+  const projectionHeadsViewDefinition = await requiredCatalogDefinition(
+    'required view',
+    `
+      select pg_catalog.pg_get_viewdef('public.current_financial_projection_heads'::regclass, false)
+      as definition
+    `
+  );
+  const executableProjectionHeadsViewDefinition = projectionHeadsViewDefinition
+    .trim()
+    .replace(/;$/u, '');
+  if (executableProjectionHeadsViewDefinition.includes(';')) {
+    throw new Error('[restore-verifier] unsafe required view catalog definition');
+  }
+  await pool.query(`
+    create or replace view public.current_financial_projection_heads as
+    select original.*
+    from (${executableProjectionHeadsViewDefinition}) original
+    where false
+  `);
+  await expectRejection(
+    'column-compatible false required view',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    create or replace view public.current_financial_projection_heads as
+    ${executableProjectionHeadsViewDefinition}
+  `);
+  await expectPass('required view definition repair', true);
+
+  const rejectHistoryFunctionDefinition = await requiredCatalogDefinition(
+    'required function',
+    `
+      select pg_catalog.pg_get_functiondef(
+        'public.plan6b_reject_history_mutation()'::regprocedure
+      ) as definition
+    `
+  );
+  await pool.query(`
+    create or replace function public.plan6b_reject_history_mutation()
+    returns trigger
+    language plpgsql
+    as $catalog_witness$
+    begin
+      return new;
+    end;
+    $catalog_witness$
+  `);
+  await expectRejection(
+    'required function definition mismatch',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(rejectHistoryFunctionDefinition);
+  await expectPass('required function definition repair', true);
+
+  await pool.query(`
+    create function public.plan6b_reject_history_mutation(value integer)
+    returns integer
+    language sql
+    immutable
+    as 'select $1'
+  `);
+  await expectRejection(
+    'unexpected protected function overload',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query('drop function public.plan6b_reject_history_mutation(integer)');
+  await expectPass('unexpected protected function overload repair', true);
+
+  const payoutTransitionTriggerDefinition = await requiredCatalogDefinition(
+    'required trigger',
+    `
+      select pg_catalog.pg_get_triggerdef(trigger_row.oid, false) as definition
+      from pg_catalog.pg_trigger trigger_row
+      where trigger_row.tgrelid = 'public.stripe_payouts'::regclass
+        and trigger_row.tgname = 'stripe_payouts_narrow_update'
+        and not trigger_row.tgisinternal
+    `
+  );
+  await pool.query('drop trigger stripe_payouts_narrow_update on stripe_payouts');
+  await expectRejection(
+    'missing financial transition trigger',
+    'financial_schema_object_manifest=2'
+  );
+  await pool.query(payoutTransitionTriggerDefinition);
+  await expectPass('financial transition trigger repair', true);
+
+  await pool.query('drop trigger stripe_payouts_narrow_update on stripe_payouts');
+  await pool.query(`
+    create trigger stripe_payouts_narrow_update
+    before update on stripe_payouts
+    for each row execute function plan6b_validate_payout_transition()
+  `);
+  await expectRejection(
+    'required trigger definition mismatch',
+    'financial_schema_object_manifest=2'
+  );
+  await pool.query('drop trigger stripe_payouts_narrow_update on stripe_payouts');
+  await pool.query(payoutTransitionTriggerDefinition);
+  await expectPass('required trigger definition repair', true);
+
+  const payoutStatusIndexDefinition = await requiredCatalogDefinition(
+    'required index',
+    `
+      select pg_catalog.pg_get_indexdef('public.stripe_payouts_status_created_idx'::regclass)
+        as definition
+    `
+  );
+  await pool.query('drop index stripe_payouts_status_created_idx');
+  await expectRejection(
+    'missing financial lookup index',
+    'financial_schema_object_manifest=2'
+  );
+  await pool.query(payoutStatusIndexDefinition);
+  await expectPass('financial lookup index repair', true);
+
+  await pool.query('drop index stripe_payouts_status_created_idx');
+  await pool.query(`
+    create index stripe_payouts_status_created_idx
+    on stripe_payouts using btree (id)
+  `);
+  await expectRejection(
+    'required index definition mismatch',
+    'financial_schema_object_manifest=2'
+  );
+  await pool.query('drop index stripe_payouts_status_created_idx');
+  await pool.query(payoutStatusIndexDefinition);
+  await expectPass('required index definition repair', true);
+
+  const omittedIssueConstraintNames = [
+    'financial_reconciliation_issues_occurrence_positive',
+    'financial_reconciliation_issues_resolution_consistent',
+    'financial_reconciliation_issues_safe_vocabulary',
+    'financial_reconciliation_issues_observation_order'
+  ] as const;
+  for (const constraintName of omittedIssueConstraintNames) {
+    const constraintDefinition = await requiredCatalogDefinition(
+      constraintName,
+      `
+        select pg_catalog.pg_get_constraintdef(constraint_row.oid, false) as definition
+        from pg_catalog.pg_constraint constraint_row
+        where constraint_row.conrelid = 'public.financial_reconciliation_issues'::regclass
+          and constraint_row.conname = $1
+          and constraint_row.contype = 'c'
+      `,
+      [constraintName]
+    );
+    if (!/^CHECK \([\s\S]+\)$/u.test(constraintDefinition) || constraintDefinition.includes(';')) {
+      throw new Error(`[restore-verifier] unsafe ${constraintName} catalog definition`);
+    }
+    await pool.query(`
+      alter table financial_reconciliation_issues drop constraint "${constraintName}"
+    `);
+    await pool.query(`
+      alter table financial_reconciliation_issues
+      add constraint "${constraintName}" check (true)
+    `);
+    await expectRejection(
+      `omitted financial issue constraint definition mismatch (${constraintName})`,
+      'financial_schema_object_manifest=2'
+    );
+    await pool.query(`
+      alter table financial_reconciliation_issues drop constraint "${constraintName}"
+    `);
+    await pool.query(`
+      alter table financial_reconciliation_issues
+      add constraint "${constraintName}" ${constraintDefinition}
+    `);
+    await expectPass(
+      `omitted financial issue constraint definition repair (${constraintName})`,
+      true
+    );
+  }
+
+  const claimAuthorizationFunctionDefinition = await requiredCatalogDefinition(
+    'claim authorization function',
+    `
+      select pg_catalog.pg_get_functiondef(
+        'public.authorize_commerce_claim_issuance(text,text)'::regprocedure
+      ) as definition
+    `
+  );
+  await pool.query(`
+    create or replace function public.authorize_commerce_claim_issuance(
+      p_raw_claim_proof text,
+      p_raw_auth_token text
+    ) returns boolean
+    language plpgsql
+    security definer
+    set search_path = 'pg_catalog'
+    as $catalog_witness$
+    begin
+      return false;
+    end;
+    $catalog_witness$
+  `);
+  await expectRejection(
+    'claim function definition mismatch',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(claimAuthorizationFunctionDefinition);
+  await expectPass('claim function definition repair', true);
+
+  await pool.query(`
+    grant execute on function public.authorize_commerce_claim_issuance(text, text)
+    to public
+  `);
+  await expectRejection(
+    'claim function direct ACL mismatch',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    revoke execute on function public.authorize_commerce_claim_issuance(text, text)
+    from public
+  `);
+  await expectPass('claim function direct ACL repair', true);
+
+  await pool.query(`
+    grant connect on database "${databaseName}" to pale_orbit_runtime with grant option
+  `);
+  await expectRejection(
+    'database fixed-group CONNECT grant option mismatch',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    revoke grant option for connect on database "${databaseName}" from pale_orbit_runtime
+  `);
+  await expectPass('database fixed-group CONNECT grant option repair', true);
+
+  await pool.query(`
+    grant temporary on database "${databaseName}" to pale_orbit_financial_worker
+  `);
+  await expectRejection(
+    'unexpected fixed-group database TEMPORARY ACL',
+    'financial_schema_object_manifest=2'
+  );
+  await pool.query(`
+    revoke temporary on database "${databaseName}" from pale_orbit_financial_worker
+  `);
+  await expectPass('unexpected fixed-group database TEMPORARY ACL repair', true);
+
+  await pool.query(`
+    create function public.authorize_commerce_claim_issuance(value integer)
+    returns boolean
+    language sql
+    immutable
+    as 'select false'
+  `);
+  await expectRejection(
+    'unexpected claim function overload',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query('drop function public.authorize_commerce_claim_issuance(integer)');
+  await expectPass('unexpected claim function overload repair', true);
+
+  const claimKindConstraintDefinition = await requiredCatalogDefinition(
+    'claim kind constraint',
+    `
+      select pg_catalog.pg_get_constraintdef(constraint_row.oid, false) as definition
+      from pg_catalog.pg_constraint constraint_row
+      where constraint_row.conrelid = 'public.commerce_claim_issuances'::regclass
+        and constraint_row.conname = 'commerce_claim_issuances_kind_valid'
+        and constraint_row.contype = 'c'
+    `
+  );
+  if (
+    !/^CHECK \([\s\S]+\)$/u.test(claimKindConstraintDefinition) ||
+    claimKindConstraintDefinition.includes(';')
+  ) {
+    throw new Error('[restore-verifier] unsafe claim kind constraint catalog definition');
+  }
+  await pool.query(`
+    alter table public.commerce_claim_issuances
+    drop constraint commerce_claim_issuances_kind_valid
+  `);
+  await pool.query(`
+    alter table public.commerce_claim_issuances
+    add constraint commerce_claim_issuances_kind_valid check (true)
+  `);
+  await expectRejection(
+    'claim constraint definition mismatch',
+    'financial_schema_object_manifest=2'
+  );
+  await pool.query(`
+    alter table public.commerce_claim_issuances
+    drop constraint commerce_claim_issuances_kind_valid
+  `);
+  await pool.query(`
+    alter table public.commerce_claim_issuances
+    add constraint commerce_claim_issuances_kind_valid ${claimKindConstraintDefinition}
+  `);
+  await expectPass('claim constraint definition repair', true);
+
+  const claimLiveEmailIndexDefinition = await requiredCatalogDefinition(
+    'claim live-email index',
+    `
+      select pg_catalog.pg_get_indexdef(
+        'public.commerce_claim_issuances_live_email_idx'::regclass
+      ) as definition
+    `
+  );
+  await pool.query('drop index public.commerce_claim_issuances_live_email_idx');
+  await pool.query(`
+    create index commerce_claim_issuances_live_email_idx
+    on public.commerce_claim_issuances using btree (claim_proof_sha256)
+  `);
+  await expectRejection(
+    'claim index definition mismatch',
+    'financial_schema_object_manifest=2'
+  );
+  await pool.query('drop index public.commerce_claim_issuances_live_email_idx');
+  await pool.query(claimLiveEmailIndexDefinition);
+  await expectPass('claim index definition repair', true);
+
+  await pool.query(`
+    alter table public.commerce_claim_issuances
+    add constraint commerce_claim_issuances_unexpected_check check (true)
+  `);
+  await expectRejection(
+    'unexpected protected constraint',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    alter table public.commerce_claim_issuances
+    drop constraint commerce_claim_issuances_unexpected_check
+  `);
+  await expectPass('unexpected protected constraint repair', true);
+
+  await pool.query(`
+    create index commerce_claim_issuances_unexpected_idx
+    on public.commerce_claim_issuances using btree (kind)
+  `);
+  await expectRejection(
+    'unexpected protected explicit index',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query('drop index public.commerce_claim_issuances_unexpected_idx');
+  await expectPass('unexpected protected explicit index repair', true);
+
+  await pool.query(`
+    create trigger commerce_claim_issuances_unexpected_trigger
+    before update on public.commerce_claim_issuances
+    for each row execute function public.plan6b_reject_history_mutation()
+  `);
+  await expectRejection(
+    'unexpected protected trigger',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    drop trigger commerce_claim_issuances_unexpected_trigger
+    on public.commerce_claim_issuances
+  `);
+  await expectPass('unexpected protected trigger repair', true);
+
+  await pool.query(`
+    alter table public.commerce_claim_issuances enable row level security
+  `);
+  await pool.query(`
+    alter table public.commerce_claim_issuances force row level security
+  `);
+  await expectRejection(
+    'protected table RLS drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    alter table public.commerce_claim_issuances no force row level security
+  `);
+  await pool.query(`
+    alter table public.commerce_claim_issuances disable row level security
+  `);
+  await expectPass('protected table RLS drift repair', true);
+
+  await pool.query('alter table public.entitlement_grants disable trigger all');
+  await expectRejection(
+    'disabled protected constraint triggers',
+    'financial_schema_object_manifest=3'
+  );
+  await pool.query('alter table public.entitlement_grants enable trigger all');
+  await expectPass('disabled protected constraint triggers repair', true);
+
+  await pool.query(`
+    alter type public.financial_evidence_status
+    rename value 'pending' to 'pending_catalog_witness'
+  `);
+  await expectRejection(
+    'enum label inventory drift',
+    'financial_schema_object_manifest=4'
+  );
+  await pool.query(`
+    alter type public.financial_evidence_status
+    rename value 'pending_catalog_witness' to 'pending'
+  `);
+  await expectPass('enum label inventory drift repair', true);
+
+  await pool.query(`
+    alter table public.jobs
+    alter column rerun_requested_at set default pg_catalog.now()
+  `);
+  await expectRejection(
+    'touched legacy column descriptor drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    alter table public.jobs alter column rerun_requested_at drop default
+  `);
+  await expectPass('touched legacy column descriptor drift repair', true);
+
+  await pool.query(`
+    create type public.entitlement_grant_source_legacy as enum ('catalog_witness')
+  `);
+  await expectRejection(
+    'forbidden retired type',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query('drop type public.entitlement_grant_source_legacy');
+  await expectPass('forbidden retired type repair', true);
+
+  await pool.query(`
+    alter table public.disputes add column reconciliation_status text
+  `);
+  await expectRejection(
+    'forbidden retired column',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    alter table public.disputes drop column reconciliation_status
+  `);
+  await expectPass('forbidden retired column repair', true);
+
+  await pool.query('alter table public.outbox_messages enable row level security');
+  await pool.query('alter table public.outbox_messages force row level security');
+  await expectRejection(
+    'sensitive relation physical state drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query('alter table public.outbox_messages no force row level security');
+  await pool.query('alter table public.outbox_messages disable row level security');
+  await expectPass('sensitive relation physical state drift repair', true);
+
+  await pool.query(`
+    alter table public.jobs add column plan6b_catalog_fk_witness uuid
+  `);
+  await pool.query(`
+    alter table public.jobs
+    add constraint jobs_plan6b_catalog_fk_witness
+    foreign key (plan6b_catalog_fk_witness) references public.stripe_payouts(id)
+    not valid
+  `);
+  await expectRejection(
+    'inbound protected foreign key',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    alter table public.jobs drop constraint jobs_plan6b_catalog_fk_witness
+  `);
+  await pool.query(`
+    alter table public.jobs drop column plan6b_catalog_fk_witness
+  `);
+  await expectPass('inbound protected foreign key repair', true);
+
+  await pool.query(`
+    create rule commerce_claim_issuances_catalog_witness as
+    on update to public.commerce_claim_issuances do instead nothing
+  `);
+  await expectRejection(
+    'protected table rule inventory drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    drop rule commerce_claim_issuances_catalog_witness
+    on public.commerce_claim_issuances
+  `);
+  await expectPass('protected table rule inventory drift repair', true);
+
+  await pool.query(`
+    create table public.commerce_claim_issuances_catalog_child ()
+    inherits (public.commerce_claim_issuances)
+  `);
+  await expectRejection(
+    'protected table inheritance edge',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query('drop table public.commerce_claim_issuances_catalog_child');
+  await expectPass('protected table inheritance edge repair', true);
+
+  await pool.query(`
+    grant select on table public.commerce_claim_issuances to pale_orbit_runtime
+  `);
+  await expectRejection(
+    'sensitive relation direct ACL mismatch',
+    'financial_schema_object_manifest=2'
+  );
+  await pool.query(`
+    revoke select on table public.commerce_claim_issuances from pale_orbit_runtime
+  `);
+  await expectPass('sensitive relation direct ACL repair', true);
+
+  await pool.query(`
+    revoke insert (payload) on table public.outbox_messages from pale_orbit_runtime
+  `);
+  await expectRejection(
+    'missing runtime outbox INSERT ACL',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    grant insert (payload) on table public.outbox_messages to pale_orbit_runtime
+  `);
+  await expectPass('missing runtime outbox INSERT ACL repair', true);
+
+  await pool.query(`
+    grant update (payload) on table public.outbox_messages to pale_orbit_financial_worker
+  `);
+  await expectRejection(
+    'excess worker outbox UPDATE ACL',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    revoke update (payload) on table public.outbox_messages from pale_orbit_financial_worker
+  `);
+  await expectPass('excess worker outbox UPDATE ACL repair', true);
+
+  const activeIngestIndexDefinition = await requiredCatalogDefinition(
+    'active ingest index',
+    `
+      select pg_catalog.pg_get_indexdef(
+        'public.jobs_active_ingest_revision_identity_idx'::regclass
+      ) as definition
+    `
+  );
+  await pool.query('drop index public.jobs_active_ingest_revision_identity_idx');
+  await pool.query(`
+    create index jobs_active_ingest_revision_identity_idx
+    on public.jobs using btree (id)
+    where type = 'catalog.ingest_revision'
+      and status in ('pending', 'running')
+  `);
+  await expectRejection(
+    'active ingest index definition mismatch',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query('drop index public.jobs_active_ingest_revision_identity_idx');
+  await pool.query(activeIngestIndexDefinition);
+  await expectPass('active ingest index definition repair', true);
+
+  await pool.query(`
+    grant execute on function public.storage_cleanup_referenced_keys(text[])
+    to public
+  `);
+  await expectRejectionChecks(
+    'PUBLIC cleanup function execute',
+    ['financial_schema_object_manifest=1', 'storage_cleanup_effective_authority=1']
+  );
+  await pool.query(`
+    revoke execute on function public.storage_cleanup_referenced_keys(text[])
+    from public
+  `);
+  await expectPass('PUBLIC cleanup function execute repair', true);
+
+  await pool.query(`
+    revoke usage on schema public from pale_orbit_storage_cleanup
+  `);
+  await expectRejectionChecks(
+    'missing cleanup group schema USAGE',
+    ['financial_schema_object_manifest=1', 'storage_cleanup_effective_authority=1']
+  );
+  await pool.query(`
+    grant usage on schema public to pale_orbit_storage_cleanup
+  `);
+  await expectPass('cleanup group schema USAGE repair', true);
+
+  const cleanupLoginResult = await pool.query<{ rolname: string }>(`
+    select member_role.rolname
+    from pg_catalog.pg_roles group_role
+    join pg_catalog.pg_auth_members membership
+      on membership.roleid = group_role.oid
+    join pg_catalog.pg_roles member_role on member_role.oid = membership.member
+    where group_role.rolname = 'pale_orbit_storage_cleanup'
+  `);
+  const cleanupLoginName = cleanupLoginResult.rows[0]?.rolname;
+  if (
+    cleanupLoginResult.rows.length !== 1 ||
+    typeof cleanupLoginName !== 'string' ||
+    cleanupLoginName === ''
+  ) {
+    throw new Error('[restore-verifier] exact storage cleanup login is missing');
+  }
+  const quotedCleanupLogin = `"${cleanupLoginName.replaceAll('"', '""')}"`;
+  await pool.query(`
+    grant connect on database "${databaseName}" to ${quotedCleanupLogin} with grant option
+  `);
+  await expectRejection(
+    'cleanup login direct grantable CONNECT',
+    'storage_cleanup_effective_authority=1'
+  );
+  await pool.query(`
+    revoke connect on database "${databaseName}" from ${quotedCleanupLogin}
+  `);
+  await expectPass('cleanup login direct grantable CONNECT repair', true);
+
+  await pool.query(`
+    grant temporary on database "${databaseName}" to ${quotedCleanupLogin}
+  `);
+  await expectRejection(
+    'cleanup login direct TEMPORARY',
+    'storage_cleanup_effective_authority=1'
+  );
+  await pool.query(`
+    revoke temporary on database "${databaseName}" from ${quotedCleanupLogin}
+  `);
+  await expectPass('cleanup login direct TEMPORARY repair', true);
+
+  await pool.query(`
+    grant pale_orbit_storage_cleanup to ${quotedCleanupLogin}
+    with admin true, inherit false, set true
+  `);
+  await expectRejection(
+    'unsafe cleanup membership flags',
+    'storage_cleanup_effective_authority=3'
+  );
+  await pool.query(`
+    grant pale_orbit_storage_cleanup to ${quotedCleanupLogin}
+    with admin false, inherit true, set false
+  `);
+  await expectPass('cleanup membership flags repair', true);
+
+  await pool.query('alter role pale_orbit_storage_cleanup noinherit');
+  await expectRejection(
+    'unsafe cleanup role attributes',
+    'storage_cleanup_effective_authority=1'
+  );
+  await pool.query('alter role pale_orbit_storage_cleanup inherit');
+  await expectPass('cleanup role attributes repair', true);
+
+  await pool.query('grant select on table public.titles to public');
+  await expectRejection(
+    'inherited cleanup relation authority via PUBLIC SELECT',
+    'storage_cleanup_effective_authority=2'
+  );
+  await pool.query('revoke select on table public.titles from public');
+  await expectPass('inherited cleanup relation authority repair', true);
+
+  await pool.query(`
+    drop trigger financial_classification_versions_unknown_issue_required
+    on financial_classification_versions
+  `);
+  await expectRejection(
+    'missing unknown-classification companion trigger',
+    'financial_schema_object_manifest=2'
+  );
+  await pool.query(`
+    create constraint trigger financial_classification_versions_unknown_issue_required
+    after insert on financial_classification_versions
+    deferrable initially deferred
+    for each row when (new.classification = 'unknown')
+    execute function plan6b_validate_unknown_classification_issue()
+  `);
+  await expectPass('unknown-classification companion trigger repair', true);
+  await pool.query('drop trigger payments_financial_issue_subject_guard on payments');
+  await expectRejection(
+    'missing payment financial issue subject guard',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    create trigger payments_financial_issue_subject_guard
+    before delete or update of id on payments
+    for each row execute function plan6b_guard_financial_issue_subject_mutation()
+  `);
+  await expectPass('payment financial issue subject guard repair', true, 'full');
+  verifierScope = 'data';
+
   const unknownBalanceId = '09000000-0000-4000-8000-000000000001';
   const unknownClassificationId = '09000000-0000-4000-8000-000000000002';
   const unknownFingerprint = '9'.repeat(64);
@@ -288,7 +1238,7 @@ async function exerciseInvariantWitnesses(): Promise<void> {
       'future_category', 'adjustment', 1, 0, 1, 'USD', 'available', now(), now(), $2
     )
   `, [unknownBalanceId, unknownFingerprint]);
-  await pool.query(`
+  await mutateAppendOnlyFixture(`
     insert into financial_classification_versions (
       id, subject_type, subject_id, classifier_version, classification,
       source_fingerprint_sha256
@@ -402,19 +1352,25 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     'allocation_set_parent_or_chain=1'
   );
   await pool.query(`
-    insert into financial_classification_versions (
-      id, subject_type, subject_id, classifier_version, classification,
-      source_fingerprint_sha256
-    ) values ($1, 'balance_transaction', $2, 3, 'unknown', $3)
-  `, [provenanceParentV3Id, provenanceBalanceId, provenanceBalanceFingerprint]);
-  await pool.query(`
+    with inserted_classification as (
+      insert into financial_classification_versions (
+        id, subject_type, subject_id, classifier_version, classification,
+        source_fingerprint_sha256
+      ) values ($2, 'balance_transaction', $3, 3, 'unknown', $4)
+      returning id
+    )
     insert into financial_reconciliation_issues (
       id, resource_type, resource_id, safe_code, impact, correlation_id
-    ) values (
-      $1, 'financial_classification', $2, 'unsupported_category', 'exception',
-      'restore-classification-provenance'
     )
-  `, [provenanceUnknownIssueId, provenanceParentV3Id]);
+    select $1, 'financial_classification', classification.id,
+      'unsupported_category', 'exception', 'restore-classification-provenance'
+    from inserted_classification classification
+  `, [
+    provenanceUnknownIssueId,
+    provenanceParentV3Id,
+    provenanceBalanceId,
+    provenanceBalanceFingerprint
+  ]);
   await expectRejection(
     'itemless account allocation cannot depend on an exact unknown parent',
     'allocation_set_parent_or_chain=1'
@@ -430,19 +1386,25 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     'allocation_set_detail_classification=1'
   );
   await pool.query(`
-    insert into financial_classification_versions (
-      id, subject_type, subject_id, classifier_version, classification,
-      source_fingerprint_sha256
-    ) values ($1, 'fee_detail', $2, 3, 'unknown', $3)
-  `, [provenanceDetailV3Id, provenanceDetailId, provenanceDetailFingerprint]);
-  await pool.query(`
+    with inserted_classification as (
+      insert into financial_classification_versions (
+        id, subject_type, subject_id, classifier_version, classification,
+        source_fingerprint_sha256
+      ) values ($2, 'fee_detail', $3, 3, 'unknown', $4)
+      returning id
+    )
     insert into financial_reconciliation_issues (
       id, resource_type, resource_id, safe_code, impact, correlation_id
-    ) values (
-      $1, 'financial_classification', $2, 'unsupported_category', 'exception',
-      'restore-classification-detail-provenance'
     )
-  `, [provenanceDetailV3IssueId, provenanceDetailV3Id]);
+    select $1, 'financial_classification', classification.id,
+      'unsupported_category', 'exception', 'restore-classification-detail-provenance'
+    from inserted_classification classification
+  `, [
+    provenanceDetailV3IssueId,
+    provenanceDetailV3Id,
+    provenanceDetailId,
+    provenanceDetailFingerprint
+  ]);
   await expectRejection(
     'itemless account allocation cannot depend on an exact unknown fee detail',
     'allocation_set_detail_classification=1'
@@ -498,6 +1460,182 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     )
   `, [payoutId]);
   await expectPass('published payout replay at the current generation', true);
+
+  const payoutMembershipBalanceId = '10000000-0000-4000-8000-000000000005';
+  await pool.query(`
+    insert into stripe_balance_transactions (
+      id, provider_id, live_mode, source_family, source_id, raw_type,
+      reporting_category, balance_type, amount_minor, fee_minor, net_minor,
+      currency, status, provider_created_at, available_at, fingerprint_sha256
+    ) values (
+      $1, 'bt_restore_payout_currency', false, 'charge', 'ch_restore_payout_currency',
+      'charge', 'charge', 'payments', 100, 0, 100, 'USD', 'available',
+      '2026-08-01T00:00:00.000Z', '2026-08-01T00:00:00.000Z', repeat('e', 64)
+    )
+  `, [payoutMembershipBalanceId]);
+  await pool.query(`
+    update payout_import_runs set candidate_count = 1
+    where id in ($1, $2)
+  `, [priorPayoutRunId, equalPayoutRunId]);
+  await pool.query(`
+    insert into payout_import_run_entries (run_id, balance_transaction_id)
+    values ($1, $3), ($2, $3)
+  `, [priorPayoutRunId, equalPayoutRunId, payoutMembershipBalanceId]);
+  await pool.query(`
+    insert into stripe_payout_balance_transactions (
+      payout_id, balance_transaction_id, published_from_run_id
+    ) values ($1, $2, $3)
+  `, [payoutId, payoutMembershipBalanceId, equalPayoutRunId]);
+  await expectPass('payout membership currency baseline', true);
+  await mutateAppendOnlyFixture(`
+    update stripe_balance_transactions set currency = 'EUR' where id = $1
+  `, [payoutMembershipBalanceId]);
+  await expectRejection(
+    'payout membership cannot cross payout currency',
+    'payout_membership_currency=1'
+  );
+  await mutateAppendOnlyFixture(`
+    update stripe_balance_transactions set currency = 'USD' where id = $1
+  `, [payoutMembershipBalanceId]);
+  await expectPass('payout membership currency repair', true);
+
+  const resolvedIssueId = '10000000-0000-4000-8000-000000000006';
+  const duplicateResolvedAuditId = '10000000-0000-4000-8000-000000000008';
+  await pool.query(`
+    insert into financial_reconciliation_issues (
+      id, resource_type, resource_id, safe_code, impact, correlation_id
+    ) values (
+      $1, 'payout', $2, 'payout_membership_conflict', 'exception',
+      'restore-resolved-audit-open'
+    )
+  `, [resolvedIssueId, payoutId]);
+  await expectPass('financial issue semantic identity baseline', true);
+  await pool.query(`
+    alter table financial_reconciliation_issues
+    drop constraint financial_reconciliation_issues_semantic_identity
+  `);
+  await mutateAppendOnlyFixture(`
+    update financial_reconciliation_issues
+    set safe_code = 'unsupported_category'
+    where id = $1
+  `, [resolvedIssueId]);
+  await pool.query(`${semanticIdentityConstraintStatement} not valid`);
+  await expectRejectionChecks(
+    'known but impossible financial issue identity',
+    ['financial_issue_vocabulary=1', 'financial_schema_object_manifest=2'],
+    'full'
+  );
+  await mutateAppendOnlyFixture(`
+    update financial_reconciliation_issues
+    set safe_code = 'payout_membership_conflict'
+    where id = $1
+  `, [resolvedIssueId]);
+  await pool.query(`
+    alter table financial_reconciliation_issues
+    drop constraint financial_reconciliation_issues_semantic_identity
+  `);
+  await pool.query(semanticIdentityConstraintStatement);
+  await expectPass('financial issue semantic identity repair', true, 'full');
+  await pool.query(`
+    alter table financial_reconciliation_issues
+    drop constraint financial_reconciliation_issues_semantic_impact
+  `);
+  await mutateAppendOnlyFixture(`
+    update financial_reconciliation_issues
+    set impact = 'informational'
+    where id = $1
+  `, [resolvedIssueId]);
+  await pool.query(`${semanticImpactConstraintStatement} not valid`);
+  await expectRejectionChecks(
+    'impossible financial issue impact',
+    ['financial_issue_vocabulary=1', 'financial_schema_object_manifest=2'],
+    'full'
+  );
+  await mutateAppendOnlyFixture(`
+    update financial_reconciliation_issues
+    set impact = 'exception'
+    where id = $1
+  `, [resolvedIssueId]);
+  await pool.query(`
+    alter table financial_reconciliation_issues
+    drop constraint financial_reconciliation_issues_semantic_impact
+  `);
+  await pool.query(semanticImpactConstraintStatement);
+  await expectPass('financial issue semantic impact repair', true, 'full');
+  await pool.query(`
+    select * from resolve_financial_issue_after_worker_recompute(
+      $1, 'restore-resolved-audit'
+    )
+  `, [resolvedIssueId]);
+  const resolvedAuditResult = await pool.query<{ id: string }>(`
+    select id
+    from audit_events
+    where action = 'financial.issue.resolved' and resource_id = $1::text
+  `, [resolvedIssueId]);
+  const resolvedAuditId = resolvedAuditResult.rows[0]?.id;
+  if (!resolvedAuditId) {
+    throw new Error('[restore-verifier] missing resolved issue audit witness');
+  }
+  await expectPass('resolved issue owns one canonical audit', true);
+  await mutateAppendOnlyFixture(`
+    update audit_events set actor_id = 'unexpected-system-resolver' where id = $1
+  `, [resolvedAuditId]);
+  await expectRejection(
+    'system-resolved issue requires the canonical worker audit actor',
+    'resolved_issue_audit_provenance=2'
+  );
+  await mutateAppendOnlyFixture(`
+    update audit_events set actor_id = 'financial-worker' where id = $1
+  `, [resolvedAuditId]);
+  await mutateAppendOnlyFixture(`
+    update audit_events set actor_type = 'user', actor_id = $2::text where id = $1
+  `, [resolvedAuditId, payoutId]);
+  await expectRejection(
+    'system-resolved issue cannot claim a user audit actor',
+    'resolved_issue_audit_provenance=2'
+  );
+  await mutateAppendOnlyFixture(`
+    update audit_events set actor_type = 'system', actor_id = 'financial-worker'
+    where id = $1
+  `, [resolvedAuditId]);
+  await mutateAppendOnlyFixture(`
+    update audit_events
+    set after = jsonb_set(after, '{resourceId}', to_jsonb($2::text))
+    where id = $1
+  `, [resolvedAuditId, payoutMembershipBalanceId]);
+  await expectRejection(
+    'resolved issue audit must mirror resource and code identity',
+    'resolved_issue_audit_provenance=2'
+  );
+  await mutateAppendOnlyFixture(`
+    update audit_events
+    set after = jsonb_build_object(
+      'resourceType', 'payout',
+      'resourceId', $2::text,
+      'safeCode', 'payout_membership_conflict',
+      'impact', 'exception',
+      'state', 'resolved',
+      'occurrenceCount', 1
+    )
+    where id = $1
+  `, [resolvedAuditId, payoutId]);
+  await pool.query(`
+    insert into audit_events (
+      id, actor_type, actor_id, action, outcome, resource_type, resource_id,
+      correlation_id, after
+    )
+    select $2, actor_type, actor_id, action, outcome, resource_type, resource_id,
+      correlation_id, after
+    from audit_events where id = $1
+  `, [resolvedAuditId, duplicateResolvedAuditId]);
+  await expectRejection(
+    'resolved issue cannot own duplicate canonical audits',
+    'resolved_issue_audit_provenance=1'
+  );
+  await mutateAppendOnlyFixture('delete from audit_events where id = $1', [
+    duplicateResolvedAuditId
+  ]);
+  await expectPass('resolved issue audit provenance repair', true);
 
   await pool.query(`
     insert into payout_import_runs (
@@ -882,6 +2020,72 @@ async function exerciseInvariantWitnesses(): Promise<void> {
   `, [chargeAllocationSetId, chargeFeeSetId]);
   await expectPass('charge exchange evidence witness cleanup', true);
   await pool.query(`
+    update payments set financial_evidence_status = 'fee_reconciled' where id = $1
+  `, [paymentId]);
+  await expectPass('fee-reconciled payment has exact current heads', true);
+  await mutateAppendOnlyFixture(`
+    update stripe_balance_transactions set amount_minor = 7, net_minor = 6 where id = $1
+  `, [chargeTransactionId]);
+  await expectRejectionChecks(
+    'same-currency payment source-principal corruption',
+    ['allocation_set_semantic_source=2', 'source_evidence_projection_parity=1']
+  );
+  await mutateAppendOnlyFixture(`
+    update stripe_balance_transactions set amount_minor = 8, net_minor = 7 where id = $1
+  `, [chargeTransactionId]);
+  await expectPass('same-currency payment source-principal repair', true);
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations
+    set effect_minor = case id when $1 then 2 else 4 end
+    where id in ($1, $2)
+  `, [chargeSubtotalItemId, '45000000-0000-4000-8000-000000000005']);
+  await expectRejection(
+    'balanced charge title redistribution is not deterministic',
+    'financial_title_allocation_determinism=1'
+  );
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations set effect_minor = 3 where id in ($1, $2)
+  `, [chargeSubtotalItemId, '45000000-0000-4000-8000-000000000005']);
+  await expectPass('charge title allocation repair', true);
+
+  const paymentProjectionIssueId = '45000000-0000-4000-8000-00000000000c';
+  const paymentSourceIssueId = '45000000-0000-4000-8000-00000000000d';
+  await pool.query(`
+    insert into financial_reconciliation_issues (
+      id, resource_type, resource_id, safe_code, impact, correlation_id
+    ) values
+    (
+      $1, 'allocation_set', $2, 'allocation_mismatch', 'exception',
+      'restore-payment-projection-parity'
+    ), (
+      $3, 'payment', $4, 'allocation_mismatch', 'exception',
+      'restore-payment-source-parity'
+    )
+  `, [paymentProjectionIssueId, chargeAllocationSetId, paymentSourceIssueId, paymentId]);
+  await expectRejection(
+    'fee-reconciled source cannot hide an incomplete selected head',
+    'source_evidence_projection_parity=1'
+  );
+  await pool.query(`
+    update payments set financial_evidence_status = 'exception' where id = $1
+  `, [paymentId]);
+  await expectPass('source exception status matches its open exception issue', true);
+  await mutateAppendOnlyFixture(`
+    delete from financial_reconciliation_issues where id in ($1, $2)
+  `, [paymentProjectionIssueId, paymentSourceIssueId]);
+  await expectRejection(
+    'source exception status requires a current exception issue',
+    'source_evidence_projection_parity=1'
+  );
+  await pool.query(`
+    update payments set financial_evidence_status = 'pending' where id = $1
+  `, [paymentId]);
+  await expectPass('unprocessed pending source needs no synthetic issue', true);
+  await pool.query(`
+    update payments set financial_evidence_status = 'fee_reconciled' where id = $1
+  `, [paymentId]);
+  await expectPass('source projection parity repair', true);
+  await pool.query(`
     insert into refunds (
       id, payment_id, stripe_refund_id, status, amount_minor, currency,
       provider_created_at, allocation_status
@@ -1070,6 +2274,17 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     where balance_transaction_id = $1
   `, [unresolvedTransactionId]);
   await expectPass('refund exchange evidence witness cleanup', true);
+  await mutateAppendOnlyFixture(`
+    update stripe_balance_transactions set amount_minor = -2, net_minor = -2 where id = $1
+  `, [unresolvedTransactionId]);
+  await expectRejection(
+    'same-currency primary-refund source-principal corruption',
+    'allocation_set_semantic_source=2'
+  );
+  await mutateAppendOnlyFixture(`
+    update stripe_balance_transactions set amount_minor = -1, net_minor = -1 where id = $1
+  `, [unresolvedTransactionId]);
+  await expectPass('same-currency primary-refund source-principal repair', true);
 
   const correctionAdminId = '46000000-0000-4000-8000-000000000001';
   const correctionTransactionId = '46000000-0000-4000-8000-000000000002';
@@ -1228,6 +2443,22 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     correctionAllocationSetId,
     correctionSourceItemId
   ]);
+  await expectPass('refund title allocation deterministic baseline', true);
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations
+    set effect_minor = case id when $1 then -1 else -2 end
+    where id in ($1, $2)
+  `, [correctionFinancialItemId, correctionSecondFinancialItemId]);
+  await expectRejection(
+    'balanced refund component redistribution is not deterministic',
+    'financial_title_allocation_determinism=1'
+  );
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations
+    set effect_minor = case id when $1 then -2 else -1 end
+    where id in ($1, $2)
+  `, [correctionFinancialItemId, correctionSecondFinancialItemId]);
+  await expectPass('refund title allocation deterministic repair', true);
   await pool.query(`
     insert into refund_reporting_correction_sets (
       id, refund_id, correction_version, kind, base_allocation_set_id,
@@ -1649,6 +2880,95 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     'withdrawal, reinstatement, equal-time refund, and second withdrawal chronology',
     true
   );
+  await mutateAppendOnlyFixture(`
+    update dispute_item_allocations
+    set subtotal_effect_minor = -99, tax_effect_minor = 0, total_effect_minor = -99
+    where id = $1
+  `, [firstWithdrawalAllocationId]);
+  await expectRejection(
+    'first dispute withdrawal presentment/source-principal corruption',
+    'dispute_first_withdrawal_source_principal=1'
+  );
+  await mutateAppendOnlyFixture(`
+    update dispute_item_allocations
+    set subtotal_effect_minor = -100, tax_effect_minor = 0, total_effect_minor = -100
+    where id = $1
+  `, [firstWithdrawalAllocationId]);
+  await expectPass('first dispute withdrawal presentment/source-principal repair', true);
+  await expectPass('later dispute withdrawal settlement remains independent', true);
+
+  const legacyDisputeIssueId = '44000000-0000-4000-8000-000000000001';
+  const legacyAllocationIssueId = '44000000-0000-4000-8000-000000000002';
+  const unrelatedAllocationIssueId = '44000000-0000-4000-8000-000000000003';
+  await pool.query(`
+    insert into financial_reconciliation_issues (
+      id, resource_type, resource_id, safe_code, impact, correlation_id
+    ) values
+      ($1, 'dispute', $4, 'currency_mismatch', 'exception',
+        'restore-legacy-dispute-resolution'),
+      ($2, 'allocation_set', $5, 'allocation_mismatch', 'exception',
+        'restore-legacy-allocation-resolution'),
+      ($3, 'allocation_set', $5, 'allocation_fork', 'exception',
+        'restore-unrelated-allocation-resolution')
+  `, [
+    legacyDisputeIssueId,
+    legacyAllocationIssueId,
+    unrelatedAllocationIssueId,
+    combinedDisputeId,
+    firstWithdrawalSetId
+  ]);
+  const legacyAuditIds: string[] = [];
+  for (const [issueId, correlationId] of [
+    [legacyDisputeIssueId, 'restore-legacy-dispute-audit'],
+    [legacyAllocationIssueId, 'restore-legacy-allocation-audit'],
+    [unrelatedAllocationIssueId, 'restore-unrelated-allocation-audit']
+  ] as const) {
+    await pool.query(`
+      select * from resolve_financial_issue_after_worker_recompute($1, $2)
+    `, [issueId, correlationId]);
+    const auditResult = await pool.query<{ id: string }>(`
+      select id
+      from audit_events
+      where action = 'financial.issue.resolved' and resource_id = $1::text
+    `, [issueId]);
+    const auditId = auditResult.rows[0]?.id;
+    if (!auditId) throw new Error('[restore-verifier] missing legacy issue audit witness');
+    legacyAuditIds.push(auditId);
+  }
+  const [legacyDisputeAuditId, legacyAllocationAuditId, unrelatedAllocationAuditId] =
+    legacyAuditIds;
+  if (!legacyDisputeAuditId || !legacyAllocationAuditId || !unrelatedAllocationAuditId) {
+    throw new Error('[restore-verifier] incomplete legacy issue audit witnesses');
+  }
+  await mutateAppendOnlyFixture(`
+    update audit_events set actor_id = 'commerce-worker' where id = $1
+  `, [legacyDisputeAuditId]);
+  await expectPass('legacy commerce-worker dispute resolution audit', true);
+  await mutateAppendOnlyFixture(`
+    update audit_events set actor_id = 'commerce-worker' where id = $1
+  `, [legacyAllocationAuditId]);
+  await expectPass('legacy commerce-worker allocation-set resolution audit', true);
+  await mutateAppendOnlyFixture(`
+    update audit_events set actor_id = 'commerce-worker' where id = $1
+  `, [resolvedAuditId]);
+  await expectRejection(
+    'commerce-worker cannot resolve a payout issue',
+    'resolved_issue_audit_provenance=2'
+  );
+  await mutateAppendOnlyFixture(`
+    update audit_events set actor_id = 'financial-worker' where id = $1
+  `, [resolvedAuditId]);
+  await mutateAppendOnlyFixture(`
+    update audit_events set actor_id = 'commerce-worker' where id = $1
+  `, [unrelatedAllocationAuditId]);
+  await expectRejection(
+    'commerce-worker cannot resolve an unrelated allocation-set issue',
+    'resolved_issue_audit_provenance=2'
+  );
+  await mutateAppendOnlyFixture(`
+    update audit_events set actor_id = 'financial-worker' where id = $1
+  `, [unrelatedAllocationAuditId]);
+  await expectPass('legacy commerce-worker audit witness repair', true);
 
   const unrelatedDisputeId = '43000000-0000-4000-8000-000000000001';
   await pool.query(`
@@ -2327,12 +3647,12 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     insert into refunds (
       id, payment_id, stripe_refund_id, status, amount_minor, currency,
       provider_created_at, allocation_status
-    ) values ($1, $2, 'bt_restore_combined_withdraw_1', 'succeeded', 0, 'USD',
+    ) values ($1, $2, 'bt_restore_combined_withdraw_1', 'succeeded', 1, 'USD',
       '2026-08-06T00:00:00.000Z', 'finalized')
   `, [combinedDisputeId, combinedPaymentId]);
   await pool.query(`
     insert into refund_allocations (id, refund_id, order_item_id, amount_minor, source)
-    values ($1, $2, $3, 0, 'automatic')
+    values ($1, $2, $3, 1, 'automatic')
   `, [
     firstWithdrawalAllocationId,
     combinedDisputeId,
@@ -2342,7 +3662,7 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     insert into refund_allocation_components (
       id, refund_allocation_id, refund_id, order_item_id,
       subtotal_minor, tax_minor, total_minor, currency
-    ) values ($1, $2, $3, $4, 0, 0, 0, 'USD')
+    ) values ($1, $2, $3, $4, 1, 0, 1, 'USD')
   `, [
     duplicateChronologyRefundComponentId,
     firstWithdrawalAllocationId,
@@ -2351,7 +3671,7 @@ async function exerciseInvariantWitnesses(): Promise<void> {
   ]);
   await expectRejection(
     'refund and dispute events duplicate the full durable chronology tuple',
-    'combined_refund_dispute_chronology_capacity=1'
+    'combined_refund_dispute_chronology_capacity='
   );
   await pool.query('set session_replication_role = replica');
   try {
@@ -2436,9 +3756,9 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     set subtotal_effect_minor = -100, tax_effect_minor = 0, total_effect_minor = -100
     where id = $1
   `, [pendingWithdrawalAllocationId]);
-  await expectRejection(
-    'pending-version same-currency presentment must equal its settlement effect',
-    'dispute_item_allocation_graph=1'
+  await expectPass(
+    'pending-version later same-currency presentment remains separate from settlement',
+    true
   );
   await mutateAppendOnlyFixture(`
     update dispute_item_allocations
@@ -2598,20 +3918,23 @@ async function exerciseInvariantWitnesses(): Promise<void> {
   `, [splitAllocationId, splitRefundId, secondItemId]);
   await expectRejection(
     'refund component violates the deterministic two-bucket split',
-    'refund_component_deterministic_split=1'
+    'refund_component_deterministic_split=1',
+    'full'
   );
 
   if (failures.length > 0) {
     throw new Error(`[restore-verifier] invariant witness failures: ${failures.join('; ')}`);
   }
   console.info(
-    '[restore-verifier] classification, payout, replay-child, allocation-graph, refund-component, dispute-presentment, and combined-chronology witnesses passed'
+    '[restore-verifier] schema-object, issue-identity, source-parity, deterministic-allocation, audit, classification, payout, replay-child, allocation-graph, refund-component, dispute-presentment, and combined-chronology witnesses passed'
   );
 }
 
 try {
   await migrate(drizzle({ client: pool }), { migrationsFolder: `${repositoryRoot}/drizzle` });
-  if (exerciseFinancialInvariantWitnesses) {
+  if (printFinancialCatalogContract) {
+    await printCatalogContractCalibration();
+  } else if (exerciseFinancialInvariantWitnesses) {
     await exerciseInvariantWitnesses();
   } else if (seedMissingCredentialAuthority) {
     await pool.query(`
@@ -2625,9 +3948,14 @@ try {
       from inserted_user
     `);
   }
-  if (!exerciseFinancialInvariantWitnesses) {
+  if (!exerciseFinancialInvariantWitnesses && !printFinancialCatalogContract) {
     let seededViolationRejected = false;
-    const { error } = await verifierOutcome();
+    const { error } = await verifierOutcome(
+      seedMissingCredentialAuthority
+        ? 'seeded credential-authority violation'
+        : 'clean executable restore check',
+      'full'
+    );
     if (error) {
       if (
         seedMissingCredentialAuthority &&
@@ -2646,5 +3974,9 @@ try {
     }
   }
 } finally {
-  await pool.end();
+  if (verifierClient) {
+    verifierClient.release();
+    verifierClient = null;
+  }
+  await Promise.all([pool.end(), verifierPool.end()]);
 }

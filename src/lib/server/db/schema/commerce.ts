@@ -270,7 +270,7 @@ export const refunds = pgTable(
     uniqueIndex('refunds_stripe_refund_unique').on(table.stripeRefundId),
     index('refunds_payment_created_idx').on(table.paymentId, table.providerCreatedAt),
     index('refunds_status_updated_idx').on(table.status, table.updatedAt),
-    check('refunds_amount_nonnegative', sql`${table.amountMinor} >= 0`),
+    check('refunds_amount_positive', sql`${table.amountMinor} > 0`),
     check('refunds_currency_iso', sql`${table.currency} ~ '^[A-Z]{3}$'`),
     check('refunds_reason_safe', sql`${table.reason} is null or char_length(${table.reason}) > 0`)
   ]
@@ -298,7 +298,7 @@ export const refundAllocations = pgTable(
       table.orderItemId
     ),
     index('refund_allocations_item_idx').on(table.orderItemId, table.createdAt),
-    check('refund_allocations_amount_nonnegative', sql`${table.amountMinor} >= 0`)
+    check('refund_allocations_amount_positive', sql`${table.amountMinor} > 0`)
   ]
 );
 
@@ -326,7 +326,7 @@ export const disputes = pgTable(
     uniqueIndex('disputes_stripe_dispute_unique').on(table.stripeDisputeId),
     index('disputes_payment_created_idx').on(table.paymentId, table.providerCreatedAt),
     index('disputes_status_updated_idx').on(table.status, table.updatedAt),
-    check('disputes_amount_nonnegative', sql`${table.amountMinor} >= 0`),
+    check('disputes_amount_positive', sql`${table.amountMinor} > 0`),
     check('disputes_currency_iso', sql`${table.currency} ~ '^[A-Z]{3}$'`),
     check('disputes_reason_safe', sql`${table.reason} is null or char_length(${table.reason}) > 0`),
     check(

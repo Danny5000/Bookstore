@@ -1,5 +1,5 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import type { VerifiedStripeEvent } from './stripe/types';
 import { permanentStripeFailure } from './stripe/errors';
 import { parseVerifiedStripeEvent } from './stripe/schemas';
@@ -8,7 +8,7 @@ import { stripeEvents, type StripeEventRow } from '$lib/server/db/schema';
 import type { DatabaseExecutor } from '$lib/server/db/transaction';
 import {
   enqueueJob as defaultEnqueueJob,
-  rearmExhaustedJob
+  rearmPendingStripeEventJob
 } from '$lib/server/jobs/repository';
 import {
   STRIPE_EVENT_JOB,
@@ -158,19 +158,6 @@ async function enqueueStripeEventJob(
   });
 }
 
-async function rearmStripeEventJob(
-  database: DatabaseExecutor,
-  stripeEventId: string,
-  providerEventId: string
-): Promise<void> {
-  await rearmExhaustedJob(database, {
-    type: STRIPE_EVENT_JOB,
-    payload: createStripeEventJobPayload(stripeEventId),
-    deduplicationKey: `stripe:event:${providerEventId}`,
-    maxAttempts: STRIPE_EVENT_JOB_MAX_ATTEMPTS
-  });
-}
-
 export async function acceptStripeEvent(
   database: Database,
   value: VerifiedStripeEvent,
@@ -180,21 +167,21 @@ export async function acceptStripeEvent(
   if (!descriptor) throw permanentStripeFailure();
   const event = descriptor.event;
   return database.transaction(async (transaction) => {
-    const [inserted] = await transaction
-      .insert(stripeEvents)
-      .values({
-        providerEventId: event.providerEventId,
-        eventType: event.type,
-        objectId: event.objectId,
-        liveMode: event.liveMode,
-        apiVersion: event.apiVersion,
-        providerCreatedAt: event.providerCreatedAt,
-        rawBodySha256: event.rawBodySha256,
-        status: 'pending',
-        processedAt: null
-      })
-      .onConflictDoNothing({ target: stripeEvents.providerEventId })
-      .returning();
+    const insertion = await transaction.execute<{
+      id: string;
+      providerEventId: string;
+    }>(sql`
+      insert into "stripe_events" (
+        "provider_event_id", "event_type", "object_id", "live_mode", "api_version",
+        "provider_created_at", "raw_body_sha256"
+      ) values (
+        ${event.providerEventId}, ${event.type}, ${event.objectId}, ${event.liveMode},
+        ${event.apiVersion}, ${event.providerCreatedAt}, ${event.rawBodySha256}
+      )
+      on conflict ("provider_event_id") do nothing
+      returning "id", "provider_event_id" as "providerEventId"
+    `);
+    const inserted = insertion.rows[0];
     if (inserted) {
       await enqueueStripeEventJob(
         transaction,
@@ -209,13 +196,12 @@ export async function acceptStripeEvent(
       .select()
       .from(stripeEvents)
       .where(eq(stripeEvents.providerEventId, event.providerEventId))
-      .limit(1)
-      .for('update');
+      .limit(1);
     if (!existing) throw permanentStripeFailure();
     const exact = timingSafeEqual(rowDigest(existing), immutableDigest(event));
     if (!exact) return { status: 'conflict', stripeEventId: existing.id };
     if (existing.status === 'pending') {
-      await rearmStripeEventJob(transaction, existing.id, existing.providerEventId);
+      await rearmPendingStripeEventJob(transaction, existing.id);
     }
     return { status: 'duplicate', stripeEventId: existing.id };
   });

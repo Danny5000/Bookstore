@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { eq } from 'drizzle-orm';
+import { createAuthClient } from 'better-auth/client';
 import { describe, expect, it } from 'vitest';
 import {
   COMMERCE_CLAIM_EMAIL_JOB,
@@ -18,20 +19,27 @@ import {
 } from '$lib/server/commerce/email/payload';
 import { fulfillCheckoutEvent } from '$lib/server/commerce/fulfillment';
 import { applyCurrentPasswordResetCredential } from '$lib/server/auth/commerce-claim-authorization';
-import { createAuthServer } from '$lib/server/auth/options';
 import {
   canSendCommerceMagicLink,
   canSendMagicLink,
-  ensureCustomerRole
+  ensureCustomerRole,
+  findOrCreateGuestIdentity
 } from '$lib/server/auth/identity';
 import {
+  registerCommerceClaimIssuance
+} from '$lib/server/auth/commerce-claim-capability';
+import { createAuthServer } from '$lib/server/auth/options';
+import { claimGuestPurchases } from '$lib/server/commerce/claims';
+import {
   account,
+  commerceClaimIssuances,
   credentialAuthority,
-  guestIdentities,
+  entitlementGrants,
   jobs,
   orderItems,
   orders,
   outboxMessages,
+  payments,
   session,
   stripeEvents,
   titles,
@@ -42,7 +50,16 @@ import { queueAuthEmail } from '$lib/server/email/enqueue';
 import { authEmailPayloadSchema } from '$lib/server/email/payload';
 import type { JobRecord } from '$lib/server/jobs/types';
 import { OutboxDeduplicationInvariantError } from '$lib/server/outbox/repository';
-import { applicationConfig, databaseClient } from './database';
+import {
+  applicationConfig,
+  databaseClient,
+  ownerDatabaseClient,
+  workerDatabaseClient
+} from './database';
+import {
+  createCommerceClaimAuthorization,
+  traverseCommerceClaimBridge
+} from './commerce-claim-capability';
 
 async function createTitle() {
   const id = randomUUID();
@@ -79,13 +96,10 @@ async function createPaidOrder(
       emailVerified: true
     });
   } else {
-    const [identity] = await databaseClient.db.insert(guestIdentities).values({
-      email
-    }).returning();
-    if (!identity) throw new Error('Expected guest identity');
+    const identity = await findOrCreateGuestIdentity(databaseClient.db, email);
     guestIdentityId = identity.id;
   }
-  await databaseClient.db.insert(orders).values({
+  await ownerDatabaseClient.db.insert(orders).values({
     id: orderId,
     status: 'paid',
     initiatingUserId,
@@ -102,7 +116,7 @@ async function createPaidOrder(
     checkoutExpiresAt: new Date('2026-08-10T12:30:00.000Z'),
     paidAt: new Date('2026-08-10T12:05:00.000Z')
   });
-  await databaseClient.db.insert(orderItems).values({
+  await ownerDatabaseClient.db.insert(orderItems).values({
     id: itemId,
     orderId,
     titleId: title.id,
@@ -115,11 +129,31 @@ async function createPaidOrder(
     totalMinor: 1403,
     stripeLineItemId: `li_test_${itemId}`
   });
+  await ownerDatabaseClient.db.insert(payments).values({
+    orderId,
+    stripePaymentIntentId: `pi_test_${orderId}`,
+    stripeLatestChargeId: `ch_test_${orderId}`,
+    status: 'succeeded',
+    amountMinor: 1403,
+    currency: 'USD',
+    paymentMethodCategory: 'card',
+    paidAt: new Date('2026-08-10T12:05:00.000Z')
+  });
+  await ownerDatabaseClient.db.insert(entitlementGrants).values({
+    titleId: title.id,
+    userId: initiatingUserId,
+    source: 'purchase',
+    orderItemId: itemId,
+    state: initiatingUserId === null ? 'unclaimed' : 'active',
+    stateReason: 'payment_succeeded',
+    grantedAt: new Date('2026-08-10T12:05:00.000Z')
+  });
   return { orderId, itemId };
 }
 
 function createCommerceAuth() {
   const messages = createCommerceMessageEnqueuer(applicationConfig.origin);
+  let claimProof: string | null = null;
   const auth = createAuthServer({
     database: databaseClient.db,
     config: applicationConfig,
@@ -127,12 +161,25 @@ function createCommerceAuth() {
     queueResetEmail: (input) => queueAuthEmail(databaseClient.db, input),
     queueMagicEmail: (input) => queueAuthEmail(databaseClient.db, input),
     queueCommerceClaimEmail: (input) =>
-      queueCommerceClaimEmail(databaseClient.db, messages, input),
+      queueCommerceClaimEmail(workerDatabaseClient.db, messages, input),
     canSendMagicLink: (email) => canSendMagicLink(databaseClient.db, email),
     canSendCommerceMagicLink: (email) => canSendCommerceMagicLink(databaseClient.db, email),
-    onUserCreated: (userId) => ensureCustomerRole(databaseClient.db, userId)
+    onUserCreated: (userId) => ensureCustomerRole(databaseClient.db, userId),
+    registerCommerceClaimIssuance: (input) =>
+      registerCommerceClaimIssuance(workerDatabaseClient.db, input),
+    readCommerceClaimProof: () => claimProof,
+    clearCommerceClaimProof: () => { claimProof = null; }
   });
-  return { auth, messages };
+  return {
+    auth,
+    messages,
+    openCommerceClaimBridge(claimUrl: string): string {
+      const bridge = traverseCommerceClaimBridge(claimUrl, applicationConfig.origin);
+      claimProof = bridge.proofCookieValue;
+      return bridge.actionUrl;
+    },
+    currentCommerceClaimProof: () => claimProof
+  };
 }
 
 function claimJob(orderId: string, type: string = COMMERCE_CLAIM_EMAIL_JOB): JobRecord {
@@ -157,7 +204,7 @@ describe('commerce email persistence', () => {
       );
     }
 
-    const messages = await databaseClient.db.select().from(outboxMessages);
+    const messages = await ownerDatabaseClient.db.select().from(outboxMessages);
     expect(messages).toHaveLength(1);
     expect(messages[0]?.deduplicationKey).toBe(
       `commerce:receipt:order:${fixture.orderId}:v1`
@@ -171,13 +218,13 @@ describe('commerce email persistence', () => {
     expect(await databaseClient.db.select().from(jobs)).toHaveLength(1);
     expect(JSON.stringify(await databaseClient.db.select().from(jobs))).not.toContain('@example.com');
 
-    await databaseClient.db.update(orderItems)
+    await ownerDatabaseClient.db.update(orderItems)
       .set({ titleSnapshot: 'Changed immutable title' })
       .where(eq(orderItems.id, fixture.itemId));
     await expect(databaseClient.db.transaction((transaction) =>
       enqueuer.enqueueAccountReceipt(transaction, fixture.orderId)
     )).rejects.toBeInstanceOf(OutboxDeduplicationInvariantError);
-    expect(await databaseClient.db.select().from(outboxMessages)).toHaveLength(1);
+    expect(await ownerDatabaseClient.db.select().from(outboxMessages)).toHaveLength(1);
     expect(await databaseClient.db.select().from(jobs)).toHaveLength(1);
   });
 
@@ -185,7 +232,7 @@ describe('commerce email persistence', () => {
     const fixture = await createPaidOrder('guest');
     const enqueuer = createCommerceMessageEnqueuer(applicationConfig.origin);
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      await databaseClient.db.transaction((transaction) =>
+      await workerDatabaseClient.db.transaction((transaction) =>
         enqueuer.enqueueGuestClaimPreparation(transaction, fixture.orderId)
       );
     }
@@ -200,7 +247,7 @@ describe('commerce email persistence', () => {
       orderId: fixture.orderId
     });
     expect(JSON.stringify(storedJobs)).not.toContain('@');
-    expect(await databaseClient.db.select().from(outboxMessages)).toHaveLength(0);
+    expect(await ownerDatabaseClient.db.select().from(outboxMessages)).toHaveLength(0);
   });
 
   it('deduplicates access-change messages by internal event UUID', async () => {
@@ -219,7 +266,7 @@ describe('commerce email persistence', () => {
     await databaseClient.db.transaction((transaction) =>
       enqueuer.enqueueAccessChange(transaction, input)
     );
-    expect(await databaseClient.db.select().from(outboxMessages)).toHaveLength(1);
+    expect(await ownerDatabaseClient.db.select().from(outboxMessages)).toHaveLength(1);
     await expect(databaseClient.db.transaction((transaction) =>
       enqueuer.enqueueAccessChange(transaction, { ...input, affectedTitleCount: 1 })
     )).rejects.toBeInstanceOf(OutboxDeduplicationInvariantError);
@@ -239,7 +286,7 @@ describe('commerce email persistence', () => {
       email: 'fulfillment@example.com',
       emailVerified: true
     });
-    await databaseClient.db.insert(orders).values({
+    await ownerDatabaseClient.db.insert(orders).values({
       id: orderId,
       status: 'checkout_open',
       initiatingUserId: userId,
@@ -252,7 +299,7 @@ describe('commerce email persistence', () => {
       statusTokenSha256: 'd'.repeat(64),
       checkoutExpiresAt: new Date('2026-08-10T12:30:00.000Z')
     });
-    await databaseClient.db.insert(orderItems).values({
+    await ownerDatabaseClient.db.insert(orderItems).values({
       id: itemId,
       orderId,
       titleId: title.id,
@@ -262,7 +309,7 @@ describe('commerce email persistence', () => {
       currency: 'USD',
       unitSubtotalMinor: 1299
     });
-    const [event] = await databaseClient.db.insert(stripeEvents).values({
+    const [event] = await ownerDatabaseClient.db.insert(stripeEvents).values({
       providerEventId: `evt_test_${orderId}`,
       eventType: 'checkout.session.completed',
       objectId: sessionId,
@@ -272,7 +319,7 @@ describe('commerce email persistence', () => {
     }).returning();
     if (!event) throw new Error('Expected event');
 
-    await fulfillCheckoutEvent(databaseClient.db, {
+    await fulfillCheckoutEvent(workerDatabaseClient.db, {
       stripeEventId: event.id,
       session: {
         providerSessionId: sessionId,
@@ -320,7 +367,7 @@ describe('commerce email persistence', () => {
     expect((await databaseClient.db.select().from(orders)
       .where(eq(orders.id, orderId)))[0]?.status).toBe('paid');
     expect(parseCommerceEmailPayload(
-      (await databaseClient.db.select().from(outboxMessages))[0]?.payload,
+      (await ownerDatabaseClient.db.select().from(outboxMessages))[0]?.payload,
       applicationConfig.origin
     )).toMatchObject({
       template: 'commerce.account-receipt',
@@ -330,16 +377,21 @@ describe('commerce email persistence', () => {
 
   it('prepares one hashed, atomic magic link and one matching guest receipt', async () => {
     const fixture = await createPaidOrder('guest', 'claim-reader@example.com');
-    const { auth, messages } = createCommerceAuth();
+    const {
+      auth,
+      messages,
+      openCommerceClaimBridge,
+      currentCommerceClaimProof
+    } = createCommerceAuth();
     const handler = createClaimEmailHandler(createClaimEmailOperations(
-      databaseClient.db,
+      workerDatabaseClient.db,
       auth,
       messages,
       applicationConfig.origin
     ));
     await handler(claimJob(fixture.orderId), new AbortController().signal);
 
-    const commerceRows = (await databaseClient.db.select().from(outboxMessages))
+    const commerceRows = (await ownerDatabaseClient.db.select().from(outboxMessages))
       .filter((row) => row.topic === 'email.commerce.v1');
     expect(commerceRows).toHaveLength(1);
     const payload = parseCommerceEmailPayload(
@@ -354,7 +406,9 @@ describe('commerce email persistence', () => {
     if (payload.template !== 'commerce.guest-receipt-claim') {
       throw new Error('Expected guest claim payload');
     }
-    const token = new URL(payload.claimUrl).searchParams.get('token');
+    const token = new URL(
+      traverseCommerceClaimBridge(payload.claimUrl, applicationConfig.origin).actionUrl
+    ).searchParams.get('token');
     if (!token) throw new Error('Expected magic token');
     const tokenRowsBeforeReplay = await databaseClient.db.select().from(verification);
     expect(tokenRowsBeforeReplay).toHaveLength(2);
@@ -364,7 +418,7 @@ describe('commerce email persistence', () => {
     expect(await databaseClient.db.select().from(verification)).toHaveLength(2);
 
     await createClaimEmailHandler(createClaimEmailOperations(
-      databaseClient.db,
+      workerDatabaseClient.db,
       auth,
       messages,
       applicationConfig.origin
@@ -372,7 +426,7 @@ describe('commerce email persistence', () => {
       claimJob(fixture.orderId, COMMERCE_CLAIM_REQUEST_JOB),
       new AbortController().signal
     );
-    const replacements = (await databaseClient.db.select().from(outboxMessages))
+    const replacements = (await ownerDatabaseClient.db.select().from(outboxMessages))
       .filter((row) => row.topic === 'email.commerce.v1');
     expect(replacements).toHaveLength(2);
     expect(replacements[1]?.deduplicationKey).toMatch(
@@ -390,7 +444,7 @@ describe('commerce email persistence', () => {
     // to one current marker, so the older link cannot create a session.
     expect(await databaseClient.db.select().from(verification)).toHaveLength(3);
 
-    const stale = await auth.handler(new Request(payload.claimUrl, {
+    const stale = await auth.handler(new Request(openCommerceClaimBridge(payload.claimUrl), {
       headers: { origin: applicationConfig.origin },
       redirect: 'manual'
     }));
@@ -402,7 +456,8 @@ describe('commerce email persistence', () => {
     expect(staleCookies).toMatch(/Max-Age=0/iu);
     expect(await databaseClient.db.select().from(session)).toHaveLength(0);
 
-    const request = () => auth.handler(new Request(replacementPayload.claimUrl, {
+    const request = () => auth.handler(new Request(
+      openCommerceClaimBridge(replacementPayload.claimUrl), {
       headers: { origin: applicationConfig.origin },
       redirect: 'manual'
     }));
@@ -410,31 +465,94 @@ describe('commerce email persistence', () => {
     expect(first.status).toBe(302);
     const firstCookies = first.headers.get('set-cookie') ?? '';
     expect(firstCookies).toMatch(/(?:better-auth|__Secure-better-auth)\.session_token=/u);
-    expect(firstCookies).toContain('pale-orbit-commerce-claim=');
-    expect(firstCookies).toMatch(/HttpOnly/iu);
-    expect(firstCookies).toMatch(/SameSite=Lax/iu);
-    expect(firstCookies).toContain('Path=/claim/complete');
+    expect(firstCookies).not.toContain('pale-orbit-commerce-claim=');
+    expect(currentCommerceClaimProof()).not.toBeNull();
     expect(await databaseClient.db.select().from(session)).toHaveLength(1);
-    expect((await databaseClient.db.select().from(verification)).filter((row) =>
-      row.identifier.startsWith('pale-orbit:commerce-claim-authorization:')
-    )).toHaveLength(1);
+    expect(await ownerDatabaseClient.db
+      .select({ state: commerceClaimIssuances.state })
+      .from(commerceClaimIssuances))
+      .toEqual([{ state: 'authorized' }]);
     const reused = await request();
     expect(reused.headers.get('set-cookie')).toBeNull();
     expect(await databaseClient.db.select().from(session)).toHaveLength(1);
   });
 
+  it('falls back to a receipt when the identity is claimed before its magic job runs', async () => {
+    const email = `claimed-before-email-${randomUUID()}@example.com`;
+    await createPaidOrder('guest', email);
+    const later = await createPaidOrder('guest', email);
+    const claimantId = randomUUID();
+    await databaseClient.db.insert(user).values({
+      id: claimantId,
+      name: 'Claimed-before-email reader',
+      email,
+      emailVerified: true
+    });
+    const authorizationToken = await createCommerceClaimAuthorization(databaseClient.db, {
+      email,
+      kind: 'commerce-magic'
+    });
+    await expect(claimGuestPurchases(databaseClient.db, {
+      userId: claimantId,
+      correlationId: `claimed-before-email-${later.orderId}`,
+      authorizationToken
+    })).resolves.toMatchObject({ claimed: true, claimedOrderCount: 2 });
+    const verificationBefore = await ownerDatabaseClient.db
+      .select({ identifier: verification.identifier })
+      .from(verification);
+    const issuanceBefore = await ownerDatabaseClient.db
+      .select({
+        claimProofSha256: commerceClaimIssuances.claimProofSha256,
+        state: commerceClaimIssuances.state
+      })
+      .from(commerceClaimIssuances);
+
+    const { auth, messages } = createCommerceAuth();
+    await createClaimEmailHandler(createClaimEmailOperations(
+      workerDatabaseClient.db,
+      auth,
+      messages,
+      applicationConfig.origin
+    ))(claimJob(later.orderId), new AbortController().signal);
+
+    const allMessages = await ownerDatabaseClient.db.select().from(outboxMessages);
+    const commerceRows = allMessages
+      .filter((row) => row.topic === 'email.commerce.v1');
+    expect(commerceRows).toHaveLength(1);
+    const payload = parseCommerceEmailPayload(
+      commerceRows[0]?.payload,
+      applicationConfig.origin
+    );
+    expect(payload).toMatchObject({
+      template: 'commerce.account-receipt',
+      messageId: later.orderId,
+      to: email
+    });
+    expect(JSON.stringify(payload)).not.toContain('claimUrl');
+    expect(allMessages.filter((row) => row.topic === 'email.auth.v1')).toHaveLength(0);
+    expect(await ownerDatabaseClient.db
+      .select({ identifier: verification.identifier })
+      .from(verification)).toEqual(verificationBefore);
+    expect(await ownerDatabaseClient.db
+      .select({
+        claimProofSha256: commerceClaimIssuances.claimProofSha256,
+        state: commerceClaimIssuances.state
+      })
+      .from(commerceClaimIssuances)).toEqual(issuanceBefore);
+  });
+
   it('cannot turn a pre-issued commerce magic link into claim authority after a credential appears', async () => {
     const email = 'magic-credential-race@example.com';
     const fixture = await createPaidOrder('guest', email);
-    const { auth, messages } = createCommerceAuth();
+    const { auth, messages, openCommerceClaimBridge } = createCommerceAuth();
     await createClaimEmailHandler(createClaimEmailOperations(
-      databaseClient.db,
+      workerDatabaseClient.db,
       auth,
       messages,
       applicationConfig.origin
     ))(claimJob(fixture.orderId), new AbortController().signal);
     const payload = parseCommerceEmailPayload(
-      (await databaseClient.db.select().from(outboxMessages)
+      (await ownerDatabaseClient.db.select().from(outboxMessages)
         .where(eq(outboxMessages.topic, 'email.commerce.v1')))[0]?.payload,
       applicationConfig.origin
     );
@@ -461,7 +579,7 @@ describe('commerce email persistence', () => {
       authorizedPasswordHash: 'test-only-credential-hash'
     });
 
-    const verified = await auth.handler(new Request(payload.claimUrl, {
+    const verified = await auth.handler(new Request(openCommerceClaimBridge(payload.claimUrl), {
       headers: { origin: applicationConfig.origin },
       redirect: 'manual'
     }));
@@ -476,23 +594,29 @@ describe('commerce email persistence', () => {
     expect(rejectedCookies).toMatch(/(?:better-auth|__Secure-better-auth)\.session_token=/u);
     expect(rejectedCookies).toMatch(/Max-Age=0/iu);
     expect(await databaseClient.db.select().from(session)).toHaveLength(0);
-    expect((await databaseClient.db.select().from(verification)).filter((row) =>
-      row.identifier.startsWith('pale-orbit:commerce-claim-authorization:')
-    )).toHaveLength(0);
+    expect(await ownerDatabaseClient.db
+      .select({ state: commerceClaimIssuances.state })
+      .from(commerceClaimIssuances))
+      .toEqual([{ state: 'issued' }]);
   });
 
   it('accepts commerce magic after stripping an intervening unverified credential', async () => {
     const email = 'magic-unverified-credential-race@example.com';
     const fixture = await createPaidOrder('guest', email);
-    const { auth, messages } = createCommerceAuth();
+    const {
+      auth,
+      messages,
+      openCommerceClaimBridge,
+      currentCommerceClaimProof
+    } = createCommerceAuth();
     await createClaimEmailHandler(createClaimEmailOperations(
-      databaseClient.db,
+      workerDatabaseClient.db,
       auth,
       messages,
       applicationConfig.origin
     ))(claimJob(fixture.orderId), new AbortController().signal);
     const payload = parseCommerceEmailPayload(
-      (await databaseClient.db.select().from(outboxMessages)
+      (await ownerDatabaseClient.db.select().from(outboxMessages)
         .where(eq(outboxMessages.topic, 'email.commerce.v1')))[0]?.payload,
       applicationConfig.origin
     );
@@ -526,14 +650,15 @@ describe('commerce email persistence', () => {
       updatedAt: new Date('2026-08-10T12:00:00.000Z')
     });
 
-    const verified = await auth.handler(new Request(payload.claimUrl, {
+    const verified = await auth.handler(new Request(openCommerceClaimBridge(payload.claimUrl), {
       headers: { origin: applicationConfig.origin },
       redirect: 'manual'
     }));
     expect(verified.status).toBe(302);
     const cookies = verified.headers.get('set-cookie') ?? '';
     expect(cookies).toMatch(/(?:better-auth|__Secure-better-auth)\.session_token=/u);
-    expect(cookies).toContain('pale-orbit-commerce-claim=');
+    expect(cookies).not.toContain('pale-orbit-commerce-claim=');
+    expect(currentCommerceClaimProof()).not.toBeNull();
     expect(await databaseClient.db.select().from(account)
       .where(eq(account.userId, credentialUserId))).toHaveLength(0);
     expect(await databaseClient.db.select().from(credentialAuthority)
@@ -545,9 +670,10 @@ describe('commerce email persistence', () => {
       .where(eq(session.userId, credentialUserId));
     expect(survivingSessions).toHaveLength(1);
     expect(survivingSessions[0]?.token).not.toBe(attackerSessionToken);
-    expect((await databaseClient.db.select().from(verification)).filter((row) =>
-      row.identifier.startsWith('pale-orbit:commerce-claim-authorization:')
-    )).toHaveLength(1);
+    expect(await ownerDatabaseClient.db
+      .select({ state: commerceClaimIssuances.state })
+      .from(commerceClaimIssuances))
+      .toEqual([{ state: 'authorized' }]);
 
     const ordinaryRequest = await auth.handler(new Request(
       `${applicationConfig.origin}/api/auth/sign-in/magic-link`,
@@ -562,7 +688,7 @@ describe('commerce email persistence', () => {
     ));
     expect(ordinaryRequest.status).toBe(200);
     const ordinaryPayload = authEmailPayloadSchema.parse(
-      (await databaseClient.db.select().from(outboxMessages)
+      (await ownerDatabaseClient.db.select().from(outboxMessages)
         .where(eq(outboxMessages.topic, 'email.auth.v1'))).at(-1)?.payload
     );
     expect(ordinaryPayload.template).toBe('auth.magic-link');
@@ -575,15 +701,15 @@ describe('commerce email persistence', () => {
   it('rejects older commerce magic after a newer reset generation has applied', async () => {
     const email = 'magic-applied-reset-race@example.com';
     const fixture = await createPaidOrder('guest', email);
-    const { auth, messages } = createCommerceAuth();
+    const { auth, messages, openCommerceClaimBridge } = createCommerceAuth();
     await createClaimEmailHandler(createClaimEmailOperations(
-      databaseClient.db,
+      workerDatabaseClient.db,
       auth,
       messages,
       applicationConfig.origin
     ))(claimJob(fixture.orderId), new AbortController().signal);
     const payload = parseCommerceEmailPayload(
-      (await databaseClient.db.select().from(outboxMessages)
+      (await ownerDatabaseClient.db.select().from(outboxMessages)
         .where(eq(outboxMessages.topic, 'email.commerce.v1')))[0]?.payload,
       applicationConfig.origin
     );
@@ -621,7 +747,7 @@ describe('commerce email persistence', () => {
       }
     ))).status).toBe(200);
     const resetPayload = authEmailPayloadSchema.parse(
-      (await databaseClient.db.select().from(outboxMessages)
+      (await ownerDatabaseClient.db.select().from(outboxMessages)
         .where(eq(outboxMessages.topic, 'email.auth.v1'))).at(-1)?.payload
     );
     expect(resetPayload.template).toBe('auth.password-reset');
@@ -636,7 +762,7 @@ describe('commerce email persistence', () => {
     // cleanup/completion interleaving without timing-dependent barriers.
     await databaseClient.db.delete(account).where(eq(account.userId, credentialUserId));
 
-    const rejected = await auth.handler(new Request(payload.claimUrl, {
+    const rejected = await auth.handler(new Request(openCommerceClaimBridge(payload.claimUrl), {
       headers: { origin: applicationConfig.origin },
       redirect: 'manual'
     }));
@@ -650,9 +776,10 @@ describe('commerce email persistence', () => {
     expect(cookies).toMatch(/(?:better-auth|__Secure-better-auth)\.session_token=/u);
     expect(cookies).toMatch(/Max-Age=0/iu);
     expect(await databaseClient.db.select().from(session)).toHaveLength(0);
-    expect((await databaseClient.db.select().from(verification)).filter((row) =>
-      row.identifier.startsWith('pale-orbit:commerce-claim-authorization:')
-    )).toHaveLength(0);
+    expect(await ownerDatabaseClient.db
+      .select({ state: commerceClaimIssuances.state })
+      .from(commerceClaimIssuances))
+      .toEqual([{ state: 'issued' }]);
     expect(await loadClaimEmailEligibility(databaseClient.db, fixture.orderId)).toMatchObject({
       accountState: 'password-recovery',
       email
@@ -669,15 +796,20 @@ describe('commerce email persistence', () => {
       email,
       emailVerified: true
     });
-    const { auth, messages } = createCommerceAuth();
+    const {
+      auth,
+      messages,
+      openCommerceClaimBridge,
+      currentCommerceClaimProof
+    } = createCommerceAuth();
     await createClaimEmailHandler(createClaimEmailOperations(
-      databaseClient.db,
+      workerDatabaseClient.db,
       auth,
       messages,
       applicationConfig.origin
     ))(claimJob(fixture.orderId), new AbortController().signal);
     const payload = parseCommerceEmailPayload(
-      (await databaseClient.db.select().from(outboxMessages)
+      (await ownerDatabaseClient.db.select().from(outboxMessages)
         .where(eq(outboxMessages.topic, 'email.commerce.v1')))[0]?.payload,
       applicationConfig.origin
     );
@@ -698,20 +830,21 @@ describe('commerce email persistence', () => {
     ));
     expect(resetRequested.status).toBe(200);
     const resetPayload = authEmailPayloadSchema.parse(
-      (await databaseClient.db.select().from(outboxMessages)
+      (await ownerDatabaseClient.db.select().from(outboxMessages)
         .where(eq(outboxMessages.topic, 'email.auth.v1'))).at(-1)?.payload
     );
     expect(resetPayload.template).toBe('auth.password-reset');
     const resetToken = new URL(resetPayload.actionUrl).pathname.split('/').at(-1);
     if (!resetToken) throw new Error('Expected pending password reset token');
 
-    const claimed = await auth.handler(new Request(payload.claimUrl, {
+    const claimed = await auth.handler(new Request(openCommerceClaimBridge(payload.claimUrl), {
       headers: { origin: applicationConfig.origin },
       redirect: 'manual'
     }));
     expect(claimed.status).toBe(302);
     expect(claimed.headers.get('set-cookie') ?? '')
-      .toContain('pale-orbit-commerce-claim=');
+      .not.toContain('pale-orbit-commerce-claim=');
+    expect(currentCommerceClaimProof()).not.toBeNull();
     expect(await databaseClient.db.select().from(credentialAuthority)
       .where(eq(credentialAuthority.userId, passwordlessUserId))).toHaveLength(0);
     expect((await databaseClient.db.select().from(verification)).filter((row) =>
@@ -757,7 +890,7 @@ describe('commerce email persistence', () => {
       }
     ));
     expect(response.status).toBe(200);
-    expect(await databaseClient.db.select().from(outboxMessages)).toHaveLength(0);
+    expect(await ownerDatabaseClient.db.select().from(outboxMessages)).toHaveLength(0);
     expect(JSON.stringify(await databaseClient.db.select().from(jobs)))
       .not.toContain(victim.orderId);
   });
@@ -773,13 +906,13 @@ describe('commerce email persistence', () => {
     });
     const { auth, messages } = createCommerceAuth();
     await createClaimEmailHandler(createClaimEmailOperations(
-      databaseClient.db,
+      workerDatabaseClient.db,
       auth,
       messages,
       applicationConfig.origin
     ))(claimJob(fixture.orderId), new AbortController().signal);
     const payload = parseCommerceEmailPayload(
-      (await databaseClient.db.select().from(outboxMessages)
+      (await ownerDatabaseClient.db.select().from(outboxMessages)
         .where(eq(outboxMessages.topic, 'email.commerce.v1')))[0]?.payload,
       applicationConfig.origin
     );
@@ -803,7 +936,12 @@ describe('commerce email persistence', () => {
       userId,
       password: 'test-password-hash'
     });
-    const { auth, messages } = createCommerceAuth();
+    const {
+      auth,
+      messages,
+      openCommerceClaimBridge,
+      currentCommerceClaimProof
+    } = createCommerceAuth();
     const blockedMagic = await auth.handler(new Request(
       `${applicationConfig.origin}/api/auth/sign-in/magic-link`,
       {
@@ -820,15 +958,18 @@ describe('commerce email persistence', () => {
       }
     ));
     expect(blockedMagic.status).toBe(200);
-    expect(await databaseClient.db.select().from(outboxMessages)).toHaveLength(0);
+    expect(await ownerDatabaseClient.db.select().from(outboxMessages)).toHaveLength(0);
+    const blockedMagicVerification = await ownerDatabaseClient.db
+      .select({ identifier: verification.identifier, value: verification.value })
+      .from(verification);
     await createClaimEmailHandler(createClaimEmailOperations(
-      databaseClient.db,
+      workerDatabaseClient.db,
       auth,
       messages,
       applicationConfig.origin
     ))(claimJob(fixture.orderId), new AbortController().signal);
 
-    const rows = await databaseClient.db.select().from(outboxMessages);
+    const rows = await ownerDatabaseClient.db.select().from(outboxMessages);
     const commerce = rows.find((row) => row.topic === 'email.commerce.v1');
     const recoveryMail = rows.find((row) => row.topic === 'email.auth.v1');
     const commercePayload = parseCommerceEmailPayload(
@@ -842,9 +983,51 @@ describe('commerce email persistence', () => {
       template: 'auth.password-reset',
       to: email
     });
-    expect(decodeURIComponent(
-      new URL(authPayload.actionUrl).searchParams.get('callbackURL') ?? ''
-    )).toBe('/reset-password?purpose=commerce-claim');
+    if (authPayload.template !== 'auth.password-reset') {
+      throw new Error('Expected commerce password recovery payload');
+    }
+    const nativeResetAction = new URL(openCommerceClaimBridge(authPayload.actionUrl));
+    const resetCallback = new URL(
+      nativeResetAction.searchParams.get('callbackURL') ?? '',
+      applicationConfig.origin
+    );
+    expect(resetCallback.pathname).toBe('/reset-password');
+    expect(resetCallback.searchParams.size).toBe(2);
+    expect(resetCallback.searchParams.get('purpose')).toBe('commerce-claim');
+    expect(resetCallback.searchParams.get('orderId')).toBe(fixture.orderId);
+    const resetToken = nativeResetAction.pathname.split('/').at(-1);
+    if (!resetToken) throw new Error('Expected commerce recovery token');
     expect(await databaseClient.db.select().from(verification)).not.toHaveLength(0);
+    const captured: { response?: Response } = {};
+    const client = createAuthClient({
+      baseURL: `${applicationConfig.origin}/api/auth`,
+      fetchOptions: {
+        customFetchImpl: async (input, init) => {
+          const headers = new Headers(init?.headers);
+          headers.set('origin', applicationConfig.origin);
+          const response = await auth.handler(new Request(input, { ...init, headers }));
+          captured.response = response.clone();
+          return response;
+        }
+      }
+    });
+    const reset = await client.resetPassword({
+      token: resetToken,
+      newPassword: 'Commerce-recovery-password-2026'
+    });
+    expect(reset.error).toBeNull();
+    expect(reset.data).toMatchObject({ status: true, commerceClaimReady: true });
+    expect(await captured.response?.clone().json())
+      .toEqual({ status: true, commerceClaimReady: true });
+    expect(captured.response?.headers.get('set-cookie') ?? '')
+      .not.toContain('pale-orbit-commerce-claim=');
+    expect(currentCommerceClaimProof()).not.toBeNull();
+    expect(await ownerDatabaseClient.db
+      .select({ state: commerceClaimIssuances.state })
+      .from(commerceClaimIssuances))
+      .toEqual([{ state: 'authorized' }]);
+    expect(await ownerDatabaseClient.db
+      .select({ identifier: verification.identifier, value: verification.value })
+      .from(verification)).toEqual(blockedMagicVerification);
   });
 });

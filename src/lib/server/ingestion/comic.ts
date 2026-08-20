@@ -18,6 +18,7 @@ export interface IngestComicInput {
   sourceKey: StorageKey;
   titleId: string;
   revisionId: string;
+  generation: number;
   limits: IngestionLimits;
   signal: AbortSignal;
 }
@@ -103,7 +104,12 @@ export async function ingestComic(input: IngestComicInput): Promise<ComicIngesti
       const normalized = await normalizeImage({
         storage: input.storage,
         source: await archive.read(entry),
-        destination: revisionComicPageKey(input.titleId, input.revisionId, pageId),
+        destination: revisionComicPageKey(
+          input.titleId,
+          input.revisionId,
+          input.generation,
+          pageId
+        ),
         profile: 'comic',
         limits: input.limits,
         signal: input.signal
@@ -122,6 +128,7 @@ export async function ingestComic(input: IngestComicInput): Promise<ComicIngesti
     const suggestionKey = revisionCoverSuggestionKey(
       input.titleId,
       input.revisionId,
+      input.generation,
       suggestionId
     );
     const copied = await input.storage.copy(firstPage.storageKey, suggestionKey);

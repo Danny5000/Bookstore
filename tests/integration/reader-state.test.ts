@@ -29,7 +29,7 @@ import {
   saveReaderPreferences,
   saveReaderTitlePreferences
 } from '$lib/server/reader-state/service';
-import { databaseClient } from './database';
+import { databaseClient, ownerDatabaseClient, workerDatabaseClient } from './database';
 
 async function createCustomer(label: string): Promise<Extract<Actor, { type: 'user' }>> {
   const id = randomUUID();
@@ -43,7 +43,7 @@ async function createCustomer(label: string): Promise<Extract<Actor, { type: 'us
 }
 
 async function grant(userId: string, titleId: string): Promise<void> {
-  await databaseClient.db.transaction((transaction) =>
+  await workerDatabaseClient.db.transaction((transaction) =>
     setPreservedGrantState(transaction, {
       userId,
       titleId,
@@ -54,7 +54,7 @@ async function grant(userId: string, titleId: string): Promise<void> {
 }
 
 async function createProsePublication() {
-  const [title] = await databaseClient.db.insert(titles).values({
+  const [title] = await ownerDatabaseClient.db.insert(titles).values({
     slug: `state-prose-${randomUUID()}`,
     title: 'State Prose',
     description: 'Reader state prose fixture',
@@ -65,14 +65,14 @@ async function createProsePublication() {
     visibility: 'private'
   }).returning();
   if (!title) throw new Error('Expected title');
-  const [revision] = await databaseClient.db.insert(titleRevisions).values({
+  const [revision] = await ownerDatabaseClient.db.insert(titleRevisions).values({
     titleId: title.id,
     state: 'active',
     createdByActorId: 'fixture',
     changeSummary: 'State fixture'
   }).returning();
   if (!revision) throw new Error('Expected revision');
-  const [section] = await databaseClient.db.insert(proseSections).values({
+  const [section] = await ownerDatabaseClient.db.insert(proseSections).values({
     revisionId: revision.id,
     ordinal: 0,
     label: 'Chapter',
@@ -91,8 +91,8 @@ async function createProsePublication() {
     },
     imageId: null
   }));
-  await databaseClient.db.insert(proseBlocks).values(blocks);
-  const [presentation] = await databaseClient.db.insert(revisionPresentations).values({
+  await ownerDatabaseClient.db.insert(proseBlocks).values(blocks);
+  const [presentation] = await ownerDatabaseClient.db.insert(revisionPresentations).values({
     revisionId: revision.id,
     state: 'published',
     previewProseSectionId: section.id,
@@ -100,14 +100,14 @@ async function createProsePublication() {
     previewComicPageId: null
   }).returning();
   if (!presentation) throw new Error('Expected presentation');
-  await databaseClient.db.update(titles)
+  await ownerDatabaseClient.db.update(titles)
     .set({ activeRevisionId: revision.id })
     .where(eq(titles.id, title.id));
   return { title, revision, presentation, section, blocks };
 }
 
 async function createComicPublication() {
-  const [title] = await databaseClient.db.insert(titles).values({
+  const [title] = await ownerDatabaseClient.db.insert(titles).values({
     slug: `state-comic-${randomUUID()}`,
     title: 'State Comic',
     description: 'Reader state comic fixture',
@@ -118,14 +118,14 @@ async function createComicPublication() {
     visibility: 'private'
   }).returning();
   if (!title) throw new Error('Expected comic title');
-  const [revision] = await databaseClient.db.insert(titleRevisions).values({
+  const [revision] = await ownerDatabaseClient.db.insert(titleRevisions).values({
     titleId: title.id,
     state: 'active',
     createdByActorId: 'fixture',
     changeSummary: 'Comic state fixture'
   }).returning();
   if (!revision) throw new Error('Expected comic revision');
-  const [page] = await databaseClient.db.insert(comicPages).values({
+  const [page] = await ownerDatabaseClient.db.insert(comicPages).values({
     revisionId: revision.id,
     ordinal: 1,
     sourcePath: '001.png',
@@ -137,7 +137,7 @@ async function createComicPublication() {
     height: 200
   }).returning();
   if (!page) throw new Error('Expected comic page');
-  const [presentation] = await databaseClient.db.insert(revisionPresentations).values({
+  const [presentation] = await ownerDatabaseClient.db.insert(revisionPresentations).values({
     revisionId: revision.id,
     state: 'published',
     guidedViewEnabled: true,
@@ -146,7 +146,7 @@ async function createComicPublication() {
     previewComicPageId: page.id
   }).returning();
   if (!presentation) throw new Error('Expected comic presentation');
-  await databaseClient.db.insert(comicPanelRegions).values({
+  await ownerDatabaseClient.db.insert(comicPanelRegions).values({
     revisionId: revision.id,
     presentationId: presentation.id,
     pageId: page.id,
@@ -156,7 +156,7 @@ async function createComicPublication() {
     width: 1,
     height: 1
   });
-  await databaseClient.db.update(titles)
+  await ownerDatabaseClient.db.update(titles)
     .set({ activeRevisionId: revision.id })
     .where(eq(titles.id, title.id));
   return { title, revision, presentation, page };
@@ -177,26 +177,26 @@ async function seedHistoricalProseState(
   options: { digest: string | null; targetMatches: readonly number[] }
 ) {
   for (const index of options.targetMatches) {
-    await databaseClient.db.update(proseBlocks).set({
+    await ownerDatabaseClient.db.update(proseBlocks).set({
       semanticFingerprintSha256: options.digest,
       semanticFingerprintVersion: options.digest ? 1 : null
     }).where(eq(proseBlocks.id, publication.blocks[index]!.id));
   }
-  const [sourceRevision] = await databaseClient.db.insert(titleRevisions).values({
+  const [sourceRevision] = await ownerDatabaseClient.db.insert(titleRevisions).values({
     titleId: publication.title.id,
     state: 'retired',
     createdByActorId: 'fixture',
     changeSummary: 'Historical migration source'
   }).returning();
   if (!sourceRevision) throw new Error('Expected source revision');
-  const [sourceSection] = await databaseClient.db.insert(proseSections).values({
+  const [sourceSection] = await ownerDatabaseClient.db.insert(proseSections).values({
     revisionId: sourceRevision.id,
     ordinal: 0,
     label: 'Old chapter',
     sourceReference: 'EPUB/old.xhtml'
   }).returning();
   if (!sourceSection) throw new Error('Expected source section');
-  const [sourceBlock] = await databaseClient.db.insert(proseBlocks).values({
+  const [sourceBlock] = await ownerDatabaseClient.db.insert(proseBlocks).values({
     revisionId: sourceRevision.id,
     sectionId: sourceSection.id,
     ordinal: 0,
@@ -207,7 +207,7 @@ async function seedHistoricalProseState(
     semanticFingerprintVersion: options.digest ? 1 : null
   }).returning();
   if (!sourceBlock) throw new Error('Expected source block');
-  await databaseClient.db.insert(readerProgress).values({
+  await ownerDatabaseClient.db.insert(readerProgress).values({
     userId: customer.id,
     titleId: publication.title.id,
     revisionId: sourceRevision.id,
@@ -215,7 +215,7 @@ async function seedHistoricalProseState(
     blockId: sourceBlock.id,
     proseOffset: 2
   });
-  const [bookmark] = await databaseClient.db.insert(readerBookmarks).values({
+  const [bookmark] = await ownerDatabaseClient.db.insert(readerBookmarks).values({
     userId: customer.id,
     titleId: publication.title.id,
     revisionId: sourceRevision.id,
@@ -357,7 +357,7 @@ describe('optimistic reader state', () => {
     expect(state.bookmarks).toHaveLength(1);
     expect(state.preferences).toEqual({ fontSize: 18, typeface: 'serif', paper: 'white', version: 0 });
 
-    await databaseClient.db.transaction((transaction) =>
+    await workerDatabaseClient.db.transaction((transaction) =>
       setPreservedGrantState(transaction, {
         userId: customer.id,
         titleId: publication.title.id,
@@ -390,21 +390,21 @@ describe('optimistic reader state', () => {
       expectedVersion: 0
     });
 
-    const [replacementRevision] = await databaseClient.db.insert(titleRevisions).values({
+    const [replacementRevision] = await ownerDatabaseClient.db.insert(titleRevisions).values({
       titleId: publication.title.id,
       state: 'ready_for_review',
       createdByActorId: 'fixture',
       changeSummary: 'Concurrent replacement'
     }).returning();
     if (!replacementRevision) throw new Error('Expected replacement revision');
-    const [replacementSection] = await databaseClient.db.insert(proseSections).values({
+    const [replacementSection] = await ownerDatabaseClient.db.insert(proseSections).values({
       revisionId: replacementRevision.id,
       ordinal: 0,
       label: 'Replacement',
       sourceReference: 'EPUB/replacement.xhtml'
     }).returning();
     if (!replacementSection) throw new Error('Expected replacement section');
-    const [replacementBlock] = await databaseClient.db.insert(proseBlocks).values({
+    const [replacementBlock] = await ownerDatabaseClient.db.insert(proseBlocks).values({
       revisionId: replacementRevision.id,
       sectionId: replacementSection.id,
       ordinal: 0,
@@ -413,7 +413,7 @@ describe('optimistic reader state', () => {
       imageId: null
     }).returning();
     if (!replacementBlock) throw new Error('Expected replacement block');
-    await databaseClient.db.insert(revisionPresentations).values({
+    await ownerDatabaseClient.db.insert(revisionPresentations).values({
       revisionId: replacementRevision.id,
       state: 'published',
       previewProseSectionId: replacementSection.id,
@@ -425,7 +425,7 @@ describe('optimistic reader state', () => {
     const release = new Promise<void>((resolve) => { releaseReplacement = resolve; });
     let signalLocked!: () => void;
     const locked = new Promise<void>((resolve) => { signalLocked = resolve; });
-    const replacement = databaseClient.db.transaction(async (transaction) => {
+    const replacement = ownerDatabaseClient.db.transaction(async (transaction) => {
       await transaction.execute(
         sql`select pg_advisory_xact_lock(hashtextextended(${publication.title.id}, 0))`
       );
@@ -462,7 +462,7 @@ describe('optimistic reader state', () => {
     const customer = await createCustomer('Reader Snapshot Customer');
     const publication = await createProsePublication();
     await grant(customer.id, publication.title.id);
-    await databaseClient.db.update(proseBlocks)
+    await ownerDatabaseClient.db.update(proseBlocks)
       .set({ semanticFingerprintSha256: '8'.repeat(64), semanticFingerprintVersion: 1 })
       .where(eq(proseBlocks.id, publication.blocks[0]!.id));
     await saveProgress({
@@ -471,21 +471,21 @@ describe('optimistic reader state', () => {
       expectedVersion: 0
     });
 
-    const [replacementRevision] = await databaseClient.db.insert(titleRevisions).values({
+    const [replacementRevision] = await ownerDatabaseClient.db.insert(titleRevisions).values({
       titleId: publication.title.id,
       state: 'ready_for_review',
       createdByActorId: 'fixture',
       changeSummary: 'Reader snapshot replacement'
     }).returning();
     if (!replacementRevision) throw new Error('Expected reader snapshot replacement');
-    const [replacementSection] = await databaseClient.db.insert(proseSections).values({
+    const [replacementSection] = await ownerDatabaseClient.db.insert(proseSections).values({
       revisionId: replacementRevision.id,
       ordinal: 0,
       label: 'Replacement',
       sourceReference: 'EPUB/reader-snapshot-replacement.xhtml'
     }).returning();
     if (!replacementSection) throw new Error('Expected reader snapshot replacement section');
-    const [replacementBlock] = await databaseClient.db.insert(proseBlocks).values({
+    const [replacementBlock] = await ownerDatabaseClient.db.insert(proseBlocks).values({
       revisionId: replacementRevision.id,
       sectionId: replacementSection.id,
       ordinal: 0,
@@ -496,13 +496,16 @@ describe('optimistic reader state', () => {
       semanticFingerprintVersion: 1
     }).returning();
     if (!replacementBlock) throw new Error('Expected reader snapshot replacement block');
-    const [replacementPresentation] = await databaseClient.db.insert(revisionPresentations).values({
-      revisionId: replacementRevision.id,
-      state: 'published',
-      previewProseSectionId: replacementSection.id,
-      previewProseBlockId: replacementBlock.id,
-      previewComicPageId: null
-    }).returning();
+    const [replacementPresentation] = await ownerDatabaseClient.db
+      .insert(revisionPresentations)
+      .values({
+        revisionId: replacementRevision.id,
+        state: 'published',
+        previewProseSectionId: replacementSection.id,
+        previewProseBlockId: replacementBlock.id,
+        previewComicPageId: null
+      })
+      .returning();
     if (!replacementPresentation) throw new Error('Expected reader snapshot replacement presentation');
 
     const staleDecision = {
@@ -520,7 +523,7 @@ describe('optimistic reader state', () => {
     const release = new Promise<void>((resolve) => { releaseReplacement = resolve; });
     let signalLocked!: () => void;
     const locked = new Promise<void>((resolve) => { signalLocked = resolve; });
-    const replacement = databaseClient.db.transaction(async (transaction) => {
+    const replacement = ownerDatabaseClient.db.transaction(async (transaction) => {
       await transaction.execute(
         sql`select pg_advisory_xact_lock(hashtextextended(${publication.title.id}, 0))`
       );
@@ -633,7 +636,7 @@ describe('optimistic reader state', () => {
       digest: 'f'.repeat(64),
       targetMatches: [1]
     });
-    await databaseClient.db.insert(readerProgress).values({
+    await ownerDatabaseClient.db.insert(readerProgress).values({
       userId: existingCustomer.id,
       titleId: existingPublication.title.id,
       revisionId: existingPublication.revision.id,
@@ -641,7 +644,7 @@ describe('optimistic reader state', () => {
       blockId: existingPublication.blocks[0]!.id,
       proseOffset: 1
     });
-    const [targetBookmark] = await databaseClient.db.insert(readerBookmarks).values({
+    const [targetBookmark] = await ownerDatabaseClient.db.insert(readerBookmarks).values({
       userId: existingCustomer.id,
       titleId: existingPublication.title.id,
       revisionId: existingPublication.revision.id,
@@ -667,18 +670,18 @@ describe('optimistic reader state', () => {
     const customer = await createCustomer('Comic Migration Customer');
     const publication = await createComicPublication();
     await grant(customer.id, publication.title.id);
-    await databaseClient.db.update(comicPages).set({
+    await ownerDatabaseClient.db.update(comicPages).set({
       semanticFingerprintSha256: '9'.repeat(64),
       semanticFingerprintVersion: 1
     }).where(eq(comicPages.id, publication.page.id));
-    const [sourceRevision] = await databaseClient.db.insert(titleRevisions).values({
+    const [sourceRevision] = await ownerDatabaseClient.db.insert(titleRevisions).values({
       titleId: publication.title.id,
       state: 'retired',
       createdByActorId: 'fixture',
       changeSummary: 'Historical comic source'
     }).returning();
     if (!sourceRevision) throw new Error('Expected comic source revision');
-    const [sourcePage] = await databaseClient.db.insert(comicPages).values({
+    const [sourcePage] = await ownerDatabaseClient.db.insert(comicPages).values({
       revisionId: sourceRevision.id,
       ordinal: 1,
       sourcePath: 'old.png',
@@ -692,14 +695,14 @@ describe('optimistic reader state', () => {
       height: 200
     }).returning();
     if (!sourcePage) throw new Error('Expected comic source page');
-    const [sourcePresentation] = await databaseClient.db.insert(revisionPresentations).values({
+    const [sourcePresentation] = await ownerDatabaseClient.db.insert(revisionPresentations).values({
       revisionId: sourceRevision.id,
       state: 'published',
       guidedViewEnabled: true,
       previewComicPageId: sourcePage.id
     }).returning();
     if (!sourcePresentation) throw new Error('Expected comic source presentation');
-    await databaseClient.db.insert(comicPanelRegions).values({
+    await ownerDatabaseClient.db.insert(comicPanelRegions).values({
       revisionId: sourceRevision.id,
       presentationId: sourcePresentation.id,
       pageId: sourcePage.id,
@@ -709,7 +712,7 @@ describe('optimistic reader state', () => {
       width: 0.5,
       height: 1
     });
-    await databaseClient.db.insert(readerProgress).values({
+    await ownerDatabaseClient.db.insert(readerProgress).values({
       userId: customer.id,
       titleId: publication.title.id,
       revisionId: sourceRevision.id,
@@ -738,21 +741,21 @@ describe('optimistic reader state', () => {
       digest: '6'.repeat(64),
       targetMatches: [1]
     });
-    const [replacementRevision] = await databaseClient.db.insert(titleRevisions).values({
+    const [replacementRevision] = await ownerDatabaseClient.db.insert(titleRevisions).values({
       titleId: publication.title.id,
       state: 'ready_for_review',
       createdByActorId: 'fixture',
       changeSummary: 'Migration race replacement'
     }).returning();
     if (!replacementRevision) throw new Error('Expected migration replacement');
-    const [replacementSection] = await databaseClient.db.insert(proseSections).values({
+    const [replacementSection] = await ownerDatabaseClient.db.insert(proseSections).values({
       revisionId: replacementRevision.id,
       ordinal: 0,
       label: 'Replacement',
       sourceReference: 'EPUB/migration-replacement.xhtml'
     }).returning();
     if (!replacementSection) throw new Error('Expected migration replacement section');
-    const [replacementBlock] = await databaseClient.db.insert(proseBlocks).values({
+    const [replacementBlock] = await ownerDatabaseClient.db.insert(proseBlocks).values({
       revisionId: replacementRevision.id,
       sectionId: replacementSection.id,
       ordinal: 0,
@@ -763,7 +766,7 @@ describe('optimistic reader state', () => {
       semanticFingerprintVersion: 1
     }).returning();
     if (!replacementBlock) throw new Error('Expected migration replacement block');
-    await databaseClient.db.insert(revisionPresentations).values({
+    await ownerDatabaseClient.db.insert(revisionPresentations).values({
       revisionId: replacementRevision.id,
       state: 'published',
       previewProseSectionId: replacementSection.id,
@@ -774,7 +777,7 @@ describe('optimistic reader state', () => {
     const release = new Promise<void>((resolve) => { releaseReplacement = resolve; });
     let signalLocked!: () => void;
     const locked = new Promise<void>((resolve) => { signalLocked = resolve; });
-    const replacement = databaseClient.db.transaction(async (transaction) => {
+    const replacement = ownerDatabaseClient.db.transaction(async (transaction) => {
       await transaction.execute(
         sql`select pg_advisory_xact_lock(hashtextextended(${publication.title.id}, 0))`
       );

@@ -59,9 +59,12 @@ describe('commerce claim-email job', () => {
     expect(ops.requestMagicLink).toHaveBeenCalledOnce();
   });
 
-  it('requests one metadata-bound magic link for no account or a verified account', async () => {
+  it('does not enqueue a conflicting fallback when magic-link delivery created the receipt', async () => {
     const record = job();
-    const ops = operations();
+    const receiptExists = vi.fn()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+    const ops = operations({ receiptExists });
     await createClaimEmailHandler(ops)(record, new AbortController().signal);
     expect(ops.requestMagicLink).toHaveBeenCalledWith({
       orderId: record.payload.orderId,
@@ -70,6 +73,36 @@ describe('commerce claim-email job', () => {
     });
     expect(ops.requestPasswordRecovery).not.toHaveBeenCalled();
     expect(ops.enqueueReceiptWithoutClaim).not.toHaveBeenCalled();
+    expect(receiptExists).toHaveBeenCalledTimes(2);
+  });
+
+  it('falls back to a receipt when a claimed-between-stages magic request queues nothing', async () => {
+    const record = job();
+    const receiptExists = vi.fn(async () => false);
+    const ops = operations({ receiptExists });
+
+    await createClaimEmailHandler(ops)(record, new AbortController().signal);
+
+    expect(ops.requestMagicLink).toHaveBeenCalledOnce();
+    expect(receiptExists).toHaveBeenCalledTimes(2);
+    expect(ops.enqueueReceiptWithoutClaim).toHaveBeenCalledWith(record.payload.orderId);
+  });
+
+  it('uses a receipt-only eligibility result without invoking either auth flow', async () => {
+    const record = job();
+    const ops = operations({
+      loadEligibility: vi.fn(async (orderId) => ({
+        orderId,
+        email: 'already-claimed@example.com',
+        accountState: 'receipt-only' as const
+      }))
+    });
+
+    await createClaimEmailHandler(ops)(record, new AbortController().signal);
+
+    expect(ops.requestMagicLink).not.toHaveBeenCalled();
+    expect(ops.requestPasswordRecovery).not.toHaveBeenCalled();
+    expect(ops.enqueueReceiptWithoutClaim).toHaveBeenCalledWith(record.payload.orderId);
   });
 
   it('forces credential recovery before enqueueing a receipt with no claim action', async () => {
@@ -87,6 +120,27 @@ describe('commerce claim-email job', () => {
     await createClaimEmailHandler(ops)(record, new AbortController().signal);
     expect(order).toEqual(['recovery', 'receipt']);
     expect(ops.requestMagicLink).not.toHaveBeenCalled();
+  });
+
+  it('does not enqueue a conflicting fallback for a recovery re-request with a base receipt', async () => {
+    const record = job();
+    const ops = operations({
+      receiptExists: vi.fn(async () => true),
+      loadEligibility: vi.fn(async (orderId) => ({
+        orderId,
+        email: 'pending@example.com',
+        accountState: 'password-recovery' as const
+      }))
+    });
+
+    await createClaimEmailHandler(ops, { allowExistingReceipt: true })(
+      record,
+      new AbortController().signal
+    );
+
+    expect(ops.requestPasswordRecovery).toHaveBeenCalledOnce();
+    expect(ops.enqueueReceiptWithoutClaim).not.toHaveBeenCalled();
+    expect(ops.receiptExists).toHaveBeenCalledOnce();
   });
 
   it('treats malformed or ineligible jobs as permanent without sending', async () => {

@@ -26,6 +26,7 @@ import {
 } from './input';
 import { withLockedAdminTitle } from './lock';
 import { toAdminTitleDto, type AdminTitleDto } from './titles';
+import { insertTitleRevision } from './title-revision-insert';
 
 const acceptRevisionUploadInputSchema = z.strictObject({
   titleId: z.uuid(),
@@ -85,22 +86,17 @@ export async function acceptRevisionUpload(
       if (!parent) throw new CatalogDomainError('parent_revision_not_in_title');
     }
 
-    const [revision] = await transaction
-      .insert(titleRevisions)
-      .values({
-        titleId: input.titleId,
-        parentRevisionId: input.parentRevisionId,
-        state: 'uploaded',
-        createdByActorId: actor.id,
-        changeSummary: input.changeSummary,
-        stagingStorageKey: input.stagingStorageKey,
-        stagingChecksumSha256: input.stagingChecksumSha256,
-        stagingByteSize: input.stagingByteSize,
-        uploadFilename: input.uploadFilename,
-        uploadMimeType: input.uploadMimeType,
-        ingestionGeneration: 0
-      })
-      .returning();
+    const revision = await insertTitleRevision(transaction, {
+      titleId: input.titleId,
+      parentRevisionId: input.parentRevisionId,
+      createdByActorId: actor.id,
+      changeSummary: input.changeSummary,
+      stagingStorageKey: input.stagingStorageKey,
+      stagingChecksumSha256: input.stagingChecksumSha256,
+      stagingByteSize: input.stagingByteSize,
+      uploadFilename: input.uploadFilename,
+      uploadMimeType: input.uploadMimeType
+    });
     if (!revision) throw new Error('Revision insert returned no row');
 
     await enqueueRevisionIngestion(transaction, revision.id, revision.ingestionGeneration);

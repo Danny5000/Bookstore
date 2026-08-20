@@ -7,20 +7,40 @@ import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 
-type FixtureKind =
-  | 'valid'
+type PrePlan6BInvalidFixtureKind =
   | 'zero-refund'
   | 'zero-allocation'
   | 'zero-dispute'
   | 'over-allocation'
   | 'currency-conflict'
   | 'partial-facts'
+  | 'no-allocation-cumulative-over-capacity'
+  | 'no-allocation-mixed-over-capacity'
+  | 'no-allocation-missing-item-total'
+  | 'no-allocation-zero-item-total'
+  | 'no-allocation-item-currency-conflict'
+  | 'no-allocation-refund-currency-conflict'
+  | 'no-allocation-payment-capacity-mismatch'
+  | 'no-allocation-mixed-refund-currency-conflict'
   | 'pending-refund-allocation'
   | 'failed-refund-allocation'
   | 'canceled-refund-allocation';
 
+type PostPlan6BInvalidFixtureKind =
+  | 'legacy-payout-membership-currency'
+  | 'legacy-source-principal';
+
+type ClaimGrantInvalidFixtureKind =
+  | 'legacy-claimed-guest-null-grant'
+  | 'legacy-paid-guest-missing-grant';
+
+type ClaimAuthorityInvalidFixtureKind =
+  | ClaimGrantInvalidFixtureKind
+  | 'legacy-claimed-identity-authority'
+  | 'legacy-entitlement-projection';
+
 const invalidRefundStatusByFixture: Partial<
-  Record<Exclude<FixtureKind, 'valid'>, 'pending' | 'failed' | 'canceled'>
+  Record<PrePlan6BInvalidFixtureKind, 'pending' | 'failed' | 'canceled'>
 > = {
   'pending-refund-allocation': 'pending',
   'failed-refund-allocation': 'failed',
@@ -38,6 +58,7 @@ interface LegacyFixture {
   refundAllocationIds: string[];
   sequentialRefundAllocationIds: string[];
   sequentialRefundOrderItemId: string;
+  guestClaimFacts: GuestOrderGraph;
   historyIds: Record<'stripeEvent' | 'job' | 'outbox' | 'audit', string>;
   countsBefore: Record<string, number>;
 }
@@ -65,6 +86,12 @@ const PLAN6B_TABLES = [
   'refund_reporting_correction_sets',
   'refund_reporting_correction_items',
   'refund_allocation_finalization_effects'
+] as const;
+const STORAGE_CLEANUP_INDEXES = [
+  'title_revisions_staging_storage_key_idx',
+  'title_revisions_original_storage_key_idx',
+  'titles_cover_storage_key_idx',
+  'jobs_active_ingest_revision_identity_idx'
 ] as const;
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -103,7 +130,10 @@ function unwrapPostgresError(error: unknown): { code: string; message: string } 
 function assertExpectedMigrationFailure(
   error: unknown,
   expectedReason: RegExp,
-  fixture: Exclude<FixtureKind, 'valid'>
+  fixture:
+    | PrePlan6BInvalidFixtureKind
+    | PostPlan6BInvalidFixtureKind
+    | ClaimAuthorityInvalidFixtureKind
 ): void {
   const postgresError = unwrapPostgresError(error);
   assert(postgresError !== null, `${fixture} rollback must expose an underlying PostgreSQL error`);
@@ -173,15 +203,18 @@ function databasePool(): Pool {
   });
 }
 
-async function createMigrationFolder(include0007: boolean): Promise<string> {
+async function createMigrationFolderThrough(maxMigrationIndex: 8 | 9 | 10 | 11): Promise<string> {
   const runId = process.env.PLAN6B_UPGRADE_RUN_ID;
   assert(runId && /^[a-f0-9]{16}$/u.test(runId), 'owned run ID is missing or invalid');
-  const folder = join(dirname(process.env.PLAN6B_UPGRADE_MANIFEST!), `migrations-${include0007 ? 'full' : 'legacy'}`);
+  const folder = join(
+    dirname(process.env.PLAN6B_UPGRADE_MANIFEST!),
+    `migrations-through-${maxMigrationIndex}`
+  );
   await mkdir(join(folder, 'meta'), { recursive: true });
   const journal = JSON.parse(
     await readFile(join(repositoryRoot, 'drizzle', 'meta', '_journal.json'), 'utf8')
   ) as { version: string; dialect: string; entries: Array<Record<string, unknown> & { idx: number; tag: string }> };
-  const entries = journal.entries.filter((entry) => entry.idx <= (include0007 ? 7 : 6));
+  const entries = journal.entries.filter((entry) => entry.idx <= maxMigrationIndex);
   for (const entry of entries) {
     const source = join(repositoryRoot, 'drizzle', `${entry.tag}.sql`);
     await writeFile(join(folder, `${entry.tag}.sql`), await readFile(source));
@@ -222,6 +255,8 @@ async function insertUserAndTitles(client: PoolClient, count: number): Promise<{
   return { userId, titleIds };
 }
 
+type PaymentSchemaPhase = 'legacy' | 'plan6b';
+
 async function insertOrderGraph(
   client: PoolClient,
   userId: string,
@@ -235,6 +270,7 @@ async function insertOrderGraph(
     paymentAmount?: number;
     paymentCurrency?: string;
     paymentReconciliation?: 'pending' | 'reconciled' | 'exception';
+    paymentSchemaPhase?: PaymentSchemaPhase;
     itemSubtotals?: number[];
     itemTaxes?: number[];
   }
@@ -288,24 +324,134 @@ async function insertOrderGraph(
        values ($1, $2, 'purchase', $3, 'active', 'paid')`,
       [titleId, userId, itemId]
     );
+    await client.query(
+      `insert into entitlements (user_id, title_id)
+       values ($1, $2)
+       on conflict (user_id, title_id) do nothing`,
+      [userId, titleId]
+    );
   }
   const paymentId = randomUUID();
-  await client.query(
-    `insert into payments
-       (id, order_id, stripe_payment_intent_id, stripe_latest_charge_id, status,
-        amount_minor, currency, paid_at, reconciliation_status)
-     values ($1, $2, $3, $4, 'succeeded', $5, $6, clock_timestamp(), $7)`,
-    [
-      paymentId,
-      orderId,
-      `pi_${options.key}_${paymentId}`,
-      `ch_${options.key}_${paymentId}`,
-      options.paymentAmount ?? orderSubtotal + orderTax,
-      options.paymentCurrency ?? 'USD',
-      options.paymentReconciliation ?? 'pending'
-    ]
-  );
+  const paymentParameters = [
+    paymentId,
+    orderId,
+    `pi_${options.key}_${paymentId}`,
+    `ch_${options.key}_${paymentId}`,
+    options.paymentAmount ?? orderSubtotal + orderTax,
+    options.paymentCurrency ?? 'USD'
+  ];
+  if ((options.paymentSchemaPhase ?? 'legacy') === 'legacy') {
+    await client.query(
+      `insert into payments
+         (id, order_id, stripe_payment_intent_id, stripe_latest_charge_id, status,
+          amount_minor, currency, paid_at, reconciliation_status)
+       values ($1, $2, $3, $4, 'succeeded', $5, $6, clock_timestamp(), $7)`,
+      [...paymentParameters, options.paymentReconciliation ?? 'pending']
+    );
+  } else {
+    await client.query(
+      `insert into payments
+         (id, order_id, stripe_payment_intent_id, stripe_latest_charge_id, status,
+          amount_minor, currency, paid_at)
+       values ($1, $2, $3, $4, 'succeeded', $5, $6, clock_timestamp())`,
+      paymentParameters
+    );
+  }
   return { orderId, orderItemIds, paymentId };
+}
+
+interface GuestOrderGraph {
+  identityId: string;
+  orderId: string;
+  orderItemId: string;
+  paymentId: string;
+  grantId: string | null;
+}
+
+async function insertGuestOrderGraph(
+  client: PoolClient,
+  input: {
+    key: string;
+    email: string;
+    titleId: string;
+    claimedByUserId?: string;
+    grantUserId?: string;
+    includeGrant: boolean;
+    paymentSchemaPhase?: PaymentSchemaPhase;
+  }
+): Promise<GuestOrderGraph> {
+  const identityId = randomUUID();
+  const orderId = randomUUID();
+  const orderItemId = randomUUID();
+  const paymentId = randomUUID();
+  const grantId = input.includeGrant ? randomUUID() : null;
+  await client.query(
+    `insert into guest_identities
+       (id, email, claimed_by_user_id, claimed_at)
+     values ($1, $2, $3, case when $3::uuid is null then null else clock_timestamp() end)`,
+    [identityId, input.email, input.claimedByUserId ?? null]
+  );
+  await client.query(
+    `insert into orders
+       (id, status, initiating_user_id, guest_identity_id, purchase_email,
+        currency, subtotal_minor, tax_minor, total_minor,
+        client_checkout_attempt_id, quote_fingerprint_sha256,
+        status_token_sha256, paid_at)
+     values ($1, 'paid', null, $2, $3, 'USD', 1000, 100, 1100,
+       $4, repeat('c', 64), repeat('d', 64), clock_timestamp())`,
+    [orderId, identityId, input.email, randomUUID()]
+  );
+  await client.query(
+    `insert into order_items
+       (id, order_id, title_id, title_snapshot, creator_name_snapshot,
+        format, currency, unit_subtotal_minor, tax_minor, total_minor)
+     values ($1, $2, $3, $4, 'Legacy Guest Creator', 'prose',
+       'USD', 1000, 100, 1100)`,
+    [orderItemId, orderId, input.titleId, `Legacy guest ${input.key}`]
+  );
+  const paymentParameters = [
+    paymentId,
+    orderId,
+    `pi_guest_${input.key}_${paymentId}`,
+    `ch_guest_${input.key}_${paymentId}`
+  ];
+  if ((input.paymentSchemaPhase ?? 'legacy') === 'legacy') {
+    await client.query(
+      `insert into payments
+         (id, order_id, stripe_payment_intent_id, stripe_latest_charge_id,
+          status, amount_minor, currency, paid_at, reconciliation_status)
+       values ($1, $2, $3, $4, 'succeeded', 1100, 'USD',
+         clock_timestamp(), 'pending')`,
+      paymentParameters
+    );
+  } else {
+    await client.query(
+      `insert into payments
+         (id, order_id, stripe_payment_intent_id, stripe_latest_charge_id,
+          status, amount_minor, currency, paid_at)
+       values ($1, $2, $3, $4, 'succeeded', 1100, 'USD', clock_timestamp())`,
+      paymentParameters
+    );
+  }
+  if (grantId) {
+    await client.query(
+      `insert into entitlement_grants
+         (id, title_id, user_id, source, order_item_id, state, state_reason)
+       values ($1, $2, $3, 'purchase', $4,
+         case when $3::uuid is null then 'unclaimed'::entitlement_grant_status
+              else 'active'::entitlement_grant_status end,
+         'payment_succeeded')`,
+      [grantId, input.titleId, input.grantUserId ?? null, orderItemId]
+    );
+    if (input.grantUserId) {
+      await client.query(
+        `insert into entitlements (user_id, title_id)
+         values ($1, $2)`,
+        [input.grantUserId, input.titleId]
+      );
+    }
+  }
+  return { identityId, orderId, orderItemId, paymentId, grantId };
 }
 
 async function insertRefund(
@@ -381,7 +527,7 @@ async function tableCounts(client: Pool | PoolClient, tableNames: string[]): Pro
 }
 
 async function seedValidLegacyFixture(client: PoolClient): Promise<LegacyFixture> {
-  const { userId, titleIds } = await insertUserAndTitles(client, 11);
+  const { userId, titleIds } = await insertUserAndTitles(client, 12);
   const paymentIds: Record<string, string> = {};
   const refundIds: Record<string, string> = {};
   const disputeIds: Record<string, string> = {};
@@ -505,6 +651,19 @@ async function seedValidLegacyFixture(client: PoolClient): Promise<LegacyFixture
     reconciliation: 'exception'
   });
 
+  const zeroPayment = await insertOrderGraph(client, userId, [titleIds[11]!], {
+    key: 'zero-payment',
+    orderSubtotal: 0,
+    orderTax: 0,
+    paymentAmount: 0,
+    paymentReconciliation: 'pending',
+    itemSubtotals: [0],
+    itemTaxes: [0]
+  });
+  orderIds.push(zeroPayment.orderId);
+  orderItemIds.push(...zeroPayment.orderItemIds);
+  paymentIds.zero = zeroPayment.paymentId;
+
   const sequential = await insertOrderGraph(client, userId, [titleIds[10]!], {
     key: 'sequential-partial',
     orderSubtotal: 2,
@@ -553,6 +712,17 @@ async function seedValidLegacyFixture(client: PoolClient): Promise<LegacyFixture
     );
   }
 
+  const guestClaimFacts = await insertGuestOrderGraph(client, {
+    key: 'valid-unclaimed',
+    email: 'legacy-unclaimed-guest@example.com',
+    titleId: titleIds[0]!,
+    includeGrant: true,
+    paymentSchemaPhase: 'legacy'
+  });
+  orderIds.push(guestClaimFacts.orderId);
+  orderItemIds.push(guestClaimFacts.orderItemId);
+  paymentIds.guestClaim = guestClaimFacts.paymentId;
+
   const historyIds = {
     stripeEvent: randomUUID(),
     job: randomUUID(),
@@ -592,6 +762,8 @@ async function seedValidLegacyFixture(client: PoolClient): Promise<LegacyFixture
     'refund_allocations',
     'disputes',
     'entitlement_grants',
+    'entitlements',
+    'guest_identities',
     'stripe_events',
     'jobs',
     'outbox_messages',
@@ -608,24 +780,83 @@ async function seedValidLegacyFixture(client: PoolClient): Promise<LegacyFixture
     refundAllocationIds,
     sequentialRefundAllocationIds,
     sequentialRefundOrderItemId: sequential.orderItemIds[0]!,
+    guestClaimFacts,
     historyIds,
     countsBefore: await tableCounts(client, preservedTables)
   };
 }
 
-async function seedInvalidLegacyFixture(client: PoolClient, kind: Exclude<FixtureKind, 'valid'>): Promise<void> {
+async function seedInvalidLegacyFixture(
+  client: PoolClient,
+  kind: PrePlan6BInvalidFixtureKind
+): Promise<void> {
   const { userId, titleIds } = await insertUserAndTitles(client, 2);
   const invalidRefundStatus = invalidRefundStatusByFixture[kind];
   const graph = await insertOrderGraph(client, userId, titleIds, {
     key: kind,
-    ...(kind === 'currency-conflict' ? { itemCurrencies: ['USD', 'EUR'] } : {})
+    ...(kind === 'currency-conflict' || kind === 'no-allocation-item-currency-conflict'
+      ? { itemCurrencies: ['USD', 'EUR'] }
+      : {}),
+    ...(kind === 'no-allocation-zero-item-total'
+      ? { itemSubtotals: [0, 1000], itemTaxes: [0, 100] }
+      : {}),
+    ...(kind === 'no-allocation-payment-capacity-mismatch' ? { paymentAmount: 2100 } : {})
   });
+  if (kind === 'no-allocation-missing-item-total') {
+    await client.query(
+      `update order_items set tax_minor = null, total_minor = null where id = $1`,
+      [graph.orderItemIds[0]]
+    );
+  }
   if (kind === 'zero-dispute') {
     await insertDispute(client, graph.paymentId, {
       key: kind,
       amountMinor: 0,
       reconciliation: 'exception'
     });
+    return;
+  }
+  if (kind.startsWith('no-allocation-')) {
+    const firstAmount = kind === 'no-allocation-cumulative-over-capacity' ? 1200 : 500;
+    const firstRefundId = await insertRefund(client, graph.paymentId, {
+      key: `${kind}-first`,
+      status: 'succeeded',
+      amountMinor: firstAmount,
+      currency: kind === 'no-allocation-refund-currency-conflict' ? 'EUR' : 'USD',
+      reconciliation: 'exception',
+      providerCreatedAt: '2026-08-01T00:00:00.000Z'
+    });
+    if (kind === 'no-allocation-cumulative-over-capacity') {
+      await insertRefund(client, graph.paymentId, {
+        key: `${kind}-second`,
+        status: 'succeeded',
+        amountMinor: 1200,
+        reconciliation: 'exception',
+        providerCreatedAt: '2026-08-02T00:00:00.000Z'
+      });
+    } else if (kind === 'no-allocation-mixed-over-capacity') {
+      await client.query(
+        `insert into refund_allocations (refund_id, order_item_id, amount_minor, source)
+         values ($1, $2, 500, 'automatic')`,
+        [firstRefundId, graph.orderItemIds[0]]
+      );
+      await insertRefund(client, graph.paymentId, {
+        key: `${kind}-second`,
+        status: 'succeeded',
+        amountMinor: 1800,
+        reconciliation: 'exception',
+        providerCreatedAt: '2026-08-02T00:00:00.000Z'
+      });
+    } else if (kind === 'no-allocation-mixed-refund-currency-conflict') {
+      await insertRefund(client, graph.paymentId, {
+        key: `${kind}-failed`,
+        status: 'failed',
+        amountMinor: 300,
+        currency: 'EUR',
+        reconciliation: 'exception',
+        providerCreatedAt: '2026-08-02T00:00:00.000Z'
+      });
+    }
     return;
   }
   const refundId = await insertRefund(client, graph.paymentId, {
@@ -674,6 +905,356 @@ async function migrationCount(pool: Pool): Promise<number> {
     `select count(*)::text as count from drizzle.__drizzle_migrations`
   );
   return Number(row.count);
+}
+
+interface LegacySourcePrincipalConflict {
+  readonly paymentBalanceId: string;
+  readonly paymentAmountMinor: number;
+  readonly refundBalanceId: string;
+  readonly refundAmountMinor: number;
+  readonly disputePresentmentId: string;
+  readonly disputeAmountMinor: number;
+  readonly disputeSubtotalMinor: number;
+  readonly disputeTaxMinor: number;
+}
+
+async function seedLegacyPayoutMembershipCurrencyConflict(pool: Pool): Promise<string> {
+  const payoutId = randomUUID();
+  const balanceId = randomUUID();
+  const runId = randomUUID();
+  await pool.query(
+    `insert into stripe_payouts (
+       id, provider_id, live_mode, amount_minor, currency, automatic, method, status,
+       reconciliation_status, provider_created_at, arrival_at, retrieved_at,
+       fingerprint_sha256
+     ) values (
+       $1, $2, false, 100, 'USD', true, 'standard', 'paid', 'not_applicable',
+       clock_timestamp(), clock_timestamp(), clock_timestamp(), repeat('a', 64)
+     )`,
+    [payoutId, `po_legacy_currency_${payoutId}`]
+  );
+  await pool.query(
+    `insert into stripe_balance_transactions (
+       id, provider_id, live_mode, raw_type, reporting_category, balance_type,
+       amount_minor, fee_minor, net_minor, currency, status, provider_created_at,
+       available_at, fingerprint_sha256
+     ) values (
+       $1, $2, false, 'adjustment', 'adjustment', 'payments', 100, 0, 100,
+       'EUR', 'available', clock_timestamp(), clock_timestamp(), repeat('b', 64)
+     )`,
+    [balanceId, `bt_legacy_currency_${balanceId}`]
+  );
+  await pool.query(
+    `insert into payout_import_runs (
+       id, payout_id, generation, state, candidate_count, page_count, safe_outcome,
+       completed_at
+     ) values ($1, $2, 0, 'published', 1, 1, 'published', clock_timestamp())`,
+    [runId, payoutId]
+  );
+  await pool.query(
+    `insert into stripe_payout_balance_transactions (
+       payout_id, balance_transaction_id, published_from_run_id
+     ) values ($1, $2, $3)`,
+    [payoutId, balanceId, runId]
+  );
+  return balanceId;
+}
+
+async function seedLegacySourcePrincipalConflict(
+  pool: Pool,
+  fixture: LegacyFixture
+): Promise<LegacySourcePrincipalConflict> {
+  const payment = await one<{
+    amount_minor: number;
+    currency: string;
+    stripe_latest_charge_id: string;
+    order_item_id: string;
+    item_subtotal_minor: number;
+    item_tax_minor: number;
+  }>(
+    pool,
+    `select payment.amount_minor, payment.currency, payment.stripe_latest_charge_id,
+       order_item.id as order_item_id,
+       order_item.unit_subtotal_minor as item_subtotal_minor,
+       order_item.tax_minor as item_tax_minor
+     from payments payment
+     join order_items order_item on order_item.order_id = payment.order_id
+     where payment.id = $1
+     order by order_item.id
+     limit 1`,
+    [fixture.paymentIds.reconciled]
+  );
+  const refund = await one<{
+    amount_minor: number;
+    currency: string;
+    stripe_refund_id: string;
+  }>(
+    pool,
+    `select amount_minor, currency, stripe_refund_id from refunds where id = $1`,
+    [fixture.refundIds.full]
+  );
+  const dispute = await one<{
+    amount_minor: number;
+    currency: string;
+    stripe_dispute_id: string;
+    order_item_id: string;
+    item_subtotal_minor: number;
+    item_tax_minor: number;
+  }>(
+    pool,
+    `select dispute.amount_minor, dispute.currency, dispute.stripe_dispute_id,
+       order_item.id as order_item_id,
+       order_item.unit_subtotal_minor as item_subtotal_minor,
+       order_item.tax_minor as item_tax_minor
+     from disputes dispute
+     join payments payment on payment.id = dispute.payment_id
+     join order_items order_item on order_item.order_id = payment.order_id
+     where dispute.id = $1
+     order by order_item.id
+     limit 1`,
+    [fixture.disputeIds.reconciled]
+  );
+  const statusClient = await pool.connect();
+  try {
+    await statusClient.query('begin');
+    await statusClient.query('set local session_replication_role = replica');
+    await statusClient.query(
+      `update payments set financial_evidence_status = 'fee_reconciled' where id = $1`,
+      [fixture.paymentIds.reconciled]
+    );
+    await statusClient.query(
+      `update refunds set financial_evidence_status = 'fee_reconciled' where id = $1`,
+      [fixture.refundIds.full]
+    );
+    await statusClient.query(
+      `update disputes set financial_evidence_status = 'fee_reconciled' where id = $1`,
+      [fixture.disputeIds.reconciled]
+    );
+    await statusClient.query('commit');
+  } catch (error) {
+    await statusClient.query('rollback');
+    throw error;
+  } finally {
+    statusClient.release();
+  }
+  const statuses = await pool.query<{ source_type: string; evidence_status: string }>(
+    `select 'payment'::text as source_type, financial_evidence_status::text as evidence_status
+       from payments where id = $1
+     union all
+     select 'refund', financial_evidence_status::text from refunds where id = $2
+     union all
+     select 'dispute', financial_evidence_status::text from disputes where id = $3
+     order by source_type`,
+    [fixture.paymentIds.reconciled, fixture.refundIds.full, fixture.disputeIds.reconciled]
+  );
+  equal(
+    statuses.rows,
+    [
+      { source_type: 'dispute', evidence_status: 'fee_reconciled' },
+      { source_type: 'payment', evidence_status: 'fee_reconciled' },
+      { source_type: 'refund', evidence_status: 'fee_reconciled' }
+    ],
+    'late-upgrade source-principal witnesses start fee-reconciled'
+  );
+
+  const paymentBalanceId = randomUUID();
+  const refundBalanceId = randomUUID();
+  const disputeBalanceId = randomUUID();
+  const paymentGrossSetId = randomUUID();
+  const paymentFeeSetId = randomUUID();
+  const refundGrossSetId = randomUUID();
+  const refundFeeSetId = randomUUID();
+  const disputeSetId = randomUUID();
+  const disputeFeeSetId = randomUUID();
+  const disputePresentmentId = randomUUID();
+  await pool.query(
+    `insert into stripe_balance_transactions (
+       id, provider_id, live_mode, source_family, source_id, raw_type,
+       reporting_category, balance_type, amount_minor, fee_minor, net_minor,
+       currency, status, provider_created_at, available_at, fingerprint_sha256
+     ) values
+       ($1, $2, false, 'charge', $3, 'charge', 'charge', 'payments', $4, 0, $4,
+         $5, 'available', '2026-08-01T00:00:00.000Z',
+         '2026-08-01T00:00:00.000Z', repeat('c', 64)),
+       ($6, $7, false, 'refund', $8, 'refund', 'refund', 'payments', $9, 0, $9,
+         $10, 'available', '2026-08-02T00:00:00.000Z',
+         '2026-08-02T00:00:00.000Z', repeat('d', 64)),
+       ($11, $12, false, 'dispute', $13, 'adjustment', 'dispute', 'payments',
+         $14, 0, $14, $15, 'available', '2026-08-03T00:00:00.000Z',
+         '2026-08-03T00:00:00.000Z', repeat('e', 64))`,
+    [
+      paymentBalanceId,
+      `bt_legacy_payment_${paymentBalanceId}`,
+      payment.stripe_latest_charge_id,
+      payment.amount_minor,
+      payment.currency,
+      refundBalanceId,
+      `bt_legacy_refund_${refundBalanceId}`,
+      refund.stripe_refund_id,
+      -refund.amount_minor,
+      refund.currency,
+      disputeBalanceId,
+      `bt_legacy_dispute_${disputeBalanceId}`,
+      dispute.stripe_dispute_id,
+      -dispute.amount_minor,
+      dispute.currency
+    ]
+  );
+  await pool.query(
+    `insert into financial_classification_versions (
+       subject_type, subject_id, classifier_version, classification,
+       source_fingerprint_sha256
+     ) values
+       ('balance_transaction', $1, 1, 'charge', repeat('c', 64)),
+       ('balance_transaction', $2, 1, 'refund', repeat('d', 64)),
+       ('balance_transaction', $3, 1, 'dispute_withdrawal', repeat('e', 64))`,
+    [paymentBalanceId, refundBalanceId, disputeBalanceId]
+  );
+  await pool.query(
+    `insert into financial_allocation_sets (
+       id, allocation_identity, balance_transaction_id, source_kind,
+       source_internal_id, basis, scope, expected_effect_minor, currency,
+       algorithm_version, classifier_version, source_fingerprint_sha256
+     ) values
+       ($1, $2, $3, 'payment', $4, 'gross_amount', 'title', $5, $6, 1, 1,
+         repeat('c', 64)),
+       ($7, $8, $3, 'payment', $4, 'fee', 'title', 0, $6, 1, 1,
+         repeat('c', 64)),
+       ($9, $10, $11, 'refund', $12, 'gross_amount', 'title', $13, $14, 1, 1,
+         repeat('d', 64)),
+       ($15, $16, $11, 'refund', $12, 'fee', 'title', 0, $14, 1, 1,
+         repeat('d', 64)),
+       ($17, $18, $19, 'dispute', $20, 'gross_amount', 'title', $21, $22, 1, 1,
+         repeat('e', 64)),
+       ($23, $24, $19, 'dispute', $20, 'fee', 'title', 0, $22, 1, 1,
+         repeat('e', 64))`,
+    [
+      paymentGrossSetId,
+      `legacy-payment-principal:${paymentGrossSetId}`,
+      paymentBalanceId,
+      fixture.paymentIds.reconciled,
+      payment.amount_minor,
+      payment.currency,
+      paymentFeeSetId,
+      `legacy-payment-fee:${paymentFeeSetId}`,
+      refundGrossSetId,
+      `legacy-refund-principal:${refundGrossSetId}`,
+      refundBalanceId,
+      fixture.refundIds.full,
+      -refund.amount_minor,
+      refund.currency,
+      refundFeeSetId,
+      `legacy-refund-fee:${refundFeeSetId}`,
+      disputeSetId,
+      `legacy-dispute-principal:${disputeSetId}`,
+      disputeBalanceId,
+      fixture.disputeIds.reconciled,
+      -dispute.amount_minor,
+      dispute.currency,
+      disputeFeeSetId,
+      `legacy-dispute-fee:${disputeFeeSetId}`
+    ]
+  );
+  await pool.query(
+    `insert into financial_item_allocations (
+       allocation_set_id, order_item_id, component, effect_minor, currency,
+       tie_break_key
+     ) values
+       ($1, $2, 'sale_subtotal', $3, $4, $5),
+       ($1, $2, 'sale_tax', $6, $4, $7),
+       ($8, $2, 'refund_subtotal', $9, $4, $10),
+       ($8, $2, 'refund_tax', $11, $4, $12),
+       ($13, $14, 'dispute_subtotal', $15, $16, $17),
+       ($13, $14, 'dispute_tax', $18, $16, $19)`,
+    [
+      paymentGrossSetId,
+      payment.order_item_id,
+      payment.item_subtotal_minor,
+      payment.currency,
+      `legacy-payment-subtotal:${paymentGrossSetId}`,
+      payment.item_tax_minor,
+      `legacy-payment-tax:${paymentGrossSetId}`,
+      refundGrossSetId,
+      -payment.item_subtotal_minor,
+      `legacy-refund-subtotal:${refundGrossSetId}`,
+      -payment.item_tax_minor,
+      `legacy-refund-tax:${refundGrossSetId}`,
+      disputeSetId,
+      dispute.order_item_id,
+      -dispute.item_subtotal_minor,
+      dispute.currency,
+      `legacy-dispute-subtotal:${disputeSetId}`,
+      -dispute.item_tax_minor,
+      `legacy-dispute-tax:${disputeSetId}`
+    ]
+  );
+  await pool.query(
+    `insert into dispute_item_allocations (
+       id, allocation_identity, dispute_id, gross_allocation_set_id, order_item_id,
+       effect, subtotal_effect_minor, tax_effect_minor, total_effect_minor, currency
+     ) values ($1, $2, $3, $4, $5, 'withdrawal', $6, $7, $8, $9)`,
+    [
+      disputePresentmentId,
+      `legacy-dispute-presentment:${disputePresentmentId}`,
+      fixture.disputeIds.reconciled,
+      disputeSetId,
+      dispute.order_item_id,
+      -dispute.item_subtotal_minor,
+      -dispute.item_tax_minor,
+      -dispute.amount_minor,
+      dispute.currency
+    ]
+  );
+  return {
+    paymentBalanceId,
+    paymentAmountMinor: payment.amount_minor,
+    refundBalanceId,
+    refundAmountMinor: refund.amount_minor,
+    disputePresentmentId,
+    disputeAmountMinor: dispute.amount_minor,
+    disputeSubtotalMinor: dispute.item_subtotal_minor,
+    disputeTaxMinor: dispute.item_tax_minor
+  };
+}
+
+async function selectLegacySourcePrincipalConflict(
+  pool: Pool,
+  fixture: LegacySourcePrincipalConflict,
+  active: 'payment' | 'refund' | 'dispute' | null
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    await client.query('set local session_replication_role = replica');
+    const paymentAmount = fixture.paymentAmountMinor - (active === 'payment' ? 1 : 0);
+    const refundAmount = -(fixture.refundAmountMinor - (active === 'refund' ? 1 : 0));
+    const disputeSubtotal = -fixture.disputeSubtotalMinor +
+      (active === 'dispute' ? 1 : 0);
+    const disputeTax = -fixture.disputeTaxMinor;
+    const disputeAmount = disputeSubtotal + disputeTax;
+    await client.query(
+      `update stripe_balance_transactions set amount_minor = $1, net_minor = $1
+       where id = $2`,
+      [paymentAmount, fixture.paymentBalanceId]
+    );
+    await client.query(
+      `update stripe_balance_transactions set amount_minor = $1, net_minor = $1
+       where id = $2`,
+      [refundAmount, fixture.refundBalanceId]
+    );
+    await client.query(
+      `update dispute_item_allocations
+       set subtotal_effect_minor = $1, tax_effect_minor = $2, total_effect_minor = $3
+       where id = $4`,
+      [disputeSubtotal, disputeTax, disputeAmount, fixture.disputePresentmentId]
+    );
+    await client.query('commit');
+  } catch (error) {
+    await client.query('rollback');
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function assertValidBackfill(pool: Pool, fixture: LegacyFixture): Promise<void> {
@@ -747,6 +1328,7 @@ async function assertValidBackfill(pool: Pool, fixture: LegacyFixture): Promise<
     'exception',
     'fact-derived payment amount conflict remains exception'
   );
+  equal(paymentStates[fixture.paymentIds.zero!], 'pending', 'zero-valued payments remain supported');
 
   const refundRows = await pool.query<{
     id: string;
@@ -958,6 +1540,104 @@ async function expectConstraintRejected(
   throw new Error(`[financial-migration-test] ${label} unexpectedly succeeded`);
 }
 
+async function expectCheckRejected(
+  pool: Pool,
+  statement: string,
+  values: unknown[],
+  label: string
+): Promise<void> {
+  try {
+    await pool.query(statement, values);
+  } catch (error) {
+    const code = (error as { code?: string }).code;
+    assert(code === '23514', `${label} must fail with check-violation SQLSTATE 23514, got ${code ?? '<missing>'}`);
+    return;
+  }
+  throw new Error(`[financial-migration-test] ${label} unexpectedly succeeded`);
+}
+
+async function expectSqlStateRejected(
+  client: Pool | PoolClient,
+  statement: string,
+  values: unknown[],
+  expectedCode: string,
+  label: string
+): Promise<void> {
+  try {
+    await client.query(statement, values);
+  } catch (error) {
+    const code = (error as { code?: string }).code;
+    assert(code === expectedCode, `${label} must fail with SQLSTATE ${expectedCode}, got ${code ?? '<missing>'}`);
+    return;
+  }
+  throw new Error(`[financial-migration-test] ${label} unexpectedly succeeded`);
+}
+
+async function assertPositiveAmountConstraints(pool: Pool, fixture: LegacyFixture): Promise<void> {
+  const constraints = await pool.query<{ name: string; definition: string }>(
+    `select conname as name, pg_get_constraintdef(oid) as definition
+     from pg_constraint
+     where conname = any($1::text[])
+     order by conname`,
+    [[
+      'payments_amount_nonnegative',
+      'refunds_amount_positive',
+      'refund_allocations_amount_positive',
+      'disputes_amount_positive'
+    ]]
+  );
+  const definitions = Object.fromEntries(
+    constraints.rows.map((row) => [row.name, row.definition.replace(/\s+/gu, ' ')])
+  );
+  assert(
+    /amount_minor >= 0/iu.test(definitions.payments_amount_nonnegative ?? ''),
+    'upgraded database keeps zero-valued payments schema-valid'
+  );
+  for (const name of [
+    'refunds_amount_positive',
+    'refund_allocations_amount_positive',
+    'disputes_amount_positive'
+  ] as const) {
+    assert(
+      /amount_minor > 0/iu.test(definitions[name] ?? ''),
+      `upgraded database permanently enforces ${name}`
+    );
+  }
+
+  const zeroPayment = await one<{ amount_minor: number }>(
+    pool,
+    `select amount_minor from payments where id = $1`,
+    [fixture.paymentIds.zero]
+  );
+  equal(zeroPayment.amount_minor, 0, 'a legacy zero-valued payment survives the upgrade');
+
+  await expectCheckRejected(
+    pool,
+    `insert into refunds
+       (payment_id, stripe_refund_id, status, amount_minor, currency,
+        provider_created_at, allocation_status, financial_evidence_status)
+     values ($1, $2, 'pending', 0, 'USD', clock_timestamp(), 'not_applicable', 'pending')`,
+    [fixture.paymentIds.pending, `re_zero_${randomUUID()}`],
+    'post-upgrade zero refund insert'
+  );
+  await expectCheckRejected(
+    pool,
+    `insert into refund_allocations (refund_id, order_item_id, amount_minor, source)
+     values ($1, $2, 0, 'automatic')`,
+    [fixture.refundIds.ambiguous, fixture.orderItemIds[1]],
+    'post-upgrade zero refund allocation insert'
+  );
+  await expectCheckRejected(
+    pool,
+    `insert into disputes
+       (payment_id, stripe_dispute_id, status, amount_minor, currency,
+        provider_created_at, provider_updated_at, financial_evidence_status)
+     values ($1, $2, 'open', 0, 'USD', clock_timestamp(), clock_timestamp(), 'pending')`,
+    [fixture.paymentIds.pending, `dp_zero_${randomUUID()}`],
+    'post-upgrade zero dispute insert'
+  );
+}
+
 async function seedGuardRows(pool: Pool, fixture: LegacyFixture): Promise<Record<string, string>> {
   const ids: Record<string, string> = {};
   const transaction = await one<{ id: string }>(
@@ -994,27 +1674,28 @@ async function seedGuardRows(pool: Pool, fixture: LegacyFixture): Promise<Record
       [transaction.id]
     )
   ).id;
-  ids.unknownClassification = (
-    await one<{ id: string }>(
-      pool,
-      `insert into financial_classification_versions
+  const unknownWithIssue = await one<{ classification_id: string; issue_id: string }>(
+    pool,
+    `with classification as (
+       insert into financial_classification_versions
          (subject_type, subject_id, classifier_version, classification,
           source_fingerprint_sha256)
        values ('fee_detail', $1, 1, 'unknown', repeat('e', 64))
-       returning id`,
-      [ids.feeDetail]
-    )
-  ).id;
-  ids.immutableIssue = (
-    await one<{ id: string }>(
-      pool,
-      `insert into financial_reconciliation_issues
+       returning id
+     ), issue as (
+       insert into financial_reconciliation_issues
          (resource_type, resource_id, safe_code, impact, correlation_id)
-       values ('financial_classification', $1, 'unsupported_category', 'exception', $2)
-       returning id`,
-      [ids.unknownClassification, randomUUID()]
-    )
-  ).id;
+       select 'financial_classification', classification.id, 'unsupported_category',
+         'exception', $2
+       from classification
+       returning id
+     )
+     select classification.id as classification_id, issue.id as issue_id
+     from classification cross join issue`,
+    [ids.feeDetail, randomUUID()]
+  );
+  ids.unknownClassification = unknownWithIssue.classification_id;
+  ids.immutableIssue = unknownWithIssue.issue_id;
   ids.allocationSet = (
     await one<{ id: string }>(
       pool,
@@ -1292,19 +1973,100 @@ async function assertHistoryGuards(pool: Pool, fixture: LegacyFixture): Promise<
     [ids.issue],
     'issues cannot bypass the guarded resolver'
   );
-  await expectMutationRejected(
+  const resolverRoles = await pool.query<{ rolname: string; rolcanlogin: boolean }>(
+    `select rolname, rolcanlogin
+     from pg_roles
+     where rolname = any($1::text[])
+     order by rolname`,
+    [['pale_orbit_financial_worker', 'pale_orbit_runtime']]
+  );
+  equal(resolverRoles.rows, [
+    { rolname: 'pale_orbit_financial_worker', rolcanlogin: false },
+    { rolname: 'pale_orbit_runtime', rolcanlogin: false }
+  ], 'Plan 6B resolver group roles are non-login roles');
+  const resolverAuthority = await one<{
+    old_resolver: string | null;
+    public_can_execute: boolean;
+    runtime_can_execute: boolean;
+    worker_can_execute: boolean;
+  }>(
     pool,
-    `select * from public.resolve_financial_reconciliation_issue($1, $2, $3, $4, $5)`,
-    [ids.immutableIssue, fixture.userId, 'user', fixture.userId,
-      'migration-immutable-resolution'],
-    'immutable classification issues cannot use the resolver'
+    `select
+       to_regprocedure(
+         'public.resolve_financial_reconciliation_issue(uuid,uuid,public.audit_actor_type,text,text)'
+       )::text as old_resolver,
+       exists (
+         select 1
+         from pg_proc resolver,
+           lateral aclexplode(coalesce(resolver.proacl, acldefault('f', resolver.proowner))) grant_row
+         where resolver.oid =
+           'public.resolve_financial_issue_after_worker_recompute(uuid,text)'::regprocedure
+           and grant_row.grantee = 0
+           and grant_row.privilege_type = 'EXECUTE'
+       ) as public_can_execute,
+       has_function_privilege(
+         'pale_orbit_runtime',
+         'public.resolve_financial_issue_after_worker_recompute(uuid,text)',
+         'EXECUTE'
+       ) as runtime_can_execute,
+       has_function_privilege(
+         'pale_orbit_financial_worker',
+         'public.resolve_financial_issue_after_worker_recompute(uuid,text)',
+         'EXECUTE'
+       ) as worker_can_execute`
+  );
+  equal(resolverAuthority, {
+    old_resolver: null,
+    public_can_execute: false,
+    runtime_can_execute: false,
+    worker_can_execute: true
+  }, '0008/0009 replace the generic resolver with worker-only authority');
+
+  const runtime = await pool.connect();
+  try {
+    await runtime.query('begin');
+    await runtime.query('set local role pale_orbit_runtime');
+    await expectSqlStateRejected(
+      runtime,
+      `select * from public.resolve_financial_issue_after_worker_recompute($1, $2)`,
+      [ids.issue, 'migration-runtime-resolution'],
+      '42501',
+      'ordinary runtime role cannot execute the worker resolver'
+    );
+  } finally {
+    await runtime.query('rollback');
+    runtime.release();
+  }
+
+  const immutableWorker = await pool.connect();
+  try {
+    await immutableWorker.query('begin');
+    await immutableWorker.query('set local role pale_orbit_financial_worker');
+    await expectSqlStateRejected(
+      immutableWorker,
+      `select * from public.resolve_financial_issue_after_worker_recompute($1, $2)`,
+      [ids.immutableIssue, 'migration-immutable-resolution'],
+      '55000',
+      'immutable classification issues cannot use the worker resolver'
+    );
+  } finally {
+    await immutableWorker.query('rollback');
+    immutableWorker.release();
+  }
+  await expectConstraintRejected(
+    pool,
+    `insert into financial_reconciliation_issues
+       (resource_type, resource_id, safe_code, impact, correlation_id)
+     values ('payment', $1, 'payout_incomplete', 'pending', $2)`,
+    [randomUUID(), 'migration-invalid-issue-pair'],
+    'known issue vocabulary still requires an exact semantic resource/code pair'
   );
   await expectMutationRejected(
     pool,
     `insert into financial_reconciliation_issues
        (resource_type, resource_id, safe_code, state, impact, occurrence_count,
         correlation_id, resolved_at)
-     values ('financial_scan_run', $1, 'missing_source', 'resolved', 'pending', 1, $2,
+     values ('payment', $1, 'missing_source', 'resolved', 'pending', 1, $2,
        clock_timestamp())`,
     [randomUUID(), 'migration-resolved-insert'],
     'issues cannot be inserted resolved'
@@ -1325,11 +2087,22 @@ async function assertHistoryGuards(pool: Pool, fixture: LegacyFixture): Promise<
   } finally {
     replica.release();
   }
-  const resolutionCorrelationId = 'migration-direct-resolution';
-  await pool.query(
-    `select * from public.resolve_financial_reconciliation_issue($1, $2, $3, $4, $5)`,
-    [ids.issue, fixture.userId, 'user', fixture.userId, resolutionCorrelationId]
-  );
+  const resolutionCorrelationId = 'migration-worker-resolution';
+  const worker = await pool.connect();
+  try {
+    await worker.query('begin');
+    await worker.query('set local role pale_orbit_financial_worker');
+    await worker.query(
+      `select * from public.resolve_financial_issue_after_worker_recompute($1, $2)`,
+      [ids.issue, resolutionCorrelationId]
+    );
+    await worker.query('commit');
+  } catch (error) {
+    await worker.query('rollback');
+    throw error;
+  } finally {
+    worker.release();
+  }
   const resolvedAudit = await one<{
     actor_type: string;
     actor_id: string;
@@ -1344,16 +2117,16 @@ async function assertHistoryGuards(pool: Pool, fixture: LegacyFixture): Promise<
      where action = 'financial.issue.resolved' and resource_id = $1`,
     [ids.issue]
   );
-  equal(resolvedAudit.actor_type, 'user', 'direct resolver audit preserves the actor type');
-  equal(resolvedAudit.actor_id, fixture.userId, 'direct resolver audit preserves the actor ID');
-  equal(resolvedAudit.resource_type, 'financial_issue', 'direct resolver audit uses the canonical resource');
-  equal(resolvedAudit.resource_id, ids.issue, 'direct resolver audit names the resolved issue');
+  equal(resolvedAudit.actor_type, 'system', 'worker resolver audit uses the system actor type');
+  equal(resolvedAudit.actor_id, 'financial-worker', 'worker resolver audit uses the fixed worker actor');
+  equal(resolvedAudit.resource_type, 'financial_issue', 'worker resolver audit uses the canonical resource');
+  equal(resolvedAudit.resource_id, ids.issue, 'worker resolver audit names the resolved issue');
   equal(resolvedAudit.correlation_id, resolutionCorrelationId,
-    'direct resolver audit preserves the correlation ID');
+    'worker resolver audit preserves the correlation ID');
   equal(resolvedAudit.after, {
     state: 'resolved', impact: 'pending', safeCode: 'missing_source',
     resourceId: fixture.paymentIds.reconciled, resourceType: 'payment', occurrenceCount: 2
-  }, 'direct resolver audit contains only canonical safe issue fields');
+  }, 'worker resolver audit contains only canonical safe issue fields');
   await expectMutationRejected(
     pool,
     `delete from financial_reconciliation_issues where id = $1`,
@@ -1377,6 +2150,514 @@ async function assertNoPlan6BObjects(pool: Pool): Promise<void> {
     `select to_regtype('public.financial_evidence_status')::text as enum_name`
   );
   equal(enumRow.enum_name, null, 'failed 0007 leaves no Plan 6B enum behind');
+  const addedColumns = await pool.query<{ table_name: string; column_name: string }>(
+    `select table_name, column_name
+     from information_schema.columns
+     where table_schema = 'public'
+       and (table_name, column_name) in (
+         ('payments', 'financial_evidence_status'),
+         ('refunds', 'allocation_status'),
+         ('refunds', 'financial_evidence_status'),
+         ('disputes', 'financial_evidence_status'),
+         ('entitlement_grants', 'recovery_refund_allocation_id')
+       )
+     order by table_name, column_name`
+  );
+  equal(addedColumns.rows, [], 'failed 0007 rolls back every Plan 6B column addition');
+  const amountConstraints = await pool.query<{ name: string }>(
+    `select conname as name
+     from pg_constraint
+     where conname = any($1::text[])
+     order by conname`,
+    [[
+      'refunds_amount_nonnegative',
+      'refund_allocations_amount_nonnegative',
+      'disputes_amount_nonnegative',
+      'refunds_amount_positive',
+      'refund_allocations_amount_positive',
+      'disputes_amount_positive'
+    ]]
+  );
+  equal(
+    amountConstraints.rows.map((row) => row.name),
+    [
+      'disputes_amount_nonnegative',
+      'refund_allocations_amount_nonnegative',
+      'refunds_amount_nonnegative'
+    ],
+    'failed 0007 restores the legacy amount constraints without target-schema leakage'
+  );
+}
+
+async function assertClaimAuthorityUpgrade(
+  pool: Pool,
+  fixture: LegacyFixture
+): Promise<void> {
+  const claimTable = await one<{ table_name: string | null }>(
+    pool,
+    `select to_regclass('public.commerce_claim_issuances')::text as table_name`
+  );
+  equal(
+    claimTable.table_name,
+    'commerce_claim_issuances',
+    '0006-to-0010 upgrade installs the protected claim issuance table'
+  );
+  const accountGrant = await one<{
+    initiating_user_id: string;
+    user_id: string;
+  }>(
+    pool,
+    `select purchase_order.initiating_user_id, grant_row.user_id
+     from orders purchase_order
+     join order_items item on item.order_id = purchase_order.id
+     join entitlement_grants grant_row
+       on grant_row.order_item_id = item.id and grant_row.source = 'purchase'
+     where purchase_order.id = $1`,
+    [fixture.orderIds[0]]
+  );
+  equal(
+    accountGrant.user_id,
+    accountGrant.initiating_user_id,
+    '0010 admits an account purchase grant assigned to its initiating user'
+  );
+  const guestGrant = await one<{
+    claimed_by_user_id: string | null;
+    user_id: string | null;
+  }>(
+    pool,
+    `select identity.claimed_by_user_id, grant_row.user_id
+     from guest_identities identity
+     join orders purchase_order on purchase_order.guest_identity_id = identity.id
+     join order_items item on item.order_id = purchase_order.id
+     join entitlement_grants grant_row
+       on grant_row.order_item_id = item.id and grant_row.source = 'purchase'
+     where identity.id = $1`,
+    [fixture.guestClaimFacts.identityId]
+  );
+  equal(
+    guestGrant,
+    { claimed_by_user_id: null, user_id: null },
+    '0010 admits an unclaimed guest purchase with a null-assigned purchase grant'
+  );
+}
+
+async function assertStorageCleanupAuthorityUpgrade(pool: Pool): Promise<void> {
+  const authority = await one<{
+    cleanup_function_present: boolean;
+    cleanup_group_can_login: boolean | null;
+    cleanup_index_count: number;
+    fixed_group_connect_count: number;
+    grantable_group_connect_count: number;
+  }>(
+    pool,
+    `select
+       to_regprocedure('public.storage_cleanup_referenced_keys(text[])') is not null
+          as cleanup_function_present,
+       (select rolcanlogin from pg_catalog.pg_roles
+         where rolname = 'pale_orbit_storage_cleanup') as cleanup_group_can_login,
+       (select count(*)::integer
+        from pg_catalog.pg_indexes
+        where schemaname = 'public' and indexname = any($1::text[])) as cleanup_index_count,
+       (select count(*)::integer
+        from pg_catalog.pg_database database_row
+        cross join lateral pg_catalog.aclexplode(database_row.datacl) acl
+        join pg_catalog.pg_roles grantee_role on grantee_role.oid = acl.grantee
+        where database_row.datname = pg_catalog.current_database()
+          and grantee_role.rolname = any($2::text[])
+          and acl.privilege_type = 'CONNECT'
+          and not acl.is_grantable) as fixed_group_connect_count,
+       (select count(*)::integer
+        from pg_catalog.pg_database database_row
+        cross join lateral pg_catalog.aclexplode(database_row.datacl) acl
+        join pg_catalog.pg_roles grantee_role on grantee_role.oid = acl.grantee
+        where database_row.datname = pg_catalog.current_database()
+          and grantee_role.rolname = any($2::text[])
+          and acl.privilege_type = 'CONNECT'
+          and acl.is_grantable) as grantable_group_connect_count`,
+    [STORAGE_CLEANUP_INDEXES, [
+      'pale_orbit_runtime', 'pale_orbit_financial_worker', 'pale_orbit_storage_cleanup'
+    ]]
+  );
+  equal(
+    authority,
+    {
+      cleanup_function_present: true,
+      cleanup_group_can_login: false,
+      cleanup_index_count: STORAGE_CLEANUP_INDEXES.length,
+      fixed_group_connect_count: 3,
+      grantable_group_connect_count: 0
+    },
+    '0006-to-0011 upgrade installs the bounded NOLOGIN storage-cleanup authority'
+  );
+}
+
+async function runFixedGroupAttributePreflightFixture(pool: Pool): Promise<void> {
+  equal(await migrationCount(pool), 7, '0009 group preflight fixture begins at migration 0006');
+  await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(8) });
+  equal(await migrationCount(pool), 9, '0009 group preflight fixture applies through migration 0008');
+
+  await pool.query(`
+    create role pale_orbit_runtime with login nosuperuser nocreatedb nocreaterole
+      noinherit noreplication nobypassrls connection limit 3
+      valid until '2030-01-01 00:00:00+00'
+  `);
+  await pool.query(`
+    alter role pale_orbit_runtime set application_name = 'fixed-group-collision-fixture'
+  `);
+
+  let rejected = false;
+  try {
+    await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(9) });
+  } catch (error) {
+    rejected = true;
+    const postgresError = unwrapPostgresError(error);
+    assert(postgresError !== null, 'unsafe fixed group must expose its PostgreSQL error');
+    equal(postgresError.code, '42501', 'unsafe fixed group must use insufficient privilege');
+    assert(
+      /preexisting Plan 6B group role has noncanonical attributes/iu.test(postgresError.message),
+      'unsafe fixed group must identify the attribute preflight'
+    );
+    equal(
+      await migrationCount(pool),
+      9,
+      'unsafe fixed group rollback does not advance the 0009 journal'
+    );
+
+    const preserved = await one<{
+      can_login: boolean;
+      inherits: boolean;
+      connection_limit: number;
+      has_valid_until: boolean;
+      has_config: boolean;
+    }>(
+      pool,
+      `select
+         role_row.rolcanlogin as can_login,
+         role_row.rolinherit as inherits,
+         role_row.rolconnlimit as connection_limit,
+         role_row.rolvaliduntil is not null as has_valid_until,
+         role_row.rolconfig is not null as has_config
+       from pg_catalog.pg_roles role_row
+       where role_row.rolname = 'pale_orbit_runtime'`
+    );
+    equal(preserved, {
+      can_login: true,
+      inherits: false,
+      connection_limit: 3,
+      has_valid_until: true,
+      has_config: true
+    }, 'failed 0009 preserves the unsafe fixed group unchanged');
+
+    const partialAuthority = await one<{
+      worker_role_count: number;
+      resolver_present: boolean;
+      positive_constraint_present: boolean;
+      legacy_constraint_present: boolean;
+    }>(
+      pool,
+      `select
+         (select count(*)::integer from pg_catalog.pg_roles
+          where rolname = 'pale_orbit_financial_worker') as worker_role_count,
+         pg_catalog.to_regprocedure(
+           'public.resolve_financial_issue_after_worker_recompute(uuid,text)'
+         ) is not null as resolver_present,
+         exists (select 1 from pg_catalog.pg_constraint
+          where conname = 'refunds_amount_positive') as positive_constraint_present,
+         exists (select 1 from pg_catalog.pg_constraint
+          where conname = 'refunds_amount_nonnegative') as legacy_constraint_present`
+    );
+    equal(partialAuthority, {
+      worker_role_count: 0,
+      resolver_present: false,
+      positive_constraint_present: false,
+      legacy_constraint_present: true
+    }, 'failed 0009 leaves no partial worker authority');
+  }
+  assert(rejected, 'unsafe fixed group unexpectedly migrated');
+
+  await pool.query('drop role pale_orbit_runtime');
+  await pool.query(`
+    create role pale_orbit_runtime with nologin nosuperuser nocreatedb nocreaterole
+      inherit noreplication nobypassrls connection limit -1
+  `);
+  await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(11) });
+  equal(await migrationCount(pool), 12, 'safe preexisting fixed group permits upgrade through 0011');
+
+  const groups = await pool.query<{
+    rolname: string;
+    rolcanlogin: boolean;
+    rolsuper: boolean;
+    rolcreatedb: boolean;
+    rolcreaterole: boolean;
+    rolinherit: boolean;
+    rolreplication: boolean;
+    rolbypassrls: boolean;
+    rolconnlimit: number;
+    has_valid_until: boolean;
+    has_config: boolean;
+  }>(
+    `select
+       role_row.rolname, role_row.rolcanlogin, role_row.rolsuper,
+       role_row.rolcreatedb, role_row.rolcreaterole, role_row.rolinherit,
+       role_row.rolreplication, role_row.rolbypassrls, role_row.rolconnlimit,
+       role_row.rolvaliduntil is not null as has_valid_until,
+       role_row.rolconfig is not null as has_config
+     from pg_catalog.pg_roles role_row
+     where role_row.rolname in ('pale_orbit_runtime', 'pale_orbit_financial_worker')
+     order by role_row.rolname`
+  );
+  equal(groups.rows, [
+    {
+      rolname: 'pale_orbit_financial_worker',
+      rolcanlogin: false,
+      rolsuper: false,
+      rolcreatedb: false,
+      rolcreaterole: false,
+      rolinherit: true,
+      rolreplication: false,
+      rolbypassrls: false,
+      rolconnlimit: -1,
+      has_valid_until: false,
+      has_config: false
+    },
+    {
+      rolname: 'pale_orbit_runtime',
+      rolcanlogin: false,
+      rolsuper: false,
+      rolcreatedb: false,
+      rolcreaterole: false,
+      rolinherit: true,
+      rolreplication: false,
+      rolbypassrls: false,
+      rolconnlimit: -1,
+      has_valid_until: false,
+      has_config: false
+    }
+  ], 'safe preexisting fixed group remains canonical through the current migration head');
+  await assertStorageCleanupAuthorityUpgrade(pool);
+}
+
+async function expectUnexpectedNamedAuthorityFailure(
+  pool: Pool,
+  fixture: string
+): Promise<void> {
+  let rejected = false;
+  try {
+    await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(9) });
+  } catch (error) {
+    rejected = true;
+    const postgresError = unwrapPostgresError(error);
+    assert(postgresError !== null, `${fixture} must expose its PostgreSQL error`);
+    equal(postgresError.code, '42501', `${fixture} must use insufficient privilege`);
+    assert(
+      /unexpected named Plan 6B database authority/iu.test(postgresError.message),
+      `${fixture} must identify the named-authority preflight`
+    );
+  }
+  assert(rejected, `${fixture} unexpectedly migrated`);
+  equal(await migrationCount(pool), 9, `${fixture} rollback does not advance the 0009 journal`);
+  equal(
+    await one<{
+      worker_role_count: number;
+      resolver_present: boolean;
+      positive_constraint_present: boolean;
+      legacy_constraint_present: boolean;
+    }>(
+      pool,
+      `select
+         (select count(*)::integer from pg_catalog.pg_roles
+          where rolname = 'pale_orbit_financial_worker') as worker_role_count,
+         pg_catalog.to_regprocedure(
+           'public.resolve_financial_issue_after_worker_recompute(uuid,text)'
+         ) is not null as resolver_present,
+         exists (select 1 from pg_catalog.pg_constraint
+          where conname = 'refunds_amount_positive') as positive_constraint_present,
+         exists (select 1 from pg_catalog.pg_constraint
+          where conname = 'refunds_amount_nonnegative') as legacy_constraint_present`
+    ),
+    {
+      worker_role_count: 0,
+      resolver_present: false,
+      positive_constraint_present: false,
+      legacy_constraint_present: true
+    },
+    `${fixture} failure leaves no partial 0009 authority or schema mutation`
+  );
+}
+
+async function runUnexpectedNamedAuthorityPreflightFixture(pool: Pool): Promise<void> {
+  equal(await migrationCount(pool), 7, 'named-authority fixture begins at migration 0006');
+  await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(8) });
+  equal(await migrationCount(pool), 9, 'named-authority fixture applies through migration 0008');
+
+  await pool.query(`
+    create role plan6b_reporting_fixture with nologin nosuperuser nocreatedb nocreaterole
+      inherit noreplication nobypassrls connection limit -1
+  `);
+  await pool.query('grant usage on schema public to plan6b_reporting_fixture');
+
+  await pool.query('grant select on table public.payments to plan6b_reporting_fixture');
+  await expectUnexpectedNamedAuthorityFailure(pool, 'direct reporting-role SELECT');
+  await pool.query('revoke select on table public.payments from plan6b_reporting_fixture');
+
+  await pool.query('grant select on table public.payments to pg_monitor');
+  await expectUnexpectedNamedAuthorityFailure(pool, 'predefined pg_ role direct SELECT');
+  await pool.query('revoke select on table public.payments from pg_monitor');
+
+  await pool.query(`
+    alter default privileges in schema public
+      grant select on tables to plan6b_reporting_fixture
+  `);
+  await expectUnexpectedNamedAuthorityFailure(pool, 'owner default SELECT');
+  await pool.query(`
+    alter default privileges in schema public
+      revoke select on tables from plan6b_reporting_fixture
+  `);
+
+  await pool.query('grant pg_write_all_data to plan6b_reporting_fixture');
+  await expectUnexpectedNamedAuthorityFailure(pool, 'inherited pg_write_all_data authority');
+  await pool.query('revoke pg_write_all_data from plan6b_reporting_fixture');
+
+  await pool.query('create table public.plan6b_reporting_owned_fixture (id integer)');
+  await pool.query(`
+    alter table public.plan6b_reporting_owned_fixture owner to plan6b_reporting_fixture
+  `);
+  await expectUnexpectedNamedAuthorityFailure(pool, 'unexpected public object ownership');
+  await pool.query('drop table public.plan6b_reporting_owned_fixture');
+
+  await pool.query('create extension hstore with schema public');
+  await pool.query('grant usage on type public.hstore to plan6b_reporting_fixture');
+  await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(11) });
+  equal(
+    await migrationCount(pool),
+    12,
+    'public schema USAGE and extension-member ACLs do not block the repaired upgrade'
+  );
+  await assertStorageCleanupAuthorityUpgrade(pool);
+}
+
+async function assertFailed0011LeftNoPartialAuthority(
+  pool: Pool,
+  options: {
+    fixture:
+      | 'unsafe cleanup role'
+      | 'unsafe cleanup schema ACL'
+      | 'cleanup routine collision';
+    code: '42501' | '42723';
+    reason: RegExp;
+    routinePresent: boolean;
+    directSchemaAcl?: boolean;
+  }
+): Promise<void> {
+  try {
+    await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(11) });
+  } catch (error) {
+    const postgresError = unwrapPostgresError(error);
+    assert(postgresError !== null, `${options.fixture} must expose its PostgreSQL error`);
+    equal(postgresError.code, options.code, `${options.fixture} must use its exact SQLSTATE`);
+    assert(
+      options.reason.test(postgresError.message),
+      `${options.fixture} must identify its exact preflight invariant`
+    );
+    equal(
+      await migrationCount(pool),
+      11,
+      `${options.fixture} rollback does not advance the 0011 journal`
+    );
+    const state = await one<{
+      cleanup_function_present: boolean;
+      cleanup_index_count: number;
+      direct_cleanup_schema_acl: boolean;
+      direct_cleanup_routine_acl: boolean;
+    }>(
+      pool,
+      `select
+         to_regprocedure('public.storage_cleanup_referenced_keys(text[])') is not null
+           as cleanup_function_present,
+         (select count(*)::integer
+          from pg_catalog.pg_indexes
+          where schemaname = 'public' and indexname = any($1::text[]))
+           as cleanup_index_count,
+         exists (
+           select 1
+           from pg_catalog.pg_namespace namespace_row
+           cross join lateral pg_catalog.aclexplode(namespace_row.nspacl) acl
+           join pg_catalog.pg_roles grantee on grantee.oid = acl.grantee
+           where namespace_row.nspname = 'public'
+             and grantee.rolname = 'pale_orbit_storage_cleanup'
+         ) as direct_cleanup_schema_acl,
+         exists (
+           select 1
+           from pg_catalog.pg_proc routine
+           cross join lateral pg_catalog.aclexplode(
+             coalesce(routine.proacl, pg_catalog.acldefault('f', routine.proowner))
+           ) acl
+           join pg_catalog.pg_roles grantee on grantee.oid = acl.grantee
+           where routine.oid = to_regprocedure(
+             'public.storage_cleanup_referenced_keys(text[])'
+           ) and grantee.rolname = 'pale_orbit_storage_cleanup'
+         ) as direct_cleanup_routine_acl`,
+      [STORAGE_CLEANUP_INDEXES]
+    );
+    equal(state, {
+      cleanup_function_present: options.routinePresent,
+      cleanup_index_count: 0,
+      direct_cleanup_schema_acl: options.directSchemaAcl ?? false,
+      direct_cleanup_routine_acl: false
+    }, `${options.fixture} rollback leaves no partial 0011 indexes or grants`);
+    return;
+  }
+  throw new Error(`[financial-migration-test] ${options.fixture} unexpectedly migrated`);
+}
+
+async function runStorageCleanupAuthorityPreflightFixture(pool: Pool): Promise<void> {
+  equal(await migrationCount(pool), 7, '0011 preflight fixture begins at migration 0006');
+  await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(10) });
+  equal(await migrationCount(pool), 11, '0011 preflight fixture applies through migration 0010');
+
+  await pool.query(`
+    create role pale_orbit_storage_cleanup with login nosuperuser nocreatedb
+      nocreaterole inherit noreplication nobypassrls connection limit -1
+  `);
+  await assertFailed0011LeftNoPartialAuthority(pool, {
+    fixture: 'unsafe cleanup role',
+    code: '42501',
+    reason: /preexisting storage cleanup role has authority/iu,
+    routinePresent: false
+  });
+
+  await pool.query(`
+    alter role pale_orbit_storage_cleanup with nologin nosuperuser nocreatedb
+      nocreaterole inherit noreplication nobypassrls connection limit -1
+  `);
+  await pool.query('grant create on schema public to pale_orbit_storage_cleanup');
+  await assertFailed0011LeftNoPartialAuthority(pool, {
+    fixture: 'unsafe cleanup schema ACL',
+    code: '42501',
+    reason: /preexisting storage cleanup role has authority/iu,
+    routinePresent: false,
+    directSchemaAcl: true
+  });
+  await pool.query('revoke create on schema public from pale_orbit_storage_cleanup');
+
+  await pool.query(`
+    create function public.storage_cleanup_referenced_keys(text[])
+    returns table (referenced_storage_key text)
+    language sql stable
+    set search_path = 'pg_catalog'
+    as 'select null::text where false'
+  `);
+  await assertFailed0011LeftNoPartialAuthority(pool, {
+    fixture: 'cleanup routine collision',
+    code: '42723',
+    reason: /storage cleanup authority routine already exists/iu,
+    routinePresent: true
+  });
+
+  await pool.query('drop function public.storage_cleanup_referenced_keys(text[])');
+  await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(11) });
+  equal(await migrationCount(pool), 12, 'safe preexisting cleanup group permits exactly 0011');
+  await assertStorageCleanupAuthorityUpgrade(pool);
 }
 
 async function runValidFixture(pool: Pool): Promise<void> {
@@ -1395,18 +2676,21 @@ async function runValidFixture(pool: Pool): Promise<void> {
 
   const beforeMigrations = await migrationCount(pool);
   equal(beforeMigrations, 7, 'owned database begins with exactly migrations 0000 through 0006');
-  await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolder(true) });
-  equal(await migrationCount(pool), 8, 'successful 0007 advances the migration journal once');
+  await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(11) });
+  equal(await migrationCount(pool), 12, 'successful Plan 6B migrations advance through 0011');
   await assertValidBackfill(pool, fixture);
+  await assertPositiveAmountConstraints(pool, fixture);
   await assertHistoryGuards(pool, fixture);
+  await assertClaimAuthorityUpgrade(pool, fixture);
+  await assertStorageCleanupAuthorityUpgrade(pool);
 
-  await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolder(true) });
-  equal(await migrationCount(pool), 8, 'running the migration runner again is a no-op');
+  await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(11) });
+  equal(await migrationCount(pool), 12, 'running the migration runner again is a no-op');
 }
 
 async function runInvalidFixture(
   pool: Pool,
-  kind: Exclude<FixtureKind, 'valid'>
+  kind: PrePlan6BInvalidFixtureKind
 ): Promise<void> {
   const client = await pool.connect();
   try {
@@ -1427,12 +2711,20 @@ async function runInvalidFixture(
     'over-allocation': /(?:over[-_ ]allocation|capacity)/iu,
     'currency-conflict': /(?:currency|cross[-_ ]currency)/iu,
     'partial-facts': /(?:partial|incomplete)[-_ ](?:allocation|facts?)/iu,
+    'no-allocation-cumulative-over-capacity': /(?:unrecoverable|multi[-_ ]item).*refund.*graph/iu,
+    'no-allocation-mixed-over-capacity': /(?:unrecoverable|multi[-_ ]item).*refund.*graph/iu,
+    'no-allocation-missing-item-total': /(?:unrecoverable|multi[-_ ]item).*refund.*graph/iu,
+    'no-allocation-zero-item-total': /(?:unrecoverable|multi[-_ ]item).*refund.*graph/iu,
+    'no-allocation-item-currency-conflict': /(?:unrecoverable|multi[-_ ]item).*refund.*graph/iu,
+    'no-allocation-refund-currency-conflict': /(?:unrecoverable|multi[-_ ]item).*refund.*graph/iu,
+    'no-allocation-payment-capacity-mismatch': /(?:unrecoverable|multi[-_ ]item).*refund.*graph/iu,
+    'no-allocation-mixed-refund-currency-conflict': /(?:unrecoverable|multi[-_ ]item).*refund.*graph/iu,
     'pending-refund-allocation': /(?:non[-_ ]succeeded|refund.*status)/iu,
     'failed-refund-allocation': /(?:non[-_ ]succeeded|refund.*status)/iu,
     'canceled-refund-allocation': /(?:non[-_ ]succeeded|refund.*status)/iu
   }[kind];
   try {
-    await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolder(true) });
+    await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(9) });
   } catch (error) {
     assertExpectedMigrationFailure(error, expectedReason, kind);
     equal(
@@ -1444,6 +2736,352 @@ async function runInvalidFixture(
     return;
   }
   throw new Error(`[financial-migration-test] ${kind} fixture unexpectedly migrated`);
+}
+
+async function expect0009Failure(
+  pool: Pool,
+  fixture: PostPlan6BInvalidFixtureKind,
+  expectedReason: RegExp
+): Promise<void> {
+  try {
+    await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(9) });
+  } catch (error) {
+    assertExpectedMigrationFailure(error, expectedReason, fixture);
+    equal(await migrationCount(pool), 9, `${fixture} rollback does not advance the 0009 journal`);
+    return;
+  }
+  throw new Error(`[financial-migration-test] ${fixture} fixture unexpectedly migrated`);
+}
+
+async function runPostPlan6BInvalidFixture(
+  pool: Pool,
+  kind: PostPlan6BInvalidFixtureKind
+): Promise<void> {
+  let legacyFixture: LegacyFixture | null = null;
+  if (kind === 'legacy-source-principal') {
+    const client = await pool.connect();
+    try {
+      await client.query('begin');
+      legacyFixture = await seedValidLegacyFixture(client);
+      await client.query('commit');
+    } catch (error) {
+      await client.query('rollback');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+  equal(await migrationCount(pool), 7, 'late-upgrade fixture begins at migration 0006');
+  await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(8) });
+  equal(await migrationCount(pool), 9, 'late-upgrade fixture applies migrations 0007 and 0008');
+
+  if (kind === 'legacy-payout-membership-currency') {
+    const balanceId = await seedLegacyPayoutMembershipCurrencyConflict(pool);
+    await expect0009Failure(pool, kind, /invalid legacy payout membership currency/iu);
+    const preserved = await one<{ currency: string }>(
+      pool,
+      `select currency from stripe_balance_transactions where id = $1`,
+      [balanceId]
+    );
+    equal(preserved.currency, 'EUR', 'failed 0009 leaves legacy payout evidence untouched');
+    const repair = await pool.connect();
+    try {
+      await repair.query('begin');
+      await repair.query('set local session_replication_role = replica');
+      await repair.query(
+        `update stripe_balance_transactions set currency = 'USD' where id = $1`,
+        [balanceId]
+      );
+      await repair.query('commit');
+    } catch (error) {
+      await repair.query('rollback');
+      throw error;
+    } finally {
+      repair.release();
+    }
+  } else {
+    assert(legacyFixture !== null, 'source-principal fixture graph is missing');
+    const conflict = await seedLegacySourcePrincipalConflict(pool, legacyFixture);
+    for (const active of ['payment', 'refund', 'dispute'] as const) {
+      await selectLegacySourcePrincipalConflict(pool, conflict, active);
+      await expect0009Failure(
+        pool,
+        kind,
+        /invalid legacy fee-reconciled source principal parity/iu
+      );
+    }
+    await selectLegacySourcePrincipalConflict(pool, conflict, null);
+  }
+
+  await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(9) });
+  equal(await migrationCount(pool), 10, `${kind} repair permits exactly migration 0009`);
+}
+
+async function expect0010Failure(
+  pool: Pool,
+  fixture: ClaimAuthorityInvalidFixtureKind,
+  expectedReason: RegExp
+): Promise<void> {
+  try {
+    await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(10) });
+  } catch (error) {
+    assertExpectedMigrationFailure(error, expectedReason, fixture);
+    equal(await migrationCount(pool), 10, `${fixture} rollback does not advance the 0010 journal`);
+    const claimTable = await one<{ table_name: string | null }>(
+      pool,
+      `select to_regclass('public.commerce_claim_issuances')::text as table_name`
+    );
+    equal(claimTable.table_name, null, `${fixture} rollback leaves no partial 0010 table`);
+    return;
+  }
+  throw new Error(`[financial-migration-test] ${fixture} fixture unexpectedly migrated`);
+}
+
+async function runClaimAuthorityInvalidFixture(
+  pool: Pool,
+  kind: ClaimGrantInvalidFixtureKind
+): Promise<void> {
+  equal(await migrationCount(pool), 7, '0010 preflight fixture begins at migration 0006');
+  await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(9) });
+  equal(await migrationCount(pool), 10, '0010 preflight fixture applies migrations 0007 through 0009');
+
+  const client = await pool.connect();
+  let graph: GuestOrderGraph;
+  try {
+    await client.query('begin');
+    const { userId, titleIds } = await insertUserAndTitles(client, 1);
+    graph = await insertGuestOrderGraph(client, {
+      key: kind,
+      email: `legacy-${userId}@example.com`,
+      titleId: titleIds[0]!,
+      paymentSchemaPhase: 'plan6b',
+      ...(kind === 'legacy-claimed-guest-null-grant'
+        ? { claimedByUserId: userId, includeGrant: true }
+        : { includeGrant: false })
+    });
+    await client.query('commit');
+  } catch (error) {
+    await client.query('rollback');
+    throw error;
+  } finally {
+    client.release();
+  }
+
+  const expectedReason = kind === 'legacy-claimed-guest-null-grant'
+    ? /purchase grant assignment is not backed by its claimed guest identity/iu
+    : /paid guest item is missing its purchase grant/iu;
+  await expect0010Failure(pool, kind, expectedReason);
+  const preserved = await one<{ present: boolean }>(
+    pool,
+    `select exists(
+       select 1 from orders where id = $1
+     ) as present`,
+    [graph.orderId]
+  );
+  assert(preserved.present, `${kind} rollback preserves the malformed legacy facts for repair`);
+
+  if (kind === 'legacy-claimed-guest-null-grant') {
+    await pool.query(
+      `update guest_identities
+       set claimed_by_user_id = null, claimed_at = null
+       where id = $1`,
+      [graph.identityId]
+    );
+  } else {
+    await pool.query(
+      `insert into entitlement_grants
+         (title_id, user_id, source, order_item_id, state, state_reason)
+       select item.title_id, null, 'purchase', item.id,
+         'unclaimed', 'payment_succeeded'
+       from order_items item
+       where item.id = $1`,
+      [graph.orderItemId]
+    );
+  }
+  await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(10) });
+  equal(await migrationCount(pool), 11, `${kind} repair permits exactly migration 0010`);
+}
+
+async function runClaimIdentityAuthorityInvalidFixture(pool: Pool): Promise<void> {
+  const fixture = 'legacy-claimed-identity-authority' as const;
+  equal(await migrationCount(pool), 7, 'claimed-identity preflight begins at migration 0006');
+  await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(9) });
+  equal(await migrationCount(pool), 10, 'claimed-identity preflight applies migrations 0007 through 0009');
+
+  const client = await pool.connect();
+  let graph: GuestOrderGraph;
+  let userId: string;
+  let normalizedEmail: string;
+  try {
+    await client.query('begin');
+    const seeded = await insertUserAndTitles(client, 1);
+    userId = seeded.userId;
+    normalizedEmail = `legacy-${userId}@example.com`;
+    graph = await insertGuestOrderGraph(client, {
+      key: fixture,
+      email: normalizedEmail,
+      titleId: seeded.titleIds[0]!,
+      claimedByUserId: userId,
+      grantUserId: userId,
+      includeGrant: true,
+      paymentSchemaPhase: 'plan6b'
+    });
+    await client.query(
+      `update "user" set email_verified = false where id = $1`,
+      [userId]
+    );
+    await client.query('commit');
+  } catch (error) {
+    await client.query('rollback');
+    throw error;
+  } finally {
+    client.release();
+  }
+
+  await expect0010Failure(
+    pool,
+    fixture,
+    /guest identity claim is not backed by the verified normalized user email/iu
+  );
+  const unverified = await one<{
+    email: string;
+    email_verified: boolean;
+    identity_email: string;
+    claimed_by_user_id: string;
+    grant_user_id: string;
+    has_active_entitlement: boolean;
+  }>(
+    pool,
+    `select claimant.email, claimant.email_verified,
+       identity.email as identity_email, identity.claimed_by_user_id,
+       grant_row.user_id as grant_user_id,
+       exists(
+         select 1 from entitlements entitlement
+         where entitlement.user_id = claimant.id
+           and entitlement.title_id = grant_row.title_id
+           and entitlement.revoked_at is null
+       ) as has_active_entitlement
+     from guest_identities identity
+     join "user" claimant on claimant.id = identity.claimed_by_user_id
+     join orders purchase_order on purchase_order.guest_identity_id = identity.id
+     join order_items item on item.order_id = purchase_order.id
+     join entitlement_grants grant_row
+       on grant_row.order_item_id = item.id and grant_row.source = 'purchase'
+     where identity.id = $1`,
+    [graph.identityId]
+  );
+  equal(
+    unverified,
+    {
+      email: normalizedEmail,
+      email_verified: false,
+      identity_email: normalizedEmail,
+      claimed_by_user_id: userId,
+      grant_user_id: userId,
+      has_active_entitlement: true
+    },
+    'failed 0010 preserves only the isolated unverified claimed-identity defect'
+  );
+
+  const mismatchedEmail = `mismatch-${userId}@example.com`;
+  await pool.query(
+    `update "user" set email = $2, email_verified = true where id = $1`,
+    [userId, mismatchedEmail]
+  );
+  await expect0010Failure(
+    pool,
+    fixture,
+    /guest identity claim is not backed by the verified normalized user email/iu
+  );
+  const mismatched = await one<{
+    email: string;
+    email_verified: boolean;
+    identity_email: string;
+  }>(
+    pool,
+    `select claimant.email, claimant.email_verified, identity.email as identity_email
+     from guest_identities identity
+     join "user" claimant on claimant.id = identity.claimed_by_user_id
+     where identity.id = $1`,
+    [graph.identityId]
+  );
+  equal(
+    mismatched,
+    { email: mismatchedEmail, email_verified: true, identity_email: normalizedEmail },
+    'failed 0010 preserves the isolated normalized-email mismatch for repair'
+  );
+
+  await pool.query(
+    `update "user" set email = $2 where id = $1`,
+    [userId, normalizedEmail]
+  );
+  await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(10) });
+  equal(await migrationCount(pool), 11, `${fixture} repair permits exactly migration 0010`);
+}
+
+async function runEntitlementProjectionInvalidFixture(pool: Pool): Promise<void> {
+  const fixture = 'legacy-entitlement-projection' as const;
+  equal(await migrationCount(pool), 7, 'entitlement preflight begins at migration 0006');
+  await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(9) });
+  equal(await migrationCount(pool), 10, 'entitlement preflight applies migrations 0007 through 0009');
+
+  const client = await pool.connect();
+  let userId: string;
+  let titleId: string;
+  let orderId: string;
+  try {
+    await client.query('begin');
+    const seeded = await insertUserAndTitles(client, 1);
+    userId = seeded.userId;
+    titleId = seeded.titleIds[0]!;
+    const graph = await insertOrderGraph(client, userId, [titleId], {
+      key: fixture,
+      paymentSchemaPhase: 'plan6b'
+    });
+    orderId = graph.orderId;
+    await client.query(
+      `delete from entitlements where user_id = $1 and title_id = $2`,
+      [userId, titleId]
+    );
+    await client.query('commit');
+  } catch (error) {
+    await client.query('rollback');
+    throw error;
+  } finally {
+    client.release();
+  }
+
+  await expect0010Failure(
+    pool,
+    fixture,
+    /effective entitlement projection is inconsistent with grant state/iu
+  );
+  const preserved = await one<{
+    order_present: boolean;
+    active_grant_count: string;
+    active_entitlement_count: string;
+  }>(
+    pool,
+    `select
+       exists(select 1 from orders where id = $1) as order_present,
+       (select count(*)::text from entitlement_grants
+         where user_id = $2 and title_id = $3 and state = 'active') as active_grant_count,
+       (select count(*)::text from entitlements
+         where user_id = $2 and title_id = $3 and revoked_at is null) as active_entitlement_count`,
+    [orderId, userId, titleId]
+  );
+  equal(
+    preserved,
+    { order_present: true, active_grant_count: '1', active_entitlement_count: '0' },
+    'failed 0010 preserves the isolated active-grant projection defect for repair'
+  );
+
+  await pool.query(
+    `insert into entitlements (user_id, title_id) values ($1, $2)`,
+    [userId, titleId]
+  );
+  await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(10) });
+  equal(await migrationCount(pool), 11, `${fixture} repair permits exactly migration 0010`);
 }
 
 async function main(): Promise<void> {
@@ -1459,9 +3097,26 @@ async function main(): Promise<void> {
       'over-allocation',
       'currency-conflict',
       'partial-facts',
+      'no-allocation-cumulative-over-capacity',
+      'no-allocation-mixed-over-capacity',
+      'no-allocation-missing-item-total',
+      'no-allocation-zero-item-total',
+      'no-allocation-item-currency-conflict',
+      'no-allocation-refund-currency-conflict',
+      'no-allocation-payment-capacity-mismatch',
+      'no-allocation-mixed-refund-currency-conflict',
       'pending-refund-allocation',
       'failed-refund-allocation',
-      'canceled-refund-allocation'
+      'canceled-refund-allocation',
+      'fixed-group-attribute-preflight',
+      'unexpected-named-authority-preflight',
+      'legacy-payout-membership-currency',
+      'legacy-source-principal',
+      'legacy-claimed-guest-null-grant',
+      'legacy-paid-guest-missing-grant',
+      'legacy-claimed-identity-authority',
+      'legacy-entitlement-projection',
+      'storage-cleanup-authority-preflight'
     ] as const) {
       const result = spawnSync(
         process.execPath,
@@ -1489,14 +3144,52 @@ async function main(): Promise<void> {
       rawFixture === 'over-allocation' ||
       rawFixture === 'currency-conflict' ||
       rawFixture === 'partial-facts' ||
+      rawFixture === 'no-allocation-cumulative-over-capacity' ||
+      rawFixture === 'no-allocation-mixed-over-capacity' ||
+      rawFixture === 'no-allocation-missing-item-total' ||
+      rawFixture === 'no-allocation-zero-item-total' ||
+      rawFixture === 'no-allocation-item-currency-conflict' ||
+      rawFixture === 'no-allocation-refund-currency-conflict' ||
+      rawFixture === 'no-allocation-payment-capacity-mismatch' ||
+      rawFixture === 'no-allocation-mixed-refund-currency-conflict' ||
       rawFixture === 'pending-refund-allocation' ||
       rawFixture === 'failed-refund-allocation' ||
-      rawFixture === 'canceled-refund-allocation',
+      rawFixture === 'canceled-refund-allocation' ||
+      rawFixture === 'fixed-group-attribute-preflight' ||
+      rawFixture === 'unexpected-named-authority-preflight' ||
+      rawFixture === 'legacy-payout-membership-currency' ||
+      rawFixture === 'legacy-source-principal' ||
+      rawFixture === 'legacy-claimed-guest-null-grant' ||
+      rawFixture === 'legacy-paid-guest-missing-grant' ||
+      rawFixture === 'legacy-claimed-identity-authority' ||
+      rawFixture === 'legacy-entitlement-projection' ||
+      rawFixture === 'storage-cleanup-authority-preflight',
     `unknown fixture ${rawFixture ?? '<missing>'}`
   );
   const pool = databasePool();
   try {
     if (rawFixture === 'valid') await runValidFixture(pool);
+    else if (rawFixture === 'fixed-group-attribute-preflight') {
+      await runFixedGroupAttributePreflightFixture(pool);
+    }
+    else if (rawFixture === 'unexpected-named-authority-preflight') {
+      await runUnexpectedNamedAuthorityPreflightFixture(pool);
+    }
+    else if (
+      rawFixture === 'legacy-payout-membership-currency' ||
+      rawFixture === 'legacy-source-principal'
+    ) await runPostPlan6BInvalidFixture(pool, rawFixture);
+    else if (
+      rawFixture === 'legacy-claimed-guest-null-grant' ||
+      rawFixture === 'legacy-paid-guest-missing-grant'
+    ) await runClaimAuthorityInvalidFixture(pool, rawFixture);
+    else if (rawFixture === 'legacy-claimed-identity-authority') {
+      await runClaimIdentityAuthorityInvalidFixture(pool);
+    } else if (rawFixture === 'legacy-entitlement-projection') {
+      await runEntitlementProjectionInvalidFixture(pool);
+    } else if (rawFixture === 'storage-cleanup-authority-preflight') {
+      await runStorageCleanupAuthorityPreflightFixture(pool);
+    }
     else await runInvalidFixture(pool, rawFixture);
     console.info(`[financial-migration-test] ${rawFixture} fixture passed`);
   } finally {

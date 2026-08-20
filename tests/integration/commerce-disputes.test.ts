@@ -27,7 +27,12 @@ import {
   titles,
   user
 } from '$lib/server/db/schema';
-import { applicationConfig, databaseClient } from './database';
+import {
+  applicationConfig,
+  databaseClient,
+  ownerDatabaseClient,
+  workerDatabaseClient
+} from './database';
 
 const fixedNow = new Date('2026-08-10T16:00:00.000Z');
 
@@ -50,21 +55,21 @@ async function createPurchase(
   let guestIdentityId: string | null = null;
   if (owner === 'account') {
     userId = randomUUID();
-    await databaseClient.db.insert(user).values({
+    await ownerDatabaseClient.db.insert(user).values({
       id: userId,
       name: 'Dispute reader',
       email,
       emailVerified: true
     });
   } else {
-    const [identity] = await databaseClient.db.insert(guestIdentities)
+    const [identity] = await ownerDatabaseClient.db.insert(guestIdentities)
       .values({ email })
       .returning();
     if (!identity) throw new Error('Expected identity');
     guestIdentityId = identity.id;
   }
   const totalMinor = totals.reduce((sum, value) => sum + value, 0);
-  await databaseClient.db.insert(orders).values({
+  await ownerDatabaseClient.db.insert(orders).values({
     id: orderId,
     status: 'paid',
     initiatingUserId: userId,
@@ -85,7 +90,7 @@ async function createPurchase(
   for (const [index, total] of totals.entries()) {
     const titleId = randomUUID();
     const itemId = randomUUID();
-    await databaseClient.db.insert(titles).values({
+    await ownerDatabaseClient.db.insert(titles).values({
       id: titleId,
       slug: `dispute-title-${titleId}`,
       title: `Private dispute title ${index}`,
@@ -96,7 +101,7 @@ async function createPurchase(
       currency: 'USD',
       visibility: 'private'
     });
-    await databaseClient.db.insert(orderItems).values({
+    await ownerDatabaseClient.db.insert(orderItems).values({
       id: itemId,
       orderId,
       titleId,
@@ -109,7 +114,7 @@ async function createPurchase(
       totalMinor: total,
       stripeLineItemId: `li_test_${itemId}`
     });
-    await databaseClient.db.insert(entitlementGrants).values({
+    await ownerDatabaseClient.db.insert(entitlementGrants).values({
       titleId,
       userId,
       source: 'purchase',
@@ -121,7 +126,7 @@ async function createPurchase(
     items.push({ id: itemId, titleId, totalMinor: total });
   }
   const paymentIntentId = `pi_test_${orderId}`;
-  const [payment] = await databaseClient.db.insert(payments).values({
+  const [payment] = await ownerDatabaseClient.db.insert(payments).values({
     orderId,
     stripePaymentIntentId: paymentIntentId,
     stripeLatestChargeId: `ch_test_${orderId}`,
@@ -133,7 +138,7 @@ async function createPurchase(
   }).returning();
   if (!payment) throw new Error('Expected payment');
   if (userId) {
-    await databaseClient.db.transaction(async (transaction) => {
+    await workerDatabaseClient.db.transaction(async (transaction) => {
       for (const item of items) {
         await projectEffectiveEntitlement(transaction, userId!, item.titleId, fixedNow);
       }
@@ -147,7 +152,7 @@ async function createDisputeEvent(
   sequence: number,
   providerCreatedAt = new Date(`2026-08-10T14:0${sequence}:00.000Z`)
 ) {
-  const [event] = await databaseClient.db.insert(stripeEvents).values({
+  const [event] = await ownerDatabaseClient.db.insert(stripeEvents).values({
     providerEventId: `evt_dispute_${sequence}_${randomUUID()}`,
     eventType: 'charge.dispute.updated',
     objectId: providerDisputeId,
@@ -206,7 +211,7 @@ function dependencies(
 }
 
 async function accessMessages() {
-  return (await databaseClient.db.select().from(outboxMessages))
+  return (await ownerDatabaseClient.db.select().from(outboxMessages))
     .map((row) => parseCommerceEmailPayload(row.payload, applicationConfig.origin));
 }
 
@@ -215,7 +220,7 @@ describe('canonical dispute fulfillment', () => {
     const fixture = await createPurchase();
     const event = await createDisputeEvent(`dp_test_${randomUUID()}`, 1);
     await fulfillDisputeEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       command(fixture, event, 'open', 1),
       dependencies()
     );
@@ -253,7 +258,7 @@ describe('canonical dispute fulfillment', () => {
     const orderBefore = await databaseClient.db.select().from(orders);
     const paymentBefore = await databaseClient.db.select().from(payments);
     const itemsBefore = await databaseClient.db.select().from(orderItems);
-    await fulfillDisputeEvent(databaseClient.db, command(fixture, event, 'open', 1), dependencies());
+    await fulfillDisputeEvent(workerDatabaseClient.db, command(fixture, event, 'open', 1), dependencies());
     expect((await databaseClient.db.select().from(disputes))[0]).toMatchObject({
       status: 'open',
       financialEvidenceStatus: 'pending'
@@ -278,9 +283,9 @@ describe('canonical dispute fulfillment', () => {
     const fixture = await createPurchase();
     const disputeId = `dp_test_${randomUUID()}`;
     const opened = await createDisputeEvent(disputeId, 1);
-    await fulfillDisputeEvent(databaseClient.db, command(fixture, opened, 'open', 1), dependencies());
+    await fulfillDisputeEvent(workerDatabaseClient.db, command(fixture, opened, 'open', 1), dependencies());
     const won = await createDisputeEvent(disputeId, 2);
-    await fulfillDisputeEvent(databaseClient.db, command(fixture, won, 'won', 2), dependencies());
+    await fulfillDisputeEvent(workerDatabaseClient.db, command(fixture, won, 'won', 2), dependencies());
     expect((await databaseClient.db.select().from(entitlementGrants))[0]?.state).toBe('active');
     expect((await databaseClient.db.select().from(entitlements))[0]?.revokedAt).toBeNull();
     expect((await accessMessages()).map((message) =>
@@ -292,7 +297,7 @@ describe('canonical dispute fulfillment', () => {
       3,
       new Date('2026-08-10T14:01:30.000Z')
     );
-    await fulfillDisputeEvent(databaseClient.db, command(fixture, stale, 'open', 1), dependencies());
+    await fulfillDisputeEvent(workerDatabaseClient.db, command(fixture, stale, 'open', 1), dependencies());
     expect((await databaseClient.db.select().from(disputes))[0]?.status).toBe('won');
     expect((await databaseClient.db.select().from(entitlementGrants))[0]?.state).toBe('active');
     expect(await accessMessages()).toHaveLength(2);
@@ -311,13 +316,13 @@ describe('canonical dispute fulfillment', () => {
       const sharedSecond = new Date('2026-08-10T14:01:00.000Z');
       const opened = await createDisputeEvent(disputeId, 1, sharedSecond);
       await fulfillDisputeEvent(
-        databaseClient.db,
+        workerDatabaseClient.db,
         command(fixture, opened, 'open', 1),
         dependencies()
       );
       const terminal = await createDisputeEvent(disputeId, 2, sharedSecond);
       await fulfillDisputeEvent(
-        databaseClient.db,
+        workerDatabaseClient.db,
         command(fixture, terminal, terminalState, 2),
         dependencies()
       );
@@ -335,11 +340,11 @@ describe('canonical dispute fulfillment', () => {
     const disputeId = `dp_test_${randomUUID()}`;
     const sharedSecond = new Date('2026-08-10T14:01:00.000Z');
     const won = await createDisputeEvent(disputeId, 1, sharedSecond);
-    await fulfillDisputeEvent(databaseClient.db, command(fixture, won, 'won', 1), dependencies());
+    await fulfillDisputeEvent(workerDatabaseClient.db, command(fixture, won, 'won', 1), dependencies());
     const delayedOpen = await createDisputeEvent(disputeId, 2, sharedSecond);
 
     await fulfillDisputeEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       command(fixture, delayedOpen, 'open', 2),
       dependencies()
     );
@@ -354,11 +359,11 @@ describe('canonical dispute fulfillment', () => {
     const fixture = await createPurchase();
     const disputeId = `dp_test_${randomUUID()}`;
     const won = await createDisputeEvent(disputeId, 1);
-    await fulfillDisputeEvent(databaseClient.db, command(fixture, won, 'won', 1), dependencies());
+    await fulfillDisputeEvent(workerDatabaseClient.db, command(fixture, won, 'won', 1), dependencies());
     const laterOpen = await createDisputeEvent(disputeId, 2);
 
     await fulfillDisputeEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       command(fixture, laterOpen, 'open', 2),
       dependencies()
     );
@@ -374,11 +379,11 @@ describe('canonical dispute fulfillment', () => {
     const disputeId = `dp_test_${randomUUID()}`;
     const sharedSecond = new Date('2026-08-10T14:01:00.000Z');
     const won = await createDisputeEvent(disputeId, 1, sharedSecond);
-    await fulfillDisputeEvent(databaseClient.db, command(fixture, won, 'won', 1), dependencies());
+    await fulfillDisputeEvent(workerDatabaseClient.db, command(fixture, won, 'won', 1), dependencies());
     const lost = await createDisputeEvent(disputeId, 2, sharedSecond);
 
     await expect(fulfillDisputeEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       command(fixture, lost, 'lost', 2),
       dependencies()
     )).rejects.toBeInstanceOf(PermanentCommerceError);
@@ -392,10 +397,10 @@ describe('canonical dispute fulfillment', () => {
     const fixture = await createPurchase();
     const disputeId = `dp_test_${randomUUID()}`;
     const lost = await createDisputeEvent(disputeId, 1);
-    await fulfillDisputeEvent(databaseClient.db, command(fixture, lost, 'lost', 1), dependencies());
+    await fulfillDisputeEvent(workerDatabaseClient.db, command(fixture, lost, 'lost', 1), dependencies());
     const won = await createDisputeEvent(disputeId, 2);
     await expect(fulfillDisputeEvent(
-      databaseClient.db,
+      workerDatabaseClient.db,
       command(fixture, won, 'won', 2),
       dependencies()
     )).rejects.toBeInstanceOf(PermanentCommerceError);
@@ -413,7 +418,7 @@ describe('canonical dispute fulfillment', () => {
 
   it('does not restore a fully refunded grant after a won dispute', async () => {
     const fixture = await createPurchase();
-    const [refund] = await databaseClient.db.insert(refunds).values({
+    const [refund] = await ownerDatabaseClient.db.insert(refunds).values({
       paymentId: fixture.paymentId,
       stripeRefundId: `re_test_${randomUUID()}`,
       status: 'succeeded',
@@ -423,14 +428,14 @@ describe('canonical dispute fulfillment', () => {
       providerCreatedAt: new Date('2026-08-10T13:00:00.000Z')
     }).returning();
     if (!refund) throw new Error('Expected refund');
-    await databaseClient.db.insert(refundAllocations).values({
+    await ownerDatabaseClient.db.insert(refundAllocations).values({
       refundId: refund.id,
       orderItemId: fixture.items[0]!.id,
       amountMinor: 1403,
       source: 'automatic'
     });
     const event = await createDisputeEvent(`dp_test_${randomUUID()}`, 1);
-    await fulfillDisputeEvent(databaseClient.db, command(fixture, event, 'won', 1), dependencies());
+    await fulfillDisputeEvent(workerDatabaseClient.db, command(fixture, event, 'won', 1), dependencies());
     expect((await databaseClient.db.select().from(entitlementGrants))[0]?.state).toBe('revoked');
     expect((await databaseClient.db.select().from(entitlements))[0]?.revokedAt)
       .toEqual(expect.any(Date));
@@ -438,7 +443,7 @@ describe('canonical dispute fulfillment', () => {
 
   it('keeps effective access when a preserved grant remains active', async () => {
     const fixture = await createPurchase();
-    await databaseClient.db.insert(entitlementGrants).values({
+    await ownerDatabaseClient.db.insert(entitlementGrants).values({
       userId: fixture.userId!,
       titleId: fixture.items[0]!.titleId,
       source: 'preserved',
@@ -447,7 +452,7 @@ describe('canonical dispute fulfillment', () => {
       grantedAt: fixedNow
     });
     const event = await createDisputeEvent(`dp_test_${randomUUID()}`, 1);
-    await fulfillDisputeEvent(databaseClient.db, command(fixture, event, 'open', 1), dependencies());
+    await fulfillDisputeEvent(workerDatabaseClient.db, command(fixture, event, 'open', 1), dependencies());
     expect((await databaseClient.db.select().from(entitlements))[0]?.revokedAt).toBeNull();
     expect(await accessMessages()).toHaveLength(0);
   });
@@ -456,13 +461,13 @@ describe('canonical dispute fulfillment', () => {
     const fixture = await createPurchase([1403], 'guest');
     const disputeId = `dp_test_${randomUUID()}`;
     const opened = await createDisputeEvent(disputeId, 1);
-    await fulfillDisputeEvent(databaseClient.db, command(fixture, opened, 'open', 1), dependencies());
+    await fulfillDisputeEvent(workerDatabaseClient.db, command(fixture, opened, 'open', 1), dependencies());
     expect((await databaseClient.db.select().from(entitlementGrants))[0]).toMatchObject({
       userId: null,
       state: 'suspended'
     });
     const won = await createDisputeEvent(disputeId, 2);
-    await fulfillDisputeEvent(databaseClient.db, command(fixture, won, 'won', 2), dependencies());
+    await fulfillDisputeEvent(workerDatabaseClient.db, command(fixture, won, 'won', 2), dependencies());
     expect((await databaseClient.db.select().from(entitlementGrants))[0]).toMatchObject({
       userId: null,
       state: 'unclaimed'
@@ -476,13 +481,13 @@ describe('canonical dispute fulfillment', () => {
     const openEvent = await createDisputeEvent(`dp_test_${randomUUID()}`, 1);
     const wonEvent = await createDisputeEvent(`dp_test_${randomUUID()}`, 2);
     await Promise.all([
-      fulfillDisputeEvent(databaseClient.db, command(fixture, openEvent, 'open', 1), dependencies()),
-      fulfillDisputeEvent(databaseClient.db, command(fixture, wonEvent, 'won', 2), dependencies())
+      fulfillDisputeEvent(workerDatabaseClient.db, command(fixture, openEvent, 'open', 1), dependencies()),
+      fulfillDisputeEvent(workerDatabaseClient.db, command(fixture, wonEvent, 'won', 2), dependencies())
     ]);
     expect((await databaseClient.db.select().from(disputes)).map((row) => row.status).sort())
       .toEqual(['open', 'won']);
     expect((await databaseClient.db.select().from(entitlementGrants))[0]?.state).toBe('suspended');
-    expect((await databaseClient.db.select().from(outboxMessages))).toHaveLength(1);
+    expect((await ownerDatabaseClient.db.select().from(outboxMessages))).toHaveLength(1);
   });
 
   it.each(['store', 'projection', 'email', 'audit', 'handoff', 'event'] as const)(
@@ -517,7 +522,7 @@ describe('canonical dispute fulfillment', () => {
           : {})
       };
       await expect(fulfillDisputeEvent(
-        databaseClient.db,
+        workerDatabaseClient.db,
         command(fixture, event, 'open', 1),
         overrides
       )).rejects.toThrow(`forced ${failure} failure`);
@@ -525,7 +530,7 @@ describe('canonical dispute fulfillment', () => {
       expect((await databaseClient.db.select().from(entitlementGrants))[0]?.state).toBe('active');
       expect((await databaseClient.db.select().from(entitlements))[0]?.revokedAt).toBeNull();
       expect((await databaseClient.db.select().from(stripeEvents))[0]?.status).toBe('pending');
-      expect(await databaseClient.db.select().from(outboxMessages)).toHaveLength(0);
+      expect(await ownerDatabaseClient.db.select().from(outboxMessages)).toHaveLength(0);
       expect(await databaseClient.db.select().from(auditEvents)).toHaveLength(0);
       expect(await databaseClient.db.select().from(jobs).where(eq(
         jobs.type,
@@ -540,13 +545,13 @@ describe('canonical dispute fulfillment', () => {
       const fixture = await createPurchase();
       const event = await createDisputeEvent(`dp_test_${randomUUID()}`, 1);
       const input = command(fixture, event, 'open', 1);
-      await fulfillDisputeEvent(databaseClient.db, input, dependencies());
+      await fulfillDisputeEvent(workerDatabaseClient.db, input, dependencies());
       const [queued] = await databaseClient.db.select().from(jobs).where(eq(
         jobs.type,
         FINANCIAL_SOURCE_JOB
       ));
       if (!queued) throw new Error('Expected financial dispute job');
-      await databaseClient.db.update(jobs).set(status === 'running'
+      await workerDatabaseClient.db.update(jobs).set(status === 'running'
         ? {
             status,
             attempts: 1,
@@ -565,7 +570,7 @@ describe('canonical dispute fulfillment', () => {
           }).where(eq(jobs.id, queued.id));
       const [before] = await databaseClient.db.select().from(jobs).where(eq(jobs.id, queued.id));
 
-      await fulfillDisputeEvent(databaseClient.db, input, dependencies());
+      await fulfillDisputeEvent(workerDatabaseClient.db, input, dependencies());
 
       expect(await databaseClient.db.select().from(jobs).where(eq(
         jobs.type,
@@ -577,7 +582,7 @@ describe('canonical dispute fulfillment', () => {
   it('writes only aggregate minimized audit state', async () => {
     const fixture = await createPurchase();
     const event = await createDisputeEvent(`dp_test_${randomUUID()}`, 1);
-    await fulfillDisputeEvent(databaseClient.db, command(fixture, event, 'open', 1), dependencies());
+    await fulfillDisputeEvent(workerDatabaseClient.db, command(fixture, event, 'open', 1), dependencies());
     const audit = await databaseClient.db.select().from(auditEvents);
     expect(audit).toHaveLength(1);
     expect(audit[0]?.after).toEqual({

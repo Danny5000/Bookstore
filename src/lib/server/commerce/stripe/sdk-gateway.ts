@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import Stripe from 'stripe';
 import { z } from 'zod';
 import {
+  CheckoutUnavailableError,
   PermanentCommerceError,
   RetryableProviderError
 } from '$lib/server/commerce/errors';
@@ -37,12 +38,23 @@ import {
   type StripeCommerceGateway
 } from './types';
 
-export interface StripeSdkGatewayOptions {
+export interface StripeSdkWorkerGatewayOptions {
   secretKey: string;
+  expectedLiveMode: boolean;
+}
+
+export interface StripeSdkGatewayOptions extends StripeSdkWorkerGatewayOptions {
   webhookSecret: string;
   origin: string;
-  expectedLiveMode: boolean;
   webhookToleranceSeconds: number;
+}
+
+interface StripeSdkInternalGatewayOptions extends StripeSdkWorkerGatewayOptions {
+  web?: {
+    webhookSecret: string;
+    origin: string;
+    webhookToleranceSeconds: number;
+  };
 }
 
 const providerIdSchema = z.string().min(1).max(255).regex(/^[A-Za-z0-9_-]+$/u);
@@ -211,12 +223,16 @@ function createSdkClient(secretKey: string): Stripe {
   });
 }
 
-export function createStripeSdkGateway(options: StripeSdkGatewayOptions): StripeCommerceGateway {
-  const origin = new URL(options.origin).origin;
+function createStripeSdkInternalGateway(
+  options: StripeSdkInternalGatewayOptions
+): StripeCommerceGateway {
+  const web = options.web;
+  const origin = web ? new URL(web.origin).origin : undefined;
   const client = createSdkClient(options.secretKey);
 
   return {
     async createCheckoutSession(untrustedInput) {
+      if (!web || !origin) throw new CheckoutUnavailableError();
       const input = parseProvider(createCheckoutSessionInputSchema, untrustedInput);
       assertReturnUrl(input.successUrl, origin);
       assertReturnUrl(input.cancelUrl, origin);
@@ -446,6 +462,7 @@ export function createStripeSdkGateway(options: StripeSdkGatewayOptions): Stripe
     },
 
     verifyWebhook(rawBody, signature) {
+      if (!web) throw new CheckoutUnavailableError();
       const rawBodySha256 = createHash('sha256').update(rawBody).digest('hex');
       try {
         const event = parseProvider(
@@ -453,8 +470,8 @@ export function createStripeSdkGateway(options: StripeSdkGatewayOptions): Stripe
           client.webhooks.constructEvent(
             Buffer.from(rawBody.buffer, rawBody.byteOffset, rawBody.byteLength),
             signature,
-            options.webhookSecret,
-            options.webhookToleranceSeconds
+            web.webhookSecret,
+            web.webhookToleranceSeconds
           )
         );
         if (event.api_version !== null && event.api_version !== STRIPE_API_VERSION) {
@@ -474,4 +491,22 @@ export function createStripeSdkGateway(options: StripeSdkGatewayOptions): Stripe
       }
     }
   };
+}
+
+export function createStripeSdkGateway(options: StripeSdkGatewayOptions): StripeCommerceGateway {
+  return createStripeSdkInternalGateway({
+    secretKey: options.secretKey,
+    expectedLiveMode: options.expectedLiveMode,
+    web: {
+      webhookSecret: options.webhookSecret,
+      origin: options.origin,
+      webhookToleranceSeconds: options.webhookToleranceSeconds
+    }
+  });
+}
+
+export function createStripeSdkWorkerGateway(
+  options: StripeSdkWorkerGatewayOptions
+): StripeCommerceGateway {
+  return createStripeSdkInternalGateway(options);
 }

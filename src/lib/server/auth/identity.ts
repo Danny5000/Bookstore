@@ -1,4 +1,4 @@
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq, sql, type SQL } from 'drizzle-orm';
 import { z } from 'zod';
 import type { ApplicationRole } from '$lib/types/auth';
 import type { Actor } from './admin-policy';
@@ -59,16 +59,28 @@ export async function findOrCreateGuestIdentity(
   email: string
 ): Promise<GuestIdentityRow> {
   const normalizedEmail = normalizeEmailAddress(email);
+  const insertedResult = await database.execute<{ id: string }>(
+    guestIdentityInsertQuery(normalizedEmail)
+  );
+  const insertedId = insertedResult.rows[0]?.id;
   const [identity] = await database
-    .insert(guestIdentities)
-    .values({ email: normalizedEmail })
-    .onConflictDoUpdate({
-      target: guestIdentities.email,
-      set: { updatedAt: sql`${guestIdentities.updatedAt}` }
-    })
-    .returning();
-  if (!identity) throw new Error('Guest identity upsert returned no row');
+    .select()
+    .from(guestIdentities)
+    .where(insertedId
+      ? eq(guestIdentities.id, insertedId)
+      : eq(guestIdentities.email, normalizedEmail))
+    .limit(1);
+  if (!identity) throw new Error('Guest identity insert conflict returned no row');
   return identity;
+}
+
+export function guestIdentityInsertQuery(normalizedEmail: string): SQL {
+  return sql`
+    insert into "public"."guest_identities" ("email")
+    values (${normalizedEmail}::text)
+    on conflict ("email") do nothing
+    returning "id"
+  `;
 }
 
 export async function canSendMagicLink(database: Database, email: string): Promise<boolean> {

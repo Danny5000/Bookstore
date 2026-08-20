@@ -461,6 +461,41 @@ function validateContainerlessManifest(owned: OwnedRunManifest): void {
   assert(owned.containerId === '', 'containerless cleanup requires an empty container ID');
 }
 
+function exactComposeResourceNames(
+  owned: OwnedRunManifest
+): ReadonlyArray<readonly ['container' | 'network' | 'volume', string]> {
+  return [
+    ['container', `${owned.project}-postgres-1`],
+    ['network', `${owned.project}_default`],
+    ['volume', `${owned.project}_postgres-data`]
+  ];
+}
+
+function exactComposeResourceNamesPresent(
+  owned: OwnedRunManifest,
+  docker: DockerCommandRuntime,
+  kind: 'container' | 'network' | 'volume',
+  expectedName: string
+): boolean {
+  const argumentsToCapture = kind === 'container'
+    ? ['ps', '--all', '--filter', `name=${expectedName}`, '--format', '{{.Names}}']
+    : [kind, 'ls', '--filter', `name=${expectedName}`, '--format', '{{.Name}}'];
+  return docker.capture(argumentsToCapture).split(/\r?\n/u).filter(Boolean).includes(expectedName);
+}
+
+function assertNoExactComposeResourceCollision(
+  owned: OwnedRunManifest,
+  docker: DockerCommandRuntime
+): void {
+  validateContainerlessManifest(owned);
+  for (const [kind, expectedName] of exactComposeResourceNames(owned)) {
+    assert(
+      !exactComposeResourceNamesPresent(owned, docker, kind, expectedName),
+      `foreign exact-name Docker ${kind} collides with the owned upgrade run`
+    );
+  }
+}
+
 function inspectOwnedComposeResource(
   owned: OwnedRunManifest,
   docker: DockerCommandRuntime,
@@ -482,6 +517,11 @@ function validateOwnedContainerlessResources(
   docker: DockerCommandRuntime
 ): void {
   validateContainerlessManifest(owned);
+  const expectedContainerName = `${owned.project}-postgres-1`;
+  assert(
+    !exactComposeResourceNamesPresent(owned, docker, 'container', expectedContainerName),
+    'foreign exact-name Docker container blocks owned cleanup'
+  );
   for (const [kind, expectedName] of [
     ['network', `${owned.project}_default`],
     ['volume', `${owned.project}_postgres-data`]
@@ -649,6 +689,7 @@ export async function startOwnedDatabase(
   owned: OwnedRunManifest,
   docker: DockerCommandRuntime = dockerCommandRuntime
 ): Promise<void> {
+  assertNoExactComposeResourceCollision(owned, docker);
   let startupError: unknown;
   try {
     docker.run([...composeArguments(owned), 'up', '--detach']);

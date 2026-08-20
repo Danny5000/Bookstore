@@ -20,6 +20,38 @@ import {
   waitForHydratedHandler
 } from './publication-admin';
 
+interface ClaimBridgeTraffic {
+  method: string;
+  status: number;
+  origin?: string | null;
+  contentType?: string | null;
+  fieldNames?: string[];
+}
+
+function observeClaimBridge(page: Page): ClaimBridgeTraffic[] {
+  const traffic: ClaimBridgeTraffic[] = [];
+  page.on('response', (response) => {
+    const url = new URL(response.url());
+    if (url.pathname !== '/claim/authorize') return;
+    const request = response.request();
+    if (request.method() === 'GET') {
+      traffic.push({ method: 'GET', status: response.status() });
+      return;
+    }
+    const headers = request.headers();
+    const contentType = headers['content-type']?.split(';', 1)[0] ?? null;
+    const postData = request.postData();
+    traffic.push({
+      method: request.method(),
+      status: response.status(),
+      origin: headers.origin ?? null,
+      contentType,
+      fieldNames: postData ? [...new URLSearchParams(postData).keys()].sort() : []
+    });
+  });
+  return traffic;
+}
+
 test.describe.configure({ mode: 'serial' });
 
 async function startGuestCheckout(
@@ -93,7 +125,7 @@ async function verificationEmailCount(
   database: E2EDatabase,
   email: string
 ): Promise<number> {
-  const messages = await database.db
+  const messages = await database.workerDb
     .select({ payload: outboxMessages.payload })
     .from(outboxMessages)
     .where(eq(outboxMessages.topic, 'email.auth.v1'));
@@ -202,7 +234,30 @@ test('guest receipts claim every same-email purchase and reject action replay', 
 
     if (!latestClaimMessage) throw new Error('Expected a guest claim email');
     const claimLink = firstHttpLink(latestClaimMessage);
+    const parsedClaimLink = new URL(claimLink);
+    expect({
+      origin: parsedClaimLink.origin,
+      pathname: parsedClaimLink.pathname,
+      search: parsedClaimLink.search,
+      fragmentKeys: [...new URLSearchParams(parsedClaimLink.hash.slice(1)).keys()].sort()
+    }).toEqual({
+      origin: baseURL,
+      pathname: '/claim/authorize',
+      search: '',
+      fragmentKeys: ['action', 'kind', 'orderId', 'proof']
+    });
+    const claimBridgeTraffic = observeClaimBridge(guestPage);
     await navigateSensitiveAction(guestPage, claimLink);
+    expect(claimBridgeTraffic).toEqual([
+      { method: 'GET', status: 200 },
+      {
+        method: 'POST',
+        status: 303,
+        origin: baseURL,
+        contentType: 'application/x-www-form-urlencoded',
+        fieldNames: ['nonce', 'payload']
+      }
+    ]);
     await expect(guestPage.getByRole('heading', { name: 'Purchases claimed' })).toBeVisible();
     await expectClaimedGrantCount(database, guestEmail, publishedTitle.titleId, 2);
     await guestPage.getByRole('link', { name: 'Open your library' }).click();
@@ -316,7 +371,24 @@ test('a pre-existing unverified credential is recovered before claiming its gues
     );
     expect(resetLink).not.toContain(encodeURIComponent(email));
     await navigateSensitiveAction(recoveryPage, resetLink);
-    await expect(recoveryPage).toHaveURL(/\/reset-password\?purpose=commerce-claim&token=/u);
+    await expect.poll(() => {
+      const resetPageUrl = new URL(recoveryPage.url());
+      return {
+        origin: resetPageUrl.origin,
+        pathname: resetPageUrl.pathname,
+        searchKeys: [...resetPageUrl.searchParams.keys()].sort(),
+        purpose: resetPageUrl.searchParams.get('purpose'),
+        orderId: resetPageUrl.searchParams.get('orderId'),
+        hasToken: Boolean(resetPageUrl.searchParams.get('token'))
+      };
+    }).toEqual({
+      origin: baseURL,
+      pathname: '/reset-password',
+      searchKeys: ['orderId', 'purpose', 'token'],
+      purpose: 'commerce-claim',
+      orderId,
+      hasToken: true
+    });
     await recoveryPage.getByLabel('Checkout email').fill(email);
     await recoveryPage.getByLabel('New password', { exact: true }).fill(victimPassword);
     await recoveryPage.getByLabel('Confirm new password').fill(victimPassword);

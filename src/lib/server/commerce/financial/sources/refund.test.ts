@@ -325,7 +325,8 @@ function refundFxGateway(
   trace: string[],
   sourceCurrency: string,
   primary: RefundFxBalance,
-  failure: RefundFxBalance
+  failure: RefundFxBalance,
+  settlementAmountMinor = 100
 ): StripeCommerceGateway {
   const provider = gateway(trace);
   vi.mocked(provider.retrieveRefund).mockImplementation(async () => {
@@ -358,7 +359,7 @@ function refundFxGateway(
     trace.push(`provider.balance.${id}`);
     const isFailure = id === 'txn_refund_failure_trace';
     const evidence = isFailure ? failure : primary;
-    const amountMinor = isFailure ? 100 : -100;
+    const amountMinor = isFailure ? settlementAmountMinor : -settlementAmountMinor;
     return {
       id, livemode: false, sourceId: 're_refund_trace', sourceFamily: 'refund',
       rawType: isFailure ? 'refund_failure' : 'refund',
@@ -475,6 +476,42 @@ describe('reconcileRefundFinancialSource', () => {
     )).rejects.toThrow('projection-stop');
 
     expect(stageBalanceTransaction).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects a conserved failed-refund pair that differs from its same-currency amount', async () => {
+    const database = routingDatabase([]);
+    prepareRefundIssueTransaction(database);
+    const provider = refundFxGateway(
+      [],
+      'USD',
+      USD_WITHOUT_EXCHANGE,
+      USD_WITHOUT_EXCHANGE,
+      90
+    );
+    vi.mocked(stageBalanceTransaction).mockImplementation(async (_database, snapshot) => ({
+      balanceTransactionId: snapshot.id === 'txn_refund_trace' ? balanceId : failureBalanceId,
+      disposition: 'inserted'
+    }));
+    vi.mocked(lockCanonicalPaymentPurchaseFacts).mockRejectedValueOnce(
+      new Error('projection-stop-after-mismatched-refund-staging')
+    );
+
+    try {
+      await expect(reconcileRefundFinancialSource(database, provider, {
+        refundId,
+        correlationId: 'refund-same-currency-amount-mismatch'
+      }, new AbortController().signal)).resolves.toMatchObject({
+        status: 'exception',
+        sourceKind: 'refund',
+        sourceId: refundId,
+        financialEvidenceStatus: 'exception',
+        safeCode: 'immutable_mismatch'
+      });
+
+      expect(stageBalanceTransaction).not.toHaveBeenCalled();
+    } finally {
+      vi.mocked(lockCanonicalPaymentPurchaseFacts).mockReset();
+    }
   });
 
   it('keeps an independently staged transaction but aborts before purchase projection', async () => {
@@ -1550,6 +1587,49 @@ describe('recomputeLockedRefundFinancialProjection', () => {
         })
       ]
     });
+  });
+
+  it('rejects a locked conserved failed-refund pair that differs from its same-currency amount', async () => {
+    const original = canonicalBalance({
+      amountMinor: -90,
+      feeMinor: 0,
+      netMinor: -90
+    });
+    const reversal = canonicalBalance({
+      id: failureBalanceId,
+      providerId: 'txn_refund_failure_amount_mismatch_trace',
+      amountMinor: 90,
+      feeMinor: 0,
+      netMinor: 90,
+      providerCreatedAt: new Date('2026-08-11T00:00:00.000Z'),
+      classification: 'refund_failure'
+    });
+    const transaction = projectionTransaction({
+      balances: [original, reversal],
+      history: []
+    });
+    vi.mocked(loadCurrentEffectiveAllocationProjection).mockResolvedValue(
+      completeProjections([original, reversal])
+    );
+    vi.mocked(observeFinancialIssue).mockResolvedValue({ id: issueId } as never);
+
+    await expect(recomputeLockedRefundFinancialProjection(transaction, lockedInput({
+      providerStatus: 'failed',
+      allocationStatus: 'not_applicable',
+      amountMinor: 100,
+      balanceTransactionIds: [balanceId, failureBalanceId],
+      finalizedAllocations: [],
+      refundComponents: []
+    }))).resolves.toEqual({
+      status: 'exception',
+      refundId,
+      financialEvidenceStatus: 'exception',
+      safeCode: 'immutable_mismatch',
+      issueId
+    });
+
+    expect(persistFinancialAllocationReplayPlanLocked).not.toHaveBeenCalled();
+    expect(persistFinancialAllocationPlanLocked).not.toHaveBeenCalled();
   });
 
   it('records a residual failed-refund principal as a durable allocation exception', async () => {

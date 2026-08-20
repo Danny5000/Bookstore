@@ -25,7 +25,7 @@ export interface ObjectStorage {
   write(
     key: StorageKey,
     body: Readable,
-    options: { maxBytes: number }
+    options: { maxBytes: number; expectedBytes?: number }
   ): Promise<StoredObjectStat>;
   read(key: StorageKey): Promise<Readable>;
   readRange(key: StorageKey, start: number, endInclusive: number): Promise<Readable>;

@@ -1,9 +1,29 @@
 import { readFile } from 'node:fs/promises';
-import { describe, expect, it } from 'vitest';
-import configuration from '../playwright.config';
+import type { PlaywrightTestConfig } from '@playwright/test';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { withoutStripeProviderSecrets } from './test-environment';
 
 describe('Playwright commerce fixture isolation', () => {
+  let configuration: PlaywrightTestConfig;
+
+  beforeAll(async () => {
+    const isolatedEnvironment = {
+      APP_ENV: 'test',
+      PALE_ORBIT_TEST_PROJECT: 'pale-orbit-test-0123456789abcdef',
+      DATABASE_HOST: '127.0.0.1',
+      DATABASE_PORT: '55432',
+      DATABASE_NAME: 'pale_orbit_test',
+      DATABASE_OWNER_USER: 'pale_orbit_test',
+      DATABASE_USER: 'pale_orbit_test_web',
+      DATABASE_WORKER_USER: 'pale_orbit_test_worker',
+      DATABASE_STORAGE_CLEANUP_USER: 'pale_orbit_test_storage_cleanup'
+    };
+    for (const [name, value] of Object.entries(isolatedEnvironment)) vi.stubEnv(name, value);
+    configuration = (await import('../playwright.config')).default;
+  });
+
+  afterAll(() => vi.unstubAllEnvs());
+
   it('does not retain browser traces containing one-use action URLs', () => {
     expect(configuration.use?.trace).toBe('off');
   });

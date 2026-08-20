@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { sql } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import { account, credentialAuthority, user } from '$lib/server/db/schema';
-import { databaseClient } from './database';
+import { databaseClient, ownerDatabaseClient } from './database';
 
 async function migrationStatements(): Promise<readonly string[]> {
   const source = await readFile(
@@ -31,7 +31,7 @@ describe('credential authority migration', () => {
     const legacyHash = '$2b$12$exact-legacy-password-hash';
     const rollback = new Error('rollback successful migration fixture');
 
-    await expect(databaseClient.db.transaction(async (transaction) => {
+    await expect(ownerDatabaseClient.db.transaction(async (transaction) => {
       await transaction.execute(sql`drop table credential_authority`);
       await transaction.insert(user).values({
         id: userId,
@@ -73,7 +73,7 @@ describe('credential authority migration', () => {
   it('rolls back the actual migration when a legacy user has duplicate credentials', async () => {
     const statements = await migrationStatements();
     const userId = randomUUID();
-    const migration = databaseClient.db.transaction(async (transaction) => {
+    const migration = ownerDatabaseClient.db.transaction(async (transaction) => {
       await transaction.execute(sql`drop table credential_authority`);
       await transaction.insert(user).values({
         id: userId,
@@ -111,7 +111,7 @@ describe('credential authority migration', () => {
   it('rolls back the actual migration when a legacy credential has no password hash', async () => {
     const statements = await migrationStatements();
     const userId = randomUUID();
-    const migration = databaseClient.db.transaction(async (transaction) => {
+    const migration = ownerDatabaseClient.db.transaction(async (transaction) => {
       await transaction.execute(sql`drop table credential_authority`);
       await transaction.insert(user).values({
         id: userId,

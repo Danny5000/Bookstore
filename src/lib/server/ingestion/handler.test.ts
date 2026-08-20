@@ -44,7 +44,7 @@ describe('ingestion manifest row mapping', () => {
       ordinal: 1,
       sourcePath: 'page-1.png',
       storageKey: parseStorageKey(
-        `titles/${randomUUID()}/revisions/${revisionId}/derived/v1/comic-pages/${randomUUID()}.webp`
+        `titles/${randomUUID()}/revisions/${revisionId}/derived/v1/generations/0/comic-pages/${randomUUID()}.webp`
       ),
       mediaType: 'image/webp',
       checksumSha256: 'b'.repeat(64),

@@ -41,6 +41,8 @@ const safeRuntime = (): DisabledRuntimeEvidence => ({
   commerceStatus: 503,
   appStripeEnabled: false,
   workerStripeEnabled: false,
+  appDatabaseRoleIsWeb: true,
+  workerDatabaseRoleIsWorker: true,
   appFixtureMode: false,
   workerFixtureMode: false,
   appHasStripeSecret: false,
@@ -230,6 +232,7 @@ describe('Plan 6B production smoke ownership', () => {
 
     for (const unsafe of [
       { appStripeEnabled: true }, { workerFixtureMode: true }, { appHasStripeSecret: true },
+      { appDatabaseRoleIsWeb: false }, { workerDatabaseRoleIsWorker: false },
       { postgresHostPublished: true }, { workerReady: false }, { providerBackedJobCount: 1 },
       { classificationRootCount: 2 }, { classificationRootUnsafeCount: 1 },
       { classificationContinuationCount: 0 },
@@ -376,6 +379,46 @@ describe('Plan 6B production smoke ownership', () => {
       .toBe(true);
   });
 
+  it('provisions the fourth role before exercising production cleanup wiring', async () => {
+    const calls: Array<{ args: readonly string[]; env: NodeJS.ProcessEnv }> = [];
+    const owned = manifest();
+    const docker = createProductionSmokeDockerOperations(owned, {
+      command: {
+        run: vi.fn(async (args, env) => { calls.push({ args, env }); }),
+        capture: vi.fn(async () => ({ status: 0, stdout: '' }))
+      },
+      environment: { PATH: 'safe-path' },
+      assertPortAvailable: vi.fn(async () => undefined),
+      requestStatus: vi.fn(async () => 503),
+      wait: vi.fn(async () => undefined)
+    });
+
+    await docker.migrate(owned);
+
+    expect(calls.map((call) => call.args.at(-1))).toEqual([
+      'migrate',
+      'database-role-provision',
+      'storage-cleanup'
+    ]);
+    expect(calls).toHaveLength(3);
+    expect(calls.every((call) =>
+      call.env.DATABASE_STORAGE_CLEANUP_USER ===
+        'plan6b_smoke_storage_cleanup_0123456789abcdef'
+    )).toBe(true);
+  });
+
+  it('materializes a private cleanup database secret with the owned smoke manifest', async () => {
+    const owned = await createProductionSmokeManifest();
+    try {
+      await expect(readFile(
+        join(owned.secretDirectory, 'database_storage_cleanup_password'),
+        'utf8'
+      )).resolves.toMatch(/^[a-f0-9]{48}$/u);
+    } finally {
+      await rm(owned.tempDirectory, { recursive: true, force: true });
+    }
+  });
+
   it('refuses a Docker project collision before building or cleaning foreign resources', async () => {
     const command: ProductionSmokeCommandRuntime = {
       run: vi.fn(async () => undefined),
@@ -394,6 +437,60 @@ describe('Plan 6B production smoke ownership', () => {
     });
 
     await expect(docker.build(owned)).rejects.toThrow(/collides/u);
+    expect(command.run).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['container', (owned: ReturnType<typeof manifest>) => `${owned.project}-postgres-1`],
+    ['network', (owned: ReturnType<typeof manifest>) => `${owned.project}_default`],
+    ['volume', (owned: ReturnType<typeof manifest>) => `${owned.project}_postgres_data`]
+  ] as const)('refuses a foreign exact-name %s before the first Docker mutation', async (
+    resource,
+    expectedName
+  ) => {
+    const owned = manifest();
+    const name = expectedName(owned);
+    const command: ProductionSmokeCommandRuntime = {
+      run: vi.fn(async () => undefined),
+      capture: vi.fn(async (args) => ({
+        status: 0,
+        stdout: args[0] === (resource === 'container' ? 'ps' : resource) &&
+          args.includes(`name=${name}`) ? `${name}\n` : ''
+      }))
+    };
+    const docker = createProductionSmokeDockerOperations(owned, {
+      command,
+      environment: { PATH: 'safe-path' },
+      assertPortAvailable: vi.fn(async () => undefined),
+      requestStatus: vi.fn(async () => 503),
+      wait: vi.fn(async () => undefined)
+    });
+
+    await expect(docker.build(owned)).rejects.toThrow(/exact-name|collid/iu);
+    expect(command.run).not.toHaveBeenCalled();
+  });
+
+  it('rechecks exact-name collisions immediately before Compose startup', async () => {
+    const owned = manifest();
+    const exactVolumeName = `${owned.project}_postgres_data`;
+    const command: ProductionSmokeCommandRuntime = {
+      run: vi.fn(async () => undefined),
+      capture: vi.fn(async (args) => ({
+        status: 0,
+        stdout: args[0] === 'volume' && args.includes(`name=${exactVolumeName}`)
+          ? `${exactVolumeName}\n`
+          : ''
+      }))
+    };
+    const docker = createProductionSmokeDockerOperations(owned, {
+      command,
+      environment: { PATH: 'safe-path' },
+      assertPortAvailable: vi.fn(async () => undefined),
+      requestStatus: vi.fn(async () => 503),
+      wait: vi.fn(async () => undefined)
+    });
+
+    await expect(docker.startDatabase(owned)).rejects.toThrow(/exact-name|collid/iu);
     expect(command.run).not.toHaveBeenCalled();
   });
 
@@ -789,7 +886,7 @@ describe('Plan 6B production smoke ownership', () => {
     }
   });
 
-  it('fails cleanup when an exact-name volume remains without project labels', async () => {
+  it('refuses cleanup before Compose down when an exact-name volume has foreign labels', async () => {
     const owned = await createProductionSmokeManifest();
     const exactVolumeName = `${owned.project}_postgres_data`;
     let downCalled = false;
@@ -798,12 +895,13 @@ describe('Plan 6B production smoke ownership', () => {
         if (args[0] === 'compose' && args.includes('down')) downCalled = true;
       }),
       capture: vi.fn(async (args) => {
-        if (
-          downCalled &&
-          args[0] === 'volume' &&
-          args[1] === 'ls' &&
-          args.includes(`name=${exactVolumeName}`)
-        ) return { status: 0, stdout: `${exactVolumeName}\n` };
+        if (args[0] === 'volume' && args[1] === 'ls' &&
+          args.includes(`name=${exactVolumeName}`)) {
+          return { status: 0, stdout: `${exactVolumeName}\n` };
+        }
+        if (args[0] === 'volume' && args[1] === 'inspect') {
+          return { status: 0, stdout: JSON.stringify({}) };
+        }
         return { status: 0, stdout: '' };
       })
     };
@@ -816,8 +914,8 @@ describe('Plan 6B production smoke ownership', () => {
     });
 
     try {
-      await expect(docker.cleanup(owned)).rejects.toThrow(/volume|cleanup/u);
-      expect(downCalled).toBe(true);
+      await expect(docker.cleanup(owned)).rejects.toThrow(/foreign|volume|cleanup/u);
+      expect(downCalled).toBe(false);
       expect(await readFile(owned.manifestFile, 'utf8')).toContain(owned.project);
     } finally {
       await rm(owned.tempDirectory, { recursive: true, force: true });

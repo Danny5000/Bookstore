@@ -10,7 +10,7 @@ import {
   userRoles,
   verification
 } from '$lib/server/db/schema';
-import { databaseClient } from './database';
+import { databaseClient, ownerDatabaseClient } from './database';
 
 async function createUser(email = `${randomUUID()}@example.com`) {
   const [created] = await databaseClient.db
@@ -77,14 +77,14 @@ describe('authentication and identity schema', () => {
       databaseClient.db.insert(userRoles).values({ userId: createdUser.id, role: 'customer' })
     ).rejects.toThrow();
     await expect(
-      databaseClient.db.insert(guestIdentities).values({ email: ' Reader@Example.COM ' })
+      ownerDatabaseClient.db.insert(guestIdentities).values({ email: ' Reader@Example.COM ' })
     ).rejects.toThrow();
-    await databaseClient.db.insert(guestIdentities).values({ email: 'reader@example.com' });
+    await ownerDatabaseClient.db.insert(guestIdentities).values({ email: 'reader@example.com' });
     await expect(
-      databaseClient.db.insert(guestIdentities).values({ email: 'reader@example.com' })
+      ownerDatabaseClient.db.insert(guestIdentities).values({ email: 'reader@example.com' })
     ).rejects.toThrow();
     await expect(
-      databaseClient.db.insert(guestIdentities).values({
+      ownerDatabaseClient.db.insert(guestIdentities).values({
         email: 'claimed@example.com',
         claimedByUserId: createdUser.id
       })
@@ -103,7 +103,7 @@ describe('authentication and identity schema', () => {
     ).toHaveLength(0);
 
     const claimedUser = await createUser();
-    await databaseClient.db.insert(guestIdentities).values({
+    await ownerDatabaseClient.db.insert(guestIdentities).values({
       email: 'claimed@example.com',
       claimedByUserId: claimedUser.id,
       claimedAt: new Date()

@@ -4,7 +4,10 @@ import { PgDialect } from 'drizzle-orm/pg-core';
 import { stageBalanceTransaction } from '$lib/server/commerce/financial/ledger';
 import { loadCurrentEffectiveAllocationProjection, persistFinancialAllocationPlanLocked } from '$lib/server/commerce/financial/allocations/repository';
 import { financialAllocationSets, financialItemAllocations, guestIdentities, orderItems, orders, payments, titles } from '$lib/server/db/schema';
-import { databaseClient } from './database';
+import {
+  ownerDatabaseClient,
+  workerDatabaseClient as databaseClient
+} from './database';
 
 const dialect = new PgDialect();
 function rendered(query: unknown): string {
@@ -64,20 +67,20 @@ describe('financial allocation repository', () => {
     const suffix = randomUUID();
     const titleId = randomUUID(); const orderId = randomUUID(); const itemId = randomUUID();
     const chargeId = `ch_allocation_repository_${suffix}`;
-    const [guest] = await databaseClient.db.insert(guestIdentities).values({ email: `allocation-${suffix}@example.com` }).returning();
+    const [guest] = await ownerDatabaseClient.db.insert(guestIdentities).values({ email: `allocation-${suffix}@example.com` }).returning();
     if (!guest) throw new Error('Expected guest fixture');
-    await databaseClient.db.insert(titles).values({ id: titleId, slug: `allocation-${suffix}`, title: 'Allocation title',
+    await ownerDatabaseClient.db.insert(titles).values({ id: titleId, slug: `allocation-${suffix}`, title: 'Allocation title',
       description: 'Allocation description', creatorName: 'Allocation creator', format: 'prose', priceMinor: 100,
       currency: 'USD', visibility: 'private' });
-    await databaseClient.db.insert(orders).values({ id: orderId, status: 'paid', guestIdentityId: guest.id, purchaseEmail: guest.email,
+    await ownerDatabaseClient.db.insert(orders).values({ id: orderId, status: 'paid', guestIdentityId: guest.id, purchaseEmail: guest.email,
       currency: 'USD', subtotalMinor: 100, taxMinor: 0, totalMinor: 100, clientCheckoutAttemptId: randomUUID(),
       quoteFingerprintSha256: 'b'.repeat(64), stripeCheckoutSessionId: `cs_${suffix}`,
       statusTokenSha256: 'c'.repeat(64), checkoutExpiresAt: new Date('2026-08-01T00:30:00.000Z'),
       paidAt: new Date('2026-08-01T00:00:00.000Z') });
-    await databaseClient.db.insert(orderItems).values({ id: itemId, orderId, titleId, titleSnapshot: 'Allocation title',
+    await ownerDatabaseClient.db.insert(orderItems).values({ id: itemId, orderId, titleId, titleSnapshot: 'Allocation title',
       creatorNameSnapshot: 'Allocation creator', format: 'prose', currency: 'USD', unitSubtotalMinor: 100,
       taxMinor: 0, totalMinor: 100, stripeLineItemId: `li_${suffix}` });
-    const [payment] = await databaseClient.db.insert(payments).values({ orderId,
+    const [payment] = await ownerDatabaseClient.db.insert(payments).values({ orderId,
       stripePaymentIntentId: `pi_${suffix}`, stripeLatestChargeId: chargeId, status: 'succeeded', amountMinor: 100,
       currency: 'USD', paymentMethodCategory: 'card', paidAt: new Date('2026-08-01T00:00:00.000Z') }).returning();
     if (!payment) throw new Error('Expected payment fixture');
@@ -193,23 +196,23 @@ describe('financial allocation repository', () => {
     const suffix = randomUUID();
     const titleId = randomUUID(); const orderId = randomUUID(); const itemId = randomUUID();
     const chargeId = `ch_allocation_reversal_${suffix}`;
-    const [guest] = await databaseClient.db.insert(guestIdentities)
+    const [guest] = await ownerDatabaseClient.db.insert(guestIdentities)
       .values({ email: `allocation-reversal-${suffix}@example.com` }).returning();
     if (!guest) throw new Error('Expected guest fixture');
-    await databaseClient.db.insert(titles).values({ id: titleId, slug: `allocation-reversal-${suffix}`,
+    await ownerDatabaseClient.db.insert(titles).values({ id: titleId, slug: `allocation-reversal-${suffix}`,
       title: 'Allocation reversal title', description: 'Allocation reversal description',
       creatorName: 'Allocation reversal creator', format: 'prose', priceMinor: 100,
       currency: 'USD', visibility: 'private' });
-    await databaseClient.db.insert(orders).values({ id: orderId, status: 'paid', guestIdentityId: guest.id,
+    await ownerDatabaseClient.db.insert(orders).values({ id: orderId, status: 'paid', guestIdentityId: guest.id,
       purchaseEmail: guest.email, currency: 'USD', subtotalMinor: 100, taxMinor: 0, totalMinor: 100,
       clientCheckoutAttemptId: randomUUID(), quoteFingerprintSha256: 'b'.repeat(64),
       stripeCheckoutSessionId: `cs_reversal_${suffix}`, statusTokenSha256: 'c'.repeat(64),
       checkoutExpiresAt: new Date('2026-08-01T00:30:00.000Z'), paidAt: new Date('2026-08-01T00:00:00.000Z') });
-    await databaseClient.db.insert(orderItems).values({ id: itemId, orderId, titleId,
+    await ownerDatabaseClient.db.insert(orderItems).values({ id: itemId, orderId, titleId,
       titleSnapshot: 'Allocation reversal title', creatorNameSnapshot: 'Allocation reversal creator',
       format: 'prose', currency: 'USD', unitSubtotalMinor: 100, taxMinor: 0, totalMinor: 100,
       stripeLineItemId: `li_reversal_${suffix}` });
-    const [payment] = await databaseClient.db.insert(payments).values({ orderId,
+    const [payment] = await ownerDatabaseClient.db.insert(payments).values({ orderId,
       stripePaymentIntentId: `pi_reversal_${suffix}`, stripeLatestChargeId: chargeId,
       status: 'succeeded', amountMinor: 100, currency: 'USD', paymentMethodCategory: 'card',
       paidAt: new Date('2026-08-01T00:00:00.000Z') }).returning();

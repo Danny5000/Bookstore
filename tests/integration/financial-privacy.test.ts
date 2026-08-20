@@ -48,7 +48,11 @@ import { disputeSnapshotFixture } from '../fixtures/stripe/dispute';
 import { paymentSnapshotFixture } from '../fixtures/stripe/payment';
 import { payoutSnapshotFixture } from '../fixtures/stripe/payout';
 import { refundSnapshotFixture } from '../fixtures/stripe/refund';
-import { applicationConfig, databaseClient } from './database';
+import {
+  applicationConfig,
+  ownerDatabaseClient,
+  workerDatabaseClient as databaseClient
+} from './database';
 
 const FINANCIAL_TABLES = [
   'stripe_balance_transactions',
@@ -265,11 +269,11 @@ async function createPrivacyFixture(): Promise<PrivacyFixture> {
   const titleId = randomUUID();
   const itemId = randomUUID();
   const paidAt = new Date('2026-08-10T12:01:00.000Z');
-  const [guest] = await databaseClient.db.insert(guestIdentities).values({
+  const [guest] = await ownerDatabaseClient.db.insert(guestIdentities).values({
     email: privateEmail
   }).returning();
   if (!guest) throw new Error('Expected a privacy guest fixture.');
-  await databaseClient.db.insert(titles).values({
+  await ownerDatabaseClient.db.insert(titles).values({
     id: titleId,
     slug: `financial-privacy-${token}`,
     title: 'Financial privacy fixture',
@@ -280,7 +284,7 @@ async function createPrivacyFixture(): Promise<PrivacyFixture> {
     currency: 'USD',
     visibility: 'private'
   });
-  await databaseClient.db.insert(orders).values({
+  await ownerDatabaseClient.db.insert(orders).values({
     id: orderId,
     status: 'paid',
     guestIdentityId: guest.id,
@@ -296,7 +300,7 @@ async function createPrivacyFixture(): Promise<PrivacyFixture> {
     checkoutExpiresAt: new Date('2026-08-10T12:30:00.000Z'),
     paidAt
   });
-  await databaseClient.db.insert(orderItems).values({
+  await ownerDatabaseClient.db.insert(orderItems).values({
     id: itemId,
     orderId,
     titleId,
@@ -309,7 +313,7 @@ async function createPrivacyFixture(): Promise<PrivacyFixture> {
     totalMinor: 1403,
     stripeLineItemId: `li_privacy_${token}`
   });
-  const [payment] = await databaseClient.db.insert(payments).values({
+  const [payment] = await ownerDatabaseClient.db.insert(payments).values({
     orderId,
     stripePaymentIntentId: provider.paymentIntentId,
     stripeLatestChargeId: provider.chargeId,

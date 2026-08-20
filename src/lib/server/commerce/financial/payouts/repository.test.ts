@@ -18,7 +18,11 @@ vi.mock('$lib/server/jobs/repository', () => jobMocks);
 vi.mock('../locks', () => lockMocks);
 vi.mock('../issues', () => issueMocks);
 
-import { persistPayoutImportPage, stagePayoutSnapshot } from './repository';
+import {
+  persistPayoutImportPage,
+  publishPayoutMembership,
+  stagePayoutSnapshot
+} from './repository';
 
 const dialect = new PgDialect();
 const compiled = (query: unknown) => dialect.sqlToQuery((query as SQLWrapper).getSQL());
@@ -124,5 +128,157 @@ describe('payout repository', () => {
       type: 'commerce.financial-payout',
       payload: { providerPayoutId: 'po_continuation_103', trigger: { kind: 'continuation' } }
     });
+  });
+
+  it('rechecks every locked candidate currency before publishing payout membership', async () => {
+    const payoutId = '00000000-0000-4000-8000-000000000106';
+    const runId = '00000000-0000-4000-8000-000000000107';
+    const balanceTransactionId = '00000000-0000-4000-8000-000000000108';
+    lockMocks.lockPayoutImportRows.mockResolvedValueOnce({
+      payoutId,
+      runId,
+      disposition: 'fresh',
+      payoutFinancialGeneration: 0,
+      runGeneration: 0,
+      runState: 'publishable',
+      balanceTransactionIds: [balanceTransactionId],
+      existingMembershipIds: [],
+      hasPublishedHistory: false,
+      issueIds: []
+    });
+    issueMocks.observeFinancialIssue.mockResolvedValueOnce({
+      id: '00000000-0000-4000-8000-000000000109'
+    });
+    const execute = vi.fn(async (query: unknown) => {
+      const rendered = compiled(query);
+      if (rendered.sql.includes('select candidate_count as "candidateCount"')) {
+        return { rows: [{ candidateCount: 1 }] };
+      }
+      if (rendered.sql.includes('select provider_id as "providerId"')) {
+        return { rows: [{
+          providerId: 'po_currency_guard_106',
+          automatic: true,
+          method: 'standard',
+          status: 'paid',
+          reconciliationStatus: 'completed',
+          financialGeneration: 0,
+          currency: 'USD'
+        }] };
+      }
+      if (rendered.sql.includes('from stripe_balance_transactions') &&
+        rendered.sql.includes('where id in')) {
+        return { rows: [{ id: balanceTransactionId, currency: 'EUR' }] };
+      }
+      return { rows: [] };
+    });
+    const database = {
+      transaction: vi.fn(async (work) => work({ execute, rollback: vi.fn() }))
+    } as unknown as Database;
+
+    await expect(publishPayoutMembership(database, {
+      payoutId,
+      runId,
+      expectedGeneration: 0,
+      correlationId: 'payout-publish-currency-guard'
+    })).rejects.toMatchObject({
+      name: 'PermanentFinancialError',
+      safeCode: 'currency_mismatch'
+    });
+
+    expect(issueMocks.observeFinancialIssue).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        resourceType: 'payout',
+        resourceId: payoutId,
+        safeCode: 'currency_mismatch',
+        impact: 'exception'
+      })
+    );
+    expect(execute.mock.calls.map(([query]) => compiled(query).sql)
+      .some((statement) => statement.includes('insert into stripe_payout_balance_transactions')))
+      .toBe(false);
+  });
+
+  it('rejects a published replay whose authoritative membership crosses currencies', async () => {
+    const payoutId = '00000000-0000-4000-8000-000000000110';
+    const runId = '00000000-0000-4000-8000-000000000111';
+    lockMocks.lockPayoutImportRows.mockResolvedValueOnce({
+      payoutId,
+      runId,
+      disposition: 'published_replay',
+      payoutFinancialGeneration: 1,
+      runGeneration: 0,
+      runState: 'published',
+      balanceTransactionIds: [],
+      existingMembershipIds: [],
+      hasPublishedHistory: false,
+      issueIds: []
+    });
+    issueMocks.observeFinancialIssue.mockResolvedValueOnce({
+      id: '00000000-0000-4000-8000-000000000112'
+    });
+    const execute = vi.fn(async (query: unknown) => {
+      const rendered = compiled(query);
+      if (rendered.sql.includes('from stripe_payout_balance_transactions') &&
+        rendered.sql.includes('mismatchCount')) {
+        return { rows: [{ count: 1, mismatchCount: 1 }] };
+      }
+      return { rows: [] };
+    });
+    const database = {
+      transaction: vi.fn(async (work) => work({ execute, rollback: vi.fn() }))
+    } as unknown as Database;
+
+    await expect(publishPayoutMembership(database, {
+      payoutId,
+      runId,
+      expectedGeneration: 0,
+      correlationId: 'payout-published-replay-currency-guard'
+    })).rejects.toMatchObject({
+      name: 'PermanentFinancialError',
+      safeCode: 'currency_mismatch'
+    });
+
+    expect(issueMocks.observeFinancialIssue).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        resourceType: 'payout',
+        resourceId: payoutId,
+        safeCode: 'currency_mismatch',
+        impact: 'exception'
+      })
+    );
+    expect(execute.mock.calls.map(([query]) => compiled(query).sql)
+      .some((statement) => statement.includes('update payout_import_runs')))
+      .toBe(false);
+  });
+
+  it('returns the authoritative same-currency membership count on published replay', async () => {
+    const payoutId = '00000000-0000-4000-8000-000000000113';
+    const runId = '00000000-0000-4000-8000-000000000114';
+    lockMocks.lockPayoutImportRows.mockResolvedValueOnce({
+      payoutId,
+      runId,
+      disposition: 'published_replay',
+      payoutFinancialGeneration: 1,
+      runGeneration: 0,
+      runState: 'published',
+      balanceTransactionIds: [],
+      existingMembershipIds: [],
+      hasPublishedHistory: false,
+      issueIds: []
+    });
+    const execute = vi.fn(async () => ({ rows: [{ count: 2, mismatchCount: 0 }] }));
+    const database = {
+      transaction: vi.fn(async (work) => work({ execute, rollback: vi.fn() }))
+    } as unknown as Database;
+
+    await expect(publishPayoutMembership(database, {
+      payoutId,
+      runId,
+      expectedGeneration: 0,
+      correlationId: 'payout-published-replay-same-currency'
+    })).resolves.toEqual({ generation: 1, membershipCount: 2 });
+    expect(issueMocks.observeFinancialIssue).not.toHaveBeenCalled();
   });
 });

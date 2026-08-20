@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 import { and, asc, eq, inArray, like, ne } from 'drizzle-orm';
 import type { Database } from '$lib/server/db/client';
@@ -13,16 +13,11 @@ import type { DatabaseExecutor } from '$lib/server/db/transaction';
 import { withTransaction } from '$lib/server/db/transaction';
 import { normalizeEmailAddress } from './identity';
 
-export const COMMERCE_CLAIM_AUTH_COOKIE = 'pale-orbit-commerce-claim';
-export const COMMERCE_CLAIM_AUTH_TTL_SECONDS = 10 * 60;
-
-const AUTHORIZATION_PREFIX = 'pale-orbit:commerce-claim-authorization:';
 const MAGIC_LINK_PREFIX = 'pale-orbit:auth-magic:';
 const RESET_TOKEN_PREFIX = 'pale-orbit:auth-password-reset:';
 const EMAIL_VERIFICATION_PREFIX = 'pale-orbit:email-verification:';
 const BETTER_AUTH_RESET_PREFIX = 'reset-password:';
 
-export type CommerceClaimAuthorizationKind = 'password-reset' | 'commerce-magic';
 export type AuthMagicLinkPurpose = 'account' | 'commerce-claim';
 export type PasswordResetPurpose = 'account' | 'commerce-claim';
 
@@ -39,12 +34,6 @@ interface MagicLinkMarkerV2 {
   email: string;
   purpose: AuthMagicLinkPurpose;
   credentialDigest: string;
-}
-
-interface AuthorizationMarkerV2 {
-  version: 2;
-  email: string;
-  kind: CommerceClaimAuthorizationKind;
 }
 
 function digest(value: string): string {
@@ -66,17 +55,6 @@ function identifier(prefix: string, token: string): string {
 function resetIdentifierForEpoch(epochSha256: string): string | null {
   if (!/^[a-f0-9]{64}$/u.test(epochSha256)) return null;
   return `${RESET_TOKEN_PREFIX}${Buffer.from(epochSha256, 'hex').toString('base64url')}`;
-}
-
-function authorizationMarker(
-  email: string,
-  kind: CommerceClaimAuthorizationKind
-): string {
-  return JSON.stringify({
-    version: 2,
-    email: normalizeEmailAddress(email),
-    kind
-  } satisfies AuthorizationMarkerV2);
 }
 
 function markerEmail(value: string): string | null {
@@ -169,28 +147,6 @@ function parseMagicLinkMarker(value: string): MagicLinkMarkerV2 | null {
   }
 }
 
-function parseAuthorizationMarker(value: string): AuthorizationMarkerV2 | null {
-  try {
-    const parsed = JSON.parse(value) as Partial<AuthorizationMarkerV2>;
-    if (
-      parsed.version !== 2 ||
-      typeof parsed.email !== 'string' ||
-      (parsed.kind !== 'password-reset' && parsed.kind !== 'commerce-magic')
-    ) return null;
-    return {
-      version: 2,
-      email: normalizeEmailAddress(parsed.email),
-      kind: parsed.kind
-    };
-  } catch {
-    return null;
-  }
-}
-
-function opaqueToken(): string {
-  return randomBytes(32).toString('base64url');
-}
-
 async function removeExpiredProjectMarkers(
   database: DatabaseExecutor,
   now: Date
@@ -222,34 +178,6 @@ async function deleteEmailMarkers(
   if (identifiers.length > 0) {
     await database.delete(verification).where(inArray(verification.identifier, identifiers));
   }
-}
-
-async function insertAuthorization(
-  database: DatabaseExecutor,
-  token: string,
-  email: string,
-  kind: CommerceClaimAuthorizationKind,
-  now: Date
-): Promise<void> {
-  await database.insert(verification).values({
-    identifier: identifier(AUTHORIZATION_PREFIX, token),
-    value: authorizationMarker(email, kind),
-    expiresAt: new Date(now.getTime() + COMMERCE_CLAIM_AUTH_TTL_SECONDS * 1000)
-  });
-}
-
-/** Test/support primitive. Production flows use the purpose-bound completion functions below. */
-export async function createCommerceClaimAuthorization(
-  database: Database,
-  input: { email: string; kind: CommerceClaimAuthorizationKind },
-  now = new Date()
-): Promise<string> {
-  const token = opaqueToken();
-  await withTransaction(database, async (transaction) => {
-    await removeExpiredProjectMarkers(transaction, now);
-    await insertAuthorization(transaction, token, input.email, input.kind, now);
-  });
-  return token;
 }
 
 /** Establishes authority only for a newly persisted ordinary credential. */
@@ -473,7 +401,7 @@ export async function applyCurrentPasswordResetCredential(
 
 export interface PasswordResetSecurityCompletion {
   completed: boolean;
-  claimToken: string | null;
+  purpose: PasswordResetPurpose | null;
 }
 
 export async function completePasswordResetSecurity(
@@ -545,11 +473,10 @@ export async function completePasswordResetSecurity(
       }
       await transaction.delete(session).where(eq(session.userId, userId));
       await transaction.delete(verification).where(eq(verification.identifier, resetIdentifier));
-      return { completed: false, claimToken: null };
+      return { completed: false, purpose: null };
     }
 
     const purpose = parsed?.purpose ?? 'account';
-    const claimToken = purpose === 'commerce-claim' ? opaqueToken() : null;
     const authorizedPasswordHash = currentCredential?.password;
     if (!authorizedPasswordHash) {
       throw new Error('Validated password reset lost its applied credential');
@@ -574,37 +501,9 @@ export async function completePasswordResetSecurity(
         .update(user)
         .set({ emailVerified: true, updatedAt: now })
         .where(eq(user.id, userId));
-      if (claimToken) {
-        await insertAuthorization(transaction, claimToken, email, 'password-reset', now);
-      }
     }
-    return { completed: true, claimToken };
+    return { completed: true, purpose };
   });
-}
-
-export async function consumeCommerceClaimAuthorizationInTransaction(
-  database: DatabaseExecutor,
-  input: { token: string; email: string; now?: Date }
-): Promise<CommerceClaimAuthorizationKind | null> {
-  if (!/^[A-Za-z0-9_-]{43}$/u.test(input.token)) return null;
-  const email = normalizeEmailAddress(input.email);
-  const now = input.now ?? new Date();
-  const claimIdentifier = identifier(AUTHORIZATION_PREFIX, input.token);
-  const [pending] = await database
-    .select({ value: verification.value, expiresAt: verification.expiresAt })
-    .from(verification)
-    .where(eq(verification.identifier, claimIdentifier))
-    .limit(1)
-    .for('update');
-  if (!pending) return null;
-  const parsed = parseAuthorizationMarker(pending.value);
-  if (!parsed || pending.expiresAt.getTime() <= now.getTime()) {
-    await database.delete(verification).where(eq(verification.identifier, claimIdentifier));
-    return null;
-  }
-  if (parsed.email !== email) return null;
-  await database.delete(verification).where(eq(verification.identifier, claimIdentifier));
-  return parsed.kind;
 }
 
 export async function registerAuthMagicLinkToken(
@@ -668,7 +567,7 @@ export async function registerAuthMagicLinkToken(
 }
 
 export interface AuthMagicLinkConsumption {
-  claimToken: string | null;
+  purpose: AuthMagicLinkPurpose;
 }
 
 async function passwordlessAuthorityCanBeCancelledByMagic(
@@ -795,16 +694,7 @@ export async function consumeAuthMagicLinkToken(
       }
     }
 
-    if (parsed.purpose === 'account') return { claimToken: null };
-    const claimToken = opaqueToken();
-    await insertAuthorization(
-      transaction,
-      claimToken,
-      parsed.email,
-      'commerce-magic',
-      now
-    );
-    return { claimToken };
+    return { purpose: parsed.purpose };
   });
 }
 

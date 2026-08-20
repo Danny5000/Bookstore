@@ -318,6 +318,33 @@ export const financialReconciliationIssues = pgTable(
       sql`${table.resourceType} ~ '^[a-z0-9_]{1,50}$' and ${table.safeCode} ~ '^[a-z0-9_]{1,100}$' and char_length(${table.correlationId}) between 1 and 100`
     ),
     check(
+      'financial_reconciliation_issues_semantic_identity',
+      sql`(
+        (${table.resourceType} in ('payment', 'refund', 'dispute', 'allocation_set') and
+          ${table.safeCode} in (
+            'allocation_fork', 'allocation_incomplete', 'allocation_mismatch',
+            'classification_fork', 'correction_rebase_required', 'currency_mismatch',
+            'immutable_mismatch', 'missing_source', 'source_linkage_mismatch',
+            'unsupported_category'
+          ))
+        or (${table.resourceType} = 'payout' and ${table.safeCode} in (
+          'currency_mismatch', 'generation_exhausted', 'immutable_mismatch',
+          'payout_membership_conflict', 'payout_reversal_incomplete'
+        ))
+        or (${table.resourceType} = 'balance_transaction' and
+          ${table.safeCode} in ('classification_fork', 'immutable_mismatch'))
+        or (${table.resourceType} = 'financial_classification' and
+          ${table.safeCode} = 'unsupported_category')
+      )`
+    ),
+    check(
+      'financial_reconciliation_issues_semantic_impact',
+      sql`(
+        (${table.safeCode} in ('allocation_incomplete', 'missing_source') and ${table.impact} = 'pending')
+        or (${table.safeCode} not in ('allocation_incomplete', 'missing_source') and ${table.impact} = 'exception')
+      )`
+    ),
+    check(
       'financial_reconciliation_issues_observation_order',
       sql`${table.lastObservedAt} >= ${table.firstObservedAt}`
     )

@@ -43,7 +43,12 @@ import {
   financialClassificationVersions,
   stripeBalanceTransactions
 } from '$lib/server/db/schema/financial-provider';
-import { applicationConfig, databaseClient } from './database';
+import {
+  applicationConfig,
+  ownerDatabaseClient,
+  workerDatabaseClient,
+  workerDatabaseClient as databaseClient
+} from './database';
 
 const dialect = new PgDialect();
 
@@ -141,10 +146,19 @@ async function legacyUnknownAdjustmentFixture(label: string) {
     availableAt: snapshot.availableAt, fingerprintSha256: fingerprint
   }).returning();
   if (!balance) throw new Error('Expected legacy replay balance');
-  await databaseClient.db.insert(financialClassificationVersions).values({
-    subjectType: 'balance_transaction', subjectId: balance.id,
-    classifierVersion: 1, classification: 'unknown',
-    sourceFingerprintSha256: fingerprint
+  await databaseClient.db.transaction(async (tx) => {
+    const [classification] = await tx.insert(financialClassificationVersions).values({
+      subjectType: 'balance_transaction', subjectId: balance.id,
+      classifierVersion: 1, classification: 'unknown',
+      sourceFingerprintSha256: fingerprint
+    }).returning();
+    if (!classification) throw new Error('Expected legacy unknown classification');
+    await observeFinancialIssue(tx, {
+      resourceType: 'financial_classification', resourceId: classification.id,
+      safeCode: 'unsupported_category', impact: 'exception',
+      actor: { type: 'system', id: 'financial-worker' },
+      correlationId: `legacy-unknown-${label}`
+    });
   });
   return { balanceTransactionId: balance.id, fingerprint };
 }
@@ -160,17 +174,17 @@ async function chargeFixture(
   const itemId = randomUUID();
   const titleId = randomUUID();
   const chargeId = `ch_${suffix}`;
-  const [guest] = await databaseClient.db.insert(guestIdentities).values({
+  const [guest] = await ownerDatabaseClient.db.insert(guestIdentities).values({
     email: `${suffix}@example.com`
   }).returning();
   if (!guest) throw new Error('Expected replay guest fixture');
-  await databaseClient.db.insert(titles).values({
+  await ownerDatabaseClient.db.insert(titles).values({
     id: titleId, slug: `replay-${randomUUID()}`, title: 'Replay title',
     description: 'Replay description',
     creatorName: 'Replay creator', format: 'prose', priceMinor: 100,
     currency: 'USD', visibility: 'private'
   });
-  await databaseClient.db.insert(orders).values({
+  await ownerDatabaseClient.db.insert(orders).values({
     id: orderId, status: 'paid', guestIdentityId: guest.id, purchaseEmail: guest.email,
     currency: 'USD', subtotalMinor: 100, taxMinor: 0, totalMinor: 100,
     clientCheckoutAttemptId: randomUUID(), quoteFingerprintSha256: 'b'.repeat(64),
@@ -178,20 +192,20 @@ async function chargeFixture(
     checkoutExpiresAt: new Date('2026-08-12T00:30:00.000Z'),
     paidAt: new Date('2026-08-12T00:00:00.000Z')
   });
-  await databaseClient.db.insert(orderItems).values({
+  await ownerDatabaseClient.db.insert(orderItems).values({
     id: itemId, orderId, titleId, titleSnapshot: 'Replay title',
     creatorNameSnapshot: 'Replay creator', format: 'prose', currency: 'USD',
     unitSubtotalMinor: 100, taxMinor: 0, totalMinor: 100,
     stripeLineItemId: `li_${suffix}`
   });
-  const [payment] = await databaseClient.db.insert(payments).values({
+  const [payment] = await ownerDatabaseClient.db.insert(payments).values({
     orderId, stripePaymentIntentId: `pi_${suffix}`, stripeLatestChargeId: chargeId,
     status: 'succeeded', amountMinor: 100, currency: 'USD',
     paymentMethodCategory: 'card', paidAt: new Date('2026-08-12T00:00:00.000Z')
   }).returning();
   if (!payment) throw new Error('Expected replay payment fixture');
   const [refund] = withRefund
-    ? await databaseClient.db.insert(refunds).values({
+    ? await ownerDatabaseClient.db.insert(refunds).values({
         paymentId: payment.id, stripeRefundId: `re_${suffix}`, status: 'succeeded',
         amountMinor: 100, currency: 'USD', providerCreatedAt: new Date('2026-08-12T00:10:00.000Z'),
         allocationStatus: 'draft'
@@ -250,18 +264,18 @@ async function chargeFixture(
 
 async function correctionRebaseGraph(label: string) {
   const suffix = `${label}_${randomUUID().replaceAll('-', '')}`;
-  const [guest] = await databaseClient.db.insert(guestIdentities).values({
+  const [guest] = await ownerDatabaseClient.db.insert(guestIdentities).values({
     email: `${suffix}@example.com`
   }).returning();
   if (!guest) throw new Error('Expected correction replay guest');
-  const admin = await databaseClient.pool.query<{ id: string }>(
+  const admin = await ownerDatabaseClient.pool.query<{ id: string }>(
     `insert into "user" (name, email, email_verified)
      values ('Correction admin', $1, true) returning id`,
     [`admin_${suffix}@example.com`]
   );
   const titleIds: string[] = [];
   for (const side of ['a', 'b']) {
-    const [title] = await databaseClient.db.insert(titles).values({
+    const [title] = await ownerDatabaseClient.db.insert(titles).values({
       slug: `rebase-${side}-${randomUUID()}`, title: `Rebase ${side}`,
       description: 'Rebase description', creatorName: 'Rebase creator',
       format: 'prose', priceMinor: 100, currency: 'USD', visibility: 'private'
@@ -270,7 +284,7 @@ async function correctionRebaseGraph(label: string) {
     titleIds.push(title.id);
   }
   const orderId = randomUUID();
-  await databaseClient.db.insert(orders).values({
+  await ownerDatabaseClient.db.insert(orders).values({
     id: orderId, status: 'paid', guestIdentityId: guest.id, purchaseEmail: guest.email,
     currency: 'USD', subtotalMinor: 200, taxMinor: 0, totalMinor: 200,
     clientCheckoutAttemptId: randomUUID(), quoteFingerprintSha256: '8'.repeat(64),
@@ -280,7 +294,7 @@ async function correctionRebaseGraph(label: string) {
   });
   const itemIds: string[] = [];
   for (const [index, titleId] of titleIds.entries()) {
-    const [item] = await databaseClient.db.insert(orderItems).values({
+    const [item] = await ownerDatabaseClient.db.insert(orderItems).values({
       orderId, titleId, titleSnapshot: `Rebase ${index}`,
       creatorNameSnapshot: 'Rebase creator', format: 'prose', currency: 'USD',
       unitSubtotalMinor: 100, taxMinor: 0, totalMinor: 100,
@@ -289,7 +303,7 @@ async function correctionRebaseGraph(label: string) {
     if (!item) throw new Error('Expected correction replay item');
     itemIds.push(item.id);
   }
-  const [payment] = await databaseClient.db.insert(payments).values({
+  const [payment] = await ownerDatabaseClient.db.insert(payments).values({
     orderId, stripePaymentIntentId: `pi_${suffix}`, stripeLatestChargeId: `ch_${suffix}`,
     status: 'succeeded', amountMinor: 200, currency: 'USD',
     paymentMethodCategory: 'card', paidAt: new Date('2026-08-12T00:00:00.000Z')
@@ -417,7 +431,7 @@ async function replayFixtureSubject(
   allocationAlgorithmVersion = 1
 ): Promise<void> {
   await replayFinancialClassification({
-    database: databaseClient.db,
+    database: workerDatabaseClient.db,
     targetClassifierVersion: classifierVersion,
     targetAllocationAlgorithmVersion: allocationAlgorithmVersion
   }, {
@@ -1339,7 +1353,7 @@ describe('financial classifier and allocation-version replay', () => {
       allocationAlgorithmVersion: 1
     }) });
     await expect(replayFinancialClassification({
-      database: databaseClient.db, targetClassifierVersion: 1,
+      database: workerDatabaseClient.db, targetClassifierVersion: 1,
       targetAllocationAlgorithmVersion: 1
     }, {
       payload: refundClaim!.payload as never,
@@ -1615,18 +1629,18 @@ describe('financial classifier and allocation-version replay', () => {
     if (!fixture.feeDetailId || !fixture.feeDetailFingerprint) {
       throw new Error('Expected fee-detail replay fixture');
     }
-    await databaseClient.pool.query(
+    await ownerDatabaseClient.pool.query(
       'alter table financial_classification_versions disable trigger ' +
       'financial_classification_versions_immutable'
     );
     try {
-      await databaseClient.pool.query(
+      await ownerDatabaseClient.pool.query(
         `delete from financial_classification_versions
           where subject_type='fee_detail' and subject_id=$1 and classifier_version=1`,
         [fixture.feeDetailId]
       );
     } finally {
-      await databaseClient.pool.query(
+      await ownerDatabaseClient.pool.query(
         'alter table financial_classification_versions enable trigger ' +
         'financial_classification_versions_immutable'
       );
@@ -1639,11 +1653,17 @@ describe('financial classifier and allocation-version replay', () => {
           impact: 'informational' },
         correlationId: 'reclassification-active-charge'
       });
-      await appendClassificationDecisionLocked(tx, {
+      const unknownFeeClassification = await appendClassificationDecisionLocked(tx, {
         subjectType: 'fee_detail', subjectId: fixture.feeDetailId!,
         classifierVersion: 1, sourceFingerprint: fixture.feeDetailFingerprint!,
         decision: { status: 'unknown', classification: 'unknown', impact: 'exception',
           safeCode: 'unsupported_category' },
+        correlationId: 'reclassification-active-unknown-fee'
+      });
+      await observeFinancialIssue(tx, {
+        resourceType: 'financial_classification', resourceId: unknownFeeClassification.id,
+        safeCode: 'unsupported_category', impact: 'exception',
+        actor: { type: 'system', id: 'financial-worker' },
         correlationId: 'reclassification-active-unknown-fee'
       });
     });
@@ -1653,7 +1673,7 @@ describe('financial classifier and allocation-version replay', () => {
     )).resolves.toMatchObject({ rowCount: 0 });
 
     await expect(replayFinancialClassification({
-      database: databaseClient.db,
+      database: workerDatabaseClient.db,
       targetClassifierVersion: 2,
       targetAllocationAlgorithmVersion: 2
     }, {
@@ -1815,8 +1835,10 @@ describe('financial classifier and allocation-version replay', () => {
     expect(refund?.allocationStatus).toBe('finalized');
   }, 15_000);
 
-  it('does not let a legacy BT correction diagnostic override a global classification fork', async () => {
+  it('does not let a superseded-set correction diagnostic override a global classification fork', async () => {
     const fixture = await adjustmentFixture('reclassification-fail-closed');
+    const grossSetId = fixture.roots[0]?.setId;
+    if (!grossSetId) throw new Error('Expected gross allocation set');
     const forkRepository = createPostgresJobRepository(
       databaseClient.db, applicationConfig.jobs, () => new Date(), 'all',
       { classifierVersion: 1, allocationAlgorithmVersion: 1 }
@@ -1848,6 +1870,10 @@ describe('financial classifier and allocation-version replay', () => {
       `select count(*)::text as count from financial_allocation_sets
        where balance_transaction_id=$1`, [fixture.balanceTransactionId]
     );
+    await expect(databaseClient.pool.query<{ count: string }>(
+      `select count(*)::text as count from financial_allocation_sets
+       where supersedes_set_id=$1`, [grossSetId]
+    )).resolves.toMatchObject({ rows: [{ count: '1' }] });
 
     await databaseClient.db.transaction((tx) => observeFinancialIssue(tx, {
       resourceType: 'balance_transaction', resourceId: fixture.balanceTransactionId,
@@ -1866,7 +1892,7 @@ describe('financial classifier and allocation-version replay', () => {
     ]);
 
     await databaseClient.db.transaction((tx) => observeFinancialIssue(tx, {
-      resourceType: 'balance_transaction', resourceId: fixture.balanceTransactionId,
+      resourceType: 'allocation_set', resourceId: grossSetId,
       safeCode: 'correction_rebase_required', impact: 'exception',
       actor: { type: 'system', id: 'financial-worker' },
       correlationId: 'reclassification-overlay'
@@ -1881,9 +1907,9 @@ describe('financial classifier and allocation-version replay', () => {
     ]);
     await expect(databaseClient.pool.query<{ count: string }>(
       `select count(*)::text as count from financial_reconciliation_issues
-       where resource_type='balance_transaction' and resource_id=$1
+       where resource_type='allocation_set' and resource_id=$1
          and safe_code='correction_rebase_required' and state='open'`,
-      [fixture.balanceTransactionId]
+      [grossSetId]
     )).resolves.toMatchObject({ rows: [{ count: '1' }] });
     const setsAfterDiagnostics = await databaseClient.pool.query<{ count: string }>(
       `select count(*)::text as count from financial_allocation_sets
@@ -2222,7 +2248,7 @@ describe('financial classifier and allocation-version replay', () => {
       set classifier_version = 1, allocation_algorithm_version = 4
       where singleton = true
     `)).rejects.toMatchObject({ cause: { code: '55000' } });
-    await expect(databaseClient.db.execute(sql`
+    await expect(ownerDatabaseClient.db.execute(sql`
       delete from financial_projection_versions where singleton = true
     `)).rejects.toMatchObject({ cause: { code: '55000' } });
   });

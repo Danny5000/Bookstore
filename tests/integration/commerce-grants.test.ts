@@ -18,11 +18,14 @@ import {
 } from '$lib/server/commerce/grants';
 import { lockEntitlementScopes } from '$lib/server/commerce/lock';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
-import { databaseClient } from './database';
+import {
+  ownerDatabaseClient,
+  workerDatabaseClient as databaseClient
+} from './database';
 
 async function createUser(label: string): Promise<string> {
   const id = randomUUID();
-  await databaseClient.db.insert(user).values({
+  await ownerDatabaseClient.db.insert(user).values({
     id,
     name: label,
     email: `${id}@example.com`,
@@ -32,7 +35,7 @@ async function createUser(label: string): Promise<string> {
 }
 
 async function createTitle(label: string): Promise<string> {
-  const [title] = await databaseClient.db
+  const [title] = await ownerDatabaseClient.db
     .insert(titles)
     .values({
       slug: `commerce-grant-${randomUUID()}`,
@@ -54,7 +57,7 @@ async function createPreservedGrant(
   state: EntitlementGrantRow['state'] = 'active'
 ): Promise<string> {
   const now = new Date();
-  const [grant] = await databaseClient.db
+  const [grant] = await ownerDatabaseClient.db
     .insert(entitlementGrants)
     .values({
       userId,
@@ -75,7 +78,7 @@ async function createPurchaseGrant(
   userId: string | null,
   state: EntitlementGrantRow['state']
 ): Promise<string> {
-  const [order] = await databaseClient.db
+  const [order] = await ownerDatabaseClient.db
     .insert(orders)
     .values({
       initiatingUserId: userId,
@@ -88,7 +91,7 @@ async function createPurchaseGrant(
     })
     .returning({ id: orders.id });
   if (!order) throw new Error('Expected order fixture');
-  const [item] = await databaseClient.db
+  const [item] = await ownerDatabaseClient.db
     .insert(orderItems)
     .values({
       orderId: order.id,
@@ -102,7 +105,7 @@ async function createPurchaseGrant(
     .returning({ id: orderItems.id });
   if (!item) throw new Error('Expected order item fixture');
   const now = new Date();
-  const [grant] = await databaseClient.db
+  const [grant] = await ownerDatabaseClient.db
     .insert(entitlementGrants)
     .values({
       titleId,

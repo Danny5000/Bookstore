@@ -53,6 +53,7 @@ type StageOutcome =
   | { error: 'generation_exhausted' | 'immutable_mismatch' };
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const CURRENCY = /^[A-Z]{3}$/u;
 
 function invalid(): never {
   throw new PermanentFinancialError('unsupported_provider_evidence');
@@ -201,6 +202,25 @@ async function rejectMembershipConflict(
       completed_at = now(), updated_at = now() where id = ${input.runId}
   `);
   return { error: 'payout_membership_conflict', issueId: issue.id };
+}
+
+async function rejectCurrencyMismatch(
+  tx: DatabaseTransaction,
+  input: PublishPayoutMembershipInput,
+  markRunException: boolean
+): Promise<{ error: 'currency_mismatch'; issueId: string }> {
+  const issue = await observeFinancialIssue(tx, {
+    resourceType: 'payout', resourceId: input.payoutId, safeCode: 'currency_mismatch',
+    impact: 'exception', actor: { type: 'system', id: 'financial-worker' },
+    correlationId: input.correlationId
+  });
+  if (markRunException) {
+    await rows(tx, sql`
+      update payout_import_runs set state = 'exception', safe_outcome = 'currency_mismatch',
+        completed_at = now(), updated_at = now() where id = ${input.runId}
+    `);
+  }
+  return { error: 'currency_mismatch', issueId: issue.id };
 }
 
 async function resolveMembershipConflict(
@@ -621,11 +641,22 @@ export async function publishPayoutMembership(
       expectedGeneration: input.expectedGeneration
     });
     if (locked.disposition === 'published_replay') {
-      const count = await rows(tx, sql`
-        select count(*)::int as count from stripe_payout_balance_transactions
-        where payout_id = ${input.payoutId}
-      `) as Array<{ count: number }>;
-      return { generation: locked.payoutFinancialGeneration, membershipCount: count[0]?.count ?? 0 };
+      const counts = await rows(tx, sql`
+        select count(*)::int as count,
+          count(*) filter (
+            where member.currency is distinct from payout.currency
+          )::int as "mismatchCount"
+        from stripe_payout_balance_transactions membership
+        join stripe_balance_transactions member
+          on member.id = membership.balance_transaction_id
+        join stripe_payouts payout on payout.id = membership.payout_id
+        where membership.payout_id = ${input.payoutId}
+      `) as Array<{ count: number; mismatchCount: number }>;
+      const count = counts[0];
+      if (counts.length !== 1 || !generation(count?.count) ||
+        !generation(count?.mismatchCount) || count.mismatchCount > count.count) invalid();
+      if (count.mismatchCount > 0) return rejectCurrencyMismatch(tx, input, false);
+      return { generation: locked.payoutFinancialGeneration, membershipCount: count.count };
     }
     if (locked.disposition === 'stale') throw new RetryableFinancialError('state_changed');
     if (locked.runState !== 'publishable') throw new RetryableFinancialError('state_changed');
@@ -638,14 +669,22 @@ export async function publishPayoutMembership(
     const payoutRows = await rows(tx, sql`
       select provider_id as "providerId", automatic, method, status,
         reconciliation_status as "reconciliationStatus",
-        financial_generation as "financialGeneration"
+        financial_generation as "financialGeneration", currency
       from stripe_payouts where id = ${input.payoutId}
-    `) as Array<{ providerId: string; automatic: boolean; method: string; status: string; reconciliationStatus: string; financialGeneration: number }>;
+    `) as Array<{
+      providerId: string;
+      automatic: boolean;
+      method: string;
+      status: string;
+      reconciliationStatus: string;
+      financialGeneration: number;
+      currency: string;
+    }>;
     const payout = payoutRows[0];
     if (!payout || !text(payout.providerId, 255) ||
       payout.financialGeneration !== input.expectedGeneration || !payout.automatic ||
       payout.method !== 'standard' || payout.status !== 'paid' ||
-      payout.reconciliationStatus !== 'completed') {
+      payout.reconciliationStatus !== 'completed' || !CURRENCY.test(payout.currency)) {
       await rows(tx, sql`
         update payout_import_runs set state = 'abandoned', safe_outcome = 'payout_changed',
           completed_at = now(), updated_at = now() where id = ${input.runId}
@@ -653,6 +692,18 @@ export async function publishPayoutMembership(
       return { retry: true as const };
     }
     const ids = [...locked.balanceTransactionIds].sort();
+    const candidateRows = ids.length === 0 ? [] : await rows(tx, sql`
+      select id, currency from stripe_balance_transactions
+      where id in (${sql.join(ids.map((id) => sql`${id}::uuid`), sql`, `)})
+      order by id
+    `) as Array<{ id: string; currency: string }>;
+    if (candidateRows.length !== ids.length ||
+      !sameSortedIds(candidateRows.map((row) => row.id), ids)) {
+      throw new RetryableFinancialError('state_changed');
+    }
+    if (candidateRows.some((row) => row.currency !== payout.currency)) {
+      return rejectCurrencyMismatch(tx, input, true);
+    }
     const hasPublishedMembership = locked.hasPublishedHistory ||
       locked.existingMembershipIds.length > 0;
     if (hasPublishedMembership) {

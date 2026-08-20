@@ -90,7 +90,7 @@ export function createCommerceHarness(database: E2EDatabase, applicationOrigin: 
     event: VerifiedStripeEvent;
   }>();
   const messages = createCommerceMessageEnqueuer(applicationOrigin);
-  const handler = createStripeEventHandler(database.db, fixture.gateway, {
+  const handler = createStripeEventHandler(database.workerDb, fixture.gateway, {
     loadStripeEvent: defaultLoadStripeEvent,
     fulfillCheckout: (selectedDatabase, input) => fulfillCheckoutEvent(selectedDatabase, input, {
       purchaseMessages: messages

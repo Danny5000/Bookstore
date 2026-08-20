@@ -30,7 +30,11 @@ import { chargeSnapshotFixture } from '../fixtures/stripe/charge';
 import { balanceTransactionSnapshotFixture } from '../fixtures/stripe/balance-transaction';
 import { refundSnapshotFixture } from '../fixtures/stripe/refund';
 import { disputeSnapshotFixture } from '../fixtures/stripe/dispute';
-import { databaseClient } from './database';
+import {
+  ownerDatabaseClient,
+  workerDatabaseClient,
+  workerDatabaseClient as databaseClient
+} from './database';
 import type { Database } from '$lib/server/db/client';
 
 function deferred<Value>() {
@@ -55,7 +59,7 @@ describe('payment financial source', () => {
     const suffix = randomUUID();
     const orderId = randomUUID();
     const paidAt = new Date('2026-08-10T12:01:00.000Z');
-    const [guest] = await databaseClient.db.insert(guestIdentities)
+    const [guest] = await ownerDatabaseClient.db.insert(guestIdentities)
       .values({ email: `financial-source-${suffix}@example.com` }).returning();
     if (!guest) throw new Error('Expected guest fixture');
     const itemFacts = [
@@ -66,23 +70,23 @@ describe('payment financial source', () => {
     for (const [index, item] of itemFacts.entries()) {
       const titleId = randomUUID();
       titleIds.push(titleId);
-      await databaseClient.db.insert(titles).values({ id: titleId, slug: `financial-source-${index}-${suffix}`,
+      await ownerDatabaseClient.db.insert(titles).values({ id: titleId, slug: `financial-source-${index}-${suffix}`,
         title: `Financial title ${index}`, description: 'Financial source title', creatorName: 'Creator',
         format: 'prose', priceMinor: item.subtotal, currency, visibility: 'private' });
       itemFacts[index] = { ...item, titleId } as typeof item & { titleId: string };
     }
-    await databaseClient.db.insert(orders).values({ id: orderId, status: 'paid', guestIdentityId: guest.id,
+    await ownerDatabaseClient.db.insert(orders).values({ id: orderId, status: 'paid', guestIdentityId: guest.id,
       purchaseEmail: guest.email, currency, subtotalMinor: 1250, taxMinor: 150, totalMinor: 1400,
       clientCheckoutAttemptId: randomUUID(), quoteFingerprintSha256: 'a'.repeat(64),
       stripeCheckoutSessionId: `cs_${suffix}`, statusTokenSha256: 'b'.repeat(64),
       checkoutExpiresAt: new Date('2026-08-10T12:30:00.000Z'), paidAt });
-    await databaseClient.db.insert(orderItems).values(itemFacts.map((item, index) => ({ id: item.id, orderId,
+    await ownerDatabaseClient.db.insert(orderItems).values(itemFacts.map((item, index) => ({ id: item.id, orderId,
       titleId: (item as typeof item & { titleId: string }).titleId, titleSnapshot: `Financial title ${index}`,
       creatorNameSnapshot: 'Creator', format: 'prose' as const, currency,
       unitSubtotalMinor: item.subtotal, taxMinor: item.tax, totalMinor: item.subtotal + item.tax,
       stripeLineItemId: `li_${index}_${suffix}` })));
     const provider = { paymentIntentId: `pi_${suffix}`, chargeId: `ch_${suffix}`, transactionId: `txn_${suffix}` };
-    const [payment] = await databaseClient.db.insert(payments).values({ orderId,
+    const [payment] = await ownerDatabaseClient.db.insert(payments).values({ orderId,
       stripePaymentIntentId: provider.paymentIntentId, stripeLatestChargeId: provider.chargeId,
       status: 'succeeded', amountMinor: 1400, currency, paymentMethodCategory: 'card', paidAt }).returning();
     if (!payment) throw new Error('Expected payment fixture');
@@ -112,10 +116,6 @@ describe('payment financial source', () => {
       currency: 'EUR', status: 'pending', createdAt: fixture.paidAt, exchangeRate: '0.9',
       exchangeSourceCurrency: 'USD', exchangeTargetCurrency: 'EUR',
       feeDetails: [{ ordinal: 0, rawType: 'stripe_fee', amountMinor: 60, currency: 'EUR' }] }));
-    await databaseClient.db.insert(financialReconciliationIssues).values({ resourceType: 'payment',
-      resourceId: fixture.payment.id, safeCode: 'payout_incomplete', impact: 'pending',
-      correlationId: `unrelated-${fixture.suffix}` });
-
     const first = await reconcilePaymentFinancialSource(databaseClient.db, stripe.gateway, {
       paymentId: fixture.payment.id, correlationId: `fx-first-${fixture.suffix}`
     }, new AbortController().signal);
@@ -123,6 +123,13 @@ describe('payment financial source', () => {
     expect((await databaseClient.db.select().from(stripeBalanceTransactions).where(eq(
       stripeBalanceTransactions.providerId, fixture.provider.transactionId
     )))[0]?.status).toBe('pending');
+    const [unrelatedResource] = await databaseClient.db.select().from(stripeBalanceTransactions)
+      .where(eq(stripeBalanceTransactions.providerId, fixture.provider.transactionId));
+    await databaseClient.db.insert(financialReconciliationIssues).values({
+      resourceType: 'balance_transaction', resourceId: unrelatedResource!.id,
+      safeCode: 'immutable_mismatch', impact: 'exception',
+      correlationId: `unrelated-${fixture.suffix}`
+    });
     stripe.harness.setBalanceTransaction(balanceTransactionSnapshotFixture({ id: fixture.provider.transactionId,
       sourceId: fixture.provider.chargeId, amountMinor: 1260, feeMinor: 60, netMinor: 1200,
       currency: 'EUR', status: 'available', createdAt: fixture.paidAt, exchangeRate: '0.9',
@@ -177,9 +184,9 @@ describe('payment financial source', () => {
     expect((await databaseClient.db.select().from(orders).where(eq(orders.id, fixture.orderId)))[0])
       .toMatchObject({ status: 'paid', paidAt: fixture.paidAt, purchaseEmail: fixture.purchaseEmail });
     expect(await databaseClient.db.select().from(financialReconciliationIssues).where(and(eq(
-      financialReconciliationIssues.safeCode, 'payout_incomplete'
-    ), eq(financialReconciliationIssues.resourceId, fixture.payment.id))))
-      .toEqual([expect.objectContaining({ resourceId: fixture.payment.id, state: 'open' })]);
+      financialReconciliationIssues.safeCode, 'immutable_mismatch'
+    ), eq(financialReconciliationIssues.resourceId, unrelatedResource!.id))))
+      .toEqual([expect.objectContaining({ resourceId: unrelatedResource!.id, state: 'open' })]);
   });
 
   it('fails a staged active-version replay closed when the pending version activates before projection', async () => {
@@ -742,7 +749,7 @@ describe('refund and dispute financial sources', () => {
     const paidAt = new Date('2026-08-10T12:05:00.000Z');
     const userId = randomUUID();
     const email = `financial-adjustment-${suffix}@example.com`;
-    await databaseClient.db.insert(user).values({
+    await ownerDatabaseClient.db.insert(user).values({
       id: userId, name: 'Financial adjustment reader', email, emailVerified: true
     });
     const itemFacts = [
@@ -750,39 +757,39 @@ describe('refund and dispute financial sources', () => {
       { id: randomUUID(), titleId: randomUUID(), subtotal: 450, tax: 70 }
     ];
     for (const [index, item] of itemFacts.entries()) {
-      await databaseClient.db.insert(titles).values({
+      await ownerDatabaseClient.db.insert(titles).values({
         id: item.titleId, slug: `financial-adjustment-${index}-${suffix}`,
         title: `Financial adjustment title ${index}`, description: 'Financial source fixture',
         creatorName: 'Creator', format: 'prose', priceMinor: item.subtotal,
         currency: 'USD', visibility: 'private'
       });
     }
-    await databaseClient.db.insert(orders).values({
+    await ownerDatabaseClient.db.insert(orders).values({
       id: orderId, status: 'paid', initiatingUserId: userId, purchaseEmail: email,
       currency: 'USD', subtotalMinor: 1250, taxMinor: 150, totalMinor: 1400,
       clientCheckoutAttemptId: randomUUID(), quoteFingerprintSha256: 'a'.repeat(64),
       stripeCheckoutSessionId: `cs_adjustment_${suffix}`, statusTokenSha256: 'b'.repeat(64),
       checkoutExpiresAt: new Date('2026-08-10T12:30:00.000Z'), paidAt
     });
-    await databaseClient.db.insert(orderItems).values(itemFacts.map((item, index) => ({
+    await ownerDatabaseClient.db.insert(orderItems).values(itemFacts.map((item, index) => ({
       id: item.id, orderId, titleId: item.titleId,
       titleSnapshot: `Financial adjustment title ${index}`, creatorNameSnapshot: 'Creator',
       format: 'prose' as const, currency: 'USD', unitSubtotalMinor: item.subtotal,
       taxMinor: item.tax, totalMinor: item.subtotal + item.tax,
       stripeLineItemId: `li_adjustment_${index}_${suffix}`
     })));
-    await databaseClient.db.insert(entitlementGrants).values(itemFacts.map((item) => ({
+    await ownerDatabaseClient.db.insert(entitlementGrants).values(itemFacts.map((item) => ({
       titleId: item.titleId, userId, source: 'purchase' as const, orderItemId: item.id,
       state: 'active' as const, stateReason: 'payment_succeeded', grantedAt: paidAt
     })));
-    await databaseClient.db.insert(entitlements).values(itemFacts.map((item) => ({
+    await ownerDatabaseClient.db.insert(entitlements).values(itemFacts.map((item) => ({
       userId, titleId: item.titleId, grantedAt: paidAt
     })));
     const provider = {
       paymentIntentId: `pi_adjustment_${suffix}`,
       chargeId: `ch_adjustment_${suffix}`
     };
-    const [payment] = await databaseClient.db.insert(payments).values({
+    const [payment] = await ownerDatabaseClient.db.insert(payments).values({
       orderId, stripePaymentIntentId: provider.paymentIntentId,
       stripeLatestChargeId: provider.chargeId, status: 'succeeded', amountMinor: 1400,
       currency: 'USD', paymentMethodCategory: 'card', paidAt
@@ -806,7 +813,7 @@ describe('refund and dispute financial sources', () => {
   }
 
   async function resolveGlobalClassificationFork(balanceTransactionId: string, correlationId: string) {
-    await databaseClient.db.transaction((tx) => resolveFinancialIssueAfterRecompute(tx, {
+    await workerDatabaseClient.db.transaction((tx) => resolveFinancialIssueAfterRecompute(tx, {
       resourceType: 'balance_transaction', resourceId: balanceTransactionId,
       safeCode: 'classification_fork',
       proof: {
@@ -930,7 +937,7 @@ describe('refund and dispute financial sources', () => {
       refundBalanceTransactionId, `refund-resolve-global-${fixture.suffix}`
     );
     await markActiveClassificationSucceeded(refundBalanceTransactionId);
-    await expect(reconcileRefundFinancialSource(databaseClient.db, stripe.gateway, {
+    await expect(reconcileRefundFinancialSource(workerDatabaseClient.db, stripe.gateway, {
       refundId: refund.id, correlationId: `refund-recover-${fixture.suffix}`
     }, new AbortController().signal)).resolves.toMatchObject({
       status: 'reconciled', financialEvidenceStatus: 'fee_reconciled'
@@ -1134,6 +1141,202 @@ describe('refund and dispute financial sources', () => {
     ]));
   });
 
+  it('rejects a same-currency dispute withdrawal whose balance principal differs', async () => {
+    const fixture = await purchase();
+    const disputeCreatedAt = new Date('2026-08-10T13:30:00.000Z');
+    const providerDisputeId = `dp_financial_mismatch_${fixture.suffix}`;
+    const providerBalanceId = `txn_dispute_mismatch_${fixture.suffix}`;
+    const [dispute] = await databaseClient.db.insert(disputes).values({
+      paymentId: fixture.payment.id, stripeDisputeId: providerDisputeId, status: 'open',
+      amountMinor: 600, currency: 'USD', reason: 'fraudulent',
+      providerCreatedAt: disputeCreatedAt, providerUpdatedAt: disputeCreatedAt
+    }).returning();
+    if (!dispute) throw new Error('Expected dispute principal-mismatch fixture');
+    const stripe = createFixtureStripeGateway();
+    stripe.harness.setDispute(disputeSnapshotFixture({
+      providerDisputeId, paymentIntentId: fixture.provider.paymentIntentId,
+      chargeId: fixture.provider.chargeId, amountMinor: 600,
+      providerCreatedAt: disputeCreatedAt, balanceTransactionIds: [providerBalanceId]
+    }));
+    stripe.harness.setPayment(paymentSnapshotFixture({
+      paymentIntentId: fixture.provider.paymentIntentId, metadataOrderId: fixture.orderId,
+      latestChargeId: fixture.provider.chargeId, amountMinor: 1400, currency: 'usd',
+      paidAt: fixture.paidAt
+    }));
+    stripe.harness.setCharge(chargeSnapshotFixture({
+      id: fixture.provider.chargeId, paymentIntentId: fixture.provider.paymentIntentId,
+      amountMinor: 1400, currency: 'USD',
+      balanceTransactionId: `txn_charge_${fixture.suffix}`, createdAt: fixture.paidAt
+    }));
+    stripe.harness.setBalanceTransaction(balanceTransactionSnapshotFixture({
+      id: providerBalanceId, sourceId: providerDisputeId, sourceFamily: 'dispute',
+      rawType: 'adjustment', reportingCategory: 'dispute', amountMinor: -590,
+      feeMinor: 0, netMinor: -590, currency: 'USD', createdAt: disputeCreatedAt,
+      feeDetails: []
+    }));
+
+    await expect(reconcileDisputeFinancialSource(databaseClient.db, stripe.gateway, {
+      disputeId: dispute.id, correlationId: `dispute-principal-mismatch-${fixture.suffix}`
+    }, new AbortController().signal)).resolves.toMatchObject({
+      status: 'exception', sourceKind: 'dispute', sourceId: dispute.id,
+      financialEvidenceStatus: 'exception', safeCode: 'allocation_mismatch'
+    });
+    expect(await databaseClient.db.select().from(financialAllocationSets).where(and(
+      eq(financialAllocationSets.sourceKind, 'dispute'),
+      eq(financialAllocationSets.sourceInternalId, dispute.id)
+    ))).toEqual([]);
+    expect(await databaseClient.db.select().from(financialReconciliationIssues).where(and(
+      eq(financialReconciliationIssues.resourceType, 'dispute'),
+      eq(financialReconciliationIssues.resourceId, dispute.id),
+      eq(financialReconciliationIssues.safeCode, 'allocation_mismatch')
+    ))).toEqual([expect.objectContaining({ state: 'open', impact: 'exception' })]);
+  });
+
+  it('reuses reinstated capacity for a smaller same-currency withdrawal and replay converges', async () => {
+    const fixture = await purchase();
+    const firstWithdrawalAt = new Date('2026-08-10T13:40:00.000Z');
+    const reinstatementAt = new Date('2026-08-10T13:41:00.000Z');
+    const laterWithdrawalAt = new Date('2026-08-10T13:42:00.000Z');
+    const providerDisputeId = `dp_rewithdrawal_${fixture.suffix}`;
+    const firstWithdrawalId = `txn_dispute_first_${fixture.suffix}`;
+    const reinstatementId = `txn_dispute_reinstatement_${fixture.suffix}`;
+    const laterWithdrawalId = `txn_dispute_later_${fixture.suffix}`;
+    const [dispute] = await databaseClient.db.insert(disputes).values({
+      paymentId: fixture.payment.id, stripeDisputeId: providerDisputeId, status: 'open',
+      amountMinor: 1400, currency: 'USD', reason: 'fraudulent',
+      providerCreatedAt: firstWithdrawalAt, providerUpdatedAt: laterWithdrawalAt
+    }).returning();
+    if (!dispute) throw new Error('Expected same-dispute rewithdrawal fixture');
+
+    const stripe = createFixtureStripeGateway();
+    stripe.harness.setPayment(paymentSnapshotFixture({
+      paymentIntentId: fixture.provider.paymentIntentId, metadataOrderId: fixture.orderId,
+      latestChargeId: fixture.provider.chargeId, amountMinor: 1400, paidAt: fixture.paidAt
+    }));
+    stripe.harness.setCharge(chargeSnapshotFixture({
+      id: fixture.provider.chargeId, paymentIntentId: fixture.provider.paymentIntentId,
+      amountMinor: 1400, currency: 'USD', balanceTransactionId: `txn_charge_${fixture.suffix}`,
+      createdAt: fixture.paidAt
+    }));
+    stripe.harness.setDispute(disputeSnapshotFixture({
+      providerDisputeId, paymentIntentId: fixture.provider.paymentIntentId,
+      chargeId: fixture.provider.chargeId, state: 'open', amountMinor: 1400,
+      providerCreatedAt: firstWithdrawalAt,
+      balanceTransactionIds: [firstWithdrawalId]
+    }));
+    stripe.harness.setBalanceTransaction(balanceTransactionSnapshotFixture({
+      id: firstWithdrawalId, sourceId: providerDisputeId, sourceFamily: 'dispute',
+      rawType: 'adjustment', reportingCategory: 'dispute', amountMinor: -1400,
+      feeMinor: 0, netMinor: -1400, currency: 'USD', createdAt: firstWithdrawalAt,
+      feeDetails: []
+    }));
+
+    await expect(reconcileDisputeFinancialSource(databaseClient.db, stripe.gateway, {
+      disputeId: dispute.id, correlationId: `dispute-first-withdrawal-${fixture.suffix}`
+    }, new AbortController().signal)).resolves.toMatchObject({
+      status: 'reconciled', financialEvidenceStatus: 'fee_reconciled'
+    });
+
+    await databaseClient.db.update(disputes).set({
+      status: 'won', providerUpdatedAt: reinstatementAt
+    }).where(eq(disputes.id, dispute.id));
+    stripe.harness.setDispute(disputeSnapshotFixture({
+      providerDisputeId, paymentIntentId: fixture.provider.paymentIntentId,
+      chargeId: fixture.provider.chargeId, state: 'won', amountMinor: 1400,
+      providerCreatedAt: firstWithdrawalAt,
+      balanceTransactionIds: [firstWithdrawalId, reinstatementId]
+    }));
+    stripe.harness.setBalanceTransaction(balanceTransactionSnapshotFixture({
+      id: reinstatementId, sourceId: providerDisputeId, sourceFamily: 'dispute',
+      rawType: 'adjustment', reportingCategory: 'dispute_reversal', amountMinor: 1400,
+      feeMinor: 0, netMinor: 1400, currency: 'USD', createdAt: reinstatementAt,
+      feeDetails: []
+    }));
+
+    await expect(reconcileDisputeFinancialSource(databaseClient.db, stripe.gateway, {
+      disputeId: dispute.id, correlationId: `dispute-reinstatement-${fixture.suffix}`
+    }, new AbortController().signal)).resolves.toMatchObject({
+      status: 'reconciled', financialEvidenceStatus: 'fee_reconciled'
+    });
+
+    await databaseClient.db.update(disputes).set({
+      status: 'open', providerUpdatedAt: laterWithdrawalAt
+    }).where(eq(disputes.id, dispute.id));
+    stripe.harness.setDispute(disputeSnapshotFixture({
+      providerDisputeId, paymentIntentId: fixture.provider.paymentIntentId,
+      chargeId: fixture.provider.chargeId, state: 'open', amountMinor: 1400,
+      providerCreatedAt: firstWithdrawalAt,
+      balanceTransactionIds: [laterWithdrawalId, reinstatementId]
+    }));
+    stripe.harness.setBalanceTransaction(balanceTransactionSnapshotFixture({
+      id: laterWithdrawalId, sourceId: providerDisputeId, sourceFamily: 'dispute',
+      rawType: 'adjustment', reportingCategory: 'dispute', amountMinor: -500,
+      feeMinor: 0, netMinor: -500, currency: 'USD', createdAt: laterWithdrawalAt,
+      feeDetails: []
+    }));
+
+    await expect(reconcileDisputeFinancialSource(databaseClient.db, stripe.gateway, {
+      disputeId: dispute.id, correlationId: `dispute-rewithdrawal-${fixture.suffix}`
+    }, new AbortController().signal)).resolves.toMatchObject({
+      status: 'reconciled', financialEvidenceStatus: 'fee_reconciled'
+    });
+
+    type CurrentWithdrawal = { providerId: string; expectedEffectMinor: number;
+      presentmentMinor: number; reversalCount: number };
+    const currentChronology = async (): Promise<CurrentWithdrawal[]> => {
+      const result = await databaseClient.db.execute(sql`
+        select balance.provider_id as "providerId",
+          allocation_set.expected_effect_minor::int as "expectedEffectMinor",
+          coalesce(sum(allocation.total_effect_minor), 0)::int as "presentmentMinor",
+          count(*) filter (where allocation.reverses_allocation_id is not null)::int
+            as "reversalCount"
+        from financial_allocation_sets allocation_set
+        join stripe_balance_transactions balance
+          on balance.id = allocation_set.balance_transaction_id
+        left join dispute_item_allocations allocation
+          on allocation.gross_allocation_set_id = allocation_set.id
+        where allocation_set.source_kind = 'dispute'
+          and allocation_set.source_internal_id = ${dispute.id}
+          and allocation_set.basis = 'gross_amount'
+          and not exists (
+            select 1 from financial_allocation_sets successor
+            where successor.supersedes_set_id = allocation_set.id
+          )
+        group by allocation_set.id, balance.provider_id, balance.provider_created_at
+        order by balance.provider_created_at, balance.provider_id collate "C", allocation_set.id
+      `);
+      return (result as unknown as { rows?: CurrentWithdrawal[] }).rows ?? [];
+    };
+    const expectedChronology: CurrentWithdrawal[] = [
+      { providerId: firstWithdrawalId, expectedEffectMinor: -1400,
+        presentmentMinor: -1400, reversalCount: 0 },
+      { providerId: reinstatementId, expectedEffectMinor: 1400,
+        presentmentMinor: 1400, reversalCount: fixture.itemFacts.length },
+      { providerId: laterWithdrawalId, expectedEffectMinor: -500,
+        presentmentMinor: -500, reversalCount: 0 }
+    ];
+    expect(await currentChronology()).toEqual(expectedChronology);
+
+    const [laterBalance] = await databaseClient.db.select().from(stripeBalanceTransactions).where(
+      eq(stripeBalanceTransactions.providerId, laterWithdrawalId)
+    );
+    if (!laterBalance) throw new Error('Expected persisted later withdrawal');
+    await expect(replayFinancialClassification({
+      database: databaseClient.db,
+      targetClassifierVersion: 1,
+      targetAllocationAlgorithmVersion: 1
+    }, {
+      payload: {
+        subjectType: 'balance_transaction', subjectId: laterBalance.id,
+        sourceFingerprintSha256: laterBalance.fingerprintSha256,
+        classifierVersion: 1, allocationAlgorithmVersion: 1, replayId: 'c1-a1'
+      },
+      correlationId: `dispute-rewithdrawal-replay-${fixture.suffix}`,
+      signal: new AbortController().signal
+    })).resolves.toBeUndefined();
+    expect(await currentChronology()).toEqual(expectedChronology);
+  }, 20_000);
+
   it('reconciles a dispute withdrawal idempotently, then fails closed and recovers', async () => {
     const fixture = await purchase();
     const disputeCreatedAt = new Date('2026-08-10T14:00:00.000Z');
@@ -1183,7 +1386,7 @@ describe('refund and dispute financial sources', () => {
       chargeId: fixture.provider.chargeId, amountMinor: 600,
       providerCreatedAt: disputeCreatedAt, balanceTransactionIds: [providerBalanceId]
     }));
-    const first = await reconcileDisputeFinancialSource(databaseClient.db, stripe.gateway, {
+    const first = await reconcileDisputeFinancialSource(workerDatabaseClient.db, stripe.gateway, {
       disputeId: dispute.id, correlationId: `dispute-first-${fixture.suffix}`
     }, new AbortController().signal);
     expect(first).toMatchObject({ status: 'reconciled', financialEvidenceStatus: 'fee_reconciled' });
@@ -1246,7 +1449,7 @@ describe('refund and dispute financial sources', () => {
       disputeBalanceTransactionId, `dispute-resolve-global-${fixture.suffix}`
     );
     await markActiveClassificationSucceeded(disputeBalanceTransactionId);
-    await expect(reconcileDisputeFinancialSource(databaseClient.db, stripe.gateway, {
+    await expect(reconcileDisputeFinancialSource(workerDatabaseClient.db, stripe.gateway, {
       disputeId: dispute.id, correlationId: `dispute-recover-${fixture.suffix}`
     }, new AbortController().signal)).resolves.toMatchObject({
       status: 'reconciled', financialEvidenceStatus: 'fee_reconciled'
@@ -1545,7 +1748,7 @@ describe('refund and dispute financial sources', () => {
       rawType: 'adjustment', reportingCategory: 'dispute', amountMinor: -2,
       feeMinor: 0, netMinor: -2, currency: 'USD', createdAt: earlierAt, feeDetails: []
     }));
-    await expect(reconcileDisputeFinancialSource(databaseClient.db, stripe.gateway, {
+    await expect(reconcileDisputeFinancialSource(workerDatabaseClient.db, stripe.gateway, {
       disputeId: earlier.id, correlationId: `dispute-earlier-late-${fixture.suffix}`
     }, new AbortController().signal)).resolves.toMatchObject({ status: 'reconciled' });
 

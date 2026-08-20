@@ -15,7 +15,7 @@ import {
   user,
   userRoles
 } from '$lib/server/db/schema';
-import { applicationConfig, databaseClient } from './database';
+import { applicationConfig, databaseClient, ownerDatabaseClient } from './database';
 
 async function createExistingUser(emailVerified: boolean) {
   const [created] = await databaseClient.db
@@ -102,7 +102,7 @@ describe('bootstrapFirstAdministrator', () => {
       expect.objectContaining({ role: 'customer' }),
       expect.objectContaining({ role: 'admin' })
     ]);
-    expect(await databaseClient.db.select().from(outboxMessages)).toHaveLength(0);
+    expect(await ownerDatabaseClient.db.select().from(outboxMessages)).toHaveLength(0);
 
     const [event] = await databaseClient.db.select().from(auditEvents);
     expect(event).toMatchObject({

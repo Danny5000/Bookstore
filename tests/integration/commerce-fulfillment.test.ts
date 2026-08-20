@@ -20,8 +20,9 @@ import {
   type CheckoutFulfillmentDependencies
 } from '$lib/server/commerce/fulfillment';
 import { PermanentCommerceError } from '$lib/server/commerce/errors';
+import { queueFinancialSourceFromEvent } from '$lib/server/commerce/financial/event-handoff';
 import type { CheckoutSnapshot, PaymentSnapshot } from '$lib/server/commerce/stripe/types';
-import { databaseClient } from './database';
+import { databaseClient, ownerDatabaseClient, workerDatabaseClient } from './database';
 
 interface Fixture {
   orderId: string;
@@ -60,14 +61,14 @@ async function createFixture(options: {
   const paidAt = new Date('2026-08-10T12:05:00.000Z');
 
   if (userId) {
-    await databaseClient.db.insert(user).values({
+    await ownerDatabaseClient.db.insert(user).values({
       id: userId,
       name: 'Commerce reader',
       email: accountEmail!,
       emailVerified: true
     });
   }
-  await databaseClient.db.insert(titles).values({
+  await ownerDatabaseClient.db.insert(titles).values({
     id: titleId,
     slug: `fulfillment-${suffix}`,
     title: 'Private fulfillment fixture',
@@ -78,7 +79,7 @@ async function createFixture(options: {
     currency: 'USD',
     visibility: 'private'
   });
-  await databaseClient.db.insert(orders).values({
+  await ownerDatabaseClient.db.insert(orders).values({
     id: orderId,
     status,
     initiatingUserId: userId,
@@ -95,7 +96,7 @@ async function createFixture(options: {
     checkoutExpiresAt: attached ? new Date('2026-08-10T12:30:00.000Z') : null,
     paidAt: paid ? paidAt : null
   });
-  await databaseClient.db.insert(orderItems).values({
+  await ownerDatabaseClient.db.insert(orderItems).values({
     id: orderItemId,
     orderId,
     titleId,
@@ -109,7 +110,7 @@ async function createFixture(options: {
     stripeLineItemId: paid ? lineId : null
   });
   if (paid) {
-    await databaseClient.db.insert(payments).values({
+    await ownerDatabaseClient.db.insert(payments).values({
       orderId,
       stripePaymentIntentId: paymentIntentId,
       stripeLatestChargeId: chargeId,
@@ -121,7 +122,7 @@ async function createFixture(options: {
     });
   }
   const providerEventId = `evt_test_${suffix}`;
-  const [event] = await databaseClient.db.insert(stripeEvents).values({
+  const [event] = await ownerDatabaseClient.db.insert(stripeEvents).values({
     providerEventId,
     eventType,
     objectId: sessionId,
@@ -188,6 +189,7 @@ function dependencies(
   return {
     purchaseMessages: {
       enqueueAccountReceipt: vi.fn(async () => undefined),
+      enqueueGuestReceiptWithoutClaim: vi.fn(async () => undefined),
       enqueueGuestClaimPreparation: vi.fn(async () => undefined)
     },
     ...overrides
@@ -195,7 +197,7 @@ function dependencies(
 }
 
 async function fulfill(fixture: Fixture, deps = dependencies()): Promise<void> {
-  await fulfillCheckoutEvent(databaseClient.db, {
+  await fulfillCheckoutEvent(workerDatabaseClient.db, {
     stripeEventId: fixture.stripeEventId,
     session: fixture.session,
     payment: fixture.payment
@@ -237,7 +239,7 @@ describe('canonical Stripe checkout fulfillment', () => {
     expectedPaymentStatus
   }) => {
     const fixture = await createFixture({ eventType });
-    await fulfillCheckoutEvent(databaseClient.db, {
+    await fulfillCheckoutEvent(workerDatabaseClient.db, {
       stripeEventId: fixture.stripeEventId,
       session: { ...fixture.session, ...session },
       payment: { ...fixture.payment, ...payment }
@@ -287,7 +289,7 @@ describe('canonical Stripe checkout fulfillment', () => {
       eventType: 'checkout.session.expired'
     });
 
-    await fulfillCheckoutEvent(databaseClient.db, {
+    await fulfillCheckoutEvent(workerDatabaseClient.db, {
       stripeEventId: fixture.stripeEventId,
       session: {
         ...fixture.session,
@@ -305,21 +307,15 @@ describe('canonical Stripe checkout fulfillment', () => {
 
   it('rolls back payment, event, and queued work when the financial handoff fails', async () => {
     const fixture = await createFixture();
-    const queueFinancialSourceFromEvent = async (
-      transaction: Parameters<NonNullable<CheckoutFulfillmentDependencies[
-        'queueFinancialSourceFromEvent'
-      ]>>[0]
-    ): Promise<void> => {
-      await transaction.insert(jobs).values({
-        type: 'test.checkout-financial-handoff',
-        payload: {},
-        deduplicationKey: `test:checkout-financial-handoff:${fixture.stripeEventId}`
-      });
+    const queueThenFail: NonNullable<CheckoutFulfillmentDependencies[
+      'queueFinancialSourceFromEvent'
+    ]> = async (transaction, input): Promise<void> => {
+      await queueFinancialSourceFromEvent(transaction, input);
       throw new Error('forced financial handoff failure');
     };
 
     await expect(fulfill(fixture, dependencies({
-      queueFinancialSourceFromEvent
+      queueFinancialSourceFromEvent: queueThenFail
     }))).rejects.toThrow('forced financial handoff failure');
 
     expect((await databaseClient.db.select().from(orders)
@@ -339,7 +335,7 @@ describe('canonical Stripe checkout fulfillment', () => {
         `stripe:financial-source:event:${fixture.providerEventId}`));
     if (!queued) throw new Error('Expected financial source job');
     const completedAt = new Date('2026-08-10T12:10:00.000Z');
-    await databaseClient.db.update(jobs).set({
+    await workerDatabaseClient.db.update(jobs).set({
       status: 'succeeded',
       completedAt,
       updatedAt: completedAt
@@ -368,7 +364,7 @@ describe('canonical Stripe checkout fulfillment', () => {
       latestChargeId: null,
       paidAt: null
     };
-    await fulfillCheckoutEvent(databaseClient.db, {
+    await fulfillCheckoutEvent(workerDatabaseClient.db, {
       stripeEventId: fixture.stripeEventId,
       session,
       payment
@@ -440,32 +436,40 @@ describe('canonical Stripe checkout fulfillment', () => {
       .toHaveBeenCalledWith(expect.anything(), guest.orderId);
   });
 
-  it('reuses a normalized guest identity even when earlier purchases were claimed', async () => {
+  it('routes a purchase on a claimed guest identity to its exact verified owner', async () => {
     const claimantId = randomUUID();
-    await databaseClient.db.insert(user).values({
+    await ownerDatabaseClient.db.insert(user).values({
       id: claimantId,
       name: 'Earlier claimant',
       email: 'guest@example.com',
       emailVerified: true
     });
-    const [identity] = await databaseClient.db.insert(guestIdentities).values({
+    const [identity] = await ownerDatabaseClient.db.insert(guestIdentities).values({
       email: 'guest@example.com',
       claimedByUserId: claimantId,
       claimedAt: new Date('2026-08-10T11:00:00.000Z')
     }).returning();
     if (!identity) throw new Error('Expected guest identity');
     const guest = await createFixture({ guest: true, customerEmail: 'guest@example.com' });
+    const deps = dependencies();
 
-    await fulfill(guest);
+    await fulfill(guest, deps);
 
     expect(await databaseClient.db.select().from(guestIdentities)).toHaveLength(1);
     expect((await databaseClient.db.select().from(orders)
       .where(eq(orders.id, guest.orderId)))[0]?.guestIdentityId).toBe(identity.id);
     expect((await databaseClient.db.select().from(entitlementGrants)
       .where(eq(entitlementGrants.orderItemId, guest.orderItemId)))[0]).toMatchObject({
-      userId: null,
-      state: 'unclaimed'
+      userId: claimantId,
+      state: 'active'
     });
+    expect(await databaseClient.db.select().from(entitlements)
+      .where(eq(entitlements.titleId, guest.titleId))).toEqual([
+      expect.objectContaining({ userId: claimantId, titleId: guest.titleId, revokedAt: null })
+    ]);
+    expect(deps.purchaseMessages.enqueueGuestReceiptWithoutClaim)
+      .toHaveBeenCalledWith(expect.anything(), guest.orderId);
+    expect(deps.purchaseMessages.enqueueGuestClaimPreparation).not.toHaveBeenCalled();
   });
 
   it('finalizes every item and projects every title in a multi-title purchase', async () => {
@@ -473,7 +477,7 @@ describe('canonical Stripe checkout fulfillment', () => {
     const secondTitleId = randomUUID();
     const secondItemId = randomUUID();
     const secondLineId = `li_test_${randomUUID()}`;
-    await databaseClient.db.insert(titles).values({
+    await ownerDatabaseClient.db.insert(titles).values({
       id: secondTitleId,
       slug: `fulfillment-${randomUUID()}`,
       title: 'Second private title',
@@ -484,7 +488,7 @@ describe('canonical Stripe checkout fulfillment', () => {
       currency: 'USD',
       visibility: 'private'
     });
-    await databaseClient.db.insert(orderItems).values({
+    await ownerDatabaseClient.db.insert(orderItems).values({
       id: secondItemId,
       orderId: fixture.orderId,
       titleId: secondTitleId,
@@ -494,7 +498,7 @@ describe('canonical Stripe checkout fulfillment', () => {
       currency: 'USD',
       unitSubtotalMinor: 1000
     });
-    await databaseClient.db.update(orders)
+    await ownerDatabaseClient.db.update(orders)
       .set({ subtotalMinor: 2299 })
       .where(eq(orders.id, fixture.orderId));
     const session: CheckoutSnapshot = {
@@ -517,7 +521,7 @@ describe('canonical Stripe checkout fulfillment', () => {
     };
     const payment: PaymentSnapshot = { ...fixture.payment, amountMinor: 2483 };
 
-    await fulfillCheckoutEvent(databaseClient.db, {
+    await fulfillCheckoutEvent(workerDatabaseClient.db, {
       stripeEventId: fixture.stripeEventId,
       session,
       payment
@@ -540,7 +544,7 @@ describe('canonical Stripe checkout fulfillment', () => {
 
   it('applies failure and expiry only to unpaid orders and never regresses paid state', async () => {
     const failed = await createFixture({ eventType: 'checkout.session.async_payment_failed' });
-    await fulfillCheckoutEvent(databaseClient.db, {
+    await fulfillCheckoutEvent(workerDatabaseClient.db, {
       stripeEventId: failed.stripeEventId,
       session: { ...failed.session, paymentStatus: 'unpaid', latestChargeId: null },
       payment: { ...failed.payment, state: 'failed', latestChargeId: null, paidAt: null }
@@ -549,7 +553,7 @@ describe('canonical Stripe checkout fulfillment', () => {
       .where(eq(orders.id, failed.orderId)))[0]?.status).toBe('failed');
 
     const expired = await createFixture({ eventType: 'checkout.session.expired' });
-    await fulfillCheckoutEvent(databaseClient.db, {
+    await fulfillCheckoutEvent(workerDatabaseClient.db, {
       stripeEventId: expired.stripeEventId,
       session: {
         ...expired.session,
@@ -564,7 +568,7 @@ describe('canonical Stripe checkout fulfillment', () => {
       orderStatus: 'paid',
       eventType: 'checkout.session.async_payment_failed'
     });
-    await fulfillCheckoutEvent(databaseClient.db, {
+    await fulfillCheckoutEvent(workerDatabaseClient.db, {
       stripeEventId: alreadyPaid.stripeEventId,
       session: { ...alreadyPaid.session, paymentStatus: 'unpaid', latestChargeId: null },
       payment: { ...alreadyPaid.payment, state: 'failed', latestChargeId: null, paidAt: null }
@@ -585,7 +589,7 @@ describe('canonical Stripe checkout fulfillment', () => {
       paymentIntentId: null,
       latestChargeId: null
     };
-    await fulfillCheckoutEvent(databaseClient.db, {
+    await fulfillCheckoutEvent(workerDatabaseClient.db, {
       stripeEventId: fixture.stripeEventId,
       session: expiredSession,
       payment: null
@@ -593,7 +597,7 @@ describe('canonical Stripe checkout fulfillment', () => {
     expect((await databaseClient.db.select().from(orders)
       .where(eq(orders.id, fixture.orderId)))[0]?.status).toBe('expired');
 
-    const [latePaidEvent] = await databaseClient.db.insert(stripeEvents).values({
+    const [latePaidEvent] = await ownerDatabaseClient.db.insert(stripeEvents).values({
       providerEventId: `evt_test_${randomUUID()}`,
       eventType: 'checkout.session.async_payment_succeeded',
       objectId: fixture.session.providerSessionId,
@@ -604,7 +608,7 @@ describe('canonical Stripe checkout fulfillment', () => {
     }).returning();
     if (!latePaidEvent) throw new Error('Expected late event');
 
-    await expect(fulfillCheckoutEvent(databaseClient.db, {
+    await expect(fulfillCheckoutEvent(workerDatabaseClient.db, {
       stripeEventId: latePaidEvent.id,
       session: fixture.session,
       payment: fixture.payment
@@ -629,13 +633,13 @@ describe('canonical Stripe checkout fulfillment', () => {
       paidAt: null,
       paymentMethodCategory: null
     };
-    await fulfillCheckoutEvent(databaseClient.db, {
+    await fulfillCheckoutEvent(workerDatabaseClient.db, {
       stripeEventId: fixture.stripeEventId,
       session: pendingSession,
       payment: pendingPayment
     }, dependencies());
 
-    const [failedEvent] = await databaseClient.db.insert(stripeEvents).values({
+    const [failedEvent] = await ownerDatabaseClient.db.insert(stripeEvents).values({
       providerEventId: `evt_test_${randomUUID()}`,
       eventType: 'checkout.session.async_payment_failed',
       objectId: fixture.session.providerSessionId,
@@ -646,7 +650,7 @@ describe('canonical Stripe checkout fulfillment', () => {
     }).returning();
     if (!failedEvent) throw new Error('Expected failed event');
 
-    await fulfillCheckoutEvent(databaseClient.db, {
+    await fulfillCheckoutEvent(workerDatabaseClient.db, {
       stripeEventId: failedEvent.id,
       session: pendingSession,
       payment: { ...pendingPayment, state: 'failed' }
@@ -658,7 +662,7 @@ describe('canonical Stripe checkout fulfillment', () => {
       paidAt: null
     });
 
-    const [repeatedFailedEvent, succeededEvent] = await databaseClient.db
+    const [repeatedFailedEvent, succeededEvent] = await ownerDatabaseClient.db
       .insert(stripeEvents)
       .values([
         {
@@ -683,7 +687,7 @@ describe('canonical Stripe checkout fulfillment', () => {
       .returning();
     if (!repeatedFailedEvent || !succeededEvent) throw new Error('Expected follow-up events');
 
-    await fulfillCheckoutEvent(databaseClient.db, {
+    await fulfillCheckoutEvent(workerDatabaseClient.db, {
       stripeEventId: repeatedFailedEvent.id,
       session: pendingSession,
       payment: { ...pendingPayment, state: 'failed' }
@@ -691,7 +695,7 @@ describe('canonical Stripe checkout fulfillment', () => {
     expect((await databaseClient.db.select().from(payments)
       .where(eq(payments.orderId, fixture.orderId)))[0]?.status).toBe('failed');
 
-    await fulfillCheckoutEvent(databaseClient.db, {
+    await fulfillCheckoutEvent(workerDatabaseClient.db, {
       stripeEventId: succeededEvent.id,
       session: fixture.session,
       payment: fixture.payment
@@ -718,13 +722,13 @@ describe('canonical Stripe checkout fulfillment', () => {
       latestChargeId: oldChargeId,
       paidAt: null
     };
-    await fulfillCheckoutEvent(databaseClient.db, {
+    await fulfillCheckoutEvent(workerDatabaseClient.db, {
       stripeEventId: fixture.stripeEventId,
       session: failedSession,
       payment: failedPayment
     }, dependencies());
 
-    const [retriedEvent] = await databaseClient.db.insert(stripeEvents).values({
+    const [retriedEvent] = await ownerDatabaseClient.db.insert(stripeEvents).values({
       providerEventId: `evt_test_${randomUUID()}`,
       eventType: 'checkout.session.async_payment_failed',
       objectId: fixture.session.providerSessionId,
@@ -735,7 +739,7 @@ describe('canonical Stripe checkout fulfillment', () => {
     }).returning();
     if (!retriedEvent) throw new Error('Expected retried payment event');
 
-    await fulfillCheckoutEvent(databaseClient.db, {
+    await fulfillCheckoutEvent(workerDatabaseClient.db, {
       stripeEventId: retriedEvent.id,
       session: { ...failedSession, latestChargeId: newChargeId },
       payment: { ...failedPayment, latestChargeId: newChargeId }
@@ -764,13 +768,13 @@ describe('canonical Stripe checkout fulfillment', () => {
       latestChargeId: oldChargeId,
       paidAt: null
     };
-    await fulfillCheckoutEvent(databaseClient.db, {
+    await fulfillCheckoutEvent(workerDatabaseClient.db, {
       stripeEventId: fixture.stripeEventId,
       session: failedSession,
       payment: failedPayment
     }, dependencies());
 
-    const [succeededEvent] = await databaseClient.db.insert(stripeEvents).values({
+    const [succeededEvent] = await ownerDatabaseClient.db.insert(stripeEvents).values({
       providerEventId: `evt_test_${randomUUID()}`,
       eventType: 'checkout.session.async_payment_succeeded',
       objectId: fixture.session.providerSessionId,
@@ -781,7 +785,7 @@ describe('canonical Stripe checkout fulfillment', () => {
     }).returning();
     if (!succeededEvent) throw new Error('Expected succeeded payment event');
 
-    await fulfillCheckoutEvent(databaseClient.db, {
+    await fulfillCheckoutEvent(workerDatabaseClient.db, {
       stripeEventId: succeededEvent.id,
       session: { ...fixture.session, latestChargeId: newChargeId },
       payment: { ...fixture.payment, latestChargeId: newChargeId }
@@ -800,7 +804,7 @@ describe('canonical Stripe checkout fulfillment', () => {
 
   it('keeps duplicate, out-of-order, and concurrent success jobs monotonic', async () => {
     const fixture = await createFixture();
-    const [secondEvent] = await databaseClient.db.insert(stripeEvents).values({
+    const [secondEvent] = await ownerDatabaseClient.db.insert(stripeEvents).values({
       providerEventId: `evt_test_${randomUUID()}`,
       eventType: 'checkout.session.completed',
       objectId: fixture.session.providerSessionId,
@@ -811,7 +815,7 @@ describe('canonical Stripe checkout fulfillment', () => {
     if (!secondEvent) throw new Error('Expected second event');
     await Promise.all([
       fulfill(fixture),
-      fulfillCheckoutEvent(databaseClient.db, {
+      fulfillCheckoutEvent(workerDatabaseClient.db, {
         stripeEventId: secondEvent.id,
         session: fixture.session,
         payment: fixture.payment
@@ -832,7 +836,7 @@ describe('canonical Stripe checkout fulfillment', () => {
 
   it('does not acknowledge a paid order whose locked payment evidence is incomplete', async () => {
     const fixture = await createFixture({ orderStatus: 'paid' });
-    await databaseClient.db.update(payments).set({
+    await ownerDatabaseClient.db.update(payments).set({
       status: 'pending',
       paidAt: null
     }).where(eq(payments.orderId, fixture.orderId));
@@ -859,7 +863,7 @@ describe('canonical Stripe checkout fulfillment', () => {
       latestChargeId: existing.payment.latestChargeId
     };
 
-    await expect(fulfillCheckoutEvent(databaseClient.db, {
+    await expect(fulfillCheckoutEvent(workerDatabaseClient.db, {
       stripeEventId: target.stripeEventId,
       session,
       payment
@@ -907,12 +911,12 @@ describe('canonical Stripe checkout fulfillment', () => {
 
   it('records canonical mismatch as a minimized permanent exception with no access', async () => {
     const fixture = await createFixture();
-    await expect(fulfillCheckoutEvent(databaseClient.db, {
+    await expect(fulfillCheckoutEvent(workerDatabaseClient.db, {
       stripeEventId: fixture.stripeEventId,
       session: { ...fixture.session, clientReferenceId: randomUUID() },
       payment: fixture.payment
     }, dependencies())).rejects.toThrow();
-    await recordFulfillmentException(databaseClient.db, {
+    await recordFulfillmentException(workerDatabaseClient.db, {
       stripeEventId: fixture.stripeEventId,
       orderId: fixture.orderId
     });
@@ -936,7 +940,7 @@ describe('canonical Stripe checkout fulfillment', () => {
   it('never regresses a signed-expired order back into a purchase reservation', async () => {
     const fixture = await createFixture({ orderStatus: 'expired' });
 
-    await recordFulfillmentException(databaseClient.db, {
+    await recordFulfillmentException(workerDatabaseClient.db, {
       stripeEventId: fixture.stripeEventId,
       orderId: fixture.orderId
     });

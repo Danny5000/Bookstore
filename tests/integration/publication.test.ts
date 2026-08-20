@@ -59,13 +59,12 @@ import {
   stagingUploadKey,
   titleCoversPrefix
 } from '$lib/server/storage/keys';
-import { createLocalObjectStorage } from '$lib/server/storage/local';
+import { storage } from './storage';
 import { onePixelPng } from '../fixtures/publications';
-import { databaseClient } from './database';
+import { databaseClient, ownerDatabaseClient } from './database';
 
 const admin = { type: 'user', id: randomUUID(), roles: ['admin'] } satisfies Actor;
 const customer = { type: 'user', id: randomUUID(), roles: ['customer'] } satisfies Actor;
-const storage = createLocalObjectStorage(process.env.STORAGE_LOCAL_ROOT!);
 const limits: IngestionLimits = {
   maxUploadBytes: 25 * 1024 * 1024,
   maxExpandedBytes: 50 * 1024 * 1024,
@@ -94,7 +93,7 @@ async function createTitle(slug = `publication-${randomUUID()}`, format: 'prose'
 }
 
 async function createCoverSuggestion(titleId: string) {
-  const [revision] = await databaseClient.db
+  const [revision] = await ownerDatabaseClient.db
     .insert(titleRevisions)
     .values({
       titleId,
@@ -105,10 +104,15 @@ async function createCoverSuggestion(titleId: string) {
     .returning();
   if (!revision) throw new Error('Expected revision');
   const suggestionId = randomUUID();
-  const key = revisionCoverSuggestionKey(titleId, revision.id, suggestionId);
+  const key = revisionCoverSuggestionKey(
+    titleId,
+    revision.id,
+    revision.ingestionGeneration,
+    suggestionId
+  );
   const bytes = await sharp(onePixelPng).webp().toBuffer();
   await storage.write(key, Readable.from(bytes), { maxBytes: limits.maxUploadBytes });
-  const [suggestion] = await databaseClient.db
+  const [suggestion] = await ownerDatabaseClient.db
     .insert(revisionCoverSuggestions)
     .values({
       id: suggestionId,
@@ -148,13 +152,20 @@ async function createProsePresentation(
   existingTitle?: Awaited<ReturnType<typeof createTitle>>
 ) {
   const title = existingTitle ?? await createTitle(slug, 'prose');
-  const [revision] = await databaseClient.db
+  const [revision] = await ownerDatabaseClient.db
     .insert(titleRevisions)
     .values({
       titleId: title.id,
       state: 'ready_for_review',
       createdByActorId: admin.type === 'user' ? admin.id : 'admin',
-      changeSummary: 'Ready prose'
+      changeSummary: 'Ready prose',
+      originalStorageKey: `originals/${randomUUID()}`,
+      originalChecksumSha256: 'a'.repeat(64),
+      originalMimeType: 'application/epub+zip',
+      originalByteSize: 1_024,
+      originalFilename: 'fixture.epub',
+      processingStartedAt: new Date(0),
+      processedAt: new Date(1)
     })
     .returning();
   if (!revision) throw new Error('Expected revision');
@@ -162,7 +173,7 @@ async function createProsePresentation(
     { id: randomUUID(), revisionId: revision.id, ordinal: 0, label: 'One', sourceReference: 'one.xhtml' },
     { id: randomUUID(), revisionId: revision.id, ordinal: 1, label: 'Two', sourceReference: 'two.xhtml' }
   ];
-  await databaseClient.db.insert(proseSections).values(sections);
+  await ownerDatabaseClient.db.insert(proseSections).values(sections);
   const blocks = [
     { id: randomUUID(), revisionId: revision.id, sectionId: sections[0]!.id, ordinal: 0 },
     { id: randomUUID(), revisionId: revision.id, sectionId: sections[0]!.id, ordinal: 1 },
@@ -173,7 +184,7 @@ async function createProsePresentation(
     content: { kind: 'paragraph' as const, fragments: [{ text: 'Text', marks: [] }] },
     imageId: null
   }));
-  await databaseClient.db.insert(proseBlocks).values(blocks);
+  await ownerDatabaseClient.db.insert(proseBlocks).values(blocks);
   const [presentation] = await databaseClient.db
     .insert(revisionPresentations)
     .values({ revisionId: revision.id, state: 'draft' })
@@ -208,7 +219,7 @@ async function publishProseSettings(
 
 async function createComicPresentation(slug = `comic-presentation-${randomUUID()}`) {
   const title = await createTitle(slug, 'comic');
-  const [revision] = await databaseClient.db
+  const [revision] = await ownerDatabaseClient.db
     .insert(titleRevisions)
     .values({
       titleId: title.id,
@@ -225,7 +236,7 @@ async function createComicPresentation(slug = `comic-presentation-${randomUUID()
       revisionId: revision.id,
       ordinal,
       sourcePath: `page-${ordinal}.png`,
-      storageKey: revisionComicPageKey(title.id, revision.id, id),
+      storageKey: revisionComicPageKey(title.id, revision.id, revision.ingestionGeneration, id),
       mediaType: 'image/webp',
       checksumSha256: String(ordinal).repeat(64),
       byteSize: 100,
@@ -233,7 +244,7 @@ async function createComicPresentation(slug = `comic-presentation-${randomUUID()
       height: 150
     };
   });
-  await databaseClient.db.insert(comicPages).values(pages);
+  await ownerDatabaseClient.db.insert(comicPages).values(pages);
   const [presentation] = await databaseClient.db
     .insert(revisionPresentations)
     .values({ revisionId: revision.id, state: 'draft' })
@@ -476,7 +487,7 @@ describe('title metadata and covers', () => {
     const title = await createTitle('cover-rollback');
     const sourceKey = stagingUploadKey(randomUUID());
     await storage.write(sourceKey, Readable.from(onePixelPng), { maxBytes: limits.maxUploadBytes });
-    await databaseClient.pool.query(`
+    await ownerDatabaseClient.pool.query(`
       create function reject_plan4_cover_update() returns trigger language plpgsql as $$
       begin
         if new.cover_storage_key is not null then raise exception 'forced cover update failure'; end if;
@@ -495,8 +506,10 @@ describe('title metadata and covers', () => {
         })
       ).rejects.toThrow();
     } finally {
-      await databaseClient.pool.query('drop trigger reject_plan4_cover_update_trigger on titles');
-      await databaseClient.pool.query('drop function reject_plan4_cover_update()');
+      await ownerDatabaseClient.pool.query(
+        'drop trigger reject_plan4_cover_update_trigger on titles'
+      );
+      await ownerDatabaseClient.pool.query('drop function reject_plan4_cover_update()');
     }
 
     const [unchanged] = await databaseClient.db.select().from(titles).where(eq(titles.id, title.id));
@@ -549,7 +562,7 @@ describe('reader presentation drafts and publication', () => {
 
   it('accepts only editable revisions and same-revision boundaries', async () => {
     const candidate = await createProsePresentation();
-    await databaseClient.db
+    await ownerDatabaseClient.db
       .update(titleRevisions)
       .set({ state: 'uploaded' })
       .where(eq(titleRevisions.id, candidate.revision.id));
@@ -562,7 +575,7 @@ describe('reader presentation drafts and publication', () => {
     ).rejects.toMatchObject({ code: 'revision_not_editable' });
 
     const other = await createProsePresentation();
-    await databaseClient.db
+    await ownerDatabaseClient.db
       .update(titleRevisions)
       .set({ state: 'ready_for_review' })
       .where(eq(titleRevisions.id, candidate.revision.id));
@@ -947,7 +960,7 @@ describe('failed revision retry', () => {
     const bytes = Buffer.from('retry source bytes');
     const digest = createHash('sha256').update(bytes).digest('hex');
     await storage.write(oldKey, Readable.from(bytes), { maxBytes: limits.maxUploadBytes });
-    const [failed] = await databaseClient.db
+    const [failed] = await ownerDatabaseClient.db
       .insert(titleRevisions)
       .values({
         titleId: title.id,
@@ -994,7 +1007,7 @@ describe('failed revision retry', () => {
   it('rejects retry when no staged source remains', async () => {
     const title = await createTitle('retry-without-source');
     await persistAdminRole();
-    const [failed] = await databaseClient.db
+    const [failed] = await ownerDatabaseClient.db
       .insert(titleRevisions)
       .values({
         titleId: title.id,

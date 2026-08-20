@@ -7,10 +7,13 @@ import {
 import type { Database } from '$lib/server/db/client';
 import {
   entitlementGrants,
+  guestIdentities,
   orderItems,
   orders,
   payments,
   stripeEvents,
+  user,
+  type GuestIdentityRow,
   type NewEntitlementGrantRow,
   type OrderItemRow,
   type OrderRow,
@@ -187,8 +190,66 @@ export function validateFulfillmentCommand(input: ValidateFulfillmentInput): Ful
   return permanent();
 }
 
+export interface PaidFulfillmentOwnership {
+  guestIdentityId: string | null;
+  grantUserId: string | null;
+  message: 'account-receipt' | 'guest-claim-preparation' | 'guest-receipt-without-claim';
+}
+
+interface VerifiedClaimant {
+  id: string;
+  email: string;
+  emailVerified: boolean;
+}
+
+export function resolvePaidFulfillmentOwnership(
+  order: OrderRow,
+  purchaseEmail: string,
+  guestIdentity: GuestIdentityRow | undefined,
+  claimant: VerifiedClaimant | undefined
+): PaidFulfillmentOwnership {
+  if (order.initiatingUserId !== null) {
+    if (guestIdentity || claimant) permanent();
+    return {
+      guestIdentityId: order.guestIdentityId,
+      grantUserId: order.initiatingUserId,
+      message: 'account-receipt'
+    };
+  }
+  if (
+    !guestIdentity ||
+    guestIdentity.email !== purchaseEmail ||
+    (order.guestIdentityId !== null && order.guestIdentityId !== guestIdentity.id)
+  ) permanent();
+  const claimedByUserId = guestIdentity.claimedByUserId;
+  if (claimedByUserId === null) {
+    if (claimant) permanent();
+    return {
+      guestIdentityId: guestIdentity.id,
+      grantUserId: null,
+      message: 'guest-claim-preparation'
+    };
+  }
+  if (
+    !claimant ||
+    claimant.id !== claimedByUserId ||
+    !claimant.emailVerified ||
+    claimant.email !== guestIdentity.email ||
+    normalizeEmail(claimant.email) !== guestIdentity.email
+  ) permanent();
+  return {
+    guestIdentityId: guestIdentity.id,
+    grantUserId: claimant.id,
+    message: 'guest-receipt-without-claim'
+  };
+}
+
 export interface PurchaseMessageEnqueuer {
   enqueueAccountReceipt(transaction: DatabaseTransaction, orderId: string): Promise<void>;
+  enqueueGuestReceiptWithoutClaim(
+    transaction: DatabaseTransaction,
+    orderId: string
+  ): Promise<void>;
   enqueueGuestClaimPreparation(
     transaction: DatabaseTransaction,
     orderId: string
@@ -377,6 +438,48 @@ async function assertPurchaseGrant(
   ) permanent();
 }
 
+async function discoverAndLockPaidGuestIdentity(
+  transaction: DatabaseTransaction,
+  session: CheckoutSnapshot,
+  payment: unknown | null,
+  expectedLiveMode: boolean
+): Promise<GuestIdentityRow | undefined> {
+  const [candidateOrder] = await transaction
+    .select()
+    .from(orders)
+    .where(eq(orders.id, session.metadataOrderId))
+    .limit(1);
+  if (!candidateOrder) permanent();
+  if (candidateOrder.initiatingUserId !== null || session.paymentStatus !== 'paid') {
+    return undefined;
+  }
+  const candidateItems = await transaction
+    .select()
+    .from(orderItems)
+    .where(eq(orderItems.orderId, candidateOrder.id))
+    .orderBy(asc(orderItems.id));
+  const candidateCommand = validateFulfillmentCommand({
+    order: candidateOrder,
+    items: candidateItems,
+    session,
+    payment,
+    expectedLiveMode
+  });
+  if (candidateCommand.state !== 'paid') permanent();
+  const discovered = await findOrCreateGuestIdentity(
+    transaction,
+    candidateCommand.purchaseEmail
+  );
+  const [lockedIdentity] = await transaction
+    .select()
+    .from(guestIdentities)
+    .where(eq(guestIdentities.id, discovered.id))
+    .limit(1)
+    .for('update');
+  if (!lockedIdentity || lockedIdentity.email !== candidateCommand.purchaseEmail) permanent();
+  return lockedIdentity;
+}
+
 async function finalizePaidOrder(
   transaction: DatabaseTransaction,
   order: OrderRow,
@@ -386,14 +489,9 @@ async function finalizePaidOrder(
     CheckoutFulfillmentDependencies,
     'purchaseMessages' | 'createPurchaseGrant' | 'projectEntitlement' | 'appendAuditEvent'
   >>,
+  ownership: PaidFulfillmentOwnership,
   now: Date
 ): Promise<void> {
-  let guestIdentityId = order.guestIdentityId;
-  if (order.initiatingUserId === null) {
-    const identity = await findOrCreateGuestIdentity(transaction, command.purchaseEmail);
-    guestIdentityId = identity.id;
-  }
-
   for (const line of command.session.lineItems) {
     const item = items.find((candidate) => candidate.id === line.orderItemId);
     if (!item) permanent();
@@ -410,7 +508,7 @@ async function finalizePaidOrder(
     .update(orders)
     .set({
       status: 'paid',
-      guestIdentityId,
+      guestIdentityId: ownership.guestIdentityId,
       purchaseEmail: command.purchaseEmail,
       taxMinor: command.session.taxMinor,
       totalMinor: command.session.totalMinor,
@@ -421,11 +519,11 @@ async function finalizePaidOrder(
     })
     .where(eq(orders.id, order.id));
 
-  const grantState = order.initiatingUserId === null ? 'unclaimed' : 'active';
+  const grantState = ownership.grantUserId === null ? 'unclaimed' : 'active';
   for (const item of items) {
     const grant: NewEntitlementGrantRow = {
       titleId: item.titleId,
-      userId: order.initiatingUserId,
+      userId: ownership.grantUserId,
       source: 'purchase',
       orderItemId: item.id,
       state: grantState,
@@ -437,16 +535,20 @@ async function finalizePaidOrder(
     await dependencies.createPurchaseGrant(transaction, grant);
     await assertPurchaseGrant(transaction, grant);
   }
-  if (order.initiatingUserId !== null) {
+  if (ownership.grantUserId !== null) {
     for (const item of items) {
       await dependencies.projectEntitlement(
         transaction,
-        order.initiatingUserId,
+        ownership.grantUserId,
         item.titleId,
         now
       );
     }
+  }
+  if (ownership.message === 'account-receipt') {
     await dependencies.purchaseMessages.enqueueAccountReceipt(transaction, order.id);
+  } else if (ownership.message === 'guest-receipt-without-claim') {
+    await dependencies.purchaseMessages.enqueueGuestReceiptWithoutClaim(transaction, order.id);
   } else {
     await dependencies.purchaseMessages.enqueueGuestClaimPreparation(transaction, order.id);
   }
@@ -464,7 +566,7 @@ async function finalizePaidOrder(
       subtotalMinor: command.session.subtotalMinor,
       taxMinor: command.session.taxMinor,
       totalMinor: command.session.totalMinor,
-      ownerType: order.initiatingUserId === null ? 'guest' : 'account'
+      ownerType: ownership.grantUserId === null ? 'guest' : 'account'
     }
   });
 }
@@ -498,6 +600,12 @@ export async function fulfillCheckoutEvent(
     if (event.status !== 'pending') return;
     assertCheckoutEvent(event, session);
 
+    const lockedGuestIdentity = await discoverAndLockPaidGuestIdentity(
+      transaction,
+      session,
+      input.payment,
+      event.liveMode
+    );
     await lockOrder(transaction, session.metadataOrderId);
     const [order] = await transaction
       .select()
@@ -546,6 +654,35 @@ export async function fulfillCheckoutEvent(
       expectedLiveMode: event.liveMode
     });
     const now = dependencies.now();
+    let paidOwnership: PaidFulfillmentOwnership | undefined;
+    if (command.state === 'paid') {
+      let claimant: VerifiedClaimant | undefined;
+      if (order.initiatingUserId === null) {
+        if (!lockedGuestIdentity || lockedGuestIdentity.email !== command.purchaseEmail) {
+          permanent();
+        }
+        const claimedByUserId = lockedGuestIdentity.claimedByUserId;
+        if (claimedByUserId !== null) {
+          await lockEntitlementScopes(
+            transaction,
+            items.map((item) => ({ userId: claimedByUserId, titleId: item.titleId }))
+          );
+          const [lockedClaimant] = await transaction
+            .select({ id: user.id, email: user.email, emailVerified: user.emailVerified })
+            .from(user)
+            .where(eq(user.id, claimedByUserId))
+            .limit(1)
+            .for('update');
+          claimant = lockedClaimant;
+        }
+      }
+      paidOwnership = resolvePaidFulfillmentOwnership(
+        order,
+        command.purchaseEmail,
+        lockedGuestIdentity,
+        claimant
+      );
+    }
 
     if (order.status === 'paid') {
       if (command.state === 'paid') {
@@ -582,8 +719,17 @@ export async function fulfillCheckoutEvent(
         }).where(eq(orders.id, order.id));
       }
     } else if (command.state === 'paid') {
+      if (!paidOwnership) permanent();
       paymentFact = await storePaymentEvidence(transaction, existingPayment, command, now);
-      await finalizePaidOrder(transaction, order, items, command, dependencies, now);
+      await finalizePaidOrder(
+        transaction,
+        order,
+        items,
+        command,
+        dependencies,
+        paidOwnership,
+        now
+      );
     } else if (command.state === 'failed') {
       paymentFact = await storePaymentEvidence(transaction, existingPayment, command, now);
       if (['checkout_pending', 'checkout_open', 'payment_pending'].includes(order.status)) {

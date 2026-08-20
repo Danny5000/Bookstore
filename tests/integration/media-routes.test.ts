@@ -19,9 +19,12 @@ import {
   user
 } from '$lib/server/db/schema';
 import { setPreservedGrantState } from '$lib/server/commerce/grants';
+import { lockEntitlementScopes } from '$lib/server/commerce/lock';
 import { revisionOriginalKey, revisionProseImageKey } from '$lib/server/storage/keys';
 import type { ObjectStorage } from '$lib/server/storage/types';
-import { databaseClient } from './database';
+import type { Database } from '$lib/server/db/client';
+import type { DatabaseTransaction } from '$lib/server/db/transaction';
+import { databaseClient, ownerDatabaseClient, workerDatabaseClient } from './database';
 
 const adminId = randomUUID();
 const checksum = 'a'.repeat(64);
@@ -38,7 +41,7 @@ async function createCustomer(): Promise<Extract<Actor, { type: 'user' }>> {
 }
 
 async function grant(userId: string, titleId: string): Promise<void> {
-  await databaseClient.db.transaction((transaction) =>
+  await workerDatabaseClient.db.transaction((transaction) =>
     setPreservedGrantState(transaction, {
       userId,
       titleId,
@@ -49,7 +52,7 @@ async function grant(userId: string, titleId: string): Promise<void> {
 }
 
 async function revoke(userId: string, titleId: string): Promise<void> {
-  await databaseClient.db.transaction((transaction) =>
+  await workerDatabaseClient.db.transaction((transaction) =>
     setPreservedGrantState(transaction, {
       userId,
       titleId,
@@ -60,7 +63,7 @@ async function revoke(userId: string, titleId: string): Promise<void> {
 }
 
 async function createPublication() {
-  const [title] = await databaseClient.db
+  const [title] = await ownerDatabaseClient.db
     .insert(titles)
     .values({
       slug: `media-${randomUUID()}`,
@@ -75,7 +78,7 @@ async function createPublication() {
     .returning();
   if (!title) throw new Error('Expected title');
   const revisionId = randomUUID();
-  const [revision] = await databaseClient.db
+  const [revision] = await ownerDatabaseClient.db
     .insert(titleRevisions)
     .values({
       id: revisionId,
@@ -91,7 +94,7 @@ async function createPublication() {
     })
     .returning();
   if (!revision) throw new Error('Expected revision');
-  const [section] = await databaseClient.db
+  const [section] = await ownerDatabaseClient.db
     .insert(proseSections)
     .values({
       revisionId: revision.id,
@@ -103,11 +106,16 @@ async function createPublication() {
   if (!section) throw new Error('Expected section');
   const previewImageId = randomUUID();
   const fullImageId = randomUUID();
-  await databaseClient.db.insert(proseImages).values([
+  await ownerDatabaseClient.db.insert(proseImages).values([
     {
       id: previewImageId,
       revisionId: revision.id,
-      storageKey: revisionProseImageKey(title.id, revision.id, previewImageId),
+      storageKey: revisionProseImageKey(
+        title.id,
+        revision.id,
+        revision.ingestionGeneration,
+        previewImageId
+      ),
       mediaType: 'image/webp',
       checksumSha256: checksum,
       byteSize: 100,
@@ -118,7 +126,12 @@ async function createPublication() {
     {
       id: fullImageId,
       revisionId: revision.id,
-      storageKey: revisionProseImageKey(title.id, revision.id, fullImageId),
+      storageKey: revisionProseImageKey(
+        title.id,
+        revision.id,
+        revision.ingestionGeneration,
+        fullImageId
+      ),
       mediaType: 'image/webp',
       checksumSha256: checksum,
       byteSize: 100,
@@ -128,7 +141,7 @@ async function createPublication() {
     }
   ]);
   const previewBlockId = randomUUID();
-  await databaseClient.db.insert(proseBlocks).values([
+  await ownerDatabaseClient.db.insert(proseBlocks).values([
     {
       id: previewBlockId,
       revisionId: revision.id,
@@ -147,20 +160,20 @@ async function createPublication() {
       imageId: fullImageId
     }
   ]);
-  await databaseClient.db.insert(revisionPresentations).values({
+  await ownerDatabaseClient.db.insert(revisionPresentations).values({
     revisionId: revision.id,
     state: 'published',
     previewProseSectionId: section.id,
     previewProseBlockId: previewBlockId,
     previewComicPageId: null
   });
-  await databaseClient.db
+  await ownerDatabaseClient.db
     .update(titles)
     .set({ activeRevisionId: revision.id })
     .where(eq(titles.id, title.id));
 
   const candidateRevisionId = randomUUID();
-  await databaseClient.db.insert(titleRevisions).values({
+  await ownerDatabaseClient.db.insert(titleRevisions).values({
     id: candidateRevisionId,
     titleId: title.id,
     state: 'ready_for_review',
@@ -168,10 +181,10 @@ async function createPublication() {
     changeSummary: 'Candidate fixture'
   });
   const candidateImageId = randomUUID();
-  await databaseClient.db.insert(proseImages).values({
+  await ownerDatabaseClient.db.insert(proseImages).values({
     id: candidateImageId,
     revisionId: candidateRevisionId,
-    storageKey: revisionProseImageKey(title.id, candidateRevisionId, candidateImageId),
+    storageKey: revisionProseImageKey(title.id, candidateRevisionId, 0, candidateImageId),
     mediaType: 'image/webp',
     checksumSha256: checksum,
     byteSize: 100,
@@ -197,22 +210,40 @@ function storage(options: { prepareFailure?: Error } = {}): ObjectStorage {
   } as unknown as ObjectStorage;
 }
 
-async function waitForBlockedEntitlementQuery(): Promise<void> {
+function namedTransactionDatabase(applicationName: string): Database {
+  return {
+    transaction: <T>(work: (transaction: DatabaseTransaction) => Promise<T>) =>
+      databaseClient.db.transaction(async (transaction) => {
+        await transaction.execute(
+          sql`select set_config('application_name', ${applicationName}, true)`
+        );
+        return work(transaction);
+      })
+  } as unknown as Database;
+}
+
+async function waitForNamedBlockedEntitlementQuery(
+  blockedApplicationName: string,
+  blockerApplicationName: string
+): Promise<void> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    const result = await databaseClient.pool.query<{ blocked: boolean }>(`
+    const result = await ownerDatabaseClient.pool.query<{ blocked: boolean }>(`
       select exists (
         select 1
-        from pg_stat_activity
-        where datname = current_database()
-          and pid <> pg_backend_pid()
-          and wait_event_type = 'Lock'
-          and query ilike '%entitlements%'
+        from pg_stat_activity blocked_activity
+        cross join lateral unnest(pg_blocking_pids(blocked_activity.pid)) blocking(pid)
+        inner join pg_stat_activity blocker_activity on blocker_activity.pid = blocking.pid
+        where blocked_activity.datname = current_database()
+          and blocked_activity.application_name = $1
+          and blocker_activity.application_name = $2
+          and blocked_activity.wait_event_type = 'Lock'
+          and blocked_activity.query ilike '%pg_advisory_xact_lock%'
       ) as blocked
-    `);
+    `, [blockedApplicationName, blockerApplicationName]);
     if (result.rows[0]?.blocked) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  throw new Error('Expected the download authorization query to wait for entitlement revocation');
+  throw new Error('Expected the download authorization query to wait for entitlement projection');
 }
 
 describe('entitled media and original download resolution', () => {
@@ -314,6 +345,9 @@ describe('entitled media and original download resolution', () => {
     const publication = await createPublication();
     await grant(customer.id, publication.title.id);
     const objectStorage = storage();
+    const downloadApplicationName = `media-download-${randomUUID()}`;
+    const revocationApplicationName = `media-revocation-${randomUUID()}`;
+    const requestDatabase = namedTransactionDatabase(downloadApplicationName);
     let releaseRevocation!: () => void;
     const release = new Promise<void>((resolve) => {
       releaseRevocation = resolve;
@@ -322,7 +356,10 @@ describe('entitled media and original download resolution', () => {
     const revocationPrepared = new Promise<void>((resolve) => {
       signalRevocationPrepared = resolve;
     });
-    const revocation = databaseClient.db.transaction(async (transaction) => {
+    const revocation = workerDatabaseClient.db.transaction(async (transaction) => {
+      await transaction.execute(
+        sql`select set_config('application_name', ${revocationApplicationName}, true)`
+      );
       await setPreservedGrantState(transaction, {
         userId: customer.id,
         titleId: publication.title.id,
@@ -335,7 +372,7 @@ describe('entitled media and original download resolution', () => {
     try {
       await revocationPrepared;
       const download = streamCustomerOriginalDownload(
-        databaseClient.db,
+        requestDatabase,
         objectStorage,
         customer,
         {
@@ -345,7 +382,10 @@ describe('entitled media and original download resolution', () => {
           rangeHeader: null
         }
       );
-      await waitForBlockedEntitlementQuery();
+      await waitForNamedBlockedEntitlementQuery(
+        downloadApplicationName,
+        revocationApplicationName
+      );
       expect(objectStorage.prepareVerifiedRead).not.toHaveBeenCalled();
 
       releaseRevocation();
@@ -360,6 +400,72 @@ describe('entitled media and original download resolution', () => {
     } finally {
       releaseRevocation();
       await Promise.allSettled([revocation]);
+    }
+  });
+
+  it('waits on entitlement scope before row locks so a pending worker grant can finish', async () => {
+    const customer = await createCustomer();
+    const publication = await createPublication();
+    const objectStorage = storage();
+    const downloadApplicationName = `media-grant-read-${randomUUID()}`;
+    const projectionApplicationName = `media-grant-work-${randomUUID()}`;
+    const requestDatabase = namedTransactionDatabase(downloadApplicationName);
+    let releaseProjection!: () => void;
+    const release = new Promise<void>((resolve) => {
+      releaseProjection = resolve;
+    });
+    let signalScopeLocked!: () => void;
+    const scopeLocked = new Promise<void>((resolve) => {
+      signalScopeLocked = resolve;
+    });
+    const projection = workerDatabaseClient.db.transaction(async (transaction) => {
+      await transaction.execute(
+        sql`select set_config('application_name', ${projectionApplicationName}, true)`
+      );
+      await lockEntitlementScopes(transaction, [{
+        userId: customer.id,
+        titleId: publication.title.id
+      }]);
+      signalScopeLocked();
+      await release;
+      return setPreservedGrantState(transaction, {
+        userId: customer.id,
+        titleId: publication.title.id,
+        active: true,
+        stateReason: 'test_pending_grant_projection'
+      });
+    });
+    void projection.catch(() => undefined);
+    let download: Promise<Response> | undefined;
+    let released = false;
+    try {
+      await scopeLocked;
+      download = streamCustomerOriginalDownload(
+        requestDatabase,
+        objectStorage,
+        customer,
+        {
+          titleId: publication.title.id,
+          correlationId: 'pending-grant-lock-order',
+          method: 'HEAD',
+          rangeHeader: null
+        }
+      );
+      void download.catch(() => undefined);
+      await waitForNamedBlockedEntitlementQuery(
+        downloadApplicationName,
+        projectionApplicationName
+      );
+
+      releaseProjection();
+      released = true;
+      await expect(projection).resolves.toEqual({ beforeActive: false, afterActive: true });
+      const response = await download;
+      expect(response.status).toBe(200);
+      expect(objectStorage.prepareVerifiedRead).not.toHaveBeenCalled();
+    } finally {
+      if (!released) releaseProjection();
+      await Promise.allSettled([projection, ...(download ? [download] : [])]);
     }
   });
 

@@ -1,7 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { and, eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
-import { STRIPE_EVENT_JOB } from '$lib/server/commerce/job';
+import {
+  STRIPE_EVENT_JOB,
+  STRIPE_EVENT_JOB_MAX_ATTEMPTS
+} from '$lib/server/commerce/job';
 import { fulfillPayoutEvent } from '$lib/server/commerce/handler';
 import { queueFinancialPayoutFromEvent } from '$lib/server/commerce/financial/event-handoff';
 import { FINANCIAL_PAYOUT_JOB } from '$lib/server/commerce/financial/jobs';
@@ -9,7 +12,7 @@ import { acceptStripeEvent } from '$lib/server/commerce/webhooks';
 import type { VerifiedStripeEvent } from '$lib/server/commerce/stripe/types';
 import { auditEvents, jobs, stripeEvents } from '$lib/server/db/schema';
 import { createPostgresJobRepository, enqueueJob } from '$lib/server/jobs/repository';
-import { applicationConfig, databaseClient } from './database';
+import { applicationConfig, databaseClient, workerDatabaseClient } from './database';
 
 function event(overrides: Partial<VerifiedStripeEvent> = {}): VerifiedStripeEvent {
   const suffix = randomUUID().replaceAll('-', '');
@@ -34,19 +37,19 @@ async function eventJob(providerEventId: string) {
 
 async function exhaustEventJob(providerEventId: string) {
   const queued = await eventJob(providerEventId);
-  await databaseClient.db.update(jobs)
-    .set({ maxAttempts: 2 })
-    .where(eq(jobs.id, queued.id));
-
   let currentTime = new Date('2099-01-01T00:00:00.000Z');
   const repository = createPostgresJobRepository(
-    databaseClient.db,
+    workerDatabaseClient.db,
     applicationConfig.jobs,
     () => currentTime
   );
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
+  for (let attempt = 1; attempt <= STRIPE_EVENT_JOB_MAX_ATTEMPTS; attempt += 1) {
     const claimed = await repository.claimNext(`stripe-test-worker-${attempt}`);
-    expect(claimed).toMatchObject({ id: queued.id, attempts: attempt, maxAttempts: 2 });
+    expect(claimed).toMatchObject({
+      id: queued.id,
+      attempts: attempt,
+      maxAttempts: STRIPE_EVENT_JOB_MAX_ATTEMPTS
+    });
     await repository.fail(
       queued.id,
       `stripe-test-worker-${attempt}`,
@@ -59,8 +62,8 @@ async function exhaustEventJob(providerEventId: string) {
   expect(failed).toMatchObject({
     id: queued.id,
     status: 'failed',
-    attempts: 2,
-    maxAttempts: 2,
+    attempts: STRIPE_EVENT_JOB_MAX_ATTEMPTS,
+    maxAttempts: STRIPE_EVENT_JOB_MAX_ATTEMPTS,
     lastError: 'forced transient Stripe outage'
   });
   return failed;
@@ -74,7 +77,7 @@ describe('atomic Stripe event acceptance', () => {
     });
     const accepted = await acceptStripeEvent(databaseClient.db, source);
 
-    await fulfillPayoutEvent(databaseClient.db, {
+    await fulfillPayoutEvent(workerDatabaseClient.db, {
       stripeEventId: accepted.stripeEventId,
       providerPayoutId: source.objectId,
       providerEventId: source.providerEventId
@@ -104,7 +107,7 @@ describe('atomic Stripe event acceptance', () => {
     });
     const accepted = await acceptStripeEvent(databaseClient.db, source);
 
-    await expect(fulfillPayoutEvent(databaseClient.db, {
+    await expect(fulfillPayoutEvent(workerDatabaseClient.db, {
       stripeEventId: accepted.stripeEventId,
       providerPayoutId: source.objectId,
       providerEventId: source.providerEventId
@@ -134,17 +137,17 @@ describe('atomic Stripe event acceptance', () => {
       providerPayoutId: source.objectId,
       providerEventId: source.providerEventId
     };
-    await fulfillPayoutEvent(databaseClient.db, input);
+    await fulfillPayoutEvent(workerDatabaseClient.db, input);
     const key = `stripe:financial-payout:event:${source.providerEventId}`;
     const [financial] = await databaseClient.db.select().from(jobs)
       .where(eq(jobs.deduplicationKey, key));
     if (!financial) throw new Error('Expected financial payout job');
     const completedAt = new Date('2099-01-02T00:00:00.000Z');
-    await databaseClient.db.update(jobs)
+    await workerDatabaseClient.db.update(jobs)
       .set({ status: 'succeeded', completedAt })
       .where(eq(jobs.id, financial.id));
 
-    await fulfillPayoutEvent(databaseClient.db, input);
+    await fulfillPayoutEvent(workerDatabaseClient.db, input);
     await expect(acceptStripeEvent(databaseClient.db, source)).resolves.toEqual({
       status: 'duplicate', stripeEventId: accepted.stripeEventId
     });
@@ -221,7 +224,7 @@ describe('atomic Stripe event acceptance', () => {
       status: 'pending',
       attempts: 0,
       maxAttempts: 12,
-      lastError: 'forced transient Stripe outage',
+      lastError: null,
       completedAt: null
     });
     expect(await databaseClient.db.select().from(jobs)
@@ -234,7 +237,7 @@ describe('atomic Stripe event acceptance', () => {
       const source = event();
       const accepted = await acceptStripeEvent(databaseClient.db, source);
       const failed = await exhaustEventJob(source.providerEventId);
-      await databaseClient.db.update(stripeEvents)
+      await workerDatabaseClient.db.update(stripeEvents)
         .set({ status, processedAt: new Date('2099-01-02T00:00:00.000Z') })
         .where(eq(stripeEvents.id, accepted.stripeEventId));
 
@@ -246,18 +249,17 @@ describe('atomic Stripe event acceptance', () => {
     }
   );
 
-  it('does not rearm an exhausted job whose identity does not match the event', async () => {
+  it('rejects an exhausted job whose identity does not match the event', async () => {
     const source = event();
     await acceptStripeEvent(databaseClient.db, source);
     const failed = await exhaustEventJob(source.providerEventId);
-    await databaseClient.db.update(jobs)
+    await workerDatabaseClient.db.update(jobs)
       .set({ type: 'test.not-a-stripe-event' })
       .where(eq(jobs.id, failed.id));
     const mismatched = await eventJob(source.providerEventId);
 
-    await expect(acceptStripeEvent(databaseClient.db, source)).resolves.toMatchObject({
-      status: 'duplicate'
-    });
+    await expect(acceptStripeEvent(databaseClient.db, source))
+      .rejects.toMatchObject({ cause: expect.objectContaining({ code: '55000' }) });
     expect(await eventJob(source.providerEventId)).toEqual(mismatched);
   });
 

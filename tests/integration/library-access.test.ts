@@ -15,7 +15,7 @@ import {
 import { setPreservedGrantState } from '$lib/server/commerce/grants';
 import { resolvePublicationAccess } from '$lib/server/library/access';
 import { listCustomerLibrary } from '$lib/server/library/query';
-import { databaseClient } from './database';
+import { databaseClient, ownerDatabaseClient, workerDatabaseClient } from './database';
 
 const anonymous = { type: 'anonymous' } satisfies Actor;
 const admin = { type: 'user', id: randomUUID(), roles: ['admin'] } satisfies Actor;
@@ -35,7 +35,7 @@ async function createPublishedProse(
   visibility: 'public' | 'private' | 'archived',
   titleLabel = 'Access Title'
 ) {
-  const [title] = await databaseClient.db
+  const [title] = await ownerDatabaseClient.db
     .insert(titles)
     .values({
       slug: `access-${randomUUID()}`,
@@ -49,7 +49,7 @@ async function createPublishedProse(
     })
     .returning();
   if (!title) throw new Error('Expected title');
-  const [revision] = await databaseClient.db
+  const [revision] = await ownerDatabaseClient.db
     .insert(titleRevisions)
     .values({
       titleId: title.id,
@@ -64,7 +64,7 @@ async function createPublishedProse(
     })
     .returning();
   if (!revision) throw new Error('Expected revision');
-  const [section] = await databaseClient.db
+  const [section] = await ownerDatabaseClient.db
     .insert(proseSections)
     .values({
       revisionId: revision.id,
@@ -86,8 +86,8 @@ async function createPublishedProse(
     },
     imageId: null
   }));
-  await databaseClient.db.insert(proseBlocks).values(blocks);
-  const [presentation] = await databaseClient.db
+  await ownerDatabaseClient.db.insert(proseBlocks).values(blocks);
+  const [presentation] = await ownerDatabaseClient.db
     .insert(revisionPresentations)
     .values({
       revisionId: revision.id,
@@ -98,7 +98,7 @@ async function createPublishedProse(
     })
     .returning();
   if (!presentation) throw new Error('Expected presentation');
-  await databaseClient.db
+  await ownerDatabaseClient.db
     .update(titles)
     .set({ activeRevisionId: revision.id, visibility })
     .where(eq(titles.id, title.id));
@@ -106,7 +106,7 @@ async function createPublishedProse(
 }
 
 async function grant(userId: string, titleId: string): Promise<void> {
-  await databaseClient.db.transaction((transaction) =>
+  await workerDatabaseClient.db.transaction((transaction) =>
     setPreservedGrantState(transaction, {
       userId,
       titleId,
@@ -117,7 +117,7 @@ async function grant(userId: string, titleId: string): Promise<void> {
 }
 
 async function revoke(userId: string, titleId: string): Promise<void> {
-  await databaseClient.db.transaction((transaction) =>
+  await workerDatabaseClient.db.transaction((transaction) =>
     setPreservedGrantState(transaction, {
       userId,
       titleId,
@@ -292,7 +292,7 @@ describe('effective publication access', () => {
       blockId: alpha.blocks[1]!.id,
       proseOffset: 3
     });
-    const [historicalRevision] = await databaseClient.db
+    const [historicalRevision] = await ownerDatabaseClient.db
       .insert(titleRevisions)
       .values({
         titleId: beta.title.id,
@@ -302,7 +302,7 @@ describe('effective publication access', () => {
       })
       .returning();
     if (!historicalRevision) throw new Error('Expected historical revision');
-    const [historicalSection] = await databaseClient.db
+    const [historicalSection] = await ownerDatabaseClient.db
       .insert(proseSections)
       .values({
         revisionId: historicalRevision.id,
@@ -312,7 +312,7 @@ describe('effective publication access', () => {
       })
       .returning();
     if (!historicalSection) throw new Error('Expected historical section');
-    const [historicalBlock] = await databaseClient.db
+    const [historicalBlock] = await ownerDatabaseClient.db
       .insert(proseBlocks)
       .values({
         revisionId: historicalRevision.id,

@@ -46,6 +46,9 @@ export const jobs = pgTable(
     uniqueIndex('jobs_deduplication_key_unique').on(table.deduplicationKey),
     index('jobs_claim_idx').on(table.status, table.runAt, table.lockedAt, table.createdAt),
     index('jobs_failed_updated_idx').on(table.status, table.updatedAt),
+    index('jobs_active_ingest_revision_identity_idx')
+      .on(sql`(${table.payload} ->> 'revisionId')`, sql`(${table.payload} ->> 'generation')`)
+      .where(sql`${table.type} = 'catalog.ingest_revision' and ${table.status} in ('pending', 'running')`),
     check('jobs_attempts_nonnegative', sql`${table.attempts} >= 0`),
     check('jobs_max_attempts_positive', sql`${table.maxAttempts} > 0`),
     check(

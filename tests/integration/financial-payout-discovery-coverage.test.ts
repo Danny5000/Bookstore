@@ -18,7 +18,11 @@ import {
 } from '$lib/server/db/schema';
 import { createPostgresJobRepository } from '$lib/server/jobs/repository';
 import type { StripeCommerceGateway } from '$lib/server/commerce/stripe/types';
-import { applicationConfig, databaseClient } from './database';
+import {
+  applicationConfig,
+  ownerDatabaseClient,
+  workerDatabaseClient as databaseClient
+} from './database';
 
 const HOUR = '2026-08-12T22:00:00.000Z';
 const HOUR_END = new Date('2026-08-12T23:00:00.000Z');
@@ -77,11 +81,11 @@ describe('durable payout discovery coverage', () => {
   it('uses seven days before the earliest paid order when coverage has not started', async () => {
     const userId = randomUUID();
     const paidAt = new Date('2026-07-01T12:00:00.000Z');
-    await databaseClient.db.execute(sql`
+    await ownerDatabaseClient.db.execute(sql`
       insert into "user" (id, name, email, email_verified)
       values (${userId}, 'Coverage Reader', ${`coverage-${userId}@example.com`}, true)
     `);
-    await databaseClient.db.execute(sql`
+    await ownerDatabaseClient.db.execute(sql`
       insert into orders
         (status, initiating_user_id, purchase_email, currency, subtotal_minor, tax_minor,
           total_minor, client_checkout_attempt_id, quote_fingerprint_sha256,

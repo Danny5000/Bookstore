@@ -1,7 +1,5 @@
 x-publication-settings: &publication-settings
   WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-1}
-  STORAGE_PROVIDER: ${STORAGE_PROVIDER:-local}
-  STORAGE_LOCAL_ROOT: /var/lib/pale-orbit/storage
   UPLOAD_MAX_BYTES: ${UPLOAD_MAX_BYTES:-536870912}
   INGEST_MAX_EXPANDED_BYTES: ${INGEST_MAX_EXPANDED_BYTES:-2147483648}
   INGEST_MAX_ENTRIES: ${INGEST_MAX_ENTRIES:-10000}
@@ -9,8 +7,6 @@ x-publication-settings: &publication-settings
   INGEST_MAX_IMAGE_PIXELS: ${INGEST_MAX_IMAGE_PIXELS:-100000000}
   INGEST_MAX_COMPRESSION_RATIO: ${INGEST_MAX_COMPRESSION_RATIO:-200}
   INGEST_TIMEOUT_MS: ${INGEST_TIMEOUT_MS:-900000}
-  STORAGE_STAGING_RETENTION_HOURS: ${STORAGE_STAGING_RETENTION_HOURS:-24}
-  STORAGE_ORPHAN_RETENTION_HOURS: ${STORAGE_ORPHAN_RETENTION_HOURS:-168}
   STRIPE_ENABLED: "false"
   STRIPE_TEST_FIXTURE_MODE: "false"
   STRIPE_LIVE_MODE: "false"
@@ -41,6 +37,13 @@ services:
       DATABASE_CONNECTION_TIMEOUT_MS: "5000"
       DATABASE_STATEMENT_TIMEOUT_MS: "30000"
       DATABASE_READINESS_TIMEOUT_MS: "2000"
+      STORAGE_PROVIDER: ${STORAGE_PROVIDER:-local}
+      STORAGE_STAGING_ROOT: /var/lib/pale-orbit/staging
+      STORAGE_PUBLICATION_ROOT: /var/lib/pale-orbit/publication
+      STORAGE_COVERS_ROOT: /var/lib/pale-orbit/covers
+      STORAGE_SCRATCH_ROOT: /tmp/pale-orbit-verified
+      STORAGE_STAGING_RETENTION_HOURS: ${STORAGE_STAGING_RETENTION_HOURS:-24}
+      STORAGE_ORPHAN_RETENTION_HOURS: ${STORAGE_ORPHAN_RETENTION_HOURS:-168}
       AUTH_SECRET_FILE: /run/secrets/auth_secret
       AUTH_SESSION_EXPIRES_SECONDS: ${AUTH_SESSION_EXPIRES_SECONDS:-604800}
       AUTH_VERIFICATION_EXPIRES_SECONDS: ${AUTH_VERIFICATION_EXPIRES_SECONDS:-3600}
@@ -54,8 +57,6 @@ services:
       SMTP_PORT: ${SMTP_PORT:?SMTP_PORT must be set}
       SMTP_SECURE: ${SMTP_SECURE:?SMTP_SECURE must be set}
       SMTP_REQUIRE_TLS: ${SMTP_REQUIRE_TLS:?SMTP_REQUIRE_TLS must be set}
-      SMTP_USER: ${SMTP_USER:?SMTP_USER must be set}
-      SMTP_PASSWORD_FILE: /run/secrets/smtp_password
       SMTP_FROM: ${SMTP_FROM:?SMTP_FROM must be set}
       SMTP_CONNECTION_TIMEOUT_MS: ${SMTP_CONNECTION_TIMEOUT_MS:-5000}
       SMTP_GREETING_TIMEOUT_MS: ${SMTP_GREETING_TIMEOUT_MS:-5000}
@@ -72,9 +73,10 @@ services:
     secrets:
       - database_password
       - auth_secret
-      - smtp_password
     volumes:
-      - book_storage:/var/lib/pale-orbit/storage
+      - book_staging:/var/lib/pale-orbit/staging
+      - book_publication:/var/lib/pale-orbit/publication:ro
+      - book_covers:/var/lib/pale-orbit/covers
     depends_on:
       postgres:
         condition: service_healthy
@@ -115,12 +117,19 @@ services:
       DATABASE_HOST: postgres
       DATABASE_PORT: "5432"
       DATABASE_NAME: ${DATABASE_NAME:?DATABASE_NAME must be set}
-      DATABASE_USER: ${DATABASE_USER:?DATABASE_USER must be set}
-      DATABASE_PASSWORD_FILE: /run/secrets/database_password
+      DATABASE_WORKER_USER: ${DATABASE_WORKER_USER:?DATABASE_WORKER_USER must be set}
+      DATABASE_WORKER_PASSWORD_FILE: /run/secrets/database_worker_password
       DATABASE_POOL_MAX: "5"
       DATABASE_CONNECTION_TIMEOUT_MS: "5000"
       DATABASE_STATEMENT_TIMEOUT_MS: "30000"
       DATABASE_READINESS_TIMEOUT_MS: "2000"
+      STORAGE_PROVIDER: ${STORAGE_PROVIDER:-local}
+      STORAGE_STAGING_ROOT: /var/lib/pale-orbit/staging
+      STORAGE_PUBLICATION_ROOT: /var/lib/pale-orbit/publication
+      STORAGE_COVERS_ROOT: /var/lib/pale-orbit/covers
+      STORAGE_SCRATCH_ROOT: /tmp/pale-orbit-verified
+      STORAGE_STAGING_RETENTION_HOURS: ${STORAGE_STAGING_RETENTION_HOURS:-24}
+      STORAGE_ORPHAN_RETENTION_HOURS: ${STORAGE_ORPHAN_RETENTION_HOURS:-168}
       AUTH_SECRET_FILE: /run/secrets/auth_secret
       AUTH_SESSION_EXPIRES_SECONDS: ${AUTH_SESSION_EXPIRES_SECONDS:-604800}
       AUTH_VERIFICATION_EXPIRES_SECONDS: ${AUTH_VERIFICATION_EXPIRES_SECONDS:-3600}
@@ -146,11 +155,13 @@ services:
       JOB_RETRY_MAX_MS: "300000"
       WORKER_READY_FILE: /tmp/worker-ready
     secrets:
-      - database_password
+      - database_worker_password
       - auth_secret
       - smtp_password
     volumes:
-      - book_storage:/var/lib/pale-orbit/storage
+      - book_staging:/var/lib/pale-orbit/staging
+      - book_publication:/var/lib/pale-orbit/publication
+      - book_covers:/var/lib/pale-orbit/covers
     depends_on:
       postgres:
         condition: service_healthy
@@ -177,48 +188,51 @@ services:
     image: ${APP_IMAGE:?APP_IMAGE must be an immutable versioned image}
     command: [node, build/services/migrate.js]
     environment:
-      <<: *publication-settings
       NODE_ENV: production
-      APP_ENV: production
-      APPLICATION_MODE: maintenance
-      ORIGIN: ${ORIGIN:?ORIGIN must be set}
       DATABASE_HOST: postgres
       DATABASE_PORT: "5432"
       DATABASE_NAME: ${DATABASE_NAME:?DATABASE_NAME must be set}
-      DATABASE_USER: ${DATABASE_USER:?DATABASE_USER must be set}
-      DATABASE_PASSWORD_FILE: /run/secrets/database_password
+      DATABASE_OWNER_USER: ${DATABASE_OWNER_USER:?DATABASE_OWNER_USER must be set}
+      DATABASE_OWNER_PASSWORD_FILE: /run/secrets/database_owner_password
       DATABASE_POOL_MAX: "1"
       DATABASE_CONNECTION_TIMEOUT_MS: "5000"
       DATABASE_STATEMENT_TIMEOUT_MS: "30000"
       DATABASE_READINESS_TIMEOUT_MS: "2000"
-      AUTH_SECRET_FILE: /run/secrets/auth_secret
-      AUTH_SESSION_EXPIRES_SECONDS: ${AUTH_SESSION_EXPIRES_SECONDS:-604800}
-      AUTH_VERIFICATION_EXPIRES_SECONDS: ${AUTH_VERIFICATION_EXPIRES_SECONDS:-3600}
-      AUTH_RESET_EXPIRES_SECONDS: ${AUTH_RESET_EXPIRES_SECONDS:-3600}
-      AUTH_MAGIC_EXPIRES_SECONDS: ${AUTH_MAGIC_EXPIRES_SECONDS:-900}
-      AUTH_RATE_LIMIT_WINDOW_SECONDS: ${AUTH_RATE_LIMIT_WINDOW_SECONDS:-60}
-      AUTH_RATE_LIMIT_MAX: ${AUTH_RATE_LIMIT_MAX:-100}
-      AUTH_LOGIN_RATE_LIMIT_MAX: ${AUTH_LOGIN_RATE_LIMIT_MAX:-5}
-      AUTH_EMAIL_RATE_LIMIT_MAX: ${AUTH_EMAIL_RATE_LIMIT_MAX:-3}
-      SMTP_HOST: ${SMTP_HOST:?SMTP_HOST must be set}
-      SMTP_PORT: ${SMTP_PORT:?SMTP_PORT must be set}
-      SMTP_SECURE: ${SMTP_SECURE:?SMTP_SECURE must be set}
-      SMTP_REQUIRE_TLS: ${SMTP_REQUIRE_TLS:?SMTP_REQUIRE_TLS must be set}
-      SMTP_USER: ${SMTP_USER:?SMTP_USER must be set}
-      SMTP_PASSWORD_FILE: /run/secrets/smtp_password
-      SMTP_FROM: ${SMTP_FROM:?SMTP_FROM must be set}
-      SMTP_CONNECTION_TIMEOUT_MS: ${SMTP_CONNECTION_TIMEOUT_MS:-5000}
-      SMTP_GREETING_TIMEOUT_MS: ${SMTP_GREETING_TIMEOUT_MS:-5000}
-      SMTP_SOCKET_TIMEOUT_MS: ${SMTP_SOCKET_TIMEOUT_MS:-10000}
-      JOB_POLL_INTERVAL_MS: "1000"
-      JOB_LEASE_MS: "30000"
-      JOB_RETRY_BASE_MS: "1000"
-      JOB_RETRY_MAX_MS: "300000"
-      WORKER_READY_FILE: /tmp/worker-ready
     secrets:
+      - database_owner_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+  database-role-provision:
+    profiles: [tools]
+    image: ${APP_IMAGE:?APP_IMAGE must be an immutable versioned image}
+    command: [node, build/services/provision-database-roles.js]
+    environment:
+      NODE_ENV: production
+      APP_ENV: production
+      APPLICATION_MODE: maintenance
+      DATABASE_HOST: postgres
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: ${DATABASE_NAME:?DATABASE_NAME must be set}
+      DATABASE_OWNER_USER: ${DATABASE_OWNER_USER:?DATABASE_OWNER_USER must be set}
+      DATABASE_OWNER_PASSWORD_FILE: /run/secrets/database_owner_password
+      DATABASE_USER: ${DATABASE_USER:?DATABASE_USER must be set}
+      DATABASE_PASSWORD_FILE: /run/secrets/database_password
+      DATABASE_STORAGE_CLEANUP_USER: ${DATABASE_STORAGE_CLEANUP_USER:?DATABASE_STORAGE_CLEANUP_USER must be set}
+      DATABASE_STORAGE_CLEANUP_PASSWORD_FILE: /run/secrets/database_storage_cleanup_password
+      DATABASE_WORKER_USER: ${DATABASE_WORKER_USER:?DATABASE_WORKER_USER must be set}
+      DATABASE_WORKER_PASSWORD_FILE: /run/secrets/database_worker_password
+      DATABASE_CONNECTION_TIMEOUT_MS: "5000"
+      DATABASE_STATEMENT_TIMEOUT_MS: "30000"
+    secrets:
+      - database_owner_password
       - database_password
-      - auth_secret
-      - smtp_password
+      - database_storage_cleanup_password
+      - database_worker_password
     depends_on:
       postgres:
         condition: service_healthy
@@ -231,11 +245,7 @@ services:
     image: ${APP_IMAGE:?APP_IMAGE must be an immutable versioned image}
     command: [node, build/services/bootstrap-admin.js]
     environment:
-      <<: *publication-settings
       NODE_ENV: production
-      APP_ENV: production
-      APPLICATION_MODE: maintenance
-      ORIGIN: ${ORIGIN:?ORIGIN must be set}
       DATABASE_HOST: postgres
       DATABASE_PORT: "5432"
       DATABASE_NAME: ${DATABASE_NAME:?DATABASE_NAME must be set}
@@ -245,37 +255,11 @@ services:
       DATABASE_CONNECTION_TIMEOUT_MS: "5000"
       DATABASE_STATEMENT_TIMEOUT_MS: "30000"
       DATABASE_READINESS_TIMEOUT_MS: "2000"
-      AUTH_SECRET_FILE: /run/secrets/auth_secret
-      AUTH_SESSION_EXPIRES_SECONDS: ${AUTH_SESSION_EXPIRES_SECONDS:-604800}
-      AUTH_VERIFICATION_EXPIRES_SECONDS: ${AUTH_VERIFICATION_EXPIRES_SECONDS:-3600}
-      AUTH_RESET_EXPIRES_SECONDS: ${AUTH_RESET_EXPIRES_SECONDS:-3600}
-      AUTH_MAGIC_EXPIRES_SECONDS: ${AUTH_MAGIC_EXPIRES_SECONDS:-900}
-      AUTH_RATE_LIMIT_WINDOW_SECONDS: ${AUTH_RATE_LIMIT_WINDOW_SECONDS:-60}
-      AUTH_RATE_LIMIT_MAX: ${AUTH_RATE_LIMIT_MAX:-100}
-      AUTH_LOGIN_RATE_LIMIT_MAX: ${AUTH_LOGIN_RATE_LIMIT_MAX:-5}
-      AUTH_EMAIL_RATE_LIMIT_MAX: ${AUTH_EMAIL_RATE_LIMIT_MAX:-3}
-      SMTP_HOST: ${SMTP_HOST:?SMTP_HOST must be set}
-      SMTP_PORT: ${SMTP_PORT:?SMTP_PORT must be set}
-      SMTP_SECURE: ${SMTP_SECURE:?SMTP_SECURE must be set}
-      SMTP_REQUIRE_TLS: ${SMTP_REQUIRE_TLS:?SMTP_REQUIRE_TLS must be set}
-      SMTP_USER: ${SMTP_USER:?SMTP_USER must be set}
-      SMTP_PASSWORD_FILE: /run/secrets/smtp_password
-      SMTP_FROM: ${SMTP_FROM:?SMTP_FROM must be set}
-      SMTP_CONNECTION_TIMEOUT_MS: ${SMTP_CONNECTION_TIMEOUT_MS:-5000}
-      SMTP_GREETING_TIMEOUT_MS: ${SMTP_GREETING_TIMEOUT_MS:-5000}
-      SMTP_SOCKET_TIMEOUT_MS: ${SMTP_SOCKET_TIMEOUT_MS:-10000}
-      JOB_POLL_INTERVAL_MS: "1000"
-      JOB_LEASE_MS: "30000"
-      JOB_RETRY_BASE_MS: "1000"
-      JOB_RETRY_MAX_MS: "300000"
-      WORKER_READY_FILE: /tmp/worker-ready
       BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:?BOOTSTRAP_ADMIN_EMAIL must be set}
       BOOTSTRAP_ADMIN_NAME: ${BOOTSTRAP_ADMIN_NAME:?BOOTSTRAP_ADMIN_NAME must be set}
       BOOTSTRAP_ADMIN_PASSWORD_FILE: /run/secrets/bootstrap_admin_password
     secrets:
       - database_password
-      - auth_secret
-      - smtp_password
       - bootstrap_admin_password
     depends_on:
       postgres:
@@ -289,37 +273,47 @@ services:
     image: ${APP_IMAGE:?APP_IMAGE must be an immutable versioned image}
     command: [node, build/services/cleanup-storage.js]
     environment:
-      <<: *publication-settings
       NODE_ENV: production
       APP_ENV: production
       DATABASE_HOST: postgres
       DATABASE_PORT: "5432"
       DATABASE_NAME: ${DATABASE_NAME:?DATABASE_NAME must be set}
-      DATABASE_USER: ${DATABASE_USER:?DATABASE_USER must be set}
-      DATABASE_PASSWORD_FILE: /run/secrets/database_password
+      DATABASE_STORAGE_CLEANUP_USER: ${DATABASE_STORAGE_CLEANUP_USER:?DATABASE_STORAGE_CLEANUP_USER must be set}
+      DATABASE_STORAGE_CLEANUP_PASSWORD_FILE: /run/secrets/database_storage_cleanup_password
       DATABASE_POOL_MAX: "1"
       DATABASE_CONNECTION_TIMEOUT_MS: "5000"
       DATABASE_STATEMENT_TIMEOUT_MS: "30000"
       DATABASE_READINESS_TIMEOUT_MS: "2000"
+      STORAGE_PROVIDER: ${STORAGE_PROVIDER:-local}
+      STORAGE_STAGING_ROOT: /var/lib/pale-orbit/staging
+      STORAGE_PUBLICATION_ROOT: /var/lib/pale-orbit/publication
+      STORAGE_COVERS_ROOT: /var/lib/pale-orbit/covers
+      STORAGE_SCRATCH_ROOT: /tmp/pale-orbit-verified
+      STORAGE_STAGING_RETENTION_HOURS: ${STORAGE_STAGING_RETENTION_HOURS:-24}
+      STORAGE_ORPHAN_RETENTION_HOURS: ${STORAGE_ORPHAN_RETENTION_HOURS:-168}
     secrets:
-      - database_password
+      - database_storage_cleanup_password
     volumes:
-      - book_storage:/var/lib/pale-orbit/storage
+      - book_staging:/var/lib/pale-orbit/staging
+      - book_publication:/var/lib/pale-orbit/publication
+      - book_covers:/var/lib/pale-orbit/covers
     depends_on:
       postgres:
         condition: service_healthy
     security_opt:
       - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
     restart: "no"
 
   postgres:
     image: ${POSTGRES_IMAGE:-postgres:18.4-alpine3.24}
     environment:
       POSTGRES_DB: ${DATABASE_NAME:?DATABASE_NAME must be set}
-      POSTGRES_USER: ${DATABASE_USER:?DATABASE_USER must be set}
-      POSTGRES_PASSWORD_FILE: /run/secrets/database_password
+      POSTGRES_USER: ${DATABASE_OWNER_USER:?DATABASE_OWNER_USER must be set}
+      POSTGRES_PASSWORD_FILE: /run/secrets/database_owner_password
     secrets:
-      - database_password
+      - database_owner_password
     volumes:
       - postgres_data:/var/lib/postgresql
     restart: unless-stopped
@@ -367,8 +361,14 @@ services:
           memory: ${CADDY_MEMORY_LIMIT:-256M}
 
 secrets:
+  database_owner_password:
+    environment: DATABASE_OWNER_PASSWORD
   database_password:
     environment: DATABASE_PASSWORD
+  database_worker_password:
+    environment: DATABASE_WORKER_PASSWORD
+  database_storage_cleanup_password:
+    environment: DATABASE_STORAGE_CLEANUP_PASSWORD
   auth_secret:
     environment: AUTH_SECRET
   smtp_password:
@@ -382,6 +382,8 @@ networks:
 
 volumes:
   postgres_data:
-  book_storage:
+  book_staging:
+  book_publication:
+  book_covers:
   caddy_data:
   caddy_config:

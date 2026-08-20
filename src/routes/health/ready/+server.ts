@@ -15,7 +15,7 @@ export const GET: RequestHandler = async () => {
   try {
     await Promise.all([
       probeDatabase(databaseClient.pool, config.database.readinessTimeoutMs),
-      probeStorage(getObjectStorage())
+      probeStorage(getObjectStorage(), 'web')
     ]);
     return json({ status: 'ready' }, { headers });
   } catch {

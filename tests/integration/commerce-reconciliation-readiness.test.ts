@@ -22,7 +22,12 @@ import type {
   PaymentSnapshot,
   RefundSnapshot
 } from '$lib/server/commerce/stripe/types';
-import { applicationConfig, databaseClient } from './database';
+import {
+  applicationConfig,
+  databaseClient,
+  ownerDatabaseClient,
+  workerDatabaseClient
+} from './database';
 
 const paidAt = new Date('2026-08-10T12:05:00.000Z');
 const checkoutExpiresAt = new Date('2026-08-10T12:30:00.000Z');
@@ -53,13 +58,13 @@ async function createReadinessFixture(): Promise<ReadinessFixture> {
   const disputeId = `dp_readiness_${suffix}`;
   const email = `readiness-${suffix}@example.com`;
 
-  await databaseClient.db.insert(user).values({
+  await ownerDatabaseClient.db.insert(user).values({
     id: userId,
     name: 'Readiness reader',
     email,
     emailVerified: true
   });
-  await databaseClient.db.insert(titles).values({
+  await ownerDatabaseClient.db.insert(titles).values({
     id: titleId,
     slug: `readiness-${suffix}`,
     title: 'Private readiness fixture',
@@ -70,7 +75,7 @@ async function createReadinessFixture(): Promise<ReadinessFixture> {
     currency: 'USD',
     visibility: 'private'
   });
-  await databaseClient.db.insert(orders).values({
+  await ownerDatabaseClient.db.insert(orders).values({
     id: orderId,
     status: 'checkout_open',
     initiatingUserId: userId,
@@ -85,7 +90,7 @@ async function createReadinessFixture(): Promise<ReadinessFixture> {
     statusTokenSha256: 'b'.repeat(64),
     checkoutExpiresAt
   });
-  await databaseClient.db.insert(orderItems).values({
+  await ownerDatabaseClient.db.insert(orderItems).values({
     id: itemId,
     orderId,
     titleId,
@@ -95,7 +100,7 @@ async function createReadinessFixture(): Promise<ReadinessFixture> {
     currency: 'USD',
     unitSubtotalMinor: 1299
   });
-  const [checkoutEvent, refundEvent, disputeEvent] = await databaseClient.db
+  const [checkoutEvent, refundEvent, disputeEvent] = await ownerDatabaseClient.db
     .insert(stripeEvents)
     .values([
       {
@@ -203,7 +208,7 @@ async function createReadinessFixture(): Promise<ReadinessFixture> {
 }
 
 async function fulfillCheckout(fixture: ReadinessFixture): Promise<void> {
-  await fulfillCheckoutEvent(databaseClient.db, {
+  await fulfillCheckoutEvent(workerDatabaseClient.db, {
     stripeEventId: fixture.checkoutEventId,
     session: fixture.checkout,
     payment: fixture.payment
@@ -222,7 +227,7 @@ describe('out-of-order commerce reconciliation readiness', () => {
       metadataOrderId: randomUUID()
     };
 
-    await expect(fulfillRefundEvent(databaseClient.db, {
+    await expect(fulfillRefundEvent(workerDatabaseClient.db, {
       stripeEventId: fixture.refundEventId,
       refund: { ...fixture.refund, paymentIntentId: foreignPayment.paymentIntentId },
       payment: foreignPayment
@@ -243,7 +248,7 @@ describe('out-of-order commerce reconciliation readiness', () => {
       payment: fixture.payment
     };
 
-    await expect(fulfillRefundEvent(databaseClient.db, command, {
+    await expect(fulfillRefundEvent(workerDatabaseClient.db, command, {
       messages,
       now: () => new Date('2026-08-10T12:08:00.000Z')
     })).rejects.toMatchObject({ code: 'LOCAL_COMMERCE_NOT_READY' });
@@ -252,7 +257,7 @@ describe('out-of-order commerce reconciliation readiness', () => {
     expect(await databaseClient.db.select().from(refunds)).toHaveLength(0);
 
     await fulfillCheckout(fixture);
-    await fulfillRefundEvent(databaseClient.db, command, {
+    await fulfillRefundEvent(workerDatabaseClient.db, command, {
       messages,
       now: () => new Date('2026-08-10T12:09:00.000Z')
     });
@@ -271,7 +276,7 @@ describe('out-of-order commerce reconciliation readiness', () => {
       payment: fixture.payment
     };
 
-    await expect(fulfillDisputeEvent(databaseClient.db, command, {
+    await expect(fulfillDisputeEvent(workerDatabaseClient.db, command, {
       messages,
       now: () => new Date('2026-08-10T12:08:00.000Z')
     })).rejects.toMatchObject({ code: 'LOCAL_COMMERCE_NOT_READY' });
@@ -280,7 +285,7 @@ describe('out-of-order commerce reconciliation readiness', () => {
     expect(await databaseClient.db.select().from(disputes)).toHaveLength(0);
 
     await fulfillCheckout(fixture);
-    await fulfillDisputeEvent(databaseClient.db, command, {
+    await fulfillDisputeEvent(workerDatabaseClient.db, command, {
       messages,
       now: () => new Date('2026-08-10T12:09:00.000Z')
     });

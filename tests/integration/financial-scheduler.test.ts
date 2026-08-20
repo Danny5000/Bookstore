@@ -29,7 +29,11 @@ import {
 } from '$lib/server/db/schema';
 import { createPostgresJobRepository } from '$lib/server/jobs/repository';
 import { runWorker } from '$lib/server/jobs/runner';
-import { applicationConfig, databaseClient } from './database';
+import {
+  applicationConfig,
+  ownerDatabaseClient,
+  workerDatabaseClient as databaseClient
+} from './database';
 
 const dialect = new PgDialect();
 
@@ -142,12 +146,12 @@ it('converges two real worker polling loops without retaining a database lease',
 
 it('commits a bounded source page and its continuation atomically', async () => {
   const suffix = randomUUID();
-  const [order] = await databaseClient.db.insert(orders).values({
+  const [order] = await ownerDatabaseClient.db.insert(orders).values({
     status: 'checkout_open', currency: 'USD', subtotalMinor: 1000,
     clientCheckoutAttemptId: randomUUID(), quoteFingerprintSha256: 'a'.repeat(64),
     statusTokenSha256: 'b'.repeat(64)
   }).returning();
-  const [payment] = await databaseClient.db.insert(payments).values({
+  const [payment] = await ownerDatabaseClient.db.insert(payments).values({
     orderId: order!.id, stripePaymentIntentId: `pi_scan_${suffix}`,
     stripeLatestChargeId: `ch_scan_${suffix}`, status: 'succeeded', amountMinor: 1000,
     currency: 'USD', paidAt: new Date('2026-08-12T18:00:00.000Z'),
@@ -408,12 +412,12 @@ it('scans pending and retryable exceptions but excludes durable exception-impact
     '00000000-0000-4000-8000-000000000403',
     '00000000-0000-4000-8000-000000000404'
   ];
-  await databaseClient.db.insert(orders).values(orderIds.map((id, index) => ({
+  await ownerDatabaseClient.db.insert(orders).values(orderIds.map((id, index) => ({
     id, status: 'checkout_open' as const, currency: 'USD', subtotalMinor: 1000,
     clientCheckoutAttemptId: `00000000-0000-4000-8000-0000000005${String(index + 1).padStart(2, '0')}`,
     quoteFingerprintSha256: 'a'.repeat(64), statusTokenSha256: 'b'.repeat(64)
   })));
-  await databaseClient.db.insert(payments).values(paymentIds.map((id, index) => ({
+  await ownerDatabaseClient.db.insert(payments).values(paymentIds.map((id, index) => ({
     id, orderId: orderIds[index]!, stripePaymentIntentId: `pi_scan_issue_${index}`,
     stripeLatestChargeId: `ch_scan_issue_${index}`, status: 'succeeded' as const,
     amountMinor: 1000, currency: 'USD', paidAt: now, paymentMethodCategory: 'card' as const,
@@ -709,14 +713,14 @@ it('serializes route publication with finalization before discovering and rearmi
     status: 'succeeded', attempts: 1, completedAt: new Date()
   }).where(eq(jobs.type, 'commerce.financial-classification'));
 
+  const [order] = await ownerDatabaseClient.db.insert(orders).values({
+    status: 'checkout_open', currency: 'USD', subtotalMinor: 100,
+    clientCheckoutAttemptId: randomUUID(), quoteFingerprintSha256: 'a'.repeat(64),
+    statusTokenSha256: 'b'.repeat(64)
+  }).returning();
   const beforeAuthorityRead = deferred<void>();
   const releasePublisher = deferred<void>();
   const publisher = databaseClient.db.transaction(async (tx) => {
-    const [order] = await tx.insert(orders).values({
-      status: 'checkout_open', currency: 'USD', subtotalMinor: 100,
-      clientCheckoutAttemptId: randomUUID(), quoteFingerprintSha256: 'a'.repeat(64),
-      statusTokenSha256: 'b'.repeat(64)
-    }).returning();
     const [payment] = await tx.insert(payments).values({
       orderId: order!.id, stripePaymentIntentId: `pi_route_enrollment_${suffix}`,
       stripeLatestChargeId: providerChargeId, status: 'succeeded', amountMinor: 100,
@@ -802,19 +806,19 @@ it('refreshes the retry budget when material route evidence rearms pending work'
     sourceFingerprintSha256: balance!.fingerprintSha256,
     classifierVersion: 1, allocationAlgorithmVersion: 1
   });
-  const [insertedSubject] = await databaseClient.db.insert(jobs).values({
+  const [insertedSubject] = await ownerDatabaseClient.db.insert(jobs).values({
     type: subject.type, payload: subject.payload as JsonObject,
     deduplicationKey: subject.deduplicationKey, maxAttempts: subject.maxAttempts,
     status: 'pending', attempts: subject.maxAttempts - 1,
     lastError: 'transient failure before route publication',
     runAt: new Date('2100-01-01T00:00:00.000Z')
   }).returning();
-  const [order] = await databaseClient.db.insert(orders).values({
+  const [order] = await ownerDatabaseClient.db.insert(orders).values({
     status: 'checkout_open', currency: 'USD', subtotalMinor: 100,
     clientCheckoutAttemptId: randomUUID(), quoteFingerprintSha256: 'a'.repeat(64),
     statusTokenSha256: 'b'.repeat(64)
   }).returning();
-  const [payment] = await databaseClient.db.insert(payments).values({
+  const [payment] = await ownerDatabaseClient.db.insert(payments).values({
     orderId: order!.id, stripePaymentIntentId: `pi_retry_budget_${suffix}`,
     stripeLatestChargeId: providerChargeId, status: 'succeeded', amountMinor: 100,
     currency: 'USD', paymentMethodCategory: 'card', paidAt: new Date()
@@ -854,7 +858,7 @@ it('rejects a linked child with a null target field before activation', async ()
     correlationId: 'scan-null-child-root', signal
   });
   const [sealed] = await databaseClient.db.select().from(financialScanRuns);
-  await databaseClient.db.insert(jobs).values({
+  await ownerDatabaseClient.db.insert(jobs).values({
     type: 'commerce.financial-classification',
     payload: {
       subjectType: 'balance_transaction', subjectId: randomUUID(),
@@ -991,7 +995,7 @@ it('rearms a running permanent subject job after replay-run adoption', async () 
     sourceFingerprintSha256: balance!.fingerprintSha256,
     classifierVersion: 2, allocationAlgorithmVersion: 2
   });
-  await databaseClient.db.insert(jobs).values({
+  await ownerDatabaseClient.db.insert(jobs).values({
     type: ordinary.type, payload: ordinary.payload as JsonObject,
     deduplicationKey: ordinary.deduplicationKey, maxAttempts: ordinary.maxAttempts
   });
@@ -1069,7 +1073,7 @@ it('lets an exact pending target finish before keyset adoption links it', async 
     sourceFingerprintSha256: balance!.fingerprintSha256,
     classifierVersion: 2, allocationAlgorithmVersion: 2
   });
-  await databaseClient.db.insert(jobs).values({
+  await ownerDatabaseClient.db.insert(jobs).values({
     type: ordinary.type, payload: ordinary.payload as JsonObject,
     deduplicationKey: ordinary.deduplicationKey, maxAttempts: ordinary.maxAttempts
   });
@@ -1147,12 +1151,12 @@ it('lets an active-version worker enroll new evidence into a newer pending repla
 
 it('rediscovers a pending source next hour after its prior generation exhausts', async () => {
   const now = new Date('2026-08-12T21:00:00.000Z');
-  const [order] = await databaseClient.db.insert(orders).values({
+  const [order] = await ownerDatabaseClient.db.insert(orders).values({
     status: 'checkout_open', currency: 'USD', subtotalMinor: 1000,
     clientCheckoutAttemptId: randomUUID(), quoteFingerprintSha256: 'a'.repeat(64),
     statusTokenSha256: 'b'.repeat(64)
   }).returning();
-  const [payment] = await databaseClient.db.insert(payments).values({
+  const [payment] = await ownerDatabaseClient.db.insert(payments).values({
     orderId: order!.id, stripePaymentIntentId: 'pi_scan_exhausted',
     stripeLatestChargeId: 'ch_scan_exhausted', status: 'succeeded', amountMinor: 1000,
     currency: 'USD', paidAt: now, paymentMethodCategory: 'card',

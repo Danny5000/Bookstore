@@ -1,5 +1,5 @@
 import { timingSafeEqual } from 'node:crypto';
-import { asc, eq } from 'drizzle-orm';
+import { asc, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import type { Actor } from '$lib/server/auth/admin-policy';
 import { normalizeEmailAddress } from '$lib/server/auth/identity';
 import { appendAuditEvent as defaultAppendAuditEvent } from '$lib/server/audit/service';
@@ -56,6 +56,26 @@ export interface AcceptedOrder {
   reused: boolean;
 }
 
+export interface AcceptedOrderInsertValues {
+  initiatingUserId: string | null;
+  purchaseEmail: string | null;
+  currency: string;
+  subtotalMinor: number;
+  clientCheckoutAttemptId: string;
+  quoteFingerprintSha256: string;
+  statusTokenSha256: string;
+}
+
+export interface AcceptedOrderItemInsertValues {
+  orderId: string;
+  titleId: string;
+  titleSnapshot: string;
+  creatorNameSnapshot: string;
+  format: OrderItemRow['format'];
+  currency: string;
+  unitSubtotalMinor: number;
+}
+
 export interface AcceptedOrderDependencies {
   appendAuditEvent(
     database: DatabaseExecutor,
@@ -66,6 +86,83 @@ export interface AcceptedOrderDependencies {
 const defaultDependencies: AcceptedOrderDependencies = {
   appendAuditEvent: defaultAppendAuditEvent
 };
+
+export function acceptedOrderInsertQuery(values: AcceptedOrderInsertValues): SQL {
+  return sql`
+    insert into "public"."orders" (
+      "initiating_user_id", "purchase_email", "currency", "subtotal_minor",
+      "client_checkout_attempt_id", "quote_fingerprint_sha256", "status_token_sha256"
+    ) values (
+      ${values.initiatingUserId}::uuid,
+      ${values.purchaseEmail}::text,
+      ${values.currency}::text,
+      ${values.subtotalMinor}::integer,
+      ${values.clientCheckoutAttemptId}::uuid,
+      ${values.quoteFingerprintSha256}::text,
+      ${values.statusTokenSha256}::text
+    )
+    returning "id"
+  `;
+}
+
+export function acceptedOrderItemsInsertQuery(
+  values: readonly AcceptedOrderItemInsertValues[]
+): SQL {
+  if (values.length === 0) throw new Error('Accepted order item insert requires at least one row');
+  const tuples = values.map((item) => sql`(
+    ${item.orderId}::uuid,
+    ${item.titleId}::uuid,
+    ${item.titleSnapshot}::text,
+    ${item.creatorNameSnapshot}::text,
+    ${item.format}::"public"."title_format",
+    ${item.currency}::text,
+    ${item.unitSubtotalMinor}::integer
+  )`);
+  return sql`
+    insert into "public"."order_items" (
+      "order_id", "title_id", "title_snapshot", "creator_name_snapshot",
+      "format", "currency", "unit_subtotal_minor"
+    ) values ${sql.join(tuples, sql`, `)}
+    returning "id"
+  `;
+}
+
+export async function insertAcceptedOrder(
+  database: DatabaseExecutor,
+  values: AcceptedOrderInsertValues
+): Promise<OrderRow | undefined> {
+  const insertedResult = await database.execute<{ id: string }>(
+    acceptedOrderInsertQuery(values)
+  );
+  const insertedId = insertedResult.rows[0]?.id;
+  if (!insertedId) return undefined;
+  const [order] = await database
+    .select()
+    .from(orders)
+    .where(eq(orders.id, insertedId));
+  return order;
+}
+
+export async function insertAcceptedOrderItems(
+  database: DatabaseExecutor,
+  values: readonly AcceptedOrderItemInsertValues[]
+): Promise<OrderItemRow[]> {
+  const insertedResult = await database.execute<{ id: string }>(
+    acceptedOrderItemsInsertQuery(values)
+  );
+  const insertedIds = insertedResult.rows.map((row) => row.id);
+  if (insertedIds.length === 0) return [];
+  const selected = await database
+    .select()
+    .from(orderItems)
+    .where(inArray(orderItems.id, insertedIds));
+  const byId = new Map(selected.map((item) => [item.id, item]));
+  const hydrated = insertedIds.map((id) => byId.get(id));
+  if (hydrated.some((item) => item === undefined)) {
+    throw new Error('Inserted order items could not be loaded');
+  }
+  return hydrated as OrderItemRow[];
+}
 
 function rawCompare(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
@@ -244,44 +341,25 @@ export async function createAcceptedOrder(
         input.applicationSecret,
         validated.checkoutAttemptId
       );
-      const [order] = await transaction
-        .insert(orders)
-        .values({
-          status: 'checkout_pending',
+      const order = await insertAcceptedOrder(transaction, {
           initiatingUserId: input.actor.type === 'user' ? input.actor.id : null,
-          guestIdentityId: null,
           purchaseEmail,
           currency: quote.currency.toUpperCase(),
           subtotalMinor: quote.subtotalMinor,
-          taxMinor: null,
-          totalMinor: null,
           clientCheckoutAttemptId: validated.checkoutAttemptId,
           quoteFingerprintSha256: quote.fingerprint,
-          stripeCheckoutSessionId: null,
-          statusTokenSha256: credential.digestSha256,
-          checkoutExpiresAt: null,
-          paidAt: null,
-          createdAt: now,
-          updatedAt: now
-        })
-        .returning();
+          statusTokenSha256: credential.digestSha256
+        });
       if (!order) throw new PermanentCommerceError();
-      const items = await transaction
-        .insert(orderItems)
-        .values(quote.items.map((item) => ({
+      const items = await insertAcceptedOrderItems(transaction, quote.items.map((item) => ({
           orderId: order.id,
           titleId: item.titleId,
           titleSnapshot: item.title,
           creatorNameSnapshot: item.creatorName,
           format: item.format,
           currency: item.currency.toUpperCase(),
-          unitSubtotalMinor: item.unitSubtotalMinor,
-          taxMinor: null,
-          totalMinor: null,
-          stripeLineItemId: null,
-          createdAt: now
-        })))
-        .returning();
+          unitSubtotalMinor: item.unitSubtotalMinor
+        })));
       if (items.length !== quote.items.length) throw new PermanentCommerceError();
 
       await dependencies.appendAuditEvent(transaction, {

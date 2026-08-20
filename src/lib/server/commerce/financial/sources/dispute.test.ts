@@ -658,7 +658,13 @@ describe('versioned locked dispute projection replay', () => {
     expect(rolledBack).toBe(true);
   });
 
-  it('rolls back and returns a durable exception when allocation construction throws', async () => {
+  it.each([
+    { label: 'overexposed withdrawal', disputeAmountMinor: 101, balanceAmountMinor: -101 },
+    { label: 'same-currency principal mismatch', disputeAmountMinor: 100,
+      balanceAmountMinor: -90 }
+  ])('rolls back and returns a durable exception for $label during replay', async ({
+    disputeAmountMinor, balanceAmountMinor
+  }) => {
     const fingerprint = 'a'.repeat(64);
     const actual = await vi.importActual<typeof import('../allocations/dispute')>(
       '../allocations/dispute'
@@ -669,7 +675,8 @@ describe('versioned locked dispute projection replay', () => {
     const execute = vi.fn()
       .mockResolvedValueOnce({ rows: [{
         id: balanceId, providerId: 'txn_dispute', sourceId: 'dp_dispute_trace',
-        amountMinor: -101, feeMinor: 0, netMinor: -101, currency: 'USD',
+        amountMinor: balanceAmountMinor, feeMinor: 0, netMinor: balanceAmountMinor,
+        currency: 'USD',
         fingerprintSha256: fingerprint, providerCreatedAt: createdAt,
         classification: 'dispute_withdrawal'
       }] })
@@ -687,7 +694,8 @@ describe('versioned locked dispute projection replay', () => {
     });
     const baseFacts = lockedFacts();
     const facts = { ...baseFacts, payment: { id: paymentId, orderId },
-      disputes: baseFacts.disputes.map((dispute) => ({ ...dispute, amountMinor: 101 })) } as never;
+      disputes: baseFacts.disputes.map((dispute) => ({ ...dispute, amountMinor:
+        disputeAmountMinor })) } as never;
 
     await expect(recomputeLockedDisputeFinancialProjectionForVersion(tx, {
       orderId, paymentId, balanceTransactionIds: [balanceId], purchaseFacts: facts,
@@ -1875,7 +1883,13 @@ describe('reconcileDisputeFinancialSource', () => {
     );
   });
 
-  it('rolls back an overexposed withdrawal and records one durable allocation exception', async () => {
+  it.each([
+    { label: 'overexposed withdrawal', disputeAmountMinor: 101, balanceAmountMinor: -101 },
+    { label: 'same-currency principal mismatch', disputeAmountMinor: 100,
+      balanceAmountMinor: -90 }
+  ])('rolls back $label and records one durable allocation exception', async ({
+    label, disputeAmountMinor, balanceAmountMinor
+  }) => {
     const provider = oneTransactionGateway();
     vi.mocked(provider.retrieveDispute).mockResolvedValue({
       providerDisputeId: 'dp_dispute_trace',
@@ -1883,7 +1897,7 @@ describe('reconcileDisputeFinancialSource', () => {
       chargeId: 'ch_dispute_trace',
       liveMode: false,
       state: 'won',
-      amountMinor: 101,
+      amountMinor: disputeAmountMinor,
       currency: 'usd',
       reason: null,
       providerCreatedAt: createdAt,
@@ -1896,9 +1910,9 @@ describe('reconcileDisputeFinancialSource', () => {
       sourceFamily: 'dispute',
       rawType: 'adjustment',
       reportingCategory: 'dispute',
-      amountMinor: -101,
+      amountMinor: balanceAmountMinor,
       feeMinor: 0,
-      netMinor: -101,
+      netMinor: balanceAmountMinor,
       currency: 'USD',
       status: 'available',
       balanceType: 'payments',
@@ -1942,9 +1956,9 @@ describe('reconcileDisputeFinancialSource', () => {
               id: balanceId,
               providerId: 'txn_withdrawal_overexposed',
               sourceId: 'dp_dispute_trace',
-              amountMinor: -101,
+              amountMinor: balanceAmountMinor,
               feeMinor: 0,
-              netMinor: -101,
+              netMinor: balanceAmountMinor,
               currency: 'USD',
               fingerprintSha256: 'e'.repeat(64),
               providerCreatedAt: createdAt
@@ -1967,7 +1981,7 @@ describe('reconcileDisputeFinancialSource', () => {
       disputes: [
         {
           ...lockedFacts().disputes[0],
-          amountMinor: 101
+          amountMinor: disputeAmountMinor
         }
       ]
     } as never);
@@ -1988,7 +2002,7 @@ describe('reconcileDisputeFinancialSource', () => {
         provider,
         {
           disputeId,
-          correlationId: 'dispute-overexposed'
+          correlationId: `dispute-${label.replaceAll(' ', '-')}`
         },
         new AbortController().signal
       )

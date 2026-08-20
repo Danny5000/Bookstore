@@ -2,7 +2,7 @@ import { eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import { jobs, outboxMessages } from '$lib/server/db/schema';
 import { AUTH_EMAIL_TOPIC, queueAuthEmail } from '$lib/server/email/enqueue';
-import { databaseClient } from './database';
+import { databaseClient, ownerDatabaseClient } from './database';
 
 describe('auth email queue', () => {
   it('atomically creates a versioned outbox message and dispatch job', async () => {
@@ -14,7 +14,7 @@ describe('auth email queue', () => {
       expiresInSeconds: 601
     });
 
-    const [message] = await databaseClient.db
+    const [message] = await ownerDatabaseClient.db
       .select()
       .from(outboxMessages)
       .where(eq(outboxMessages.topic, AUTH_EMAIL_TOPIC));

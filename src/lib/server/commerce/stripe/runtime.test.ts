@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import { CheckoutUnavailableError, PermanentCommerceError } from '$lib/server/commerce/errors';
 import { createFixtureStripeGateway } from './fixture-gateway';
-import { createStripeCommerceRuntime, type StripeRuntimeConfig } from './runtime';
+import {
+  createStripeCommerceRuntime,
+  createStripeWorkerRuntime,
+  type StripeRuntimeConfig
+} from './runtime';
 
 function config(overrides: Partial<StripeRuntimeConfig['stripe']> = {}): StripeRuntimeConfig {
   return {
@@ -90,6 +94,42 @@ describe('Stripe commerce runtime selection', () => {
       expectedLiveMode: false,
       webhookToleranceSeconds: 300
     });
+  });
+
+  it('selects the Stripe worker SDK with API retrieval authority and no webhook secret', () => {
+    const sdkGateway = createFixtureStripeGateway().gateway;
+    const sdkFactory = vi.fn(() => sdkGateway);
+    const runtime = createStripeWorkerRuntime({
+      environment: 'production',
+      stripe: {
+        enabled: true,
+        testFixtureMode: false,
+        liveMode: false,
+        secretKey: 'sk_test_worker_runtime_only'
+      }
+    }, { sdkFactory, fixtureFactory: vi.fn() });
+
+    expect(runtime).toEqual({
+      mode: 'stripe',
+      webhooksConfigured: false,
+      gateway: sdkGateway
+    });
+    expect(sdkFactory).toHaveBeenCalledWith({
+      secretKey: 'sk_test_worker_runtime_only',
+      expectedLiveMode: false
+    });
+    expect(JSON.stringify(sdkFactory.mock.calls)).not.toContain('webhook');
+  });
+
+  it.each([
+    { enabled: true, testFixtureMode: false, liveMode: false, secretKey: undefined },
+    { enabled: true, testFixtureMode: false, liveMode: false, secretKey: 'sk_live_wrong_mode' },
+    { enabled: true, testFixtureMode: true, liveMode: false, secretKey: 'sk_test_impossible' }
+  ])('fails closed for an invalid worker provider configuration', (stripe) => {
+    expect(() => createStripeWorkerRuntime({ environment: 'production', stripe }, {
+      sdkFactory: vi.fn(),
+      fixtureFactory: vi.fn()
+    })).toThrow(PermanentCommerceError);
   });
 
   it.each([

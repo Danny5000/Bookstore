@@ -981,13 +981,17 @@ async function recomputeLockedDisputeFinancialProjectionForVersionInSavepoint(
         .reduce((sum, row) => sum + row.subtotalMinor + row.taxMinor, 0);
     const presentmentCurrency = effectKind === 'fee_credit'
       ? balance.currency : sourceDispute.currency;
+    const hasPriorWithdrawal = priorEffects.some((row) =>
+      row.disputeId === sourceDispute.id && row.effect === 'withdrawal');
     const presentmentAmountMinor = effectKind === 'fee_credit'
       ? Math.abs(balance.amountMinor)
-      : balance.currency === sourceDispute.currency
-        ? Math.abs(balance.amountMinor)
-        : effectKind === 'reinstatement'
-          ? (exactOutstandingPresentment ?? 0)
-          : sourceDispute.amountMinor;
+      : effectKind === 'withdrawal'
+        ? !hasPriorWithdrawal || balance.currency !== sourceDispute.currency
+          ? sourceDispute.amountMinor
+          : Math.abs(balance.amountMinor)
+        : balance.currency === sourceDispute.currency
+          ? Math.abs(balance.amountMinor)
+          : (exactOutstandingPresentment ?? 0);
     const bundle = buildDisputeAllocationPlan({
       sourceKind: 'dispute', sourceId: sourceDispute.id, disputeId: sourceDispute.id,
       balanceTransactionId: balance.id, providerTransactionId: balance.providerId,
@@ -1538,14 +1542,18 @@ export async function reconcileDisputeFinancialSource(
                     .reduce((sum, row) => sum + row.subtotalMinor + row.taxMinor, 0);
             const presentmentCurrency =
               effectKind === 'fee_credit' ? balance.currency : sourceDispute.currency;
+            const hasPriorWithdrawal = priorEffects.some((row) =>
+              row.disputeId === sourceDispute.id && row.effect === 'withdrawal');
             const presentmentAmountMinor =
               effectKind === 'fee_credit'
                 ? Math.abs(balance.amountMinor)
-                : balance.currency === sourceDispute.currency
-                  ? Math.abs(balance.amountMinor)
-                  : effectKind === 'reinstatement'
-                    ? (exactOutstandingPresentment ?? 0)
-                    : sourceDispute.amountMinor;
+                : effectKind === 'withdrawal'
+                  ? !hasPriorWithdrawal || balance.currency !== sourceDispute.currency
+                    ? sourceDispute.amountMinor
+                    : Math.abs(balance.amountMinor)
+                  : balance.currency === sourceDispute.currency
+                    ? Math.abs(balance.amountMinor)
+                    : (exactOutstandingPresentment ?? 0);
             const bundle = buildDisputeAllocationPlan({
               sourceKind: 'dispute',
               sourceId: sourceDispute.id,

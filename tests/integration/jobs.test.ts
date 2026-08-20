@@ -4,7 +4,7 @@ import { financialProjectionVersions, financialScanRuns, jobs } from '$lib/serve
 import { enqueueJob, createPostgresJobRepository } from '$lib/server/jobs/repository';
 import { processFinancialScanJob } from '$lib/server/commerce/financial/scans/service';
 import type { StripeCommerceGateway } from '$lib/server/commerce/stripe/types';
-import { applicationConfig, databaseClient } from './database';
+import { applicationConfig, workerDatabaseClient as databaseClient } from './database';
 
 describe('PostgreSQL jobs', () => {
   it('deduplicates enqueue by key', async () => {

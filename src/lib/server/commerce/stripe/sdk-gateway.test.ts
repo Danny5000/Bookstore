@@ -1,7 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { Readable } from 'node:stream';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { PermanentCommerceError, RetryableProviderError } from '$lib/server/commerce/errors';
+import {
+  CheckoutUnavailableError,
+  PermanentCommerceError,
+  RetryableProviderError
+} from '$lib/server/commerce/errors';
 import { checkoutInputFixture, FIXTURE_ORDER_ITEM_ID } from '../../../../../tests/fixtures/stripe/checkout';
 import { STRIPE_API_VERSION } from './types';
 
@@ -30,7 +34,7 @@ const sdk = vi.hoisted(() => {
 
 vi.mock('stripe', () => ({ default: sdk.Stripe }));
 
-import { createStripeSdkGateway } from './sdk-gateway';
+import { createStripeSdkGateway, createStripeSdkWorkerGateway } from './sdk-gateway';
 
 const options = {
   secretKey: 'sk_test_unit_test_only',
@@ -430,6 +434,39 @@ describe('Stripe SDK gateway', () => {
       .not.toContain('private');
     expect(JSON.stringify(await gateway.retrieveDispute('dp_test_fixture_101')))
       .not.toContain('private@example.com');
+  });
+
+  it('constructs a retrieval-only worker gateway without webhook or checkout authority', async () => {
+    sdk.client.charges.retrieve.mockResolvedValue({
+      id: 'ch_test_worker_gateway',
+      payment_intent: { id: 'pi_test_worker_gateway' },
+      livemode: false,
+      amount: 1403,
+      amount_refunded: 0,
+      currency: 'usd',
+      status: 'succeeded',
+      balance_transaction: 'txn_test_worker_gateway',
+      created: 1_786_362_060
+    });
+    const gateway = createStripeSdkWorkerGateway({
+      secretKey: 'sk_test_worker_gateway_only',
+      expectedLiveMode: false
+    });
+
+    expect(sdk.Stripe).toHaveBeenCalledWith('sk_test_worker_gateway_only', expect.objectContaining({
+      telemetry: false
+    }));
+    await expect(gateway.retrieveCharge('ch_test_worker_gateway')).resolves.toMatchObject({
+      id: 'ch_test_worker_gateway',
+      paymentIntentId: 'pi_test_worker_gateway',
+      balanceTransactionId: 'txn_test_worker_gateway'
+    });
+    await expect(gateway.createCheckoutSession(checkoutInputFixture()))
+      .rejects.toBeInstanceOf(CheckoutUnavailableError);
+    expect(() => gateway.verifyWebhook(new Uint8Array(), 'signature'))
+      .toThrow(CheckoutUnavailableError);
+    expect(sdk.client.checkout.sessions.create).not.toHaveBeenCalled();
+    expect(sdk.client.webhooks.constructEvent).not.toHaveBeenCalled();
   });
 
   it('preserves the exact balance-transaction exchange-rate token through one bounded raw request', async () => {

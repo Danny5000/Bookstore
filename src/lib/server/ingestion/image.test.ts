@@ -52,7 +52,7 @@ describe('image normalization', () => {
   function destinationKey() {
     destinationSequence += 1;
     return parseStorageKey(
-      `titles/018f0000-0000-7000-8000-000000000010/revisions/018f0000-0000-7000-8000-000000000011/derived/v1/prose-images/018f0000-0000-7000-8000-${destinationSequence.toString().padStart(12, '0')}.webp`
+      `titles/018f0000-0000-7000-8000-000000000010/revisions/018f0000-0000-7000-8000-000000000011/derived/v1/generations/0/prose-images/018f0000-0000-7000-8000-${destinationSequence.toString().padStart(12, '0')}.webp`
     );
   }
 

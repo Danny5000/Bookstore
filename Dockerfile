@@ -27,7 +27,14 @@ COPY --from=build --chown=node:node /app/build ./build
 COPY --from=build --chown=node:node /app/drizzle ./drizzle
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/package.json ./package.json
-RUN mkdir -p /var/lib/pale-orbit/storage && chown node:node /var/lib/pale-orbit/storage
+RUN mkdir -p \
+      /var/lib/pale-orbit/staging \
+      /var/lib/pale-orbit/publication \
+      /var/lib/pale-orbit/covers \
+    && chown node:node \
+      /var/lib/pale-orbit/staging \
+      /var/lib/pale-orbit/publication \
+      /var/lib/pale-orbit/covers
 USER node
 EXPOSE 3000
 CMD ["node", "build"]

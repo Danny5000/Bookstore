@@ -16,6 +16,7 @@ import type { IngestionLimits } from './limits';
 
 const titleId = '018f0000-0000-7000-8000-000000000010';
 const revisionId = '018f0000-0000-7000-8000-000000000011';
+const generation = 3;
 const limits: IngestionLimits = Object.freeze({
   maxUploadBytes: 10_000_000,
   maxExpandedBytes: 20_000_000,
@@ -75,7 +76,7 @@ describe('EPUB ingestion', () => {
       `018f0000-0000-7000-8000-${uploadSequence.toString().padStart(12, '0')}`
     );
     await storage.write(sourceKey, Readable.from([bytes]), { maxBytes: limits.maxUploadBytes });
-    return ingestEpub({ storage, sourceKey, titleId, revisionId, limits, signal });
+    return ingestEpub({ storage, sourceKey, titleId, revisionId, generation, limits, signal });
   }
 
   it('returns a deterministic complete prose manifest in spine order', async () => {
@@ -116,6 +117,7 @@ describe('EPUB ingestion', () => {
       height: 1
     });
     expect(result.images[0]?.semanticFingerprintSha256).toMatch(/^[0-9a-f]{64}$/u);
+    expect(result.images[0]?.storageKey).toContain('/derived/v1/generations/3/prose-images/');
     expect(
       result.sections.flatMap((section) => section.blocks).every(
         (block) =>
@@ -130,6 +132,8 @@ describe('EPUB ingestion', () => {
       width: 1,
       height: 1
     });
+    expect(result.coverSuggestion?.storageKey)
+      .toContain('/derived/v1/generations/3/cover-suggestions/');
     expect(result.warnings).toEqual([]);
   });
 

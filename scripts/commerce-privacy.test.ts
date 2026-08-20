@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { readFile } from 'node:fs/promises';
 import { assertCommercePrivacy } from '../tests/e2e/commerce-privacy';
 
 describe('commerce privacy evidence helper', () => {
@@ -74,5 +75,18 @@ describe('commerce privacy evidence helper', () => {
     expect(failure).toBe('Sensitive commerce data detected on account response');
     expect(failure).not.toContain('client_secret');
     expect(failure).not.toContain(privateValue);
+  });
+
+  it('keeps customer identity and token fields out of financial purchase-lock queries', async () => {
+    const [rebase, payment, refund] = await Promise.all([
+      readFile(new URL('../src/lib/server/commerce/financial/rebase.ts', import.meta.url), 'utf8'),
+      readFile(new URL('../src/lib/server/commerce/financial/sources/payment.ts', import.meta.url), 'utf8'),
+      readFile(new URL('../src/lib/server/commerce/financial/sources/refund.ts', import.meta.url), 'utf8')
+    ]);
+    const forbidden = /guest_identity_id|purchase_email|status_token_sha256/u;
+
+    expect(rebase.match(/select id, status,[\s\S]*?from orders where id =/u)?.[0]).not.toMatch(forbidden);
+    expect(payment).not.toMatch(/\.select\(\)\.from\(orders\)/u);
+    expect(refund).not.toMatch(/\.select\(\)\.from\(orders\)/u);
   });
 });

@@ -2,7 +2,10 @@ import { and, eq, sql, type SQL } from 'drizzle-orm';
 import { appendAuditEvent } from '$lib/server/audit/service';
 import { PermanentCommerceError, RetryableProviderError } from '$lib/server/commerce/errors';
 import { lockOrder } from '$lib/server/commerce/lock';
-import { lockPaymentPurchaseFacts } from '$lib/server/commerce/reconciliation';
+import {
+  lockPaymentPurchaseFacts,
+  type PaymentPurchaseOrderRow
+} from '$lib/server/commerce/reconciliation';
 import { lockCanonicalPaymentPurchaseFacts } from './payment';
 import {
   parseBalanceTransactionSnapshot,
@@ -292,7 +295,14 @@ export async function recordLocalFinancialSourceIssue(
   return database.transaction(async (transaction) => {
     throwIfFinancialSourceAborted(signal);
     await lockOrder(transaction, routing.orderId);
-    const [order] = await transaction.select().from(orders)
+    const orderSelection = {
+      id: orders.id,
+      status: orders.status,
+      currency: orders.currency,
+      totalMinor: orders.totalMinor,
+      paidAt: orders.paidAt
+    } satisfies Record<keyof PaymentPurchaseOrderRow, unknown>;
+    const [order] = await transaction.select(orderSelection).from(orders)
       .where(eq(orders.id, routing.orderId)).limit(1).for('update');
     const [payment] = await transaction.select().from(payments).where(and(
       eq(payments.id, routing.paymentId), eq(payments.orderId, routing.orderId)
@@ -804,6 +814,10 @@ function assertRefundBalanceLinkage(
   } else if (sourceCurrency !== balance.currency) {
     throw new PermanentFinancialError('currency_mismatch');
   }
+  if (!hasExchangeEvidence && kind === 'primary' &&
+    balance.amountMinor !== -refund.amountMinor) {
+    throw new PermanentFinancialError('immutable_mismatch');
+  }
 }
 
 async function loadRefundRouting(database: Database, refundId: string): Promise<RefundRouting> {
@@ -1119,6 +1133,9 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
         if (!primary) throw new RefundProjectionIssue('missing_source', 'pending');
         if (failure && primary.currency !== failure.currency) {
           throw new PermanentFinancialError('currency_mismatch');
+        }
+        if (primary.currency === input.currency && primary.amountMinor !== -input.amountMinor) {
+          throw new PermanentFinancialError('immutable_mismatch');
         }
 
         const primaryFeeDetails = await loadFeeDetails(

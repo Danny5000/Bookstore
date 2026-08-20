@@ -3,9 +3,12 @@ import { drizzle } from 'drizzle-orm/node-postgres';
 import * as schema from '$lib/server/db/schema';
 import { setPreservedGrantState } from '$lib/server/commerce/grants';
 import type { Database } from '$lib/server/db/client';
+import { databaseEnvironmentForRole } from '$lib/server/db/database-role-provision';
+import { assertIsolatedTestDatabaseEnvironment } from '../../scripts/test-environment';
 
 export interface E2EDatabase {
   readonly db: Database;
+  readonly workerDb: Database;
   grantEntitlement(email: string, titleId: string): Promise<void>;
   revokeEntitlement(email: string, titleId: string): Promise<void>;
   close(): Promise<void>;
@@ -13,9 +16,9 @@ export interface E2EDatabase {
 
 const loopbackHosts = new Set(['127.0.0.1', 'localhost', '::1']);
 
-function configuredClient(): Client {
-  const host = process.env.DATABASE_HOST ?? '127.0.0.1';
-  const database = process.env.DATABASE_NAME ?? 'pale_orbit_test';
+function configuredClient(source: NodeJS.ProcessEnv): Client {
+  const host = source.DATABASE_HOST ?? '127.0.0.1';
+  const database = source.DATABASE_NAME ?? 'pale_orbit_test';
   if (!loopbackHosts.has(host) || !/(?:^|_)test(?:$|_)/u.test(database)) {
     throw new Error(
       `E2E database helpers refuse host=${host} database=${database}; expected a loopback test database`
@@ -23,17 +26,26 @@ function configuredClient(): Client {
   }
   return new Client({
     host,
-    port: Number(process.env.DATABASE_PORT ?? '5432'),
+    port: Number(source.DATABASE_PORT ?? '5432'),
     database,
-    user: process.env.DATABASE_USER ?? 'pale_orbit_test',
-    password: process.env.DATABASE_PASSWORD ?? 'pale_orbit_test_only'
+    user: source.DATABASE_USER ?? 'pale_orbit_test',
+    password: source.DATABASE_PASSWORD ?? 'pale_orbit_test_only'
   });
 }
 
 export async function openE2EDatabase(): Promise<E2EDatabase> {
-  const client = configuredClient();
+  assertIsolatedTestDatabaseEnvironment(process.env);
+  const client = configuredClient(process.env);
+  const workerClient = configuredClient(databaseEnvironmentForRole(process.env, 'worker'));
   await client.connect();
+  try {
+    await workerClient.connect();
+  } catch (error) {
+    await client.end();
+    throw error;
+  }
   const database = drizzle({ client, schema });
+  const workerDatabase = drizzle({ client: workerClient, schema });
 
   async function userId(email: string): Promise<string> {
     const result = await client.query<{ id: string }>(
@@ -47,9 +59,10 @@ export async function openE2EDatabase(): Promise<E2EDatabase> {
 
   return {
     db: database,
+    workerDb: workerDatabase,
     async grantEntitlement(email, titleId) {
       const id = await userId(email);
-      await database.transaction((transaction) =>
+      await workerDatabase.transaction((transaction) =>
         setPreservedGrantState(transaction, {
           userId: id,
           titleId,
@@ -60,7 +73,7 @@ export async function openE2EDatabase(): Promise<E2EDatabase> {
     },
     async revokeEntitlement(email, titleId) {
       const id = await userId(email);
-      await database.transaction((transaction) =>
+      await workerDatabase.transaction((transaction) =>
         setPreservedGrantState(transaction, {
           userId: id,
           titleId,
@@ -70,7 +83,7 @@ export async function openE2EDatabase(): Promise<E2EDatabase> {
       );
     },
     async close() {
-      await client.end();
+      await Promise.all([client.end(), workerClient.end()]);
     }
   };
 }

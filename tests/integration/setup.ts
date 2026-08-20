@@ -1,9 +1,14 @@
 import { sql } from 'drizzle-orm';
 import { afterAll, beforeEach } from 'vitest';
-import { databaseClient } from './database';
+import {
+  databaseClient,
+  ownerDatabaseClient,
+  storageCleanupDatabaseClient,
+  workerDatabaseClient
+} from './database';
 
 beforeEach(async () => {
-  await databaseClient.db.execute(sql`
+  await ownerDatabaseClient.db.execute(sql`
     truncate table
       refund_allocation_finalization_effects,
       refund_reporting_correction_items, refund_reporting_correction_sets,
@@ -24,21 +29,26 @@ beforeEach(async () => {
       comic_panel_regions, revision_presentations, prose_blocks, prose_images,
       prose_sections, comic_pages, revision_cover_suggestions,
       revision_ingestion_warnings,
-      audit_events, outbox_messages, jobs, title_revisions, titles,
+      audit_events, commerce_claim_issuances, outbox_messages, jobs, title_revisions, titles,
       guest_identities, user_roles, verification, account, session, rate_limit, "user"
     restart identity cascade
   `);
-  await databaseClient.db.execute(sql`
+  await ownerDatabaseClient.db.execute(sql`
     insert into financial_projection_versions
       (singleton, classifier_version, allocation_algorithm_version, activation_correlation_id)
     values (true, 1, 1, 'integration-reset-c1-a1')
   `);
-  await databaseClient.db.execute(sql`
+  await ownerDatabaseClient.db.execute(sql`
     insert into financial_payout_discovery_state (singleton, covered_through)
     values (true, null)
   `);
 });
 
 afterAll(async () => {
-  await databaseClient.close();
+  await Promise.all([
+    databaseClient.close(),
+    ownerDatabaseClient.close(),
+    workerDatabaseClient.close(),
+    storageCleanupDatabaseClient.close()
+  ]);
 });

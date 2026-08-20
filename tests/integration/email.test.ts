@@ -9,7 +9,7 @@ import { createNodemailerEmailTransport } from '$lib/server/email/nodemailer';
 import type { EmailTransport } from '$lib/server/email/types';
 import { createPostgresJobRepository } from '$lib/server/jobs/repository';
 import { createOutboxDispatchHandler } from '$lib/server/outbox/dispatcher';
-import { databaseClient } from './database';
+import { databaseClient, ownerDatabaseClient, workerDatabaseClient } from './database';
 
 const config = loadApplicationConfig(process.env);
 
@@ -51,13 +51,13 @@ describe('SMTP outbox delivery', () => {
     });
 
     const repository = createPostgresJobRepository(
-      databaseClient.db,
+      workerDatabaseClient.db,
       config.jobs,
       () => new Date(Date.now() + 1_000)
     );
     const transport = createNodemailerEmailTransport(config.smtp);
     const dispatch = createOutboxDispatchHandler(
-      databaseClient.db,
+      workerDatabaseClient.db,
       new Map([
         [
           AUTH_EMAIL_TOPIC,
@@ -82,7 +82,8 @@ describe('SMTP outbox delivery', () => {
       expect(message).toContain('expires in 11 minutes');
       expect(message).toContain(actionUrl);
       expect(
-        await databaseClient.db.select().from(outboxMessages).where(eq(outboxMessages.status, 'delivered'))
+        await ownerDatabaseClient.db.select().from(outboxMessages)
+          .where(eq(outboxMessages.status, 'delivered'))
       ).toHaveLength(1);
 
       await dispatch(job, controller.signal);
@@ -105,7 +106,7 @@ describe('SMTP outbox delivery', () => {
       }
     };
     const failingDispatch = createOutboxDispatchHandler(
-      databaseClient.db,
+      workerDatabaseClient.db,
       new Map([
         [
           AUTH_EMAIL_TOPIC,
@@ -114,7 +115,7 @@ describe('SMTP outbox delivery', () => {
       ])
     );
     const failingRepository = createPostgresJobRepository(
-      databaseClient.db,
+      workerDatabaseClient.db,
       config.jobs,
       () => new Date(Date.now() + 1_000)
     );
@@ -132,7 +133,7 @@ describe('SMTP outbox delivery', () => {
       .select()
       .from(jobs)
       .where(eq(jobs.id, failedJob.id));
-    const [storedMessage] = await databaseClient.db
+    const [storedMessage] = await ownerDatabaseClient.db
       .select()
       .from(outboxMessages)
       .where(eq(outboxMessages.dispatchJobId, failedJob.id));

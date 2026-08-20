@@ -1,7 +1,18 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { Readable } from 'node:stream';
-import { healthProbeKey } from './keys';
+import {
+  healthProbeKey,
+  publicationReadinessSentinelKey,
+  publicationReadinessSentinelValue,
+  revisionCoverSuggestionKey,
+  titleCoverKey,
+  type StorageKey
+} from './keys';
 import type { ObjectStorage } from './types';
+
+export type StorageProbeCapability = 'web' | 'writer';
+
+const publicationSentinelBytes = Buffer.from(publicationReadinessSentinelValue, 'utf8');
 
 async function readProbe(stream: Readable): Promise<Buffer> {
   const chunks: Buffer[] = [];
@@ -15,8 +26,7 @@ async function readProbe(stream: Readable): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
-export async function probeStorage(storage: ObjectStorage): Promise<void> {
-  const key = healthProbeKey(randomUUID());
+async function roundTripProbe(storage: ObjectStorage, key: StorageKey): Promise<void> {
   const expected = randomBytes(32);
 
   try {
@@ -26,4 +36,39 @@ export async function probeStorage(storage: ObjectStorage): Promise<void> {
   } finally {
     await storage.delete(key);
   }
+}
+
+async function verifyProbe(
+  storage: ObjectStorage,
+  key: StorageKey,
+  expected: Buffer
+): Promise<void> {
+  const received = await readProbe(await storage.read(key));
+  if (!received.equals(expected)) throw new Error('Storage readiness probe failed');
+}
+
+export async function probeStorage(
+  storage: ObjectStorage,
+  capability: StorageProbeCapability
+): Promise<void> {
+  const probeId = randomUUID();
+  await roundTripProbe(storage, healthProbeKey(probeId));
+
+  const publicationSentinelKey = publicationReadinessSentinelKey();
+  if (capability === 'writer') {
+    await storage.write(
+      publicationSentinelKey,
+      Readable.from([publicationSentinelBytes]),
+      {
+        maxBytes: publicationSentinelBytes.byteLength,
+        expectedBytes: publicationSentinelBytes.byteLength
+      }
+    );
+  }
+  await verifyProbe(storage, publicationSentinelKey, publicationSentinelBytes);
+
+  const publicationKey = revisionCoverSuggestionKey(probeId, probeId, 0, probeId);
+  if (capability === 'writer') await roundTripProbe(storage, publicationKey);
+
+  await roundTripProbe(storage, titleCoverKey(probeId, probeId));
 }
