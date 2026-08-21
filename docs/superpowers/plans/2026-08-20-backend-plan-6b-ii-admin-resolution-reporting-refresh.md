@@ -4,7 +4,7 @@
 
 **Goal:** Deliver the administrator-only Sales, reconciliation-resolution, payout, and bounded CSV experience while preserving the hardened web/worker database-authority split introduced after Plan 6B-I.
 
-**Architecture:** The web process performs authorized reads and submits strict durable `financial_admin_commands` through owner-owned bounded routines; it never receives financial write authority. The existing worker reauthorizes the submitting administrator under the role-management lock and executes each command through the canonical TypeScript financial, projection, grant, entitlement, audit, and outbox services. Safe detail and export reads stay synchronous and commit their audit through narrow typed routines only after the complete DTO or CSV bytes exist.
+**Architecture:** The web process performs authorized reads and submits strict durable `financial_admin_commands` through owner-owned bounded routines; it never receives financial write authority. The existing worker reauthorizes the submitting administrator under the role-management lock and executes each command through the canonical TypeScript financial, projection, grant, entitlement, audit, and outbox services. A private owner-only claim row and a per-generation 256-bit opaque capability prevent stale/crashed/cross-session worker generations from exercising a financial-admin job after expiry or takeover; this is task-specific lease proof under a trusted worker credential, not Byzantine-worker resistance. Safe detail and export reads stay synchronous and commit their audit through narrow typed routines only after the complete DTO or CSV bytes exist.
 
 **Tech Stack:** Node.js 26.7.x, npm 11.19.x, SvelteKit 2.70.x, Svelte 5.56.x, TypeScript 6.0.x, PostgreSQL 18.4, Drizzle ORM 0.45.2 and Drizzle Kit 0.31.10, Stripe Node 22.5.x pinned to API version `2026-07-29.dahlia`, Zod 4.4.x, Vitest 4.1.x, and Playwright 1.62.x.
 
@@ -34,7 +34,7 @@ Plan 6B-II owns:
 5. Shared refund drafts, one-way allocation finalization, append-only reporting corrections, and narrowly proven administrative recovery.
 6. Unit, PostgreSQL, browser, migration, role, restore, smoke, checkpoint, privacy, and final independent-review evidence.
 
-Plan 6B-II does not activate production or live Stripe; initiate provider refunds/disputes; expose generic job/outbox/provider retry or requeue controls; add generic issue resolution; purge/retain administrator commands; schedule/encrypt/ship off-host backups; add monitoring/alerts; tune pools/capacity; add CI/CD; or broaden web/owner credentials. Production remains maintenance-mode and Stripe-disabled; those launch and operability concerns remain Plan 7.
+Plan 6B-II does not activate production or live Stripe; initiate provider refunds/disputes; expose generic job/outbox/provider retry or requeue controls; add generic issue resolution; purge/retain administrator commands; schedule/encrypt/ship off-host backups; add monitoring/alerts; tune pools/capacity; add CI/CD; or broaden web/owner credentials. Its private capability protects only financial-admin jobs from stale/crashed/cross-session generations under a trusted worker credential; it does not claim malicious/Byzantine worker resistance or redesign generic job authority. Production remains maintenance-mode and Stripe-disabled; those launch and operability concerns remain Plan 7.
 
 ## Execution and evidence discipline
 
@@ -99,8 +99,9 @@ Existing worker financial actions remain unchanged. No action named `financial.i
 
 ### Authority and transport
 
-- `src/lib/server/db/schema/financial-admin.ts` owns the command enums/table only.
-- `drizzle/0012_plan6bii_admin_command_authority.sql` owns the table, deferred job relationship, routines, triggers, routine provenance, and exact grants/revokes.
+- `src/lib/server/db/schema/financial-admin.ts` owns the command enums/table and the private `financial_admin_job_claims` table; no second claim schema file is created.
+- `drizzle/0012_plan6bii_admin_command_authority.sql` owns both tables, the deferred command/job relationship, private claim lifecycle, routines, triggers, routine provenance, and exact grants/revokes.
+- `src/lib/server/jobs/types.ts`, `src/lib/server/jobs/runner.ts`, and `src/lib/server/jobs/repository.ts` carry and consume the opaque capability only inside the worker process; no route-facing type contains it.
 - `src/lib/server/commerce/financial/admin-commands/contracts.ts` owns strict private command parsing and safe result parsing.
 - `src/lib/server/commerce/financial/admin-commands/repository.ts` is the only TypeScript wrapper around submit/status and terminal-state database operations.
 - `src/lib/server/commerce/financial/admin-commands/handler.ts` owns job parsing, execution-time reauthorization, terminal classification, and replay behavior.
@@ -405,7 +406,7 @@ git diff --cached --check
 git commit -m "feat: add Plan 6B-II reporting contracts"
 ```
 
-### Task 3: Add the protected administrator-command schema and authority migration
+### Task 3: Add the protected administrator-command schema, lease capability, and authority migration
 
 **Files:**
 - Create: `src/lib/server/db/schema/financial-admin.ts`
@@ -423,6 +424,9 @@ git commit -m "feat: add Plan 6B-II reporting contracts"
 - Modify: `tests/integration/database-role-boundaries.test.ts`
 - Modify: `src/lib/server/jobs/repository.ts`
 - Modify: `src/lib/server/jobs/repository.test.ts`
+- Modify: `src/lib/server/jobs/types.ts`
+- Modify: `src/lib/server/jobs/runner.ts`
+- Modify: `src/lib/server/jobs/runner.test.ts`
 - Modify: `src/lib/server/commerce/claims.ts`
 - Modify: `src/lib/server/commerce/claims.test.ts`
 - Modify: `src/lib/server/outbox/repository.ts`
@@ -478,17 +482,92 @@ export const financialAdminCommands = pgTable('financial_admin_commands', {
     table.status, table.createdAt, table.id
   )
 ]);
+
+export const financialAdminJobClaims = pgTable('financial_admin_job_claims', {
+  jobId: uuid('job_id').primaryKey().references(() => jobs.id, {
+    onUpdate: 'restrict',
+    onDelete: 'restrict'
+  }),
+  generation: integer('generation').notNull(),
+  attempt: integer('attempt').notNull(),
+  capabilitySha256: text('capability_sha256').notNull(),
+  leaseDurationMs: integer('lease_duration_ms').notNull(),
+  state: varchar('state', { length: 16 }).notNull(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  issuedAt: timestamp('issued_at', { withTimezone: true }).notNull(),
+  renewedAt: timestamp('renewed_at', { withTimezone: true }),
+  invalidatedAt: timestamp('invalidated_at', { withTimezone: true })
+}, (table) => [
+  check('financial_admin_job_claims_generation_positive',
+    sql`(${table.generation} between 1 and 2147483647) is true`),
+  check('financial_admin_job_claims_attempt_positive',
+    sql`(${table.attempt} between 1 and 2147483647) is true`),
+  check('financial_admin_job_claims_capability_sha256_valid',
+    sql`(${table.capabilitySha256} ~ '^[a-f0-9]{64}$') is true`),
+  check('financial_admin_job_claims_lease_duration_bounded',
+    sql`(${table.leaseDurationMs} between 1 and 86400000) is true`),
+  check('financial_admin_job_claims_lifecycle_consistent', sql`(
+    (${table.state} = 'active' and ${table.invalidatedAt} is null and
+      (${table.renewedAt} is null or ${table.renewedAt} >= ${table.issuedAt}) and
+      ${table.expiresAt} > coalesce(${table.renewedAt}, ${table.issuedAt}))
+    or
+    (${table.state} = 'invalidated' and ${table.invalidatedAt} is not null and
+      (${table.renewedAt} is null or ${table.renewedAt} >= ${table.issuedAt}) and
+      ${table.invalidatedAt} >= coalesce(${table.renewedAt}, ${table.issuedAt}))
+  ) is true`)
+]);
 ```
 
-Static tests must require SHA-256 lowercase hex, bounded canonical correlation IDs, JSON object input/result with `pg_column_size(private_input) <= 8192` and `pg_column_size(safe_result) <= 4096`, immutable identity/input/job fields, terminal immutability, no delete path, and a deferred restrictive `job_id -> jobs.id` foreign key. The lifecycle constraint is exact: pending means code/result/completion are null; succeeded means a kind-matched success code, exact safe-result object, and completion are present; denied/conflict/failed mean their fixed failure code and completion are present while result is null.
+Add `integer` and `text` imports and import `jobs` from the existing operations schema; keep this private table in `financial-admin.ts`. Static tests must require SHA-256 lowercase hex, bounded canonical correlation IDs, JSON object input/result with `pg_column_size(private_input) <= 8192` and `pg_column_size(safe_result) <= 4096`, immutable identity/input/job fields, terminal immutability, no delete path, and a deferred restrictive `job_id -> jobs.id` foreign key. The command lifecycle constraint is exact: pending means code/result/completion are null; succeeded means a kind-matched success code, exact safe-result object, and completion are present; denied/conflict/failed mean their fixed failure code and completion are present while result is null. All SQL JSON/key/type/lifecycle predicates are total and NULL-safe: required keys are explicitly present, extra keys are absent, JSON `null` is rejected, guarded casts use `pg_input_is_valid`, and the complete accepted predicate must be `IS TRUE` so SQL UNKNOWN cannot satisfy a `CHECK`. Every JSON version later stored or compared to a PostgreSQL `integer` is `1..2147483647`, not merely a JavaScript safe integer.
+
+The claim relation has exactly the columns and checks above, one row per financial-admin job, no clear-token column, and no application ACL. `generation` increases on every initial claim/retry/takeover rotation; `attempt` equals the linked job attempt. `active` has no invalidation timestamp and an expiry later than issue/latest renewal; only a terminal job produces `invalidated`, which is irreversible. A retryable failure or rerun keeps the row nonterminal but expires it at database time so the next claim must rotate it.
 
 In the same RED, require an `EnqueuedJobReference` seam that inserts/replays a job but returns only the job ID and, only where a caller must compare it, deterministic deduplication identity. Runtime-capable claim-request, outbox-dispatch, commerce-email, ingestion-submission, and Stripe-webhook call sites must use this seam without selecting `jobs.payload`; worker-owned flows that need a parsed full job row may retain the full-row helper.
+
+Require this internal runner plumbing without changing any browser/public DTO:
+
+```ts
+export interface JobRecord {
+  id: string;
+  type: string;
+  payload: JsonObject;
+  deduplicationKey: string | null;
+  attempts: number;
+  maxAttempts: number;
+  lockedBy: string;
+  financialAdminLeaseCapability?: string;
+}
+
+export interface JobRepository {
+  claimNext(workerId: string): Promise<JobRecord | null>;
+  renewLease(
+    jobId: string,
+    workerId: string,
+    financialAdminLeaseCapability?: string
+  ): Promise<boolean>;
+  complete(
+    jobId: string,
+    workerId: string,
+    financialAdminLeaseCapability?: string
+  ): Promise<boolean>;
+  fail(
+    jobId: string,
+    workerId: string,
+    safeError: string,
+    retryable: boolean,
+    financialAdminLeaseCapability?: string
+  ): Promise<boolean>;
+}
+```
+
+`runner.test.ts` must prove the runner passes the exact opaque value from the claimed record to renewal, completion, permanent failure, transient retry, exhausted failure, and ambiguous-completion fallback; it must also prove missing/stale lease responses abort without another terminal write and that no log/error contains the token. Existing nonfinancial records omit the optional field and retain their current behavior.
 
 - [ ] **Step 2: Write failing migration rollback and collision fixtures**
 
 Extend `financial-migration.test.ts` with isolated `through(11) -> 0012` fixtures for:
 
-- an unsafe pre-existing enum, table, routine, or trigger name;
+- an unsafe pre-existing enum, either table, routine, or trigger name, including `financial_admin_job_claims`, `plan6bii_assert_financial_admin_job_lease(uuid)`, `plan6bii_guard_financial_admin_job_lease()`, or `jobs_plan6bii_financial_admin_lease_guard`;
+- unsafe prerequisite owner/direct ACL/default ACL/fixed-group membership, a disabled or displaced prerequisite job/audit/issue trigger, and a non-origin `session_replication_role`;
 - malformed legacy command-like data is impossible because the table is new;
 - a clean populated 0011 database migrates through 0012;
 - failure leaves journal at 0011 and creates no partial enum/table/routine/trigger/ACL;
@@ -499,10 +578,10 @@ Expected migration errors are SQLSTATE `42501` for authority/collision preflight
 - [ ] **Step 3: Run the focused tests and confirm RED**
 
 ```powershell
-npx vitest run src/lib/server/db/schema/financial-admin.test.ts src/lib/server/db/database-role-provision.test.ts scripts/database-role-deployment.test.ts scripts/financial-schema-preservation.test.ts src/lib/server/jobs/repository.test.ts src/lib/server/commerce/claims.test.ts src/lib/server/outbox/repository.test.ts src/lib/server/commerce/email/enqueue.test.ts src/lib/server/ingestion/job.test.ts src/lib/server/commerce/webhooks.test.ts
+npx vitest run src/lib/server/db/schema/financial-admin.test.ts src/lib/server/db/database-role-provision.test.ts scripts/database-role-deployment.test.ts scripts/financial-schema-preservation.test.ts src/lib/server/jobs/repository.test.ts src/lib/server/jobs/runner.test.ts src/lib/server/commerce/claims.test.ts src/lib/server/outbox/repository.test.ts src/lib/server/commerce/email/enqueue.test.ts src/lib/server/ingestion/job.test.ts src/lib/server/commerce/webhooks.test.ts
 ```
 
-Expected: FAIL because the schema, 0012 journal entry, functions, triggers, and privilege contracts do not exist.
+Expected: FAIL because the private claim schema, 0012 journal entry, capability-aware repository/runner, functions, triggers, and privilege contracts do not exist.
 
 - [ ] **Step 4: Implement the schema and generate the migration metadata**
 
@@ -514,7 +593,22 @@ Expected: Drizzle creates index `12`, one SQL file, and `drizzle/meta/0012_snaps
 
 - [ ] **Step 5: Add absolute-first preflight and complete bounded SQL routines**
 
-Before any persistent 0012 statement, fail closed on a conflicting enum/table/routine/trigger or unexpected owner/ACL. Then add these exact signatures:
+Before any persistent or conditionally persistent 0012 statement, run one absolute preflight and fail with `42501` on any mismatch. It must prove: the current role is the exact database owner; `session_replication_role = 'origin'`; both new type names, both new table names, every new function signature, and every new trigger name are wholly absent; every prerequisite relation/function/type has the exact owner; the prerequisite database/schema/table/column/function ACLs are exact; and the runtime, financial-worker, and storage-cleanup groups plus configured logins have their exact login flags and direct memberships with no unexpected member/admin option.
+
+Do not blanket-reject the canonical owner default ACLs established by migration 0009. Normalize `pg_default_acl` through `aclexplode` and require exactly these tuples, with database owner as both default-ACL owner and grantor and every grant non-grantable:
+
+```text
+public / table: DATABASE_OWNER -> INSERT, SELECT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER, MAINTAIN
+public / table: pale_orbit_runtime -> SELECT
+public / sequence: DATABASE_OWNER -> USAGE, SELECT, UPDATE
+public / sequence: pale_orbit_runtime -> USAGE, SELECT, UPDATE
+global / routine: DATABASE_OWNER -> EXECUTE
+global / routine: PUBLIC -> no tuple
+```
+
+Reject a missing or extra default-ACL row/privilege, another grantee, namespace/object-type drift, grant option, owner drift, or grantor drift. No default ACL may name the worker, storage-cleanup group/login, configured application logins, or another role. Also prove `jobs_plan6b_web_insert_guard -> plan6b_guard_job_insert()`, `audit_events_plan6b_web_insert_guard -> plan6b_guard_audit_insert()`, and `financial_reconciliation_issues_narrow_update -> plan6b_validate_issue_transition()` exist on the exact relations, are enabled in origin mode, and have the expected owner-controlled functions. Do not create an object, revoke a default, repair a trigger, or otherwise mutate state before this entire check passes.
+
+Then add these exact public callable signatures, unchanged by the private claim design:
 
 ```sql
 public.submit_financial_admin_command(uuid,text,text,text,text,jsonb)
@@ -527,22 +621,45 @@ public.resolve_financial_issue_after_admin_command(uuid,uuid)
 public.transition_administrative_recovery_grant_after_admin_command(uuid)
 ```
 
-Every routine is database-owner owned, `SECURITY DEFINER`, uses `SET search_path = pg_catalog`, fully qualifies every application relation/type, rejects `PUBLIC`, and validates the fixed caller group before any read or write. Submit/status/the four fixed-action read-audit routines are executable only by `pale_orbit_runtime`. Issue and administrative-grant transitions are executable only by `pale_orbit_financial_worker`. Neither application login receives direct function grants; it inherits through its fixed group.
+Also create these private owner helpers and exact job trigger; they are not a ninth callable application boundary:
+
+```sql
+public.plan6bii_assert_financial_admin_job_lease(uuid)
+public.plan6bii_guard_financial_admin_job_lease()
+
+CREATE TRIGGER jobs_plan6bii_financial_admin_lease_guard
+BEFORE UPDATE ON public.jobs
+FOR EACH ROW EXECUTE FUNCTION public.plan6bii_guard_financial_admin_job_lease();
+```
+
+Both helpers are database-owner owned, `SECURITY DEFINER`, use `SET search_path = pg_catalog`, fully qualify every application object, and have all function privileges revoked from `PUBLIC`, both application groups/logins, and storage cleanup. `plan6bii_assert_financial_admin_job_lease(job_id)` reads only the transaction-local `pale_orbit.plan6bii_financial_admin_job_capability`, requires the exact 43-character unpadded base64url grammar, hashes it with `encode(sha256(convert_to(token, 'UTF8')), 'hex')`, and accepts only a matching owner-private row whose generation/attempt/state, linked job type/status/attempt, and `expires_at > clock_timestamp()` are current. A missing, malformed, forged, cross-job, expired, prior-generation, prior-attempt, or invalidated capability raises `55000` with one constant safe message.
+
+Because the canonical table default grants runtime `SELECT`, immediately after creating the two protected tables—and before any subsequent callable routine or trigger can expose them—execute explicit `REVOKE ALL ON TABLE public.financial_admin_commands, public.financial_admin_job_claims FROM PUBLIC, pale_orbit_runtime, pale_orbit_financial_worker, pale_orbit_storage_cleanup`. After each private helper is created, explicitly `REVOKE ALL ON FUNCTION` for its exact signature from those same four principals. Prove configured application logins have no direct ACL, then grant back only the command-table worker SELECT/column UPDATE and the eight callable routine EXECUTE privileges listed in Step 7. The claim table and two private functions finish owner-only; do not rely on a default-ACL assumption for their final authority.
+
+`plan6bii_guard_financial_admin_job_lease()` applies only to `commerce.financial-admin-command` jobs and uses PostgreSQL `clock_timestamp()` as the sole lease clock. On `pending -> running` or an expired `running -> running` takeover, it acquires/reenters the exclusive per-job advisory transaction lock and requires the transaction-local capability plus canonical integer `pale_orbit.plan6bii_financial_admin_job_lease_duration_ms`, then inserts or rotates the private row: `generation = old + 1` (or `1`), `attempt = NEW.attempts`, new digest, bounded lease duration, `state = 'active'`, new issue/expiry, and null renewal/invalidation. On a same-generation heartbeat it acquires/reenters the shared advisory lock plus the current unexpired capability, preserves generation/attempt/digest/duration, and advances only `renewed_at`/`expires_at`. On a retryable failure or rerun to `pending`, it requires the current capability and expires the active claim at database time without marking it terminal. On `succeeded|failed`, it acquires/reenters the exclusive advisory lock and requires the current capability, then atomically sets `state = 'invalidated'`/`invalidated_at`; invalidated rows cannot rotate or renew. It rejects direct or structurally inconsistent job transitions before the existing terminal-sync trigger runs.
+
+For one lock namespace, use `hashtextextended('pale-orbit:plan6bii-financial-admin-job-lease:' || job_id::text, 0)`. Claim/takeover/complete/fail lock and revalidate the job row first and then acquire its exclusive transaction lock; heartbeat locks/revalidates the job row and then acquires its shared transaction lock. Every command-handler transaction uses exactly `set transaction-local token -> administrator-role advisory lock -> shared per-job lease advisory lock -> bounded command identity/status row lock -> terminal replay handling`. Only when that bounded row remains pending does the handler take the actor identity from that row, reload the actor's current roles, require the fixed capabilities, and then load private input or enter domain work. Heartbeat takes no command lock, and no command-holding path waits for a job row or lease lock. The public eight routines remain the only application-callable SQL surface.
+
+Every callable routine is database-owner owned, `SECURITY DEFINER`, uses `SET search_path = pg_catalog`, fully qualifies every application relation/type, rejects `PUBLIC`, and validates the fixed caller group before any read or write. Submit/status/the four fixed-action read-audit routines are executable only by `pale_orbit_runtime`. Issue and administrative-grant transitions are executable only by `pale_orbit_financial_worker`. Neither application login receives direct function grants; it inherits through its fixed group.
 
 `submit_financial_admin_command` must:
 
-1. validate exact actor UUID, canonical correlation text, kind, two lowercase SHA-256 values, and per-kind exact JSON keys/types/ranges;
+1. validate exact actor UUID, canonical correlation text, kind, two lowercase SHA-256 values, and per-kind exact JSON keys/types/ranges with total NULL-safe predicates: require `jsonb_typeof(input) IS NOT DISTINCT FROM 'object'`, explicit required-key presence, exact key subtraction/equality, non-JSON-null typed values, guarded casts, and a final `... IS TRUE`; bound every database version to `1..2147483647`;
 2. independently acquire `pg_advisory_xact_lock(hashtext('pale-orbit:user-roles:admin'))`, then prove the actor currently has `admin` in `user_roles` (the lock is reentrant when TypeScript already holds it);
 3. insert or recover one row by `(actor_user_id, idempotency_key_sha256)`;
 4. reject the same identity with a different kind, fingerprint, or input;
 5. precompute the job UUID, insert the command first, then insert exactly one `commerce.financial-admin-command` job whose payload is `{"commandId": <uuid>}`, dedupe is `commerce:financial-admin-command:<uuid>:v1`, and `max_attempts = 8`; and
 6. return only command ID, kind, actual safe status, and created timestamp, because an identical replay may recover a terminal command.
 
+The command table's input/result/lifecycle checks follow the same total-Boolean rule. PostgreSQL `CHECK` treats UNKNOWN as accepted, so no required JSON key, `jsonb_typeof`, UUID/hash test, numeric range, kind/result pairing, or timestamp relation may be left nullable. Tests insert missing keys and explicit JSON `null` at every required position and prove each is rejected without a row/job/audit side effect.
+
 Replace `plan6b_guard_job_insert()` with its complete previous definition plus one exact command-job branch. That branch must load the uncommitted command row, require `command.job_id = NEW.id`, exact payload/dedupe/defaults/max-attempts, and reject every other new web job type. Do not weaken existing Stripe, ingestion, claim-request, or outbox branches.
 
-`financial_admin_command_status` and each read-audit routine independently acquire the same global administrator-role lock before reading roles. The TypeScript status wrapper always requires `sales.read`; the routine independently proves current admin role, enforces `actor_user_id = p_actor_user_id`, and returns only the strict safe status columns. Each read-audit routine hard-codes exactly one action and accepts only scalar actor/resource/correlation/method/route fields; the export routine additionally accepts only filter fingerprint and row/byte/currency-pair counts. No routine accepts caller-selected action text or JSON. The issue/admin-grant routines independently verify worker membership, acquire the same reentrant administrator-role advisory lock, reload the command actor's current roles, and require current administrator authority before checking a pending matching command, exact kind/input/target linkage, and a currently `running` linked job. They derive actor, correlation, target, desired transition, and audit identity from the command; callers cannot supply them.
+`financial_admin_command_status` and each read-audit routine independently acquire the same global administrator-role lock before reading roles. The TypeScript status wrapper always requires `sales.read`; the routine independently proves current admin role, enforces `actor_user_id = p_actor_user_id`, and returns only the strict safe status columns. Each read-audit routine hard-codes exactly one action and accepts only scalar actor/resource/correlation/method/route fields; the export routine additionally accepts only filter fingerprint and row/byte/currency-pair counts. No routine accepts caller-selected action text or JSON. The issue/admin-grant routines independently verify worker membership and preserve the handler prefix rather than creating an alternative lock order. After the reentrant role lock, an unlocked lookup may read only `job_id` to address the already-held shared lease key; the routine then acquires/reenters that shared lease lock, locks the bounded command identity/status row, takes the actor identity from that row, reloads the actor's current roles and requires the kind's authority, invokes `plan6bii_assert_financial_admin_job_lease(job_id)`, and only then reads/revalidates private input and target linkage. They accept only a still-pending matching command. Actor, correlation, target, desired transition, and audit identity are derived from the revalidated command and cannot be supplied by callers.
 
-- [ ] **Step 6: Add transition, audit, grant, and exhausted-job guards**
+For recovery activation, the routine and executor must both bind the command to the exact refund, finalization effect, order item, current correction-set ID/version, current source fingerprint, and active projection implementation. Under the canonical projection/purchase locks they re-read all six relationships and recompute the preview fingerprint; correction-tip, fingerprint, projection-head/implementation, or finalization-provenance drift is `conflict/stale_state`, while a current but causally ineligible relationship is `conflict/not_eligible`. Deactivation binds the exact recovery grant, immutable recovery reference, and expected state-change timestamp. Neither routine may accept a caller-supplied user/title/grant source.
+
+- [ ] **Step 6: Add lease, transition, audit, grant, and exhausted-job guards**
 
 Create and attach these exact trigger functions/triggers:
 
@@ -551,17 +668,32 @@ plan6bii_guard_financial_admin_command_update
 financial_admin_commands_plan6bii_update_guard
 plan6bii_guard_financial_admin_command_delete
 financial_admin_commands_plan6bii_delete_guard
+plan6bii_assert_financial_admin_job_lease(uuid)
+plan6bii_guard_financial_admin_job_lease
+jobs_plan6bii_financial_admin_lease_guard
 plan6bii_guard_administrative_grant_transition
 entitlement_grants_plan6bii_administrative_guard
 plan6bii_sync_failed_financial_admin_command
 jobs_plan6bii_financial_admin_terminal_sync
 ```
 
-The command update guard permits only `pending -> terminal` with immutable identity/private input/job and exact safe-result shape; terminal rows cannot change. An ordinary worker transition also requires the exact linked command job to be currently `running` with matching `{commandId}` payload/dedupe and an unexpired lease. Direct worker UPDATE before claim, after lease loss, for another command, or after terminal completion raises `55000`. Delete always raises `55000`. The entitlement trigger rejects every INSERT, UPDATE, or DELETE involving an OLD or NEW row with `source='administrative'` unless `current_user` is the transition-routine owner and the transaction-local command identity set by that exact routine matches the row linkage.
+The command update guard permits only `pending -> terminal` with immutable identity/private input/job and exact NULL-safe safe-result shape; terminal rows cannot change. An ordinary worker transition also requires the transaction-local clear capability to pass `plan6bii_assert_financial_admin_job_lease(job_id)` for the exact linked `running` command job with matching `{commandId}` payload/dedupe/generation/attempt. `running` plus non-null `locked_at` is never sufficient authority. Direct worker UPDATE before claim, with a missing/forged/cross-job/expired/prior-generation token, after lease loss, for another command, or after terminal completion raises `55000`. Delete always raises `55000`. The entitlement trigger rejects every INSERT, UPDATE, or DELETE involving an OLD or NEW row with `source='administrative'` unless `current_user` is the transition-routine owner, the current lease assertion has passed, and the transaction-local command identity set by that exact routine matches the row linkage.
 
-Centralize `denied|conflict|failed` audit insertion in the command transition trigger: every valid pending-to-failure transition appends exactly one minimized fixed action from NEW status/code, actor, command ID/kind, and correlation, never private input or job error. Handler code updates the command but does not insert a second terminal audit. When a linked job becomes terminal failed while its command is still pending, the job trigger uses a narrowly identified owner/GUC exception to store `failed/command_failed`; the command transition trigger supplies its audit. An already-terminal command produces neither duplicate. A linked job may become `succeeded` only when its command is already `succeeded`; denied/conflict/failed commands can end only with a failed job.
+Centralize `denied|conflict|failed` audit insertion in the command transition trigger: every valid pending-to-failure transition appends exactly one minimized fixed action from NEW status/code, actor, command ID/kind, and correlation, never private input or job error. Handler code updates the command but does not insert a second terminal audit. When a linked job becomes terminal failed while its command is still pending, the lease guard first validates and invalidates the current claim under the exclusive per-job lock; the following terminal-sync trigger uses a narrowly identified owner/GUC exception to store `failed/command_failed`, and the command transition trigger supplies its audit. An already-terminal command produces neither duplicate. A linked job may become `succeeded` only when its command is already `succeeded`; denied/conflict/failed commands can end only with a failed job. Trigger creation order and tests pin `jobs_plan6bii_financial_admin_lease_guard` before `jobs_plan6bii_financial_admin_terminal_sync`.
 
 Extend `plan6b_guard_audit_insert()` with exact owner-routine provenance for the three detail actions and export action only. General runtime `financial.*` insertion remains rejected. Worker-authored mutation/terminal actions remain allowed through the existing worker branch.
+
+Implement the repository/runner side in the same RED/GREEN tranche. One `claimNext` invocation opens one transaction, selects and locks at most one candidate through `FOR UPDATE SKIP LOCKED LIMIT 1`, and processes only that row. The candidate ordering includes normally pending jobs, expired running retry/takeover jobs, and expired running final-attempt cleanup jobs, but there is no bulk exhausted-job update CTE. After the one locked candidate is revalidated and only if it is a financial-admin job requiring a generation rotation, generate exactly once:
+
+```ts
+const financialAdminLeaseCapability = randomBytes(32).toString('base64url');
+```
+
+The transaction sets that one value with `set_config('pale_orbit.plan6bii_financial_admin_job_capability', value, true)` and the canonical decimal lease duration with `set_config('pale_orbit.plan6bii_financial_admin_job_lease_duration_ms', value, true)`, acquires the locked job's exclusive advisory transaction lock, and performs exactly one guarded claim/takeover rotation. Return the clear value only as `JobRecord.financialAdminLeaseCapability` for a nonterminal claimed command; discard the short-lived value after an exhausted cleanup. A no-row or nonfinancial outcome generates no financial-admin capability. Never reuse one value for a second job, loop over multiple exhausted rows inside the transaction, or calculate/compare expiry with injected `now()`; SQL and the guard use `clock_timestamp()`.
+
+An expired running job already at `max_attempts` follows one exact cleanup path: under its locked job row and exclusive lease lock, rotate to the fresh token and `generation + 1` while retaining the maximal positive attempt, then immediately transition the job to failed and the claim to irreversible invalidated in that same transaction. The terminal-sync trigger stores `failed/command_failed` when the command is still pending. Do not validate this cleanup with the expired prior token, increment attempts beyond `max_attempts`, or return the short-lived adoption token to a handler.
+
+`renewLease` requires the supplied value for a financial-admin job, sets it transaction-locally, locks/revalidates the job row, acquires the shared advisory lock, and performs the guarded same-attempt renewal; it returns `false` after expiry and never revives a claim. `complete` and `fail` set the supplied value transaction-locally, lock/revalidate the job row, take the exclusive advisory lock, and let the lease guard invalidate a terminal claim or expire a requeued one atomically. `complete` with `rerun_requested_at` returns the job to pending and expires rather than invalidates the claim. `fail(retryable=true)` expires/requeues before exhaustion and invalidates on exhaustion; nonretryable failure invalidates immediately. Every missing, stale, forged, or cross-job capability returns false or raises the one bounded internal authority error without echoing the value. The generic runner forwards the optional value on every heartbeat/complete/fail path and never logs, serializes, clones into a payload, or places it in an error.
 
 - [ ] **Step 7: Add exact ACLs and provisioner parity**
 
@@ -573,11 +705,13 @@ runtime EXECUTE: submit, status, four fixed-action financial read audits
 worker SELECT: financial_admin_commands
 worker UPDATE columns: status, safe_result_code, safe_result, updated_at, completed_at
 worker EXECUTE: admin issue resolution, administrative recovery transition
+financial_admin_job_claims: owner-only; no table/column privilege for either application group/login, storage cleanup, or PUBLIC
+private lease helper/trigger functions: owner-only; no direct EXECUTE for either application group/login, storage cleanup, or PUBLIC
 PUBLIC: none
 storage-cleanup: none
 ```
 
-Add the table and `jobs` to `RUNTIME_TABLE_SELECT_EXCLUSIONS`; add the command table to `PROTECTED_RUNTIME_WRITE_TABLES` and sensitive column scans. Runtime receives at most the narrow job reference columns required by the refactored enqueue seam and never `jobs.payload`, status internals, attempts, lease data, or errors. Worker retains full jobs SELECT. Add only the listed function signatures to `RUNTIME_EXECUTE_FUNCTIONS` and `WORKER_EXECUTE_FUNCTIONS`.
+Add both new tables and `jobs` to `RUNTIME_TABLE_SELECT_EXCLUSIONS`; add both new tables to `PROTECTED_RUNTIME_WRITE_TABLES` and sensitive-column scans. Add the private claim table to the worker SELECT/write exclusions as well: the worker interacts with it only through the owner trigger. Runtime receives at most the narrow job reference columns required by the refactored enqueue seam and never `jobs.payload`, status internals, attempts, lease data, or errors. Worker retains full jobs SELECT. Add only the eight callable signatures to `RUNTIME_EXECUTE_FUNCTIONS` and `WORKER_EXECUTE_FUNCTIONS`; the two private lease functions must be explicitly absent. Provisioner/static tests prove the database-owner default ACL and final direct ACL state cannot make a future or current claim/helper object application-executable.
 
 Implement the tested safe enqueue seam and move every runtime-capable call site named in Step 1 before applying the `jobs.payload` revoke. Unit and PostgreSQL role tests must prove runtime enqueue/idempotent replay still succeeds through the reference seam after the revoke. This refactor is part of the same authority/catalog commit; do not leave an intermediate commit in which current web paths call a full-row `INSERT ... RETURNING *` without SELECT authority.
 
@@ -586,7 +720,7 @@ Grant the worker the exact domain DML the six executors require: INSERT on `refu
 - [ ] **Step 8: Run service-free GREEN and inspect the migration**
 
 ```powershell
-npx vitest run src/lib/server/db/schema/financial-admin.test.ts src/lib/server/db/database-role-provision.test.ts scripts/database-role-deployment.test.ts scripts/financial-schema-preservation.test.ts src/lib/server/jobs/repository.test.ts src/lib/server/commerce/claims.test.ts src/lib/server/outbox/repository.test.ts src/lib/server/commerce/email/enqueue.test.ts src/lib/server/ingestion/job.test.ts src/lib/server/commerce/webhooks.test.ts
+npx vitest run src/lib/server/db/schema/financial-admin.test.ts src/lib/server/db/database-role-provision.test.ts scripts/database-role-deployment.test.ts scripts/financial-schema-preservation.test.ts src/lib/server/jobs/repository.test.ts src/lib/server/jobs/runner.test.ts src/lib/server/commerce/claims.test.ts src/lib/server/outbox/repository.test.ts src/lib/server/commerce/email/enqueue.test.ts src/lib/server/ingestion/job.test.ts src/lib/server/commerce/webhooks.test.ts
 npm run db:check
 npm run check
 npm run lint
@@ -605,12 +739,12 @@ npm run test:integration -- tests/integration/financial-schema.test.ts tests/int
 node --import tsx scripts/with-plan6b-upgrade-database.ts --phase-command tsx tests/integration/financial-migration.test.ts --fixture plan6bii-admin-command-authority
 ```
 
-Expected: fresh schema, collision rollback/repair, 0011-to-0012 upgrade, direct web denial, bounded runtime routine success, runtime enqueue/replay through the safe reference seam, worker-only status/transition authority, job-terminal synchronization, and exact ACLs pass. Direct worker command UPDATE before job claim, after lease loss, against another command, and after terminal completion each raises `55000` with command/audit state unchanged. Direct worker invocation of either command-bound routine after actor demotion fails under the routine's own role lock. Each harness self-cleans its owned project.
+Expected: fresh schema, collision rollback/repair, 0011-to-0012 upgrade, direct web denial, bounded runtime routine success, runtime enqueue/replay through the safe reference seam, worker-only status/transition authority, capability-aware job-terminal synchronization, and exact ACLs pass. Prove positive current-token claim, heartbeat, pending-to-success/failure command transition, command-bound issue/grant routine, retry requeue, and terminal invalidation—not only rejection paths. Seed two normal financial-admin jobs plus two expired final-attempt jobs and call `claimNext` four times: each transaction changes exactly one target, invokes the cryptographic token source exactly once for that target, produces one correct per-job generation and four distinct capabilities/stored digests overall, and leaves the other three rows unchanged until their own invocation. No bulk exhausted CTE or shared-GUC token may exist; using any captured normal-job token against another job is rejected. Then prove database-clock expiry; takeover/retry generation rotation; old-session resumption; and missing, forged, cross-job, expired, prior-attempt, prior-generation, renewed-after-expiry, and terminal tokens each raise `55000` or return false with job/claim/command/domain/audit state unchanged. Direct worker invocation after actor demotion fails under the routine's own role lock. Named concurrent witnesses show handler/heartbeat shared locks coexist, takeover/terminal exclusive locks wait without deadlock, and no command-holding transaction waits for a job row or lease lock. Each harness self-cleans its owned project.
 
 - [ ] **Step 10: Freeze the authority diff without committing it yet**
 
 ```powershell
-git diff --check -- src/lib/server/db/schema/financial-admin.ts src/lib/server/db/schema/financial-admin.test.ts src/lib/server/db/schema/index.ts drizzle/0012_plan6bii_admin_command_authority.sql drizzle/meta/0012_snapshot.json drizzle/meta/_journal.json src/lib/server/db/database-role-provision.ts src/lib/server/db/database-role-provision.test.ts scripts/database-role-deployment.test.ts scripts/financial-schema-preservation.test.ts tests/integration/financial-schema.test.ts tests/integration/financial-migration.test.ts tests/integration/database-role-boundaries.test.ts src/lib/server/jobs/repository.ts src/lib/server/jobs/repository.test.ts src/lib/server/commerce/claims.ts src/lib/server/commerce/claims.test.ts src/lib/server/outbox/repository.ts src/lib/server/outbox/repository.test.ts src/lib/server/commerce/email/enqueue.ts src/lib/server/commerce/email/enqueue.test.ts src/lib/server/ingestion/job.ts src/lib/server/ingestion/job.test.ts src/lib/server/commerce/webhooks.ts src/lib/server/commerce/webhooks.test.ts
+git diff --check -- src/lib/server/db/schema/financial-admin.ts src/lib/server/db/schema/financial-admin.test.ts src/lib/server/db/schema/index.ts drizzle/0012_plan6bii_admin_command_authority.sql drizzle/meta/0012_snapshot.json drizzle/meta/_journal.json src/lib/server/db/database-role-provision.ts src/lib/server/db/database-role-provision.test.ts scripts/database-role-deployment.test.ts scripts/financial-schema-preservation.test.ts tests/integration/financial-schema.test.ts tests/integration/financial-migration.test.ts tests/integration/database-role-boundaries.test.ts src/lib/server/jobs/types.ts src/lib/server/jobs/runner.ts src/lib/server/jobs/runner.test.ts src/lib/server/jobs/repository.ts src/lib/server/jobs/repository.test.ts src/lib/server/commerce/claims.ts src/lib/server/commerce/claims.test.ts src/lib/server/outbox/repository.ts src/lib/server/outbox/repository.test.ts src/lib/server/commerce/email/enqueue.ts src/lib/server/commerce/email/enqueue.test.ts src/lib/server/ingestion/job.ts src/lib/server/ingestion/job.test.ts src/lib/server/commerce/webhooks.ts src/lib/server/commerce/webhooks.test.ts
 ```
 
 Expected: the diff is clean. Do not stage or commit it until Task 5 has advanced and calibrated the exact restore/catalog contract.
@@ -629,7 +763,6 @@ Expected: the diff is clean. Do not stage or commit it until Task 5 has advanced
 - Create: `src/lib/server/commerce/reporting/audit.test.ts`
 - Create: `src/routes/admin/sales/commands/[commandId]/+server.ts`
 - Modify: `src/routes/admin/sales/route-support.test.ts`
-- Modify: `src/lib/server/jobs/repository.ts`
 - Modify: `src/lib/server/jobs/repository.test.ts`
 - Create: `tests/integration/financial-admin-commands.test.ts`
 
@@ -694,7 +827,7 @@ export type FinancialAdminPrivateCommand =
     };
 ```
 
-UUIDs are canonical lowercase. Fingerprints are lowercase SHA-256. Versions are safe positive integers. Draft/correction rows contain 1–25 unique items with nonnegative safe totals. Timestamps are canonical UTC ISO strings. Reject unknown keys, sparse/accessor/proxy objects, duplicates, unsafe numbers, customer/user/title/provider fields, arbitrary capability/audit/result/job fields, free-form reason/evidence, and noncanonical JSON.
+UUIDs are canonical lowercase. Fingerprints are lowercase SHA-256. Versions are safe positive integers bounded to the PostgreSQL integer maximum `2147483647`. Draft/correction rows contain 1–25 unique items with nonnegative safe totals. Timestamps are canonical UTC ISO strings. Reject unknown keys, sparse/accessor/proxy objects, duplicates, unsafe numbers, customer/user/title/provider fields, arbitrary capability/audit/result/job fields, free-form reason/evidence, and noncanonical JSON.
 
 - [ ] **Step 2: Write failing repository and audited-read client tests**
 
@@ -778,15 +911,15 @@ export function createFinancialAdminCommandExecutors(input: {
 }): ReadonlyMap<FinancialAdminCommandKind, FinancialAdminCommandExecutor>;
 ```
 
-The handler must prove exact `{commandId}` payload and job dedupe, then:
+The handler must prove exact `{commandId}` payload and job dedupe and require the internal `job.financialAdminLeaseCapability` to match the exact 43-character unpadded base64url grammar without copying or logging it. Each main or follow-up handler transaction sets it only with transaction-local `set_config('pale_orbit.plan6bii_financial_admin_job_capability', token, true)`, then:
 
 1. acquire the global administrator-role lock before the command row;
-2. lock and parse the command row;
-3. on terminal replay, return only for `succeeded`; for `denied`, `conflict`, or `failed`, throw `PermanentJobError` without another mutation/audit so the generic runner records job failure;
-4. for a pending command only, load current actor roles and use the injected-or-default resolver plus the shared kind map—every mutation requires `sales.read` and `reconciliation.manage`;
-5. invoke exactly one mapped executor in the transaction;
-6. store `succeeded` plus the kind's exact result code/data in the same commit as domain/audit/outbox effects; and
-7. respect an aborted lease signal before domain work and before commit.
+2. acquire `pg_advisory_xact_lock_shared(hashtextextended('pale-orbit:plan6bii-financial-admin-job-lease:' || job.id, 0))` before any command row lock;
+3. lock and re-read only the command identity/status/idempotency fields, require its linked job identity to match the `JobRecord`, and do not select private input yet;
+4. on terminal replay, return only for `succeeded`; for `denied`, `conflict`, or `failed`, throw `PermanentJobError` without another mutation/audit so the generic runner records job failure;
+5. for a pending command, take the actor identity from that bounded locked row, load the actor's current roles, use the injected-or-default resolver plus the shared kind map, require `sales.read` plus `reconciliation.manage`, and only then select/parse private input and invoke exactly one mapped executor in the same transaction;
+6. store `succeeded` plus the kind's exact result code/data in the same commit as domain/audit/outbox effects; the command guard performs the database-clock capability assertion at this final transition; and
+7. respect an aborted lease signal before domain work and before the terminal command update/commit; every command-bound owner routine asserts the current token before its effect, and the final command-update guard asserts it again so any intervening expiry rolls back the entire transaction.
 
 Define exact typed failures:
 
@@ -807,7 +940,7 @@ export class FinancialAdminPermanentError extends Error {
 }
 ```
 
-Capability revocation stores `denied/capability_revoked` with no domain write. Stale locked facts store `conflict/stale_state`; a currently ineligible domain relationship stores `conflict/not_eligible`. Malformed stored data stores `failed/invalid_command`; a safe permanent or exhausted operational error stores `failed/command_failed`. Idempotency mismatch is a submission-time 409 and is never a worker terminal code. A denied/conflict/permanent error rolls back the domain transaction first, then uses a new role-lock -> command-row transaction to update the terminal result; the command transition trigger atomically appends exactly one fixed `financial.admin_command.denied|conflict|failed` audit attributed to the submitting administrator. The audit contains command ID/kind, safe code, and correlation only—never private input or an internal error. A transient error before the last attempt remains pending and rethrows. On the last attempt it stores `failed/command_failed` and throws `PermanentJobError`; the trigger supplies the audit. A process crash after a terminal commit replays without another audit or domain change and preserves the corresponding job outcome.
+Capability revocation stores `denied/capability_revoked` with no domain write. Stale locked facts store `conflict/stale_state`; a currently ineligible domain relationship stores `conflict/not_eligible`. Malformed stored data stores `failed/invalid_command`; a safe permanent or exhausted operational error stores `failed/command_failed`. Idempotency mismatch is a submission-time 409 and is never a worker terminal code. A denied/conflict/permanent error rolls back the domain transaction first, then uses a new transaction with the same current opaque token and exact `role advisory -> shared lease advisory -> command row` order to update the terminal result; the command transition trigger atomically appends exactly one fixed `financial.admin_command.denied|conflict|failed` audit attributed to the submitting administrator. The audit contains command ID/kind, safe code, and correlation only—never private input, token, digest, or an internal error. A transient error before the last attempt leaves the command pending and rethrows so the capability-aware runner atomically expires/requeues the job. On the last attempt the runner's guarded terminal failure invalidates the claim and the terminal-sync trigger stores `failed/command_failed`; the command trigger supplies the audit. A process crash after a terminal command commit leaves the job/claim nonterminal until database-clock expiry; takeover rotates generation/token, replays without another audit or domain change, and produces the corresponding terminal job outcome. The old token cannot perform the follow-up transition after expiry or rotation.
 
 - [ ] **Step 4: Write failing route, claim-policy, and PostgreSQL lifecycle tests**
 
@@ -820,11 +953,16 @@ Extend `jobs/repository.test.ts` to prove the new job remains claimable in `loca
 - same key with different fingerprint conflicts;
 - web cannot read the command table or job payload;
 - worker can read/lock and update only terminal columns;
+- a current claimed generation with its opaque token can execute, renew, store a terminal command, and complete/fail the linked job through the real runner;
+- every handler and follow-up terminal transaction sets only the current token transaction-locally and takes `role -> shared lease -> command`, while heartbeat takes `job -> shared lease` and terminal runner work takes `job -> exclusive lease -> command sync`;
 - demotion before execution produces denied with no domain executor call;
 - demotion concurrent with execution serializes on the role lock;
 - succeeded terminal replay is a no-op and completes the job; denied/conflict/failed terminal replay adds no domain/audit change and permanently fails the job;
 - transient retry and final exhaustion synchronize a safe failed status; and
 - crash-after-terminal-commit replay preserves the correct job outcome for succeeded, denied, conflict, and failed commands; and
+- expiry/takeover rotates generation and rejects the old token; missing, forged, cross-job, prior-attempt, prior-generation, renewed-after-expiry, and invalidated tokens leave every effect unchanged; and
+- outside the transient transaction-local setting, a high-entropy secret sentinel appears only in the test process's in-memory `JobRecord`, never in jobs/commands/claims/audit/logs/status/API data; and
+- two normal and two exhausted jobs require four separate `claimNext` transactions and four distinct capabilities/digests, with one-row mutation deltas and cross-job rejection; and
 - no owner credential is used by web/worker application code.
 
 The safe `EnqueuedJobReference` seam and every runtime-capable caller were already committed atomically with the Task 3/5 authority boundary. This task must preserve that boundary. Extend `jobs/repository.test.ts` only as needed to prove the new command job remains claimable in local-only mode; do not restore full-row runtime reads.
@@ -840,9 +978,9 @@ Expected: FAIL because the TypeScript transport, handler, status route, and loca
 
 - [ ] **Step 6: Implement the command transport and fail-closed handler factory**
 
-`executors.ts` exports only the pure six-dependency builder shown above. It constructs the fixed keys internally and rejects a missing, duplicate, or unknown kind; it does not accept a caller-supplied iterable and must not expose placeholder executors. Task 4 tests it with six local stubs. Do not register the job in `worker.ts` in this task because no production executor exists yet. Do not add a dynamic module loader or caller-selected executor name. Tasks 11–14 implement the six concrete executor functions without mutating a shared registry; Task 14 performs the sole complete production composition after all six exist.
+`executors.ts` exports only the pure six-dependency builder shown above. It constructs the fixed keys internally and rejects a missing, duplicate, or unknown kind; it does not accept a caller-supplied iterable and must not expose incomplete executors. Task 4 tests it with six local stubs. Do not register the job in `worker.ts` in this task because no production executor exists yet. Do not add a dynamic module loader or caller-selected executor name. Tasks 11–14 implement the six concrete executor functions without mutating a shared registry; Task 14 performs the sole complete production composition after all six exist.
 
-Keep raw SQL limited to the routine calls, role advisory lock, and command `FOR UPDATE` query. Parse every database JSON/result value through the strict schemas before using or returning it.
+Keep raw SQL limited to the eight callable routine calls, role/shared-lease advisory locks, transaction-local token setting, and command identity/`FOR UPDATE` queries. The private lease helper remains non-executable and is reached only through owner routines/triggers; do not add a ninth routine grant or any lease route/endpoint. Parse every database JSON/result value through the strict schemas before using or returning it.
 
 - [ ] **Step 7: Run focused GREEN verification**
 
@@ -859,7 +997,7 @@ Expected: all commands exit zero; the handler uses the worker client and status/
 - [ ] **Step 8: Commit the command transport**
 
 ```powershell
-git add src/lib/server/commerce/financial/admin-commands src/lib/server/commerce/reporting/audit.ts src/lib/server/commerce/reporting/audit.test.ts src/routes/admin/sales/commands src/routes/admin/sales/route-support.test.ts src/lib/server/jobs/repository.ts src/lib/server/jobs/repository.test.ts tests/integration/financial-admin-commands.test.ts
+git add src/lib/server/commerce/financial/admin-commands src/lib/server/commerce/reporting/audit.ts src/lib/server/commerce/reporting/audit.test.ts src/routes/admin/sales/commands src/routes/admin/sales/route-support.test.ts src/lib/server/jobs/repository.test.ts tests/integration/financial-admin-commands.test.ts
 git diff --cached --check
 git commit -m "feat: add financial administrator command transport"
 ```
@@ -887,13 +1025,17 @@ Advance the contract version from `plan6b-financial-catalog-v1` to `plan6b-finan
 
 - both new enum label inventories;
 - the full `financial_admin_commands` table descriptor, including relation state, owner/ACL, columns, every constraint, inbound FK, non-constraint index, noninternal trigger, rule, inheritance edge, and internal constraint-trigger mode;
+- the full owner-only `financial_admin_job_claims` descriptor with the same exhaustive relation inventory, its restrictive job FK, positive generation/attempt, lowercase digest, bounded duration, exact timestamp/state lifecycle checks, and zero application/PUBLIC/storage-cleanup table or column ACL;
 - all eight new callable boundary-routine definitions, kinds, security, volatility, search paths, owners, and direct ACLs;
-- all four new trigger-function definitions, the changed audit/job guard function definitions, and every new/replaced trigger definition;
+- all six new trigger/private-helper definitions—including `plan6bii_assert_financial_admin_job_lease(uuid)` and `plan6bii_guard_financial_admin_job_lease()`—the changed audit/job guard definitions, and every new/replaced trigger definition including `jobs_plan6bii_financial_admin_lease_guard` before terminal sync;
 - exact runtime/worker command-table privileges and the changed `jobs` table/column SELECT boundary;
 - exact runtime and worker function EXECUTE sets; and
-- no direct privilege for the configured application logins, storage-cleanup role/login, or PUBLIC.
+- the normalized canonical database-owner default-ACL tuple inventory from Task 3, including runtime future-table/sequence grants, owner grants, grantors/grantability, and absent `PUBLIC` routine execute; and
+- no direct privilege for the configured application logins, storage-cleanup role/login, or PUBLIC, plus exact absence of application EXECUTE on both private lease functions.
 
-Add reversible witness labels for wrong command enum order, table shape/owner/RLS/persistence, unexpected constraint/index/trigger/rule/inheritance, runtime private-input SELECT, runtime `jobs.payload` SELECT, worker private-input UPDATE, PUBLIC routine EXECUTE, wrong routine owner/search path, disabled trigger, job-guard drift, audit-guard drift, direct login ACL, and missing/excess worker/runtime EXECUTE.
+Add reversible witness labels for wrong command enum order, either table's shape/owner/RLS/persistence, unexpected constraint/index/trigger/rule/inheritance, runtime private-input SELECT, runtime `jobs.payload` SELECT, any application claim-table privilege, worker private-input UPDATE, PUBLIC routine EXECUTE, application EXECUTE on a private helper, wrong routine/helper owner/security/search path, disabled or reordered lease/terminal trigger, claim capability-hash constraint drift, expiry/lifecycle constraint drift, generation/attempt constraint drift, job-guard drift, audit-guard drift, direct login ACL, and missing/excess worker/runtime EXECUTE. Default-ACL witnesses must separately cover missing runtime future-table SELECT; missing runtime future-sequence USAGE/SELECT/UPDATE; excess worker/storage/login/default grantee; reintroduced PUBLIC routine EXECUTE; namespace/object-type, owner, grantor, or grant-option drift; inherited runtime SELECT left on either new protected table; and inherited PUBLIC/runtime/worker execute left on either private helper. Add an unexpected `capability_token text` column witness so the exact descriptor rejects any schema capable of persisting the clear token.
+
+The behavioral verifier uses the real one-row claim path for two normal and two expired final-attempt financial-admin jobs. Across four separate `claimNext` transactions it proves exactly one row changes per invocation, exactly four distinct capabilities and four distinct stored digests exist, every row has its correct independent generation/attempt, no digest is shared across jobs, and a token from one normal job fails against the other. A process-owned secret sentinel witness proves the database contains only its computed lowercase SHA-256 digest and exercises current renewal plus terminal invalidation. Owner-only corruption pairs alter the digest to invalid/uppercase form, expiry/lifecycle, generation/attempt relationship, trigger enabled mode, helper owner/security/search path, and a synthetic plaintext-token column/value; each must produce its exact single rejection key/count, repair to the source definition, and pass. Never print a clear capability or include it in calibration JSON, failure details, SQL comments, or the embedded manifest.
 
 - [ ] **Step 2: Run the static catalog test and confirm RED**
 
@@ -904,9 +1046,9 @@ npx vitest run scripts/database-role-deployment.test.ts scripts/with-plan6b-upgr
 
 Expected: FAIL on the stale v1 object/count/witness contract and missing 0012 upgrade/checkpoint assertions.
 
-- [ ] **Step 3: Implement v2 actual-catalog branches and placeholder expected rows**
+- [ ] **Step 3: Implement v2 actual-catalog branches with temporary invalid fingerprints**
 
-Reuse the current normalized descriptor builders. Do not weaken table inventory, ACL grantor normalization, current-database CONNECT checks, forbidden retired objects, or cleanup-login authority. Add v2 rows with zero/empty placeholder fingerprints only long enough for the static test to prove `invalid_contract_fingerprints > 0`; never commit placeholders.
+Reuse the current normalized descriptor builders. Do not weaken table inventory, ACL grantor normalization, current-database CONNECT checks, forbidden retired objects, or cleanup-login authority. Add v2 rows for both tables, all eight callable routines, both private helpers, and all triggers with deliberately invalid zero/empty fingerprints only long enough for the static test to prove `invalid_contract_fingerprints > 0`; replace every invalid fingerprint before commit.
 
 Keep the SQL marker block byte-identical in `scripts/verify-financial-restore.sql` and `docs/stripe-financial-reconciliation.md`.
 
@@ -970,7 +1112,7 @@ Expected: one isolated project writes one bounded BEGIN/END catalog block contai
 
 - [ ] **Step 5: Embed v2 fingerprints and add reversible witnesses**
 
-Update both exact marker copies from the one retained `$calibrationPayload`. Extend the executor with corrupt -> expect exact rejection count/key -> repair -> expect pass pairs for every witness from Step 1. For 0012 function/trigger repair and source-parity checks, load and uniquely extract the reviewed definitions from `drizzle/0012_plan6bii_admin_command_authority.sql`; do not duplicate their bodies in TypeScript or reuse 0009-only extraction. Do not change an exact count to a prefix-only or positive-count assertion.
+Update both exact marker copies from the one retained `$calibrationPayload`. Extend the executor with corrupt -> expect exact rejection count/key -> repair -> expect pass pairs for every witness from Step 1. For 0012 table/check/function/trigger repair and source-parity checks, load and uniquely extract the reviewed definitions from `drizzle/0012_plan6bii_admin_command_authority.sql`; do not duplicate their bodies in TypeScript or reuse 0009-only extraction. Include the private table, helper definitions, trigger order/mode, and exact no-ACL state. Do not change an exact count to a prefix-only or positive-count assertion, and do not persist or print the clear capability while building any witness.
 
 Update upgrade tests to apply 0000–0012, preserve rollback at each historical fixture, and verify a second pass is a no-op. Update checkpoint/bundle tests to require the copied v2 verifier and journal entry. `capture-restore-row-counts.sql` already inventories every base table; assert that property instead of adding a hand-maintained command-table row count.
 
@@ -991,12 +1133,12 @@ Then, under the serialized PostgreSQL slot:
 npx vitest run scripts/commerce-operations.test.ts -t "executes schema-object, source-parity, deterministic-allocation, audit, payout, and chronology verifier witnesses in PostgreSQL" --reporter=verbose
 ```
 
-Expected: static suites pass; every corruption is rejected and repaired; the final verifier succeeds; the disposable project and temp delta are zero after cleanup.
+Expected: static suites pass; every command/claim/helper/trigger/ACL corruption is rejected under its exact key/count and repaired; the secret sentinel is never printed or persisted clear; the final verifier succeeds; the disposable project and temp delta are zero after cleanup.
 
 - [ ] **Step 7: Commit the atomic authority/catalog boundary**
 
 ```powershell
-git add src/lib/server/db/schema/financial-admin.ts src/lib/server/db/schema/financial-admin.test.ts src/lib/server/db/schema/index.ts drizzle/0012_plan6bii_admin_command_authority.sql drizzle/meta/0012_snapshot.json drizzle/meta/_journal.json src/lib/server/db/database-role-provision.ts src/lib/server/db/database-role-provision.test.ts scripts/database-role-deployment.test.ts scripts/financial-schema-preservation.test.ts tests/integration/financial-schema.test.ts tests/integration/financial-migration.test.ts tests/integration/database-role-boundaries.test.ts src/lib/server/jobs/repository.ts src/lib/server/jobs/repository.test.ts src/lib/server/commerce/claims.ts src/lib/server/commerce/claims.test.ts src/lib/server/outbox/repository.ts src/lib/server/outbox/repository.test.ts src/lib/server/commerce/email/enqueue.ts src/lib/server/commerce/email/enqueue.test.ts src/lib/server/ingestion/job.ts src/lib/server/ingestion/job.test.ts src/lib/server/commerce/webhooks.ts src/lib/server/commerce/webhooks.test.ts scripts/verify-financial-restore.sql scripts/execute-financial-restore-verifier.ts scripts/commerce-operations.test.ts docs/stripe-financial-reconciliation.md docs/storage-ingestion-and-publication.md scripts/deployment-checkpoint.test.ts scripts/deployment-checkpoint-runtime.test.ts scripts/deployment-backup-bundle.test.ts scripts/with-plan6b-upgrade-database.test.ts
+git add src/lib/server/db/schema/financial-admin.ts src/lib/server/db/schema/financial-admin.test.ts src/lib/server/db/schema/index.ts drizzle/0012_plan6bii_admin_command_authority.sql drizzle/meta/0012_snapshot.json drizzle/meta/_journal.json src/lib/server/db/database-role-provision.ts src/lib/server/db/database-role-provision.test.ts scripts/database-role-deployment.test.ts scripts/financial-schema-preservation.test.ts tests/integration/financial-schema.test.ts tests/integration/financial-migration.test.ts tests/integration/database-role-boundaries.test.ts src/lib/server/jobs/types.ts src/lib/server/jobs/runner.ts src/lib/server/jobs/runner.test.ts src/lib/server/jobs/repository.ts src/lib/server/jobs/repository.test.ts src/lib/server/commerce/claims.ts src/lib/server/commerce/claims.test.ts src/lib/server/outbox/repository.ts src/lib/server/outbox/repository.test.ts src/lib/server/commerce/email/enqueue.ts src/lib/server/commerce/email/enqueue.test.ts src/lib/server/ingestion/job.ts src/lib/server/ingestion/job.test.ts src/lib/server/commerce/webhooks.ts src/lib/server/commerce/webhooks.test.ts scripts/verify-financial-restore.sql scripts/execute-financial-restore-verifier.ts scripts/commerce-operations.test.ts docs/stripe-financial-reconciliation.md docs/storage-ingestion-and-publication.md scripts/deployment-checkpoint.test.ts scripts/deployment-checkpoint-runtime.test.ts scripts/deployment-backup-bundle.test.ts scripts/with-plan6b-upgrade-database.test.ts
 git diff --cached --check
 git commit -m "feat: add financial administrator database authority"
 ```
@@ -1715,7 +1857,7 @@ The prepare request submits only fixed reason, `expectedNextCorrectionVersion`, 
 
 - [ ] **Step 2: Write failing mutation/rebase/lock tests**
 
-Use the same role -> command -> active projection -> purchase -> financial closure order as finalization. Require finalized succeeded refund, complete canonical balance transactions/current allocation, exact compatible base/correction tip, and component capacities. Prove:
+Use the same role advisory -> shared financial-admin lease advisory -> command -> active projection -> purchase -> financial closure order as finalization. Require finalized succeeded refund, complete canonical balance transactions/current allocation, exact compatible base/correction tip, and component capacities. Prove:
 
 - first correction and successor form one append-only predecessor chain;
 - stale/concurrent proposals cannot fork;
@@ -1837,13 +1979,15 @@ Activation requires all of:
 - immutable finalization effect `revoked_by_finalization`;
 - the same administrative allocation/refund/order item/exact purchase grant;
 - purchase grant not already revoked before finalization;
-- current compatible correction tip/fingerprint below the full-refund threshold;
-- no `correction_rebase_required` or incomplete projection; and
+- the command's exact `expectedCorrectionSetId`, `expectedCorrectionVersion`, and `expectedSourceFingerprint` still match the current compatible correction tip and current projection source below the full-refund threshold;
+- the active projection implementation, current projection head/items, correction base/tip, and finalization provenance are mutually linked with no `correction_rebase_required` or incomplete projection; and
 - a claimed purchase grant whose non-null user/title is derived from the locked grant.
 
 It never reads `commerce_claim_issuances`, credential authority, email identity, or claim proof; never manufactures/claims a user; and never accepts user/title from the caller. Test ineligibility before claim, then run the real protected register -> authorize -> claim lifecycle and prove a fresh preview becomes eligible.
 
-The worker calls only `transition_administrative_recovery_grant_after_admin_command(commandId)`. Direct worker/admin-row DML must fail the trigger. The routine requires the command's linked job to be running, re-parses the fixed command kind/input, derives the activation/deactivation target and expected state, creates/reactivates one unique linked administrative grant or explicitly revokes it, and returns only the derived grant/user/title transition needed for entitlement projection.
+The preview fingerprint covers the exact refund, finalization effect, order item, correction-set ID/version, source fingerprint, active projection implementation, projected eligibility, and predicted access/email consequence. The executor re-reads and recomputes all of them under the canonical locks. Any changed correction ID/version, source fingerprint, projection head/implementation, provenance link, or preview is `conflict/stale_state`; only a current but causally ineligible relationship is `conflict/not_eligible`.
+
+The worker calls only `transition_administrative_recovery_grant_after_admin_command(commandId)`. Direct worker/admin-row DML must fail the trigger. The routine requires the command's linked job to hold the current unexpired capability; job status and legacy lease columns alone are never authority. It re-parses the fixed command kind/input, independently rechecks the correction/source/projection/provenance linkage, derives the activation/deactivation target and expected state, creates/reactivates one unique linked administrative grant or explicitly revokes it, and returns only the derived grant/user/title transition needed for entitlement projection.
 
 - [ ] **Step 3: Implement and commit the pure eligibility/grant-origin boundary**
 
@@ -1864,13 +2008,13 @@ Expected after implementation: both unit files pass; no worker registration, gra
 
 - [ ] **Step 4: Write failing lock, persistence, email, and atomicity tests**
 
-Activation uses role -> command -> active projection -> order/payment/full purchase/financial closure -> provenance -> current correction -> sorted entitlement scopes/grants. It never starts at entitlement/provenance and never acquires guest-identity/claim/user locks after an order.
+Activation uses role advisory -> shared financial-admin lease advisory -> command -> active projection -> order/payment/full purchase/financial closure -> provenance -> current correction -> sorted entitlement scopes/grants. It never starts at entitlement/provenance and never acquires guest-identity/claim/user locks after an order.
 
 After activation, run a later correction, refund, dispute, and classifier rebase; the administrative grant remains active. Only confirmed deactivation changes it. Both operations project effective entitlement, enqueue email only on effective access change, audit as the original administrator, and store command result in one transaction.
 
 Add the minimized template `commerce.administrative-recovery-access-changed` with no administrator identity, internal/provider ID, amount, recipient in logs, or action link. Use dedupe `commerce:recovery-access:<grant-id>:<active|revoked>:<transition-epoch-ms>` from the actual row transition; replay does not change time or enqueue.
 
-Test concurrent correction/finalization/recovery barriers, cumulative full refund making activation stale, two activations, another active grant, exact replay, deactivation replay, and forced routine/projection/audit/outbox failures with full rollback.
+Test concurrent correction/finalization/recovery barriers; correction ID/version drift; source-fingerprint drift; projection-head/implementation drift; cumulative full refund making activation stale; two activations; another active grant; exact replay; deactivation replay; stale/forged/expired capability; and forced routine/projection/audit/outbox failures with full rollback.
 
 - [ ] **Step 5: Write failing confirmation UI tests**
 
@@ -1887,7 +2031,7 @@ Expected: FAIL because protected recovery behavior and UI do not exist.
 
 - [ ] **Step 7: Implement both recovery executor functions and prove complete composition in tests**
 
-Do not mutate a shared registry. Handler tests now pass all six real executor functions to `createFinancialAdminCommandExecutors(...)` and require exactly six fixed entries. No shared placeholder executor is exported and no partial production handler is registered. Do not alter purchase-grant provenance, reporting allocations, copy counts, or claim authority.
+Do not mutate a shared registry. Handler tests now pass all six real executor functions to `createFinancialAdminCommandExecutors(...)` and require exactly six fixed entries. No shared incomplete executor is exported and no partial production handler is registered. Do not alter purchase-grant provenance, reporting allocations, copy counts, or claim authority.
 
 - [ ] **Step 8: Run domain GREEN and commit recovery behavior**
 
@@ -1973,12 +2117,16 @@ Use unique transaction-local `application_name` values and an owner observer tha
 4. draft save versus finalization;
 5. finalization versus correction;
 6. correction versus classifier rebase; and
-7. recovery versus correction/refund/dispute.
+7. recovery versus correction/refund/dispute;
+8. handler shared lease versus heartbeat shared lease;
+9. expired-claim takeover exclusive lease versus the old handler shared lease; and
+10. terminal job exclusive lease/command synchronization versus command execution.
 
 Assert the canonical prefix everywhere:
 
 ```text
 administrator-role advisory lock
+  -> per-job shared financial-admin lease advisory lock
   -> command/idempotency row
   -> active projection implementation (projection-dependent finalization, correction, and recovery kinds only)
   -> order/payment/full purchase graph
@@ -1989,6 +2137,8 @@ administrator-role advisory lock
 
 Draft save/discard stops after the purchase graph and never takes projection/financial/entitlement locks. Finalization, correction, and recovery all depend on current projection authority and therefore take the projection prefix even when recovery does not rewrite projection rows. Replace the existing synthetic finalization-style reclassification witness with the real administrator command handler plus finalization executor so the test cannot encode purchase-before-projection order that production forbids.
 
+Pin the complementary repository orders exactly: claim/takeover/complete/fail lock and revalidate the job row before the per-job exclusive lease advisory lock; heartbeat locks/revalidates the job row before the shared lease advisory lock and never locks a command. A command-holding transaction never waits for a job row or lease lock. Prove shared handler/heartbeat coexistence, exclusive takeover/terminal blocking on the exact shared-lock PID, release without deadlock, database-clock expiry, strictly increasing generation on retry/takeover, and rejection of a resumed old session using the former token. Exercise missing, forged, cross-job, prior-attempt, prior-generation, renewed-after-expiry, and invalidated tokens with unchanged job/claim/command/domain/audit state. Establish expiry with an owner fixture update or bounded database-clock barrier, never an elapsed-time assumption or fixed sleep.
+
 Every blocker/probe transaction, connection, pool, and injected pause must be inside bounded `try/finally` cleanup. Never infer blocking from elapsed time alone.
 
 - [ ] **Step 4: Extend static and runtime privacy scans**
@@ -1996,12 +2146,14 @@ Every blocker/probe transaction, connection, pool, and injected pause must be in
 Reject these strings or values from HTML, JSON, CSV, logs, audit metadata, status responses, command safe results, email payloads, and browser artifacts unless a specific DTO field explicitly permits them:
 
 - private command JSON and idempotency keys;
-- job ID, attempts, lease token, and `last_error`;
+- job ID, attempts, clear financial-admin lease capability, capability digest, generation, expiry, and `last_error`;
 - Stripe secrets, provider request/response bodies, and every charge/refund/dispute/payout provider ID; new Plan 6B-II browser DTOs, CSV, status, audit metadata, email, and logs may contain only the explicitly named internal UUIDs, while canonical provider columns remain server-only;
 - claim proof, auth token, password/reset/magic-link token, raw email, IP address, and user-agent;
 - internal SQL errors, stack traces, database role names, and filesystem paths.
 
 Keep the tests structural and value-based. Do not add broad source-string exclusions that could hide a leak.
+
+Use one fresh 256-bit base64url secret sentinel in the real claim/handler/heartbeat/terminal path. Assert that, outside the deliberately transient transaction-local setting, it is present only in the in-memory internal `JobRecord` handed to the runner and is absent from all queryable text/JSON columns in jobs, commands, claims, audit, outbox/email, every captured log/error, status/API/HTML/CSV/browser artifact, and restore-verifier output. The claim table must contain only the sentinel's lowercase SHA-256 digest; even that digest remains absent from public DTOs, logs, audit, and browser surfaces.
 
 - [ ] **Step 5: Run focused tests and confirm RED**
 
@@ -2376,6 +2528,7 @@ Expected: all reviewers report no unresolved Critical/Important/Minor findings, 
 | Independent capabilities and authorize-before-parse | Tasks 2, 7–16 |
 | Strict safe DTO/filter/cursor/money contracts | Tasks 2, 6–10 |
 | Durable private command with web/worker authority split | Tasks 3–5, 11–15 |
+| Stale-generation financial-admin lease capability, takeover, and secret isolation | Tasks 3–5, 14–15 |
 | Execution-time role reauthorization and replay safety | Tasks 4, 15–16 |
 | Exact migration/ACL/restore/upgrade/checkpoint parity | Tasks 3, 5, 17 |
 | Signed per-title reporting and aggregate CSV | Tasks 6–7, 10, 16 |
@@ -2391,7 +2544,9 @@ Expected: all reviewers report no unresolved Critical/Important/Minor findings, 
 
 - Start from the exact approved base named above and keep one task commit per boundary unless a task explicitly names multiple commits.
 - Use `superpowers:subagent-driven-development` for same-session execution or `superpowers:executing-plans` for a separate execution session.
-- Preserve the six command kinds, five statuses, audit vocabulary, routine signatures, job type, and lock prefix exactly. A change to one is a design change, not a convenient implementation detail.
+- Preserve the six command kinds, five statuses, audit vocabulary, eight callable routine signatures, job type, private claim-table/helper/trigger names, transaction-local setting names, and advisory lock prefix exactly. A change to one is a design change, not a convenient implementation detail.
+- Preserve `role advisory -> shared lease advisory -> command row` for command work, `job row -> exclusive lease advisory -> claim/optional command sync` for claim/takeover/terminal work, and `job row -> shared lease advisory -> claim` for heartbeat. Never add a command-to-job/lease edge.
+- Keep Task 3 and Task 5 as one atomic authority/catalog commit, including `types.ts`, `runner.ts`, and `runner.test.ts`; do not commit migration 0012 before the v2 manifest includes the private claim authority.
 - Task 4 builds the handler and fixed registry interface but must not make an incomplete executor map reachable in production. Register the production job handler only when the first complete six-kind composition exists; until then, keep the factory test-only and fail closed on any unknown/missing executor.
 - Run database-backed commands only under the serialized resource protocol. Never launch a duplicate command because output is quiet; poll the same process/session to its final exit.
 - If any requirement is ambiguous, stop at the nearest task boundary and compare both approved design documents before changing code or authority.
