@@ -129,6 +129,28 @@ describe('deterministic refund allocation', () => {
     });
   });
 
+  it('orders exact multi-title allocation by provider timestamp before provider refund ID', () => {
+    const earlier = refund('local-z', 1, {
+      providerRefundId: 're_provider_z',
+      providerCreatedAt: new Date('2026-08-10T13:00:00.000Z')
+    });
+    const later = refund('local-a', 1, {
+      providerRefundId: 're_provider_a',
+      providerCreatedAt: new Date('2026-08-10T13:00:01.000Z')
+    });
+
+    expect(allocateDeterministicRefunds(facts({
+      items: [item('item-b', 1), item('item-a', 1)],
+      refunds: [later, earlier]
+    }))).toEqual({
+      state: 'allocated',
+      allocations: [
+        { refundId: earlier.refundId, orderItemId: 'item-a', amountMinor: 1 },
+        { refundId: later.refundId, orderItemId: 'item-b', amountMinor: 1 }
+      ]
+    });
+  });
+
   it('allocates one remaining refund when it exactly fills all remaining item capacity', () => {
     const first = refund('refund-1', 500);
     const final = refund('refund-2', 2000);
@@ -155,6 +177,15 @@ describe('deterministic refund allocation', () => {
       refunds: [refund('refund-1', 500)],
       existingAllocations: [
         { refundId: 'refund-1', orderItemId: 'item-a', amountMinor: 501 }
+      ]
+    }))).toEqual({ state: 'exception', allocations: [] });
+
+    expect(allocateDeterministicRefunds(facts({
+      items: [item('item-a', 999), item('item-b', 1500)],
+      refunds: [refund('refund-1', 500), refund('refund-2', 500)],
+      existingAllocations: [
+        { refundId: 'refund-1', orderItemId: 'item-a', amountMinor: 500 },
+        { refundId: 'refund-2', orderItemId: 'item-a', amountMinor: 500 }
       ]
     }))).toEqual({ state: 'exception', allocations: [] });
   });
