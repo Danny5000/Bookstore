@@ -1610,12 +1610,18 @@ Expected: CSV and Overview match for rows/totals/order, negative numeric cells r
 - Create: `src/lib/server/commerce/financial/refund-review/drafts.ts`
 - Create: `src/lib/server/commerce/financial/refund-review/drafts.test.ts`
 - Modify: `src/lib/server/commerce/financial/admin-commands/handler.test.ts`
+- Modify: `src/lib/server/commerce/financial/admin-commands/repository.ts`
+- Modify: `src/lib/server/commerce/financial/admin-commands/repository.test.ts`
 - Create: `tests/integration/financial-refund-review.test.ts`
+- Modify: `src/routes/admin/sales/route-support.ts`
+- Modify: `src/routes/admin/sales/route-support.test.ts`
 - Create: `src/routes/admin/sales/refunds/[refundId]/+page.server.ts`
 - Create: `src/routes/admin/sales/refunds/[refundId]/+page.svelte`
 - Create: `src/routes/admin/sales/refunds/refund-routes.test.ts`
 - Create: `src/lib/components/admin/RefundAllocationEditor.svelte`
 - Create: `src/lib/components/admin/FinancialCommandStatus.svelte`
+- Create: `src/lib/components/admin/financial-command-status.ts`
+- Create: `src/lib/components/admin/financial-command-status.test.ts`
 - Create: `src/lib/components/admin/FinancialActionOutcome.svelte`
 - Create: `src/lib/components/admin/RefundReview.test.ts`
 
@@ -1675,7 +1681,7 @@ Test same-origin native forms, safe 400/404/409 mapping, bounded return context,
 - [ ] **Step 4: Run focused tests and confirm RED**
 
 ```powershell
-npx vitest run src/lib/server/commerce/financial/refund-review/inputs.test.ts src/lib/server/commerce/financial/refund-review/query.test.ts src/lib/server/commerce/financial/refund-review/drafts.test.ts src/lib/server/commerce/financial/admin-commands/handler.test.ts src/routes/admin/sales/refunds/refund-routes.test.ts src/lib/components/admin/RefundReview.test.ts
+npx vitest run src/lib/server/commerce/financial/refund-review/inputs.test.ts src/lib/server/commerce/financial/refund-review/query.test.ts src/lib/server/commerce/financial/refund-review/drafts.test.ts src/lib/server/commerce/financial/admin-commands/handler.test.ts src/lib/server/commerce/financial/admin-commands/repository.test.ts src/routes/admin/sales/route-support.test.ts src/routes/admin/sales/refunds/refund-routes.test.ts src/lib/components/admin/financial-command-status.test.ts src/lib/components/admin/RefundReview.test.ts
 npm run test:integration -- tests/integration/financial-refund-review.test.ts tests/integration/database-role-boundaries.test.ts
 ```
 
@@ -1688,12 +1694,12 @@ Do not mutate or export a partial registry. Handler tests call the Task 4 six-de
 - [ ] **Step 6: Run GREEN and commit**
 
 ```powershell
-npx vitest run src/lib/server/commerce/financial/refund-review/inputs.test.ts src/lib/server/commerce/financial/refund-review/query.test.ts src/lib/server/commerce/financial/refund-review/drafts.test.ts src/lib/server/commerce/financial/admin-commands/handler.test.ts src/routes/admin/sales/refunds/refund-routes.test.ts src/lib/components/admin/RefundReview.test.ts
+npx vitest run src/lib/server/commerce/financial/refund-review/inputs.test.ts src/lib/server/commerce/financial/refund-review/query.test.ts src/lib/server/commerce/financial/refund-review/drafts.test.ts src/lib/server/commerce/financial/admin-commands/handler.test.ts src/lib/server/commerce/financial/admin-commands/repository.test.ts src/routes/admin/sales/route-support.test.ts src/routes/admin/sales/refunds/refund-routes.test.ts src/lib/components/admin/financial-command-status.test.ts src/lib/components/admin/RefundReview.test.ts
 npm run test:integration -- tests/integration/financial-refund-review.test.ts tests/integration/database-role-boundaries.test.ts
 npm run check
 npm run lint
 git diff --check
-git add src/lib/server/commerce/financial/refund-review/inputs.ts src/lib/server/commerce/financial/refund-review/inputs.test.ts src/lib/server/commerce/financial/refund-review/query.ts src/lib/server/commerce/financial/refund-review/query.test.ts src/lib/server/commerce/financial/refund-review/drafts.ts src/lib/server/commerce/financial/refund-review/drafts.test.ts src/lib/server/commerce/financial/admin-commands/handler.test.ts tests/integration/financial-refund-review.test.ts src/routes/admin/sales/refunds src/lib/components/admin/RefundAllocationEditor.svelte src/lib/components/admin/FinancialCommandStatus.svelte src/lib/components/admin/FinancialActionOutcome.svelte src/lib/components/admin/RefundReview.test.ts
+git add src/lib/server/commerce/financial/refund-review/inputs.ts src/lib/server/commerce/financial/refund-review/inputs.test.ts src/lib/server/commerce/financial/refund-review/query.ts src/lib/server/commerce/financial/refund-review/query.test.ts src/lib/server/commerce/financial/refund-review/drafts.ts src/lib/server/commerce/financial/refund-review/drafts.test.ts src/lib/server/commerce/financial/admin-commands/handler.test.ts src/lib/server/commerce/financial/admin-commands/repository.ts src/lib/server/commerce/financial/admin-commands/repository.test.ts tests/integration/financial-refund-review.test.ts src/routes/admin/sales/route-support.ts src/routes/admin/sales/route-support.test.ts src/routes/admin/sales/refunds src/lib/components/admin/RefundAllocationEditor.svelte src/lib/components/admin/FinancialCommandStatus.svelte src/lib/components/admin/financial-command-status.ts src/lib/components/admin/financial-command-status.test.ts src/lib/components/admin/FinancialActionOutcome.svelte src/lib/components/admin/RefundReview.test.ts
 git diff --cached --check
 git commit -m "feat: add shared refund draft commands"
 ```
@@ -1709,8 +1715,12 @@ Expected: all commands pass; web submission and worker mutation authority remain
 - Create: `src/lib/server/commerce/refund-allocation-components.test.ts`
 - Create: `src/lib/server/commerce/financial/refund-review/finalize.ts`
 - Create: `src/lib/server/commerce/financial/refund-review/finalize.test.ts`
+- Modify: `src/lib/server/commerce/financial/admin-commands/handler.ts`
+- Modify: `src/lib/server/commerce/financial/admin-commands/handler.test.ts`
+- Modify: `src/lib/server/commerce/financial/refund-review/drafts.test.ts`
 - Modify: `src/lib/server/commerce/refunds.ts`
 - Modify: `src/lib/server/commerce/refunds.test.ts`
+- Modify: `src/lib/server/commerce/reconciliation.ts`
 - Modify: `src/lib/server/commerce/financial/sources/refund.ts`
 - Modify: `src/lib/server/commerce/financial/sources/refund.test.ts`
 - Modify: `src/lib/server/commerce/financial/issues.ts`
@@ -1721,7 +1731,9 @@ Expected: all commands pass; web submission and worker mutation authority remain
 - Modify: `src/lib/components/admin/RefundAllocationEditor.svelte`
 - Create: `src/lib/components/admin/FinancialActionConfirmation.svelte`
 - Modify: `src/lib/components/admin/RefundReview.test.ts`
+- Modify: `tests/integration/financial-admin-commands.test.ts`
 - Modify: `tests/integration/financial-refund-review.test.ts`
+- Modify: `tests/integration/commerce-lock-order.test.ts`
 - Modify: `tests/integration/financial-lock-order.test.ts`
 
 - [ ] **Step 1: Write failing preview/fingerprint tests**
@@ -1743,11 +1755,15 @@ export async function executeRefundAllocationFinalize(
 ): Promise<FinancialAdminCommandSafeResultByCode['allocation_finalized']>;
 ```
 
+Add one required, transaction-bound access-message capability to the executor context. `createFinancialAdminCommandHandler` receives an `accessMessages` dependency beside `database` and `executors`, exposes only `enqueueAccessChange(input)` to executors, and binds the current command transaction internally. Do not inject the full commerce message enqueuer, make the dependency optional, add a seventh executor-builder function, create an enqueuer in the domain module, or open a second transaction. Task 12 uses the existing refund access-change message; Task 14 extends the same narrow input union for recovery and supplies the existing production enqueuer when it registers all six executors.
+
 Preview reports each safe item proposal, derived subtotal/tax split, full-refund outcome, purchase-grant transition, other-grant access preservation, and expected access email without user/email identity. Its fingerprint covers refund/payment/order/items, current allocations/components, active draft ID/version/items, active projection implementation, current source/correction tips, and current grant states.
 
 - [ ] **Step 2: Extract existing access and allocation planners under characterization tests**
 
 Move provider-neutral purchase-grant recomputation from `refunds.ts` into `refund-access.ts` without changing ordinary refund behavior. Preserve the current payment/refund/dispute/claim/preserved transition checks byte-for-byte. Do not add an `administrative-recovery` origin or modify `grants.ts` here; Task 14 owns the one complete origin-matrix change together with its protected transition routine and tests.
+
+Split entitlement locking from `lockPaymentAccessFacts` without changing that existing wrapper. Add a late helper that accepts already locked `PaymentPurchaseFacts`, discovers and validates the exact purchase grants, acquires every affected user/title scope advisory in canonical order, locks the global union of purchase and other affected-scope grants by grant ID, and revalidates purchase provenance after locking. Finalization calls `lockPaymentPurchaseFacts` before projection enrollment and financial closure, then calls the late entitlement helper; it never calls `lockPaymentAccessFacts`, locks a purchase grant before its scope, locks scopes piecemeal, or locks the purchase graph twice.
 
 Also move the private `planRefundAllocationComponents` algorithm from `refunds.ts` into `refund-allocation-components.ts` and make both ordinary refund handling and administrator finalization call the same pure planner. Characterize largest-remainder tie-breaking, subtotal/tax capacity, currency handling, and signed component totals before extraction; do not copy the formula into `finalize.ts`.
 
@@ -1837,6 +1853,7 @@ Use native `prepareFinalize` to produce the server preview and native `confirmFi
 ```powershell
 npx vitest run src/lib/server/commerce/refund-access.test.ts src/lib/server/commerce/refund-allocation-components.test.ts src/lib/server/commerce/financial/refund-review/finalize.test.ts src/lib/server/commerce/refunds.test.ts src/lib/server/commerce/financial/sources/refund.test.ts src/lib/server/commerce/financial/issues.test.ts src/routes/admin/sales/refunds/refund-routes.test.ts src/lib/components/admin/RefundReview.test.ts
 npm run test:integration -- tests/integration/financial-refund-review.test.ts tests/integration/commerce-refunds.test.ts tests/integration/commerce-lock-order.test.ts tests/integration/financial-lock-order.test.ts
+npm run test:integration -- tests/integration/financial-admin-commands.test.ts
 ```
 
 Expected: FAIL because the finalization executor, routes, and confirmation UI do not exist yet.
@@ -1848,6 +1865,7 @@ Do not mutate a shared registry. Unit/integration tests pass the function direct
 ```powershell
 npx vitest run src/lib/server/commerce/refund-access.test.ts src/lib/server/commerce/refund-allocation-components.test.ts src/lib/server/commerce/financial/refund-review/finalize.test.ts src/lib/server/commerce/refunds.test.ts src/lib/server/commerce/financial/sources/refund.test.ts src/lib/server/commerce/financial/issues.test.ts src/routes/admin/sales/refunds/refund-routes.test.ts src/lib/components/admin/RefundReview.test.ts
 npm run test:integration -- tests/integration/financial-refund-review.test.ts tests/integration/commerce-refunds.test.ts tests/integration/commerce-lock-order.test.ts tests/integration/financial-lock-order.test.ts
+npm run test:integration -- tests/integration/financial-admin-commands.test.ts
 npm run check
 npm run lint
 git diff --check
@@ -1858,7 +1876,7 @@ Expected: all commands pass; finalization/result/audit/access/email are atomic a
 - [ ] **Step 9: Commit finalization**
 
 ```powershell
-git add src/lib/server/commerce/financial/refund-review/finalize.ts src/lib/server/commerce/financial/refund-review/finalize.test.ts src/routes/admin/sales/refunds/refund-routes.test.ts src/lib/components/admin/RefundAllocationEditor.svelte src/lib/components/admin/FinancialActionConfirmation.svelte src/lib/components/admin/RefundReview.test.ts tests/integration/financial-refund-review.test.ts tests/integration/financial-lock-order.test.ts
+git add src/lib/server/commerce/financial/admin-commands/handler.ts src/lib/server/commerce/financial/admin-commands/handler.test.ts src/lib/server/commerce/financial/refund-review/drafts.test.ts src/lib/server/commerce/financial/refund-review/finalize.ts src/lib/server/commerce/financial/refund-review/finalize.test.ts src/lib/server/commerce/reconciliation.ts src/routes/admin/sales/refunds/refund-routes.test.ts src/lib/components/admin/RefundAllocationEditor.svelte src/lib/components/admin/FinancialActionConfirmation.svelte src/lib/components/admin/RefundReview.test.ts tests/integration/financial-admin-commands.test.ts tests/integration/financial-refund-review.test.ts tests/integration/commerce-lock-order.test.ts tests/integration/financial-lock-order.test.ts
 git add -- ':(literal)src/routes/admin/sales/refunds/[refundId]/+page.server.ts' ':(literal)src/routes/admin/sales/refunds/[refundId]/+page.svelte'
 git diff --cached --check
 git commit -m "feat: finalize ambiguous refund allocations"
