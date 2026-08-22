@@ -34,6 +34,19 @@ export interface RefundDraftDiscardSubmission {
   readonly command: Extract<FinancialAdminPrivateCommand, { kind: 'refund_draft_discard' }>;
 }
 
+export interface RefundFinalizationPrepareInput {
+  readonly refundId: string;
+  readonly expectedActiveDraftVersion: number;
+}
+
+export interface RefundFinalizationSubmission {
+  readonly idempotencyKey: string;
+  readonly command: Extract<
+    FinancialAdminPrivateCommand,
+    { kind: 'refund_allocation_finalize' }
+  >;
+}
+
 export class RefundReviewInputError extends Error {
   readonly fieldKey: string | null;
 
@@ -198,6 +211,52 @@ export async function parseRefundDraftDiscardRequest(
       kind: 'refund_draft_discard',
       refundId: parsedRefundId,
       expectedActiveDraftVersion
+    })
+  };
+}
+
+export async function parseRefundFinalizationPrepareRequest(
+  request: Request,
+  refundId: string
+): Promise<RefundFinalizationPrepareInput> {
+  const input = await readForm(request);
+  exactKeys(input, new Set(['expectedActiveDraftVersion']));
+  return {
+    refundId: canonicalUuid(refundId),
+    expectedActiveDraftVersion: canonicalInteger(
+      exactlyOne(input, 'expectedActiveDraftVersion'),
+      1,
+      POSTGRES_INTEGER_MAX
+    )
+  };
+}
+
+export async function parseRefundFinalizationConfirmRequest(
+  request: Request,
+  refundId: string
+): Promise<RefundFinalizationSubmission> {
+  const input = await readForm(request);
+  exactKeys(input, new Set([
+    'idempotencyKey',
+    'expectedActiveDraftVersion',
+    'previewFingerprint',
+    'confirmation'
+  ]));
+  const idempotencyKey = canonicalUuid(exactlyOne(input, 'idempotencyKey'));
+  const confirmation = exactlyOne(input, 'confirmation');
+  if (confirmation !== 'finalize_refund_allocation') return invalidInput();
+  return {
+    idempotencyKey,
+    command: privateCommand({
+      kind: 'refund_allocation_finalize',
+      refundId: canonicalUuid(refundId),
+      expectedActiveDraftVersion: canonicalInteger(
+        exactlyOne(input, 'expectedActiveDraftVersion'),
+        1,
+        POSTGRES_INTEGER_MAX
+      ),
+      previewFingerprint: exactlyOne(input, 'previewFingerprint'),
+      confirmation
     })
   };
 }
