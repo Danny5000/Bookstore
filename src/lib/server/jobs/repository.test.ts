@@ -559,6 +559,12 @@ describe('job claim policy', () => {
     expect(candidateSelection.sql.match(
       /jobs\.run_at <= pg_catalog\.clock_timestamp\(\)/gu
     )).toHaveLength(2);
+    // The four occurrences are only the pending/running database-clock routing
+    // equality/inequality branches above. Any fifth occurrence would put this
+    // local command behind a provider or projection-readiness predicate.
+    expect(candidateSelection.params.filter((value) => value === FINANCIAL_ADMIN_JOB))
+      .toHaveLength(4);
+    expect(candidateSelection.params).toContain(false);
     expect(candidateSelection.sql).not.toContain(
       "jobs.locked_at <= pg_catalog.clock_timestamp() -"
     );

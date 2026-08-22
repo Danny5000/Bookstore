@@ -17,6 +17,23 @@ import {
   type FinancialRouteFailure
 } from './route-support';
 
+const routeMocks = vi.hoisted(() => ({
+  database: {},
+  getFinancialAdminCommandStatus: vi.fn()
+}));
+
+vi.mock('$lib/server/db/runtime', () => ({
+  getDatabaseClient: () => ({ db: routeMocks.database })
+}));
+vi.mock('$lib/server/config', () => ({
+  getApplicationConfig: () => ({ origin: 'https://books.example.test' })
+}));
+vi.mock('$lib/server/commerce/financial/admin-commands/repository', () => ({
+  getFinancialAdminCommandStatus: routeMocks.getFinancialAdminCommandStatus
+}));
+
+import { GET as getFinancialAdminCommand } from './commands/[commandId]/+server';
+
 const admin: Actor = { type: 'user', id: randomUUID(), roles: ['admin'] };
 
 describe('financial route authorization', () => {
@@ -166,5 +183,174 @@ describe('financial route failure mapping', () => {
     for (const cause of causes) {
       expect(JSON.stringify(financialActionFailure(cause))).not.toContain(unsafe);
     }
+  });
+});
+
+describe('financial administrator command status route', () => {
+  it('authorizes the same-origin GET before reading its path parameter', async () => {
+    const commandIdGetter = vi.fn(() => 'private-path-value');
+    const params = {} as Record<string, string>;
+    Object.defineProperty(params, 'commandId', {
+      enumerable: true,
+      get: commandIdGetter
+    });
+
+    const response = await getFinancialAdminCommand({
+      locals: { actor: { type: 'anonymous' } },
+      params,
+      request: new Request('https://books.example.test/admin/sales/commands/private')
+    } as never);
+
+    expect(response.status).toBe(401);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(commandIdGetter).not.toHaveBeenCalled();
+    expect(routeMocks.getFinancialAdminCommandStatus).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { headers: { origin: 'https://evil.example.test' }, label: 'foreign origin' },
+    { headers: { 'sec-fetch-site': 'cross-site' }, label: 'cross-site fetch metadata' },
+    { headers: { 'sec-fetch-site': 'same-site' }, label: 'sibling-site fetch metadata' }
+  ])('rejects $label before parsing a command identity', async ({ headers }) => {
+    const commandIdGetter = vi.fn(() => 'private-path-value');
+    const params = {} as Record<string, string>;
+    Object.defineProperty(params, 'commandId', {
+      enumerable: true,
+      get: commandIdGetter
+    });
+
+    const response = await getFinancialAdminCommand({
+      locals: { actor: admin },
+      params,
+      request: new Request('https://books.example.test/admin/sales/commands/private', {
+        headers
+      })
+    } as never);
+
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ status: 403, code: 'forbidden' });
+    expect(commandIdGetter).not.toHaveBeenCalled();
+    expect(routeMocks.getFinancialAdminCommandStatus).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {},
+    { origin: 'https://books.example.test' },
+    { 'sec-fetch-site': 'same-origin' },
+    { 'sec-fetch-site': 'none' }
+  ])('admits ordinary same-origin GET evidence %j', async (headers) => {
+    routeMocks.getFinancialAdminCommandStatus.mockResolvedValueOnce(null);
+    const commandId = '00000000-0000-4000-8000-000000004100';
+    const response = await getFinancialAdminCommand({
+      locals: { actor: admin },
+      params: { commandId },
+      request: new Request(`https://books.example.test/admin/sales/commands/${commandId}`, {
+        headers
+      })
+    } as never);
+    expect(response.status).toBe(404);
+    expect(routeMocks.getFinancialAdminCommandStatus).toHaveBeenCalledWith(
+      routeMocks.database,
+      admin,
+      commandId
+    );
+  });
+
+  it('uses configured application origin instead of Host-derived request authority', async () => {
+    routeMocks.getFinancialAdminCommandStatus.mockResolvedValueOnce(null);
+    const commandId = '00000000-0000-4000-8000-000000004109';
+    const response = await getFinancialAdminCommand({
+      locals: { actor: admin },
+      params: { commandId },
+      request: new Request(`https://host-header-canary.test/admin/sales/commands/${commandId}`, {
+        headers: { origin: 'https://books.example.test' }
+      })
+    } as never);
+    expect(response.status).toBe(404);
+    expect(routeMocks.getFinancialAdminCommandStatus).toHaveBeenCalledWith(
+      routeMocks.database,
+      admin,
+      commandId
+    );
+  });
+
+  it('returns only a reparsed safe DTO with no-store caching', async () => {
+    const commandId = '00000000-0000-4000-8000-000000004101';
+    const refundId = '00000000-0000-4000-8000-000000004102';
+    routeMocks.getFinancialAdminCommandStatus.mockResolvedValueOnce({
+      commandId,
+      kind: 'refund_draft_save',
+      status: 'succeeded',
+      resultCode: 'draft_saved',
+      result: { refundId, draftVersion: 2, changed: true },
+      createdAt: '2026-08-22T12:00:00.000Z',
+      updatedAt: '2026-08-22T12:01:00.000Z',
+      completedAt: '2026-08-22T12:01:00.000Z'
+    });
+
+    const response = await getFinancialAdminCommand({
+      locals: { actor: admin },
+      params: { commandId },
+      request: new Request(`https://books.example.test/admin/sales/commands/${commandId}`)
+    } as never);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(response.headers.get('content-type')).toBe('application/json; charset=utf-8');
+    const body = await response.json();
+    expect(body).toEqual({
+      commandId,
+      kind: 'refund_draft_save',
+      status: 'succeeded',
+      resultCode: 'draft_saved',
+      result: { refundId, draftVersion: 2, changed: true },
+      createdAt: '2026-08-22T12:00:00.000Z',
+      updatedAt: '2026-08-22T12:01:00.000Z',
+      completedAt: '2026-08-22T12:01:00.000Z'
+    });
+    expect(JSON.stringify(body)).not.toMatch(
+      /jobId|payload|attempts|last_error|privateInput|actorId|internalError/iu
+    );
+    expect(routeMocks.getFinancialAdminCommandStatus).toHaveBeenCalledWith(
+      routeMocks.database,
+      admin,
+      commandId
+    );
+  });
+
+  it('maps malformed, missing, and foreign command identities to the same safe 404', async () => {
+    const malformed = await getFinancialAdminCommand({
+      locals: { actor: admin },
+      params: { commandId: 'PRIVATE-malformed-command' },
+      request: new Request('https://books.example.test/admin/sales/commands/malformed')
+    } as never);
+    expect(malformed.status).toBe(404);
+    expect(await malformed.json()).toEqual({ status: 404, code: 'not_found' });
+    expect(routeMocks.getFinancialAdminCommandStatus).not.toHaveBeenCalled();
+
+    routeMocks.getFinancialAdminCommandStatus.mockResolvedValueOnce(null);
+    const absent = await getFinancialAdminCommand({
+      locals: { actor: admin },
+      params: { commandId: '00000000-0000-4000-8000-000000004103' },
+      request: new Request('https://books.example.test/admin/sales/commands/missing')
+    } as never);
+    expect(absent.status).toBe(404);
+    expect(await absent.json()).toEqual({ status: 404, code: 'not_found' });
+  });
+
+  it('maps a protected repository failure to a detail-free 503', async () => {
+    routeMocks.getFinancialAdminCommandStatus.mockRejectedValueOnce(
+      new Error('private protected routine output')
+    );
+    const commandId = '00000000-0000-4000-8000-000000004104';
+    const response = await getFinancialAdminCommand({
+      locals: { actor: admin },
+      params: { commandId },
+      request: new Request(`https://books.example.test/admin/sales/commands/${commandId}`)
+    } as never);
+    expect(response.status).toBe(503);
+    const body = await response.json();
+    expect(body).toEqual({ status: 503, code: 'temporarily_unavailable' });
+    expect(JSON.stringify(body)).not.toContain('private protected routine output');
   });
 });
