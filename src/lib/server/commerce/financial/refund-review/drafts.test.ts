@@ -352,6 +352,42 @@ describe('worker-executed shared refund draft commands', () => {
     )).rejects.toMatchObject({ safeCode: 'stale_state' });
   });
 
+  it('rejects exhausted draft versions before save or discard writes', async () => {
+    const exhausted = activeFacts({
+      refundDrafts: [{
+        id: DRAFT_ID,
+        refundId: REFUND_ID,
+        state: 'active',
+        version: 2_147_483_647,
+        createdByAdminId: ADMIN_ID,
+        updatedByAdminId: ADMIN_ID,
+        createdCorrelationId: 'draft-created',
+        updatedCorrelationId: 'draft-updated'
+      }]
+    });
+
+    collaborators.lockPurchaseFacts.mockResolvedValueOnce(exhausted);
+    const save = fakeTransaction();
+    await expect(executeRefundDraftSave(
+      context(save.transaction),
+      saveCommand({ expectedVersion: 2_147_483_647 })
+    )).rejects.toMatchObject({ safeCode: 'stale_state' });
+    expect(save.statements.some((statement) =>
+      statement.includes('update refund_allocation_drafts')
+    )).toBe(false);
+
+    collaborators.lockPurchaseFacts.mockResolvedValueOnce(exhausted);
+    const discard = fakeTransaction();
+    await expect(executeRefundDraftDiscard(context(discard.transaction), {
+      kind: 'refund_draft_discard',
+      refundId: REFUND_ID,
+      expectedActiveDraftVersion: 2_147_483_647
+    })).rejects.toMatchObject({ safeCode: 'stale_state' });
+    expect(discard.statements.some((statement) =>
+      statement.includes('update refund_allocation_drafts')
+    )).toBe(false);
+  });
+
   it('rejects a snapshot whose complete total does not equal the succeeded refund', async () => {
     const database = fakeTransaction();
 

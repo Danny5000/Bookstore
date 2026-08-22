@@ -453,6 +453,7 @@ export async function executeRefundDraftSave(
   if (!snapshotChanged(currentSnapshot, snapshot)) {
     return { refundId: command.refundId, draftVersion: activeDraft.version, changed: false };
   }
+  if (activeDraft.version >= 2_147_483_647) return staleState();
   await upsertSnapshotItems(context.transaction, activeDraft.id, snapshot);
   const nextDraft = parseOne(draftWriteSchema, await executeRows(context.transaction, sql`
     update refund_allocation_drafts set version = version + 1,
@@ -501,6 +502,7 @@ export async function executeRefundDraftDiscard(
     return staleState();
   }
   exactActiveSnapshot(prepared.facts, activeDraft, prepared.activeDraftItems);
+  if (activeDraft.version >= 2_147_483_647) return staleState();
   throwIfAborted(context.signal);
   const nextDraft = parseOne(draftWriteSchema, await executeRows(context.transaction, sql`
     update refund_allocation_drafts set state = 'discarded', version = version + 1,

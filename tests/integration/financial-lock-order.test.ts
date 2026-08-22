@@ -1,17 +1,21 @@
 import { randomUUID } from 'node:crypto';
-import { and, asc, eq, sql } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import type { PoolClient } from 'pg';
 import { describe, expect, it } from 'vitest';
 import { appendClassificationDecisionLocked } from '$lib/server/commerce/financial/classification';
 import { FINANCIAL_CLASSIFIER_VERSION } from '$lib/server/commerce/financial/constants';
+import { FinancialAdminConflictError } from '$lib/server/commerce/financial/admin-commands/handler';
 import { stageBalanceTransaction } from '$lib/server/commerce/financial/ledger';
 import {
   lockFinancialProjectionRows,
   lockPayoutImportRows,
   type FinancialProjectionLockInput
 } from '$lib/server/commerce/financial/locks';
-import { setPreservedGrantState } from '$lib/server/commerce/grants';
-import { lockEntitlementScopes, lockOrder } from '$lib/server/commerce/lock';
+import {
+  lockFinancialProjectionAuthority
+} from '$lib/server/commerce/financial/rebase';
+import { executeRefundAllocationFinalize } from '$lib/server/commerce/financial/refund-review/finalize';
+import { lockOrder } from '$lib/server/commerce/lock';
 import { lockPaymentPurchaseFacts } from '$lib/server/commerce/reconciliation';
 import {
   entitlementGrants,
@@ -61,6 +65,23 @@ interface Blocker {
   readonly client: PoolClient;
   readonly pid: number;
   released: boolean;
+}
+
+interface RefundFinalizationProbeSnapshot {
+  readonly refund_status: string;
+  readonly allocation_status: string;
+  readonly financial_evidence_status: string;
+  readonly refund_updated_at: string;
+  readonly draft_count: number;
+  readonly allocation_count: number;
+  readonly component_count: number;
+  readonly effect_count: number;
+  readonly grant_state: string;
+  readonly grant_updated_at: string;
+  readonly entitlement_states: string;
+  readonly issue_states: string;
+  readonly audit_count: number;
+  readonly outbox_count: number;
 }
 
 function deferred<T>(): Deferred<T> {
@@ -318,6 +339,59 @@ async function createPurchaseFixture(sourceId: string): Promise<PurchaseFixture>
   };
 }
 
+async function readRefundFinalizationProbeSnapshot(
+  purchase: PurchaseFixture,
+  commandId: string
+): Promise<RefundFinalizationProbeSnapshot> {
+  const result = await ownerDatabaseClient.pool.query<RefundFinalizationProbeSnapshot>(`
+    select refund.status::text as refund_status,
+      refund.allocation_status::text as allocation_status,
+      refund.financial_evidence_status::text as financial_evidence_status,
+      refund.updated_at::text as refund_updated_at,
+      (select count(*)::integer from refund_allocation_drafts draft
+        where draft.refund_id = refund.id) as draft_count,
+      (select count(*)::integer from refund_allocations allocation
+        where allocation.refund_id = refund.id) as allocation_count,
+      (select count(*)::integer from refund_allocation_components component
+        where component.refund_id = refund.id) as component_count,
+      (select count(*)::integer from refund_allocation_finalization_effects effect
+        where effect.refund_id = refund.id) as effect_count,
+      (select grant_row.state::text from entitlement_grants grant_row
+        where grant_row.id = $2) as grant_state,
+      (select grant_row.updated_at::text from entitlement_grants grant_row
+        where grant_row.id = $2) as grant_updated_at,
+      coalesce((select string_agg(
+        entitlement.id::text || ':' || entitlement.revoked_at::text,
+        ',' order by entitlement.id
+      ) from entitlements entitlement
+        where entitlement.user_id = $3 and entitlement.title_id = $4), '')
+        as entitlement_states,
+      coalesce((select string_agg(
+        issue.id::text || ':' || issue.state::text || ':' || issue.occurrence_count::text,
+        ',' order by issue.id
+      ) from financial_reconciliation_issues issue
+        where issue.resource_type = 'refund' and issue.resource_id = refund.id), '')
+        as issue_states,
+      (select count(*)::integer from audit_events audit
+        where audit.action = 'financial.refund_allocation.finalized'
+          and audit.resource_id = refund.id::text) as audit_count,
+      (select count(*)::integer from outbox_messages message
+        where message.deduplication_key = $5) as outbox_count
+    from refunds refund where refund.id = $1
+  `, [
+    purchase.refundId,
+    purchase.grantId,
+    purchase.userId,
+    purchase.titleId,
+    `commerce:access-change:event:${commandId}:v1`
+  ]);
+  const row = result.rows[0];
+  if (!row || result.rows.length !== 1) {
+    throw new Error('Expected one refund finalization probe snapshot');
+  }
+  return row;
+}
+
 async function createPayoutFixture(
   balanceTransactionIds: readonly string[],
   publishMemberships: boolean,
@@ -377,8 +451,7 @@ async function lockPurchaseFinancialProjection(
   applicationName: string,
   purchase: PurchaseFixture,
   input: FinancialProjectionLockInput,
-  entered?: Deferred<number>,
-  lockEntitlement = false
+  entered?: Deferred<number>
 ): Promise<void> {
   await databaseClient.db.transaction(async (tx) => {
     await configureProbe(tx, applicationName, entered);
@@ -388,17 +461,52 @@ async function lockPurchaseFinancialProjection(
     if (!order || !payment) throw new Error('Expected purchase graph roots');
     await lockPaymentPurchaseFacts(tx, payment, order);
     await lockFinancialProjectionRows(tx, input);
-    if (lockEntitlement) {
-      await lockEntitlementScopes(tx, [{ userId: purchase.userId, titleId: purchase.titleId }]);
-      await tx.select({ id: entitlementGrants.id })
-        .from(entitlementGrants)
-        .where(and(
-          eq(entitlementGrants.userId, purchase.userId),
-          eq(entitlementGrants.titleId, purchase.titleId)
-        ))
-        .orderBy(asc(entitlementGrants.id))
-        .for('update');
-    }
+  });
+}
+
+async function executeRefundFinalizationProbe(
+  applicationName: string,
+  purchase: PurchaseFixture,
+  commandId: string,
+  entered?: Deferred<number>
+): Promise<'not_eligible'> {
+  try {
+    await databaseClient.db.transaction(async (transaction) => {
+      await configureProbe(transaction, applicationName, entered);
+      await executeRefundAllocationFinalize({
+        transaction,
+        commandId,
+        actor: { type: 'user', id: purchase.userId, roles: ['admin'] },
+        correlationId: `financial-lock-finalization-${commandId}`,
+        signal: new AbortController().signal,
+        enqueueAccessChange: async () => {
+          throw new Error('Ineligible finalization lock probe must not enqueue email');
+        }
+      }, {
+        kind: 'refund_allocation_finalize',
+        refundId: purchase.refundId,
+        expectedActiveDraftVersion: 1,
+        previewFingerprint: 'e'.repeat(64),
+        confirmation: 'finalize_refund_allocation'
+      });
+    });
+  } catch (error) {
+    if (
+      error instanceof FinancialAdminConflictError &&
+      error.safeCode === 'not_eligible'
+    ) return error.safeCode;
+    throw error;
+  }
+  throw new Error('Ineligible finalization lock probe unexpectedly succeeded');
+}
+
+async function lockProjectionAuthority(
+  applicationName: string,
+  entered: Deferred<number>
+): Promise<void> {
+  await databaseClient.db.transaction(async (tx) => {
+    await configureProbe(tx, applicationName, entered);
+    await lockFinancialProjectionAuthority(tx);
   });
 }
 
@@ -451,23 +559,6 @@ async function publishPayout(
       payoutId: payout.payoutId,
       runId: payout.runId,
       expectedGeneration: payout.generation
-    });
-  });
-}
-
-async function mutateEntitlement(
-  applicationName: string,
-  purchase: PurchaseFixture,
-  entered: Deferred<number>
-): Promise<void> {
-  await databaseClient.db.transaction(async (tx) => {
-    await configureProbe(tx, applicationName, entered);
-    await setPreservedGrantState(tx, {
-      userId: purchase.userId,
-      titleId: purchase.titleId,
-      active: true,
-      stateReason: 'financial_lock_probe',
-      now: fixtureTime
     });
   });
 }
@@ -651,7 +742,77 @@ describe.each(LOCK_PROBE_REPETITIONS)('financial lock ordering (repetition %i)',
     }
   }, 15_000);
 
-  it('lets entitlement mutation complete while refund projection is still waiting on its financial rows', async () => {
+  it('locks active projection authority before the finalization order graph', async () => {
+    const purchase = await createPurchaseFixture(`ch_finalize_authority_${randomUUID()}`);
+    const refundSource = snapshot({
+      sourceFamily: 'refund',
+      sourceId: purchase.stripeRefundId,
+      amountMinor: -100,
+      feeMinor: 0
+    });
+    await stageBalanceTransaction(databaseClient.db, refundSource, {
+      correlationId: 'locks-finalization-authority'
+    });
+    const commandId = randomUUID();
+    const before = await readRefundFinalizationProbeSnapshot(purchase, commandId);
+    const blocker = await beginBlocker(
+      probeName('finalize-order-blocker', purchase.orderId),
+      'select pg_advisory_xact_lock(hashtextextended($1, 0))',
+      [`pale-orbit:commerce:order:${purchase.orderId}`]
+    );
+    const finalizationName = probeName('finalize-authority', purchase.refundId);
+    const competingAuthorityName = probeName('projection-authority', purchase.paymentId);
+    const finalizationEntered = deferred<number>();
+    const authorityEntered = deferred<number>();
+    let finalization: Promise<'not_eligible'> | undefined;
+    let competingAuthority: Promise<void> | undefined;
+    try {
+      finalization = executeRefundFinalizationProbe(
+        finalizationName,
+        purchase,
+        commandId,
+        finalizationEntered
+      );
+      observe(finalization);
+      const finalizationPid = await finalizationEntered.promise;
+      expect(await waitForBlockedOperation(
+        finalization,
+        finalizationPid,
+        finalizationName,
+        'pg_advisory_xact_lock'
+      )).toContain(blocker.pid);
+
+      competingAuthority = lockProjectionAuthority(
+        competingAuthorityName,
+        authorityEntered
+      );
+      observe(competingAuthority);
+      const competingAuthorityPid = await authorityEntered.promise;
+      expect(await waitForBlockedOperation(
+        competingAuthority,
+        competingAuthorityPid,
+        competingAuthorityName,
+        'from financial_projection_versions'
+      )).toContain(finalizationPid);
+
+      await releaseBlocker(blocker);
+      const outcomes = await Promise.allSettled([finalization, competingAuthority]);
+      assertFulfilled(
+        ['refund finalization', 'competing projection authority'],
+        outcomes
+      );
+      expect(outcomes[0]).toEqual({ status: 'fulfilled', value: 'not_eligible' });
+      expect(await readRefundFinalizationProbeSnapshot(purchase, commandId)).toEqual(before);
+    } finally {
+      await releaseBlocker(blocker).catch(() => undefined);
+      await Promise.allSettled([
+        ...(finalization ? [finalization] : []),
+        ...(competingAuthority ? [competingAuthority] : [])
+      ]);
+    }
+  }, 15_000);
+
+  it('keeps finalization financial closure ahead of its late entitlement lock', async () => {
     const purchase = await createPurchaseFixture(`ch_refund_${randomUUID()}`);
     const refundSource = snapshot({
       sourceFamily: 'refund',
@@ -660,47 +821,69 @@ describe.each(LOCK_PROBE_REPETITIONS)('financial lock ordering (repetition %i)',
       feeMinor: 0
     });
     const staged = await stageBalanceTransaction(databaseClient.db, refundSource, { correlationId: 'locks-refund-entitlement' });
-    const blocker = await beginBlocker(
+    const commandId = randomUUID();
+    const before = await readRefundFinalizationProbeSnapshot(purchase, commandId);
+    const financialBlocker = await beginBlocker(
       probeName('refund-bt-blocker', purchase.refundId),
       'select id from stripe_balance_transactions where id = $1 for update',
       [staged.balanceTransactionId]
     );
-    const refundName = probeName('refund-projection', purchase.refundId);
-    const entitlementName = probeName('entitlement-mutation', purchase.grantId);
+    const refundName = probeName('refund-finalization', purchase.refundId);
     const refundEntered = deferred<number>();
-    const entitlementEntered = deferred<number>();
-    let refundProjection: Promise<void> | undefined;
-    let entitlementMutation: Promise<void> | undefined;
+    let refundFinalization: Promise<'not_eligible'> | undefined;
+    let scopeBlocker: Blocker | undefined;
+    let grantBlocker: Blocker | undefined;
     try {
-      refundProjection = lockPurchaseFinancialProjection(refundName, purchase, {
-        payoutGenerations: [],
-        balanceTransactionIds: [staged.balanceTransactionId],
-        classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
-        issueKeys: []
-      }, refundEntered, true);
-      observe(refundProjection);
+      refundFinalization = executeRefundFinalizationProbe(
+        refundName,
+        purchase,
+        commandId,
+        refundEntered
+      );
+      observe(refundFinalization);
       const refundPid = await refundEntered.promise;
-      expect(await waitForBlockedOperation(refundProjection,
+      expect(await waitForBlockedOperation(refundFinalization,
         refundPid,
         refundName,
         'from stripe_balance_transactions'
-      )).toContain(blocker.pid);
+      )).toContain(financialBlocker.pid);
 
-      entitlementMutation = mutateEntitlement(entitlementName, purchase, entitlementEntered);
-      observe(entitlementMutation);
-      await entitlementEntered.promise;
-      await expect(entitlementMutation).resolves.toBeUndefined();
-
-      await releaseBlocker(blocker);
-      assertFulfilled(
-        ['refund projection', 'entitlement mutation'],
-        await Promise.allSettled([refundProjection, entitlementMutation])
+      scopeBlocker = await beginBlocker(
+        probeName('refund-scope-blocker', purchase.grantId),
+        'select pg_advisory_xact_lock(hashtextextended($1, 0))',
+        [`pale-orbit:commerce:entitlement:${purchase.userId}:${purchase.titleId}`]
       );
+      grantBlocker = await beginBlocker(
+        probeName('refund-grant-blocker', purchase.grantId),
+        'select id from entitlement_grants where id = $1 for update',
+        [purchase.grantId]
+      );
+
+      await releaseBlocker(financialBlocker);
+      expect(await waitForBlockedOperation(
+        refundFinalization,
+        refundPid,
+        refundName,
+        'pg_advisory_xact_lock'
+      )).toContain(scopeBlocker.pid);
+
+      await releaseBlocker(scopeBlocker);
+      expect(await waitForBlockedOperation(
+        refundFinalization,
+        refundPid,
+        refundName,
+        'from "entitlement_grants"'
+      )).toContain(grantBlocker.pid);
+
+      await releaseBlocker(grantBlocker);
+      await expect(refundFinalization).resolves.toBe('not_eligible');
+      expect(await readRefundFinalizationProbeSnapshot(purchase, commandId)).toEqual(before);
     } finally {
-      await releaseBlocker(blocker).catch(() => undefined);
+      await releaseBlocker(financialBlocker).catch(() => undefined);
+      if (scopeBlocker) await releaseBlocker(scopeBlocker).catch(() => undefined);
+      if (grantBlocker) await releaseBlocker(grantBlocker).catch(() => undefined);
       await Promise.allSettled([
-        ...(refundProjection ? [refundProjection] : []),
-        ...(entitlementMutation ? [entitlementMutation] : [])
+        ...(refundFinalization ? [refundFinalization] : [])
       ]);
     }
   }, 15_000);
