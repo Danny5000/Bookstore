@@ -99,7 +99,8 @@ const migrationTimestamps = [
   1786793164447,
   1786810772351,
   1786823450867,
-  1787280731368
+  1787280731368,
+  1787414827000
 ] as const;
 const migrationJournal = [
   'id,hash,created_at',
@@ -507,18 +508,18 @@ describe('deployment checkpoint injected lifecycle runtime', () => {
     const copiedJournalRows = copiedJournal.trimEnd().split('\n');
     expect(copiedVerifier).toBe(sourceVerifier);
     expect(copiedVerifier.match(/plan6b-financial-catalog-v\d+/gu)).toEqual([
-      'plan6b-financial-catalog-v2'
+      'plan6b-financial-catalog-v3'
     ]);
     expect(copiedVerifier).not.toContain('plan6b-financial-catalog-v1');
     expect(/'0{64}'/u.test(copiedVerifier)).toBe(false);
     expect(copiedVerifier.includes('$catalog${}$catalog$')).toBe(false);
-    expect(copiedJournalRows).toHaveLength(14);
+    expect(copiedJournalRows).toHaveLength(15);
     expect(copiedJournalRows.at(-1)).toBe(
-      `13,${'c'.repeat(64)},${String(journal.entries.at(-1)?.when)}`
+      `14,${'d'.repeat(64)},${String(journal.entries.at(-1)?.when)}`
     );
     expect(journal.entries.at(-1)).toMatchObject({
-      idx: 12,
-      tag: '0012_plan6bii_admin_command_authority'
+      idx: 13,
+      tag: '0013_plan6bii_reporting_correction_authority'
     });
     expect(events.slice(-2)).toEqual(['seal', 'verify']);
     expect(runtime.calls.some((args) => args.includes('pg_dump'))).toBe(true);

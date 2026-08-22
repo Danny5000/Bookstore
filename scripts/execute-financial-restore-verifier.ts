@@ -58,10 +58,19 @@ const workerAuthorityMigrationPath = fileURLToPath(
 const adminCommandAuthorityMigrationPath = fileURLToPath(
   new URL('../drizzle/0012_plan6bii_admin_command_authority.sql', import.meta.url)
 );
-const [verifier, workerAuthorityMigration, adminCommandAuthorityMigration] = await Promise.all([
+const reportingCorrectionAuthorityMigrationPath = fileURLToPath(
+  new URL('../drizzle/0013_plan6bii_reporting_correction_authority.sql', import.meta.url)
+);
+const [
+  verifier,
+  workerAuthorityMigration,
+  adminCommandAuthorityMigration,
+  reportingCorrectionAuthorityMigration
+] = await Promise.all([
   readFile(verifierPath, 'utf8'),
   readFile(workerAuthorityMigrationPath, 'utf8'),
-  readFile(adminCommandAuthorityMigrationPath, 'utf8')
+  readFile(adminCommandAuthorityMigrationPath, 'utf8'),
+  readFile(reportingCorrectionAuthorityMigrationPath, 'utf8')
 ]);
 const verifierLines = verifier.split(/\r?\n/u);
 const allowedMetaCommands = ['\\set ON_ERROR_STOP on', '\\set QUIET on'];
@@ -158,6 +167,27 @@ function requiredWorkerAuthorityStatement(witnessName: string, prefix: string): 
     throw new Error(`[restore-verifier] expected one canonical ${witnessName} statement`);
   }
   const statement = workerAuthorityMigration.slice(start, end);
+  if (!statement.startsWith(prefix) || statement.includes('\0')) {
+    throw new Error(`[restore-verifier] unsafe canonical ${witnessName} statement`);
+  }
+  return statement;
+}
+
+function requiredReportingCorrectionAuthorityStatement(
+  witnessName: string,
+  prefix: string
+): string {
+  const start = reportingCorrectionAuthorityMigration.indexOf(prefix);
+  const endMarker = ';--> statement-breakpoint';
+  const end = reportingCorrectionAuthorityMigration.indexOf(endMarker, start);
+  if (
+    start < 0 ||
+    end < 0 ||
+    reportingCorrectionAuthorityMigration.indexOf(prefix, start + prefix.length) >= 0
+  ) {
+    throw new Error(`[restore-verifier] expected one canonical ${witnessName} statement`);
+  }
+  const statement = reportingCorrectionAuthorityMigration.slice(start, end);
   if (!statement.startsWith(prefix) || statement.includes('\0')) {
     throw new Error(`[restore-verifier] unsafe canonical ${witnessName} statement`);
   }
@@ -303,6 +333,22 @@ const financialWorkerResolveGrantStatement = requiredAdminCommandAuthorityStatem
   'financial worker resolve grant',
   'GRANT EXECUTE ON FUNCTION "public"."resolve_financial_issue_after_admin_command"(uuid,uuid)'
 );
+const reportingCorrectionResolveFunctionStatement = canonicalReplaceFunctionStatement(
+  requiredReportingCorrectionAuthorityStatement(
+    'reporting-correction resolver',
+    'CREATE FUNCTION "public"."resolve_financial_issue_after_reporting_correction_command"(uuid,uuid)'
+  )
+);
+const reportingCorrectionResolveRevokeStatement =
+  requiredReportingCorrectionAuthorityStatement(
+    'reporting-correction resolver revoke',
+    'REVOKE ALL ON FUNCTION "public"."resolve_financial_issue_after_reporting_correction_command"(uuid,uuid)'
+  );
+const reportingCorrectionResolveGrantStatement =
+  requiredReportingCorrectionAuthorityStatement(
+    'reporting-correction resolver grant',
+    'GRANT EXECUTE ON FUNCTION "public"."resolve_financial_issue_after_reporting_correction_command"(uuid,uuid)'
+  );
 const financialJobsRuntimeSelectRevokeStatement = requiredAdminCommandAuthorityStatement(
   'financial jobs runtime select revoke',
   'REVOKE SELECT ON TABLE "public"."jobs" FROM "pale_orbit_runtime"'
@@ -1542,6 +1588,154 @@ async function exerciseFinancialAdminCatalogWitnesses(
   );
   await pool.query(financialWorkerResolveGrantStatement);
   await expectPass('missing worker financial routine EXECUTE repair', true);
+
+  await pool.query(`
+    drop function public.resolve_financial_issue_after_reporting_correction_command(uuid,uuid)
+  `);
+  await expectRejection(
+    'missing reporting-correction resolver',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(reportingCorrectionResolveFunctionStatement);
+  await pool.query(reportingCorrectionResolveRevokeStatement);
+  await pool.query(reportingCorrectionResolveGrantStatement);
+  await expectPass('missing reporting-correction resolver repair', true);
+
+  await pool.query(`
+    create function public.resolve_financial_issue_after_reporting_correction_command(uuid,text)
+    returns setof public.financial_reconciliation_issues language sql security definer
+    set search_path = 'pg_catalog'
+    as 'select issue.* from public.financial_reconciliation_issues issue where false';
+    revoke all on function
+      public.resolve_financial_issue_after_reporting_correction_command(uuid,text)
+    from public, pale_orbit_runtime, pale_orbit_financial_worker,
+      pale_orbit_storage_cleanup
+  `);
+  await expectRejection(
+    'excess reporting-correction resolver overload',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    drop function public.resolve_financial_issue_after_reporting_correction_command(uuid,text)
+  `);
+  await expectPass('excess reporting-correction resolver overload repair', true);
+
+  await pool.query(`
+    alter function public.resolve_financial_issue_after_reporting_correction_command(uuid,uuid)
+    owner to pale_orbit_financial_worker
+  `);
+  await expectRejection(
+    'reporting-correction resolver owner drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    alter function public.resolve_financial_issue_after_reporting_correction_command(uuid,uuid)
+    owner to ${databaseOwner}
+  `);
+  await pool.query(reportingCorrectionResolveFunctionStatement);
+  await pool.query(reportingCorrectionResolveRevokeStatement);
+  await pool.query(reportingCorrectionResolveGrantStatement);
+  await expectPass('reporting-correction resolver owner repair', true);
+
+  await pool.query(`
+    alter function public.resolve_financial_issue_after_reporting_correction_command(uuid,uuid)
+    security invoker
+  `);
+  await expectRejection(
+    'reporting-correction resolver security drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(reportingCorrectionResolveFunctionStatement);
+  await pool.query(reportingCorrectionResolveRevokeStatement);
+  await pool.query(reportingCorrectionResolveGrantStatement);
+  await expectPass('reporting-correction resolver security repair', true);
+
+  await pool.query(`
+    alter function public.resolve_financial_issue_after_reporting_correction_command(uuid,uuid)
+    set search_path = 'public'
+  `);
+  await expectRejection(
+    'reporting-correction resolver search_path drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(reportingCorrectionResolveFunctionStatement);
+  await pool.query(reportingCorrectionResolveRevokeStatement);
+  await pool.query(reportingCorrectionResolveGrantStatement);
+  await expectPass('reporting-correction resolver search_path repair', true);
+
+  await pool.query(`
+    create or replace function
+      public.resolve_financial_issue_after_reporting_correction_command(uuid,uuid)
+    returns setof public.financial_reconciliation_issues language sql security definer
+    set search_path = 'pg_catalog'
+    as 'select issue.* from public.financial_reconciliation_issues issue where false'
+  `);
+  await expectRejection(
+    'reporting-correction resolver definition drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(reportingCorrectionResolveFunctionStatement);
+  await pool.query(reportingCorrectionResolveRevokeStatement);
+  await pool.query(reportingCorrectionResolveGrantStatement);
+  await expectPass('reporting-correction resolver definition repair', true);
+
+  await pool.query(`
+    grant execute on function
+      public.resolve_financial_issue_after_reporting_correction_command(uuid,uuid)
+    to public
+  `);
+  await expectRejectionChecks(
+    'PUBLIC reporting-correction resolver EXECUTE',
+    [
+      'financial_schema_object_manifest=1',
+      'storage_cleanup_effective_authority=1'
+    ]
+  );
+  await pool.query(reportingCorrectionResolveRevokeStatement);
+  await pool.query(reportingCorrectionResolveGrantStatement);
+  await expectPass('PUBLIC reporting-correction resolver EXECUTE repair', true);
+
+  await pool.query(`
+    grant execute on function
+      public.resolve_financial_issue_after_reporting_correction_command(uuid,uuid)
+    to pale_orbit_runtime
+  `);
+  await expectRejection(
+    'runtime reporting-correction resolver EXECUTE',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(reportingCorrectionResolveRevokeStatement);
+  await pool.query(reportingCorrectionResolveGrantStatement);
+  await expectPass('runtime reporting-correction resolver EXECUTE repair', true);
+
+  await pool.query(`
+    grant execute on function
+      public.resolve_financial_issue_after_reporting_correction_command(uuid,uuid)
+    to ${webLogin}
+  `);
+  await expectRejection(
+    'direct-login reporting-correction resolver EXECUTE',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    revoke execute on function
+      public.resolve_financial_issue_after_reporting_correction_command(uuid,uuid)
+    from ${webLogin}
+  `);
+  await expectPass('direct-login reporting-correction resolver EXECUTE repair', true);
+
+  await pool.query(`
+    grant execute on function
+      public.resolve_financial_issue_after_reporting_correction_command(uuid,uuid)
+    to pale_orbit_financial_worker with grant option
+  `);
+  await expectRejection(
+    'reporting-correction resolver worker grant-option drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(reportingCorrectionResolveRevokeStatement);
+  await pool.query(reportingCorrectionResolveGrantStatement);
+  await expectPass('reporting-correction resolver worker grant-option repair', true);
 
   await pool.query(`
     alter function public.financial_admin_command_status(uuid,uuid)

@@ -4,6 +4,7 @@ import type { SQL } from 'drizzle-orm';
 import {
   observeFinancialIssue,
   resolveFinancialIssueAfterAdminCommand,
+  resolveFinancialIssueAfterReportingCorrectionCommand,
   resolveFinancialIssueAfterRecompute,
   type FinancialIssueRow
 } from './issues';
@@ -253,6 +254,31 @@ describe('financial issue lifecycle', () => {
     expect(transition.sql).toContain('resolve_financial_issue_after_admin_command');
     expect(transition.sql).not.toContain('resolve_financial_issue_after_worker_recompute');
     expect(transition.sql).not.toContain('resolve_financial_reconciliation_issue');
+    expect(transition.sql).not.toContain('update financial_reconciliation_issues');
+    expect(transition.params).toEqual([COMMAND_ID, ISSUE_ID]);
+  });
+
+  it('uses only the reporting-correction command boundary for correction issue transitions', async () => {
+    const resolved = issue({
+      resourceType: 'refund',
+      state: 'resolved',
+      resolvedByAdminId: USER_ID,
+      resolvedAt: new Date('2026-08-12T00:02:00.000Z')
+    });
+    const database = executor([[resolved]]);
+
+    await expect(resolveFinancialIssueAfterReportingCorrectionCommand(database.tx, {
+      commandId: COMMAND_ID,
+      issueId: ISSUE_ID
+    })).resolves.toEqual(resolved);
+
+    expect(database.calls).toHaveLength(1);
+    const transition = rendered(database.calls[0]!);
+    expect(transition.sql).toContain(
+      'resolve_financial_issue_after_reporting_correction_command'
+    );
+    expect(transition.sql).not.toContain('resolve_financial_issue_after_admin_command');
+    expect(transition.sql).not.toContain('resolve_financial_issue_after_worker_recompute');
     expect(transition.sql).not.toContain('update financial_reconciliation_issues');
     expect(transition.params).toEqual([COMMAND_ID, ISSUE_ID]);
   });

@@ -244,6 +244,82 @@ async function commandAndJob(commandId: string) {
 }
 
 describe("financial administrator command PostgreSQL lifecycle", () => {
+  it("confines reporting-correction issue resolution to a current claimed correction command", async () => {
+    const actor = await createAdministrator("correction-resolver-target");
+    const roleAdministrator = await createAdministrator(
+      "correction-resolver-role-authority",
+    );
+    const ordinary = await submitDraft(actor, draftCommand());
+    await expect(
+      workerDatabaseClient.pool.query(
+        `select id from
+          public.resolve_financial_issue_after_reporting_correction_command($1,$2)`,
+        [ordinary.commandId, randomUUID()],
+      ),
+    ).resolves.toMatchObject({ rows: [] });
+
+    const correctionCommand: Extract<
+      FinancialAdminPrivateCommand,
+      { kind: "refund_reporting_correction_create" }
+    > = {
+      kind: "refund_reporting_correction_create",
+      refundId: randomUUID(),
+      reason: "allocation_attribution_correction",
+      expectedNextCorrectionVersion: 1,
+      expectedBaseAllocationSetId: randomUUID(),
+      expectedSourceFingerprint: "8".repeat(64),
+      items: [{ orderItemId: randomUUID(), totalPresentmentMinor: 1 }],
+      previewFingerprint: "9".repeat(64),
+      confirmation: "create_reporting_correction",
+    };
+    const correction = await submitFinancialAdminCommand(databaseClient.db, {
+      actor,
+      idempotencyKey: randomUUID(),
+      command: correctionCommand,
+      context: { correlationId: `correction-resolver-${randomUUID()}` },
+    });
+    const issueId = randomUUID();
+    await expectPostgresCode(
+      databaseClient.pool.query(
+        `select * from
+          public.resolve_financial_issue_after_reporting_correction_command($1,$2)`,
+        [correction.commandId, issueId],
+      ),
+      "42501",
+    );
+    await expectPostgresCode(
+      workerDatabaseClient.pool.query(
+        `select * from
+          public.resolve_financial_issue_after_reporting_correction_command($1,$2)`,
+        [correction.commandId, issueId],
+      ),
+      "55000",
+    );
+
+    await setAdminRole(databaseClient.db, {
+      actor: roleAdministrator,
+      targetUserId: actor.id,
+      enabled: false,
+      correlationId: `correction-resolver-demotion-${randomUUID()}`,
+    });
+    await expectPostgresCode(
+      workerDatabaseClient.pool.query(
+        `select * from
+          public.resolve_financial_issue_after_reporting_correction_command($1,$2)`,
+        [correction.commandId, issueId],
+      ),
+      "42501",
+    );
+    await expect(
+      ownerDatabaseClient.pool.query(
+        `select count(*)::integer as count from audit_events
+         where action = 'financial.issue.resolved'
+           and "after" ->> 'commandId' = $1`,
+        [correction.commandId],
+      ),
+    ).resolves.toMatchObject({ rows: [{ count: 0 }] });
+  }, 15_000);
+
   it("submits atomically, replays idempotently, rejects conflicting fingerprints, and exposes only safe status", async () => {
     const actor = await createAdministrator("submission-owner");
     const otherActor = await createAdministrator("submission-foreign");

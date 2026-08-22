@@ -168,7 +168,7 @@ function partialStartupDocker(owned: OwnedRunManifest, state: FakeDockerState): 
 }
 
 describe('Plan 6B disposable upgrade database ownership', () => {
-  it('keeps historical rollback proofs while repaired and valid flows reach 0012 once', async () => {
+  it('keeps historical rollback proofs while repaired and valid flows reach 0013 once', async () => {
     const [journalText, fixture] = await Promise.all([
       readFile('drizzle/meta/_journal.json', 'utf8'),
       readFile('tests/integration/financial-migration.test.ts', 'utf8')
@@ -185,14 +185,14 @@ describe('Plan 6B disposable upgrade database ownership', () => {
     };
 
     expect(journal.entries.map(({ idx }) => idx)).toEqual(
-      Array.from({ length: 13 }, (_value, idx) => idx)
+      Array.from({ length: 14 }, (_value, idx) => idx)
     );
     expect(journal.entries.at(-1)).toEqual(expect.objectContaining({
-      idx: 12,
-      tag: '0012_plan6bii_admin_command_authority'
+      idx: 13,
+      tag: '0013_plan6bii_reporting_correction_authority'
     }));
     expect(fixture).toContain(
-      'async function createMigrationFolderThrough(maxMigrationIndex: 8 | 9 | 10 | 11 | 12)'
+      'maxMigrationIndex: 8 | 9 | 10 | 11 | 12 | 13'
     );
 
     const repairedHeadCall = 'await runRepairedFixtureThroughPlan6biiHead(pool';
@@ -227,12 +227,32 @@ describe('Plan 6B disposable upgrade database ownership', () => {
 
     const headHelper = block(
       'async function runRepairedFixtureThroughPlan6biiHead(',
+      'const REPORTING_CORRECTION_RESOLVER ='
+    );
+    expect(headHelper).toContain('createMigrationFolderThrough(13)');
+    expect(headHelper).toContain("equal(await migrationCount(pool), 14");
+    expect(headHelper.match(/runCommittedPlan6biiAttestedMigration\(/gu)).toHaveLength(4);
+    expect(headHelper).toContain('second 0012 migration pass is a no-op');
+    expect(headHelper).toContain('second 0013 migration pass is a no-op');
+
+    const correctionAuthorityHelper = block(
+      'const REPORTING_CORRECTION_RESOLVER =',
       'type Plan6biiIdentityPrepare ='
     );
-    expect(headHelper).toContain('createMigrationFolderThrough(12)');
-    expect(headHelper).toContain("equal(await migrationCount(pool), 13");
-    expect(headHelper.match(/runCommittedPlan6biiAttestedMigration\(/gu)).toHaveLength(2);
-    expect(headHelper).toContain('second 0012 migration pass is a no-op');
+    for (const witness of [
+      '0013 routine-name collision',
+      '0013 prerequisite owner drift',
+      '0013 prerequisite security drift',
+      '0013 prerequisite search_path drift',
+      '0013 prerequisite ACL drift',
+      '0013 issue-trigger drift'
+    ]) expect(correctionAuthorityHelper).toContain(witness);
+    expect(correctionAuthorityHelper).toContain(
+      'rollback leaves no 0013 resolver or ACL'
+    );
+    expect(correctionAuthorityHelper).toContain(
+      'a second 0013 migrator pass is a no-op'
+    );
   });
 
   it('refuses a foreign exact-name volume before Compose can mount or mutate it', async () => {

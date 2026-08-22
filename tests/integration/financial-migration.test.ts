@@ -217,7 +217,9 @@ function databasePool(): Pool {
   });
 }
 
-async function createMigrationFolderThrough(maxMigrationIndex: 8 | 9 | 10 | 11 | 12): Promise<string> {
+async function createMigrationFolderThrough(
+  maxMigrationIndex: 8 | 9 | 10 | 11 | 12 | 13
+): Promise<string> {
   const runId = process.env.PLAN6B_UPGRADE_RUN_ID;
   assert(runId && /^[a-f0-9]{16}$/u.test(runId), 'owned run ID is missing or invalid');
   const folder = join(
@@ -2968,6 +2970,7 @@ async function runRepairedFixtureThroughPlan6biiHead(
   await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(11) });
   equal(await migrationCount(pool), 12, `${fixture} reaches historical prerequisite 0011`);
   const migrationsThrough12 = await createMigrationFolderThrough(12);
+  const migrationsThrough13 = await createMigrationFolderThrough(13);
   try {
     await createPlan6biiAttestedRoles(pool, 0b111);
     await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough12);
@@ -2978,9 +2981,218 @@ async function runRepairedFixtureThroughPlan6biiHead(
       13,
       `${fixture} second 0012 migration pass is a no-op`
     );
+    await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough13);
+    equal(await migrationCount(pool), 14, `${fixture} reaches migration 0013 exactly once`);
+    await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough13);
+    equal(
+      await migrationCount(pool),
+      14,
+      `${fixture} second 0013 migration pass is a no-op`
+    );
   } finally {
     await dropPlan6biiAttestedRoles(pool);
   }
+}
+
+const REPORTING_CORRECTION_RESOLVER =
+  'public.resolve_financial_issue_after_reporting_correction_command(uuid,uuid)';
+
+interface ReportingCorrectionAuthorityState {
+  resolver_present: boolean;
+  resolver_name_count: number;
+  resolver_owner: string | null;
+  security_definer: boolean | null;
+  routine_config: string[] | null;
+  nonowner_acl: string[];
+}
+
+async function reportingCorrectionAuthorityState(
+  pool: Pool
+): Promise<ReportingCorrectionAuthorityState> {
+  return one<ReportingCorrectionAuthorityState>(
+    pool,
+    `select
+       pg_catalog.to_regprocedure($1) is not null as resolver_present,
+       (select pg_catalog.count(*)::integer
+        from pg_catalog.pg_proc routine
+        join pg_catalog.pg_namespace namespace_row
+          on namespace_row.oid = routine.pronamespace
+        where namespace_row.nspname = 'public'
+          and routine.proname =
+            'resolve_financial_issue_after_reporting_correction_command')
+         as resolver_name_count,
+       pg_catalog.pg_get_userbyid(routine.proowner) as resolver_owner,
+       routine.prosecdef as security_definer,
+       routine.proconfig as routine_config,
+       coalesce((
+         select pg_catalog.array_agg(
+           pg_catalog.concat_ws(':', grantee.rolname, acl.privilege_type,
+             acl.is_grantable::text)
+           order by grantee.rolname, acl.privilege_type, acl.is_grantable
+         )
+         from pg_catalog.aclexplode(
+           coalesce(routine.proacl,
+             pg_catalog.acldefault('f', routine.proowner))
+         ) acl
+         join pg_catalog.pg_roles grantee on grantee.oid = acl.grantee
+         where acl.grantee <> routine.proowner
+       ), array[]::text[]) as nonowner_acl
+     from (values (1)) singleton(value)
+     left join pg_catalog.pg_proc routine
+       on routine.oid = pg_catalog.to_regprocedure($1)`,
+    [REPORTING_CORRECTION_RESOLVER]
+  );
+}
+
+async function expectReportingCorrectionAuthorityFailure(
+  pool: Pool,
+  migrationsThrough13: string,
+  fixture: string,
+  reason: RegExp
+): Promise<void> {
+  equal(await migrationCount(pool), 13, `${fixture} begins at migration 0012`);
+  const before = await reportingCorrectionAuthorityState(pool);
+  equal(before.resolver_present, false, `${fixture} begins without the 0013 resolver`);
+  let rejected = false;
+  try {
+    await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough13);
+  } catch (error) {
+    rejected = true;
+    const postgresError = unwrapPostgresError(error);
+    assert(postgresError !== null, `${fixture} must expose its PostgreSQL error`);
+    equal(postgresError.code, '42501', `${fixture} must use insufficient privilege`);
+    assert(reason.test(postgresError.message), `${fixture} must identify its preflight invariant`);
+  }
+  assert(rejected, `${fixture} unexpectedly migrated`);
+  equal(await migrationCount(pool), 13, `${fixture} rollback leaves the journal at 0012`);
+  equal(
+    await reportingCorrectionAuthorityState(pool),
+    before,
+    `${fixture} rollback leaves no 0013 resolver or ACL`
+  );
+}
+
+async function assertReportingCorrectionAuthorityUpgrade(pool: Pool): Promise<void> {
+  const migrationsThrough13 = await createMigrationFolderThrough(13);
+
+  await pool.query(`
+    create function
+      public.resolve_financial_issue_after_reporting_correction_command(uuid,text)
+    returns void language plpgsql as 'begin return; end'
+  `);
+  await expectReportingCorrectionAuthorityFailure(
+    pool,
+    migrationsThrough13,
+    '0013 routine-name collision',
+    /reporting-correction authority name is already occupied/iu
+  );
+  await pool.query(`
+    drop function public.resolve_financial_issue_after_reporting_correction_command(uuid,text)
+  `);
+
+  await pool.query(`
+    alter function public.resolve_financial_issue_after_admin_command(uuid,uuid)
+    owner to pale_orbit_storage_cleanup
+  `);
+  await expectReportingCorrectionAuthorityFailure(
+    pool,
+    migrationsThrough13,
+    '0013 prerequisite owner drift',
+    /reporting-correction prerequisite (?:owner|authority) is not canonical/iu
+  );
+  await pool.query(`
+    alter function public.resolve_financial_issue_after_admin_command(uuid,uuid)
+    owner to current_user
+  `);
+  await pool.query(`
+    revoke all on function public.resolve_financial_issue_after_admin_command(uuid,uuid)
+    from public, pale_orbit_runtime, pale_orbit_financial_worker,
+      pale_orbit_storage_cleanup;
+    grant execute on function public.resolve_financial_issue_after_admin_command(uuid,uuid)
+    to pale_orbit_financial_worker
+  `);
+
+  await pool.query(`
+    alter function public.resolve_financial_issue_after_admin_command(uuid,uuid)
+    security invoker
+  `);
+  await expectReportingCorrectionAuthorityFailure(
+    pool,
+    migrationsThrough13,
+    '0013 prerequisite security drift',
+    /reporting-correction prerequisite authority is not canonical/iu
+  );
+  await pool.query(`
+    alter function public.resolve_financial_issue_after_admin_command(uuid,uuid)
+    security definer
+  `);
+
+  await pool.query(`
+    alter function public.resolve_financial_issue_after_admin_command(uuid,uuid)
+    set search_path = 'public'
+  `);
+  await expectReportingCorrectionAuthorityFailure(
+    pool,
+    migrationsThrough13,
+    '0013 prerequisite search_path drift',
+    /reporting-correction prerequisite authority is not canonical/iu
+  );
+  await pool.query(`
+    alter function public.resolve_financial_issue_after_admin_command(uuid,uuid)
+    set search_path = 'pg_catalog'
+  `);
+
+  await pool.query(`
+    grant execute on function
+      public.resolve_financial_issue_after_admin_command(uuid,uuid)
+    to pale_orbit_runtime
+  `);
+  await expectReportingCorrectionAuthorityFailure(
+    pool,
+    migrationsThrough13,
+    '0013 prerequisite ACL drift',
+    /reporting-correction prerequisite authority is not canonical/iu
+  );
+  await pool.query(`
+    revoke execute on function
+      public.resolve_financial_issue_after_admin_command(uuid,uuid)
+    from pale_orbit_runtime
+  `);
+
+  await pool.query(`
+    alter table public.financial_reconciliation_issues
+    disable trigger financial_reconciliation_issues_narrow_update
+  `);
+  await expectReportingCorrectionAuthorityFailure(
+    pool,
+    migrationsThrough13,
+    '0013 issue-trigger drift',
+    /reporting-correction prerequisite authority is not canonical/iu
+  );
+  await pool.query(`
+    alter table public.financial_reconciliation_issues
+    enable trigger financial_reconciliation_issues_narrow_update
+  `);
+
+  await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough13);
+  equal(await migrationCount(pool), 14, 'clean migration 0012 applies 0013 exactly once');
+  const installed = await reportingCorrectionAuthorityState(pool);
+  const databaseOwner = (await one<{ owner_name: string }>(
+    pool,
+    `select pg_catalog.pg_get_userbyid(database_row.datdba) as owner_name
+     from pg_catalog.pg_database database_row
+     where database_row.datname = pg_catalog.current_database()`
+  )).owner_name;
+  equal(installed, {
+    resolver_present: true,
+    resolver_name_count: 1,
+    resolver_owner: databaseOwner,
+    security_definer: true,
+    routine_config: ['search_path=pg_catalog'],
+    nonowner_acl: ['pale_orbit_financial_worker:EXECUTE:false']
+  }, '0013 installs one exact database-owner correction resolver with worker-only EXECUTE');
+  await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough13);
+  equal(await migrationCount(pool), 14, 'a second 0013 migrator pass is a no-op');
 }
 
 type Plan6biiIdentityPrepare = (context: {
@@ -4002,6 +4214,7 @@ async function assertPlan6biiAdminCommandAuthorityFixture(
   );
   await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough12);
   equal(await migrationCount(pool), 13, 'a second 0012 migrator pass is a no-op');
+  await assertReportingCorrectionAuthorityUpgrade(pool);
 }
 
 async function runValidFixture(pool: Pool): Promise<void> {

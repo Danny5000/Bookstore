@@ -956,6 +956,9 @@ describe('production database authority split', () => {
 
   it('pins Plan 6B-II command routines, runtime privacy, and worker transition authority', () => {
     const migration = source('drizzle/0012_plan6bii_admin_command_authority.sql');
+    const correctionMigration = source(
+      'drizzle/0013_plan6bii_reporting_correction_authority.sql'
+    );
     const provisioner = source('src/lib/server/db/database-role-provision.ts');
     const runtimeRoutines = [
       'submit_financial_admin_command(uuid,text,text,text,text,jsonb)',
@@ -982,6 +985,15 @@ describe('production database authority split', () => {
       expect(provisioner).toContain(`'public.${signature}'`);
       expect(migration).toContain(`TO "pale_orbit_financial_worker"`);
     }
+    const correctionResolver =
+      'resolve_financial_issue_after_reporting_correction_command(uuid,uuid)';
+    expect(provisioner).toContain(`'public.${correctionResolver}'`);
+    expect(correctionMigration).toContain(
+      `GRANT EXECUTE ON FUNCTION "public"."${correctionResolver.replace('(uuid,uuid)', '')}"(uuid,uuid) TO "pale_orbit_financial_worker"`
+    );
+    expect(correctionMigration).toContain(
+      `REVOKE ALL ON FUNCTION "public"."${correctionResolver.replace('(uuid,uuid)', '')}"(uuid,uuid) FROM PUBLIC, "pale_orbit_runtime", "pale_orbit_financial_worker", "pale_orbit_storage_cleanup"`
+    );
     expect(provisioner).toContain("'financial_admin_commands'");
     expect(provisioner).toContain("'financial_admin_job_claims'");
     expect(provisioner).toContain("'jobs:SELECT:id'");

@@ -253,6 +253,7 @@ const WORKER_EXECUTE_FUNCTIONS = [
   'public.register_commerce_claim_issuance(text,text,text,uuid,text,timestamp with time zone)',
   'public.purge_commerce_claim_issuances()',
   'public.resolve_financial_issue_after_admin_command(uuid,uuid)',
+  'public.resolve_financial_issue_after_reporting_correction_command(uuid,uuid)',
   'public.transition_administrative_recovery_grant_after_admin_command(uuid)'
 ] as const;
 

@@ -354,3 +354,28 @@ export async function resolveFinancialIssueAfterAdminCommand(
   if (resultRows.length === 0) return null;
   return adminResolvedIssueRow(resultRows[0], input.issueId);
 }
+
+export async function resolveFinancialIssueAfterReportingCorrectionCommand(
+  tx: DatabaseTransaction,
+  input: ResolveFinancialIssueAfterAdminCommandInput
+): Promise<FinancialIssueRow | null> {
+  assertAdminResolveInput(input);
+  const result = await tx.execute(sql`
+    select id, resource_type as "resourceType", resource_id as "resourceId",
+      safe_code as "safeCode", state, impact,
+      first_observed_at as "firstObservedAt", last_observed_at as "lastObservedAt",
+      occurrence_count as "occurrenceCount", correlation_id as "correlationId",
+      resolved_by_admin_id as "resolvedByAdminId", resolved_at as "resolvedAt"
+    from "public"."resolve_financial_issue_after_reporting_correction_command"(
+      ${input.commandId}, ${input.issueId}
+    )
+  `) as unknown;
+  if (!result || typeof result !== 'object' ||
+    !Array.isArray((result as SqlResult).rows) ||
+    ((result as SqlResult).rows?.length ?? 0) > 1) {
+    return invalidAdminTransition();
+  }
+  const resultRows = (result as SqlResult).rows ?? [];
+  if (resultRows.length === 0) return null;
+  return adminResolvedIssueRow(resultRows[0], input.issueId);
+}

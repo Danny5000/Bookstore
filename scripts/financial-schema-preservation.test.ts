@@ -85,6 +85,8 @@ const NARROW_UPDATE_GUARD_TABLES = [
 ] as const;
 
 const ADMIN_COMMAND_MIGRATION = '../drizzle/0012_plan6bii_admin_command_authority.sql';
+const REPORTING_CORRECTION_AUTHORITY_MIGRATION =
+  '../drizzle/0013_plan6bii_reporting_correction_authority.sql';
 
 function renderedProjectionHeads(): string {
   return getViewConfig(currentFinancialProjectionHeads).query.toQuery({
@@ -112,6 +114,71 @@ function triggerAttachment(tableName: string): RegExp {
 }
 
 describe('Plan 6B financial schema preservation', () => {
+  it('adds one append-only correction resolver after an absolute authority preflight', () => {
+    const migration = source(REPORTING_CORRECTION_AUTHORITY_MIGRATION);
+    const routineSignature =
+      'resolve_financial_issue_after_reporting_correction_command"(uuid,uuid)';
+    const createIndex = migration.indexOf(`CREATE FUNCTION "public"."${routineSignature}`);
+    const preflightEnd = migration.indexOf(
+      '$plan6bii_reporting_correction_preflight$;--> statement-breakpoint'
+    );
+
+    expect(migration.startsWith('DO $plan6bii_reporting_correction_preflight$')).toBe(true);
+    expect(preflightEnd).toBeGreaterThan(0);
+    expect(createIndex).toBeGreaterThan(preflightEnd);
+    expect(migration.split(routineSignature)).toHaveLength(4);
+    expect(migration).toContain('session_replication_role');
+    expect(migration).toContain('migration_expected_web_login');
+    expect(migration).toContain('migration_expected_worker_login');
+    expect(migration).toContain('migration_expected_storage_cleanup_login');
+    expect(migration).toContain('plan6bii_assert_financial_admin_job_lease(uuid)');
+    expect(migration).toContain('plan6b_validate_issue_transition()');
+    expect(migration).toContain('resolve_financial_issue_after_admin_command(uuid,uuid)');
+    expect(migration).not.toContain(
+      'CREATE OR REPLACE FUNCTION "public"."resolve_financial_issue_after_admin_command"'
+    );
+    expect(migration).not.toContain(
+      'CREATE OR REPLACE FUNCTION "public"."plan6b_validate_issue_transition"'
+    );
+    expect(migration).toContain('SECURITY DEFINER');
+    expect(migration).toContain("SET search_path = 'pg_catalog'");
+    expect(migration).toContain(
+      'REVOKE ALL ON FUNCTION "public"."resolve_financial_issue_after_reporting_correction_command"(uuid,uuid) FROM PUBLIC, "pale_orbit_runtime", "pale_orbit_financial_worker", "pale_orbit_storage_cleanup"'
+    );
+    expect(migration).toContain(
+      'GRANT EXECUTE ON FUNCTION "public"."resolve_financial_issue_after_reporting_correction_command"(uuid,uuid) TO "pale_orbit_financial_worker"'
+    );
+  });
+
+  it('pins issue-independent correction compatibility and exact command provenance', () => {
+    const migration = source(REPORTING_CORRECTION_AUTHORITY_MIGRATION);
+    const start = migration.indexOf(
+      'CREATE FUNCTION "public"."resolve_financial_issue_after_reporting_correction_command"'
+    );
+    const end = migration.indexOf('$reporting_correction_issue_resolution$;', start);
+    const resolver = migration.slice(start, end);
+
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    for (const proof of [
+      "command.kind = 'refund_reporting_correction_create'",
+      'expectedNextCorrectionVersion', 'expectedBaseAllocationSetId',
+      'expectedSourceFingerprint', "'allocation_attribution_correction'",
+      'predecessor_correction_set_id', 'source_fingerprint_sha256',
+      'approved_by_admin_id', 'created_by_admin_id', 'correlation_id',
+      'refund_reporting_correction_items', 'financial_item_allocations',
+      'refund_allocation_components', 'stable_tie_break_key'
+    ]) expect(resolver).toContain(proof);
+    expect(resolver).toContain("correction_item.component <>\n                'refund_fee'");
+    expect(resolver).toContain("item_source.basis =\n              'gross_amount'");
+    expect(resolver).not.toContain('current_financial_projection_heads');
+    expect(resolver).not.toContain('pg_catalog.coalesce');
+    expect(resolver).toContain('plan6bii_assert_financial_admin_job_lease');
+    expect(resolver).toContain('pale_orbit.plan6bii_financial_admin_issue_resolution_command_id');
+    expect(resolver).toContain("'financial.issue.resolved'");
+    expect(resolver).not.toContain("'unsupported_category'");
+  });
+
   it('casts every dynamic pg_catalog.format parameter in the migration fixture', () => {
     const integration = source('../tests/integration/financial-migration.test.ts');
     const helperStart = integration.indexOf('async function formattedRoleStatement(');
@@ -1521,7 +1588,7 @@ describe('Plan 6B financial schema preservation', () => {
 
     expect(setup).toMatch(/truncate table[\s\S]+?financial_projection_versions/iu);
     expect(setup).toMatch(
-      /insert\s+into\s+financial_projection_versions[\s\S]+?values\s*\(true,\s*1,\s*1,/iu
+      /insert\s+into\s+financial_projection_versions[\s\S]+?values\s*\(true,\s*1,\s*2,/iu
     );
   });
 });

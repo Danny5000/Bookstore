@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { describe, expect, it, onTestFinished } from 'vitest';
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 import {
   createPostgresJobRepository,
   enqueueJobReference
@@ -1019,10 +1019,11 @@ describe('database runtime role boundaries', () => {
       'append_financial_payout_view_audit',
       'append_financial_sales_export_audit',
       'resolve_financial_issue_after_admin_command',
+      'resolve_financial_issue_after_reporting_correction_command',
       'transition_administrative_recovery_grant_after_admin_command'
     ]]);
     expect(routineAcl.rows).toEqual([
-      { role_name: 'pale_orbit_financial_worker', execute_count: 2 },
+      { role_name: 'pale_orbit_financial_worker', execute_count: 3 },
       { role_name: 'pale_orbit_runtime', execute_count: 6 }
     ]);
 
@@ -3559,6 +3560,490 @@ describe('database runtime role boundaries', () => {
       activationCapability
     )).resolves.toBe(true);
 
+    const reportingCorrectionIssueId = randomUUID();
+    await ownerDatabaseClient.pool.query(`
+      insert into financial_reconciliation_issues (
+        id, resource_type, resource_id, safe_code, impact, correlation_id
+      ) values (
+        $1, 'allocation_set', $2, 'correction_rebase_required', 'exception', $3
+      )
+    `, [
+      reportingCorrectionIssueId,
+      activationTargetGrossSetId,
+      `reporting-correction-issue-${randomUUID()}`
+    ]);
+    const reportingCorrectionInput = {
+      kind: 'refund_reporting_correction_create',
+      refundId: activationTargetRefundId,
+      reason: 'allocation_attribution_correction',
+      expectedNextCorrectionVersion: 2,
+      expectedBaseAllocationSetId: activationTargetGrossSetId,
+      expectedSourceFingerprint: activationTargetFingerprint,
+      items: [{ orderItemId: activationOrderItem.id, totalPresentmentMinor: 100 }],
+      previewFingerprint: createHash('sha256')
+        .update(`reporting-correction-preview:${activationTargetRefundId}`)
+        .digest('hex'),
+      confirmation: 'create_reporting_correction'
+    };
+    const reportingCorrectionCommand = await submit(
+      'refund_reporting_correction_create',
+      reportingCorrectionInput,
+      createHash('sha256').update('reporting-correction-positive').digest('hex'),
+      createHash('sha256').update(JSON.stringify(reportingCorrectionInput)).digest('hex')
+    );
+    const reportingCorrectionJob = (await ownerDatabaseClient.pool.query<{
+      job_id: string;
+    }>(`
+      select job_id from financial_admin_commands where id = $1
+    `, [reportingCorrectionCommand.command_id])).rows[0]!;
+    const claimedReportingCorrection = await claimExpectedCommandJob(
+      reportingCorrectionJob.job_id,
+      'financial-command-reporting-correction'
+    );
+    const reportingCorrectionCapability =
+      claimedReportingCorrection.financialAdminLeaseCapability!;
+    const reportingCorrectionSideEffects = async () => (await ownerDatabaseClient.pool.query<{
+      issue_state: string;
+      correction_count: number;
+      audit_count: number;
+    }>(`
+      select
+        (select state::text from financial_reconciliation_issues where id = $1)
+          as issue_state,
+        (select count(*)::integer from refund_reporting_correction_sets
+          where refund_id = $2) as correction_count,
+        (select count(*)::integer from audit_events
+          where action = 'financial.issue.resolved'
+            and "after" ->> 'commandId' = $3) as audit_count
+    `, [
+      reportingCorrectionIssueId,
+      activationTargetRefundId,
+      reportingCorrectionCommand.command_id
+    ])).rows[0]!;
+    const correctionSideEffectsBefore = await reportingCorrectionSideEffects();
+
+    const wrongRowTransition = await workerDatabaseClient.pool.connect();
+    try {
+      await wrongRowTransition.query('begin');
+      await wrongRowTransition.query(`
+        select pg_catalog.set_config(
+          'pale_orbit.plan6bii_financial_admin_job_capability', $1, true
+        )
+      `, [reportingCorrectionCapability]);
+      await wrongRowTransition.query(`
+        insert into refund_reporting_correction_sets (
+          refund_id, correction_version, kind, base_allocation_set_id,
+          predecessor_correction_set_id, source_fingerprint_sha256,
+          approved_by_admin_id, created_by_admin_id, correlation_id
+        ) values (
+          $1, 2, 'allocation_attribution_correction', $2, $3, $4,
+          $5, $5, $6
+        )
+      `, [
+        activationTargetRefundId,
+        activationTargetGrossSetId,
+        activationCorrection.id,
+        activationTargetFingerprint,
+        actorId,
+        `wrong-command-correlation-${randomUUID()}`
+      ]);
+      await expect(wrongRowTransition.query(`
+        select * from
+          public.resolve_financial_issue_after_reporting_correction_command($1,$2)
+      `, [reportingCorrectionCommand.command_id, reportingCorrectionIssueId]))
+        .rejects.toMatchObject({ code: '55000' });
+    } finally {
+      await wrongRowTransition.query('rollback');
+      wrongRowTransition.release();
+    }
+    expect(await reportingCorrectionSideEffects()).toEqual(correctionSideEffectsBefore);
+
+    const wrongTopologyTransition = await workerDatabaseClient.pool.connect();
+    try {
+      await wrongTopologyTransition.query('begin');
+      await wrongTopologyTransition.query(`
+        select pg_catalog.set_config(
+          'pale_orbit.plan6bii_financial_admin_job_capability', $1, true
+        )
+      `, [reportingCorrectionCapability]);
+      const wrongTopologyTip = (await wrongTopologyTransition.query<{ id: string }>(`
+        insert into refund_reporting_correction_sets (
+          refund_id, correction_version, kind, base_allocation_set_id,
+          predecessor_correction_set_id, source_fingerprint_sha256,
+          approved_by_admin_id, created_by_admin_id, correlation_id
+        )
+        select $1, 2, 'allocation_attribution_correction', $2, $3, $4,
+          command.actor_user_id, command.actor_user_id, command.correlation_id
+        from financial_admin_commands command where command.id = $5
+        returning id
+      `, [
+        activationTargetRefundId,
+        activationTargetGrossSetId,
+        activationCorrection.id,
+        activationTargetFingerprint,
+        reportingCorrectionCommand.command_id
+      ])).rows[0]!;
+      await wrongTopologyTransition.query(`
+        insert into refund_reporting_correction_sets (
+          refund_id, correction_version, kind, base_allocation_set_id,
+          predecessor_correction_set_id, source_fingerprint_sha256,
+          approved_by_admin_id, created_by_admin_id, correlation_id
+        ) values (
+          $1, 3, 'allocation_attribution_correction', $2, $3, $4,
+          $5, $5, $6
+        )
+      `, [
+        activationTargetRefundId,
+        activationTargetGrossSetId,
+        wrongTopologyTip.id,
+        activationTargetFingerprint,
+        actorId,
+        `wrong-topology-${randomUUID()}`
+      ]);
+      await expect(wrongTopologyTransition.query(`
+        select * from
+          public.resolve_financial_issue_after_reporting_correction_command($1,$2)
+      `, [reportingCorrectionCommand.command_id, reportingCorrectionIssueId]))
+        .rejects.toMatchObject({ code: '55000' });
+    } finally {
+      await wrongTopologyTransition.query('rollback');
+      wrongTopologyTransition.release();
+    }
+    expect(await reportingCorrectionSideEffects()).toEqual(correctionSideEffectsBefore);
+
+    const presentmentSubtotalTie =
+      `presentment:${activationOrderItem.id}:refund_subtotal`;
+    const presentmentTaxTie = `presentment:${activationOrderItem.id}:refund_tax`;
+    const settlementSubtotalTie =
+      `settlement:gross:${activationOrderItem.id}:refund_subtotal`;
+    const settlementTaxTie = `settlement:gross:${activationOrderItem.id}:refund_tax`;
+    const validDirectProofItems = [
+      {
+        domain: 'presentment', sourceAllocationSetId: null,
+        component: 'refund_subtotal', approvedAbsoluteMinor: 90,
+        deltaMinor: 0, stableTieBreakKey: presentmentSubtotalTie
+      },
+      {
+        domain: 'presentment', sourceAllocationSetId: null,
+        component: 'refund_tax', approvedAbsoluteMinor: 10,
+        deltaMinor: 0, stableTieBreakKey: presentmentTaxTie
+      },
+      {
+        domain: 'settlement', sourceAllocationSetId: activationTargetGrossSetId,
+        component: 'refund_subtotal', approvedAbsoluteMinor: -90,
+        deltaMinor: 0, stableTieBreakKey: settlementSubtotalTie
+      },
+      {
+        domain: 'settlement', sourceAllocationSetId: activationTargetGrossSetId,
+        component: 'refund_tax', approvedAbsoluteMinor: -10,
+        deltaMinor: 0, stableTieBreakKey: settlementTaxTie
+      }
+    ] as const;
+    const insertDirectProofItems = async (
+      client: PoolClient,
+      correctionSetId: string,
+      items: ReadonlyArray<{
+        domain: string;
+        sourceAllocationSetId: string | null;
+        component: string;
+        approvedAbsoluteMinor: number;
+        deltaMinor: number;
+        stableTieBreakKey: string;
+      }>
+    ): Promise<void> => {
+      await client.query(`
+        insert into refund_reporting_correction_items (
+          correction_set_id, domain, source_allocation_set_id, order_item_id,
+          component, currency, approved_absolute_minor, delta_minor,
+          stable_tie_break_key
+        )
+        select $1, item.domain::refund_correction_domain,
+          item.source_allocation_set_id::uuid, $2,
+          item.component::financial_component, 'USD',
+          item.approved_absolute_minor, item.delta_minor, item.stable_tie_break_key
+        from pg_catalog.jsonb_to_recordset($3::jsonb) item(
+          domain text, source_allocation_set_id text, component text,
+          approved_absolute_minor integer, delta_minor integer,
+          stable_tie_break_key text
+        )
+      `, [correctionSetId, activationOrderItem.id, JSON.stringify(items.map((item) => ({
+        domain: item.domain,
+        source_allocation_set_id: item.sourceAllocationSetId,
+        component: item.component,
+        approved_absolute_minor: item.approvedAbsoluteMinor,
+        delta_minor: item.deltaMinor,
+        stable_tie_break_key: item.stableTieBreakKey
+      })))]);
+    };
+    const expectDirectProofRejection = async (
+      label: string,
+      items: Parameters<typeof insertDirectProofItems>[2],
+      prepare?: (client: PoolClient) => Promise<void>
+    ): Promise<void> => {
+      const transition = await workerDatabaseClient.pool.connect();
+      try {
+        await transition.query('begin');
+        await transition.query(`
+          select pg_catalog.set_config(
+            'pale_orbit.plan6bii_financial_admin_job_capability', $1, true
+          )
+        `, [reportingCorrectionCapability]);
+        await prepare?.(transition);
+        const correction = (await transition.query<{ id: string }>(`
+          insert into refund_reporting_correction_sets (
+            refund_id, correction_version, kind, base_allocation_set_id,
+            predecessor_correction_set_id, source_fingerprint_sha256,
+            approved_by_admin_id, created_by_admin_id, correlation_id
+          )
+          select $1, 2, 'allocation_attribution_correction', $2, $3, $4,
+            command.actor_user_id, command.actor_user_id, command.correlation_id
+          from financial_admin_commands command where command.id = $5
+          returning id
+        `, [
+          activationTargetRefundId,
+          activationTargetGrossSetId,
+          activationCorrection.id,
+          activationTargetFingerprint,
+          reportingCorrectionCommand.command_id
+        ])).rows[0]!;
+        await insertDirectProofItems(transition, correction.id, items);
+        await expect(transition.query(`
+          select * from
+            public.resolve_financial_issue_after_reporting_correction_command($1,$2)
+        `, [reportingCorrectionCommand.command_id, reportingCorrectionIssueId]), label)
+          .rejects.toMatchObject({ code: '55000' });
+      } finally {
+        await transition.query('rollback');
+        transition.release();
+      }
+      expect(await reportingCorrectionSideEffects(), label)
+        .toEqual(correctionSideEffectsBefore);
+    };
+
+    await expectDirectProofRejection('direct item arithmetic', [
+      ...validDirectProofItems.slice(0, 2),
+      { ...validDirectProofItems[2], approvedAbsoluteMinor: -89 },
+      { ...validDirectProofItems[3], approvedAbsoluteMinor: -11 }
+    ]);
+    await expectDirectProofRejection('direct grouped conservation', [
+      ...validDirectProofItems.slice(0, 2),
+      { ...validDirectProofItems[2], approvedAbsoluteMinor: -89, deltaMinor: 1 },
+      validDirectProofItems[3]
+    ]);
+    await expectDirectProofRejection('direct complete base coverage', [
+      ...validDirectProofItems.slice(0, 2),
+      { ...validDirectProofItems[2], approvedAbsoluteMinor: -100, deltaMinor: -10 }
+    ]);
+    await expectDirectProofRejection('direct representable fee basis', [
+      ...validDirectProofItems,
+      {
+        domain: 'settlement', sourceAllocationSetId: activationTargetFeeSetId,
+        component: 'refund_subtotal', approvedAbsoluteMinor: 1,
+        deltaMinor: 1,
+        stableTieBreakKey: `settlement:fee:${activationOrderItem.id}:refund_subtotal`
+      },
+      {
+        domain: 'settlement', sourceAllocationSetId: activationTargetFeeSetId,
+        component: 'refund_tax', approvedAbsoluteMinor: -1,
+        deltaMinor: -1,
+        stableTieBreakKey: `settlement:fee:${activationOrderItem.id}:refund_tax`
+      }
+    ]);
+    await expectDirectProofRejection(
+      'direct effective sibling capacity',
+      validDirectProofItems,
+      async (client) => {
+        const overCapacityRefundId = randomUUID();
+        await client.query(`
+          insert into refunds (
+            id, payment_id, stripe_refund_id, status, amount_minor, currency,
+            provider_created_at, allocation_status
+          ) values (
+            $1, $2, $3, 'succeeded', 1000, 'USD', clock_timestamp(), 'finalized'
+          )
+        `, [
+          overCapacityRefundId,
+          activationPayment.id,
+          `re_capacity_${randomUUID()}`
+        ]);
+        const overCapacityAllocation = (await client.query<{ id: string }>(`
+          insert into refund_allocations (
+            refund_id, order_item_id, amount_minor, source
+          ) values ($1, $2, 1000, 'automatic') returning id
+        `, [overCapacityRefundId, activationOrderItem.id])).rows[0]!;
+        await client.query(`
+          insert into refund_allocation_components (
+            refund_allocation_id, refund_id, order_item_id, subtotal_minor,
+            tax_minor, total_minor, currency
+          ) values ($1, $2, $3, 900, 100, 1000, 'USD')
+        `, [overCapacityAllocation.id, overCapacityRefundId, activationOrderItem.id]);
+      }
+    );
+
+    const appendedReportingCorrection = (await ownerDatabaseClient.pool.query<{
+      id: string;
+    }>(`
+      insert into refund_reporting_correction_sets (
+        refund_id, correction_version, kind, base_allocation_set_id,
+        predecessor_correction_set_id, source_fingerprint_sha256,
+        approved_by_admin_id, created_by_admin_id, correlation_id
+      )
+      select $1, 2, 'allocation_attribution_correction', $2, $3, $4,
+        command.actor_user_id, command.actor_user_id, command.correlation_id
+      from financial_admin_commands command where command.id = $5
+      returning id
+    `, [
+      activationTargetRefundId,
+      activationTargetGrossSetId,
+      activationCorrection.id,
+      activationTargetFingerprint,
+      reportingCorrectionCommand.command_id
+    ])).rows[0]!;
+    await ownerDatabaseClient.pool.query(`
+      insert into refund_reporting_correction_items (
+        correction_set_id, domain, source_allocation_set_id, order_item_id,
+        component, currency, approved_absolute_minor, delta_minor,
+        stable_tie_break_key
+      ) values
+        ($1, 'presentment', null, $2, 'refund_subtotal', 'USD', 90, 0, $3),
+        ($1, 'presentment', null, $2, 'refund_tax', 'USD', 10, 0, $4),
+        ($1, 'settlement', $5, $2, 'refund_subtotal', 'USD', -90, 0, $6),
+        ($1, 'settlement', $5, $2, 'refund_tax', 'USD', -10, 0, $7)
+    `, [
+      appendedReportingCorrection.id,
+      activationOrderItem.id,
+      `presentment:${activationOrderItem.id}:refund_subtotal`,
+      `presentment:${activationOrderItem.id}:refund_tax`,
+      activationTargetGrossSetId,
+      `settlement:gross:${activationOrderItem.id}:refund_subtotal`,
+      `settlement:gross:${activationOrderItem.id}:refund_tax`
+    ]);
+    const outOfScopeCorrectionIssueId = randomUUID();
+    await ownerDatabaseClient.pool.query(`
+      insert into financial_reconciliation_issues (
+        id, resource_type, resource_id, safe_code, impact, correlation_id
+      ) values ($1, 'allocation_set', $2, 'allocation_mismatch', 'exception', $3)
+    `, [
+      outOfScopeCorrectionIssueId,
+      activationSiblingGrossSetId,
+      `out-of-scope-correction-issue-${randomUUID()}`
+    ]);
+    const outOfScopeTransition = await workerDatabaseClient.pool.connect();
+    try {
+      await outOfScopeTransition.query('begin');
+      await outOfScopeTransition.query(`
+        select pg_catalog.set_config(
+          'pale_orbit.plan6bii_financial_admin_job_capability', $1, true
+        )
+      `, [reportingCorrectionCapability]);
+      await expect(outOfScopeTransition.query(`
+        select * from
+          public.resolve_financial_issue_after_reporting_correction_command($1,$2)
+      `, [reportingCorrectionCommand.command_id, outOfScopeCorrectionIssueId]))
+        .rejects.toMatchObject({ code: '55000' });
+    } finally {
+      await outOfScopeTransition.query('rollback');
+      outOfScopeTransition.release();
+    }
+    await expect(ownerDatabaseClient.pool.query(`
+      select state, resolved_by_admin_id, resolved_at,
+        (select count(*)::integer from audit_events
+          where action = 'financial.issue.resolved'
+            and resource_id = $1::text) as audit_count
+      from financial_reconciliation_issues where id = $1::uuid
+    `, [outOfScopeCorrectionIssueId])).resolves.toMatchObject({ rows: [{
+      state: 'open',
+      resolved_by_admin_id: null,
+      resolved_at: null,
+      audit_count: 0
+    }] });
+    await expect(ownerDatabaseClient.pool.query(`
+      select base_set_id, compatible_correction_tip_id, is_complete,
+        proposed_issue_code
+      from current_financial_projection_heads
+      where balance_transaction_id = $1 and basis = 'gross_amount'
+    `, [activationTargetTransactionId])).resolves.toMatchObject({ rows: [{
+      base_set_id: null,
+      compatible_correction_tip_id: null,
+      is_complete: false,
+      proposed_issue_code: 'correction_rebase_required'
+    }] });
+
+    const correctionTransition = await workerDatabaseClient.pool.connect();
+    try {
+      await correctionTransition.query('begin');
+      await correctionTransition.query(`
+        select pg_catalog.set_config(
+          'pale_orbit.plan6bii_financial_admin_job_capability', $1, true
+        )
+      `, [reportingCorrectionCapability]);
+      await expect(correctionTransition.query<{
+        id: string;
+        state: string;
+        resolved_by_admin_id: string;
+      }>(`
+        select id, state, resolved_by_admin_id
+        from public.resolve_financial_issue_after_reporting_correction_command($1,$2)
+      `, [reportingCorrectionCommand.command_id, reportingCorrectionIssueId]))
+        .resolves.toMatchObject({ rows: [{
+          id: reportingCorrectionIssueId,
+          state: 'resolved',
+          resolved_by_admin_id: actorId
+        }] });
+      await correctionTransition.query('commit');
+    } catch (error) {
+      await correctionTransition.query('rollback');
+      throw error;
+    } finally {
+      correctionTransition.release();
+    }
+    await expect(ownerDatabaseClient.pool.query(`
+      select basis, base_set_id, compatible_correction_tip_id, is_complete
+      from current_financial_projection_heads
+      where balance_transaction_id = $1
+      order by case basis when 'gross_amount' then 1 else 2 end
+    `, [activationTargetTransactionId])).resolves.toMatchObject({ rows: [
+      {
+        basis: 'gross_amount',
+        base_set_id: activationTargetGrossSetId,
+        compatible_correction_tip_id: appendedReportingCorrection.id,
+        is_complete: true
+      },
+      {
+        basis: 'fee',
+        base_set_id: activationTargetFeeSetId,
+        compatible_correction_tip_id: appendedReportingCorrection.id,
+        is_complete: true
+      }
+    ] });
+    await expect(ownerDatabaseClient.pool.query(`
+      select action, actor_id, resource_id, outcome
+      from audit_events
+      where action = 'financial.issue.resolved'
+        and "after" ->> 'commandId' = $1
+    `, [reportingCorrectionCommand.command_id])).resolves.toMatchObject({ rows: [{
+      action: 'financial.issue.resolved',
+      actor_id: actorId,
+      resource_id: reportingCorrectionIssueId,
+      outcome: 'succeeded'
+    }] });
+    await transitionCommandSucceeded(
+      reportingCorrectionCommand.command_id,
+      reportingCorrectionJob.job_id,
+      reportingCorrectionCapability,
+      'correction_created',
+      {
+        refundId: activationTargetRefundId,
+        correctionSetId: appendedReportingCorrection.id,
+        correctionVersion: 2
+      }
+    );
+    await expect(commandRepository.complete(
+      reportingCorrectionJob.job_id,
+      'financial-command-reporting-correction',
+      reportingCorrectionCapability
+    )).resolves.toBe(true);
+
     const resolvedRefundId = randomUUID();
     const crossLinkedRefundId = randomUUID();
     const resolverTitleId = randomUUID();
@@ -4063,6 +4548,39 @@ describe('database runtime role boundaries', () => {
     const recoveryCommand = await submit(
       'administrative_recovery_activate', recoveryInput, '5'.repeat(64), 'f'.repeat(64)
     );
+    const guardedCorrectionInput = {
+      kind: 'refund_reporting_correction_create',
+      refundId: randomUUID(),
+      reason: 'allocation_attribution_correction',
+      expectedNextCorrectionVersion: 1,
+      expectedBaseAllocationSetId: randomUUID(),
+      expectedSourceFingerprint: '6'.repeat(64),
+      items: [{ orderItemId: randomUUID(), totalPresentmentMinor: 1 }],
+      previewFingerprint: '7'.repeat(64),
+      confirmation: 'create_reporting_correction'
+    };
+    const guardedCorrectionCommand = await submit(
+      'refund_reporting_correction_create',
+      guardedCorrectionInput,
+      createHash('sha256').update('guarded-correction-idempotency').digest('hex'),
+      createHash('sha256').update('guarded-correction-fingerprint').digest('hex')
+    );
+    await expect(workerDatabaseClient.pool.query(
+      `select * from
+        public.resolve_financial_issue_after_reporting_correction_command($1,$2)`,
+      [guardedCorrectionCommand.command_id, randomUUID()]
+    )).rejects.toMatchObject({ code: '55000' });
+    await expect(databaseClient.pool.query(
+      `select * from
+        public.resolve_financial_issue_after_reporting_correction_command($1,$2)`,
+      [guardedCorrectionCommand.command_id, randomUUID()]
+    )).rejects.toMatchObject({ code: '42501' });
+    await expect(workerDatabaseClient.pool.query<{
+      id: string;
+    }>(`
+      select id from
+        public.resolve_financial_issue_after_reporting_correction_command($1,$2)
+    `, [finalizeCommand.command_id, randomUUID()])).resolves.toMatchObject({ rows: [] });
     const demotion = await ownerDatabaseClient.pool.connect();
     try {
       await demotion.query('begin');
@@ -4084,6 +4602,11 @@ describe('database runtime role boundaries', () => {
       [finalizeCommand.command_id, randomUUID()]
     )).rejects.toMatchObject({ code: '42501' });
     await expect(workerDatabaseClient.pool.query(
+      `select * from
+        public.resolve_financial_issue_after_reporting_correction_command($1,$2)`,
+      [guardedCorrectionCommand.command_id, randomUUID()]
+    )).rejects.toMatchObject({ code: '42501' });
+    await expect(workerDatabaseClient.pool.query(
       `select * from public.transition_administrative_recovery_grant_after_admin_command($1)`,
       [recoveryCommand.command_id]
     )).rejects.toMatchObject({ code: '42501' });
@@ -4091,7 +4614,7 @@ describe('database runtime role boundaries', () => {
       `select * from public.financial_admin_command_status($1,$2)`,
       [actorId, finalizeCommand.command_id]
     )).rejects.toMatchObject({ code: '42501' });
-  });
+  }, 60_000);
 
   it('rearms only the exact exhausted job derived from a pending Stripe event', async () => {
     const event = (await databaseClient.pool.query<{ id: string }>(`

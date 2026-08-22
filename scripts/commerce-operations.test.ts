@@ -1771,7 +1771,8 @@ describe('commerce operations contract', () => {
       '0009_plan6b_worker_authority_and_commerce_integrity.sql',
       '0010_plan6b_guest_claim_authority.sql',
       '0011_plan6b_storage_cleanup_authority.sql',
-      '0012_plan6bii_admin_command_authority.sql'
+      '0012_plan6bii_admin_command_authority.sql',
+      '0013_plan6bii_reporting_correction_authority.sql'
     ]);
     const plan6bSchemaMigrations = (
       await Promise.all(
@@ -1932,7 +1933,7 @@ describe('commerce operations contract', () => {
 
     expect(documentedManifest).toBe(financialSchemaManifest);
     expect(financialSchemaManifest).toMatch(
-      /catalog_contract_version\s*\(\s*contract_version\s*\)\s+as\s*\(\s*values\s*\(\s*'plan6b-financial-catalog-v2'\s*\)/iu
+      /catalog_contract_version\s*\(\s*contract_version\s*\)\s+as\s*\(\s*values\s*\(\s*'plan6b-financial-catalog-v3'\s*\)/iu
     );
     expect(financialSchemaManifest).toMatch(
       /required_catalog_objects\s*\(\s*object_kind\s*,\s*schema_name\s*,\s*parent_name\s*,\s*object_name\s*,\s*identity_arguments\s*,\s*expected_fingerprint_sha256\s*,\s*expected_catalog\s*\)/iu
@@ -2032,7 +2033,7 @@ describe('commerce operations contract', () => {
       })
     );
     expect(catalogRows.length).toBeGreaterThan(100);
-    expect(catalogRows).toHaveLength(273);
+    expect(catalogRows).toHaveLength(274);
     expect(new Set(catalogRows.map((row) =>
       `${row.kind}:${row.parent}:${row.name}:${row.arguments}`
     )).size).toBe(catalogRows.length);
@@ -2137,7 +2138,7 @@ describe('commerce operations contract', () => {
       sensitive_relation_state: 4
     });
     expect(requiredTableNames.size).toBe(23);
-    expect(requiredFunctionNames.size).toBe(44);
+    expect(requiredFunctionNames.size).toBe(45);
     expect(requiredTriggerKeys.size).toBe(39);
     expect(requiredLegacyColumnKeys.size).toBe(7);
     expect(requiredEnumLabels.size).toBe(25);
@@ -2328,6 +2329,7 @@ describe('commerce operations contract', () => {
     ]);
     const newWorkerRoutines = new Set([
       'resolve_financial_issue_after_admin_command',
+      'resolve_financial_issue_after_reporting_correction_command',
       'transition_administrative_recovery_grant_after_admin_command'
     ]);
     const expectedBaseDirectAcl = financialSchemaManifest.match(
@@ -2365,6 +2367,7 @@ describe('commerce operations contract', () => {
       'purge_commerce_claim_issuances()',
       'register_commerce_claim_issuance(text,text,text,uuid,text,timestamp with time zone)',
       'resolve_financial_issue_after_admin_command(uuid,uuid)',
+      'resolve_financial_issue_after_reporting_correction_command(uuid,uuid)',
       'resolve_financial_issue_after_worker_recompute(uuid,text)',
       'transition_administrative_recovery_grant_after_admin_command(uuid)'
     ]);
@@ -2765,6 +2768,26 @@ describe('commerce operations contract', () => {
       'missing runtime financial routine EXECUTE repair',
       'missing worker financial routine EXECUTE',
       'missing worker financial routine EXECUTE repair',
+      'missing reporting-correction resolver',
+      'missing reporting-correction resolver repair',
+      'excess reporting-correction resolver overload',
+      'excess reporting-correction resolver overload repair',
+      'reporting-correction resolver owner drift',
+      'reporting-correction resolver owner repair',
+      'reporting-correction resolver security drift',
+      'reporting-correction resolver security repair',
+      'reporting-correction resolver search_path drift',
+      'reporting-correction resolver search_path repair',
+      'reporting-correction resolver definition drift',
+      'reporting-correction resolver definition repair',
+      'PUBLIC reporting-correction resolver EXECUTE',
+      'PUBLIC reporting-correction resolver EXECUTE repair',
+      'runtime reporting-correction resolver EXECUTE',
+      'runtime reporting-correction resolver EXECUTE repair',
+      'direct-login reporting-correction resolver EXECUTE',
+      'direct-login reporting-correction resolver EXECUTE repair',
+      'reporting-correction resolver worker grant-option drift',
+      'reporting-correction resolver worker grant-option repair',
       'financial routine SECURITY DEFINER search_path drift',
       'financial routine SECURITY DEFINER search_path repair',
       'financial routine owner drift',
@@ -3334,6 +3357,35 @@ describe('commerce operations contract', () => {
       ['financial routine direct login EXECUTE', ['financial_schema_object_manifest=1']],
       ['missing runtime financial routine EXECUTE', ['financial_schema_object_manifest=1']],
       ['missing worker financial routine EXECUTE', ['financial_schema_object_manifest=1']],
+      ['missing reporting-correction resolver', ['financial_schema_object_manifest=1']],
+      ['excess reporting-correction resolver overload', [
+        'financial_schema_object_manifest=1'
+      ]],
+      ['reporting-correction resolver owner drift', [
+        'financial_schema_object_manifest=1'
+      ]],
+      ['reporting-correction resolver security drift', [
+        'financial_schema_object_manifest=1'
+      ]],
+      ['reporting-correction resolver search_path drift', [
+        'financial_schema_object_manifest=1'
+      ]],
+      ['reporting-correction resolver definition drift', [
+        'financial_schema_object_manifest=1'
+      ]],
+      ['PUBLIC reporting-correction resolver EXECUTE', [
+        'financial_schema_object_manifest=1',
+        'storage_cleanup_effective_authority=1'
+      ]],
+      ['runtime reporting-correction resolver EXECUTE', [
+        'financial_schema_object_manifest=1'
+      ]],
+      ['direct-login reporting-correction resolver EXECUTE', [
+        'financial_schema_object_manifest=1'
+      ]],
+      ['reporting-correction resolver worker grant-option drift', [
+        'financial_schema_object_manifest=1'
+      ]],
       ['missing runtime future table SELECT', ['financial_schema_object_manifest=10']],
       ['missing runtime future sequence privileges', ['financial_schema_object_manifest=7']],
       ['reintroduced PUBLIC default routine EXECUTE', ['financial_schema_object_manifest=2']],
