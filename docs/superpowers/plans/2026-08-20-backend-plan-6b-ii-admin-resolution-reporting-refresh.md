@@ -1715,6 +1715,8 @@ Expected: all commands pass; web submission and worker mutation authority remain
 - Create: `src/lib/server/commerce/refund-allocation-components.test.ts`
 - Create: `src/lib/server/commerce/financial/refund-review/finalize.ts`
 - Create: `src/lib/server/commerce/financial/refund-review/finalize.test.ts`
+- Modify: `src/lib/server/commerce/financial/refund-review/inputs.ts`
+- Modify: `src/lib/server/commerce/financial/refund-review/inputs.test.ts`
 - Modify: `src/lib/server/commerce/financial/admin-commands/handler.ts`
 - Modify: `src/lib/server/commerce/financial/admin-commands/handler.test.ts`
 - Modify: `src/lib/server/commerce/financial/refund-review/drafts.test.ts`
@@ -1876,7 +1878,7 @@ Expected: all commands pass; finalization/result/audit/access/email are atomic a
 - [ ] **Step 9: Commit finalization**
 
 ```powershell
-git add src/lib/server/commerce/financial/admin-commands/handler.ts src/lib/server/commerce/financial/admin-commands/handler.test.ts src/lib/server/commerce/financial/refund-review/drafts.test.ts src/lib/server/commerce/financial/refund-review/finalize.ts src/lib/server/commerce/financial/refund-review/finalize.test.ts src/lib/server/commerce/reconciliation.ts src/routes/admin/sales/refunds/refund-routes.test.ts src/lib/components/admin/RefundAllocationEditor.svelte src/lib/components/admin/FinancialActionConfirmation.svelte src/lib/components/admin/RefundReview.test.ts tests/integration/financial-admin-commands.test.ts tests/integration/financial-refund-review.test.ts tests/integration/commerce-lock-order.test.ts tests/integration/financial-lock-order.test.ts
+git add src/lib/server/commerce/financial/admin-commands/handler.ts src/lib/server/commerce/financial/admin-commands/handler.test.ts src/lib/server/commerce/financial/refund-review/drafts.test.ts src/lib/server/commerce/financial/refund-review/finalize.ts src/lib/server/commerce/financial/refund-review/finalize.test.ts src/lib/server/commerce/financial/refund-review/inputs.ts src/lib/server/commerce/financial/refund-review/inputs.test.ts src/lib/server/commerce/reconciliation.ts src/routes/admin/sales/refunds/refund-routes.test.ts src/lib/components/admin/RefundAllocationEditor.svelte src/lib/components/admin/FinancialActionConfirmation.svelte src/lib/components/admin/RefundReview.test.ts tests/integration/financial-admin-commands.test.ts tests/integration/financial-refund-review.test.ts tests/integration/commerce-lock-order.test.ts tests/integration/financial-lock-order.test.ts
 git add -- ':(literal)src/routes/admin/sales/refunds/[refundId]/+page.server.ts' ':(literal)src/routes/admin/sales/refunds/[refundId]/+page.svelte'
 git diff --cached --check
 git commit -m "feat: finalize ambiguous refund allocations"
