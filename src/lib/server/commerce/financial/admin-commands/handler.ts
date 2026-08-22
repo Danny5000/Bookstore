@@ -8,6 +8,10 @@ import {
   type CapabilityResolver,
 } from "$lib/server/auth/admin-policy";
 import { listRolesForUser } from "$lib/server/auth/identity";
+import type {
+  AccessChangeInput,
+  CommerceMessageEnqueuer,
+} from "$lib/server/commerce/email/enqueue";
 import type { Database } from "$lib/server/db/client";
 import { financialAdminCommands, type JsonObject } from "$lib/server/db/schema";
 import {
@@ -66,7 +70,13 @@ export interface FinancialAdminCommandExecutorContext {
   readonly actor: AdministratorActor;
   readonly correlationId: string;
   readonly signal: AbortSignal;
+  readonly enqueueAccessChange: (input: AccessChangeInput) => Promise<void>;
 }
+
+type FinancialAdminAccessMessages = Pick<
+  CommerceMessageEnqueuer,
+  "enqueueAccessChange"
+>;
 
 export type FinancialAdminCommandExecutor = (
   context: FinancialAdminCommandExecutorContext,
@@ -376,6 +386,20 @@ function validatedExecutorMap(
   return new Map(executors);
 }
 
+function validatedAccessMessages(
+  accessMessages: FinancialAdminAccessMessages,
+): FinancialAdminAccessMessages {
+  if (
+    !accessMessages ||
+    typeof accessMessages.enqueueAccessChange !== "function"
+  ) {
+    throw new Error(
+      "Financial administrator command handler requires an access-message dependency",
+    );
+  }
+  return accessMessages;
+}
+
 async function persistTerminalFailure(
   database: Database,
   commandId: string,
@@ -404,9 +428,11 @@ export function createFinancialAdminCommandHandler(input: {
     FinancialAdminCommandKind,
     FinancialAdminCommandExecutor
   >;
+  readonly accessMessages: FinancialAdminAccessMessages;
   readonly capabilityResolver?: CapabilityResolver;
 }): JobHandler {
   const executors = validatedExecutorMap(input.executors);
+  const accessMessages = validatedAccessMessages(input.accessMessages);
 
   return async (job, signal) => {
     throwIfAborted(signal);
@@ -453,6 +479,8 @@ export function createFinancialAdminCommandHandler(input: {
               actor,
               correlationId: command.correlationId,
               signal,
+              enqueueAccessChange: (messageInput) =>
+                accessMessages.enqueueAccessChange(transaction, messageInput),
             },
             privateCommand,
           ),

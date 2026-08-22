@@ -3,6 +3,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { describe, expect, it, vi } from "vitest";
 import type { AdministratorActor } from "$lib/server/auth/admin-policy";
 import { setAdminRole } from "$lib/server/auth/roles";
+import { createCommerceMessageEnqueuer } from "$lib/server/commerce/email/enqueue";
 import { createFinancialAdminCommandExecutors } from "$lib/server/commerce/financial/admin-commands/executors";
 import {
   FINANCIAL_ADMIN_COMMAND_JOB,
@@ -27,6 +28,7 @@ import {
 
 const FORBIDDEN_STATUS_FIELDS =
   /jobId|payload|attempts|lastError|privateInput|actorUserId|internalError/iu;
+const accessMessages = createCommerceMessageEnqueuer(applicationConfig.origin);
 
 interface Deferred {
   readonly promise: Promise<void>;
@@ -383,6 +385,7 @@ describe("financial administrator command PostgreSQL lifecycle", () => {
     const handler = createFinancialAdminCommandHandler({
       database: workerDatabaseClient.db,
       executors: executorsWithDraftSave(executor),
+      accessMessages,
     });
     const postgresRepository = createPostgresJobRepository(
       workerDatabaseClient.db,
@@ -558,6 +561,7 @@ describe("financial administrator command PostgreSQL lifecycle", () => {
     const handler = createFinancialAdminCommandHandler({
       database: workerDatabaseClient.db,
       executors: executorsWithDraftSave(executor),
+      accessMessages,
     });
 
     const firstClaim = await postgresRepository.claimNext(
@@ -656,6 +660,7 @@ describe("financial administrator command PostgreSQL lifecycle", () => {
     const handler = createFinancialAdminCommandHandler({
       database: workerDatabaseClient.db,
       executors: executorsWithDraftSave(executor),
+      accessMessages,
     });
     const controller = new AbortController();
     const observations: RepositoryObservations = {

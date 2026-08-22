@@ -161,7 +161,8 @@ function context(transaction: DatabaseTransaction): FinancialAdminCommandExecuto
     commandId: COMMAND_ID,
     actor: { type: 'user', id: ADMIN_ID, roles: ['customer', 'admin'] },
     correlationId: 'refund-draft-command',
-    signal: new AbortController().signal
+    signal: new AbortController().signal,
+    enqueueAccessChange: vi.fn(async () => undefined)
   };
 }
 

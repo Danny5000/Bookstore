@@ -1,6 +1,7 @@
 import type { SQL } from "drizzle-orm";
 import { describe, expect, it, vi } from "vitest";
 import type { CapabilityResolver } from "$lib/server/auth/admin-policy";
+import type { AccessChangeInput } from "$lib/server/commerce/email/enqueue";
 import type { Database } from "$lib/server/db/client";
 import type { DatabaseTransaction } from "$lib/server/db/transaction";
 import type { JobRecord } from "$lib/server/jobs/types";
@@ -29,6 +30,13 @@ const COMMAND_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const ACTOR_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const LEASE_CAPABILITY = "abcdefghijklmnopqrstuvwxyzABCDEFGH123456789";
 const HASH = "a".repeat(64);
+const ACCESS_CHANGE_INPUT = {
+  template: "commerce.refund-access-changed",
+  eventId: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+  to: "financial-access@example.com",
+  reasonCategory: "refund_completed",
+  affectedTitleCount: 1,
+} satisfies AccessChangeInput;
 
 const PRIVATE_COMMAND = {
   kind: "refund_draft_save",
@@ -231,6 +239,7 @@ function handlerFor(
   return createFinancialAdminCommandHandler({
     database: database as unknown as Database,
     executors: sixExecutors(executor),
+    accessMessages: { enqueueAccessChange: vi.fn(async () => undefined) },
     ...(capabilityResolver ? { capabilityResolver } : {}),
   });
 }
@@ -400,6 +409,52 @@ describe("financial administrator command job identity", () => {
 });
 
 describe("financial administrator command handler state machine", () => {
+  it("requires a callable access-message dependency at construction", () => {
+    const database = new FakeCommandDatabase();
+    const executors = sixExecutors();
+
+    expect(() =>
+      createFinancialAdminCommandHandler({
+        database: database as unknown as Database,
+        executors,
+      } as never),
+    ).toThrow(/access-message dependency/u);
+    expect(() =>
+      createFinancialAdminCommandHandler({
+        database: database as unknown as Database,
+        executors,
+        accessMessages: { enqueueAccessChange: "not-callable" },
+      } as never),
+    ).toThrow(/access-message dependency/u);
+  });
+
+  it("binds only a unary access-message capability to the current command transaction", async () => {
+    const database = new FakeCommandDatabase();
+    const enqueueAccessChange = vi.fn(async () => undefined);
+    const executor = vi.fn<FinancialAdminCommandExecutor>(async (context) => {
+      await context.enqueueAccessChange(ACCESS_CHANGE_INPUT);
+      return SAFE_RESULT;
+    });
+    const handler = createFinancialAdminCommandHandler({
+      database: database as unknown as Database,
+      executors: sixExecutors(executor),
+      accessMessages: { enqueueAccessChange },
+    });
+
+    await expect(
+      handler(baseJob(), new AbortController().signal),
+    ).resolves.toBeUndefined();
+
+    const [executorContext] = executor.mock.calls[0]!;
+    expect(executorContext).not.toHaveProperty("accessMessages");
+    expect(executorContext.enqueueAccessChange).toHaveLength(1);
+    expect(enqueueAccessChange).toHaveBeenCalledOnce();
+    expect(enqueueAccessChange.mock.calls[0]).toEqual([
+      database.transactions[0],
+      ACCESS_CHANGE_INPUT,
+    ]);
+  });
+
   it("sets the opaque token locally, locks role then lease then command, authorizes, and succeeds", async () => {
     const database = new FakeCommandDatabase();
     const executor = vi.fn(async () => SAFE_RESULT);
@@ -429,6 +484,7 @@ describe("financial administrator command handler state machine", () => {
         actor: { type: "user", id: ACTOR_ID, roles: ["customer", "admin"] },
         correlationId: "financial-command-test",
         signal,
+        enqueueAccessChange: expect.any(Function),
       },
       PRIVATE_COMMAND,
     );
