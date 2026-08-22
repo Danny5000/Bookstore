@@ -1,13 +1,14 @@
 <script lang="ts">
-  import { SvelteDate } from 'svelte/reactivity';
+  import { SvelteDate, SvelteURLSearchParams } from 'svelte/reactivity';
   import { resolve } from '$app/paths';
   import type { SalesOverviewFilterDto } from '$lib/server/commerce/reporting/overview';
 
   interface Props {
     filters: SalesOverviewFilterDto;
+    canExport: boolean;
   }
 
-  let { filters }: Props = $props();
+  let { filters, canExport }: Props = $props();
 
   function utcDate(value: string | null): string {
     return value?.slice(0, 10) ?? '';
@@ -19,6 +20,28 @@
     value.setUTCDate(value.getUTCDate() - 1);
     return value.toISOString().slice(0, 10);
   }
+
+  function exportUrl(filters: SalesOverviewFilterDto): string {
+    const search = new SvelteURLSearchParams();
+    search.set('range', filters.range);
+    if (filters.range === 'custom' && filters.from !== null && filters.to !== null) {
+      search.set('from', utcDate(filters.from));
+      search.set('to', inclusiveUtcDate(filters.to));
+    }
+    if (filters.titleId !== null) search.set('titleId', filters.titleId);
+    if (filters.format !== null) search.set('format', filters.format);
+    if (filters.presentmentCurrency !== null) {
+      search.set('presentmentCurrency', filters.presentmentCurrency);
+    }
+    if (filters.settlementCurrency !== null) {
+      search.set('settlementCurrency', filters.settlementCurrency);
+    }
+    if (filters.state !== null) search.set('state', filters.state);
+    search.set('sort', filters.sort);
+    return `${resolve('/admin/sales/export.csv')}?${search.toString()}`;
+  }
+
+  const exportHref = $derived(exportUrl(filters));
 
   function omitEmptyOptionalFields(event: SubmitEvent): void {
     const form = event.currentTarget;
@@ -132,5 +155,10 @@
   <div class="sales-filter-actions">
     <button type="submit">Apply filters</button>
     <a href={resolve('/admin/sales')}>Clear</a>
+    {#if canExport}
+      <!-- Generated only from the strict normalized noncursor DTO. -->
+      <!-- eslint-disable-next-line svelte/no-navigation-without-resolve -->
+      <a href={exportHref}>Export filtered CSV</a>
+    {/if}
   </div>
 </form>

@@ -1,6 +1,9 @@
 import { error } from '@sveltejs/kit';
 import { requireCapability } from '$lib/server/auth/admin-policy';
-import { listSalesOverview } from '$lib/server/commerce/reporting/overview';
+import {
+  canExportSalesOverview,
+  listSalesOverview
+} from '$lib/server/commerce/reporting/overview';
 import { parseSalesOverviewFilters } from '$lib/server/commerce/reporting/filters';
 import { getDatabaseClient } from '$lib/server/db/runtime';
 import { financialActionFailure } from './route-support';
@@ -15,7 +18,11 @@ export const load: PageServerLoad = async (event) => {
   try {
     requireCapability(event.locals.actor, 'sales.read');
     const filters = parseSalesOverviewFilters(event.url, new Date());
-    return await listSalesOverview(getDatabaseClient().db, event.locals.actor, filters);
+    const overview = await listSalesOverview(getDatabaseClient().db, event.locals.actor, filters);
+    return {
+      ...overview,
+      canExport: canExportSalesOverview(event.locals.actor)
+    };
   } catch (cause: unknown) {
     failSafely(cause);
   }

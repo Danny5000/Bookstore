@@ -13,6 +13,9 @@ import {
 import {
   SALES_OVERVIEW_DTO_KEYS,
   SALES_OVERVIEW_FILTER_DTO_KEYS,
+  canExportSalesOverview,
+  loadSalesAggregateRows,
+  loadSalesDataThroughAt,
   listSalesOverview
 } from './overview';
 
@@ -122,6 +125,55 @@ function normalizedSql(call: unknown): string {
 }
 
 describe('sales overview read model', () => {
+  it('derives the optional export affordance through the injected capability resolver', () => {
+    const salesReadOnly = () => new Set(['sales.read'] as const);
+    const salesExportOnly = () => new Set(['sales.export'] as const);
+    const salesExporter = () => new Set(['sales.read', 'sales.export'] as const);
+
+    expect(canExportSalesOverview(admin, { capabilityResolver: salesReadOnly })).toBe(false);
+    expect(canExportSalesOverview(admin, { capabilityResolver: salesExportOnly })).toBe(false);
+    expect(canExportSalesOverview(admin, { capabilityResolver: salesExporter })).toBe(true);
+    expect(canExportSalesOverview({ type: 'anonymous' }, {
+      capabilityResolver: salesExporter
+    })).toBe(false);
+  });
+
+  it('loads a bounded aggregate in the shared deterministic order while explicitly omitting cursor', async () => {
+    const cursor = {
+      filterFingerprint: fingerprintSalesFilters(filters),
+      primary: 2_000,
+      titleId: titleId(20),
+      presentmentCurrency: 'USD',
+      settlementCurrency: 'USD'
+    } as const;
+    const { execute } = databaseWith([[completeRow()]]);
+
+    const rows = await loadSalesAggregateRows(
+      { execute } as never,
+      { ...filters, cursor },
+      { applyCursor: false, limit: 10_001 }
+    );
+
+    expect(rows).toHaveLength(1);
+    const statement = normalizedSql(execute.mock.calls[0]![0]);
+    expect(statement).toContain('gross_presentment_minor desc');
+    expect(statement).not.toMatch(/gross_presentment_minor < \$\d+/u);
+    expect(statement).toMatch(/limit \$\d+$/u);
+    expect(dialect.sqlToQuery(execute.mock.calls[0]![0] as never).params.at(-1)).toBe(10_001);
+  });
+
+  it('loads and validates the shared global data-through timestamp', async () => {
+    const { execute } = databaseWith([{
+      sourceCompletedAt: '2026-08-21 12:00:00+00',
+      payoutCompletedAt: '2026-08-21 11:00:00+00',
+      projectionCompletedAt: '2026-08-21 13:00:00+00'
+    }].map((row) => [row]));
+
+    await expect(loadSalesDataThroughAt({ execute } as never)).resolves.toBe(
+      '2026-08-21T11:00:00.000Z'
+    );
+  });
+
   it('authorizes sales.read before opening a transaction or issuing a query', async () => {
     const { database, transaction } = successfulDatabase();
     await expect(listSalesOverview(database, admin, filters, {

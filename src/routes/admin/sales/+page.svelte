@@ -103,7 +103,7 @@
   {/if}
 
   <SalesSummaryCards summaries={data.summaries} />
-  <SalesFilters filters={data.filters} />
+  <SalesFilters filters={data.filters} canExport={data.canExport} />
 
   <p class="sales-results-status" role="status" aria-live="polite" aria-atomic="true">
     {data.rows.length} matching {data.rows.length === 1 ? 'sales row' : 'sales rows'}.

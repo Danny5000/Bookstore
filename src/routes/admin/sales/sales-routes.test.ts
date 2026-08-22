@@ -15,11 +15,15 @@ import type {
   PayoutDetailDto,
   PayoutListDto
 } from '$lib/server/commerce/reporting/payouts';
+import { SalesReportingInputError } from '$lib/server/commerce/reporting/filters';
 
 const routeMocks = vi.hoisted(() => ({
   database: {},
   denySalesReadForAdmin: false,
+  denySalesExportForAdmin: false,
   listSalesOverview: vi.fn(),
+  canExportSalesOverview: vi.fn(),
+  exportSalesCsv: vi.fn(),
   listFinancialIssues: vi.fn(),
   getFinancialIssueDetail: vi.fn(),
   listPayouts: vi.fn(),
@@ -45,10 +49,10 @@ vi.mock('$lib/server/auth/admin-policy', async (importOriginal) => {
       capabilityResolver?: CapabilityResolver
     ): asserts actor is AdministratorActor {
       if (
-        routeMocks.denySalesReadForAdmin &&
         actor.type === 'user' &&
         actor.roles.includes('admin') &&
-        capability === 'sales.read'
+        ((routeMocks.denySalesReadForAdmin && capability === 'sales.read') ||
+          (routeMocks.denySalesExportForAdmin && capability === 'sales.export'))
       ) {
         throw new actual.AuthorizationError('forbidden', 403);
       }
@@ -58,7 +62,12 @@ vi.mock('$lib/server/auth/admin-policy', async (importOriginal) => {
 });
 
 vi.mock('$lib/server/commerce/reporting/overview', () => ({
-  listSalesOverview: routeMocks.listSalesOverview
+  listSalesOverview: routeMocks.listSalesOverview,
+  canExportSalesOverview: routeMocks.canExportSalesOverview
+}));
+
+vi.mock('$lib/server/commerce/reporting/csv', () => ({
+  exportSalesCsv: routeMocks.exportSalesCsv
 }));
 
 vi.mock('$lib/server/commerce/reporting/review', async (importOriginal) => {
@@ -81,6 +90,7 @@ vi.mock('$lib/server/commerce/reporting/payouts', async (importOriginal) => {
 
 import { load as loadSalesLayout } from './+layout.server';
 import * as overviewRoute from './+page.server';
+import * as exportRoute from './export.csv/+server';
 import * as reviewRoute from './review/+page.server';
 import * as reviewDetailRoute from './review/[issueId]/+page.server';
 import * as payoutsRoute from './payouts/+page.server';
@@ -225,6 +235,7 @@ describe('Sales route authorization', () => {
 describe('Sales Overview loader', () => {
   beforeEach(() => {
     routeMocks.denySalesReadForAdmin = false;
+    routeMocks.canExportSalesOverview.mockReset().mockReturnValue(true);
   });
 
   it.each([
@@ -272,7 +283,7 @@ describe('Sales Overview loader', () => {
       ) as never
     );
 
-    expect(result).toBe(overviewDto);
+    expect(result).toEqual({ ...overviewDto, canExport: true });
     expect(routeMocks.listSalesOverview).toHaveBeenCalledOnce();
   });
 
@@ -306,7 +317,7 @@ describe('Sales Overview loader', () => {
           pageSize: 50
         }
       );
-      expect(result).toEqual(overviewDto);
+      expect(result).toEqual({ ...overviewDto, canExport: true });
       expect(Object.keys(result as object)).toEqual([
         'filters',
         'rows',
@@ -315,15 +326,144 @@ describe('Sales Overview loader', () => {
         'dataThroughAt',
         'stripeEnabled',
         'missingSourceCount',
-        'needsReviewCount'
+        'needsReviewCount',
+        'canExport'
       ]);
     } finally {
       vi.useRealTimers();
     }
   });
 
+  it('returns canExport false without exposing export for a read-only actor', async () => {
+    routeMocks.canExportSalesOverview.mockReturnValueOnce(false);
+    routeMocks.listSalesOverview.mockResolvedValueOnce(overviewDto);
+
+    await expect(overviewRoute.load(pageEvent(
+      admin,
+      new URL('https://books.example.test/admin/sales')
+    ) as never)).resolves.toEqual({ ...overviewDto, canExport: false });
+  });
+
   it('has no Overview action surface', () => {
     expect('actions' in overviewRoute).toBe(false);
+  });
+});
+
+describe('bounded audited Sales CSV route', () => {
+  beforeEach(() => {
+    routeMocks.denySalesReadForAdmin = false;
+    routeMocks.denySalesExportForAdmin = false;
+    routeMocks.exportSalesCsv.mockReset();
+  });
+
+  it.each([
+    ['sales.read', anonymous, false, 401],
+    ['sales.export', admin, true, 403]
+  ])('requires %s before touching URL, request, or route input', async (
+    _capability,
+    actor,
+    denyExport,
+    status
+  ) => {
+    routeMocks.denySalesExportForAdmin = denyExport;
+    const accesses = { url: vi.fn(), request: vi.fn(), route: vi.fn() };
+    const event: Record<string, unknown> = { locals: { actor } };
+    for (const key of Object.keys(accesses) as Array<keyof typeof accesses>) {
+      Object.defineProperty(event, key, { enumerable: true, get: accesses[key] });
+    }
+
+    const response = await exportRoute.GET(event as never);
+
+    expect(response.status).toBe(status);
+    await expect(response.json()).resolves.toMatchObject({
+      code: status === 401 ? 'unauthenticated' : 'forbidden'
+    });
+    for (const access of Object.values(accesses)) expect(access).not.toHaveBeenCalled();
+    expect(routeMocks.exportSalesCsv).not.toHaveBeenCalled();
+  });
+
+  it('passes normalized filters and fixed audit context, then returns only complete CSV bytes', async () => {
+    const bytes = new TextEncoder().encode('currentTitle\r\nPale Orbit\r\n');
+    routeMocks.exportSalesCsv.mockResolvedValueOnce({
+      bytes,
+      filename: 'pale-orbit-sales-2026-08-01-2026-08-10.csv',
+      rowCount: 1
+    });
+    const request = new Request(
+      'https://books.example.test/admin/sales/export.csv?range=custom&from=2026-08-01&to=2026-08-10&format=comic&presentmentCurrency=USD&settlementCurrency=EUR&state=fee_reconciled&sort=title_asc',
+      { headers: { 'x-request-id': 'sales-export-route-1' } }
+    );
+
+    const response = await exportRoute.GET({
+      locals: { actor: admin },
+      url: new URL(request.url),
+      request,
+      route: { id: '/admin/sales/export.csv' }
+    } as never);
+
+    expect(routeMocks.exportSalesCsv).toHaveBeenCalledWith(
+      routeMocks.database,
+      admin,
+      {
+        range: 'custom',
+        from: new Date('2026-08-01T00:00:00.000Z'),
+        to: new Date('2026-08-11T00:00:00.000Z'),
+        format: 'comic',
+        presentmentCurrency: 'USD',
+        settlementCurrency: 'EUR',
+        state: 'fee_reconciled',
+        sort: 'title_asc',
+        pageSize: 50
+      },
+      {
+        correlationId: 'sales-export-route-1',
+        requestMetadata: { method: 'GET', routeId: '/admin/sales/export.csv' }
+      }
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toBe('text/csv; charset=utf-8');
+    expect(response.headers.get('content-disposition')).toBe(
+      'attachment; filename="pale-orbit-sales-2026-08-01-2026-08-10.csv"'
+    );
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(response.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes);
+  });
+
+  it.each([
+    ['malformed filter', new URL('https://books.example.test/admin/sales/export.csv?unknown=private'), null],
+    ['bounded service rejection', new URL('https://books.example.test/admin/sales/export.csv'), new SalesReportingInputError('private limit')]
+  ])('maps %s to safe non-CSV 400 with no partial bytes', async (_label, url, rejection) => {
+    if (rejection !== null) routeMocks.exportSalesCsv.mockRejectedValueOnce(rejection);
+    const request = new Request(url);
+
+    const response = await exportRoute.GET({
+      locals: { actor: admin }, url, request, route: { id: '/admin/sales/export.csv' }
+    } as never);
+    const body = await response.text();
+
+    expect(response.status).toBe(400);
+    expect(response.headers.get('content-type')).toBe('application/json; charset=utf-8');
+    expect(response.headers.get('content-disposition')).toBeNull();
+    expect(body).toContain('invalid_request');
+    expect(body).not.toContain('private');
+    if (rejection === null) expect(routeMocks.exportSalesCsv).not.toHaveBeenCalled();
+  });
+
+  it('maps a private export failure to a detail-free non-CSV 503', async () => {
+    routeMocks.exportSalesCsv.mockRejectedValueOnce(new Error('private CSV query detail'));
+    const url = new URL('https://books.example.test/admin/sales/export.csv');
+    const request = new Request(url);
+
+    const response = await exportRoute.GET({
+      locals: { actor: admin }, url, request, route: { id: '/admin/sales/export.csv' }
+    } as never);
+    const body = await response.text();
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get('content-disposition')).toBeNull();
+    expect(body).toContain('temporarily_unavailable');
+    expect(body).not.toContain('private CSV query detail');
   });
 });
 

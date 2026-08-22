@@ -1,11 +1,13 @@
 import { sql, type SQL } from 'drizzle-orm';
 import { z } from 'zod';
 import {
+  capabilitiesForRoles,
   requireCapability,
   type Actor,
   type FinancialAuthorizationDependencies
 } from '$lib/server/auth/admin-policy';
 import type { Database } from '$lib/server/db/client';
+import type { DatabaseTransaction } from '$lib/server/db/transaction';
 import { financialReconciliationIssues } from '$lib/server/db/schema';
 import type {
   PublicFinancialState,
@@ -25,6 +27,11 @@ import { currentOperationalFinancialIssuePredicate } from './review-authority';
 
 export interface SalesOverviewDependencies extends FinancialAuthorizationDependencies {
   readonly stripeEnabled?: boolean;
+}
+
+export interface SalesAggregateRowsOptions {
+  readonly applyCursor: boolean;
+  readonly limit: number;
 }
 
 export const SALES_OVERVIEW_FILTER_DTO_KEYS = [
@@ -940,20 +947,39 @@ function rowColumns(): SQL {
   `;
 }
 
-function pageQuery(filters: SalesOverviewFilters): SQL {
-  const order = filters.sort === 'gross_desc'
+function rowOrder(filters: SalesOverviewFilters): SQL {
+  return filters.sort === 'gross_desc'
     ? sql`sales_rows.gross_presentment_minor desc, sales_rows.title_id asc,
         sales_rows.presentment_currency asc, coalesce(sales_rows.settlement_currency, '') asc`
     : sql`sales_rows.current_title collate "C" asc, sales_rows.title_id asc,
         sales_rows.presentment_currency asc, coalesce(sales_rows.settlement_currency, '') asc`;
+}
+
+function aggregateRowsQuery(
+  filters: SalesOverviewFilters,
+  options: SalesAggregateRowsOptions
+): SQL {
   return sql`
     with ${salesRowsRelation(filters)}
     select ${rowColumns()}
     from sales_rows
-    where ${outputFilters(filters)} and ${cursorCondition(filters)}
-    order by ${order}
-    limit ${filters.pageSize + 1}
+    where ${outputFilters(filters)} and ${options.applyCursor ? cursorCondition(filters) : sql`true`}
+    order by ${rowOrder(filters)}
+    limit ${options.limit}
   `;
+}
+
+export async function loadSalesAggregateRows(
+  transaction: DatabaseTransaction,
+  filters: SalesOverviewFilters,
+  options: SalesAggregateRowsOptions
+): Promise<readonly TitleSalesRowDto[]> {
+  if (!Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 10_001) {
+    return invalidData();
+  }
+  const rawRows = queryRows(await transaction.execute(aggregateRowsQuery(filters, options)));
+  if (rawRows.length > options.limit) return invalidData();
+  return rawRows.map(parseRow);
 }
 
 function summaryQuery(filters: SalesOverviewFilters): SQL {
@@ -1047,6 +1073,24 @@ function dataThroughAt(value: unknown): string | null {
   )!;
 }
 
+export async function loadSalesDataThroughAt(
+  transaction: DatabaseTransaction
+): Promise<string | null> {
+  const rawFreshness = queryRows(await transaction.execute(freshnessQuery()));
+  if (rawFreshness.length !== 1) return invalidData();
+  return dataThroughAt(rawFreshness[0]);
+}
+
+export function canExportSalesOverview(
+  actor: Actor,
+  dependencies: FinancialAuthorizationDependencies = {}
+): boolean {
+  if (actor.type !== 'user') return false;
+  const resolveCapabilities = dependencies.capabilityResolver ?? capabilitiesForRoles;
+  const capabilities = resolveCapabilities(actor.roles);
+  return capabilities.has('sales.read') && capabilities.has('sales.export');
+}
+
 function sumMissingSources(summaries: readonly SalesCurrencySummaryDto[]): number {
   return summaries.reduce((total, summary) => safeAdd(total, summary.missingSourceCount), 0);
 }
@@ -1061,17 +1105,17 @@ export async function listSalesOverview(
   const stripeEnabled = dependencies.stripeEnabled ??
     (await import('$lib/server/config')).getApplicationConfig().stripe.enabled;
   const result = await database.transaction(async (transaction) => {
-    const rawPage = queryRows(await transaction.execute(pageQuery(filters)));
-    if (rawPage.length > filters.pageSize + 1) return invalidData();
-    const parsedPage = rawPage.map(parseRow);
+    const parsedPage = await loadSalesAggregateRows(transaction, filters, {
+      applyCursor: true,
+      limit: filters.pageSize + 1
+    });
     const rows = parsedPage.slice(0, filters.pageSize);
     const summaryRows = queryRows(await transaction.execute(summaryQuery(filters))).map(parseSummary);
     const rawReview = queryRows(await transaction.execute(reviewCountQuery()));
     if (rawReview.length !== 1) return invalidData();
     const review = reviewCountSchema.safeParse(rawReview[0]);
     if (!review.success) return invalidData();
-    const rawFreshness = queryRows(await transaction.execute(freshnessQuery()));
-    if (rawFreshness.length !== 1) return invalidData();
+    const freshness = await loadSalesDataThroughAt(transaction);
 
     const nextCursor = parsedPage.length > filters.pageSize
       ? encodeSalesCursor({
@@ -1088,7 +1132,7 @@ export async function listSalesOverview(
       rows,
       summaries: summaryRows,
       nextCursor,
-      dataThroughAt: dataThroughAt(rawFreshness[0]),
+      dataThroughAt: freshness,
       missingSourceCount: sumMissingSources(summaryRows),
       needsReviewCount: review.data.needsReviewCount
     };

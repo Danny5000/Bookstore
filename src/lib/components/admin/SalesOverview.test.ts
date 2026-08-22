@@ -475,6 +475,40 @@ describe('Sales Overview page', () => {
     expect(body).not.toContain('autofocus');
   });
 
+  it('shows a canonical cursor-free export link only when canExport is true', () => {
+    componentMocks.url =
+      'https://books.example.test/admin/sales?private=ignored&cursor=page_cursor';
+    const filters = {
+      range: 'custom' as const,
+      from: '2026-08-01T00:00:00.000Z',
+      to: '2026-08-11T00:00:00.000Z',
+      titleId,
+      format: 'comic' as const,
+      presentmentCurrency: 'USD',
+      settlementCurrency: 'EUR',
+      state: 'fee_reconciled' as const,
+      sort: 'title_asc' as const
+    };
+    const visible = render(SalesOverview, {
+      props: { data: { ...overview({ filters }), canExport: true } as never }
+    }).body;
+    const hidden = render(SalesOverview, {
+      props: { data: { ...overview({ filters }), canExport: false } as never }
+    }).body;
+    const href = decodedHref(visible, 'Export filtered CSV');
+
+    expect(href).toBe(
+      `/admin/sales/export.csv?range=custom&from=2026-08-01&to=2026-08-10&titleId=${titleId}&format=comic&presentmentCurrency=USD&settlementCurrency=EUR&state=fee_reconciled&sort=title_asc`
+    );
+    const exported = new URL(href, 'https://books.example.test');
+    expect(exported.searchParams.has('cursor')).toBe(false);
+    expect(exported.searchParams.has('private')).toBe(false);
+    for (const key of exported.searchParams.keys()) {
+      expect(exported.searchParams.getAll(key)).toHaveLength(1);
+    }
+    expect(hidden).not.toContain('Export filtered CSV');
+  });
+
   it('renders explicit disabled, freshness, pending-only, and review notices', () => {
     const data = overview({
       rows: [incompleteRow()],
