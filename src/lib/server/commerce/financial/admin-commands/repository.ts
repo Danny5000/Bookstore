@@ -87,6 +87,24 @@ class FinancialAdminCommandRepositoryError extends Error {
   }
 }
 
+export class FinancialAdminCommandSubmissionConflictError extends Error {
+  readonly code = 'stale_state' as const;
+
+  constructor() {
+    super('The financial administrator command conflicts with an existing submission.');
+    this.name = 'FinancialAdminCommandSubmissionConflictError';
+  }
+}
+
+function isSubmissionConflict(error: unknown): boolean {
+  try {
+    return error instanceof Error &&
+      (error as Error & { readonly code?: unknown }).code === '40900';
+  } catch {
+    return false;
+  }
+}
+
 function invalidRepositoryData(): never {
   throw new FinancialAdminCommandRepositoryError();
 }
@@ -153,14 +171,22 @@ export async function submitFinancialAdminCommand(
     };
     requireFinancialCommandSubmissionCapabilities(authorizedActor, kind, dependencies);
 
-    const result = await transaction.execute(sql`
-      select command_id as "commandId", command_kind as kind,
-        command_status as status, created_at as "createdAt"
-      from public.submit_financial_admin_command(
-        ${actorId}, ${correlationId}, ${kind}, ${idempotencyKeySha256},
-        ${inputFingerprintSha256}, ${canonicalCommand}::jsonb
-      )
-    `);
+    let result: unknown;
+    try {
+      result = await transaction.execute(sql`
+        select command_id as "commandId", command_kind as kind,
+          command_status as status, created_at as "createdAt"
+        from public.submit_financial_admin_command(
+          ${actorId}, ${correlationId}, ${kind}, ${idempotencyKeySha256},
+          ${inputFingerprintSha256}, ${canonicalCommand}::jsonb
+        )
+      `);
+    } catch (error) {
+      if (isSubmissionConflict(error)) {
+        throw new FinancialAdminCommandSubmissionConflictError();
+      }
+      throw error;
+    }
     const rows = queryRows(result);
     if (rows.length !== 1) return invalidRepositoryData();
     return parseProtectedRow(referenceRowSchema, rows[0]) as FinancialAdminCommandReferenceDto;

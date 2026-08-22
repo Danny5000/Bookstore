@@ -12,6 +12,10 @@ import type {
 } from "$lib/types/financial-reporting";
 import { createFinancialAdminCommandExecutors } from "./executors";
 import {
+  executeRefundDraftDiscard,
+  executeRefundDraftSave,
+} from "../refund-review/drafts";
+import {
   FINANCIAL_ADMIN_COMMAND_JOB,
   FinancialAdminConflictError,
   FinancialAdminDeniedError,
@@ -232,6 +236,25 @@ function handlerFor(
 }
 
 describe("createFinancialAdminCommandExecutors", () => {
+  it("composes the two real draft executors with four distinct future-task stubs", () => {
+    const futureStub = (label: string): FinancialAdminCommandExecutor =>
+      vi.fn(async () => {
+        throw new Error(`${label} executor is not implemented in Task 11`);
+      });
+    const executors = createFinancialAdminCommandExecutors({
+      refundDraftSave: executeRefundDraftSave as FinancialAdminCommandExecutor,
+      refundDraftDiscard: executeRefundDraftDiscard as FinancialAdminCommandExecutor,
+      refundAllocationFinalize: futureStub("finalize"),
+      refundReportingCorrectionCreate: futureStub("correction"),
+      administrativeRecoveryActivate: futureStub("recovery-activate"),
+      administrativeRecoveryDeactivate: futureStub("recovery-deactivate"),
+    });
+
+    expect(executors.get("refund_draft_save")).toBe(executeRefundDraftSave);
+    expect(executors.get("refund_draft_discard")).toBe(executeRefundDraftDiscard);
+    expect(new Set(executors.values()).size).toBe(6);
+  });
+
   it("constructs exactly the six fixed command-kind bindings", () => {
     const dependencies = {
       refundDraftSave: vi.fn(),

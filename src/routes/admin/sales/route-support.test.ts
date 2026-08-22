@@ -7,6 +7,8 @@ import {
   type CapabilityResolver
 } from '$lib/server/auth/admin-policy';
 import { SalesReportingInputError } from '$lib/server/commerce/reporting/filters';
+import { FinancialAdminCommandSubmissionConflictError } from '$lib/server/commerce/financial/admin-commands/repository';
+import { StrictHttpError } from '$lib/server/http/strict-json';
 import {
   FinancialRouteError,
   FinancialRouteInputError,
@@ -28,7 +30,10 @@ vi.mock('$lib/server/db/runtime', () => ({
 vi.mock('$lib/server/config', () => ({
   getApplicationConfig: () => ({ origin: 'https://books.example.test' })
 }));
-vi.mock('$lib/server/commerce/financial/admin-commands/repository', () => ({
+vi.mock('$lib/server/commerce/financial/admin-commands/repository', async (importOriginal) => ({
+  ...(await importOriginal<
+    typeof import('$lib/server/commerce/financial/admin-commands/repository')
+  >()),
   getFinancialAdminCommandStatus: routeMocks.getFinancialAdminCommandStatus
 }));
 
@@ -155,6 +160,12 @@ describe('financial route failure mapping', () => {
       code: 'unauthenticated'
     },
     { cause: new AuthorizationError('forbidden', 403), status: 403, code: 'forbidden' },
+    { cause: new StrictHttpError(403, 'forbidden'), status: 403, code: 'forbidden' },
+    {
+      cause: new FinancialAdminCommandSubmissionConflictError(),
+      status: 409,
+      code: 'stale_state'
+    },
     { cause: new FinancialRouteError('not_found'), status: 404, code: 'not_found' },
     { cause: new FinancialRouteError('stale_state'), status: 409, code: 'stale_state' },
     {

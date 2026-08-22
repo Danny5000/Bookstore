@@ -12,6 +12,7 @@ import type { Database } from '$lib/server/db/client';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
 import { listRolesForUser } from '$lib/server/auth/identity';
 import {
+  FinancialAdminCommandSubmissionConflictError,
   getFinancialAdminCommandStatus,
   submitFinancialAdminCommand
 } from './repository';
@@ -191,6 +192,26 @@ describe('financial administrator command submission repository', () => {
       });
       expect(failure).not.toHaveProperty('cause');
     }
+  });
+
+  it('translates the protected submission routine replay conflict into a detail-free typed error', async () => {
+    const conflict = Object.assign(new Error('private fingerprint mismatch'), { code: '40900' });
+    const transaction = {
+      execute: vi.fn()
+        .mockResolvedValueOnce({ rows: [] })
+        .mockRejectedValueOnce(conflict)
+    } as unknown as DatabaseTransaction;
+    const database = {
+      transaction: vi.fn(async (work: (tx: DatabaseTransaction) => Promise<unknown>) =>
+        work(transaction))
+    } as unknown as Database;
+
+    const failure = await submitFinancialAdminCommand(database, submissionInput())
+      .catch((error: unknown) => error);
+
+    expect(failure).toEqual(new FinancialAdminCommandSubmissionConflictError());
+    expect(failure).not.toHaveProperty('cause');
+    expect(JSON.stringify(failure)).not.toContain('private fingerprint mismatch');
   });
 });
 

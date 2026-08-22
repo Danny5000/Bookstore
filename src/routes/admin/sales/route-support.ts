@@ -11,6 +11,9 @@ import {
 import { safeAuditRequestMetadata } from '$lib/server/audit/request-metadata';
 import type { FinancialRequestContext } from '$lib/server/commerce/reporting/context';
 import { SalesReportingInputError } from '$lib/server/commerce/reporting/filters';
+import { FinancialAdminCommandSubmissionConflictError } from '$lib/server/commerce/financial/admin-commands/repository';
+import { RefundReviewInputError } from '$lib/server/commerce/financial/refund-review/inputs';
+import { StrictHttpError } from '$lib/server/http/strict-json';
 
 export type FinancialRouteFailure =
   | { readonly status: 400; readonly code: 'invalid_request' }
@@ -98,8 +101,15 @@ function safeFailure(code: FinancialRouteFailureCode): FinancialRouteFailure {
 
 export function financialActionFailure(cause: unknown): FinancialRouteFailure {
   if (cause instanceof AuthorizationError) return safeFailure(cause.code);
+  if (cause instanceof StrictHttpError && cause.status === 403 && cause.code === 'forbidden') {
+    return safeFailure('forbidden');
+  }
+  if (cause instanceof FinancialAdminCommandSubmissionConflictError) {
+    return safeFailure('stale_state');
+  }
   if (
     cause instanceof FinancialRouteInputError ||
+    cause instanceof RefundReviewInputError ||
     cause instanceof SalesReportingInputError ||
     cause instanceof ZodError ||
     cause instanceof SyntaxError
