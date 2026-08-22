@@ -43,7 +43,11 @@ import {
   FINANCIAL_REPLAY_ID
 } from '../constants';
 import { PermanentFinancialError, RetryableFinancialError } from '../errors';
-import { observeFinancialIssue, resolveFinancialIssueAfterRecompute } from '../issues';
+import {
+  observeFinancialIssue,
+  resolveFinancialIssueAfterAdminCommand,
+  resolveFinancialIssueAfterRecompute
+} from '../issues';
 import {
   lockActiveFinancialProjectionImplementation,
   lockFinancialProjectionRows
@@ -73,6 +77,11 @@ const ISSUE_CODES: readonly FinancialIssueCode[] = [
   'source_linkage_mismatch', 'unsupported_category'
 ];
 const ORDINARY_REFUND_SET_ISSUE_CODES: readonly FinancialIssueCode[] = ISSUE_CODES;
+const ADMIN_RESOLVABLE_REFUND_ISSUE_CODES: readonly FinancialIssueCode[] = [
+  'allocation_fork', 'allocation_incomplete', 'allocation_mismatch', 'classification_fork',
+  'correction_rebase_required', 'currency_mismatch', 'immutable_mismatch', 'missing_source',
+  'source_linkage_mismatch'
+];
 const LOCKED_REFUND_KEYS = [
   'orderId', 'paymentId', 'refundId', 'providerStatus', 'allocationStatus', 'amountMinor',
   'currency', 'balanceTransactionIds', 'orderItems', 'finalizedAllocations',
@@ -176,12 +185,16 @@ export type LockedRefundProjectionReplayResult =
       readonly impact: Exclude<FinancialIssueImpact, 'informational'>;
     };
 
-interface RefundProjectionVersionTarget {
+interface RefundProjectionVersion {
   readonly classifierVersion: number;
   readonly allocationAlgorithmVersion: number;
   readonly replayId: string;
-  readonly mode: 'ordinary' | 'replay';
 }
+
+type RefundProjectionVersionTarget = RefundProjectionVersion & (
+  | { readonly mode: 'ordinary' | 'replay' }
+  | { readonly mode: 'admin'; readonly commandId: string }
+);
 
 interface PersistedRefundProjectionPlan {
   readonly setId: string;
@@ -199,15 +212,15 @@ class RefundProjectionIssue extends Error {
   }
 }
 
-interface ResolvedOrdinaryRefundSetIssue {
+interface ResolvedRefundProjectionIssue {
   readonly id: string;
   readonly safeCode: FinancialIssueCode;
   readonly impact: FinancialIssueImpact;
 }
 
 function compareResolvedSetIssuePriority(
-  left: ResolvedOrdinaryRefundSetIssue,
-  right: ResolvedOrdinaryRefundSetIssue
+  left: ResolvedRefundProjectionIssue,
+  right: ResolvedRefundProjectionIssue
 ): number {
   const impactRank = (impact: FinancialIssueImpact): number =>
     impact === 'exception' ? 0 : impact === 'pending' ? 1 : 2;
@@ -215,6 +228,20 @@ function compareResolvedSetIssuePriority(
   if (rank !== 0) return rank;
   if (left.safeCode !== right.safeCode) return left.safeCode < right.safeCode ? -1 : 1;
   return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+}
+
+function canonicalAdminIssueIds(values: readonly unknown[]): string[] {
+  const ids: string[] = [];
+  for (const value of values) {
+    if (!exactObject(value, ['id']) || !UUID.test(value.id as string)) {
+      throw new PermanentFinancialError('immutable_mismatch');
+    }
+    ids.push(value.id as string);
+  }
+  if (new Set(ids).size !== ids.length) {
+    throw new PermanentFinancialError('immutable_mismatch');
+  }
+  return ids.sort();
 }
 
 function exactObject(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
@@ -843,7 +870,8 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
   assertLockedRefundProjectionInput(input);
   if (ordinarySelectedSetIds.some((id) => !UUID.test(id)) ||
     new Set(ordinarySelectedSetIds).size !== ordinarySelectedSetIds.length ||
-    (target.mode === 'replay' && ordinarySelectedSetIds.length > 0)) {
+    (target.mode === 'replay' && ordinarySelectedSetIds.length > 0) ||
+    (target.mode === 'admin' && !UUID.test(target.commandId))) {
     invalidLockedInput();
   }
   const [localState] = await rows(transaction, sql`
@@ -1349,20 +1377,55 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
           return { kind: 'replay' as const, persisted };
         }
 
-        const resolvedAllocationSetIssues: ResolvedOrdinaryRefundSetIssue[] = [];
+        const resolvedProjectionIssues: ResolvedRefundProjectionIssue[] = [];
         const validatedSelectedSetIds = [...new Set(persisted.flatMap((row) => [
           row.setId,
           ...(row.plan.supersedesSetId === null ? [] : [row.plan.supersedesSetId])
         ]).filter((id) => ordinarySelectedSetIds.includes(id)))].sort();
-        for (const resourceId of validatedSelectedSetIds) {
-          for (const safeCode of ORDINARY_REFUND_SET_ISSUE_CODES) {
-            const resolved = await resolveFinancialIssueAfterRecompute(projectionTx, {
-              resourceType: 'allocation_set', resourceId, safeCode,
-              proof: { status: 'resolved', resourceType: 'allocation_set',
-                resourceId, safeCode },
-              actor: ACTOR, correlationId: input.correlationId
+        if (target.mode === 'ordinary') {
+          for (const resourceId of validatedSelectedSetIds) {
+            for (const safeCode of ORDINARY_REFUND_SET_ISSUE_CODES) {
+              const resolved = await resolveFinancialIssueAfterRecompute(projectionTx, {
+                resourceType: 'allocation_set', resourceId, safeCode,
+                proof: { status: 'resolved', resourceType: 'allocation_set',
+                  resourceId, safeCode },
+                actor: ACTOR, correlationId: input.correlationId
+              });
+              if (resolved) resolvedProjectionIssues.push({
+                id: resolved.id, safeCode: resolved.safeCode, impact: resolved.impact
+              });
+            }
+          }
+        } else if (target.mode === 'admin') {
+          const allocationSetScope = validatedSelectedSetIds.length === 0
+            ? sql`false`
+            : sql`(
+                admin_issue.resource_type = 'allocation_set' and
+                admin_issue.resource_id in (${sql.join(
+                  validatedSelectedSetIds.map((id) => sql`${id}::uuid`), sql`, `
+                )})
+              )`;
+          const openIssueIds = canonicalAdminIssueIds(await rows(projectionTx, sql`
+            select admin_issue.id
+            from financial_reconciliation_issues admin_issue
+            where admin_issue.state = 'open'
+              and admin_issue.safe_code in (${sql.join(
+                ADMIN_RESOLVABLE_REFUND_ISSUE_CODES.map((safeCode) => sql`${safeCode}`),
+                sql`, `
+              )})
+              and (
+                (admin_issue.resource_type = 'refund' and
+                  admin_issue.resource_id = ${input.refundId}::uuid)
+                or ${allocationSetScope}
+              )
+            order by admin_issue.id
+          `));
+          for (const issueId of openIssueIds) {
+            const resolved = await resolveFinancialIssueAfterAdminCommand(projectionTx, {
+              commandId: target.commandId,
+              issueId
             });
-            if (resolved) resolvedAllocationSetIssues.push({
+            if (resolved) resolvedProjectionIssues.push({
               id: resolved.id, safeCode: resolved.safeCode, impact: resolved.impact
             });
           }
@@ -1375,7 +1438,7 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
         }
         const failureProjection = projections.find((projection) => projection.status !== 'complete');
         if (failureProjection) {
-          const resolvedBlockingIssue = [...resolvedAllocationSetIssues]
+          const resolvedBlockingIssue = [...resolvedProjectionIssues]
             .sort(compareResolvedSetIssuePriority)
             .find((issue) => issue.impact !== 'informational');
           if (resolvedBlockingIssue) {
@@ -1409,7 +1472,7 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
           kind: 'complete' as const,
           persisted,
           projections,
-          resolvedAllocationSetIssueIds: resolvedAllocationSetIssues.map((issue) => issue.id)
+          resolvedProjectionIssueIds: resolvedProjectionIssues.map((issue) => issue.id)
         };
       });
       return value;
@@ -1483,14 +1546,16 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
   if (outcome.kind === 'issue') {
     return recordLockedRefundIssue(transaction, input, outcome.safeCode, outcome.impact);
   }
-  const resolvedIssueIds: string[] = [...outcome.resolvedAllocationSetIssueIds];
-  for (const safeCode of ISSUE_CODES) {
-    const resolved = await resolveFinancialIssueAfterRecompute(transaction, {
-      resourceType: 'refund', resourceId: input.refundId, safeCode,
-      proof: { status: 'resolved', resourceType: 'refund', resourceId: input.refundId, safeCode },
-      actor: ACTOR, correlationId: input.correlationId
-    });
-    if (resolved) resolvedIssueIds.push(resolved.id);
+  const resolvedIssueIds: string[] = [...outcome.resolvedProjectionIssueIds];
+  if (target.mode === 'ordinary') {
+    for (const safeCode of ISSUE_CODES) {
+      const resolved = await resolveFinancialIssueAfterRecompute(transaction, {
+        resourceType: 'refund', resourceId: input.refundId, safeCode,
+        proof: { status: 'resolved', resourceType: 'refund', resourceId: input.refundId, safeCode },
+        actor: ACTOR, correlationId: input.correlationId
+      });
+      if (resolved) resolvedIssueIds.push(resolved.id);
+    }
   }
   const changed = localState.financialEvidenceStatus !== 'fee_reconciled' ||
     outcome.persisted.some((row) => row.disposition === 'inserted') || resolvedIssueIds.length > 0;
@@ -1543,6 +1608,21 @@ export async function recomputeLockedRefundFinancialProjection(
     replayId: FINANCIAL_REPLAY_ID,
     mode: 'ordinary'
   }, ordinarySelectedSetIds) as Promise<RefundFinancialRecomputeResult>;
+}
+
+export async function recomputeLockedRefundFinancialProjectionForAdminCommand(
+  transaction: DatabaseTransaction,
+  input: LockedRefundProjectionInput,
+  lockedAndRevalidatedOrdinarySelectedSetIds: readonly string[],
+  commandId: string
+): Promise<RefundFinancialRecomputeResult> {
+  return recomputeLockedRefundFinancialProjectionAtVersion(transaction, input, {
+    classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+    allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+    replayId: FINANCIAL_REPLAY_ID,
+    mode: 'admin',
+    commandId
+  }, lockedAndRevalidatedOrdinarySelectedSetIds) as Promise<RefundFinancialRecomputeResult>;
 }
 
 /**

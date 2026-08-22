@@ -41,6 +41,11 @@ export interface ResolveFinancialIssueInput extends FinancialIssueIdentity {
   readonly correlationId: string;
 }
 
+export interface ResolveFinancialIssueAfterAdminCommandInput {
+  readonly commandId: string;
+  readonly issueId: string;
+}
+
 const SOURCE_AND_SET_ISSUE_CODES = new Set<FinancialIssueCode>([
   'allocation_fork', 'allocation_incomplete', 'allocation_mismatch', 'classification_fork',
   'correction_rebase_required', 'currency_mismatch', 'immutable_mismatch', 'missing_source',
@@ -72,13 +77,26 @@ const PENDING_ISSUE_CODES = new Set<FinancialIssueCode>([
   'allocation_incomplete',
   'missing_source'
 ]);
+const ADMIN_RESOLVABLE_ISSUE_CODES = new Set<FinancialIssueCode>([
+  'allocation_fork', 'allocation_incomplete', 'allocation_mismatch', 'classification_fork',
+  'correction_rebase_required', 'currency_mismatch', 'immutable_mismatch', 'missing_source',
+  'source_linkage_mismatch'
+]);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const CANONICAL_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const MAX_OCCURRENCES = 2_147_483_647;
+const POSTGRES_TIMESTAMP_PATTERN =
+  /^[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}:[0-9]{2}(?:[.][0-9]{1,6})?(?:Z|[+-][0-9]{2}(?::?[0-9]{2})?)$/u;
 
 type SqlResult = { rows?: unknown[] };
 
 function unsupportedEvidence(): never {
   throw new PermanentFinancialError('unsupported_provider_evidence');
+}
+
+function invalidAdminTransition(): never {
+  throw new Error('Financial administrator issue transition returned invalid data.');
 }
 
 function hasExactKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
@@ -130,6 +148,69 @@ function assertResolveInput(value: unknown): asserts value is ResolveFinancialIs
     (value.proof.status !== 'resolved' && value.proof.status !== 'still_open')) unsupportedEvidence();
   assertIdentity({ resourceType: value.proof.resourceType, resourceId: value.proof.resourceId, safeCode: value.proof.safeCode });
   if (value.proof.resourceType !== value.resourceType || value.proof.resourceId !== value.resourceId || value.proof.safeCode !== value.safeCode) unsupportedEvidence();
+}
+
+function assertAdminResolveInput(
+  value: unknown
+): asserts value is ResolveFinancialIssueAfterAdminCommandInput {
+  if (!hasExactKeys(value, ['commandId', 'issueId']) ||
+    !CANONICAL_UUID_PATTERN.test(value.commandId as string) ||
+    !CANONICAL_UUID_PATTERN.test(value.issueId as string)) unsupportedEvidence();
+}
+
+function adminTimestamp(value: unknown): Date {
+  if (value instanceof Date && Number.isFinite(value.getTime())) return value;
+  if (typeof value !== 'string' || !POSTGRES_TIMESTAMP_PATTERN.test(value)) {
+    return invalidAdminTransition();
+  }
+  let normalized = value.replace(' ', 'T');
+  normalized = normalized.replace(/([+-][0-9]{2})$/u, '$1:00');
+  normalized = normalized.replace(/([+-][0-9]{2})([0-9]{2})$/u, '$1:$2');
+  const parsed = new Date(normalized);
+  if (!Number.isFinite(parsed.getTime())) return invalidAdminTransition();
+  return parsed;
+}
+
+function adminResolvedIssueRow(value: unknown, issueId: string): FinancialIssueRow {
+  const keys = [
+    'id', 'resourceType', 'resourceId', 'safeCode', 'state', 'impact', 'firstObservedAt',
+    'lastObservedAt', 'occurrenceCount', 'correlationId', 'resolvedByAdminId', 'resolvedAt'
+  ] as const;
+  if (!hasExactKeys(value, keys) || value.id !== issueId ||
+    !CANONICAL_UUID_PATTERN.test(value.id as string) ||
+    (value.resourceType !== 'refund' && value.resourceType !== 'allocation_set') ||
+    !CANONICAL_UUID_PATTERN.test(value.resourceId as string) ||
+    !ADMIN_RESOLVABLE_ISSUE_CODES.has(value.safeCode as FinancialIssueCode) ||
+    value.state !== 'resolved' ||
+    value.impact !== (PENDING_ISSUE_CODES.has(value.safeCode as FinancialIssueCode)
+      ? 'pending'
+      : 'exception') ||
+    !Number.isInteger(value.occurrenceCount) || (value.occurrenceCount as number) < 1 ||
+    (value.occurrenceCount as number) > MAX_OCCURRENCES ||
+    !validText(value.correlationId, 100) ||
+    !CANONICAL_UUID_PATTERN.test(value.resolvedByAdminId as string)) {
+    return invalidAdminTransition();
+  }
+  const firstObservedAt = adminTimestamp(value.firstObservedAt);
+  const lastObservedAt = adminTimestamp(value.lastObservedAt);
+  const resolvedAt = adminTimestamp(value.resolvedAt);
+  if (lastObservedAt < firstObservedAt || resolvedAt < lastObservedAt) {
+    return invalidAdminTransition();
+  }
+  return {
+    id: value.id as string,
+    resourceType: value.resourceType,
+    resourceId: value.resourceId as string,
+    safeCode: value.safeCode as FinancialIssueCode,
+    state: 'resolved',
+    impact: value.impact as FinancialIssueImpact,
+    firstObservedAt,
+    lastObservedAt,
+    occurrenceCount: value.occurrenceCount as number,
+    correlationId: value.correlationId as string,
+    resolvedByAdminId: value.resolvedByAdminId as string,
+    resolvedAt
+  };
 }
 
 async function rows(tx: DatabaseTransaction, query: SQL): Promise<unknown[]> {
@@ -247,4 +328,29 @@ export async function resolveFinancialIssueAfterRecompute(
   `);
   if (!updated[0]) return null;
   return issueRow(updated[0]);
+}
+
+export async function resolveFinancialIssueAfterAdminCommand(
+  tx: DatabaseTransaction,
+  input: ResolveFinancialIssueAfterAdminCommandInput
+): Promise<FinancialIssueRow | null> {
+  assertAdminResolveInput(input);
+  const result = await tx.execute(sql`
+    select id, resource_type as "resourceType", resource_id as "resourceId",
+      safe_code as "safeCode", state, impact,
+      first_observed_at as "firstObservedAt", last_observed_at as "lastObservedAt",
+      occurrence_count as "occurrenceCount", correlation_id as "correlationId",
+      resolved_by_admin_id as "resolvedByAdminId", resolved_at as "resolvedAt"
+    from "public"."resolve_financial_issue_after_admin_command"(
+      ${input.commandId}, ${input.issueId}
+    )
+  `) as unknown;
+  if (!result || typeof result !== 'object' ||
+    !Array.isArray((result as SqlResult).rows) ||
+    ((result as SqlResult).rows?.length ?? 0) > 1) {
+    return invalidAdminTransition();
+  }
+  const resultRows = (result as SqlResult).rows ?? [];
+  if (resultRows.length === 0) return null;
+  return adminResolvedIssueRow(resultRows[0], input.issueId);
 }

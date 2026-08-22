@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { SQL } from 'drizzle-orm';
 import {
   observeFinancialIssue,
+  resolveFinancialIssueAfterAdminCommand,
   resolveFinancialIssueAfterRecompute,
   type FinancialIssueRow
 } from './issues';
@@ -10,6 +11,7 @@ import {
 const RESOURCE_ID = '11111111-1111-4111-8111-111111111111';
 const ISSUE_ID = '22222222-2222-4222-8222-222222222222';
 const USER_ID = '33333333-3333-4333-8333-333333333333';
+const COMMAND_ID = '44444444-4444-4444-8444-aaaaaaaaaaaa';
 
 function rendered(query: SQL): { sql: string; params: unknown[] } {
   return query.toQuery({
@@ -217,6 +219,84 @@ describe('financial issue lifecycle', () => {
     const missing = executor([[], []]);
     await expect(resolveFinancialIssueAfterRecompute(missing.tx, resolve('resolved'))).resolves.toBeNull();
     expect(missing.calls).toHaveLength(2);
+  });
+
+  it.each([
+    { commandId: 'not-a-uuid', issueId: ISSUE_ID },
+    { commandId: '00000000-0000-0000-0000-000000000000', issueId: ISSUE_ID },
+    { commandId: COMMAND_ID.toUpperCase(), issueId: ISSUE_ID },
+    { commandId: COMMAND_ID, issueId: 'not-a-uuid' },
+    { commandId: COMMAND_ID, issueId: ISSUE_ID, resolver: USER_ID }
+  ])('rejects malformed administrator command proof before querying', async (input) => {
+    const database = executor([]);
+    await expect(resolveFinancialIssueAfterAdminCommand(database.tx, input as never))
+      .rejects.toMatchObject({ safeCode: 'unsupported_provider_evidence' });
+    expect(database.calls).toHaveLength(0);
+  });
+
+  it('uses only the command-bound protected transition and verifies administrator attribution', async () => {
+    const resolved = issue({
+      resourceType: 'refund',
+      state: 'resolved',
+      resolvedByAdminId: USER_ID,
+      resolvedAt: new Date('2026-08-12T00:02:00.000Z')
+    });
+    const database = executor([[resolved]]);
+
+    await expect(resolveFinancialIssueAfterAdminCommand(database.tx, {
+      commandId: COMMAND_ID,
+      issueId: ISSUE_ID
+    })).resolves.toEqual(resolved);
+
+    expect(database.calls).toHaveLength(1);
+    const transition = rendered(database.calls[0]!);
+    expect(transition.sql).toContain('resolve_financial_issue_after_admin_command');
+    expect(transition.sql).not.toContain('resolve_financial_issue_after_worker_recompute');
+    expect(transition.sql).not.toContain('resolve_financial_reconciliation_issue');
+    expect(transition.sql).not.toContain('update financial_reconciliation_issues');
+    expect(transition.params).toEqual([COMMAND_ID, ISSUE_ID]);
+  });
+
+  it('is idempotent for an absent open issue and rejects unverified protected results', async () => {
+    const missing = executor([[]]);
+    await expect(resolveFinancialIssueAfterAdminCommand(missing.tx, {
+      commandId: COMMAND_ID,
+      issueId: ISSUE_ID
+    })).resolves.toBeNull();
+
+    for (const row of [
+      issue({
+        resourceType: 'refund',
+        id: RESOURCE_ID,
+        state: 'resolved',
+        resolvedByAdminId: USER_ID,
+        resolvedAt: new Date('2026-08-12T00:02:00.000Z')
+      }),
+      issue({ resourceType: 'refund', state: 'open' }),
+      issue({ resourceType: 'refund', state: 'resolved', resolvedByAdminId: null,
+        resolvedAt: new Date('2026-08-12T00:02:00.000Z') }),
+      issue({ resourceType: 'refund', state: 'resolved', resolvedByAdminId: USER_ID,
+        lastObservedAt: new Date('2026-08-12T00:03:00.000Z'),
+        resolvedAt: new Date('2026-08-12T00:02:00.000Z') }),
+      { ...issue({ resourceType: 'refund', state: 'resolved', resolvedByAdminId: USER_ID,
+        resolvedAt: new Date('2026-08-12T00:02:00.000Z') }), providerPayload: true }
+    ]) {
+      const invalid = executor([[row]]);
+      await expect(resolveFinancialIssueAfterAdminCommand(invalid.tx, {
+        commandId: COMMAND_ID,
+        issueId: ISSUE_ID
+      })).rejects.toThrow('Financial administrator issue transition returned invalid data.');
+    }
+
+    const duplicate = issue({
+      resourceType: 'refund', state: 'resolved', resolvedByAdminId: USER_ID,
+      resolvedAt: new Date('2026-08-12T00:02:00.000Z')
+    });
+    const multiple = executor([[duplicate, duplicate]]);
+    await expect(resolveFinancialIssueAfterAdminCommand(multiple.tx, {
+      commandId: COMMAND_ID,
+      issueId: ISSUE_ID
+    })).rejects.toThrow('Financial administrator issue transition returned invalid data.');
   });
 
   it('propagates audit failures so the caller transaction can roll back', async () => {
