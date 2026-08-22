@@ -101,6 +101,7 @@ Existing worker financial actions remain unchanged. No action named `financial.i
 
 - `src/lib/server/db/schema/financial-admin.ts` owns the command enums/table and the private `financial_admin_job_claims` table; no second claim schema file is created.
 - `drizzle/0012_plan6bii_admin_command_authority.sql` owns both tables, the deferred command/job relationship, private claim lifecycle, routines, triggers, routine provenance, and exact grants/revokes.
+- `drizzle/0013_plan6bii_reporting_correction_authority.sql` owns only the ninth, correction-specific issue-resolution routine and its exact revoke/grant/postflight; it never replaces 0012's finalization resolver or issue trigger.
 - `src/lib/server/jobs/types.ts`, `src/lib/server/jobs/runner.ts`, and `src/lib/server/jobs/repository.ts` carry and consume the opaque capability only inside the worker process; no route-facing type contains it.
 - `src/lib/server/commerce/financial/admin-commands/contracts.ts` owns strict private command parsing and safe result parsing.
 - `src/lib/server/commerce/financial/admin-commands/repository.ts` is the only TypeScript wrapper around submit/status and terminal-state database operations.
@@ -675,11 +676,11 @@ FOR EACH ROW EXECUTE FUNCTION public.plan6bii_guard_financial_admin_job_lease();
 
 Both helpers are database-owner owned, `SECURITY DEFINER`, use `SET search_path = pg_catalog`, fully qualify every application object, and have all function privileges revoked from `PUBLIC`, both application groups/logins, and storage cleanup. `plan6bii_assert_financial_admin_job_lease(job_id)` reads only the transaction-local `pale_orbit.plan6bii_financial_admin_job_capability`, requires the exact 43-character unpadded base64url grammar, hashes it with `encode(sha256(convert_to(token, 'UTF8')), 'hex')`, and accepts only a matching owner-private row whose generation/attempt/state, linked job type/status/attempt, and `expires_at > clock_timestamp()` are current. A missing, malformed, forged, cross-job, expired, prior-generation, prior-attempt, or invalidated capability raises `55000` with one constant safe message.
 
-Because the canonical table default grants runtime `SELECT`, immediately after creating the two protected tables—and before any subsequent callable routine or trigger can expose them—execute explicit `REVOKE ALL ON TABLE public.financial_admin_commands, public.financial_admin_job_claims FROM PUBLIC, pale_orbit_runtime, pale_orbit_financial_worker, pale_orbit_storage_cleanup`. After each private helper is created, explicitly `REVOKE ALL ON FUNCTION` for its exact signature from those same four principals. Prove configured application logins have no direct ACL, then grant back only the command-table worker SELECT/column UPDATE and the eight callable routine EXECUTE privileges listed in Step 7. The claim table and two private functions finish owner-only; do not rely on a default-ACL assumption for their final authority.
+Because the canonical table default grants runtime `SELECT`, immediately after creating the two protected tables—and before any subsequent callable routine or trigger can expose them—execute explicit `REVOKE ALL ON TABLE public.financial_admin_commands, public.financial_admin_job_claims FROM PUBLIC, pale_orbit_runtime, pale_orbit_financial_worker, pale_orbit_storage_cleanup`. After each private helper is created, explicitly `REVOKE ALL ON FUNCTION` for its exact signature from those same four principals. At the Task 3/5 migration-0012 commit boundary, prove configured application logins have no direct ACL, then grant back only the command-table worker SELECT/column UPDATE and the eight callable routine EXECUTE privileges listed in Step 7. The claim table and two private functions finish owner-only; do not rely on a default-ACL assumption for their final authority. Task 13 later adds the independently reviewed ninth correction-only routine through migration 0013.
 
 `plan6bii_guard_financial_admin_job_lease()` applies only to `commerce.financial-admin-command` jobs and uses PostgreSQL `clock_timestamp()` as the sole lease clock. On `pending -> running` or an expired `running -> running` takeover, it acquires/reenters the exclusive per-job advisory transaction lock and requires the transaction-local capability plus canonical integer `pale_orbit.plan6bii_financial_admin_job_lease_duration_ms`, then inserts or rotates the private row: `generation = old + 1` (or `1`), `attempt = NEW.attempts`, new digest, bounded lease duration, `state = 'active'`, new issue/expiry, and null renewal/invalidation. On a same-generation heartbeat it acquires/reenters the shared advisory lock plus the current unexpired capability, preserves generation/attempt/digest/duration, and advances only `renewed_at`/`expires_at`. On a retryable failure or rerun to `pending`, it requires the current capability and expires the active claim at database time without marking it terminal. On `succeeded|failed`, it acquires/reenters the exclusive advisory lock and requires the current capability, then atomically sets `state = 'invalidated'`/`invalidated_at`; invalidated rows cannot rotate or renew. It rejects direct or structurally inconsistent job transitions before the existing terminal-sync trigger runs.
 
-For one lock namespace, use `hashtextextended('pale-orbit:plan6bii-financial-admin-job-lease:' || job_id::text, 0)`. Claim/takeover/complete/fail lock and revalidate the job row first and then acquire its exclusive transaction lock; heartbeat locks/revalidates the job row and then acquires its shared transaction lock. Every command-handler transaction uses exactly `set transaction-local token -> administrator-role advisory lock -> shared per-job lease advisory lock -> bounded command identity/status row lock -> terminal replay handling`. Only when that bounded row remains pending does the handler take the actor identity from that row, reload the actor's current roles, require the fixed capabilities, and then load private input or enter domain work. Heartbeat takes no command lock, and no command-holding path waits for a job row or lease lock. The public eight routines remain the only application-callable SQL surface.
+For one lock namespace, use `hashtextextended('pale-orbit:plan6bii-financial-admin-job-lease:' || job_id::text, 0)`. Claim/takeover/complete/fail lock and revalidate the job row first and then acquire its exclusive transaction lock; heartbeat locks/revalidates the job row and then acquires its shared transaction lock. Every command-handler transaction uses exactly `set transaction-local token -> administrator-role advisory lock -> shared per-job lease advisory lock -> bounded command identity/status row lock -> terminal replay handling`. Only when that bounded row remains pending does the handler take the actor identity from that row, reload the actor's current roles, require the fixed capabilities, and then load private input or enter domain work. Heartbeat takes no command lock, and no command-holding path waits for a job row or lease lock. At the migration-0012 Task 3/5 boundary, the public eight routines are the only application-callable SQL surface; Task 13's migration 0013 later adds only the ninth correction-specific resolver.
 
 Every callable routine is database-owner owned, `SECURITY DEFINER`, uses `SET search_path = pg_catalog`, fully qualifies every application relation/type, rejects `PUBLIC`, and validates the fixed caller group before any read or write. Submit/status/the four fixed-action read-audit routines are executable only by `pale_orbit_runtime`. Issue and administrative-grant transitions are executable only by `pale_orbit_financial_worker`. Neither application login receives direct function grants; it inherits through its fixed group.
 
@@ -752,7 +753,7 @@ PUBLIC: none
 storage-cleanup: none
 ```
 
-Add both new tables and `jobs` to `RUNTIME_TABLE_SELECT_EXCLUSIONS`; add both new tables to `PROTECTED_RUNTIME_WRITE_TABLES` and sensitive-column scans. Add the private claim table to the worker SELECT/write exclusions as well: the worker interacts with it only through the owner trigger. Runtime receives at most the narrow job reference columns required by the refactored enqueue seam and never `jobs.payload`, status internals, attempts, lease data, or errors. Worker retains full jobs SELECT. Add only the eight callable signatures to `RUNTIME_EXECUTE_FUNCTIONS` and `WORKER_EXECUTE_FUNCTIONS`; the two private lease functions must be explicitly absent. Provisioner/static tests prove the database-owner default ACL and final direct ACL state cannot make a future or current claim/helper object application-executable.
+Add both new tables and `jobs` to `RUNTIME_TABLE_SELECT_EXCLUSIONS`; add both new tables to `PROTECTED_RUNTIME_WRITE_TABLES` and sensitive-column scans. Add the private claim table to the worker SELECT/write exclusions as well: the worker interacts with it only through the owner trigger. Runtime receives at most the narrow job reference columns required by the refactored enqueue seam and never `jobs.payload`, status internals, attempts, lease data, or errors. Worker retains full jobs SELECT. For the Task 3/5 migration-0012 commit, add only its eight callable signatures to `RUNTIME_EXECUTE_FUNCTIONS` and `WORKER_EXECUTE_FUNCTIONS`; the two private lease functions must be explicitly absent. Task 13 later extends only the worker list with the ninth correction-specific resolver. Provisioner/static tests prove the database-owner default ACL and final direct ACL state cannot make a future or current claim/helper object application-executable.
 
 Implement the tested safe enqueue seam and move every runtime-capable call site named in Step 1 before applying the `jobs.payload` revoke. Unit and PostgreSQL role tests must prove runtime enqueue/idempotent replay still succeeds through the reference seam after the revoke. This refactor is part of the same authority/catalog commit; do not leave an intermediate commit in which current web paths call a full-row `INSERT ... RETURNING *` without SELECT authority.
 
@@ -1021,7 +1022,7 @@ Expected: FAIL because the TypeScript transport, handler, status route, and loca
 
 `executors.ts` exports only the pure six-dependency builder shown above. It constructs the fixed keys internally and rejects a missing, duplicate, or unknown kind; it does not accept a caller-supplied iterable and must not expose incomplete executors. Task 4 tests it with six local stubs. Do not register the job in `worker.ts` in this task because no production executor exists yet. Do not add a dynamic module loader or caller-selected executor name. Tasks 11–14 implement the six concrete executor functions without mutating a shared registry; Task 14 performs the sole complete production composition after all six exist.
 
-Keep raw SQL limited to the eight callable routine calls, role/shared-lease advisory locks, transaction-local token setting, and command identity/`FOR UPDATE` queries. The private lease helper remains non-executable and is reached only through owner routines/triggers; do not add a ninth routine grant or any lease route/endpoint. Parse every database JSON/result value through the strict schemas before using or returning it.
+At the Task 4 transport boundary, keep raw SQL limited to migration 0012's eight callable routine calls, role/shared-lease advisory locks, transaction-local token setting, and command identity/`FOR UPDATE` queries. The private lease helper remains non-executable and is reached only through owner routines/triggers; do not prematurely add a ninth grant or any lease route/endpoint. Task 13 later adds the explicitly designed correction-only ninth routine and no lease endpoint. Parse every database JSON/result value through the strict schemas before using or returning it.
 
 - [ ] **Step 7: Run focused GREEN verification**
 
@@ -1089,7 +1090,7 @@ Expected: FAIL on the stale v1 object/count/witness contract and missing 0012 up
 
 - [ ] **Step 3: Implement v2 actual-catalog branches with temporary invalid fingerprints**
 
-Reuse the current normalized descriptor builders. Do not weaken table inventory, ACL grantor normalization, current-database CONNECT checks, forbidden retired objects, or cleanup-login authority. Add v2 rows for both tables, all eight callable routines, both private helpers, and all triggers with deliberately invalid zero/empty fingerprints only long enough for the static test to prove `invalid_contract_fingerprints > 0`; replace every invalid fingerprint before commit.
+For the historical Task 5 v2 contract through migration 0012, reuse the current normalized descriptor builders. Do not weaken table inventory, ACL grantor normalization, current-database CONNECT checks, forbidden retired objects, or cleanup-login authority. Add v2 rows for both tables, all eight callable routines, both private helpers, and all triggers with deliberately invalid zero/empty fingerprints only long enough for the static test to prove `invalid_contract_fingerprints > 0`; replace every invalid fingerprint before commit. Task 13 later advances this preserved inventory to v3 and adds only migration 0013's ninth correction-specific routine.
 
 Keep the SQL marker block byte-identical in `scripts/verify-financial-restore.sql` and `docs/stripe-financial-reconciliation.md`.
 
@@ -1887,8 +1888,37 @@ git commit -m "feat: finalize ambiguous refund allocations"
 ### Task 13: Add append-only reporting corrections and classifier-rebase safety
 
 **Files:**
+- Create: `drizzle/0013_plan6bii_reporting_correction_authority.sql`
+- Create: `drizzle/meta/0013_snapshot.json`
+- Modify: `drizzle/meta/_journal.json`
+- Modify: `src/lib/server/db/database-role-provision.ts`
+- Modify: `src/lib/server/db/database-role-provision.test.ts`
+- Modify: `src/lib/server/commerce/financial/issues.ts`
+- Modify: `src/lib/server/commerce/financial/issues.test.ts`
+- Modify: `scripts/database-role-deployment.test.ts`
+- Modify: `scripts/financial-schema-preservation.test.ts`
+- Modify: `scripts/commerce-operations.test.ts`
+- Modify: `scripts/verify-financial-restore.sql`
+- Modify: `scripts/execute-financial-restore-verifier.ts`
+- Modify: `scripts/deployment-checkpoint.test.ts`
+- Modify: `scripts/deployment-checkpoint-runtime.test.ts`
+- Modify: `scripts/deployment-backup-bundle.test.ts`
+- Modify: `scripts/with-plan6b-upgrade-database.test.ts`
+- Modify: `docs/stripe-financial-reconciliation.md`
+- Modify: `docs/storage-ingestion-and-publication.md`
+- Modify: `tests/integration/financial-migration.test.ts`
+- Modify: `tests/integration/database-role-boundaries.test.ts`
+- Modify: `tests/integration/financial-admin-commands.test.ts`
+- Modify: `src/lib/types/financial-reporting.ts`
+- Modify: `src/lib/types/financial-reporting.test.ts`
+- Modify: `src/lib/server/commerce/financial/refund-review/inputs.ts`
+- Modify: `src/lib/server/commerce/financial/refund-review/inputs.test.ts`
+- Create: `src/lib/server/commerce/financial/refund-review/correction-plan.ts`
+- Create: `src/lib/server/commerce/financial/refund-review/correction-plan.test.ts`
 - Create: `src/lib/server/commerce/financial/refund-review/corrections.ts`
 - Create: `src/lib/server/commerce/financial/refund-review/corrections.test.ts`
+- Modify: `src/lib/server/commerce/financial/sources/refund.ts`
+- Modify: `src/lib/server/commerce/financial/sources/refund.test.ts`
 - Create: `tests/integration/financial-corrections.test.ts`
 - Modify: `tests/integration/financial-reclassification.test.ts`
 - Modify: `tests/integration/financial-lock-order.test.ts`
@@ -1898,11 +1928,185 @@ git commit -m "feat: finalize ambiguous refund allocations"
 - Modify: `src/routes/admin/sales/refunds/refund-routes.test.ts`
 - Modify: `src/lib/components/admin/RefundReview.test.ts`
 
-- [ ] **Step 1: Write failing correction planner and preview tests**
+- [ ] **Step 1: Write failing 0013 authority, ACL, migration, and restore-contract tests**
 
-Require:
+Migration 0012 and Task 3 historically create exactly eight public callable boundaries: submit, status, four read-audit routines, the finalization-bound issue resolver, and the administrative-recovery transition. Do not edit 0012, its snapshot, or its finalization-only routine. Task 13 adds exactly one ninth boundary in append-only migration 0013:
+
+```sql
+public.resolve_financial_issue_after_reporting_correction_command(uuid,uuid)
+```
+
+Write RED tests for a clean `through(12) -> 0013` upgrade, collision/owner/prerequisite/ACL rollback before any 0013 effect, idempotent second migration, and exact final routine authority. The new routine is database-owner owned, `SECURITY DEFINER`, `SET search_path = pg_catalog`, fully qualified, explicitly revoked from `PUBLIC`, runtime, worker, and storage-cleanup principals before granting `EXECUTE` only to `pale_orbit_financial_worker`; configured login roles receive no direct grant. Its preflight preserves 0012's exact eight-routine surface and proves the current database owner, origin replication mode, exact attested login/group topology, exact 0012 resolver/lease-helper/issue-trigger prerequisites, and absence of the new signature before the first persistent statement. Never use `CREATE OR REPLACE` on the 0012 resolver or issue trigger.
+
+The routine independently requires worker membership, canonical non-null arguments, the administrator-role lock, linked job shared lease lock, a still-pending `refund_reporting_correction_create` command, current administrator role, and `plan6bii_assert_financial_admin_job_lease(job_id)`. It parses exactly the correction command's private keys and item shapes, then proves one appended `allocation_attribution_correction` row matches the command's refund, expected next version, current immutable base, source fingerprint, submitting administrator as approver/creator, correlation, and exact raw-predecessor topology. It directly re-proves item arithmetic, complete base coverage, grouped conservation, representable fee basis, and effective sibling capacity from the locked current immutable base/fingerprint and correction rows. It must not require an issue-dependent current-head view to expose the row while the linked issue is still open. Add a positive witness where the open issue suppresses head exposure but these direct facts allow resolution, plus one rejection witness for each direct-proof dimension with issue/audit unchanged. After this issue-independent compatibility proof, it accepts only the same nine issue codes as the finalization resolver and only a linked refund or current selected-set lineage, sets the existing three `pale_orbit.plan6bii_financial_admin_issue_resolution_*` settings, resolves in stable issue order with the submitter as resolver, and appends the fixed issue audit. TypeScript then reads current heads and requires the repaired row to be the exposed compatible raw tip with all relevant heads complete. Both resolvers have the same database owner, so the existing issue-transition trigger remains unchanged and recognizes the guarded owner call; this is not a generic issue resolver.
+
+Advance the exact restore contract to `plan6b-financial-catalog-v3`. Add only the 0013 routine definition/owner/security/search-path/ACL and protected journal head to the exhaustive v2 inventory; preserve every v2 descriptor and witness. Load the reviewed function definition uniquely from 0013 for source-parity repair, update both exact marker copies, update upgrade/checkpoint/bundle expectations through 0013, and add reversible missing/excess/wrong-owner/wrong-security/wrong-search-path/wrong-definition/PUBLIC/runtime/direct-login/wrong-worker-ACL witnesses.
+
+Run RED:
+
+```powershell
+npx vitest run src/lib/server/commerce/financial/issues.test.ts src/lib/server/db/database-role-provision.test.ts scripts/database-role-deployment.test.ts scripts/financial-schema-preservation.test.ts scripts/deployment-checkpoint.test.ts scripts/deployment-checkpoint-runtime.test.ts scripts/deployment-backup-bundle.test.ts scripts/with-plan6b-upgrade-database.test.ts
+npx vitest run scripts/commerce-operations.test.ts -t "pins one versioned exact catalog contract|confines the executable verifier witness|times and scopes every verifier expectation|refuses ambiguous financial witness timeout cleanup targets|bounds financial witness process-tree termination|allows only inert fail-closed" --reporter=verbose
+npm run test:integration -- tests/integration/financial-migration.test.ts tests/integration/database-role-boundaries.test.ts tests/integration/financial-admin-commands.test.ts
+```
+
+Expected before implementation: FAIL on missing migration 0013, ninth worker routine, v3 catalog/head, provisioner parity, and correction-only command proof.
+
+- [ ] **Step 2: Generate 0013 and implement the correction-only authority boundary**
+
+```powershell
+npm run db:generate -- --custom --name plan6bii_reporting_correction_authority
+```
+
+Expected: Drizzle creates index `13`, `drizzle/0013_plan6bii_reporting_correction_authority.sql`, `drizzle/meta/0013_snapshot.json`, and the matching journal entry. Rename only the generated SQL suffix if needed; do not edit 0012 or any prior migration/snapshot. Implement the absolute-first preflight, routine, explicit revoke/grant, and exact postflight in 0013. Add only the new signature to the worker execute allowlist and exact role/static tests.
+
+In `issues.ts`, keep `resolveFinancialIssueAfterAdminCommand` unchanged and add:
 
 ```ts
+export async function resolveFinancialIssueAfterReportingCorrectionCommand(
+  tx: DatabaseTransaction,
+  input: ResolveFinancialIssueAfterAdminCommandInput
+): Promise<FinancialIssueRow | null>;
+```
+
+The wrapper calls only `resolve_financial_issue_after_reporting_correction_command(uuid,uuid)` and applies the same strict zero-or-one-row parser. No caller-selectable routine name crosses this wrapper.
+
+- [ ] **Step 3: Run authority/catalog GREEN and commit it independently**
+
+Run serially:
+
+```powershell
+npx vitest run src/lib/server/commerce/financial/issues.test.ts src/lib/server/db/database-role-provision.test.ts scripts/database-role-deployment.test.ts scripts/financial-schema-preservation.test.ts scripts/deployment-checkpoint.test.ts scripts/deployment-checkpoint-runtime.test.ts scripts/deployment-backup-bundle.test.ts scripts/with-plan6b-upgrade-database.test.ts
+npx vitest run scripts/commerce-operations.test.ts -t "pins one versioned exact catalog contract|confines the executable verifier witness|times and scopes every verifier expectation|refuses ambiguous financial witness timeout cleanup targets|bounds financial witness process-tree termination|allows only inert fail-closed" --reporter=verbose
+npm run test:integration -- tests/integration/financial-migration.test.ts tests/integration/database-role-boundaries.test.ts tests/integration/financial-admin-commands.test.ts
+npx vitest run scripts/commerce-operations.test.ts -t "executes schema-object, source-parity, deterministic-allocation, audit, payout, and chronology verifier witnesses in PostgreSQL" --reporter=verbose
+npm run db:check
+npm run check
+npm run lint
+git diff --check
+```
+
+Expected: 0012 remains byte-identical with eight historical routines; 0013, provisioner, upgrade path, checkpoint/bundle assertions, and exact restored catalog agree on nine final callable routines; the new resolver rejects every non-correction, stale-lease, demoted-actor, wrong-row/topology, out-of-scope-issue, and nonworker invocation without domain or audit change.
+
+```powershell
+git add drizzle/0013_plan6bii_reporting_correction_authority.sql drizzle/meta/0013_snapshot.json drizzle/meta/_journal.json src/lib/server/db/database-role-provision.ts src/lib/server/db/database-role-provision.test.ts src/lib/server/commerce/financial/issues.ts src/lib/server/commerce/financial/issues.test.ts scripts/database-role-deployment.test.ts scripts/financial-schema-preservation.test.ts scripts/commerce-operations.test.ts scripts/verify-financial-restore.sql scripts/execute-financial-restore-verifier.ts scripts/deployment-checkpoint.test.ts scripts/deployment-checkpoint-runtime.test.ts scripts/deployment-backup-bundle.test.ts scripts/with-plan6b-upgrade-database.test.ts docs/stripe-financial-reconciliation.md docs/storage-ingestion-and-publication.md tests/integration/financial-migration.test.ts tests/integration/database-role-boundaries.test.ts tests/integration/financial-admin-commands.test.ts
+git diff --cached --check
+git commit -m "feat: add reporting correction issue authority"
+```
+
+- [ ] **Step 4: Write failing seed DTO, strict form-input, and pure planner tests**
+
+Add a separately keyed and parsed seed DTO; do not turn `RefundDetailDto.correctionPreview` into a page-load no-op. Its exact safe shape is:
+
+```ts
+export interface RefundReportingCorrectionSeedItemDto {
+  readonly orderItemId: string;
+  readonly titleId: string;
+  readonly soldAsTitle: string;
+  readonly baselineTotalMinor: number;
+  readonly baselineSubtotalMinor: number;
+  readonly baselineTaxMinor: number;
+  readonly baselineSettlementGrossMinor: number | null;
+  readonly baselineRefundFeeImpactMinor: number | null;
+}
+
+export interface RefundReportingCorrectionSeedDto {
+  readonly refundId: string;
+  readonly reason: 'allocation_attribution_correction';
+  readonly expectedNextCorrectionVersion: number | null;
+  readonly expectedBaseAllocationSetId: string | null;
+  readonly expectedSourceFingerprint: string | null;
+  readonly rawPredecessorCorrectionSetId: string | null;
+  readonly compatibleCorrectionSetId: string | null;
+  readonly baselineKind: 'immutable_base' | 'compatible_correction' | null;
+  readonly currentReportingComplete: boolean;
+  readonly currency: string | null;
+  readonly settlementCurrency: string | null;
+  readonly baselineTotalMinor: number | null;
+  readonly eligible: boolean;
+  readonly ineligibleReason:
+    | 'provider_evidence_pending'
+    | 'immutable_conflict'
+    | 'not_finalized'
+    | null;
+  readonly items: readonly RefundReportingCorrectionSeedItemDto[];
+}
+
+export const REFUND_CORRECTION_ITEM_PREVIEW_DTO_KEYS = [
+  'orderItemId', 'titleId', 'soldAsTitle',
+  'baselineTotalMinor', 'baselineSubtotalMinor', 'baselineTaxMinor',
+  'proposedTotalMinor', 'proposedSubtotalMinor', 'proposedTaxMinor',
+  'subtotalDisplayDeltaMinor', 'taxDisplayDeltaMinor',
+  'baselineSettlementGrossMinor', 'proposedSettlementGrossMinor',
+  'settlementGrossDisplayDeltaMinor',
+  'baselineRefundFeeImpactMinor', 'proposedRefundFeeImpactMinor',
+  'refundFeeImpactDisplayDeltaMinor'
+] as const;
+
+export interface RefundCorrectionItemPreviewDto {
+  readonly orderItemId: string;
+  readonly titleId: string;
+  readonly soldAsTitle: string;
+  readonly baselineTotalMinor: number;
+  readonly baselineSubtotalMinor: number;
+  readonly baselineTaxMinor: number;
+  readonly proposedTotalMinor: number;
+  readonly proposedSubtotalMinor: number;
+  readonly proposedTaxMinor: number;
+  readonly subtotalDisplayDeltaMinor: number;
+  readonly taxDisplayDeltaMinor: number;
+  readonly baselineSettlementGrossMinor: number | null;
+  readonly proposedSettlementGrossMinor: number | null;
+  readonly settlementGrossDisplayDeltaMinor: number | null;
+  readonly baselineRefundFeeImpactMinor: number | null;
+  readonly proposedRefundFeeImpactMinor: number | null;
+  readonly refundFeeImpactDisplayDeltaMinor: number | null;
+}
+
+export const REFUND_REPORTING_CORRECTION_PREVIEW_DTO_KEYS = [
+  'refundId', 'expectedBaseAllocationSetId',
+  'rawPredecessorCorrectionSetId', 'compatibleCorrectionSetId',
+  'expectedNextCorrectionVersion', 'expectedSourceFingerprint',
+  'previewFingerprint', 'baselineKind', 'currentReportingComplete',
+  'proposedReportingComplete', 'compatibilityRepair', 'currency',
+  'settlementCurrency', 'baselineTotalMinor', 'proposedTotalMinor',
+  'eligible', 'ineligibleReason', 'items'
+] as const;
+
+export interface RefundReportingCorrectionPreviewDto {
+  readonly refundId: string;
+  readonly expectedBaseAllocationSetId: string;
+  readonly rawPredecessorCorrectionSetId: string | null;
+  readonly compatibleCorrectionSetId: string | null;
+  readonly expectedNextCorrectionVersion: number;
+  readonly expectedSourceFingerprint: string;
+  readonly previewFingerprint: string | null;
+  readonly baselineKind: 'immutable_base' | 'compatible_correction';
+  readonly currentReportingComplete: boolean;
+  readonly proposedReportingComplete: boolean;
+  readonly compatibilityRepair: boolean;
+  readonly currency: string;
+  readonly settlementCurrency: string | null;
+  readonly baselineTotalMinor: number;
+  readonly proposedTotalMinor: number;
+  readonly eligible: boolean;
+  readonly ineligibleReason:
+    | 'provider_evidence_pending'
+    | 'immutable_conflict'
+    | 'not_finalized'
+    | 'no_change'
+    | null;
+  readonly items: readonly RefundCorrectionItemPreviewDto[];
+}
+
+export async function getReportingCorrectionSeed(
+  database: Database,
+  actor: Actor,
+  refundId: string,
+  context: FinancialRequestContext,
+  dependencies?: FinancialAuthorizationDependencies
+): Promise<RefundReportingCorrectionSeedDto | null>;
+
 export type ReportingCorrectionPrepareInput = Omit<
   Extract<FinancialAdminPrivateCommand, {
     kind: 'refund_reporting_correction_create'
@@ -1916,7 +2120,7 @@ export async function previewReportingCorrection(
   input: ReportingCorrectionPrepareInput,
   context: FinancialRequestContext,
   dependencies?: FinancialAuthorizationDependencies
-): Promise<ReportingCorrectionPreviewDto>;
+): Promise<RefundReportingCorrectionPreviewDto>;
 
 export async function executeReportingCorrectionCreate(
   context: FinancialAdminCommandExecutorContext,
@@ -1926,57 +2130,254 @@ export async function executeReportingCorrectionCreate(
 ): Promise<FinancialAdminCommandSafeResultByCode['correction_created']>;
 ```
 
-The prepare request submits only fixed reason, `expectedNextCorrectionVersion`, expected base/source fingerprint, and 1–25 absolute per-item presentment totals. The first correction requires next version 1 and no current tip; every successor requires exactly `currentTip.version + 1`. Server derives subtotal, tax, settlement, refund-fee, currency, capacity, every signed delta, and the preview fingerprint. Confirmation adds only that returned fingerprint plus the fixed literal. Preview shows old/new absolute attribution and zero-sum deltas independently for presentment refund subtotal/tax, settlement refund gross, and deterministic refund-specific fee attribution.
+The planner contract is exact and database-free:
 
-- [ ] **Step 2: Write failing mutation/rebase/lock tests**
+```ts
+export interface RefundReportingCorrectionPlanItemFacts {
+  readonly orderItemId: string;
+  readonly titleId: string;
+  readonly soldAsTitle: string;
+  readonly paidSubtotalMinor: number;
+  readonly paidTaxMinor: number;
+  readonly paidTotalMinor: number;
+  readonly effectiveSiblingSubtotalMinor: number;
+  readonly effectiveSiblingTaxMinor: number;
+  readonly immutablePresentmentSubtotalMinor: number;
+  readonly immutablePresentmentTaxMinor: number;
+  readonly immutableSettlementSubtotalMinor: number | null;
+  readonly immutableSettlementTaxMinor: number | null;
+  readonly immutableRefundFeeImpactMinor: number | null;
+  readonly compatiblePresentmentSubtotalMinor: number | null;
+  readonly compatiblePresentmentTaxMinor: number | null;
+  readonly compatibleSettlementSubtotalMinor: number | null;
+  readonly compatibleSettlementTaxMinor: number | null;
+  readonly compatibleRefundFeeImpactMinor: number | null;
+}
 
-Use the same role advisory -> shared financial-admin lease advisory -> command -> active projection -> purchase -> financial closure order as finalization. Require finalized succeeded refund, complete canonical balance transactions/current allocation, exact compatible base/correction tip, and component capacities. Prove:
+export interface RefundReportingCorrectionPlanInput {
+  readonly request: ReportingCorrectionPrepareInput;
+  readonly activeProjection: {
+    readonly classifierVersion: number;
+    readonly allocationAlgorithmVersion: number;
+    readonly replayId: string;
+  };
+  readonly currentReportingComplete: boolean;
+  readonly rawTip: {
+    readonly id: string;
+    readonly correctionVersion: number;
+    readonly baseAllocationSetId: string;
+    readonly sourceFingerprint: string;
+  } | null;
+  readonly compatibleTip: {
+    readonly id: string;
+    readonly correctionVersion: number;
+  } | null;
+  readonly immutableBase: {
+    readonly grossAllocationSetId: string;
+    readonly feeAllocationSetId: string | null;
+    readonly sourceFingerprint: string;
+    readonly currency: string;
+    readonly settlementCurrency: string | null;
+    readonly totalPresentmentMinor: number;
+  };
+  readonly activeFeeComponents: readonly {
+    readonly component: FinancialComponent;
+    readonly amountMinor: number;
+    readonly currency: string;
+  }[];
+  readonly items: readonly RefundReportingCorrectionPlanItemFacts[];
+}
+
+export interface RefundReportingCorrectionPersistableItem {
+  readonly domain: 'presentment' | 'settlement';
+  readonly sourceAllocationSetId: string | null;
+  readonly orderItemId: string;
+  readonly component: 'refund_subtotal' | 'refund_tax' | 'refund_fee';
+  readonly currency: string;
+  readonly approvedAbsoluteMinor: number;
+  readonly deltaMinor: number;
+  readonly stableTieBreakKey: string;
+}
+
+export interface RefundReportingCorrectionFingerprintDocument {
+  readonly version: 'refund-reporting-correction-preview-v1';
+  readonly refundId: string;
+  readonly reason: 'allocation_attribution_correction';
+  readonly activeProjection: {
+    readonly classifierVersion: number;
+    readonly allocationAlgorithmVersion: number;
+    readonly replayId: string;
+  };
+  readonly expectedBaseAllocationSetId: string;
+  readonly rawPredecessorCorrectionSetId: string | null;
+  readonly compatibleCorrectionSetId: string | null;
+  readonly expectedNextCorrectionVersion: number;
+  readonly expectedSourceFingerprint: string;
+  readonly baselineKind: 'immutable_base' | 'compatible_correction';
+  readonly currentReportingComplete: boolean;
+  readonly proposedReportingComplete: boolean;
+  readonly compatibilityRepair: boolean;
+  readonly requestedItems: readonly {
+    readonly orderItemId: string;
+    readonly totalPresentmentMinor: number;
+  }[];
+  readonly previewItems: readonly RefundCorrectionItemPreviewDto[];
+  readonly persistableItems: readonly RefundReportingCorrectionPersistableItem[];
+}
+
+export type RefundReportingCorrectionPlanResult =
+  | {
+      readonly kind: 'ineligible';
+      readonly preview: RefundReportingCorrectionPreviewDto;
+      readonly fingerprintDocument: null;
+      readonly persistableItems: readonly [];
+    }
+  | {
+      readonly kind: 'ready';
+      readonly preview: RefundReportingCorrectionPreviewDto;
+      readonly fingerprintDocument: RefundReportingCorrectionFingerprintDocument;
+      readonly persistableItems: readonly RefundReportingCorrectionPersistableItem[];
+    };
+
+export function planRefundReportingCorrection(
+  input: RefundReportingCorrectionPlanInput
+): RefundReportingCorrectionPlanResult;
+```
+
+The exact DTO definitions above replace `current*` with `baseline*`, name every UI-only delta `*DisplayDeltaMinor`, replace ambiguous correction ID/version fields, and add explicit `compatibilityRepair`. Define `compatibilityRepair = !currentReportingComplete && proposedReportingComplete`, `distributionChanged` as any effective component difference, and ready eligibility as `distributionChanged || compatibilityRepair`. A ready preview has `eligible: true`, null reason, the lowercase SHA-256 of canonical JSON for the exact fingerprint document, `proposedReportingComplete: true`, a non-null fingerprint document, and full sorted persistable items. An unchanged already-complete distribution returns the ineligible `no_change` preview, null fingerprint/document, and no persistable items. An incomplete-chain repair is ready even when every numeric display and stored delta is zero: `compatibilityRepair` is true and the new successor itself restores completeness.
+
+Add `parseRefundReportingCorrectionPrepareRequest(request, refundId)` and `parseRefundReportingCorrectionConfirmRequest(request, refundId)`. Prepare accepts exactly scalar `reason`, `expectedNextCorrectionVersion`, `expectedBaseAllocationSetId`, and `expectedSourceFingerprint` plus paired repeated `orderItemId`/`totalPresentmentMinor`; confirm adds exactly `idempotencyKey`, `previewFingerprint`, and `confirmation`. Both use the existing 16 KiB URL-encoded reader and enforce only canonical lowercase UUID/SHA grammar, positive int32 version, safe totals, 1–25 syntactically unique items, exact keys/multiplicity/paired-array length, fixed literals, and sorted output. They perform no database/current-membership check. After both capabilities are proven, the shared planner requires the sorted IDs to equal the exact current order-item set and requires explicit zero totals for unchanged members. The route path is the only refund-ID source.
+
+The pure planner loads no database state. Test first correction as raw predecessor/compatible tip null, version 1, and immutable baseline; a normal successor as raw tip equal to compatible tip, raw version plus one, and compatible absolute baseline; and repair as an incompatible raw predecessor, no compatible tip, raw version plus one, current immutable base/fingerprint anchor and baseline, current completeness false, and proposed completeness true. Include a repair whose proposed absolute distribution equals the immutable baseline and whose persistable deltas are all zero; it remains ready because it changes compatibility from incomplete to complete. The browser never supplies either tip ID. The preview fingerprint binds both derived tips, baseline/completeness/repair state, active projection implementation, immutable anchor/fingerprint, next version, sorted totals, exact preview rows, and every persistable component/source/currency/tie-key value.
+
+Derive presentment subtotal/tax, settlement gross, and representable refund-fee values with `allocateSignedLargestRemainder`/`allocateFeeDetails` semantics and stable semantic tie keys that exclude allocation/correction-set IDs. Capacity uses all succeeded sibling refunds' effective distributions, including compatible corrections, not raw allocation components. Persisted deltas are proposed absolute minus current immutable base; UI deltas are baseline-to-proposed. Include every nonzero immutable settlement component for a corrected source and, when any presentment component changes, every nonzero immutable presentment component.
+
+Display subtotal and tax independently, but assert zero-sum over their coalesced presentment source-allocation set per `(domain, sourceAllocationSetId, currency)`: a subtotal increase may offset a tax decrease. Settlement gross and fee are independently zero-sum because their source-set IDs differ. Add a valid subtotal/tax offset test and failures for nonzero combined presentment, gross, and fee groups. A nonzero fee source containing `provider_fee_tax`, `other`, or another unrepresentable component is `immutable_conflict`; never drop or relabel it. `no_change` requires both current completeness and effective distribution equivalence. If locked execution reaches that already-complete/equivalent state after preparation, store `conflict/not_eligible` with no correction effect; never classify an incomplete-to-complete zero-delta repair as a no-op.
+
+Run RED:
+
+```powershell
+npx vitest run src/lib/types/financial-reporting.test.ts src/lib/server/commerce/financial/refund-review/inputs.test.ts src/lib/server/commerce/financial/refund-review/correction-plan.test.ts src/lib/server/commerce/financial/refund-review/corrections.test.ts
+```
+
+Expected before implementation: FAIL on the missing seed/parser/planner/API and changed strict DTO keys.
+
+- [ ] **Step 5: Implement seed, parsers, and the pure correction plan; run focused GREEN**
+
+`getReportingCorrectionSeed` and `previewReportingCorrection` each independently require both `sales.read` and `reconciliation.manage` before inspecting the refund ID/request or making any database call; the route applies the same dual check before parsing. Add four negative service tests—seed and preview each missing `sales.read` with manage present, and each missing `reconciliation.manage` with read present—and route tests proving denial precedes body/identifier parsing. The seed returns `null` for a missing safe target and discovers the unique raw tip from successor topology independently from the compatible tip in current projection; a null compatible tip never means no correction history. For ineligible state, unavailable bindings/baseline fields are null and no confirmable fingerprint is issued. Keep `getRefundReviewDetail` and `query.ts` unchanged; the page server loads the separately authorized seed.
+
+Implement both parsers and one deterministic `planRefundReportingCorrection(...)` seam in `correction-plan.ts`; prepare and locked execution must use that same planner. Run:
+
+```powershell
+npx vitest run src/lib/types/financial-reporting.test.ts src/lib/server/commerce/financial/refund-review/inputs.test.ts src/lib/server/commerce/financial/refund-review/correction-plan.test.ts src/lib/server/commerce/financial/refund-review/corrections.test.ts
+```
+
+Expected: focused DTO, form, seed, raw/compatible-chain, repair, capacity, fee, conservation, coverage, delta, no-op, and fingerprint tests pass.
+
+- [ ] **Step 6: Write failing mutation, resolver, rebase, atomicity, and lock-order tests**
+
+After the handler's existing `role advisory -> shared current-job lease advisory -> command row -> execution-time reauthorization` prefix, require this exact correction suffix:
+
+1. discover refund -> payment -> order routing without taking a row or advisory lock;
+2. discover and lock active projection authority; reject pending authority;
+3. take order advisory -> order row -> payment row;
+4. call `lockPaymentPurchaseFacts` for the complete refund/draft/allocation/correction/dispute/item graph;
+5. take `lockFinancialProjectionEnrollment`;
+6. discover the bounded payout/balance-transaction/classification/allocation/issue closure;
+7. call `lockFinancialProjectionRows` with every multi-row identity set sorted, then re-read exact equality for finalization state, raw tip, compatible tip, immutable base/fingerprint, fee evidence, effective sibling capacity, and current projection; and
+8. re-plan and insert one set plus sorted items; recompute through correction authority, whose resolver proves compatibility directly without current-head exposure; resolve eligible issues; then read current heads and require the new compatible raw tip and complete projection before audit/result.
+
+Require a finalized succeeded refund, complete canonical balance transactions/current allocation authority, exact current immutable base/source fingerprint, a unique raw chain, and bounded representable component capacity. Prove:
 
 - first correction and successor form one append-only predecessor chain;
+- an incompatible raw chain is repaired only by succeeding its raw tip at `raw.version + 1` while using the current immutable base as the absolute baseline;
+- an incomplete-chain repair whose proposed distribution equals that immutable baseline remains eligible and appends a successor even when every numeric delta is zero;
+- repair restores current completeness and resolves `correction_rebase_required` without editing, deleting, or silently reattaching history;
 - stale/concurrent proposals cannot fork;
-- every domain/source/currency delta sums to zero;
-- effective values remain within paid capacities;
-- refund-fee redistribution conserves provider fee basis;
+- stored deltas remain immutable-base-relative on successors while displayed deltas remain compatible-baseline-relative;
+- coalesced presentment subtotal/tax, settlement gross, and settlement fee conservation obey the exact grouping above;
+- full base-component coverage, stable rebase-safe tie keys, effective paid capacities, and representable fee-basis conservation hold;
+- unsupported fee components fail closed, and prepare-to-execute equivalence is a no-op only when reporting is already complete; an incomplete-to-complete zero-delta repair is not a no-op;
 - report changes while allocations, copies, grants, entitlement, access, and email do not;
 - classifier replay calls `rebaseApprovedCorrectionDistributionLocked` and preserves a compatible approved absolute distribution;
 - incompatible replay opens `correction_rebase_required`, nulls current metrics, and disables recovery; and
-- correction, issue transition, audit, and command result are atomic.
+- correction set/items, projection, correction-specific issue transition/audit, correction audit, completeness check, and command result are atomic, with forced failures at each seam rolling back all domain effects.
 
-Do not update an earlier correction or attach it silently to a new base. Use the command-bound issue resolver only after canonical recomputation proof.
+Add a source regression proving `recomputeLockedRefundFinancialProjectionForAdminCommand` remains finalization-only. Add this separate exported entry point, backed by an internal correction resolver mode rather than a caller-selected SQL name:
 
-- [ ] **Step 3: Write failing prepare/confirm UI tests**
-
-The editor shows old/new attribution by item/currency, all component deltas, completeness impact, and exact copy `Reporting only — this does not restore or revoke access.` Use server prepare, explicit native confirmation, field-linked validation, and the shared async status component. No generic issue control.
-
-- [ ] **Step 4: Run RED, implement, register, and run GREEN**
-
-```powershell
-npx vitest run src/lib/server/commerce/financial/refund-review/corrections.test.ts src/routes/admin/sales/refunds/refund-routes.test.ts src/lib/components/admin/RefundReview.test.ts
-npm run test:integration -- tests/integration/financial-corrections.test.ts tests/integration/financial-reclassification.test.ts tests/integration/financial-lock-order.test.ts
+```ts
+export async function recomputeLockedRefundFinancialProjectionForReportingCorrectionCommand(
+  transaction: DatabaseTransaction,
+  input: LockedRefundProjectionInput,
+  lockedAndRevalidatedOrdinarySelectedSetIds: readonly string[],
+  commandId: string
+): Promise<RefundFinancialRecomputeResult>;
 ```
 
-Expected before implementation: FAIL.
+It uses only `resolveFinancialIssueAfterReportingCorrectionCommand`; ordinary recompute and classifier replay retain their existing resolvers. The executor never calls `enqueueAccessChange` and never locks or writes purchase grants, administrative grants, entitlement, copies, email, or outbox.
 
-Implement the correction executor as a standalone exported function. Do not mutate a shared registry; focused tests pass it directly or compose it with test-local stubs through the Task 4 builder.
+Every PostgreSQL lock witness in `financial-lock-order.test.ts` must invoke the production `executeReportingCorrectionCreate` executor with a real pending correction command/lease context; it may not reproduce the executor with test SQL or call lock helpers as a substitute. From a second backend, hold each asserted blocker in turn—active projection authority, order advisory, order row, payment row, a descendant purchase-fact row, projection enrollment, and a sorted payout/balance-transaction/classification/allocation/issue row—then identify the executor backend and assert its exact `pg_locks`/`pg_stat_activity` wait target. While blocked, require pending command status and an exact no-mutation snapshot across correction sets/items, projection rows, issues/audits, and command result. Release only that blocker, require the expected succeeded or safe terminal outcome, and compare the final snapshot. Forced-error witnesses take the same production path and prove full rollback; time-based “still pending” alone is not lock evidence.
 
-Then rerun the same commands plus:
+Run RED:
 
 ```powershell
+npx vitest run src/lib/server/commerce/financial/refund-review/corrections.test.ts src/lib/server/commerce/financial/sources/refund.test.ts src/lib/server/commerce/financial/issues.test.ts
+npm run test:integration -- tests/integration/financial-corrections.test.ts tests/integration/financial-admin-commands.test.ts tests/integration/financial-reclassification.test.ts tests/integration/financial-lock-order.test.ts
+```
+
+Expected before implementation: FAIL on missing executor/recompute mode and correction-chain, resolver, repair, atomicity, and lock witnesses.
+
+- [ ] **Step 7: Implement the locked executor and correction-specific recompute path**
+
+Prepare may read and plan without row locks but never inserts or submits. Execution reloads every fact under the exact locks, calls the same pure planner, compares the canonical fingerprint, and maps stale base/fingerprint/version/tip/projection/capacity to `conflict/stale_state`; an ineligible or already-complete/equivalent state to `conflict/not_eligible`; and malformed stored input to `failed/invalid_command`. An incomplete-to-complete repair remains executable even when all numeric deltas are zero. Insert the correction set before its sorted full-coverage items, use raw predecessor topology even in repair, and call correction recompute only after insertion. Its SQL resolver proves compatibility directly from locked immutable/topology/item/capacity facts and resolves the blocking issue without consulting issue-suppressed current heads; only afterward does TypeScript load current heads and require the new tip exposed/complete before correction audit/result. Exact terminal replay returns the committed safe result without another row or audit.
+
+Rerun Step 6's commands. Expected: mutation, source, resolver, rebase, repair, authority, atomicity, no-access-effect, and lock-order tests pass.
+
+- [ ] **Step 8: Write RED UI/route tests, then implement prepare and confirm**
+
+The loader, seed service, preview service, prepare action, and confirm action each require both `sales.read` and `reconciliation.manage` before identifier/body inspection or database work. Tests deny each missing capability independently at route and service seams. Existing safe refund detail itself remains a `sales.read` query. Prepare uses the exact syntax-only parser, then lets the authorized planner validate current membership; it returns a strict action preview without submission. Confirm submits the approved command, displays its actual pending/terminal safe reference, and uses the shared bounded/cancelable poller.
+
+The editor shows baseline kind, current/proposed completeness, raw-history repair state, old/new attribution by item/currency, and separate subtotal, tax, settlement gross, and fee display deltas. It uses field-linked validation, explicit native confirmation, accessible live status, and the exact copy `Reporting only — this does not restore or revoke access.` It offers no generic issue control and never implies that repair rewrites history.
+
+On an ambiguous confirm `503`, freeze the complete confirmed payload: idempotency key, reason, expected next version/base/fingerprint, both sorted repeated item arrays including zeros, preview fingerprint, and confirmation. Do not automatically resubmit on retry timers, polling, refresh, navigation, or remount. Show an explicit Retry control; only that click posts the exact frozen payload with the same idempotency key, so the server recovers the same command if the first submit committed. Editing or preparing again discards the frozen payload and generates a new key. Route/component tests simulate response loss/503, prove zero automatic POSTs, compare every retried field and array byte-for-byte, recover pending and terminal existing commands, and prove same-key payload drift is a conflict rather than a second command.
+
+Run RED, implement, then rerun:
+
+```powershell
+npx vitest run src/lib/server/commerce/financial/refund-review/inputs.test.ts src/lib/server/commerce/financial/refund-review/corrections.test.ts src/routes/admin/sales/refunds/refund-routes.test.ts src/lib/components/admin/RefundReview.test.ts
+```
+
+Expected before implementation: FAIL on missing seed load/actions/editor. Expected after implementation: PASS with dual-capability denials, normal successor, numeric-zero raw-tip repair, already-complete `no_change`, stale preview, explicit exact-payload 503 retry with no auto-resubmit, async terminal, abort-on-navigation, keyboard, focus, error-linking, and responsive display coverage.
+
+- [ ] **Step 9: Run complete Task 13 GREEN**
+
+Keep the correction executor standalone; focused tests pass it directly or compose it with test-local stubs through the Task 4 builder. Do not mutate a shared registry. Run service-free tests first, then database-backed suites serially:
+
+```powershell
+npx vitest run src/lib/types/financial-reporting.test.ts src/lib/server/commerce/financial/refund-review/inputs.test.ts src/lib/server/commerce/financial/refund-review/correction-plan.test.ts src/lib/server/commerce/financial/refund-review/corrections.test.ts src/lib/server/commerce/financial/sources/refund.test.ts src/lib/server/commerce/financial/issues.test.ts src/lib/server/db/database-role-provision.test.ts src/routes/admin/sales/refunds/refund-routes.test.ts src/lib/components/admin/RefundReview.test.ts scripts/database-role-deployment.test.ts scripts/financial-schema-preservation.test.ts scripts/deployment-checkpoint.test.ts scripts/deployment-checkpoint-runtime.test.ts scripts/deployment-backup-bundle.test.ts scripts/with-plan6b-upgrade-database.test.ts
+npx vitest run scripts/commerce-operations.test.ts -t "pins one versioned exact catalog contract|confines the executable verifier witness|times and scopes every verifier expectation|refuses ambiguous financial witness timeout cleanup targets|bounds financial witness process-tree termination|allows only inert fail-closed" --reporter=verbose
+npm run test:integration -- tests/integration/financial-migration.test.ts tests/integration/database-role-boundaries.test.ts tests/integration/financial-admin-commands.test.ts tests/integration/financial-corrections.test.ts tests/integration/financial-reclassification.test.ts tests/integration/financial-lock-order.test.ts
+npx vitest run scripts/commerce-operations.test.ts -t "executes schema-object, source-parity, deterministic-allocation, audit, payout, and chronology verifier witnesses in PostgreSQL" --reporter=verbose
+npm run db:check
 npm run check
 npm run lint
 git diff --check
 ```
 
-Expected: all commands pass and access history remains unchanged.
+Expected: every command passes; migration/catalog head is 0013/v3 with exactly nine callable routines; first, successor, and incompatible-raw-tip repair paths are deterministic; issue resolution uses only correction authority; grouped conservation and immutable-base deltas hold; and access history remains unchanged.
 
-- [ ] **Step 5: Commit corrections**
+- [ ] **Step 10: Commit correction behavior separately**
+
+The authority/catalog commit from Step 3 must already be HEAD. This behavior commit contains no migration, role, restore, or provisioner file.
 
 ```powershell
-git add src/lib/server/commerce/financial/refund-review/corrections.ts src/lib/server/commerce/financial/refund-review/corrections.test.ts tests/integration/financial-corrections.test.ts tests/integration/financial-reclassification.test.ts tests/integration/financial-lock-order.test.ts src/lib/components/admin/ReportingCorrectionEditor.svelte src/routes/admin/sales/refunds/refund-routes.test.ts src/lib/components/admin/RefundReview.test.ts
+git add src/lib/types/financial-reporting.ts src/lib/types/financial-reporting.test.ts src/lib/server/commerce/financial/refund-review/inputs.ts src/lib/server/commerce/financial/refund-review/inputs.test.ts src/lib/server/commerce/financial/refund-review/correction-plan.ts src/lib/server/commerce/financial/refund-review/correction-plan.test.ts src/lib/server/commerce/financial/refund-review/corrections.ts src/lib/server/commerce/financial/refund-review/corrections.test.ts src/lib/server/commerce/financial/sources/refund.ts src/lib/server/commerce/financial/sources/refund.test.ts tests/integration/financial-corrections.test.ts tests/integration/financial-admin-commands.test.ts tests/integration/financial-reclassification.test.ts tests/integration/financial-lock-order.test.ts src/lib/components/admin/ReportingCorrectionEditor.svelte src/routes/admin/sales/refunds/refund-routes.test.ts src/lib/components/admin/RefundReview.test.ts
 git add -- ':(literal)src/routes/admin/sales/refunds/[refundId]/+page.server.ts' ':(literal)src/routes/admin/sales/refunds/[refundId]/+page.svelte'
 git diff --cached --check
 git commit -m "feat: add refund reporting corrections"
 ```
+
+Expected: Task 13 ends with two reviewable commits, no uncommitted authority/behavior file, and no edit to migration 0012 or its finalization-only resolver.
 
 ### Task 14: Add causally proven persistent administrative recovery
 
@@ -2491,7 +2892,7 @@ Create `docs/financial-reconciliation-and-reporting.md` with the signed metric f
 Update all listed status/runbook documents to describe:
 
 - Plan 6B-I and 6B-II as one candidate phase;
-- migration 0012 and the exact four database principals;
+- migrations through 0013, the historical 0012 eight-routine boundary, the final nine-routine boundary, and the exact four database principals;
 - web submit/status/audit routines versus worker mutation authority;
 - migrate -> provision -> checkpoint capture -> distinct-engine rehearsal -> smoke ordering;
 - the unchanged maintenance/Stripe-disabled production boundary; and
@@ -2543,7 +2944,7 @@ npm run smoke:plan6b -- --stage 6b-ii
 npm run smoke:plan6b-fixture -- --stage 6b-ii
 ```
 
-Expected: every command exits zero; exact catalog/ACL corruption witnesses repair cleanly; all upgrade fixtures reach 0012; browser journeys use the real worker; smoke and fixture share the validated production image lease; and no owned or foreign resource is mutated after cleanup.
+Expected: every command exits zero; exact catalog/ACL corruption witnesses repair cleanly; all upgrade fixtures reach 0013 and the v3 contract; browser journeys use the real worker; smoke and fixture share the validated production image lease; and no owned or foreign resource is mutated after cleanup.
 
 `npm run test:unit` is deliberately in the serialized service-backed tranche because the current Vitest file set contains the supervised PostgreSQL restore witness. Do not assume its name makes it service-free and do not launch it concurrently with any other harness.
 
@@ -2603,7 +3004,7 @@ Expected: all reviewers report no unresolved Critical/Important/Minor findings, 
 | Durable private command with web/worker authority split | Tasks 3–5, 11–15 |
 | Stale-generation financial-admin lease capability, takeover, and secret isolation | Tasks 3–5, 14–15 |
 | Execution-time role reauthorization and replay safety | Tasks 4, 15–16 |
-| Exact migration/ACL/restore/upgrade/checkpoint parity | Tasks 3, 5, 17 |
+| Exact migration/ACL/restore/upgrade/checkpoint parity | Tasks 3, 5, 13, 17 |
 | Signed per-title reporting and aggregate CSV | Tasks 6–7, 10, 16 |
 | Operational Needs Review and local payout detail | Tasks 8–9, 16 |
 | Audited detail/export before response | Tasks 4, 8–10, 15 |
@@ -2617,7 +3018,7 @@ Expected: all reviewers report no unresolved Critical/Important/Minor findings, 
 
 - Start from the exact approved base named above and keep one task commit per boundary unless a task explicitly names multiple commits.
 - Use `superpowers:subagent-driven-development` for same-session execution or `superpowers:executing-plans` for a separate execution session.
-- Preserve the six command kinds, five statuses, audit vocabulary, eight callable routine signatures, job type, private claim-table/helper/trigger names, transaction-local setting names, and advisory lock prefix exactly. A change to one is a design change, not a convenient implementation detail.
+- Preserve the six command kinds, five statuses, audit vocabulary, job type, private claim-table/helper/trigger names, transaction-local setting names, and advisory lock prefix exactly. Migration 0012's historical surface remains eight callable routine signatures; after Task 13, migration 0013 adds only `resolve_financial_issue_after_reporting_correction_command(uuid,uuid)` for an exact final surface of nine. Any other signature change is a design change, not a convenient implementation detail.
 - Preserve `role advisory -> shared lease advisory -> command row` for command work, `job row -> exclusive lease advisory -> claim/optional command sync` for claim/takeover/terminal work, and `job row -> shared lease advisory -> claim` for heartbeat. Never add a command-to-job/lease edge.
 - Keep Task 3 and Task 5 as one atomic authority/catalog commit, including `types.ts`, `runner.ts`, and `runner.test.ts`; do not commit migration 0012 before the v2 manifest includes the private claim authority.
 - Task 4 builds the handler and fixed registry interface but must not make an incomplete executor map reachable in production. Register the production job handler only when the first complete six-kind composition exists; until then, keep the factory test-only and fail closed on any unknown/missing executor.
