@@ -470,11 +470,66 @@ export interface RefundReportingCorrectionPreviewDto {
   readonly items: readonly RefundCorrectionItemPreviewDto[];
 }
 
-export const ADMINISTRATIVE_RECOVERY_PREVIEW_DTO_KEYS = [
-  'refundId',
+export const ADMINISTRATIVE_RECOVERY_ACTIVATION_CANDIDATE_DTO_KEYS = [
+  'finalizationEffectId',
   'orderItemId',
   'titleId',
   'soldAsTitle',
+  'expectedCorrectionSetId',
+  'expectedCorrectionVersion',
+  'expectedSourceFingerprint'
+] as const;
+
+export interface AdministrativeRecoveryActivationCandidateDto {
+  readonly finalizationEffectId: string;
+  readonly orderItemId: string;
+  readonly titleId: string;
+  readonly soldAsTitle: string;
+  readonly expectedCorrectionSetId: string;
+  readonly expectedCorrectionVersion: number;
+  readonly expectedSourceFingerprint: string;
+}
+
+export const ADMINISTRATIVE_RECOVERY_DEACTIVATION_CANDIDATE_DTO_KEYS = [
+  'recoveryGrantId',
+  'recoveryReferenceId',
+  'expectedStateChangedAt',
+  'orderItemId',
+  'titleId',
+  'soldAsTitle'
+] as const;
+
+export interface AdministrativeRecoveryDeactivationCandidateDto {
+  readonly recoveryGrantId: string;
+  readonly recoveryReferenceId: string;
+  readonly expectedStateChangedAt: string;
+  readonly orderItemId: string;
+  readonly titleId: string;
+  readonly soldAsTitle: string;
+}
+
+export const ADMINISTRATIVE_RECOVERY_SEED_DTO_KEYS = [
+  'refundId',
+  'activationCandidates',
+  'deactivationCandidates'
+] as const;
+
+export interface AdministrativeRecoverySeedDto {
+  readonly refundId: string;
+  readonly activationCandidates: readonly AdministrativeRecoveryActivationCandidateDto[];
+  readonly deactivationCandidates: readonly AdministrativeRecoveryDeactivationCandidateDto[];
+}
+
+export const ADMINISTRATIVE_RECOVERY_PREVIEW_DTO_KEYS = [
+  'refundId',
+  'finalizationEffectId',
+  'orderItemId',
+  'titleId',
+  'soldAsTitle',
+  'expectedCorrectionSetId',
+  'expectedCorrectionVersion',
+  'expectedSourceFingerprint',
+  'previewFingerprint',
   'recoveryGrantId',
   'eligible',
   'ineligibleReason',
@@ -487,9 +542,14 @@ export const ADMINISTRATIVE_RECOVERY_PREVIEW_DTO_KEYS = [
 
 export interface AdministrativeRecoveryPreviewDto {
   readonly refundId: string;
+  readonly finalizationEffectId: string;
   readonly orderItemId: string;
   readonly titleId: string;
   readonly soldAsTitle: string;
+  readonly expectedCorrectionSetId: string;
+  readonly expectedCorrectionVersion: number;
+  readonly expectedSourceFingerprint: string;
+  readonly previewFingerprint: string | null;
   readonly recoveryGrantId: string | null;
   readonly eligible: boolean;
   readonly ineligibleReason:
@@ -504,6 +564,38 @@ export interface AdministrativeRecoveryPreviewDto {
   readonly accessChanged: boolean;
   readonly emailQueued: boolean;
   readonly persistsUntilDeactivated: true;
+}
+
+export const ADMINISTRATIVE_RECOVERY_DEACTIVATION_PREVIEW_DTO_KEYS = [
+  'refundId',
+  'recoveryGrantId',
+  'recoveryReferenceId',
+  'expectedStateChangedAt',
+  'orderItemId',
+  'titleId',
+  'soldAsTitle',
+  'eligible',
+  'ineligibleReason',
+  'effectiveAccessBefore',
+  'effectiveAccessAfter',
+  'accessChanged',
+  'emailQueued'
+] as const;
+
+export interface AdministrativeRecoveryDeactivationPreviewDto {
+  readonly refundId: string;
+  readonly recoveryGrantId: string;
+  readonly recoveryReferenceId: string;
+  readonly expectedStateChangedAt: string;
+  readonly orderItemId: string;
+  readonly titleId: string;
+  readonly soldAsTitle: string;
+  readonly eligible: boolean;
+  readonly ineligibleReason: 'already_in_requested_state' | null;
+  readonly effectiveAccessBefore: boolean;
+  readonly effectiveAccessAfter: boolean;
+  readonly accessChanged: boolean;
+  readonly emailQueued: boolean;
 }
 
 export const REFUND_DETAIL_DTO_KEYS = [
@@ -728,7 +820,14 @@ export const FINANCIAL_REPORTING_DTO_KEYSETS = {
   refundReportingCorrectionSeed: REFUND_REPORTING_CORRECTION_SEED_DTO_KEYS,
   refundCorrectionItemPreview: REFUND_CORRECTION_ITEM_PREVIEW_DTO_KEYS,
   refundReportingCorrectionPreview: REFUND_REPORTING_CORRECTION_PREVIEW_DTO_KEYS,
+  administrativeRecoveryActivationCandidate:
+    ADMINISTRATIVE_RECOVERY_ACTIVATION_CANDIDATE_DTO_KEYS,
+  administrativeRecoveryDeactivationCandidate:
+    ADMINISTRATIVE_RECOVERY_DEACTIVATION_CANDIDATE_DTO_KEYS,
+  administrativeRecoverySeed: ADMINISTRATIVE_RECOVERY_SEED_DTO_KEYS,
   administrativeRecoveryPreview: ADMINISTRATIVE_RECOVERY_PREVIEW_DTO_KEYS,
+  administrativeRecoveryDeactivationPreview:
+    ADMINISTRATIVE_RECOVERY_DEACTIVATION_PREVIEW_DTO_KEYS,
   refundDetail: REFUND_DETAIL_DTO_KEYS,
   payoutSummary: PAYOUT_SUMMARY_DTO_KEYS,
   payoutDetail: PAYOUT_DETAIL_DTO_KEYS,

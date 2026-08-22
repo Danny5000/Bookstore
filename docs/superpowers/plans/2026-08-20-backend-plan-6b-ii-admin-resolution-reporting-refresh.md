@@ -2382,6 +2382,10 @@ Expected: Task 13 ends with two reviewable commits, no uncommitted authority/beh
 ### Task 14: Add causally proven persistent administrative recovery
 
 **Files:**
+- Modify: `src/lib/types/financial-reporting.ts`
+- Modify: `src/lib/types/financial-reporting.test.ts`
+- Modify: `src/lib/server/commerce/financial/refund-review/inputs.ts`
+- Modify: `src/lib/server/commerce/financial/refund-review/inputs.test.ts`
 - Create: `src/lib/server/commerce/financial/refund-review/recovery.ts`
 - Create: `src/lib/server/commerce/financial/refund-review/recovery.test.ts`
 - Modify: `src/lib/server/commerce/financial/admin-commands/handler.test.ts`
@@ -2407,6 +2411,112 @@ Expected: Task 13 ends with two reviewable commits, no uncommitted authority/beh
 - Modify: `src/worker.ts`
 - Modify: `scripts/storage-process-isolation.test.ts`
 
+- [ ] **Step 0: Define and commit the recovery discovery and form-input contract spine**
+
+Recovery discovery is separate from `RefundDetailDto`. Add an independently authorized
+`AdministrativeRecoverySeedDto` with exact activation and deactivation candidate arrays:
+
+```ts
+export interface AdministrativeRecoveryActivationCandidateDto {
+  readonly finalizationEffectId: string;
+  readonly orderItemId: string;
+  readonly titleId: string;
+  readonly soldAsTitle: string;
+  readonly expectedCorrectionSetId: string;
+  readonly expectedCorrectionVersion: number;
+  readonly expectedSourceFingerprint: string;
+}
+
+export interface AdministrativeRecoveryDeactivationCandidateDto {
+  readonly recoveryGrantId: string;
+  readonly recoveryReferenceId: string;
+  readonly expectedStateChangedAt: string;
+  readonly orderItemId: string;
+  readonly titleId: string;
+  readonly soldAsTitle: string;
+}
+
+export interface AdministrativeRecoverySeedDto {
+  readonly refundId: string;
+  readonly activationCandidates:
+    readonly AdministrativeRecoveryActivationCandidateDto[];
+  readonly deactivationCandidates:
+    readonly AdministrativeRecoveryDeactivationCandidateDto[];
+}
+```
+
+Extend `AdministrativeRecoveryPreviewDto` with `finalizationEffectId`,
+`expectedCorrectionSetId`, `expectedCorrectionVersion`,
+`expectedSourceFingerprint`, and `previewFingerprint: string | null`. Add a separate
+deactivation preview with this exact safe shape:
+
+```ts
+export interface AdministrativeRecoveryDeactivationPreviewDto {
+  readonly refundId: string;
+  readonly recoveryGrantId: string;
+  readonly recoveryReferenceId: string;
+  readonly expectedStateChangedAt: string;
+  readonly orderItemId: string;
+  readonly titleId: string;
+  readonly soldAsTitle: string;
+  readonly eligible: boolean;
+  readonly ineligibleReason: 'already_in_requested_state' | null;
+  readonly effectiveAccessBefore: boolean;
+  readonly effectiveAccessAfter: boolean;
+  readonly accessChanged: boolean;
+  readonly emailQueued: boolean;
+}
+```
+
+The deactivation preview has no fingerprint: its canonical millisecond-UTC
+`expectedStateChangedAt` is the concurrency token. Enumerate and test every exact DTO key;
+return every candidate and preview array in stable identifier order.
+
+Activation and deactivation discovery are independent. A persistent administrative grant
+remains discoverable for deactivation after later correction, refund, dispute, or rebase
+makes the original activation relationship ineligible. `recoveryReferenceId` is the linked
+refund-allocation ID; `expectedStateChangedAt` is the administrative grant's canonical
+millisecond-UTC `updated_at`. The page server loads this seed separately; do not modify
+`query.ts` or populate the legacy `RefundDetailDto.recoveryPreviews` field from page-load
+side effects.
+
+Add four strict URL-encoded parsers using the existing 16 KiB reader and exact
+key/multiplicity rules:
+
+- activation prepare accepts exactly `finalizationEffectId`, `orderItemId`,
+  `expectedCorrectionSetId`, `expectedCorrectionVersion`, and
+  `expectedSourceFingerprint`;
+- activation confirm adds exactly `idempotencyKey`, `previewFingerprint`, and
+  `confirmation=activate_persistent_recovery`;
+- deactivation prepare accepts exactly `recoveryGrantId`, `recoveryReferenceId`, and
+  `expectedStateChangedAt`; and
+- deactivation confirm adds exactly `idempotencyKey` and
+  `confirmation=deactivate_persistent_recovery`.
+
+The route path is the only `refundId` source for both prepare service inputs. The established
+deactivation private command intentionally contains no `refundId`. Require canonical
+lowercase UUID/SHA-256 values, positive int32 versions, and an exact real millisecond-UTC
+timestamp whose `Date#toISOString()` round-trip is identical. Confirm parsers construct the
+complete value through `parseFinancialAdminPrivateCommand`; neither prepare parser performs
+database or current-membership work.
+
+Capture RED before implementing, then run GREEN and commit only this contract spine:
+
+```powershell
+npx vitest run src/lib/types/financial-reporting.test.ts src/lib/server/commerce/financial/refund-review/inputs.test.ts
+# Expected first run: FAIL on missing seed/deactivation DTOs and four parsers.
+npx vitest run src/lib/types/financial-reporting.test.ts src/lib/server/commerce/financial/refund-review/inputs.test.ts
+npm run check
+git diff --check
+git add docs/superpowers/plans/2026-08-20-backend-plan-6b-ii-admin-resolution-reporting-refresh.md src/lib/types/financial-reporting.ts src/lib/types/financial-reporting.test.ts src/lib/server/commerce/financial/refund-review/inputs.ts src/lib/server/commerce/financial/refund-review/inputs.test.ts
+git diff --cached --check
+git commit -m "feat: define administrative recovery inputs"
+```
+
+Expected: the discovery/confirmation contract is fixed before domain, email, route, and UI
+lanes begin, and no database, executor, entitlement, email, route, or worker code changes in
+this commit.
+
 - [ ] **Step 1: Write failing grant-origin and recovery-preview tests**
 
 Make `assertGrantTransitionAllowed` an exact source/origin/state matrix. Payment/refund/dispute/claim reducers may change only purchase grants as currently permitted; preserved maintenance changes only preserved grants; only `administrative-recovery` may request an administrative transition, and it must use the protected SQL routine rather than direct Drizzle insert/update.
@@ -2421,6 +2531,23 @@ export type AdministrativeRecoveryPrepareInput = Omit<
   'kind' | 'previewFingerprint' | 'confirmation'
 >;
 
+export type AdministrativeRecoveryDeactivationPrepareInput = {
+  readonly refundId: string;
+} & Omit<
+  Extract<FinancialAdminPrivateCommand, {
+    kind: 'administrative_recovery_deactivate'
+  }>,
+  'kind' | 'confirmation'
+>;
+
+export async function getAdministrativeRecoverySeed(
+  database: Database,
+  actor: Actor,
+  refundId: string,
+  context: FinancialRequestContext,
+  dependencies?: FinancialAuthorizationDependencies
+): Promise<AdministrativeRecoverySeedDto | null>;
+
 export async function previewAdministrativeRecovery(
   database: Database,
   actor: Actor,
@@ -2428,6 +2555,14 @@ export async function previewAdministrativeRecovery(
   context: FinancialRequestContext,
   dependencies?: FinancialAuthorizationDependencies
 ): Promise<AdministrativeRecoveryPreviewDto>;
+
+export async function previewAdministrativeRecoveryDeactivation(
+  database: Database,
+  actor: Actor,
+  input: AdministrativeRecoveryDeactivationPrepareInput,
+  context: FinancialRequestContext,
+  dependencies?: FinancialAuthorizationDependencies
+): Promise<AdministrativeRecoveryDeactivationPreviewDto>;
 
 export async function executeAdministrativeRecoveryActivate(
   context: FinancialAdminCommandExecutorContext,
@@ -2445,6 +2580,10 @@ export async function executeAdministrativeRecoveryDeactivate(
 ```
 
 The prepare input never contains `previewFingerprint` or confirmation. The server returns the fingerprint only after deriving and locking the safe eligibility preview; confirm adds that exact fingerprint and the fixed `activate_persistent_recovery` literal to form the private command.
+The deactivation prepare input includes the route-derived `refundId` only for service-level
+refund/allocation membership validation; the confirm parser removes it and submits the
+established grant/reference/timestamp private command. Graph, reference, or timestamp drift
+is `conflict/stale_state`, not a new public preview reason.
 
 - [ ] **Step 2: Write failing eligibility and protected-transition tests**
 
@@ -2497,7 +2636,7 @@ Preview states the exact title/access transition and that the override persists 
 - [ ] **Step 6: Run focused tests and confirm RED**
 
 ```powershell
-npx vitest run src/lib/server/commerce/financial/refund-review/recovery.test.ts src/lib/server/commerce/financial/admin-commands/handler.test.ts src/lib/server/commerce/grants.test.ts src/lib/server/commerce/email/payload.test.ts src/lib/server/commerce/email/enqueue.test.ts src/lib/server/commerce/email/render.test.ts src/routes/admin/sales/refunds/refund-routes.test.ts src/lib/components/admin/RefundReview.test.ts scripts/storage-process-isolation.test.ts
+npx vitest run src/lib/types/financial-reporting.test.ts src/lib/server/commerce/financial/refund-review/inputs.test.ts src/lib/server/commerce/financial/refund-review/recovery.test.ts src/lib/server/commerce/financial/admin-commands/handler.test.ts src/lib/server/commerce/grants.test.ts src/lib/server/commerce/email/payload.test.ts src/lib/server/commerce/email/enqueue.test.ts src/lib/server/commerce/email/render.test.ts src/routes/admin/sales/refunds/refund-routes.test.ts src/lib/components/admin/RefundReview.test.ts scripts/storage-process-isolation.test.ts
 npm run test:integration -- tests/integration/financial-administrative-recovery.test.ts tests/integration/commerce-claims.test.ts tests/integration/commerce-refunds.test.ts tests/integration/commerce-disputes.test.ts tests/integration/commerce-lock-order.test.ts tests/integration/financial-lock-order.test.ts
 ```
 

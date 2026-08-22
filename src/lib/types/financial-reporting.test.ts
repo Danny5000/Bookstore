@@ -1,7 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
+  ADMINISTRATIVE_RECOVERY_ACTIVATION_CANDIDATE_DTO_KEYS,
+  ADMINISTRATIVE_RECOVERY_DEACTIVATION_CANDIDATE_DTO_KEYS,
+  ADMINISTRATIVE_RECOVERY_DEACTIVATION_PREVIEW_DTO_KEYS,
   ADMINISTRATIVE_RECOVERY_PREVIEW_DTO_KEYS,
+  ADMINISTRATIVE_RECOVERY_SEED_DTO_KEYS,
   FINANCIAL_ADMIN_COMMAND_KINDS,
   FINANCIAL_ADMIN_COMMAND_STATUSES,
   FINANCIAL_ADMIN_SUCCESS_CODE_BY_KIND,
@@ -27,7 +31,11 @@ import {
   STATUS_DTO_KEYS,
   TITLE_SALES_ROW_DTO_KEYS,
   parseFinancialAdminCommandStatus,
+  type AdministrativeRecoveryActivationCandidateDto,
+  type AdministrativeRecoveryDeactivationCandidateDto,
+  type AdministrativeRecoveryDeactivationPreviewDto,
   type AdministrativeRecoveryPreviewDto,
+  type AdministrativeRecoverySeedDto,
   type FinancialAdminCommandReferenceDto,
   type FinancialAdminCommandResultCode,
   type FinancialAdminCommandSafeResultByCode,
@@ -250,11 +258,38 @@ const EXPECTED_FINANCIAL_REPORTING_DTO_KEYSETS = {
     'ineligibleReason',
     'items'
   ],
-  administrativeRecoveryPreview: [
-    'refundId',
+  administrativeRecoveryActivationCandidate: [
+    'finalizationEffectId',
     'orderItemId',
     'titleId',
     'soldAsTitle',
+    'expectedCorrectionSetId',
+    'expectedCorrectionVersion',
+    'expectedSourceFingerprint'
+  ],
+  administrativeRecoveryDeactivationCandidate: [
+    'recoveryGrantId',
+    'recoveryReferenceId',
+    'expectedStateChangedAt',
+    'orderItemId',
+    'titleId',
+    'soldAsTitle'
+  ],
+  administrativeRecoverySeed: [
+    'refundId',
+    'activationCandidates',
+    'deactivationCandidates'
+  ],
+  administrativeRecoveryPreview: [
+    'refundId',
+    'finalizationEffectId',
+    'orderItemId',
+    'titleId',
+    'soldAsTitle',
+    'expectedCorrectionSetId',
+    'expectedCorrectionVersion',
+    'expectedSourceFingerprint',
+    'previewFingerprint',
     'recoveryGrantId',
     'eligible',
     'ineligibleReason',
@@ -263,6 +298,21 @@ const EXPECTED_FINANCIAL_REPORTING_DTO_KEYSETS = {
     'accessChanged',
     'emailQueued',
     'persistsUntilDeactivated'
+  ],
+  administrativeRecoveryDeactivationPreview: [
+    'refundId',
+    'recoveryGrantId',
+    'recoveryReferenceId',
+    'expectedStateChangedAt',
+    'orderItemId',
+    'titleId',
+    'soldAsTitle',
+    'eligible',
+    'ineligibleReason',
+    'effectiveAccessBefore',
+    'effectiveAccessAfter',
+    'accessChanged',
+    'emailQueued'
   ],
   refundDetail: [
     'refundId',
@@ -498,11 +548,38 @@ describe('browser-safe financial reporting DTOs', () => {
     ineligibleReason: null,
     items: [correctionItem]
   };
-  const recovery: AdministrativeRecoveryPreviewDto = {
-    refundId: finalization.refundId,
+  const recoveryActivationCandidate: AdministrativeRecoveryActivationCandidateDto = {
+    finalizationEffectId: id(),
     orderItemId: refundItem.orderItemId,
     titleId: refundItem.titleId,
     soldAsTitle: refundItem.soldAsTitle,
+    expectedCorrectionSetId: id(),
+    expectedCorrectionVersion: 2,
+    expectedSourceFingerprint: 'd'.repeat(64)
+  };
+  const recoveryDeactivationCandidate: AdministrativeRecoveryDeactivationCandidateDto = {
+    recoveryGrantId: id(),
+    recoveryReferenceId: id(),
+    expectedStateChangedAt: occurredAt,
+    orderItemId: refundItem.orderItemId,
+    titleId: refundItem.titleId,
+    soldAsTitle: refundItem.soldAsTitle
+  };
+  const recoverySeed: AdministrativeRecoverySeedDto = {
+    refundId: finalization.refundId,
+    activationCandidates: [recoveryActivationCandidate],
+    deactivationCandidates: [recoveryDeactivationCandidate]
+  };
+  const recovery: AdministrativeRecoveryPreviewDto = {
+    refundId: finalization.refundId,
+    finalizationEffectId: recoveryActivationCandidate.finalizationEffectId,
+    orderItemId: refundItem.orderItemId,
+    titleId: refundItem.titleId,
+    soldAsTitle: refundItem.soldAsTitle,
+    expectedCorrectionSetId: recoveryActivationCandidate.expectedCorrectionSetId,
+    expectedCorrectionVersion: recoveryActivationCandidate.expectedCorrectionVersion,
+    expectedSourceFingerprint: recoveryActivationCandidate.expectedSourceFingerprint,
+    previewFingerprint: 'e'.repeat(64),
     recoveryGrantId: null,
     eligible: true,
     ineligibleReason: null,
@@ -511,6 +588,21 @@ describe('browser-safe financial reporting DTOs', () => {
     accessChanged: true,
     emailQueued: true,
     persistsUntilDeactivated: true
+  };
+  const recoveryDeactivation: AdministrativeRecoveryDeactivationPreviewDto = {
+    refundId: recoverySeed.refundId,
+    recoveryGrantId: recoveryDeactivationCandidate.recoveryGrantId,
+    recoveryReferenceId: recoveryDeactivationCandidate.recoveryReferenceId,
+    expectedStateChangedAt: recoveryDeactivationCandidate.expectedStateChangedAt,
+    orderItemId: recoveryDeactivationCandidate.orderItemId,
+    titleId: recoveryDeactivationCandidate.titleId,
+    soldAsTitle: recoveryDeactivationCandidate.soldAsTitle,
+    eligible: true,
+    ineligibleReason: null,
+    effectiveAccessBefore: true,
+    effectiveAccessAfter: false,
+    accessChanged: true,
+    emailQueued: true
   };
 
   const fixtures: readonly [object, readonly string[]][] = [
@@ -591,7 +683,20 @@ describe('browser-safe financial reporting DTOs', () => {
     [correctionSeed, REFUND_REPORTING_CORRECTION_SEED_DTO_KEYS],
     [correctionItem, REFUND_CORRECTION_ITEM_PREVIEW_DTO_KEYS],
     [correction, REFUND_REPORTING_CORRECTION_PREVIEW_DTO_KEYS],
+    [
+      recoveryActivationCandidate,
+      ADMINISTRATIVE_RECOVERY_ACTIVATION_CANDIDATE_DTO_KEYS
+    ],
+    [
+      recoveryDeactivationCandidate,
+      ADMINISTRATIVE_RECOVERY_DEACTIVATION_CANDIDATE_DTO_KEYS
+    ],
+    [recoverySeed, ADMINISTRATIVE_RECOVERY_SEED_DTO_KEYS],
     [recovery, ADMINISTRATIVE_RECOVERY_PREVIEW_DTO_KEYS],
+    [
+      recoveryDeactivation,
+      ADMINISTRATIVE_RECOVERY_DEACTIVATION_PREVIEW_DTO_KEYS
+    ],
     [{
       refundId: finalization.refundId,
       orderId: id(),
@@ -798,6 +903,17 @@ describe('browser-safe financial reporting DTOs', () => {
     } satisfies AdministrativeRecoveryPreviewDto;
 
     expect(rebaseRequired.ineligibleReason).toBe('correction_rebase_required');
+  });
+
+  it('keeps activation fingerprinting separate from timestamp-bound deactivation', () => {
+    expectTypeOf<AdministrativeRecoveryPreviewDto['previewFingerprint']>()
+      .toEqualTypeOf<string | null>();
+    expectTypeOf<AdministrativeRecoveryDeactivationPreviewDto['expectedStateChangedAt']>()
+      .toEqualTypeOf<string>();
+    expectTypeOf<AdministrativeRecoveryDeactivationPreviewDto['ineligibleReason']>()
+      .toEqualTypeOf<'already_in_requested_state' | null>();
+    expect(ADMINISTRATIVE_RECOVERY_DEACTIVATION_PREVIEW_DTO_KEYS)
+      .not.toContain('previewFingerprint');
   });
 
   it('does not expose forbidden identity, provider, job, evidence, audit, credential, claim, or URL keys', () => {

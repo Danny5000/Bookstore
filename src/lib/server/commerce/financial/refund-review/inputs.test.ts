@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
+  parseAdministrativeRecoveryActivateConfirmRequest,
+  parseAdministrativeRecoveryActivatePrepareRequest,
+  parseAdministrativeRecoveryDeactivateConfirmRequest,
+  parseAdministrativeRecoveryDeactivatePrepareRequest,
   parseRefundReportingCorrectionConfirmRequest,
   parseRefundReportingCorrectionPrepareRequest,
   parseRefundFinalizationConfirmRequest,
@@ -339,6 +343,217 @@ describe('refund reporting-correction form input', () => {
     );
     await expect(parseRefundReportingCorrectionPrepareRequest(
       formRequest(entries), REFUND_ID
+    )).rejects.toMatchObject({ name: 'RefundReviewInputError' });
+  });
+});
+
+describe('administrative recovery form input', () => {
+  const FINALIZATION_EFFECT_ID = '00000000-0000-4000-8000-000000011006';
+  const CORRECTION_SET_ID = '00000000-0000-4000-8000-000000011007';
+  const RECOVERY_GRANT_ID = '00000000-0000-4000-8000-000000011008';
+  const RECOVERY_REFERENCE_ID = '00000000-0000-4000-8000-000000011009';
+  const SOURCE_FINGERPRINT = 'd'.repeat(64);
+  const PREVIEW_FINGERPRINT = 'e'.repeat(64);
+  const STATE_CHANGED_AT = '2026-08-21T12:34:56.789Z';
+
+  const activationPrepareEntries = [
+    ['finalizationEffectId', FINALIZATION_EFFECT_ID],
+    ['orderItemId', FIRST_ITEM_ID],
+    ['expectedCorrectionSetId', CORRECTION_SET_ID],
+    ['expectedCorrectionVersion', '7'],
+    ['expectedSourceFingerprint', SOURCE_FINGERPRINT]
+  ] as const;
+
+  const deactivationPrepareEntries = [
+    ['recoveryGrantId', RECOVERY_GRANT_ID],
+    ['recoveryReferenceId', RECOVERY_REFERENCE_ID],
+    ['expectedStateChangedAt', STATE_CHANGED_AT]
+  ] as const;
+
+  it('parses the exact activation prepare service input with its route-derived refund', async () => {
+    await expect(parseAdministrativeRecoveryActivatePrepareRequest(
+      formRequest(activationPrepareEntries), REFUND_ID
+    )).resolves.toEqual({
+      refundId: REFUND_ID,
+      finalizationEffectId: FINALIZATION_EFFECT_ID,
+      orderItemId: FIRST_ITEM_ID,
+      expectedCorrectionSetId: CORRECTION_SET_ID,
+      expectedCorrectionVersion: 7,
+      expectedSourceFingerprint: SOURCE_FINGERPRINT
+    });
+  });
+
+  it('parses the exact activation confirmation through the private command contract', async () => {
+    await expect(parseAdministrativeRecoveryActivateConfirmRequest(formRequest([
+      ...activationPrepareEntries,
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['previewFingerprint', PREVIEW_FINGERPRINT],
+      ['confirmation', 'activate_persistent_recovery']
+    ]), REFUND_ID)).resolves.toEqual({
+      idempotencyKey: IDEMPOTENCY_KEY,
+      command: {
+        kind: 'administrative_recovery_activate',
+        refundId: REFUND_ID,
+        finalizationEffectId: FINALIZATION_EFFECT_ID,
+        orderItemId: FIRST_ITEM_ID,
+        expectedCorrectionSetId: CORRECTION_SET_ID,
+        expectedCorrectionVersion: 7,
+        expectedSourceFingerprint: SOURCE_FINGERPRINT,
+        previewFingerprint: PREVIEW_FINGERPRINT,
+        confirmation: 'activate_persistent_recovery'
+      }
+    });
+  });
+
+  it.each([
+    ['duplicate scalar', [...activationPrepareEntries, ['orderItemId', FIRST_ITEM_ID]]],
+    ['unknown key', [...activationPrepareEntries, ['titleId', SECOND_ITEM_ID]]],
+    ['noncanonical version', activationPrepareEntries.map((entry) =>
+      entry[0] === 'expectedCorrectionVersion'
+        ? ['expectedCorrectionVersion', '07'] as const : entry)],
+    ['nonpositive version', activationPrepareEntries.map((entry) =>
+      entry[0] === 'expectedCorrectionVersion'
+        ? ['expectedCorrectionVersion', '0'] as const : entry)],
+    ['out-of-range version', activationPrepareEntries.map((entry) =>
+      entry[0] === 'expectedCorrectionVersion'
+        ? ['expectedCorrectionVersion', '2147483648'] as const : entry)],
+    ['uppercase UUID', activationPrepareEntries.map((entry) =>
+      entry[0] === 'finalizationEffectId'
+        ? ['finalizationEffectId', 'ABCDEF00-0000-4000-8000-000000011006'] as const : entry)],
+    ['uppercase source fingerprint', activationPrepareEntries.map((entry) =>
+      entry[0] === 'expectedSourceFingerprint'
+        ? ['expectedSourceFingerprint', SOURCE_FINGERPRINT.toUpperCase()] as const : entry)]
+  ] as const)('rejects %s activation prepare data', async (_label, entries) => {
+    await expect(parseAdministrativeRecoveryActivatePrepareRequest(
+      formRequest(entries), REFUND_ID
+    )).rejects.toMatchObject({ name: 'RefundReviewInputError' });
+  });
+
+  it.each([
+    ['uppercase preview fingerprint', [
+      ...activationPrepareEntries,
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['previewFingerprint', PREVIEW_FINGERPRINT.toUpperCase()],
+      ['confirmation', 'activate_persistent_recovery']
+    ]],
+    ['wrong confirmation', [
+      ...activationPrepareEntries,
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['previewFingerprint', PREVIEW_FINGERPRINT],
+      ['confirmation', 'yes']
+    ]],
+    ['duplicate idempotency key', [
+      ...activationPrepareEntries,
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['previewFingerprint', PREVIEW_FINGERPRINT],
+      ['confirmation', 'activate_persistent_recovery']
+    ]]
+  ] as const)('rejects %s activation confirm data', async (_label, entries) => {
+    await expect(parseAdministrativeRecoveryActivateConfirmRequest(
+      formRequest(entries), REFUND_ID
+    )).rejects.toMatchObject({ name: 'RefundReviewInputError' });
+  });
+
+  it('parses exact deactivation prepare input with route refundId for service authorization', async () => {
+    await expect(parseAdministrativeRecoveryDeactivatePrepareRequest(
+      formRequest(deactivationPrepareEntries), REFUND_ID
+    )).resolves.toEqual({
+      refundId: REFUND_ID,
+      recoveryGrantId: RECOVERY_GRANT_ID,
+      recoveryReferenceId: RECOVERY_REFERENCE_ID,
+      expectedStateChangedAt: STATE_CHANGED_AT
+    });
+  });
+
+  it('parses deactivation confirmation without adding route state to its command', async () => {
+    const submission = await parseAdministrativeRecoveryDeactivateConfirmRequest(formRequest([
+      ...deactivationPrepareEntries,
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['confirmation', 'deactivate_persistent_recovery']
+    ]));
+
+    expect(submission).toEqual({
+      idempotencyKey: IDEMPOTENCY_KEY,
+      command: {
+        kind: 'administrative_recovery_deactivate',
+        recoveryGrantId: RECOVERY_GRANT_ID,
+        recoveryReferenceId: RECOVERY_REFERENCE_ID,
+        expectedStateChangedAt: STATE_CHANGED_AT,
+        confirmation: 'deactivate_persistent_recovery'
+      }
+    });
+    expect(submission.command).not.toHaveProperty('refundId');
+  });
+
+  it.each([
+    ['missing milliseconds', '2026-08-21T12:34:56Z'],
+    ['non-UTC offset', '2026-08-21T12:34:56.789+00:00'],
+    ['impossible date', '2026-02-30T12:34:56.789Z'],
+    ['year zero', '0000-08-21T12:34:56.789Z'],
+    ['lowercase timezone', '2026-08-21T12:34:56.789z']
+  ])('rejects a %s deactivation timestamp', async (_label, expectedStateChangedAt) => {
+    const entries = deactivationPrepareEntries.map((entry) =>
+      entry[0] === 'expectedStateChangedAt'
+        ? ['expectedStateChangedAt', expectedStateChangedAt] as const : entry);
+    await expect(parseAdministrativeRecoveryDeactivatePrepareRequest(
+      formRequest(entries), REFUND_ID
+    )).rejects.toMatchObject({ name: 'RefundReviewInputError' });
+  });
+
+  it.each([
+    ['duplicate scalar', [...deactivationPrepareEntries, ['recoveryGrantId', RECOVERY_GRANT_ID]]],
+    ['unknown key', [...deactivationPrepareEntries, ['userId', SECOND_ITEM_ID]]],
+    ['uppercase UUID', deactivationPrepareEntries.map((entry) =>
+      entry[0] === 'recoveryGrantId'
+        ? ['recoveryGrantId', 'ABCDEF00-0000-4000-8000-000000011008'] as const : entry)]
+  ] as const)('rejects %s deactivation prepare data', async (_label, entries) => {
+    await expect(parseAdministrativeRecoveryDeactivatePrepareRequest(
+      formRequest(entries), REFUND_ID
+    )).rejects.toMatchObject({ name: 'RefundReviewInputError' });
+  });
+
+  it.each([
+    ['wrong confirmation', [
+      ...deactivationPrepareEntries,
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['confirmation', 'deactivate']
+    ]],
+    ['duplicate idempotency key', [
+      ...deactivationPrepareEntries,
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['confirmation', 'deactivate_persistent_recovery']
+    ]],
+    ['unknown key', [
+      ...deactivationPrepareEntries,
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['confirmation', 'deactivate_persistent_recovery'],
+      ['refundId', REFUND_ID]
+    ]]
+  ] as const)('rejects %s deactivation confirm data', async (_label, entries) => {
+    await expect(parseAdministrativeRecoveryDeactivateConfirmRequest(
+      formRequest(entries)
+    )).rejects.toMatchObject({ name: 'RefundReviewInputError' });
+  });
+
+  it('rejects a deactivation body over 16 KiB', async () => {
+    await expect(parseAdministrativeRecoveryDeactivatePrepareRequest(new Request(
+      'https://books.example.test/admin/sales/refunds/example', {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: `recoveryGrantId=${'a'.repeat(17_000)}`
+      }
+    ), REFUND_ID)).rejects.toMatchObject({ name: 'RefundReviewInputError' });
+  });
+
+  it('rejects noncanonical route refund identifiers for both prepare services', async () => {
+    const uppercaseRefundId = 'ABCDEF00-0000-4000-8000-000000011001';
+    await expect(parseAdministrativeRecoveryActivatePrepareRequest(
+      formRequest(activationPrepareEntries), uppercaseRefundId
+    )).rejects.toMatchObject({ name: 'RefundReviewInputError' });
+    await expect(parseAdministrativeRecoveryDeactivatePrepareRequest(
+      formRequest(deactivationPrepareEntries), uppercaseRefundId
     )).rejects.toMatchObject({ name: 'RefundReviewInputError' });
   });
 });

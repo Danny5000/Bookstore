@@ -14,6 +14,8 @@ const CANONICAL_UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
 const CANONICAL_INTEGER = /^(?:0|[1-9][0-9]*)$/u;
+const UTC_MILLISECOND_TIMESTAMP =
+  /^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9][.][0-9]{3}Z$/u;
 const URLENCODED_CONTENT_TYPE =
   /^application\/x-www-form-urlencoded(?:\s*;\s*charset\s*=\s*utf-8)?$/iu;
 
@@ -63,6 +65,34 @@ export interface RefundReportingCorrectionSubmission {
   >;
 }
 
+export type AdministrativeRecoveryPrepareInput = Omit<
+  Extract<FinancialAdminPrivateCommand, { kind: 'administrative_recovery_activate' }>,
+  'kind' | 'previewFingerprint' | 'confirmation'
+>;
+
+export interface AdministrativeRecoveryActivateSubmission {
+  readonly idempotencyKey: string;
+  readonly command: Extract<
+    FinancialAdminPrivateCommand,
+    { kind: 'administrative_recovery_activate' }
+  >;
+}
+
+export interface AdministrativeRecoveryDeactivationPrepareInput {
+  readonly refundId: string;
+  readonly recoveryGrantId: string;
+  readonly recoveryReferenceId: string;
+  readonly expectedStateChangedAt: string;
+}
+
+export interface AdministrativeRecoveryDeactivateSubmission {
+  readonly idempotencyKey: string;
+  readonly command: Extract<
+    FinancialAdminPrivateCommand,
+    { kind: 'administrative_recovery_deactivate' }
+  >;
+}
+
 export class RefundReviewInputError extends Error {
   readonly fieldKey: string | null;
 
@@ -103,6 +133,19 @@ function canonicalInteger(
     return invalidInput(fieldKey);
   }
   return parsed;
+}
+
+function canonicalUtcMillisecondTimestamp(value: string | undefined): string {
+  if (
+    value === undefined ||
+    value.startsWith('0000-') ||
+    !UTC_MILLISECOND_TIMESTAMP.test(value)
+  ) return invalidInput();
+  const parsed = new Date(value);
+  if (!Number.isFinite(parsed.getTime()) || parsed.toISOString() !== value) {
+    return invalidInput();
+  }
+  return value;
 }
 
 function exactlyOne(input: URLSearchParams, key: string): string {
@@ -369,6 +412,124 @@ export async function parseRefundReportingCorrectionConfirmRequest(
       kind: 'refund_reporting_correction_create',
       ...prepare,
       previewFingerprint: canonicalSha256(exactlyOne(input, 'previewFingerprint')),
+      confirmation
+    })
+  };
+}
+
+const ADMINISTRATIVE_RECOVERY_ACTIVATE_PREPARE_KEYS = new Set([
+  'finalizationEffectId',
+  'orderItemId',
+  'expectedCorrectionSetId',
+  'expectedCorrectionVersion',
+  'expectedSourceFingerprint'
+]);
+
+function parseAdministrativeRecoveryActivateInput(
+  input: URLSearchParams,
+  refundId: string
+): AdministrativeRecoveryPrepareInput {
+  return {
+    refundId: canonicalUuid(refundId),
+    finalizationEffectId: canonicalUuid(exactlyOne(input, 'finalizationEffectId')),
+    orderItemId: canonicalUuid(exactlyOne(input, 'orderItemId')),
+    expectedCorrectionSetId: canonicalUuid(exactlyOne(input, 'expectedCorrectionSetId')),
+    expectedCorrectionVersion: canonicalInteger(
+      exactlyOne(input, 'expectedCorrectionVersion'),
+      1,
+      POSTGRES_INTEGER_MAX
+    ),
+    expectedSourceFingerprint: canonicalSha256(
+      exactlyOne(input, 'expectedSourceFingerprint')
+    )
+  };
+}
+
+export async function parseAdministrativeRecoveryActivatePrepareRequest(
+  request: Request,
+  refundId: string
+): Promise<AdministrativeRecoveryPrepareInput> {
+  const input = await readForm(request);
+  exactKeys(input, ADMINISTRATIVE_RECOVERY_ACTIVATE_PREPARE_KEYS);
+  return parseAdministrativeRecoveryActivateInput(input, refundId);
+}
+
+export async function parseAdministrativeRecoveryActivateConfirmRequest(
+  request: Request,
+  refundId: string
+): Promise<AdministrativeRecoveryActivateSubmission> {
+  const input = await readForm(request);
+  exactKeys(input, new Set([
+    ...ADMINISTRATIVE_RECOVERY_ACTIVATE_PREPARE_KEYS,
+    'idempotencyKey',
+    'previewFingerprint',
+    'confirmation'
+  ]));
+  const prepare = parseAdministrativeRecoveryActivateInput(input, refundId);
+  const confirmation = exactlyOne(input, 'confirmation');
+  if (confirmation !== 'activate_persistent_recovery') return invalidInput();
+  const idempotencyKey = canonicalUuid(exactlyOne(input, 'idempotencyKey'));
+  return {
+    idempotencyKey,
+    command: privateCommand({
+      kind: 'administrative_recovery_activate',
+      ...prepare,
+      previewFingerprint: canonicalSha256(exactlyOne(input, 'previewFingerprint')),
+      confirmation
+    })
+  };
+}
+
+const ADMINISTRATIVE_RECOVERY_DEACTIVATE_PREPARE_KEYS = new Set([
+  'recoveryGrantId',
+  'recoveryReferenceId',
+  'expectedStateChangedAt'
+]);
+
+function parseAdministrativeRecoveryDeactivateInput(
+  input: URLSearchParams
+): Omit<AdministrativeRecoveryDeactivationPrepareInput, 'refundId'> {
+  return {
+    recoveryGrantId: canonicalUuid(exactlyOne(input, 'recoveryGrantId')),
+    recoveryReferenceId: canonicalUuid(exactlyOne(input, 'recoveryReferenceId')),
+    expectedStateChangedAt: canonicalUtcMillisecondTimestamp(
+      exactlyOne(input, 'expectedStateChangedAt')
+    )
+  };
+}
+
+export async function parseAdministrativeRecoveryDeactivatePrepareRequest(
+  request: Request,
+  refundId: string
+): Promise<AdministrativeRecoveryDeactivationPrepareInput> {
+  const input = await readForm(request);
+  exactKeys(input, ADMINISTRATIVE_RECOVERY_DEACTIVATE_PREPARE_KEYS);
+  return {
+    refundId: canonicalUuid(refundId),
+    ...parseAdministrativeRecoveryDeactivateInput(input)
+  };
+}
+
+export async function parseAdministrativeRecoveryDeactivateConfirmRequest(
+  request: Request
+): Promise<AdministrativeRecoveryDeactivateSubmission> {
+  const input = await readForm(request);
+  exactKeys(input, new Set([
+    ...ADMINISTRATIVE_RECOVERY_DEACTIVATE_PREPARE_KEYS,
+    'idempotencyKey',
+    'confirmation'
+  ]));
+  const prepare = parseAdministrativeRecoveryDeactivateInput(input);
+  const confirmation = exactlyOne(input, 'confirmation');
+  if (confirmation !== 'deactivate_persistent_recovery') return invalidInput();
+  const idempotencyKey = canonicalUuid(exactlyOne(input, 'idempotencyKey'));
+  return {
+    idempotencyKey,
+    command: privateCommand({
+      kind: 'administrative_recovery_deactivate',
+      recoveryGrantId: prepare.recoveryGrantId,
+      recoveryReferenceId: prepare.recoveryReferenceId,
+      expectedStateChangedAt: prepare.expectedStateChangedAt,
       confirmation
     })
   };
