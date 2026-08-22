@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray } from 'drizzle-orm';
+import { and, asc, eq, inArray, or } from 'drizzle-orm';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
 import {
   disputes,
@@ -17,6 +17,7 @@ import {
   stripeEvents,
   type DisputeItemAllocationRow,
   type DisputeRow,
+  type EntitlementGrantRow,
   type OrderItemRow,
   type OrderRow,
   type PaymentRow,
@@ -311,49 +312,90 @@ export async function lockPaymentAccessFacts(
   order: OrderRow
 ) {
   const purchaseFacts = await lockPaymentPurchaseFacts(transaction, payment, order);
+  return lockPaymentEntitlementFacts(transaction, purchaseFacts);
+}
+
+export interface PaymentEntitlementFacts extends PaymentPurchaseFacts {
+  grants: readonly EntitlementGrantRow[];
+  affectedScopeGrants: readonly EntitlementGrantRow[];
+}
+
+/**
+ * Extends an already locked purchase graph with its entitlement graph. Purchase grants are
+ * discovered without row locks so every claimed scope can be locked first. The final row lock
+ * covers the globally ID-sorted union of those purchase grants and every grant in an affected
+ * scope, after which purchase provenance is checked again against the discovery snapshot.
+ */
+export async function lockPaymentEntitlementFacts(
+  transaction: DatabaseTransaction,
+  purchaseFacts: PaymentPurchaseFacts
+): Promise<PaymentEntitlementFacts> {
   const items = purchaseFacts.orderItems;
   const candidateGrants = await transaction
     .select()
     .from(entitlementGrants)
     .where(inArray(entitlementGrants.orderItemId, items.map((item) => item.id)))
     .orderBy(asc(entitlementGrants.id));
+  const itemById = new Map(items.map((item) => [item.id, item]));
+  const candidateByOrderItemId = new Map<string, EntitlementGrantRow>();
+  for (const grant of candidateGrants) {
+    const item = grant.orderItemId ? itemById.get(grant.orderItemId) : undefined;
+    if (
+      grant.source !== 'purchase' ||
+      !item ||
+      grant.titleId !== item.titleId ||
+      candidateByOrderItemId.has(item.id)
+    ) permanentReconciliationFailure();
+    candidateByOrderItemId.set(item.id, grant);
+  }
   if (
     candidateGrants.length !== items.length ||
-    candidateGrants.some((grant) => grant.source !== 'purchase')
-  ) {
-    permanentReconciliationFailure();
-  }
-  const itemById = new Map(items.map((item) => [item.id, item]));
-  if (candidateGrants.some((grant) => {
-    const item = grant.orderItemId ? itemById.get(grant.orderItemId) : undefined;
-    return !item || grant.titleId !== item.titleId;
-  })) permanentReconciliationFailure();
-  await lockEntitlementScopes(
-    transaction,
-    candidateGrants.flatMap((grant) => grant.userId
-      ? [{ userId: grant.userId, titleId: grant.titleId }]
-      : [])
+    items.some((item) => !candidateByOrderItemId.has(item.id))
+  ) permanentReconciliationFailure();
+
+  const affectedScopes = [...new Map(candidateGrants.flatMap((grant) => grant.userId
+    ? [[
+        `${grant.userId}\0${grant.titleId}`,
+        { userId: grant.userId, titleId: grant.titleId }
+      ] as const]
+    : [])).values()];
+  await lockEntitlementScopes(transaction, affectedScopes);
+
+  const affectedGrantPredicate = or(
+    inArray(entitlementGrants.id, candidateGrants.map((grant) => grant.id)),
+    ...affectedScopes.map((scope) => and(
+      eq(entitlementGrants.userId, scope.userId),
+      eq(entitlementGrants.titleId, scope.titleId)
+    ))
   );
-  const grants = await transaction
+  if (!affectedGrantPredicate) permanentReconciliationFailure();
+  const affectedScopeGrants = await transaction
     .select()
     .from(entitlementGrants)
-    .where(inArray(entitlementGrants.orderItemId, items.map((item) => item.id)))
+    .where(affectedGrantPredicate)
     .orderBy(asc(entitlementGrants.id))
     .for('update');
+
+  const lockedById = new Map(affectedScopeGrants.map((grant) => [grant.id, grant]));
+  const grants = candidateGrants.map((candidate) => {
+    const grant = lockedById.get(candidate.id);
+    if (
+      !grant ||
+      grant.id !== candidate.id ||
+      grant.orderItemId !== candidate.orderItemId ||
+      grant.titleId !== candidate.titleId ||
+      grant.userId !== candidate.userId ||
+      grant.source !== candidate.source
+    ) permanentReconciliationFailure();
+    return grant;
+  });
   if (
-    grants.length !== candidateGrants.length ||
-    grants.some((grant, index) => {
-      const candidate = candidateGrants[index];
-      return !candidate ||
-        grant.id !== candidate.id ||
-        grant.orderItemId !== candidate.orderItemId ||
-        grant.titleId !== candidate.titleId ||
-        grant.userId !== candidate.userId ||
-        grant.source !== candidate.source;
-    })
+    lockedById.size !== affectedScopeGrants.length ||
+    grants.length !== candidateGrants.length
   ) permanentReconciliationFailure();
   return {
     ...purchaseFacts,
-    grants
+    grants,
+    affectedScopeGrants
   };
 }

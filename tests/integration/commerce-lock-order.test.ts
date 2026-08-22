@@ -16,6 +16,7 @@ import { setPreservedGrantState } from '$lib/server/commerce/grants';
 import { fulfillRefundEvent } from '$lib/server/commerce/refunds';
 import {
   lockPaymentAccessFacts,
+  lockPaymentEntitlementFacts,
   lockPaymentPurchaseFacts
 } from '$lib/server/commerce/reconciliation';
 import { lockOrder } from '$lib/server/commerce/lock';
@@ -289,6 +290,22 @@ async function waitForNamedBlockedQuery(
   throw new Error(
     `Expected ${applicationName} to wait for ${expectedQueryFragment}`
   );
+}
+
+async function waitForNamedBlockedQueryWhile<T>(
+  operation: Promise<T>,
+  applicationName: string,
+  expectedQueryFragment: string
+): Promise<void> {
+  await Promise.race([
+    waitForNamedBlockedQuery(applicationName, expectedQueryFragment),
+    operation.then(
+      () => Promise.reject(new Error(
+        `${applicationName} completed before waiting for ${expectedQueryFragment}`
+      )),
+      (error: unknown) => Promise.reject(error)
+    )
+  ]);
 }
 
 async function backendPid(client: PoolClient): Promise<number> {
@@ -792,6 +809,51 @@ async function beginBalanceTransactionBlocker(
     [balanceTransactionId]
   );
   return blocker;
+}
+
+async function beginEntitlementScopeBlocker(
+  userId: string,
+  titleId: string
+): Promise<PoolClient> {
+  const blocker = await ownerDatabaseClient.pool.connect();
+  await blocker.query('begin');
+  await blocker.query("set local lock_timeout = '5s'");
+  await blocker.query(
+    'select pg_advisory_xact_lock(hashtextextended($1, 0))',
+    [`pale-orbit:commerce:entitlement:${userId}:${titleId}`]
+  );
+  return blocker;
+}
+
+async function lockLatePaymentEntitlements(
+  fixture: LockFixture,
+  database: Database
+): Promise<{
+  purchaseGrantIds: readonly string[];
+  affectedScopeGrantIds: readonly string[];
+}> {
+  return database.transaction(async (transaction) => {
+    await lockOrder(transaction, fixture.orderId);
+    const [order] = await transaction
+      .select()
+      .from(orders)
+      .where(eq(orders.id, fixture.orderId))
+      .limit(1)
+      .for('update');
+    const [payment] = await transaction
+      .select()
+      .from(payments)
+      .where(eq(payments.id, fixture.paymentId))
+      .limit(1)
+      .for('update');
+    if (!order || !payment) throw new Error('Expected locked late-entitlement roots');
+    const purchaseFacts = await lockPaymentPurchaseFacts(transaction, payment, order);
+    const accessFacts = await lockPaymentEntitlementFacts(transaction, purchaseFacts);
+    return {
+      purchaseGrantIds: accessFacts.grants.map((grant) => grant.id),
+      affectedScopeGrantIds: accessFacts.affectedScopeGrants.map((grant) => grant.id)
+    };
+  });
 }
 
 async function lockPurchaseAccessGraph(
@@ -1441,6 +1503,129 @@ describe('commerce transaction lock order', () => {
           ? [payoutAcquisition, purchaseProjection]
           : [payoutAcquisition]
       );
+    }
+  }, 15_000);
+
+  it('locks the complete affected entitlement-grant union by global grant ID', async () => {
+    const fixture = await createLockFixture({ assignedPurchase: true });
+    const preservedGrantId = '00000000-0000-4000-8000-000000000001';
+    await ownerDatabaseClient.db.insert(entitlementGrants).values({
+      id: preservedGrantId,
+      titleId: fixture.titleId,
+      userId: fixture.claimantId,
+      source: 'preserved',
+      state: 'active',
+      stateReason: 'late_lock_union_fixture',
+      grantedAt: paidAt
+    });
+    const blocker = await beginGrantBlocker(preservedGrantId);
+    const applicationName = `plan6b-late-union-${fixture.orderId}`;
+    const probeDatabase = createBoundedProbeDatabase(applicationName, 'worker');
+    let lateLock: ReturnType<typeof lockLatePaymentEntitlements> | undefined;
+    let blockerReleased = false;
+
+    try {
+      lateLock = lockLatePaymentEntitlements(fixture, probeDatabase.database);
+      void lateLock.catch(() => undefined);
+      await waitForNamedBlockedQueryWhile(
+        lateLock,
+        applicationName,
+        'from "entitlement_grants"'
+      );
+      await blocker.query('commit');
+      blocker.release();
+      blockerReleased = true;
+
+      await expect(lateLock).resolves.toEqual({
+        purchaseGrantIds: [fixture.grantId],
+        affectedScopeGrantIds: [preservedGrantId, fixture.grantId].sort()
+      });
+    } finally {
+      if (!blockerReleased) await releaseBlocker(blocker).catch(() => undefined);
+      await Promise.allSettled(lateLock ? [lateLock] : []);
+      await probeDatabase.close();
+    }
+  }, 15_000);
+
+  it('waits for every claimed entitlement scope before locking any purchase grant', async () => {
+    const fixture = await createLockFixture({ assignedPurchase: true });
+    const scopeBlocker = await beginEntitlementScopeBlocker(
+      fixture.claimantId,
+      fixture.titleId
+    );
+    const applicationName = `plan6b-late-scope-${fixture.orderId}`;
+    const probeDatabase = createBoundedProbeDatabase(applicationName, 'worker');
+    let lateLock: ReturnType<typeof lockLatePaymentEntitlements> | undefined;
+    let scopeReleased = false;
+
+    try {
+      lateLock = lockLatePaymentEntitlements(fixture, probeDatabase.database);
+      void lateLock.catch(() => undefined);
+      await waitForNamedBlockedQueryWhile(
+        lateLock,
+        applicationName,
+        'pg_advisory_xact_lock'
+      );
+
+      const grantProbe = await ownerDatabaseClient.pool.connect();
+      try {
+        await grantProbe.query('begin');
+        await grantProbe.query("set local lock_timeout = '1s'");
+        await grantProbe.query(
+          'select id from entitlement_grants where id = $1 for update',
+          [fixture.grantId]
+        );
+        await grantProbe.query('commit');
+      } finally {
+        await grantProbe.query('rollback').catch(() => undefined);
+        grantProbe.release();
+      }
+
+      await scopeBlocker.query('commit');
+      scopeBlocker.release();
+      scopeReleased = true;
+      await expect(lateLock).resolves.toMatchObject({
+        purchaseGrantIds: [fixture.grantId]
+      });
+    } finally {
+      if (!scopeReleased) await releaseBlocker(scopeBlocker).catch(() => undefined);
+      await Promise.allSettled(lateLock ? [lateLock] : []);
+      await probeDatabase.close();
+    }
+  }, 15_000);
+
+  it('revalidates purchase-grant provenance after acquiring entitlement scopes', async () => {
+    const fixture = await createLockFixture({ assignedPurchase: true });
+    const scopeBlocker = await beginEntitlementScopeBlocker(
+      fixture.claimantId,
+      fixture.titleId
+    );
+    const applicationName = `plan6b-late-revalidate-${fixture.orderId}`;
+    const probeDatabase = createBoundedProbeDatabase(applicationName, 'worker');
+    let lateLock: ReturnType<typeof lockLatePaymentEntitlements> | undefined;
+    let scopeReleased = false;
+
+    try {
+      lateLock = lockLatePaymentEntitlements(fixture, probeDatabase.database);
+      void lateLock.catch(() => undefined);
+      await waitForNamedBlockedQueryWhile(
+        lateLock,
+        applicationName,
+        'pg_advisory_xact_lock'
+      );
+      await ownerDatabaseClient.db
+        .update(entitlementGrants)
+        .set({ userId: null, state: 'unclaimed' })
+        .where(eq(entitlementGrants.id, fixture.grantId));
+      await scopeBlocker.query('commit');
+      scopeBlocker.release();
+      scopeReleased = true;
+
+      await expect(lateLock).rejects.toThrow();
+    } finally {
+      if (!scopeReleased) await releaseBlocker(scopeBlocker).catch(() => undefined);
+      await Promise.allSettled(lateLock ? [lateLock] : []);
+      await probeDatabase.close();
     }
   }, 15_000);
 });
