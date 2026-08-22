@@ -10,6 +10,10 @@ import { FinancialAdminConflictError } from '$lib/server/commerce/financial/admi
 import {
   parseRefundDraftDiscardRequest,
   parseRefundDraftSaveRequest,
+  parseAdministrativeRecoveryActivateConfirmRequest,
+  parseAdministrativeRecoveryActivatePrepareRequest,
+  parseAdministrativeRecoveryDeactivateConfirmRequest,
+  parseAdministrativeRecoveryDeactivatePrepareRequest,
   parseRefundFinalizationConfirmRequest,
   parseRefundFinalizationPrepareRequest,
   parseRefundReportingCorrectionConfirmRequest,
@@ -22,6 +26,11 @@ import {
   getReportingCorrectionSeed,
   previewReportingCorrection
 } from '$lib/server/commerce/financial/refund-review/corrections';
+import {
+  getAdministrativeRecoverySeed,
+  previewAdministrativeRecovery,
+  previewAdministrativeRecoveryDeactivation
+} from '$lib/server/commerce/financial/refund-review/recovery';
 import { getRefundReviewDetail } from '$lib/server/commerce/financial/refund-review/query';
 import { getDatabaseClient } from '$lib/server/db/runtime';
 import { assertSameOrigin } from '$lib/server/http/strict-json';
@@ -51,7 +60,11 @@ type RefundAction =
   | 'prepareFinalize'
   | 'confirmFinalize'
   | 'prepareCorrection'
-  | 'confirmCorrection';
+  | 'confirmCorrection'
+  | 'prepareRecoveryActivation'
+  | 'confirmRecoveryActivation'
+  | 'prepareRecoveryDeactivation'
+  | 'confirmRecoveryDeactivation';
 
 type RetrySubmission =
   | {
@@ -88,6 +101,25 @@ type RetrySubmission =
       }[];
       readonly previewFingerprint: string;
       readonly confirmation: 'create_reporting_correction';
+    }
+  | {
+      readonly action: 'confirmRecoveryActivation';
+      readonly idempotencyKey: string;
+      readonly finalizationEffectId: string;
+      readonly orderItemId: string;
+      readonly expectedCorrectionSetId: string;
+      readonly expectedCorrectionVersion: number;
+      readonly expectedSourceFingerprint: string;
+      readonly previewFingerprint: string;
+      readonly confirmation: 'activate_persistent_recovery';
+    }
+  | {
+      readonly action: 'confirmRecoveryDeactivation';
+      readonly idempotencyKey: string;
+      readonly recoveryGrantId: string;
+      readonly recoveryReferenceId: string;
+      readonly expectedStateChangedAt: string;
+      readonly confirmation: 'deactivate_persistent_recovery';
     };
 
 function actionReturnContext(url: URL, action: RefundAction) {
@@ -124,14 +156,23 @@ export const load: PageServerLoad = async (event) => {
       refundId,
       context
     );
+    const administrativeRecoverySeed = await getAdministrativeRecoverySeed(
+      database,
+      actor,
+      refundId,
+      context
+    );
     return {
       detail,
       reportingCorrectionSeed,
+      administrativeRecoverySeed,
       reviewCursor: returnContext.reviewCursor,
       saveDraftIdempotencyKey: randomUUID(),
       discardDraftIdempotencyKey: randomUUID(),
       finalizeIdempotencyKey: randomUUID(),
-      correctionIdempotencyKey: randomUUID()
+      correctionIdempotencyKey: randomUUID(),
+      recoveryActivationIdempotencyKey: randomUUID(),
+      recoveryDeactivationIdempotencyKey: randomUUID()
     };
   } catch (cause: unknown) {
     failLoadSafely(cause);
@@ -361,11 +402,184 @@ async function confirmCorrection(
   }
 }
 
+async function prepareRecoveryActivation(
+  event: Parameters<Actions['saveDraft']>[0]
+) {
+  try {
+    const actor = requireRefundManagement(event.locals.actor);
+    assertSameOrigin(event.request);
+    const refundId = requireFinancialRouteUuid(event.params.refundId);
+    const returnContext = actionReturnContext(event.url, 'prepareRecoveryActivation');
+    const input = await parseAdministrativeRecoveryActivatePrepareRequest(
+      event.request,
+      refundId
+    );
+    const administrativeRecoveryActivationPreview = await previewAdministrativeRecovery(
+      getDatabaseClient().db,
+      actor,
+      input,
+      createFinancialRequestContext(event.request, event.route.id)
+    );
+    return {
+      administrativeRecoveryActivationPreview,
+      reviewCursor: returnContext.reviewCursor
+    };
+  } catch (cause: unknown) {
+    const failure = financialActionFailure(
+      cause instanceof FinancialAdminConflictError
+        ? new FinancialRouteError('stale_state')
+        : cause
+    );
+    return fail(failure.status, {
+      code: failure.code,
+      fieldErrors: failure.code === 'invalid_request'
+        ? { form: 'Reload current recovery facts and prepare activation again.' }
+        : {},
+      retrySubmission: null
+    });
+  }
+}
+
+async function confirmRecoveryActivation(
+  event: Parameters<Actions['saveDraft']>[0]
+) {
+  let retrySubmission: Extract<
+    RetrySubmission,
+    { action: 'confirmRecoveryActivation' }
+  > | null = null;
+  try {
+    const actor = requireRefundManagement(event.locals.actor);
+    assertSameOrigin(event.request);
+    const refundId = requireFinancialRouteUuid(event.params.refundId);
+    const returnContext = actionReturnContext(event.url, 'confirmRecoveryActivation');
+    const submission = await parseAdministrativeRecoveryActivateConfirmRequest(
+      event.request,
+      refundId
+    );
+    retrySubmission = {
+      action: 'confirmRecoveryActivation',
+      idempotencyKey: submission.idempotencyKey,
+      finalizationEffectId: submission.command.finalizationEffectId,
+      orderItemId: submission.command.orderItemId,
+      expectedCorrectionSetId: submission.command.expectedCorrectionSetId,
+      expectedCorrectionVersion: submission.command.expectedCorrectionVersion,
+      expectedSourceFingerprint: submission.command.expectedSourceFingerprint,
+      previewFingerprint: submission.command.previewFingerprint,
+      confirmation: submission.command.confirmation
+    };
+    const command = await submitFinancialAdminCommand(getDatabaseClient().db, {
+      actor,
+      idempotencyKey: submission.idempotencyKey,
+      command: submission.command,
+      context: createFinancialRequestContext(event.request, event.route.id)
+    });
+    return { command, reviewCursor: returnContext.reviewCursor };
+  } catch (cause: unknown) {
+    const failure = financialActionFailure(cause);
+    return fail(failure.status, {
+      code: failure.code,
+      fieldErrors: failure.code === 'invalid_request'
+        ? { form: 'Reload current recovery facts and prepare activation again.' }
+        : {},
+      retrySubmission: failure.code === 'temporarily_unavailable'
+        ? retrySubmission
+        : null
+    });
+  }
+}
+
+async function prepareRecoveryDeactivation(
+  event: Parameters<Actions['saveDraft']>[0]
+) {
+  try {
+    const actor = requireRefundManagement(event.locals.actor);
+    assertSameOrigin(event.request);
+    const refundId = requireFinancialRouteUuid(event.params.refundId);
+    const returnContext = actionReturnContext(event.url, 'prepareRecoveryDeactivation');
+    const input = await parseAdministrativeRecoveryDeactivatePrepareRequest(
+      event.request,
+      refundId
+    );
+    const administrativeRecoveryDeactivationPreview =
+      await previewAdministrativeRecoveryDeactivation(
+        getDatabaseClient().db,
+        actor,
+        input,
+        createFinancialRequestContext(event.request, event.route.id)
+      );
+    return {
+      administrativeRecoveryDeactivationPreview,
+      reviewCursor: returnContext.reviewCursor
+    };
+  } catch (cause: unknown) {
+    const failure = financialActionFailure(
+      cause instanceof FinancialAdminConflictError
+        ? new FinancialRouteError('stale_state')
+        : cause
+    );
+    return fail(failure.status, {
+      code: failure.code,
+      fieldErrors: failure.code === 'invalid_request'
+        ? { form: 'Reload current recovery facts and prepare deactivation again.' }
+        : {},
+      retrySubmission: null
+    });
+  }
+}
+
+async function confirmRecoveryDeactivation(
+  event: Parameters<Actions['saveDraft']>[0]
+) {
+  let retrySubmission: Extract<
+    RetrySubmission,
+    { action: 'confirmRecoveryDeactivation' }
+  > | null = null;
+  try {
+    const actor = requireRefundManagement(event.locals.actor);
+    assertSameOrigin(event.request);
+    requireFinancialRouteUuid(event.params.refundId);
+    const returnContext = actionReturnContext(event.url, 'confirmRecoveryDeactivation');
+    const submission = await parseAdministrativeRecoveryDeactivateConfirmRequest(
+      event.request
+    );
+    retrySubmission = {
+      action: 'confirmRecoveryDeactivation',
+      idempotencyKey: submission.idempotencyKey,
+      recoveryGrantId: submission.command.recoveryGrantId,
+      recoveryReferenceId: submission.command.recoveryReferenceId,
+      expectedStateChangedAt: submission.command.expectedStateChangedAt,
+      confirmation: submission.command.confirmation
+    };
+    const command = await submitFinancialAdminCommand(getDatabaseClient().db, {
+      actor,
+      idempotencyKey: submission.idempotencyKey,
+      command: submission.command,
+      context: createFinancialRequestContext(event.request, event.route.id)
+    });
+    return { command, reviewCursor: returnContext.reviewCursor };
+  } catch (cause: unknown) {
+    const failure = financialActionFailure(cause);
+    return fail(failure.status, {
+      code: failure.code,
+      fieldErrors: failure.code === 'invalid_request'
+        ? { form: 'Reload current recovery facts and prepare deactivation again.' }
+        : {},
+      retrySubmission: failure.code === 'temporarily_unavailable'
+        ? retrySubmission
+        : null
+    });
+  }
+}
+
 export const actions: Actions = {
   saveDraft: (event) => submitDraft(event, 'saveDraft'),
   discardDraft: (event) => submitDraft(event, 'discardDraft'),
   prepareFinalize: prepareFinalization,
   confirmFinalize: confirmFinalization,
   prepareCorrection,
-  confirmCorrection
+  confirmCorrection,
+  prepareRecoveryActivation,
+  confirmRecoveryActivation,
+  prepareRecoveryDeactivation,
+  confirmRecoveryDeactivation
 };

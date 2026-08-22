@@ -16,6 +16,12 @@ import {
   executeRefundDraftDiscard,
   executeRefundDraftSave,
 } from "../refund-review/drafts";
+import { executeRefundAllocationFinalize } from "../refund-review/finalize";
+import { executeReportingCorrectionCreate } from "../refund-review/corrections";
+import {
+  executeAdministrativeRecoveryActivate,
+  executeAdministrativeRecoveryDeactivate,
+} from "../refund-review/recovery";
 import {
   FINANCIAL_ADMIN_COMMAND_JOB,
   FinancialAdminConflictError,
@@ -245,22 +251,30 @@ function handlerFor(
 }
 
 describe("createFinancialAdminCommandExecutors", () => {
-  it("composes the two real draft executors with four distinct future-task stubs", () => {
-    const futureStub = (label: string): FinancialAdminCommandExecutor =>
-      vi.fn(async () => {
-        throw new Error(`${label} executor is not implemented in Task 11`);
-      });
+  it("composes all six concrete financial administrator executors", () => {
     const executors = createFinancialAdminCommandExecutors({
       refundDraftSave: executeRefundDraftSave as FinancialAdminCommandExecutor,
       refundDraftDiscard: executeRefundDraftDiscard as FinancialAdminCommandExecutor,
-      refundAllocationFinalize: futureStub("finalize"),
-      refundReportingCorrectionCreate: futureStub("correction"),
-      administrativeRecoveryActivate: futureStub("recovery-activate"),
-      administrativeRecoveryDeactivate: futureStub("recovery-deactivate"),
+      refundAllocationFinalize:
+        executeRefundAllocationFinalize as FinancialAdminCommandExecutor,
+      refundReportingCorrectionCreate:
+        executeReportingCorrectionCreate as FinancialAdminCommandExecutor,
+      administrativeRecoveryActivate:
+        executeAdministrativeRecoveryActivate as FinancialAdminCommandExecutor,
+      administrativeRecoveryDeactivate:
+        executeAdministrativeRecoveryDeactivate as FinancialAdminCommandExecutor,
     });
 
     expect(executors.get("refund_draft_save")).toBe(executeRefundDraftSave);
     expect(executors.get("refund_draft_discard")).toBe(executeRefundDraftDiscard);
+    expect(executors.get("refund_allocation_finalize"))
+      .toBe(executeRefundAllocationFinalize);
+    expect(executors.get("refund_reporting_correction_create"))
+      .toBe(executeReportingCorrectionCreate);
+    expect(executors.get("administrative_recovery_activate"))
+      .toBe(executeAdministrativeRecoveryActivate);
+    expect(executors.get("administrative_recovery_deactivate"))
+      .toBe(executeAdministrativeRecoveryDeactivate);
     expect(new Set(executors.values()).size).toBe(6);
   });
 

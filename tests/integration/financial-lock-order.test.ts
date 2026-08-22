@@ -37,6 +37,8 @@ import {
 import { executeReportingCorrectionCreate } from
   '$lib/server/commerce/financial/refund-review/corrections';
 import { executeRefundAllocationFinalize } from '$lib/server/commerce/financial/refund-review/finalize';
+import { executeAdministrativeRecoveryActivate } from
+  '$lib/server/commerce/financial/refund-review/recovery';
 import { lockOrder } from '$lib/server/commerce/lock';
 import { lockPaymentPurchaseFacts } from '$lib/server/commerce/reconciliation';
 import {
@@ -209,6 +211,10 @@ interface CorrectionProjectionFixture {
 interface CorrectionWorkerProbe {
   readonly operation: Promise<void>;
   abort(): void;
+}
+
+interface RecoveryWorkerProbe extends CorrectionWorkerProbe {
+  readonly commandId: string;
 }
 
 interface CorrectionDomainSnapshot {
@@ -1277,6 +1283,85 @@ function runCorrectionWorkerProbe(
   return { operation, abort: () => controller.abort() };
 }
 
+async function runRecoveryWorkerProbe(
+  applicationName: string,
+  purchase: PurchaseFixture,
+  entered: Deferred<number>
+): Promise<RecoveryWorkerProbe> {
+  await ownerDatabaseClient.pool.query(
+    `insert into user_roles (user_id, role) values ($1, 'admin')`,
+    [purchase.userId]
+  );
+  const submitted = await submitFinancialAdminCommand(runtimeDatabaseClient.db, {
+    actor: { type: 'user', id: purchase.userId, roles: ['admin'] },
+    idempotencyKey: randomUUID(),
+    command: {
+      kind: 'administrative_recovery_activate',
+      refundId: purchase.refundId,
+      finalizationEffectId: randomUUID(),
+      orderItemId: purchase.itemId,
+      expectedCorrectionSetId: randomUUID(),
+      expectedCorrectionVersion: 1,
+      expectedSourceFingerprint: 'f'.repeat(64),
+      previewFingerprint: 'e'.repeat(64),
+      confirmation: 'activate_persistent_recovery'
+    },
+    context: { correlationId: `financial-lock-recovery-${purchase.refundId}` }
+  });
+  const recoveryActivate: FinancialAdminCommandExecutor = async (context, command) => {
+    if (command.kind !== 'administrative_recovery_activate') {
+      throw new Error('Recovery probe received another command kind');
+    }
+    await configureProbe(context.transaction, applicationName, entered);
+    return executeAdministrativeRecoveryActivate(context, command);
+  };
+  const handler = createFinancialAdminCommandHandler({
+    database: databaseClient.db,
+    executors: createFinancialAdminCommandExecutors({
+      refundDraftSave: unexpectedFinancialAdminExecutor('draft-save'),
+      refundDraftDiscard: unexpectedFinancialAdminExecutor('draft-discard'),
+      refundAllocationFinalize: unexpectedFinancialAdminExecutor('refund-finalization'),
+      refundReportingCorrectionCreate: unexpectedFinancialAdminExecutor('correction'),
+      administrativeRecoveryActivate: recoveryActivate,
+      administrativeRecoveryDeactivate: unexpectedFinancialAdminExecutor('recovery-deactivate')
+    }),
+    accessMessages: correctionAccessMessages
+  });
+  const repository = createPostgresJobRepository(
+    databaseClient.db,
+    { ...applicationConfig.jobs, leaseMs: 60_000 },
+    undefined,
+    'local-only',
+    {
+      classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
+    },
+    () => createHash('sha256')
+      .update(`recovery-lock:${submitted.commandId}`)
+      .digest('base64url')
+  );
+  const controller = new AbortController();
+  let polls = 0;
+  const operation = runWorker({
+    repository,
+    handlers: new Map([[FINANCIAL_ADMIN_COMMAND_JOB, handler]]),
+    workerId: `recovery-lock-${submitted.commandId}`,
+    concurrency: 1,
+    pollIntervalMs: 1,
+    heartbeatIntervalMs: 250,
+    signal: controller.signal,
+    beforePoll: async () => {
+      polls += 1;
+      if (polls === 2) controller.abort();
+    }
+  });
+  return {
+    commandId: submitted.commandId,
+    operation,
+    abort: () => controller.abort()
+  };
+}
+
 async function waitForCorrectionExecutorEntry(
   entered: Deferred<number>,
   probe: CorrectionWorkerProbe
@@ -1916,6 +2001,71 @@ describe.each(LOCK_PROBE_REPETITIONS)('financial lock ordering (repetition %i)',
     }
   }, 15_000);
 
+  it('lets recovery hold projection authority while waiting on the order graph without mutation', async () => {
+    const purchase = await createPurchaseFixture(`ch_recovery_authority_${randomUUID()}`);
+    const before = await readRefundFinalizationProbeSnapshot(purchase, randomUUID());
+    const blocker = await beginBlocker(
+      probeName('recovery-order-blocker', purchase.orderId),
+      'select pg_advisory_xact_lock(hashtextextended($1, 0))',
+      [`pale-orbit:commerce:order:${purchase.orderId}`]
+    );
+    const recoveryName = probeName('recovery-authority', purchase.refundId);
+    const authorityName = probeName('recovery-competing-authority', purchase.paymentId);
+    const recoveryEntered = deferred<number>();
+    const authorityEntered = deferred<number>();
+    let recovery: RecoveryWorkerProbe | undefined;
+    let competingAuthority: Promise<void> | undefined;
+    try {
+      recovery = await runRecoveryWorkerProbe(recoveryName, purchase, recoveryEntered);
+      observe(recovery.operation);
+      const recoveryPid = await recoveryEntered.promise;
+      expect(await waitForBlockedOperation(
+        recovery.operation,
+        recoveryPid,
+        recoveryName,
+        'transition_administrative_recovery_grant_after_admin_command'
+      )).toContain(blocker.pid);
+      expect(await readRefundFinalizationProbeSnapshot(
+        purchase, recovery.commandId
+      )).toEqual(before);
+
+      competingAuthority = lockProjectionAuthority(authorityName, authorityEntered);
+      observe(competingAuthority);
+      const authorityPid = await authorityEntered.promise;
+      expect(await waitForBlockedOperation(
+        competingAuthority,
+        authorityPid,
+        authorityName,
+        'from financial_projection_versions'
+      )).toContain(recoveryPid);
+      expect(await readRefundFinalizationProbeSnapshot(
+        purchase, recovery.commandId
+      )).toEqual(before);
+
+      await releaseBlocker(blocker);
+      assertFulfilled(
+        ['administrative recovery', 'competing projection authority'],
+        await Promise.allSettled([recovery.operation, competingAuthority])
+      );
+      expect(await readRefundFinalizationProbeSnapshot(
+        purchase, recovery.commandId
+      )).toEqual(before);
+      await expect(ownerDatabaseClient.pool.query(
+        `select status, safe_result_code from financial_admin_commands where id = $1`,
+        [recovery.commandId]
+      )).resolves.toMatchObject({
+        rows: [{ status: 'conflict', safe_result_code: 'stale_state' }]
+      });
+    } finally {
+      recovery?.abort();
+      await releaseBlocker(blocker).catch(() => undefined);
+      await Promise.allSettled([
+        ...(recovery ? [recovery.operation] : []),
+        ...(competingAuthority ? [competingAuthority] : [])
+      ]);
+    }
+  }, 20_000);
+
   it('keeps finalization financial closure ahead of its late entitlement lock', async () => {
     const purchase = await createPurchaseFixture(`ch_refund_${randomUUID()}`);
     const refundSource = snapshot({
@@ -1991,4 +2141,35 @@ describe.each(LOCK_PROBE_REPETITIONS)('financial lock ordering (repetition %i)',
       ]);
     }
   }, 15_000);
+
+  it('pins recovery financial closure ahead of entitlement mutation in the protected routine', async () => {
+    const definition = (await ownerDatabaseClient.pool.query<{ definition: string }>(`
+      select pg_get_functiondef(
+        'public.transition_administrative_recovery_grant_after_admin_command(uuid)'
+          ::regprocedure
+      ) as definition
+    `)).rows[0]!.definition.replace(/\s+/gu, ' ').toLowerCase();
+    const activationStart = definition.indexOf(
+      "if locked_command_kind = 'administrative_recovery_activate'"
+    );
+    const activation = definition.slice(activationStart);
+    const orderedFragments = [
+      'from "public"."financial_projection_versions"',
+      "'pale-orbit:financial:replay-enrollment'",
+      "'pale-orbit:financial:payout:'",
+      "'pale-orbit:financial:balance-transaction:'",
+      "'pale-orbit:financial:classification:balance_transaction:'",
+      "'pale-orbit:financial:allocation:'",
+      "'pale-orbit:financial:issue:'",
+      "'pale-orbit:commerce:entitlement:'",
+      'insert into "public"."entitlement_grants"'
+    ] as const;
+    let cursor = -1;
+    for (const fragment of orderedFragments) {
+      const position = activation.indexOf(fragment, cursor + 1);
+      expect(position, `missing/out-of-order recovery fragment: ${fragment}`)
+        .toBeGreaterThan(cursor);
+      cursor = position;
+    }
+  });
 });

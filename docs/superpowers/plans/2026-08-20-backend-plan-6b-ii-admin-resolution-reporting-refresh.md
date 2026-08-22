@@ -2382,6 +2382,8 @@ Expected: Task 13 ends with two reviewable commits, no uncommitted authority/beh
 ### Task 14: Add causally proven persistent administrative recovery
 
 **Files:**
+- Modify: `docs/superpowers/specs/2026-08-20-plan-6b-ii-implementation-refresh-design.md`
+- Modify: `docs/superpowers/plans/2026-08-20-backend-plan-6b-ii-admin-resolution-reporting-refresh.md`
 - Modify: `src/lib/types/financial-reporting.ts`
 - Modify: `src/lib/types/financial-reporting.test.ts`
 - Modify: `src/lib/server/commerce/financial/refund-review/inputs.ts`
@@ -2408,6 +2410,9 @@ Expected: Task 13 ends with two reviewable commits, no uncommitted authority/beh
 - Modify: `src/lib/server/commerce/email/enqueue.test.ts`
 - Modify: `src/lib/server/commerce/email/render.ts`
 - Modify: `src/lib/server/commerce/email/render.test.ts`
+- Modify: `drizzle/0012_plan6bii_admin_command_authority.sql`
+- Modify: `scripts/verify-financial-restore.sql`
+- Modify: `docs/stripe-financial-reconciliation.md`
 - Modify: `src/worker.ts`
 - Modify: `scripts/storage-process-isolation.test.ts`
 
@@ -2602,6 +2607,19 @@ The preview fingerprint covers the exact refund, finalization effect, order item
 
 The worker calls only `transition_administrative_recovery_grant_after_admin_command(commandId)`. Direct worker/admin-row DML must fail the trigger. The routine requires the command's linked job to hold the current unexpired capability; job status and legacy lease columns alone are never authority. It re-parses the fixed command kind/input, independently rechecks the correction/source/projection/provenance linkage, derives the activation/deactivation target and expected state, creates/reactivates one unique linked administrative grant or explicitly revokes it, and returns only the derived grant/user/title transition needed for entitlement projection.
 
+Pre-release authority correction: migrations 0012 and 0013 remain unmerged and undeployed
+while this plan executes. Task 14 therefore corrects 0012's recovery routine in place before
+the branch first reaches `main`, rather than preserving a known defect behind a redundant
+0014 migration. The corrected routine must compare the recomputed fingerprint before
+classifying a now-cumulative-full-refund relationship as ineligible, so post-prepare drift is
+`stale_state`, while a fingerprint matching the current intrinsically ineligible state remains
+`not_eligible`. Every existing-row transition timestamp must also be strictly greater than the
+prior millisecond timestamp, preventing ABA concurrency tokens and email-dedupe reuse. Re-run
+and recalibrate the exact catalog-v3 routine descriptor after this pre-release edit; no journal,
+snapshot, signature, owner, ACL, security mode, or search path changes.
+The routine and preview must also share the exact bounded closure of at most 100 succeeded
+refunds; neither side may accept a causal graph that the other cannot represent and fingerprint.
+
 - [ ] **Step 3: Implement and commit the pure eligibility/grant-origin boundary**
 
 Run the two focused unit files to capture RED, implement only the preview eligibility and exact grant-origin matrix from Steps 1–2, then rerun and commit:
@@ -2629,6 +2647,10 @@ Add the minimized template `commerce.administrative-recovery-access-changed` wit
 
 Test concurrent correction/finalization/recovery barriers; correction ID/version drift; source-fingerprint drift; projection-head/implementation drift; cumulative full refund making activation stale; two activations; another active grant; exact replay; deactivation replay; stale/forged/expired capability; and forced routine/projection/audit/outbox failures with full rollback.
 
+Also force an existing recovery row's millisecond timestamp ahead of the database clock, then
+execute active -> revoked -> active. Assert each returned concurrency token is strictly
+monotonic and all three access-change dedupe keys remain distinct.
+
 - [ ] **Step 5: Write failing confirmation UI tests**
 
 Preview states the exact title/access transition and that the override persists through future refund/correction/dispute processing until separate deactivation. Use native prepare/confirm plus shared async status; no `window.confirm`.
@@ -2650,11 +2672,12 @@ Do not mutate a shared registry. Handler tests now pass all six real executor fu
 
 ```powershell
 npx vitest run src/lib/server/commerce/financial/refund-review/recovery.test.ts src/lib/server/commerce/financial/admin-commands/handler.test.ts src/lib/server/commerce/grants.test.ts src/lib/server/commerce/email/payload.test.ts src/lib/server/commerce/email/enqueue.test.ts src/lib/server/commerce/email/render.test.ts src/routes/admin/sales/refunds/refund-routes.test.ts src/lib/components/admin/RefundReview.test.ts
+npx vitest run scripts/financial-schema-preservation.test.ts scripts/commerce-operations.test.ts
 npm run test:integration -- tests/integration/financial-administrative-recovery.test.ts tests/integration/commerce-claims.test.ts tests/integration/commerce-refunds.test.ts tests/integration/commerce-disputes.test.ts tests/integration/commerce-lock-order.test.ts tests/integration/financial-lock-order.test.ts
 npm run check
 npm run lint
 git diff --check
-git add src/lib/server/commerce/financial/refund-review/recovery.ts src/lib/server/commerce/financial/refund-review/recovery.test.ts src/lib/server/commerce/financial/admin-commands/handler.test.ts tests/integration/financial-administrative-recovery.test.ts tests/integration/commerce-claims.test.ts tests/integration/commerce-refunds.test.ts tests/integration/commerce-disputes.test.ts tests/integration/commerce-lock-order.test.ts tests/integration/financial-lock-order.test.ts src/lib/components/admin/AdministrativeRecoveryActions.svelte src/routes/admin/sales/refunds/refund-routes.test.ts src/lib/components/admin/RefundReview.test.ts src/lib/server/commerce/email/payload.ts src/lib/server/commerce/email/payload.test.ts src/lib/server/commerce/email/enqueue.ts src/lib/server/commerce/email/enqueue.test.ts src/lib/server/commerce/email/render.ts src/lib/server/commerce/email/render.test.ts
+git add docs/superpowers/specs/2026-08-20-plan-6b-ii-implementation-refresh-design.md docs/superpowers/plans/2026-08-20-backend-plan-6b-ii-admin-resolution-reporting-refresh.md drizzle/0012_plan6bii_admin_command_authority.sql scripts/verify-financial-restore.sql docs/stripe-financial-reconciliation.md src/lib/server/commerce/financial/refund-review/recovery.ts src/lib/server/commerce/financial/refund-review/recovery.test.ts src/lib/server/commerce/financial/admin-commands/handler.test.ts tests/integration/financial-administrative-recovery.test.ts tests/integration/commerce-claims.test.ts tests/integration/commerce-refunds.test.ts tests/integration/commerce-disputes.test.ts tests/integration/commerce-lock-order.test.ts tests/integration/financial-lock-order.test.ts src/lib/components/admin/AdministrativeRecoveryActions.svelte src/routes/admin/sales/refunds/refund-routes.test.ts src/lib/components/admin/RefundReview.test.ts src/lib/server/commerce/email/payload.ts src/lib/server/commerce/email/payload.test.ts src/lib/server/commerce/email/enqueue.ts src/lib/server/commerce/email/enqueue.test.ts src/lib/server/commerce/email/render.ts src/lib/server/commerce/email/render.test.ts
 git add -- ':(literal)src/routes/admin/sales/refunds/[refundId]/+page.server.ts' ':(literal)src/routes/admin/sales/refunds/[refundId]/+page.svelte'
 git diff --cached --check
 git commit -m "feat: add administrative access recovery"

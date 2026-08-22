@@ -26,6 +26,18 @@ import {
 } from './payload';
 
 const idSchema = z.uuid();
+const canonicalIdSchema = z.string()
+  .regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u)
+  .pipe(z.uuid());
+const utcMillisecondTimestampSchema = z.string()
+  .regex(
+    /^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9][.][0-9]{3}Z$/u
+  )
+  .refine((value) => {
+    if (value.startsWith('0000-')) return false;
+    const parsed = new Date(value);
+    return Number.isFinite(parsed.getTime()) && parsed.toISOString() === value;
+  });
 
 export interface ReceiptSnapshot {
   orderId: string;
@@ -57,7 +69,26 @@ export type AccessChangeInput =
       to: string;
       reasonCategory: 'dispute_opened' | 'dispute_resolved';
       affectedTitleCount: number;
+    }
+  | {
+      template: 'commerce.administrative-recovery-access-changed';
+      eventId: string;
+      to: string;
+      soldAsTitle: string;
+      accessState: 'active' | 'revoked';
+      recoveryGrantId: string;
+      stateChangedAt: string;
     };
+
+const administrativeRecoveryAccessInputSchema = z.strictObject({
+  template: z.literal('commerce.administrative-recovery-access-changed'),
+  eventId: canonicalIdSchema,
+  to: z.string(),
+  soldAsTitle: z.string(),
+  accessState: z.enum(['active', 'revoked']),
+  recoveryGrantId: canonicalIdSchema,
+  stateChangedAt: utcMillisecondTimestampSchema
+});
 
 export interface CommerceMessageEnqueuer extends PurchaseMessageEnqueuer {
   enqueueGuestReceiptClaim(
@@ -231,6 +262,26 @@ export function createCommerceMessageEnqueuer(
     },
 
     async enqueueAccessChange(transaction, input) {
+      if (input.template === 'commerce.administrative-recovery-access-changed') {
+        const recovery = administrativeRecoveryAccessInputSchema.parse(input);
+        const payload = parseCommerceEmailPayload({
+          version: 1,
+          template: recovery.template,
+          to: recovery.to,
+          messageId: recovery.eventId,
+          soldAsTitle: recovery.soldAsTitle,
+          accessState: recovery.accessState
+        }, origin);
+        await dependencies.enqueueOutboxMessage(transaction, {
+          topic: COMMERCE_EMAIL_TOPIC,
+          payload: asJson(payload),
+          deduplicationKey:
+            `commerce:recovery-access:${recovery.recoveryGrantId}:` +
+            `${recovery.accessState}:${Date.parse(recovery.stateChangedAt)}`,
+          maxAttempts: 8
+        });
+        return;
+      }
       const eventId = idSchema.parse(input.eventId);
       const payload = parseCommerceEmailPayload({
         version: 1,

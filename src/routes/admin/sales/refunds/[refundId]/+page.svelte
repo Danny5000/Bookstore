@@ -3,9 +3,12 @@
   import FinancialAmount from '$lib/components/admin/FinancialAmount.svelte';
   import FinancialActionConfirmation from '$lib/components/admin/FinancialActionConfirmation.svelte';
   import FinancialActionOutcome from '$lib/components/admin/FinancialActionOutcome.svelte';
+  import AdministrativeRecoveryActions from '$lib/components/admin/AdministrativeRecoveryActions.svelte';
   import RefundAllocationEditor from '$lib/components/admin/RefundAllocationEditor.svelte';
   import ReportingCorrectionEditor from '$lib/components/admin/ReportingCorrectionEditor.svelte';
   import type {
+    AdministrativeRecoveryDeactivationPreviewDto,
+    AdministrativeRecoveryPreviewDto,
     FinancialAdminCommandReferenceDto,
     RefundFinalizationPreviewDto,
     RefundReportingCorrectionPreviewDto
@@ -57,6 +60,25 @@
         }[];
         readonly previewFingerprint: string;
         readonly confirmation: 'create_reporting_correction';
+      }
+    | {
+        readonly action: 'confirmRecoveryActivation';
+        readonly idempotencyKey: string;
+        readonly finalizationEffectId: string;
+        readonly orderItemId: string;
+        readonly expectedCorrectionSetId: string;
+        readonly expectedCorrectionVersion: number;
+        readonly expectedSourceFingerprint: string;
+        readonly previewFingerprint: string;
+        readonly confirmation: 'activate_persistent_recovery';
+      }
+    | {
+        readonly action: 'confirmRecoveryDeactivation';
+        readonly idempotencyKey: string;
+        readonly recoveryGrantId: string;
+        readonly recoveryReferenceId: string;
+        readonly expectedStateChangedAt: string;
+        readonly confirmation: 'deactivate_persistent_recovery';
       };
 
   let { data, form }: Props = $props();
@@ -146,6 +168,18 @@
   const reportingCorrectionPreview = $derived(
     form && 'reportingCorrectionPreview' in form
       ? form.reportingCorrectionPreview as RefundReportingCorrectionPreviewDto | undefined
+      : undefined
+  );
+  const administrativeRecoveryActivationPreview = $derived(
+    form && 'administrativeRecoveryActivationPreview' in form
+      ? form.administrativeRecoveryActivationPreview as
+          AdministrativeRecoveryPreviewDto | undefined
+      : undefined
+  );
+  const administrativeRecoveryDeactivationPreview = $derived(
+    form && 'administrativeRecoveryDeactivationPreview' in form
+      ? form.administrativeRecoveryDeactivationPreview as
+          AdministrativeRecoveryDeactivationPreviewDto | undefined
       : undefined
   );
   const actionFailure = $derived(actionFailurePresentation(
@@ -297,7 +331,7 @@
             name="confirmation"
             value={retrySubmission.confirmation}
           />
-        {:else}
+        {:else if retrySubmission.action === 'confirmCorrection'}
           <input type="hidden" name="reason" value={retrySubmission.reason} />
           <input
             type="hidden"
@@ -326,6 +360,59 @@
             type="hidden"
             name="previewFingerprint"
             value={retrySubmission.previewFingerprint}
+          />
+          <input
+            type="hidden"
+            name="confirmation"
+            value={retrySubmission.confirmation}
+          />
+        {:else if retrySubmission.action === 'confirmRecoveryActivation'}
+          <input
+            type="hidden"
+            name="finalizationEffectId"
+            value={retrySubmission.finalizationEffectId}
+          />
+          <input type="hidden" name="orderItemId" value={retrySubmission.orderItemId} />
+          <input
+            type="hidden"
+            name="expectedCorrectionSetId"
+            value={retrySubmission.expectedCorrectionSetId}
+          />
+          <input
+            type="hidden"
+            name="expectedCorrectionVersion"
+            value={retrySubmission.expectedCorrectionVersion}
+          />
+          <input
+            type="hidden"
+            name="expectedSourceFingerprint"
+            value={retrySubmission.expectedSourceFingerprint}
+          />
+          <input
+            type="hidden"
+            name="previewFingerprint"
+            value={retrySubmission.previewFingerprint}
+          />
+          <input
+            type="hidden"
+            name="confirmation"
+            value={retrySubmission.confirmation}
+          />
+        {:else}
+          <input
+            type="hidden"
+            name="recoveryGrantId"
+            value={retrySubmission.recoveryGrantId}
+          />
+          <input
+            type="hidden"
+            name="recoveryReferenceId"
+            value={retrySubmission.recoveryReferenceId}
+          />
+          <input
+            type="hidden"
+            name="expectedStateChangedAt"
+            value={retrySubmission.expectedStateChangedAt}
           />
           <input
             type="hidden"
@@ -451,6 +538,8 @@
     retrySubmission === null &&
     finalizationPreview === undefined &&
     reportingCorrectionPreview === undefined &&
+    administrativeRecoveryActivationPreview === undefined &&
+    administrativeRecoveryDeactivationPreview === undefined &&
     (data.detail.allocationStatus === 'needs_review' || data.detail.allocationStatus === 'draft')}
     {#key data.detail}
       <RefundAllocationEditor
@@ -466,12 +555,33 @@
   {#if submittedCommand === undefined &&
     retrySubmission === null &&
     finalizationPreview === undefined &&
+    administrativeRecoveryActivationPreview === undefined &&
+    administrativeRecoveryDeactivationPreview === undefined &&
     data.reportingCorrectionSeed !== null}
     {#key data.reportingCorrectionSeed}
       <ReportingCorrectionEditor
         seed={data.reportingCorrectionSeed}
         preview={reportingCorrectionPreview}
         confirmIdempotencyKey={data.correctionIdempotencyKey}
+        reviewCursor={data.reviewCursor}
+        {fieldErrors}
+      />
+    {/key}
+  {/if}
+
+  {#if submittedCommand === undefined &&
+    retrySubmission === null &&
+    finalizationPreview === undefined &&
+    reportingCorrectionPreview === undefined &&
+    data.administrativeRecoverySeed !== null &&
+    data.administrativeRecoverySeed !== undefined}
+    {#key data.administrativeRecoverySeed}
+      <AdministrativeRecoveryActions
+        seed={data.administrativeRecoverySeed}
+        activationPreview={administrativeRecoveryActivationPreview}
+        deactivationPreview={administrativeRecoveryDeactivationPreview}
+        activationIdempotencyKey={data.recoveryActivationIdempotencyKey}
+        deactivationIdempotencyKey={data.recoveryDeactivationIdempotencyKey}
         reviewCursor={data.reviewCursor}
         {fieldErrors}
       />

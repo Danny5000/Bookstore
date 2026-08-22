@@ -6,6 +6,9 @@ import type {
   CapabilityResolver
 } from '$lib/server/auth/admin-policy';
 import type {
+  AdministrativeRecoveryDeactivationPreviewDto,
+  AdministrativeRecoveryPreviewDto,
+  AdministrativeRecoverySeedDto,
   RefundDetailDto,
   RefundFinalizationPreviewDto,
   RefundReportingCorrectionPreviewDto,
@@ -19,8 +22,11 @@ const routeMocks = vi.hoisted(() => ({
   denyManage: false,
   getDetail: vi.fn(),
   getCorrectionSeed: vi.fn(),
+  getRecoverySeed: vi.fn(),
   preview: vi.fn(),
   previewCorrection: vi.fn(),
+  previewRecoveryActivation: vi.fn(),
+  previewRecoveryDeactivation: vi.fn(),
   submit: vi.fn()
 }));
 
@@ -39,6 +45,11 @@ vi.mock('$lib/server/commerce/financial/refund-review/finalize', () => ({
 vi.mock('$lib/server/commerce/financial/refund-review/corrections', () => ({
   getReportingCorrectionSeed: routeMocks.getCorrectionSeed,
   previewReportingCorrection: routeMocks.previewCorrection
+}));
+vi.mock('$lib/server/commerce/financial/refund-review/recovery', () => ({
+  getAdministrativeRecoverySeed: routeMocks.getRecoverySeed,
+  previewAdministrativeRecovery: routeMocks.previewRecoveryActivation,
+  previewAdministrativeRecoveryDeactivation: routeMocks.previewRecoveryDeactivation
 }));
 vi.mock('$lib/server/commerce/financial/admin-commands/repository', async (importOriginal) => ({
   ...(await importOriginal<
@@ -87,8 +98,12 @@ const COMMAND_ID = '00000000-0000-4000-8000-000000011304';
 const IDEMPOTENCY_KEY = '00000000-0000-4000-8000-000000011305';
 const BASE_ALLOCATION_SET_ID = '00000000-0000-4000-8000-000000011309';
 const CORRECTION_SET_ID = '00000000-0000-4000-8000-000000011310';
+const FINALIZATION_EFFECT_ID = '00000000-0000-4000-8000-000000011311';
+const RECOVERY_GRANT_ID = '00000000-0000-4000-8000-000000011312';
+const RECOVERY_REFERENCE_ID = '00000000-0000-4000-8000-000000011313';
 const PREVIEW_FINGERPRINT = 'a'.repeat(64);
 const SOURCE_FINGERPRINT = 'b'.repeat(64);
+const EXPECTED_STATE_CHANGED_AT = '2026-08-22T12:00:00.000Z';
 const REVIEW_CURSOR = encodeFinancialIssueCursor({
   actionabilityRank: 0,
   impactRank: 1,
@@ -219,6 +234,63 @@ const correctionPreview: RefundReportingCorrectionPreviewDto = {
   }]
 };
 
+const recoverySeed: AdministrativeRecoverySeedDto = {
+  refundId: REFUND_ID,
+  activationCandidates: [{
+    finalizationEffectId: FINALIZATION_EFFECT_ID,
+    orderItemId: ITEM_ID,
+    titleId: '00000000-0000-4000-8000-000000011308',
+    soldAsTitle: 'Safe title',
+    expectedCorrectionSetId: CORRECTION_SET_ID,
+    expectedCorrectionVersion: 2,
+    expectedSourceFingerprint: SOURCE_FINGERPRINT
+  }],
+  deactivationCandidates: [{
+    recoveryGrantId: RECOVERY_GRANT_ID,
+    recoveryReferenceId: RECOVERY_REFERENCE_ID,
+    expectedStateChangedAt: EXPECTED_STATE_CHANGED_AT,
+    orderItemId: ITEM_ID,
+    titleId: '00000000-0000-4000-8000-000000011308',
+    soldAsTitle: 'Safe title'
+  }]
+};
+
+const recoveryActivationPreview: AdministrativeRecoveryPreviewDto = {
+  refundId: REFUND_ID,
+  finalizationEffectId: FINALIZATION_EFFECT_ID,
+  orderItemId: ITEM_ID,
+  titleId: '00000000-0000-4000-8000-000000011308',
+  soldAsTitle: 'Safe title',
+  expectedCorrectionSetId: CORRECTION_SET_ID,
+  expectedCorrectionVersion: 2,
+  expectedSourceFingerprint: SOURCE_FINGERPRINT,
+  previewFingerprint: PREVIEW_FINGERPRINT,
+  recoveryGrantId: RECOVERY_GRANT_ID,
+  eligible: true,
+  ineligibleReason: null,
+  effectiveAccessBefore: false,
+  effectiveAccessAfter: true,
+  accessChanged: true,
+  emailQueued: true,
+  persistsUntilDeactivated: true
+};
+
+const recoveryDeactivationPreview: AdministrativeRecoveryDeactivationPreviewDto = {
+  refundId: REFUND_ID,
+  recoveryGrantId: RECOVERY_GRANT_ID,
+  recoveryReferenceId: RECOVERY_REFERENCE_ID,
+  expectedStateChangedAt: EXPECTED_STATE_CHANGED_AT,
+  orderItemId: ITEM_ID,
+  titleId: '00000000-0000-4000-8000-000000011308',
+  soldAsTitle: 'Safe title',
+  eligible: true,
+  ineligibleReason: null,
+  effectiveAccessBefore: true,
+  effectiveAccessAfter: false,
+  accessChanged: true,
+  emailQueued: true
+};
+
 function urlencoded(entries: readonly (readonly [string, string])[]): Request {
   const body = new URLSearchParams();
   for (const [key, value] of entries) body.append(key, value);
@@ -248,15 +320,21 @@ describe('refund review loader and async command routes', () => {
     vi.clearAllMocks();
     routeMocks.getDetail.mockReset();
     routeMocks.getCorrectionSeed.mockReset();
+    routeMocks.getRecoverySeed.mockReset();
     routeMocks.preview.mockReset();
     routeMocks.previewCorrection.mockReset();
+    routeMocks.previewRecoveryActivation.mockReset();
+    routeMocks.previewRecoveryDeactivation.mockReset();
     routeMocks.submit.mockReset();
     routeMocks.denyRead = false;
     routeMocks.denyManage = false;
     routeMocks.getDetail.mockResolvedValue(detail);
     routeMocks.getCorrectionSeed.mockResolvedValue(correctionSeed);
+    routeMocks.getRecoverySeed.mockResolvedValue(recoverySeed);
     routeMocks.preview.mockResolvedValue(finalizationPreview);
     routeMocks.previewCorrection.mockResolvedValue(correctionPreview);
+    routeMocks.previewRecoveryActivation.mockResolvedValue(recoveryActivationPreview);
+    routeMocks.previewRecoveryDeactivation.mockResolvedValue(recoveryDeactivationPreview);
     routeMocks.submit.mockResolvedValue({
       commandId: COMMAND_ID,
       kind: 'refund_draft_save',
@@ -303,6 +381,7 @@ describe('refund review loader and async command routes', () => {
       for (const access of Object.values(accesses)) expect(access).not.toHaveBeenCalled();
       expect(routeMocks.getDetail).not.toHaveBeenCalled();
       expect(routeMocks.getCorrectionSeed).not.toHaveBeenCalled();
+      expect(routeMocks.getRecoverySeed).not.toHaveBeenCalled();
     }
   );
 
@@ -359,9 +438,19 @@ describe('refund review loader and async command routes', () => {
         requestMetadata: { method: 'GET', routeId: '/admin/sales/refunds/[refundId]' }
       }
     );
+    expect(routeMocks.getRecoverySeed).toHaveBeenCalledWith(
+      routeMocks.database,
+      ADMIN,
+      REFUND_ID,
+      {
+        correlationId: 'refund-route-load',
+        requestMetadata: { method: 'GET', routeId: '/admin/sales/refunds/[refundId]' }
+      }
+    );
     expect(result).toMatchObject({
       detail,
       reportingCorrectionSeed: correctionSeed,
+      administrativeRecoverySeed: recoverySeed,
       reviewCursor: REVIEW_CURSOR
     });
     if (!result) throw new Error('refund loader returned no data');
@@ -369,13 +458,17 @@ describe('refund review loader and async command routes', () => {
     expect(result.discardDraftIdempotencyKey).toMatch(/^[0-9a-f-]{36}$/u);
     expect(result.finalizeIdempotencyKey).toMatch(/^[0-9a-f-]{36}$/u);
     expect(result.correctionIdempotencyKey).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(result.recoveryActivationIdempotencyKey).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(result.recoveryDeactivationIdempotencyKey).toMatch(/^[0-9a-f-]{36}$/u);
     expect(result.saveDraftIdempotencyKey).not.toBe(result.discardDraftIdempotencyKey);
     expect(new Set([
       result.saveDraftIdempotencyKey,
       result.discardDraftIdempotencyKey,
       result.finalizeIdempotencyKey,
-      result.correctionIdempotencyKey
-    ]).size).toBe(4);
+      result.correctionIdempotencyKey,
+      result.recoveryActivationIdempotencyKey,
+      result.recoveryDeactivationIdempotencyKey
+    ]).size).toBe(6);
   });
 
   it.each(['prepareFinalize', 'confirmFinalize'] as const)(
@@ -749,6 +842,453 @@ describe('refund review loader and async command routes', () => {
     expect(result).toMatchObject({
       command: { kind: 'refund_reporting_correction_create', status: 'pending' },
       reviewCursor: REVIEW_CURSOR
+    });
+  });
+
+  it.each([
+    'prepareRecoveryActivation',
+    'confirmRecoveryActivation',
+    'prepareRecoveryDeactivation',
+    'confirmRecoveryDeactivation'
+  ] as const)(
+    'requires both capabilities before touching %s origin, path, return context, or body',
+    async (action) => {
+      for (const actor of [{ type: 'anonymous' } as const, ADMIN]) {
+        routeMocks.denyManage = actor === ADMIN;
+        const accesses = {
+          params: vi.fn(), url: vi.fn(), request: vi.fn(), route: vi.fn()
+        };
+        const event: Record<string, unknown> = { locals: { actor } };
+        for (const key of Object.keys(accesses) as Array<keyof typeof accesses>) {
+          Object.defineProperty(event, key, { enumerable: true, get: accesses[key] });
+        }
+
+        const handler = refundRoute.actions[action];
+        expect(handler).toBeTypeOf('function');
+        const result = await handler!(event as never);
+
+        expect(result).toMatchObject({
+          status: actor === ADMIN ? 403 : 401,
+          data: { code: actor === ADMIN ? 'forbidden' : 'unauthenticated' }
+        });
+        for (const access of Object.values(accesses)) expect(access).not.toHaveBeenCalled();
+      }
+      expect(routeMocks.previewRecoveryActivation).not.toHaveBeenCalled();
+      expect(routeMocks.previewRecoveryDeactivation).not.toHaveBeenCalled();
+      expect(routeMocks.submit).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([
+    'prepareRecoveryActivation',
+    'confirmRecoveryActivation',
+    'prepareRecoveryDeactivation',
+    'confirmRecoveryDeactivation'
+  ] as const)('requires sales.read before touching %s request state', async (action) => {
+    routeMocks.denyRead = true;
+    const accesses = {
+      params: vi.fn(), url: vi.fn(), request: vi.fn(), route: vi.fn()
+    };
+    const event: Record<string, unknown> = { locals: { actor: ADMIN } };
+    for (const key of Object.keys(accesses) as Array<keyof typeof accesses>) {
+      Object.defineProperty(event, key, { enumerable: true, get: accesses[key] });
+    }
+
+    const result = await refundRoute.actions[action]!(event as never);
+
+    expect(result).toMatchObject({ status: 403, data: { code: 'forbidden' } });
+    for (const access of Object.values(accesses)) expect(access).not.toHaveBeenCalled();
+    expect(routeMocks.previewRecoveryActivation).not.toHaveBeenCalled();
+    expect(routeMocks.previewRecoveryDeactivation).not.toHaveBeenCalled();
+    expect(routeMocks.submit).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'prepareRecoveryActivation',
+    'confirmRecoveryActivation',
+    'prepareRecoveryDeactivation',
+    'confirmRecoveryDeactivation'
+  ] as const)('checks same-origin before consuming the %s body', async (action) => {
+    let pulled = false;
+    const request = new Request(
+      `https://books.example.test/admin/sales/refunds/${REFUND_ID}`,
+      {
+        method: 'POST',
+        headers: {
+          origin: 'https://evil.example.test',
+          'content-type': 'application/x-www-form-urlencoded'
+        },
+        body: 'unused'
+      }
+    );
+    Object.defineProperty(request, 'body', {
+      configurable: true,
+      get() {
+        pulled = true;
+        throw new Error('private body read');
+      }
+    });
+    const protectedAccesses = { params: vi.fn(), url: vi.fn(), route: vi.fn() };
+    const event: Record<string, unknown> = { locals: { actor: ADMIN }, request };
+    for (const key of Object.keys(protectedAccesses) as Array<keyof typeof protectedAccesses>) {
+      Object.defineProperty(event, key, { enumerable: true, get: protectedAccesses[key] });
+    }
+
+    const result = await refundRoute.actions[action]!(event as never);
+
+    expect(result).toMatchObject({ status: 403, data: { code: 'forbidden' } });
+    expect(pulled).toBe(false);
+    for (const access of Object.values(protectedAccesses)) {
+      expect(access).not.toHaveBeenCalled();
+    }
+    expect(routeMocks.previewRecoveryActivation).not.toHaveBeenCalled();
+    expect(routeMocks.previewRecoveryDeactivation).not.toHaveBeenCalled();
+    expect(routeMocks.submit).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['prepareRecoveryActivation', [
+      ['finalizationEffectId', FINALIZATION_EFFECT_ID],
+      ['orderItemId', ITEM_ID],
+      ['expectedCorrectionSetId', CORRECTION_SET_ID],
+      ['expectedCorrectionVersion', '2'],
+      ['expectedSourceFingerprint', SOURCE_FINGERPRINT]
+    ]],
+    ['confirmRecoveryActivation', [
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['finalizationEffectId', FINALIZATION_EFFECT_ID],
+      ['orderItemId', ITEM_ID],
+      ['expectedCorrectionSetId', CORRECTION_SET_ID],
+      ['expectedCorrectionVersion', '2'],
+      ['expectedSourceFingerprint', SOURCE_FINGERPRINT],
+      ['previewFingerprint', PREVIEW_FINGERPRINT],
+      ['confirmation', 'activate_persistent_recovery']
+    ]],
+    ['prepareRecoveryDeactivation', [
+      ['recoveryGrantId', RECOVERY_GRANT_ID],
+      ['recoveryReferenceId', RECOVERY_REFERENCE_ID],
+      ['expectedStateChangedAt', EXPECTED_STATE_CHANGED_AT]
+    ]],
+    ['confirmRecoveryDeactivation', [
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['recoveryGrantId', RECOVERY_GRANT_ID],
+      ['recoveryReferenceId', RECOVERY_REFERENCE_ID],
+      ['expectedStateChangedAt', EXPECTED_STATE_CHANGED_AT],
+      ['confirmation', 'deactivate_persistent_recovery']
+    ]]
+  ] as const)('accepts only the exact empty %s action marker before parsing', async (
+    action,
+    entries
+  ) => {
+    const request = urlencoded(entries);
+    const event = actionEvent(ADMIN, request, action);
+    event.url = new URL(`${request.url}?/${action}=private&reviewCursor=${REVIEW_CURSOR}`);
+
+    const result = await refundRoute.actions[action]!(event as never);
+
+    expect(result).toMatchObject({ status: 400, data: { code: 'invalid_request' } });
+    expect(routeMocks.previewRecoveryActivation).not.toHaveBeenCalled();
+    expect(routeMocks.previewRecoveryDeactivation).not.toHaveBeenCalled();
+    expect(routeMocks.submit).not.toHaveBeenCalled();
+  });
+
+  it('prepares a causally bound administrative recovery activation without submitting', async () => {
+    const request = urlencoded([
+      ['finalizationEffectId', FINALIZATION_EFFECT_ID],
+      ['orderItemId', ITEM_ID],
+      ['expectedCorrectionSetId', CORRECTION_SET_ID],
+      ['expectedCorrectionVersion', '2'],
+      ['expectedSourceFingerprint', SOURCE_FINGERPRINT]
+    ]);
+
+    const result = await refundRoute.actions.prepareRecoveryActivation!(
+      actionEvent(ADMIN, request, 'prepareRecoveryActivation') as never
+    );
+
+    expect(routeMocks.previewRecoveryActivation).toHaveBeenCalledWith(
+      routeMocks.database,
+      ADMIN,
+      {
+        refundId: REFUND_ID,
+        finalizationEffectId: FINALIZATION_EFFECT_ID,
+        orderItemId: ITEM_ID,
+        expectedCorrectionSetId: CORRECTION_SET_ID,
+        expectedCorrectionVersion: 2,
+        expectedSourceFingerprint: SOURCE_FINGERPRINT
+      },
+      {
+        correlationId: 'refund-route-action',
+        requestMetadata: { method: 'POST', routeId: '/admin/sales/refunds/[refundId]' }
+      }
+    );
+    expect(routeMocks.submit).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      administrativeRecoveryActivationPreview: recoveryActivationPreview,
+      reviewCursor: REVIEW_CURSOR
+    });
+  });
+
+  it('confirms activation with the exact preview-bound private command', async () => {
+    routeMocks.submit.mockResolvedValueOnce({
+      commandId: COMMAND_ID,
+      kind: 'administrative_recovery_activate',
+      status: 'pending',
+      createdAt: '2026-08-22T12:01:00.000Z'
+    });
+    const request = urlencoded([
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['finalizationEffectId', FINALIZATION_EFFECT_ID],
+      ['orderItemId', ITEM_ID],
+      ['expectedCorrectionSetId', CORRECTION_SET_ID],
+      ['expectedCorrectionVersion', '2'],
+      ['expectedSourceFingerprint', SOURCE_FINGERPRINT],
+      ['previewFingerprint', PREVIEW_FINGERPRINT],
+      ['confirmation', 'activate_persistent_recovery']
+    ]);
+
+    const result = await refundRoute.actions.confirmRecoveryActivation!(
+      actionEvent(ADMIN, request, 'confirmRecoveryActivation') as never
+    );
+
+    expect(routeMocks.previewRecoveryActivation).not.toHaveBeenCalled();
+    expect(routeMocks.submit).toHaveBeenCalledWith(routeMocks.database, {
+      actor: ADMIN,
+      idempotencyKey: IDEMPOTENCY_KEY,
+      command: {
+        kind: 'administrative_recovery_activate',
+        refundId: REFUND_ID,
+        finalizationEffectId: FINALIZATION_EFFECT_ID,
+        orderItemId: ITEM_ID,
+        expectedCorrectionSetId: CORRECTION_SET_ID,
+        expectedCorrectionVersion: 2,
+        expectedSourceFingerprint: SOURCE_FINGERPRINT,
+        previewFingerprint: PREVIEW_FINGERPRINT,
+        confirmation: 'activate_persistent_recovery'
+      },
+      context: {
+        correlationId: 'refund-route-action',
+        requestMetadata: { method: 'POST', routeId: '/admin/sales/refunds/[refundId]' }
+      }
+    });
+    expect(result).toMatchObject({
+      command: { kind: 'administrative_recovery_activate', status: 'pending' },
+      reviewCursor: REVIEW_CURSOR
+    });
+  });
+
+  it('prepares deactivation with route-bound membership context without submitting', async () => {
+    const request = urlencoded([
+      ['recoveryGrantId', RECOVERY_GRANT_ID],
+      ['recoveryReferenceId', RECOVERY_REFERENCE_ID],
+      ['expectedStateChangedAt', EXPECTED_STATE_CHANGED_AT]
+    ]);
+
+    const result = await refundRoute.actions.prepareRecoveryDeactivation!(
+      actionEvent(ADMIN, request, 'prepareRecoveryDeactivation') as never
+    );
+
+    expect(routeMocks.previewRecoveryDeactivation).toHaveBeenCalledWith(
+      routeMocks.database,
+      ADMIN,
+      {
+        refundId: REFUND_ID,
+        recoveryGrantId: RECOVERY_GRANT_ID,
+        recoveryReferenceId: RECOVERY_REFERENCE_ID,
+        expectedStateChangedAt: EXPECTED_STATE_CHANGED_AT
+      },
+      {
+        correlationId: 'refund-route-action',
+        requestMetadata: { method: 'POST', routeId: '/admin/sales/refunds/[refundId]' }
+      }
+    );
+    expect(routeMocks.submit).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      administrativeRecoveryDeactivationPreview: recoveryDeactivationPreview,
+      reviewCursor: REVIEW_CURSOR
+    });
+  });
+
+  it('confirms deactivation without copying the route refund into the private command', async () => {
+    routeMocks.submit.mockResolvedValueOnce({
+      commandId: COMMAND_ID,
+      kind: 'administrative_recovery_deactivate',
+      status: 'pending',
+      createdAt: '2026-08-22T12:01:00.000Z'
+    });
+    const request = urlencoded([
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['recoveryGrantId', RECOVERY_GRANT_ID],
+      ['recoveryReferenceId', RECOVERY_REFERENCE_ID],
+      ['expectedStateChangedAt', EXPECTED_STATE_CHANGED_AT],
+      ['confirmation', 'deactivate_persistent_recovery']
+    ]);
+
+    const result = await refundRoute.actions.confirmRecoveryDeactivation!(
+      actionEvent(ADMIN, request, 'confirmRecoveryDeactivation') as never
+    );
+
+    expect(routeMocks.previewRecoveryDeactivation).not.toHaveBeenCalled();
+    expect(routeMocks.submit).toHaveBeenCalledWith(routeMocks.database, {
+      actor: ADMIN,
+      idempotencyKey: IDEMPOTENCY_KEY,
+      command: {
+        kind: 'administrative_recovery_deactivate',
+        recoveryGrantId: RECOVERY_GRANT_ID,
+        recoveryReferenceId: RECOVERY_REFERENCE_ID,
+        expectedStateChangedAt: EXPECTED_STATE_CHANGED_AT,
+        confirmation: 'deactivate_persistent_recovery'
+      },
+      context: {
+        correlationId: 'refund-route-action',
+        requestMetadata: { method: 'POST', routeId: '/admin/sales/refunds/[refundId]' }
+      }
+    });
+    expect(routeMocks.submit.mock.calls[0]?.[1].command).not.toHaveProperty('refundId');
+    expect(result).toMatchObject({
+      command: { kind: 'administrative_recovery_deactivate', status: 'pending' },
+      reviewCursor: REVIEW_CURSOR
+    });
+  });
+
+  it.each([
+    ['activation', 'confirmRecoveryActivation', [
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['finalizationEffectId', FINALIZATION_EFFECT_ID],
+      ['orderItemId', ITEM_ID],
+      ['expectedCorrectionSetId', CORRECTION_SET_ID],
+      ['expectedCorrectionVersion', '2'],
+      ['expectedSourceFingerprint', SOURCE_FINGERPRINT],
+      ['previewFingerprint', PREVIEW_FINGERPRINT],
+      ['confirmation', 'activate_persistent_recovery']
+    ], {
+      action: 'confirmRecoveryActivation',
+      idempotencyKey: IDEMPOTENCY_KEY,
+      finalizationEffectId: FINALIZATION_EFFECT_ID,
+      orderItemId: ITEM_ID,
+      expectedCorrectionSetId: CORRECTION_SET_ID,
+      expectedCorrectionVersion: 2,
+      expectedSourceFingerprint: SOURCE_FINGERPRINT,
+      previewFingerprint: PREVIEW_FINGERPRINT,
+      confirmation: 'activate_persistent_recovery'
+    }],
+    ['deactivation', 'confirmRecoveryDeactivation', [
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['recoveryGrantId', RECOVERY_GRANT_ID],
+      ['recoveryReferenceId', RECOVERY_REFERENCE_ID],
+      ['expectedStateChangedAt', EXPECTED_STATE_CHANGED_AT],
+      ['confirmation', 'deactivate_persistent_recovery']
+    ], {
+      action: 'confirmRecoveryDeactivation',
+      idempotencyKey: IDEMPOTENCY_KEY,
+      recoveryGrantId: RECOVERY_GRANT_ID,
+      recoveryReferenceId: RECOVERY_REFERENCE_ID,
+      expectedStateChangedAt: EXPECTED_STATE_CHANGED_AT,
+      confirmation: 'deactivate_persistent_recovery'
+    }]
+  ] as const)(
+    'freezes and replays the exact canonical recovery %s payload after an ambiguous submit',
+    async (_label, action, entries, expectedRetrySubmission) => {
+      routeMocks.submit
+        .mockRejectedValueOnce(new Error('ambiguous private recovery outcome'))
+        .mockResolvedValueOnce({
+          commandId: COMMAND_ID,
+          kind: action === 'confirmRecoveryActivation'
+            ? 'administrative_recovery_activate'
+            : 'administrative_recovery_deactivate',
+          status: 'succeeded',
+          createdAt: '2026-08-22T12:01:00.000Z'
+        });
+
+      const ambiguous = await refundRoute.actions[action]!(
+        actionEvent(ADMIN, urlencoded(entries), action) as never
+      );
+
+      expect(ambiguous).toMatchObject({
+        status: 503,
+        data: {
+          code: 'temporarily_unavailable',
+          retrySubmission: expectedRetrySubmission
+        }
+      });
+      expect(JSON.stringify(ambiguous)).not.toContain('ambiguous private recovery outcome');
+      const firstSubmission = routeMocks.submit.mock.calls[0];
+
+      const recovered = await refundRoute.actions[action]!(
+        actionEvent(ADMIN, urlencoded(entries), action) as never
+      );
+
+      expect(routeMocks.submit).toHaveBeenCalledTimes(2);
+      expect(routeMocks.submit.mock.calls[1]).toEqual(firstSubmission);
+      expect(recovered).toMatchObject({ command: { status: 'succeeded' } });
+    }
+  );
+
+  it.each([
+    ['prepareRecoveryActivation', 'previewRecoveryActivation', [
+      ['finalizationEffectId', FINALIZATION_EFFECT_ID],
+      ['orderItemId', ITEM_ID],
+      ['expectedCorrectionSetId', CORRECTION_SET_ID],
+      ['expectedCorrectionVersion', '2'],
+      ['expectedSourceFingerprint', SOURCE_FINGERPRINT]
+    ]],
+    ['prepareRecoveryDeactivation', 'previewRecoveryDeactivation', [
+      ['recoveryGrantId', RECOVERY_GRANT_ID],
+      ['recoveryReferenceId', RECOVERY_REFERENCE_ID],
+      ['expectedStateChangedAt', EXPECTED_STATE_CHANGED_AT]
+    ]]
+  ] as const)('maps %s domain drift to stale state without freezing a retry', async (
+    action,
+    previewMock,
+    entries
+  ) => {
+    routeMocks[previewMock].mockRejectedValueOnce(
+      new FinancialAdminConflictError('not_eligible')
+    );
+
+    const result = await refundRoute.actions[action]!(
+      actionEvent(ADMIN, urlencoded(entries), action) as never
+    );
+
+    expect(result).toMatchObject({
+      status: 409,
+      data: { code: 'stale_state', retrySubmission: null }
+    });
+    expect(routeMocks.submit).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['confirmRecoveryActivation', [
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['finalizationEffectId', FINALIZATION_EFFECT_ID],
+      ['orderItemId', ITEM_ID],
+      ['expectedCorrectionSetId', CORRECTION_SET_ID],
+      ['expectedCorrectionVersion', '2'],
+      ['expectedSourceFingerprint', SOURCE_FINGERPRINT],
+      ['previewFingerprint', PREVIEW_FINGERPRINT],
+      ['confirmation', 'activate_persistent_recovery']
+    ]],
+    ['confirmRecoveryDeactivation', [
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['recoveryGrantId', RECOVERY_GRANT_ID],
+      ['recoveryReferenceId', RECOVERY_REFERENCE_ID],
+      ['expectedStateChangedAt', EXPECTED_STATE_CHANGED_AT],
+      ['confirmation', 'deactivate_persistent_recovery']
+    ]]
+  ] as const)('does not freeze %s after a same-key payload conflict', async (
+    action,
+    entries
+  ) => {
+    routeMocks.submit.mockRejectedValueOnce(
+      new FinancialAdminCommandSubmissionConflictError()
+    );
+
+    const result = await refundRoute.actions[action]!(
+      actionEvent(ADMIN, urlencoded(entries), action) as never
+    );
+
+    expect(result).toMatchObject({
+      status: 409,
+      data: { code: 'stale_state', retrySubmission: null }
     });
   });
 

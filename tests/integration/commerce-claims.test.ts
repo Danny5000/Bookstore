@@ -61,6 +61,7 @@ async function createGuestPurchase(input: {
   email: string;
   titleId?: string;
   adverse?: 'open-dispute' | 'lost-dispute' | 'full-refund' | 'permanent';
+  refundAllocationSource?: 'automatic' | 'administrative';
 }) {
   const identity = await findOrCreateGuestIdentity(workerDatabaseClient.db, input.email);
   const title = input.titleId
@@ -138,7 +139,7 @@ async function createGuestPurchase(input: {
       refundId: refund.id,
       orderItemId: itemId,
       amountMinor: 1403,
-      source: 'automatic'
+      source: input.refundAllocationSource ?? 'automatic'
     });
   }
   if (input.adverse === 'open-dispute' || input.adverse === 'lost-dispute') {
@@ -155,6 +156,50 @@ async function createGuestPurchase(input: {
     });
   }
   return { identity, titleId: title.id, orderId, itemId };
+}
+
+async function createAdministrativeGrantFixture(input: {
+  readonly userId: string;
+  readonly titleId: string;
+  readonly refundAllocationId: string;
+}): Promise<string> {
+  const client = await ownerDatabaseClient.pool.connect();
+  try {
+    await client.query('begin');
+    await client.query(`set local session_replication_role = replica`);
+    const grant = (await client.query<{ id: string }>(`
+      insert into entitlement_grants (
+        title_id, user_id, source, recovery_refund_allocation_id, state,
+        state_reason, granted_at, created_at, updated_at
+      ) values (
+        $1, $2, 'administrative', $3, 'active',
+        'refund_allocation_recovery', $4, $4, $4
+      ) returning id
+    `, [
+      input.titleId,
+      input.userId,
+      input.refundAllocationId,
+      new Date('2026-08-10T14:00:00.000Z')
+    ])).rows[0]!;
+    await client.query('commit');
+    return grant.id;
+  } catch (error) {
+    await client.query('rollback');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function administrativeGrantSnapshot(grantId: string): Promise<string> {
+  return (await ownerDatabaseClient.pool.query<{ snapshot: string }>(`
+    select jsonb_build_array(
+      id, title_id, user_id, source, order_item_id,
+      recovery_refund_allocation_id, state, state_reason, granted_at,
+      suspended_at, revoked_at, created_at, updated_at
+    )::text as snapshot
+    from entitlement_grants where id = $1
+  `, [grantId])).rows[0]!.snapshot;
 }
 
 async function command(userId: string) {
@@ -268,6 +313,36 @@ describe('atomic guest purchase claiming', () => {
     expect(await databaseClient.db.select().from(entitlements)).toEqual([
       expect.objectContaining({ userId: claimant.id, titleId: active.titleId, revokedAt: null })
     ]);
+  });
+
+  it('leaves a persistent administrative grant byte-for-byte unchanged while claiming its purchase', async () => {
+    const email = `claim-administrative-${randomUUID()}@example.com`;
+    const claimant = await createUser(email);
+    const purchase = await createGuestPurchase({
+      email,
+      adverse: 'full-refund',
+      refundAllocationSource: 'administrative'
+    });
+    const [allocation] = await ownerDatabaseClient.db
+      .select({ id: refundAllocations.id })
+      .from(refundAllocations)
+      .where(eq(refundAllocations.orderItemId, purchase.itemId));
+    if (!allocation) throw new Error('Expected recovery reference allocation');
+    const administrativeGrantId = await createAdministrativeGrantFixture({
+      userId: claimant.id,
+      titleId: purchase.titleId,
+      refundAllocationId: allocation.id
+    });
+    const before = await administrativeGrantSnapshot(administrativeGrantId);
+
+    await claimGuestPurchases(databaseClient.db, await command(claimant.id));
+
+    expect(await administrativeGrantSnapshot(administrativeGrantId)).toBe(before);
+    expect((await ownerDatabaseClient.db
+      .select({ state: entitlementGrants.state, userId: entitlementGrants.userId })
+      .from(entitlementGrants)
+      .where(eq(entitlementGrants.orderItemId, purchase.itemId)))[0])
+      .toEqual({ state: 'revoked', userId: claimant.id });
   });
 
   it('denies unverified and foreign-claimed identities generically', async () => {
@@ -453,7 +528,7 @@ describe('enumeration-resistant claim requests', () => {
     await expect(requestGuestClaimEmails(databaseClient.db, input)).resolves.toBeUndefined();
     await expect(requestGuestClaimEmails(databaseClient.db, input)).resolves.toBeUndefined();
 
-    const queued = await databaseClient.db.select().from(jobs);
+    const queued = await ownerDatabaseClient.db.select().from(jobs);
     expect(queued).toHaveLength(2);
     expect(queued.map((job) => job.payload)).toEqual(expect.arrayContaining([
       { orderId: first.orderId },
@@ -496,6 +571,6 @@ describe('enumeration-resistant claim requests', () => {
       windowSeconds: 60,
       maxAttempts: 3
     })).resolves.toBeUndefined();
-    expect(await databaseClient.db.select().from(jobs)).toHaveLength(0);
+    expect(await ownerDatabaseClient.db.select().from(jobs)).toHaveLength(0);
   });
 });

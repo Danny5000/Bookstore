@@ -334,6 +334,18 @@ Activation creates or reactivates one uniquely linked administrative grant. The 
 
 A database trigger plus worker-only command-bound transition routine guards any row transition involving `source = 'administrative'`. The routine independently verifies the running command's current financial-admin claim capability, exact linkage, correction/source/projection bindings, and requested transition; runtime receives no execute privilege.
 
+The routine recomputes and compares the complete activation preview fingerprint before it
+classifies a relationship that has become cumulatively fully refunded as ineligible. Thus a
+full-refund change after prepare is stale state, while an input fingerprint matching the
+current intrinsically ineligible facts remains not eligible. Existing-row transitions use a
+canonical millisecond timestamp strictly greater than the row's preceding `updated_at`, so
+active -> revoked -> active cannot exhibit an ABA concurrency token or reuse an access-email
+dedupe key. Because 0012 is still unmerged and undeployed during this implementation, these
+two defects are corrected in the original authority migration before its first release; its
+signature, owner, ACL, security mode, search path, journal identity, and snapshot do not change.
+Both preview and protected execution cap the cumulative presentment closure at 100 succeeded
+refunds so their representable preimages and eligibility decisions remain exact.
+
 ## 11. Lock order
 
 Projection-dependent finalization, correction, and recovery commands use this canonical order:

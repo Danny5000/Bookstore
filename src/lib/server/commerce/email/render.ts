@@ -107,9 +107,26 @@ function renderAccessChange(
   };
 }
 
+function renderAdministrativeRecoveryAccessChange(
+  payload: Extract<CommerceEmailPayload, {
+    template: 'commerce.administrative-recovery-access-changed';
+  }>
+): RenderedEmail {
+  const outcome = `Your access to ${payload.soldAsTitle} is now ${payload.accessState}.`;
+  return {
+    subject: 'Your Pale Orbit library access changed',
+    text: outcome,
+    html: `<!doctype html><html><body><p>${escapeHtml(outcome)}</p></body></html>`
+  };
+}
+
 export function renderCommerceEmail(payload: CommerceEmailPayload): RenderedEmail {
-  return payload.template === 'commerce.account-receipt' ||
+  if (
+    payload.template === 'commerce.account-receipt' ||
     payload.template === 'commerce.guest-receipt-claim'
-    ? renderReceipt(payload)
-    : renderAccessChange(payload);
+  ) return renderReceipt(payload);
+  if (payload.template === 'commerce.administrative-recovery-access-changed') {
+    return renderAdministrativeRecoveryAccessChange(payload);
+  }
+  return renderAccessChange(payload);
 }

@@ -2,6 +2,9 @@ import { readFileSync } from 'node:fs';
 import { render } from 'svelte/server';
 import { describe, expect, it, vi } from 'vitest';
 import type {
+  AdministrativeRecoveryDeactivationPreviewDto,
+  AdministrativeRecoveryPreviewDto,
+  AdministrativeRecoverySeedDto,
   FinancialAdminCommandReferenceDto,
   FinancialAdminCommandStatusDto,
   RefundDetailDto,
@@ -17,6 +20,7 @@ import RefundAllocationEditor from './RefundAllocationEditor.svelte';
 import FinancialActionOutcome from './FinancialActionOutcome.svelte';
 import FinancialCommandStatus from './FinancialCommandStatus.svelte';
 import ReportingCorrectionEditor from './ReportingCorrectionEditor.svelte';
+import AdministrativeRecoveryActions from './AdministrativeRecoveryActions.svelte';
 import RefundReviewPage from '../../../routes/admin/sales/refunds/[refundId]/+page.svelte';
 
 const REFUND_ID = '00000000-0000-4000-8000-000000011401';
@@ -30,8 +34,14 @@ const FINALIZE_KEY = '00000000-0000-4000-8000-000000011412';
 const CORRECTION_KEY = '00000000-0000-4000-8000-000000011413';
 const BASE_ALLOCATION_SET_ID = '00000000-0000-4000-8000-000000011414';
 const RAW_CORRECTION_SET_ID = '00000000-0000-4000-8000-000000011415';
+const RECOVERY_ACTIVATION_KEY = '00000000-0000-4000-8000-000000011416';
+const RECOVERY_DEACTIVATION_KEY = '00000000-0000-4000-8000-000000011417';
+const FINALIZATION_EFFECT_ID = '00000000-0000-4000-8000-000000011418';
+const RECOVERY_GRANT_ID = '00000000-0000-4000-8000-000000011419';
+const RECOVERY_REFERENCE_ID = '00000000-0000-4000-8000-000000011420';
 const PREVIEW_FINGERPRINT = 'b'.repeat(64);
 const SOURCE_FINGERPRINT = 'c'.repeat(64);
+const EXPECTED_STATE_CHANGED_AT = '2026-08-22T12:05:00.000Z';
 
 function finalizationPreview(
   overrides: Partial<RefundFinalizationPreviewDto> = {}
@@ -180,6 +190,78 @@ function correctionPreview(
         refundFeeImpactDisplayDeltaMinor: -1
       }
     ],
+    ...overrides
+  };
+}
+
+function recoverySeed(
+  overrides: Partial<AdministrativeRecoverySeedDto> = {}
+): AdministrativeRecoverySeedDto {
+  return {
+    refundId: REFUND_ID,
+    activationCandidates: [{
+      finalizationEffectId: FINALIZATION_EFFECT_ID,
+      orderItemId: FIRST_ITEM_ID,
+      titleId: '00000000-0000-4000-8000-000000011409',
+      soldAsTitle: 'First title',
+      expectedCorrectionSetId: RAW_CORRECTION_SET_ID,
+      expectedCorrectionVersion: 2,
+      expectedSourceFingerprint: SOURCE_FINGERPRINT
+    }],
+    deactivationCandidates: [{
+      recoveryGrantId: RECOVERY_GRANT_ID,
+      recoveryReferenceId: RECOVERY_REFERENCE_ID,
+      expectedStateChangedAt: EXPECTED_STATE_CHANGED_AT,
+      orderItemId: SECOND_ITEM_ID,
+      titleId: '00000000-0000-4000-8000-000000011410',
+      soldAsTitle: 'Second title'
+    }],
+    ...overrides
+  };
+}
+
+function recoveryActivationPreview(
+  overrides: Partial<AdministrativeRecoveryPreviewDto> = {}
+): AdministrativeRecoveryPreviewDto {
+  return {
+    refundId: REFUND_ID,
+    finalizationEffectId: FINALIZATION_EFFECT_ID,
+    orderItemId: FIRST_ITEM_ID,
+    titleId: '00000000-0000-4000-8000-000000011409',
+    soldAsTitle: 'First title',
+    expectedCorrectionSetId: RAW_CORRECTION_SET_ID,
+    expectedCorrectionVersion: 2,
+    expectedSourceFingerprint: SOURCE_FINGERPRINT,
+    previewFingerprint: PREVIEW_FINGERPRINT,
+    recoveryGrantId: RECOVERY_GRANT_ID,
+    eligible: true,
+    ineligibleReason: null,
+    effectiveAccessBefore: false,
+    effectiveAccessAfter: true,
+    accessChanged: true,
+    emailQueued: true,
+    persistsUntilDeactivated: true,
+    ...overrides
+  };
+}
+
+function recoveryDeactivationPreview(
+  overrides: Partial<AdministrativeRecoveryDeactivationPreviewDto> = {}
+): AdministrativeRecoveryDeactivationPreviewDto {
+  return {
+    refundId: REFUND_ID,
+    recoveryGrantId: RECOVERY_GRANT_ID,
+    recoveryReferenceId: RECOVERY_REFERENCE_ID,
+    expectedStateChangedAt: EXPECTED_STATE_CHANGED_AT,
+    orderItemId: SECOND_ITEM_ID,
+    titleId: '00000000-0000-4000-8000-000000011410',
+    soldAsTitle: 'Second title',
+    eligible: true,
+    ineligibleReason: null,
+    effectiveAccessBefore: true,
+    effectiveAccessAfter: false,
+    accessChanged: true,
+    emailQueued: true,
     ...overrides
   };
 }
@@ -507,6 +589,242 @@ describe('append-only reporting correction editor', () => {
   });
 });
 
+describe('causally bound administrative recovery actions', () => {
+  it('renders independent native activation and deactivation prepare forms from the seed', () => {
+    const body = render(AdministrativeRecoveryActions, {
+      props: {
+        seed: recoverySeed(),
+        activationPreview: undefined,
+        deactivationPreview: undefined,
+        activationIdempotencyKey: RECOVERY_ACTIVATION_KEY,
+        deactivationIdempotencyKey: RECOVERY_DEACTIVATION_KEY,
+        reviewCursor: 'bounded_cursor'
+      }
+    }).body;
+
+    expect(body).toContain('Administrative access recovery');
+    expect(body).toContain('First title');
+    expect(body).toContain('Second title');
+    expect(body).toContain('?/prepareRecoveryActivation&amp;reviewCursor=bounded_cursor');
+    expect(body).toContain('?/prepareRecoveryDeactivation&amp;reviewCursor=bounded_cursor');
+    expect(body).toContain(`name="finalizationEffectId" value="${FINALIZATION_EFFECT_ID}"`);
+    expect(body).toContain(`name="orderItemId" value="${FIRST_ITEM_ID}"`);
+    expect(body).toContain(
+      `name="expectedCorrectionSetId" value="${RAW_CORRECTION_SET_ID}"`
+    );
+    expect(body).toContain('name="expectedCorrectionVersion" value="2"');
+    expect(body).toContain(
+      `name="expectedSourceFingerprint" value="${SOURCE_FINGERPRINT}"`
+    );
+    expect(body).toContain(`name="recoveryGrantId" value="${RECOVERY_GRANT_ID}"`);
+    expect(body).toContain(
+      `name="recoveryReferenceId" value="${RECOVERY_REFERENCE_ID}"`
+    );
+    expect(body).toContain(
+      `name="expectedStateChangedAt" value="${EXPECTED_STATE_CHANGED_AT}"`
+    );
+    expect(body).toContain('Review persistent access activation');
+    expect(body).toContain('Review persistent access deactivation');
+    expect(body.match(/<form\b/gu)).toHaveLength(2);
+    expect(body).not.toContain('idempotencyKey');
+    expect(body).not.toContain(RECOVERY_ACTIVATION_KEY);
+    expect(body).not.toContain(RECOVERY_DEACTIVATION_KEY);
+    expect(body).not.toContain('window.confirm');
+  });
+
+  it('gives every recovery candidate button a title-specific accessible name', () => {
+    const seed = recoverySeed();
+    const activationCandidate = seed.activationCandidates[0];
+    const deactivationCandidate = seed.deactivationCandidates[0];
+    if (!activationCandidate || !deactivationCandidate) {
+      throw new Error('Expected recovery seed candidates');
+    }
+    const body = render(AdministrativeRecoveryActions, {
+      props: {
+        seed: recoverySeed({
+          activationCandidates: [
+            ...seed.activationCandidates,
+            {
+              ...activationCandidate,
+              finalizationEffectId: '00000000-0000-4000-8000-000000011421',
+              orderItemId: '00000000-0000-4000-8000-000000011422',
+              titleId: '00000000-0000-4000-8000-000000011423',
+              soldAsTitle: 'Third & final title'
+            }
+          ],
+          deactivationCandidates: [
+            ...seed.deactivationCandidates,
+            {
+              ...deactivationCandidate,
+              recoveryGrantId: '00000000-0000-4000-8000-000000011424',
+              recoveryReferenceId: '00000000-0000-4000-8000-000000011425',
+              orderItemId: '00000000-0000-4000-8000-000000011426',
+              titleId: '00000000-0000-4000-8000-000000011427',
+              soldAsTitle: 'Fourth title'
+            }
+          ]
+        }),
+        activationPreview: undefined,
+        deactivationPreview: undefined,
+        activationIdempotencyKey: RECOVERY_ACTIVATION_KEY,
+        deactivationIdempotencyKey: RECOVERY_DEACTIVATION_KEY,
+        reviewCursor: null
+      }
+    }).body;
+
+    expect(body).toContain(
+      'aria-label="Review persistent access activation for First title"'
+    );
+    expect(body).toContain(
+      'aria-label="Review persistent access activation for Third &amp; final title"'
+    );
+    expect(body).toContain(
+      'aria-label="Review persistent access deactivation for Second title"'
+    );
+    expect(body).toContain(
+      'aria-label="Review persistent access deactivation for Fourth title"'
+    );
+    expect(body.match(/<form\b/gu)).toHaveLength(4);
+  });
+
+  it('shows the exact title, access, email, and persistence consequences before activation', () => {
+    const body = render(AdministrativeRecoveryActions, {
+      props: {
+        seed: recoverySeed(),
+        activationPreview: recoveryActivationPreview(),
+        deactivationPreview: undefined,
+        activationIdempotencyKey: RECOVERY_ACTIVATION_KEY,
+        deactivationIdempotencyKey: RECOVERY_DEACTIVATION_KEY,
+        reviewCursor: 'bounded_cursor'
+      }
+    }).body;
+
+    expect(body).toContain('Review persistent access activation');
+    expect(body).toContain('First title');
+    expect(body).toContain(
+      'Effective access is currently unavailable and will become available.'
+    );
+    expect(body).toContain('An access-change email will be queued.');
+    expect(body).toContain(
+      'This administrative access override persists through future refund, reporting correction, dispute, and classifier rebase processing until it is separately deactivated.'
+    );
+    expect(body).toContain('?/confirmRecoveryActivation&amp;reviewCursor=bounded_cursor');
+    expect(body).toContain(
+      `name="idempotencyKey" value="${RECOVERY_ACTIVATION_KEY}"`
+    );
+    expect(body).toContain(`name="finalizationEffectId" value="${FINALIZATION_EFFECT_ID}"`);
+    expect(body).toContain(`name="orderItemId" value="${FIRST_ITEM_ID}"`);
+    expect(body).toContain(
+      `name="expectedCorrectionSetId" value="${RAW_CORRECTION_SET_ID}"`
+    );
+    expect(body).toContain('name="expectedCorrectionVersion" value="2"');
+    expect(body).toContain(
+      `name="expectedSourceFingerprint" value="${SOURCE_FINGERPRINT}"`
+    );
+    expect(body).toContain(`name="previewFingerprint" value="${PREVIEW_FINGERPRINT}"`);
+    expect(body).toContain(
+      'name="confirmation" value="activate_persistent_recovery"'
+    );
+    expect(body.match(/<form\b/gu)).toHaveLength(1);
+    expect(body).not.toContain('?/prepareRecoveryActivation');
+    expect(body).not.toContain('?/prepareRecoveryDeactivation');
+    expect(body).not.toContain(RECOVERY_DEACTIVATION_KEY);
+  });
+
+  it('shows the exact title, access, and email consequences before deactivation', () => {
+    const body = render(AdministrativeRecoveryActions, {
+      props: {
+        seed: recoverySeed(),
+        activationPreview: undefined,
+        deactivationPreview: recoveryDeactivationPreview(),
+        activationIdempotencyKey: RECOVERY_ACTIVATION_KEY,
+        deactivationIdempotencyKey: RECOVERY_DEACTIVATION_KEY,
+        reviewCursor: null
+      }
+    }).body;
+
+    expect(body).toContain('Review persistent access deactivation');
+    expect(body).toContain('Second title');
+    expect(body).toContain(
+      'Effective access is currently available and will become unavailable.'
+    );
+    expect(body).toContain('An access-change email will be queued.');
+    expect(body).toContain(
+      'Deactivation ends this persistent administrative override. It does not change refund or reporting amounts.'
+    );
+    expect(body).toContain('?/confirmRecoveryDeactivation');
+    expect(body).toContain(
+      `name="idempotencyKey" value="${RECOVERY_DEACTIVATION_KEY}"`
+    );
+    expect(body).toContain(`name="recoveryGrantId" value="${RECOVERY_GRANT_ID}"`);
+    expect(body).toContain(
+      `name="recoveryReferenceId" value="${RECOVERY_REFERENCE_ID}"`
+    );
+    expect(body).toContain(
+      `name="expectedStateChangedAt" value="${EXPECTED_STATE_CHANGED_AT}"`
+    );
+    expect(body).toContain(
+      'name="confirmation" value="deactivate_persistent_recovery"'
+    );
+    expect(body.match(/<form\b/gu)).toHaveLength(1);
+    expect(body).not.toContain('?/prepareRecoveryActivation');
+    expect(body).not.toContain('?/prepareRecoveryDeactivation');
+    expect(body).not.toContain(RECOVERY_ACTIVATION_KEY);
+  });
+
+  it('shows safe ineligibility guidance without rendering a confirmation form', () => {
+    const activation = render(AdministrativeRecoveryActions, {
+      props: {
+        seed: recoverySeed(),
+        activationPreview: recoveryActivationPreview({
+          eligible: false,
+          ineligibleReason: 'unclaimed_purchase',
+          previewFingerprint: null,
+          recoveryGrantId: null,
+          effectiveAccessBefore: false,
+          effectiveAccessAfter: false,
+          accessChanged: false,
+          emailQueued: false
+        }),
+        deactivationPreview: undefined,
+        activationIdempotencyKey: RECOVERY_ACTIVATION_KEY,
+        deactivationIdempotencyKey: RECOVERY_DEACTIVATION_KEY,
+        reviewCursor: null
+      }
+    }).body;
+    const deactivation = render(AdministrativeRecoveryActions, {
+      props: {
+        seed: recoverySeed(),
+        activationPreview: undefined,
+        deactivationPreview: recoveryDeactivationPreview({
+          eligible: false,
+          ineligibleReason: 'already_in_requested_state',
+          effectiveAccessBefore: false,
+          effectiveAccessAfter: false,
+          accessChanged: false,
+          emailQueued: false
+        }),
+        activationIdempotencyKey: RECOVERY_ACTIVATION_KEY,
+        deactivationIdempotencyKey: RECOVERY_DEACTIVATION_KEY,
+        reviewCursor: null
+      }
+    }).body;
+
+    expect(activation).toContain(
+      'The purchase has not been claimed, so administrative recovery cannot be activated.'
+    );
+    expect(activation).not.toContain('<form');
+    expect(deactivation).toContain('This administrative recovery grant is already inactive.');
+    expect(deactivation).not.toContain('<form');
+
+    const source = readFileSync(
+      new URL('./AdministrativeRecoveryActions.svelte', import.meta.url),
+      'utf8'
+    );
+    expect(source).not.toMatch(/window\.confirm|fetch\(|use:enhance|requestSubmit|\.submit\(/iu);
+  });
+});
+
 describe('safe financial command outcome and polling', () => {
   it('renders a non-JavaScript-safe command reference, status, reload link, and live region', () => {
     const body = render(FinancialActionOutcome, {
@@ -615,7 +933,10 @@ describe('refund review page', () => {
           discardDraftIdempotencyKey: DISCARD_KEY,
           finalizeIdempotencyKey: FINALIZE_KEY,
           reportingCorrectionSeed: correctionSeed(),
-          correctionIdempotencyKey: CORRECTION_KEY
+          correctionIdempotencyKey: CORRECTION_KEY,
+          administrativeRecoverySeed: recoverySeed(),
+          recoveryActivationIdempotencyKey: RECOVERY_ACTIVATION_KEY,
+          recoveryDeactivationIdempotencyKey: RECOVERY_DEACTIVATION_KEY
         },
         form: { command: command(), reviewCursor: 'bounded_cursor' }
       } as never
@@ -629,6 +950,7 @@ describe('refund review page', () => {
     expect(body).toContain(COMMAND_ID);
     expect(body).not.toContain('Shared allocation draft');
     expect(body).not.toContain('Reporting attribution correction');
+    expect(body).not.toContain('Administrative access recovery');
     expect(body).not.toMatch(/<form\b/gu);
     expect(body).not.toMatch(/customer@example|stripe_|provider_private|adminId|correlationId/iu);
 
@@ -769,6 +1091,75 @@ describe('refund review page', () => {
     expect(body).not.toContain('Shared allocation draft');
     expect(body).not.toContain('?/prepareFinalize');
     expect(body).not.toContain('?/prepareCorrection');
+    expect(body.match(/<form\b/gu)).toHaveLength(1);
+  });
+
+  it('renders only the prepared administrative recovery activation confirmation', () => {
+    const body = render(RefundReviewPage, {
+      props: {
+        data: {
+          detail: detail({ allocationStatus: 'finalized', draft: null }),
+          reportingCorrectionSeed: correctionSeed(),
+          administrativeRecoverySeed: recoverySeed(),
+          reviewCursor: 'bounded_cursor',
+          saveDraftIdempotencyKey: SAVE_KEY,
+          discardDraftIdempotencyKey: DISCARD_KEY,
+          finalizeIdempotencyKey: FINALIZE_KEY,
+          correctionIdempotencyKey: CORRECTION_KEY,
+          recoveryActivationIdempotencyKey: RECOVERY_ACTIVATION_KEY,
+          recoveryDeactivationIdempotencyKey: RECOVERY_DEACTIVATION_KEY
+        },
+        form: {
+          administrativeRecoveryActivationPreview: recoveryActivationPreview(),
+          reviewCursor: 'bounded_cursor'
+        }
+      } as never
+    }).body;
+
+    expect(body).toContain('Review persistent access activation');
+    expect(body).toContain('First title');
+    expect(body).toContain(
+      'This administrative access override persists through future refund, reporting correction, dispute, and classifier rebase processing until it is separately deactivated.'
+    );
+    expect(body).toContain('?/confirmRecoveryActivation&amp;reviewCursor=bounded_cursor');
+    expect(body).toContain(`name="idempotencyKey" value="${RECOVERY_ACTIVATION_KEY}"`);
+    expect(body).not.toContain('?/prepareCorrection');
+    expect(body).not.toContain('?/prepareRecoveryActivation');
+    expect(body).not.toContain('?/prepareRecoveryDeactivation');
+    expect(body.match(/<form\b/gu)).toHaveLength(1);
+  });
+
+  it('renders only the prepared administrative recovery deactivation confirmation', () => {
+    const body = render(RefundReviewPage, {
+      props: {
+        data: {
+          detail: detail({ allocationStatus: 'finalized', draft: null }),
+          reportingCorrectionSeed: correctionSeed(),
+          administrativeRecoverySeed: recoverySeed(),
+          reviewCursor: null,
+          saveDraftIdempotencyKey: SAVE_KEY,
+          discardDraftIdempotencyKey: DISCARD_KEY,
+          finalizeIdempotencyKey: FINALIZE_KEY,
+          correctionIdempotencyKey: CORRECTION_KEY,
+          recoveryActivationIdempotencyKey: RECOVERY_ACTIVATION_KEY,
+          recoveryDeactivationIdempotencyKey: RECOVERY_DEACTIVATION_KEY
+        },
+        form: {
+          administrativeRecoveryDeactivationPreview: recoveryDeactivationPreview(),
+          reviewCursor: null
+        }
+      } as never
+    }).body;
+
+    expect(body).toContain('Review persistent access deactivation');
+    expect(body).toContain('Second title');
+    expect(body).toContain('?/confirmRecoveryDeactivation');
+    expect(body).toContain(
+      `name="idempotencyKey" value="${RECOVERY_DEACTIVATION_KEY}"`
+    );
+    expect(body).not.toContain('?/prepareCorrection');
+    expect(body).not.toContain('?/prepareRecoveryActivation');
+    expect(body).not.toContain('?/prepareRecoveryDeactivation');
     expect(body.match(/<form\b/gu)).toHaveLength(1);
   });
 
@@ -950,5 +1341,107 @@ describe('refund review page', () => {
     expect(`${pageSource}\n${editorSource}`).not.toMatch(
       /requestSubmit|\.submit\(|fetch\(|use:enhance|onMount/iu
     );
+  });
+
+  it.each([
+    [
+      'activation',
+      {
+        action: 'confirmRecoveryActivation',
+        idempotencyKey: RECOVERY_ACTIVATION_KEY,
+        finalizationEffectId: FINALIZATION_EFFECT_ID,
+        orderItemId: FIRST_ITEM_ID,
+        expectedCorrectionSetId: RAW_CORRECTION_SET_ID,
+        expectedCorrectionVersion: 2,
+        expectedSourceFingerprint: SOURCE_FINGERPRINT,
+        previewFingerprint: PREVIEW_FINGERPRINT,
+        confirmation: 'activate_persistent_recovery'
+      },
+      'confirmRecoveryActivation'
+    ],
+    [
+      'deactivation',
+      {
+        action: 'confirmRecoveryDeactivation',
+        idempotencyKey: RECOVERY_DEACTIVATION_KEY,
+        recoveryGrantId: RECOVERY_GRANT_ID,
+        recoveryReferenceId: RECOVERY_REFERENCE_ID,
+        expectedStateChangedAt: EXPECTED_STATE_CHANGED_AT,
+        confirmation: 'deactivate_persistent_recovery'
+      },
+      'confirmRecoveryDeactivation'
+    ]
+  ] as const)('renders one explicit exact recovery %s retry and freezes every editor', (
+    _label,
+    retrySubmission,
+    action
+  ) => {
+    const body = render(RefundReviewPage, {
+      props: {
+        data: {
+          detail: detail({ allocationStatus: 'finalized', draft: null }),
+          reportingCorrectionSeed: correctionSeed(),
+          administrativeRecoverySeed: recoverySeed(),
+          reviewCursor: 'bounded_cursor',
+          saveDraftIdempotencyKey: SAVE_KEY,
+          discardDraftIdempotencyKey: DISCARD_KEY,
+          finalizeIdempotencyKey: FINALIZE_KEY,
+          correctionIdempotencyKey: CORRECTION_KEY,
+          recoveryActivationIdempotencyKey: RECOVERY_ACTIVATION_KEY,
+          recoveryDeactivationIdempotencyKey: RECOVERY_DEACTIVATION_KEY
+        },
+        form: {
+          code: 'temporarily_unavailable',
+          fieldErrors: {},
+          retrySubmission
+        }
+      } as never
+    }).body;
+
+    expect(body.match(/<form\b/gu)).toHaveLength(1);
+    expect(body).toContain(`?/${action}&amp;reviewCursor=bounded_cursor`);
+    expect(body).toContain(
+      `name="idempotencyKey" value="${retrySubmission.idempotencyKey}"`
+    );
+    if (retrySubmission.action === 'confirmRecoveryActivation') {
+      expect(body).toContain(
+        `name="finalizationEffectId" value="${FINALIZATION_EFFECT_ID}"`
+      );
+      expect(body).toContain(`name="orderItemId" value="${FIRST_ITEM_ID}"`);
+      expect(body).toContain(
+        `name="expectedCorrectionSetId" value="${RAW_CORRECTION_SET_ID}"`
+      );
+      expect(body).toContain('name="expectedCorrectionVersion" value="2"');
+      expect(body).toContain(
+        `name="expectedSourceFingerprint" value="${SOURCE_FINGERPRINT}"`
+      );
+      expect(body).toContain(
+        `name="previewFingerprint" value="${PREVIEW_FINGERPRINT}"`
+      );
+      expect(body).toContain(
+        'name="confirmation" value="activate_persistent_recovery"'
+      );
+    } else {
+      expect(body).toContain(`name="recoveryGrantId" value="${RECOVERY_GRANT_ID}"`);
+      expect(body).toContain(
+        `name="recoveryReferenceId" value="${RECOVERY_REFERENCE_ID}"`
+      );
+      expect(body).toContain(
+        `name="expectedStateChangedAt" value="${EXPECTED_STATE_CHANGED_AT}"`
+      );
+      expect(body).toContain(
+        'name="confirmation" value="deactivate_persistent_recovery"'
+      );
+    }
+    expect(body).toContain('Retry this exact request');
+    expect(body).not.toContain('Administrative access recovery');
+    expect(body).not.toContain('Reporting attribution correction');
+    expect(body).not.toContain('Shared allocation draft');
+
+    const pageSource = readFileSync(
+      new URL('../../../routes/admin/sales/refunds/[refundId]/+page.svelte', import.meta.url),
+      'utf8'
+    );
+    expect(pageSource).not.toMatch(/requestSubmit|\.submit\(|fetch\(|use:enhance/iu);
   });
 });

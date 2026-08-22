@@ -357,6 +357,73 @@ describe('canonical refund fulfillment', () => {
     expect(await ownerDatabaseClient.db.select().from(outboxMessages)).toHaveLength(1);
   });
 
+  it('revokes only the purchase grant and preserves an explicit administrative grant', async () => {
+    const fixture = await createPurchase([1403]);
+    const first = await createRefundEvent(`re_test_${randomUUID()}`, 1);
+    await fulfillRefundEvent(
+      workerDatabaseClient.db,
+      snapshots(fixture, first, 500, 'succeeded', 1),
+      dependencies()
+    );
+    const [allocation] = await ownerDatabaseClient.db
+      .select({ id: refundAllocations.id })
+      .from(refundAllocations);
+    if (!allocation || !fixture.userId) throw new Error('Expected recovery fixture facts');
+    const administrativeGrantId = randomUUID();
+    const client = await ownerDatabaseClient.pool.connect();
+    try {
+      await client.query('begin');
+      await client.query(`set local session_replication_role = replica`);
+      await client.query(`
+        insert into entitlement_grants (
+          id, title_id, user_id, source, recovery_refund_allocation_id, state,
+          state_reason, granted_at, created_at, updated_at
+        ) values (
+          $1, $2, $3, 'administrative', $4, 'active',
+          'refund_allocation_recovery', $5, $5, $5
+        )
+      `, [
+        administrativeGrantId,
+        fixture.items[0]!.titleId,
+        fixture.userId,
+        allocation.id,
+        new Date('2026-08-10T13:30:00.000Z')
+      ]);
+      await client.query('commit');
+    } catch (error) {
+      await client.query('rollback');
+      throw error;
+    } finally {
+      client.release();
+    }
+    const snapshot = async () => (await ownerDatabaseClient.pool.query<{ value: string }>(`
+      select jsonb_build_array(
+        id, title_id, user_id, source, order_item_id,
+        recovery_refund_allocation_id, state, state_reason, granted_at,
+        suspended_at, revoked_at, created_at, updated_at
+      )::text as value from entitlement_grants where id = $1
+    `, [administrativeGrantId])).rows[0]!.value;
+    const before = await snapshot();
+
+    const second = await createRefundEvent(`re_test_${randomUUID()}`, 2);
+    await fulfillRefundEvent(
+      workerDatabaseClient.db,
+      snapshots(fixture, second, 903, 'succeeded', 2),
+      dependencies()
+    );
+
+    expect(await snapshot()).toBe(before);
+    const grants = await ownerDatabaseClient.db
+      .select({ source: entitlementGrants.source, state: entitlementGrants.state })
+      .from(entitlementGrants);
+    expect(grants).toEqual(expect.arrayContaining([
+      { source: 'purchase', state: 'revoked' },
+      { source: 'administrative', state: 'active' }
+    ]));
+    expect((await databaseClient.db.select().from(entitlements))[0]?.revokedAt).toBeNull();
+    expect(await ownerDatabaseClient.db.select().from(outboxMessages)).toHaveLength(0);
+  });
+
   it('keeps both reconciled refunds current on a distinct exact no-op event', async () => {
     const fixture = await createPurchase([1403]);
     const firstProviderId = `re_test_${randomUUID()}`;

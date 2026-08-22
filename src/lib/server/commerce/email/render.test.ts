@@ -47,6 +47,17 @@ function receipt(template: 'commerce.account-receipt' | 'commerce.guest-receipt-
   }, origin);
 }
 
+function recoveryAccess(accessState: 'active' | 'revoked', soldAsTitle = 'The Recovered Book') {
+  return parseCommerceEmailPayload({
+    version: 1,
+    template: 'commerce.administrative-recovery-access-changed',
+    to: 'reader@example.com',
+    messageId: randomUUID(),
+    soldAsTitle,
+    accessState
+  }, origin);
+}
+
 describe('commerce email rendering', () => {
   it('renders escaped receipt HTML and explicit direct-download guidance', () => {
     const rendered = renderCommerceEmail(receipt('commerce.account-receipt'));
@@ -84,5 +95,33 @@ describe('commerce email rendering', () => {
     expect(rendered.text).toContain(`${origin}/library`);
     expect(rendered.text).toContain(`${origin}/help`);
     expect(JSON.stringify(rendered)).not.toMatch(/pi_|ch_|card|billing|stripe|refund amount/iu);
+  });
+
+  it.each([
+    ['active', 'Your access to The Recovered Book is now active.'],
+    ['revoked', 'Your access to The Recovered Book is now revoked.']
+  ] as const)('renders the exact administrative-recovery access outcome: %s',
+    (accessState, expectedText) => {
+      const rendered = renderCommerceEmail(recoveryAccess(accessState));
+      expect(rendered).toEqual({
+        subject: 'Your Pale Orbit library access changed',
+        text: expectedText,
+        html: `<!doctype html><html><body><p>${expectedText}</p></body></html>`
+      });
+    });
+
+  it('escapes the sold-as title and emits no identity, internal evidence, amount, or URL', () => {
+    const payload = recoveryAccess('active', '<A & B>');
+    const rendered = renderCommerceEmail(payload);
+    const serialized = JSON.stringify(rendered);
+
+    expect(rendered.text).toContain('<A & B>');
+    expect(rendered.html).toContain('&lt;A &amp; B&gt;');
+    expect(rendered.html).not.toContain('<A & B>');
+    expect(serialized).not.toContain(payload.to);
+    expect(serialized).not.toContain(payload.messageId);
+    expect(serialized).not.toMatch(
+      /administrator|recoveryGrant|provider|pi_|ch_|amount|\$|https?:|href=|\/(?:library|help)\b/iu
+    );
   });
 });

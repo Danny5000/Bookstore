@@ -69,6 +69,7 @@ function harness(initial = snapshot()) {
   return {
     snapshot: initial,
     enqueuer,
+    stored,
     enqueueOutboxMessage,
     enqueueJob,
     enqueueJobReference,
@@ -196,4 +197,99 @@ describe('transactional commerce email enqueue', () => {
       affectedTitleCount: 1
     })).rejects.toBeInstanceOf(OutboxDeduplicationInvariantError);
   });
+
+  it('deduplicates administrative-recovery mail from the actual grant transition', async () => {
+    const test = harness();
+    const eventId = randomUUID();
+    const recoveryGrantId = randomUUID();
+    const stateChangedAt = '2026-08-22T12:34:56.789Z';
+    const input = {
+      template: 'commerce.administrative-recovery-access-changed' as const,
+      eventId,
+      to: ' Reader@Example.COM ',
+      soldAsTitle: 'The Recovered Book',
+      accessState: 'active' as const,
+      recoveryGrantId,
+      stateChangedAt
+    };
+
+    await test.enqueuer.enqueueAccessChange(transaction, input);
+    await test.enqueuer.enqueueAccessChange(transaction, input);
+
+    const expectedKey =
+      `commerce:recovery-access:${recoveryGrantId}:active:${Date.parse(stateChangedAt)}`;
+    expect(test.enqueueOutboxMessage).toHaveBeenCalledTimes(2);
+    expect(test.stored.size).toBe(1);
+    expect(test.enqueueOutboxMessage).toHaveBeenLastCalledWith(transaction, {
+      topic: 'email.commerce.v1',
+      deduplicationKey: expectedKey,
+      maxAttempts: 8,
+      payload: {
+        version: 1,
+        template: 'commerce.administrative-recovery-access-changed',
+        to: 'reader@example.com',
+        messageId: eventId,
+        soldAsTitle: 'The Recovered Book',
+        accessState: 'active'
+      }
+    });
+    const serializedPayload = JSON.stringify(test.enqueueOutboxMessage.mock.calls[0]?.[1].payload);
+    expect(serializedPayload).not.toContain(recoveryGrantId);
+    expect(serializedPayload).not.toContain(stateChangedAt);
+  });
+
+  it('uses the exact active or revoked outcome in the recovery deduplication key', async () => {
+    const test = harness();
+    const recoveryGrantId = randomUUID();
+    const activeAt = '2026-08-22T12:34:56.789Z';
+    const revokedAt = '2026-08-22T12:35:00.001Z';
+    await test.enqueuer.enqueueAccessChange(transaction, {
+      template: 'commerce.administrative-recovery-access-changed',
+      eventId: randomUUID(),
+      to: 'reader@example.com',
+      soldAsTitle: 'The Recovered Book',
+      accessState: 'active',
+      recoveryGrantId,
+      stateChangedAt: activeAt
+    });
+    await test.enqueuer.enqueueAccessChange(transaction, {
+      template: 'commerce.administrative-recovery-access-changed',
+      eventId: randomUUID(),
+      to: 'reader@example.com',
+      soldAsTitle: 'The Recovered Book',
+      accessState: 'revoked',
+      recoveryGrantId,
+      stateChangedAt: revokedAt
+    });
+
+    expect(test.enqueueOutboxMessage.mock.calls.map((call) => call[1].deduplicationKey))
+      .toEqual([
+        `commerce:recovery-access:${recoveryGrantId}:active:${Date.parse(activeAt)}`,
+        `commerce:recovery-access:${recoveryGrantId}:revoked:${Date.parse(revokedAt)}`
+      ]);
+  });
+
+  it.each([
+    ['uppercase event UUID', { eventId: randomUUID().toUpperCase() }],
+    ['uppercase grant UUID', { recoveryGrantId: randomUUID().toUpperCase() }],
+    ['missing milliseconds', { stateChangedAt: '2026-08-22T12:34:56Z' }],
+    ['short milliseconds', { stateChangedAt: '2026-08-22T12:34:56.78Z' }],
+    ['offset timestamp', { stateChangedAt: '2026-08-22T12:34:56.789+00:00' }],
+    ['impossible date', { stateChangedAt: '2026-02-29T12:34:56.789Z' }],
+    ['unknown input field', { administratorId: randomUUID() }]
+  ])('rejects malformed administrative-recovery enqueue input: %s',
+    async (_label, overrides) => {
+      const test = harness();
+      await expect(test.enqueuer.enqueueAccessChange(transaction, {
+        template: 'commerce.administrative-recovery-access-changed',
+        eventId: randomUUID(),
+        to: 'reader@example.com',
+        soldAsTitle: 'The Recovered Book',
+        accessState: 'active',
+        recoveryGrantId: randomUUID(),
+        stateChangedAt: '2026-08-22T12:34:56.789Z',
+        ...overrides
+      } as never)).rejects.toThrow();
+      expect(test.enqueueOutboxMessage).not.toHaveBeenCalled();
+    });
 });

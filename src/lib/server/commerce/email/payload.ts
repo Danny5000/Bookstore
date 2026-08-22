@@ -6,6 +6,9 @@ export const COMMERCE_EMAIL_TOPIC = 'email.commerce.v1' as const;
 const loopbackHosts = new Set(['localhost', '127.0.0.1', '[::1]']);
 const supportedCurrencies = new Set(Intl.supportedValuesOf('currency'));
 const moneySchema = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
+const canonicalUuidSchema = z.string()
+  .regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u)
+  .pipe(z.uuid());
 function secureCredentialFreeUrl(value: string): boolean {
   const url = new URL(value);
   return (
@@ -76,12 +79,20 @@ const disputeAccessSchema = z.strictObject({
   libraryUrl: safeUrlSchema,
   helpUrl: safeUrlSchema
 });
+const administrativeRecoveryAccessSchema = z.strictObject({
+  ...common,
+  messageId: canonicalUuidSchema,
+  template: z.literal('commerce.administrative-recovery-access-changed'),
+  soldAsTitle: z.string().trim().min(1).max(500),
+  accessState: z.enum(['active', 'revoked'])
+});
 
 export const commerceEmailPayloadSchema = z.union([
   accountReceiptSchema,
   guestReceiptSchema,
   refundAccessSchema,
-  disputeAccessSchema
+  disputeAccessSchema,
+  administrativeRecoveryAccessSchema
 ]);
 
 export type CommerceEmailPayload = z.output<typeof commerceEmailPayloadSchema>;

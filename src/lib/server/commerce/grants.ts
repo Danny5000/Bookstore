@@ -21,7 +21,46 @@ export type GrantTransitionOrigin =
   | 'payment'
   | 'refund'
   | 'dispute'
-  | 'preserved';
+  | 'preserved'
+  | 'administrative-recovery';
+
+type GrantState = EntitlementGrantRow['state'];
+
+interface GrantTransitionRule {
+  readonly source: EntitlementGrantRow['source'];
+  readonly nextStatesByState: Readonly<Record<GrantState, readonly GrantState[]>>;
+}
+
+const REVERSIBLE_TRANSITIONS: GrantTransitionRule['nextStatesByState'] = {
+  unclaimed: ['active', 'suspended', 'revoked'],
+  active: ['unclaimed', 'suspended', 'revoked'],
+  suspended: ['unclaimed', 'active', 'revoked'],
+  revoked: ['unclaimed', 'active', 'suspended']
+};
+
+const PURCHASE_TRANSITIONS: GrantTransitionRule['nextStatesByState'] = {
+  ...REVERSIBLE_TRANSITIONS,
+  revoked: []
+};
+
+const ADMINISTRATIVE_TRANSITIONS: GrantTransitionRule['nextStatesByState'] = {
+  unclaimed: [],
+  active: ['revoked'],
+  suspended: [],
+  revoked: ['active']
+};
+
+const GRANT_TRANSITION_MATRIX: Readonly<Record<GrantTransitionOrigin, GrantTransitionRule>> = {
+  claim: { source: 'purchase', nextStatesByState: PURCHASE_TRANSITIONS },
+  payment: { source: 'purchase', nextStatesByState: PURCHASE_TRANSITIONS },
+  refund: { source: 'purchase', nextStatesByState: PURCHASE_TRANSITIONS },
+  dispute: { source: 'purchase', nextStatesByState: PURCHASE_TRANSITIONS },
+  preserved: { source: 'preserved', nextStatesByState: REVERSIBLE_TRANSITIONS },
+  'administrative-recovery': {
+    source: 'administrative',
+    nextStatesByState: ADMINISTRATIVE_TRANSITIONS
+  }
+};
 
 export function assertGrantTransitionAllowed(
   grant: Pick<EntitlementGrantRow, 'source' | 'state'>,
@@ -32,8 +71,15 @@ export function assertGrantTransitionAllowed(
   if (grant.source === 'preserved' && (origin === 'refund' || origin === 'dispute')) {
     throw new CommerceConflictError('PRESERVED_GRANT_IMMUTABLE');
   }
+  const rule = GRANT_TRANSITION_MATRIX[origin];
+  if (rule.source !== grant.source) {
+    throw new PermanentCommerceError();
+  }
   if (grant.source === 'purchase' && grant.state === 'revoked') {
     throw new CommerceConflictError('GRANT_PERMANENTLY_REVOKED');
+  }
+  if (!rule.nextStatesByState[grant.state].includes(nextState)) {
+    throw new PermanentCommerceError();
   }
 }
 

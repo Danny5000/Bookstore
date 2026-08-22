@@ -1628,4 +1628,38 @@ describe('commerce transaction lock order', () => {
       await probeDatabase.close();
     }
   }, 15_000);
+
+  it('pins the protected recovery transition to projection-before-purchase-before-entitlement order', async () => {
+    const definition = (await ownerDatabaseClient.pool.query<{ definition: string }>(`
+      select pg_get_functiondef(
+        'public.transition_administrative_recovery_grant_after_admin_command(uuid)'
+          ::regprocedure
+      ) as definition
+    `)).rows[0]!.definition.replace(/\s+/gu, ' ').toLowerCase();
+    const activation = definition.slice(
+      definition.indexOf("if locked_command_kind = 'administrative_recovery_activate'"),
+      definition.indexOf('input_recovery_grant_id :=')
+    );
+    const orderedFragments = [
+      'from "public"."financial_projection_versions"',
+      "'pale-orbit:commerce:order:'",
+      'from "public"."orders" purchase_order',
+      'from "public"."payments" payment',
+      'from "public"."refunds" candidate',
+      'from "public"."order_items" candidate',
+      "'pale-orbit:commerce:entitlement:'",
+      'from "public"."entitlement_grants" candidate',
+      'insert into "public"."entitlement_grants"'
+    ] as const;
+    let cursor = -1;
+    for (const fragment of orderedFragments) {
+      const position = activation.indexOf(fragment, cursor + 1);
+      expect(position, `missing/out-of-order recovery fragment: ${fragment}`)
+        .toBeGreaterThan(cursor);
+      cursor = position;
+    }
+    expect(activation).not.toContain('guest_identities');
+    expect(activation).not.toContain('commerce_claim_issuances');
+    expect(activation).not.toContain('credential_authority');
+  });
 });

@@ -58,6 +58,18 @@ function access(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function administrativeRecoveryAccess(overrides: Record<string, unknown> = {}) {
+  return {
+    version: 1,
+    template: 'commerce.administrative-recovery-access-changed',
+    to: ' Reader@Example.COM ',
+    messageId: randomUUID(),
+    soldAsTitle: '  The Recovered Book  ',
+    accessState: 'active',
+    ...overrides
+  };
+}
+
 describe('strict commerce email payloads', () => {
   it('normalizes a bounded account receipt and exposes the versioned topic', () => {
     expect(COMMERCE_EMAIL_TOPIC).toBe('email.commerce.v1');
@@ -123,6 +135,51 @@ describe('strict commerce email payloads', () => {
       reasonCategory: 'dispute_opened'
     });
   });
+
+  it('accepts only the minimized administrative-recovery dispatch payload', () => {
+    const messageId = randomUUID();
+    expect(parseCommerceEmailPayload(administrativeRecoveryAccess({ messageId }), origin))
+      .toEqual({
+        version: 1,
+        template: 'commerce.administrative-recovery-access-changed',
+        to: 'reader@example.com',
+        messageId,
+        soldAsTitle: 'The Recovered Book',
+        accessState: 'active'
+      });
+    expect(parseCommerceEmailPayload(administrativeRecoveryAccess({
+      accessState: 'revoked'
+    }), origin)).toMatchObject({ accessState: 'revoked' });
+  });
+
+  it.each([
+    ['administrator identity', { administratorId: randomUUID() }],
+    ['recovery grant identifier', { recoveryGrantId: randomUUID() }],
+    ['transition timestamp', { stateChangedAt: '2026-08-22T12:34:56.789Z' }],
+    ['provider identifier', { providerId: 'pi_secret' }],
+    ['amount', { amountMinor: 1299 }],
+    ['action URL', { actionUrl: `${origin}/admin/recovery` }],
+    ['library URL', { libraryUrl: `${origin}/library` }],
+    ['help URL', { helpUrl: `${origin}/help` }]
+  ])('rejects administrative-recovery payload data not needed for dispatch: %s',
+    (_label, extra) => {
+      expect(() => parseCommerceEmailPayload(
+        administrativeRecoveryAccess(extra),
+        origin
+      )).toThrow();
+    });
+
+  it.each([
+    ['non-canonical event UUID', { messageId: randomUUID().toUpperCase() }],
+    ['unknown access state', { accessState: 'suspended' }],
+    ['blank sold-as title', { soldAsTitle: '   ' }]
+  ])('rejects malformed administrative-recovery payload content: %s',
+    (_label, overrides) => {
+      expect(() => parseCommerceEmailPayload(
+        administrativeRecoveryAccess(overrides),
+        origin
+      )).toThrow();
+    });
 
   it.each([
     ['unknown field', receipt({ unknown: true })],

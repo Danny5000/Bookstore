@@ -4588,7 +4588,7 @@ BEGIN
     remaining_unrefunded_minor :=
       order_item_row.total_minor::bigint - corrected_presentment_total;
     IF NOT ((
-      succeeded_refund_count BETWEEN 1 AND 1073741823 AND
+      succeeded_refund_count BETWEEN 1 AND 100 AND
       presentment_evidence_count = 2 * succeeded_refund_count AND
       presentment_resolved_count = presentment_evidence_count AND
       presentment_serialized_count = presentment_evidence_count AND
@@ -4599,7 +4599,7 @@ BEGIN
         order_item_row.tax_minor::bigint AND
       corrected_presentment_total =
         cumulative_refund_subtotal_minor + cumulative_refund_tax_minor AND
-      corrected_presentment_total < order_item_row.total_minor
+      corrected_presentment_total <= order_item_row.total_minor
     ) IS TRUE) THEN
       RAISE EXCEPTION USING ERRCODE = '55000',
         MESSAGE = 'administrative recovery is not eligible';
@@ -4709,6 +4709,11 @@ BEGIN
         MESSAGE = 'administrative recovery state is stale';
     END IF;
 
+    IF corrected_presentment_total >= order_item_row.total_minor THEN
+      RAISE EXCEPTION USING ERRCODE = '55000',
+        MESSAGE = 'administrative recovery is not eligible';
+    END IF;
+
     transition_at :=
       pg_catalog.date_trunc('milliseconds', pg_catalog.clock_timestamp());
     IF recovery_row.id IS NULL THEN
@@ -4716,6 +4721,11 @@ BEGIN
       prior_state := NULL;
     ELSE
       prior_state := recovery_row.state;
+      transition_at := GREATEST(
+        transition_at,
+        pg_catalog.date_trunc('milliseconds', recovery_row.updated_at) +
+          interval '1 millisecond'
+      );
     END IF;
     PERFORM pg_catalog.set_config(
       'pale_orbit.plan6bii_administrative_grant_command_id',
@@ -5032,8 +5042,11 @@ BEGIN
       MESSAGE = 'administrative recovery state is stale';
   END IF;
 
-  transition_at :=
-    pg_catalog.date_trunc('milliseconds', pg_catalog.clock_timestamp());
+  transition_at := GREATEST(
+    pg_catalog.date_trunc('milliseconds', pg_catalog.clock_timestamp()),
+    pg_catalog.date_trunc('milliseconds', recovery_row.updated_at) +
+      interval '1 millisecond'
+  );
   prior_state := recovery_row.state;
   PERFORM pg_catalog.set_config(
     'pale_orbit.plan6bii_administrative_grant_command_id',

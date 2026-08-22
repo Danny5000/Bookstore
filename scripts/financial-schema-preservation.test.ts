@@ -1067,7 +1067,7 @@ describe('Plan 6B financial schema preservation', () => {
     );
   });
 
-  it('pins the eligible-only administrative-recovery v1 preimage and canonical lock root', () => {
+  it('pins drift-before-ineligibility recovery fingerprints and monotonic transition time', () => {
     const migration = source(ADMIN_COMMAND_MIGRATION);
     const transitionStart = migration.indexOf(
       'CREATE FUNCTION "public"."transition_administrative_recovery_grant_after_admin_command"'
@@ -1112,7 +1112,24 @@ describe('Plan 6B financial schema preservation', () => {
     expect(transition).toContain('allocation_status <> \'finalized\'');
     expect(transition).toContain('cumulative_refund_subtotal_minor');
     expect(transition).toContain('cumulative_refund_tax_minor');
-    expect(transition).toContain('corrected_presentment_total < order_item_row.total_minor');
+    expect(transition).toContain('succeeded_refund_count BETWEEN 1 AND 100');
+    expect(transition).not.toContain(
+      'succeeded_refund_count BETWEEN 1 AND 1073741823'
+    );
+    expect(transition).toContain('corrected_presentment_total <= order_item_row.total_minor');
+    expect(transition).not.toContain('corrected_presentment_total < order_item_row.total_minor');
+
+    const fingerprintComparison = transition.indexOf(
+      'IF computed_preview_fingerprint IS DISTINCT FROM input_preview_fingerprint THEN'
+    );
+    const fullRefundIneligibility = transition.indexOf(
+      'IF corrected_presentment_total >= order_item_row.total_minor THEN'
+    );
+    expect(fingerprintComparison).toBeGreaterThanOrEqual(0);
+    expect(fullRefundIneligibility).toBeGreaterThan(fingerprintComparison);
+    expect(transition.match(
+      /transition_at := GREATEST\([\s\S]{0,220}?recovery_row\.updated_at[\s\S]{0,100}?interval '1 millisecond'/gu
+    ) ?? []).toHaveLength(2);
 
     const sharedLease = transition.indexOf('pg_advisory_xact_lock_shared');
     const commandLock = transition.indexOf('FOR UPDATE;', transition.indexOf(
