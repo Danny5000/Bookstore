@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { SQL } from 'drizzle-orm';
 import { describe, expect, it, vi } from 'vitest';
 import type { JobRow } from '$lib/server/db/schema';
@@ -16,6 +17,10 @@ import {
 
 const SOURCE_ID = '00000000-0000-4000-8000-000000001611';
 const NOW = new Date('2026-08-12T12:00:00.000Z');
+const FINANCIAL_ADMIN_JOB = 'commerce.financial-admin-command';
+const FINANCIAL_ADMIN_COMMAND_ID = '00000000-0000-4000-8000-000000001701';
+const FINANCIAL_ADMIN_JOB_ID = '00000000-0000-4000-8000-000000001702';
+const FINANCIAL_ADMIN_LEASE_CAPABILITY = 'B'.repeat(43);
 
 function jobRow(overrides: Partial<JobRow> = {}): JobRow {
   return {
@@ -87,6 +92,57 @@ function rendered(query: SQL): { sql: string; params: unknown[] } {
 }
 
 describe('job enqueue insert authority', () => {
+  it('offers a runtime-safe reference seam that never selects a full job row', async () => {
+    const enqueueReference = (jobRepository as unknown as Record<string, unknown>)
+      .enqueueJobReference;
+    expect(typeof enqueueReference).toBe('function');
+    if (typeof enqueueReference !== 'function') return;
+
+    const execute = vi.fn(async (_query: SQL) => ({
+      rows: [{
+        id: '00000000-0000-4000-8000-000000001612',
+        deduplicationKey: 'email:test:v1'
+      }]
+    }));
+    const select = vi.fn(() => {
+      throw new Error('runtime-safe enqueue must not select jobs');
+    });
+    const result = await (enqueueReference as (
+      database: unknown,
+      input: unknown
+    ) => Promise<unknown>)({ execute, select }, {
+      type: 'commerce.email',
+      payload: { purpose: 'test' },
+      deduplicationKey: 'email:test:v1',
+      maxAttempts: 7
+    });
+
+    expect(result).toEqual({ id: '00000000-0000-4000-8000-000000001612' });
+    expect(execute).toHaveBeenCalledOnce();
+    expect(select).not.toHaveBeenCalled();
+    const query = rendered(execute.mock.calls[0]![0] as SQL).sql;
+    expect(query).not.toContain('as "deduplicationKey"');
+  });
+
+  it('recovers a concurrently committed replay through an ID-only follow-up read', async () => {
+    const existingId = '00000000-0000-4000-8000-000000001613';
+    const execute = vi.fn(async () => ({ rows: [] }));
+    const limit = vi.fn(async () => [{ id: existingId }]);
+    const where = vi.fn(() => ({ limit }));
+    const from = vi.fn(() => ({ where }));
+    const select = vi.fn(() => ({ from }));
+
+    await expect(jobRepository.enqueueJobReference({ execute, select } as never, {
+      type: 'commerce.email',
+      payload: { purpose: 'test' },
+      deduplicationKey: 'email:test:race:v1',
+      maxAttempts: 7
+    })).resolves.toEqual({ id: existingId });
+
+    expect(select).toHaveBeenCalledWith({ id: expect.anything() });
+    expect(limit).toHaveBeenCalledWith(1);
+  });
+
   it('targets only the five runtime-granted columns and preserves defaults', async () => {
     const query = rendered(jobInsertQuery({
       type: 'commerce.email',
@@ -376,8 +432,11 @@ describe('job claim policy', () => {
       claimQueries.push(query);
       return { rows: [] };
     });
+    const transaction = { execute };
+    const transact = vi.fn(async (work: (tx: unknown) => Promise<unknown>) =>
+      work(transaction));
     const repository = createPostgresJobRepository(
-      { execute } as never,
+      { transaction: transact } as never,
       {
         pollIntervalMs: 1,
         leaseMs: 1_000,
@@ -393,6 +452,7 @@ describe('job claim policy', () => {
 
     await expect(repository.claimNext('claim-policy-worker')).resolves.toBeNull();
 
+    expect(transact).toHaveBeenCalledOnce();
     expect(execute).toHaveBeenCalledOnce();
     expect(claimQueries).toHaveLength(1);
     const claim = rendered(claimQueries[0]!);
@@ -400,13 +460,13 @@ describe('job claim policy', () => {
     expect(claim.sql).toContain('pending_allocation_algorithm_version is null');
     expect(claim.sql).toContain('pending_replay_id is null');
     expect(claim.sql).toContain('pending_scan_run_id is null');
-    expect(claim.params.filter((value) => value === 'commerce.stripe-event')).toHaveLength(4);
+    expect(claim.params.filter((value) => value === 'commerce.stripe-event')).toHaveLength(2);
     expect(claim.params.filter((value) => value === 'commerce.financial-source'))
-      .toHaveLength(4);
+      .toHaveLength(2);
     expect(claim.params.filter((value) => value === 'commerce.financial-payout'))
-      .toHaveLength(4);
+      .toHaveLength(2);
     expect(claim.params.filter((value) => value === 'commerce.financial-scan').length)
-      .toBeGreaterThanOrEqual(4);
+      .toBeGreaterThanOrEqual(2);
     expect(claim.sql).toContain("payload ->> 'kind' = 'composite_replay'");
     expect(claim.sql).toContain("'classification_replay_page', 'classification_replay_finalize'");
     expect(claim.params).toEqual(expect.arrayContaining([
@@ -421,5 +481,531 @@ describe('job claim policy', () => {
     expect(claim.sql).toMatch(
       /cleanup_authority\.classifier_version\s*=\s*\$\d+[\s\S]+?cleanup_authority\.pending_classifier_version\s*=\s*\$\d+/u
     );
+  });
+
+  it('claims one financial-admin target in one transaction with one opaque capability', async () => {
+    const calls: SQL[] = [];
+    const candidate = {
+      ...jobRow({
+        id: FINANCIAL_ADMIN_JOB_ID,
+        type: FINANCIAL_ADMIN_JOB,
+        payload: { commandId: FINANCIAL_ADMIN_COMMAND_ID },
+        deduplicationKey:
+          `commerce:financial-admin-command:${FINANCIAL_ADMIN_COMMAND_ID}:v1`,
+        attempts: 0,
+        maxAttempts: 8
+      }),
+      priorStatus: 'pending',
+      hadRerunRequest: false
+    };
+    const claimed = {
+      id: candidate.id,
+      type: candidate.type,
+      payload: candidate.payload,
+      deduplicationKey: candidate.deduplicationKey,
+      attempts: 1,
+      maxAttempts: candidate.maxAttempts,
+      lockedBy: 'financial-admin-worker'
+    };
+    const transaction = {
+      execute: vi.fn(async (query: SQL) => {
+        calls.push(query);
+        const statement = rendered(query).sql;
+        if (statement.includes('for update skip locked')) return { rows: [candidate] };
+        if (statement.includes('returning') && statement.includes('update')) {
+          return { rows: [claimed] };
+        }
+        return { rows: [] };
+      })
+    };
+    const database = {
+      execute: vi.fn(async () => ({ rows: [claimed] })),
+      transaction: vi.fn(async (work: (tx: unknown) => Promise<unknown>) => work(transaction))
+    };
+    const capabilitySource = vi.fn(() => FINANCIAL_ADMIN_LEASE_CAPABILITY);
+    const repository = createPostgresJobRepository(
+      database as never,
+      {
+        pollIntervalMs: 1,
+        leaseMs: 30_000,
+        retryBaseMs: 1,
+        retryMaxMs: 1,
+        workerReadyFile: 'unused',
+        concurrency: 1
+      },
+      () => NOW,
+      'local-only',
+      { classifierVersion: 2, allocationAlgorithmVersion: 3 },
+      capabilitySource
+    );
+
+    await expect(repository.claimNext('financial-admin-worker')).resolves.toEqual({
+      ...claimed,
+      financialAdminLeaseCapability: FINANCIAL_ADMIN_LEASE_CAPABILITY
+    });
+
+    expect(database.transaction).toHaveBeenCalledOnce();
+    expect(database.execute).not.toHaveBeenCalled();
+    expect(capabilitySource).toHaveBeenCalledOnce();
+    const statements = calls.map((query) => rendered(query));
+    expect(statements.filter((item) => item.sql.includes('for update skip locked')))
+      .toHaveLength(1);
+    const candidateSelection = statements.find((item) =>
+      item.sql.includes('for update skip locked'))!;
+    expect(candidateSelection.sql).toContain('limit 1');
+    expect(candidateSelection.sql).toContain(
+      'jobs.run_at <= pg_catalog.clock_timestamp()'
+    );
+    expect(candidateSelection.sql.match(
+      /jobs\.run_at <= pg_catalog\.clock_timestamp\(\)/gu
+    )).toHaveLength(2);
+    expect(candidateSelection.sql).not.toContain(
+      "jobs.locked_at <= pg_catalog.clock_timestamp() -"
+    );
+    expect(candidateSelection.params).not.toContain(30_000);
+    expect(statements.some((item) => item.sql.includes('with exhausted as'))).toBe(false);
+    const tokenSetting = statements.find((item) =>
+      item.sql.includes('plan6bii_financial_admin_job_capability'));
+    expect(tokenSetting?.params).toContain(FINANCIAL_ADMIN_LEASE_CAPABILITY);
+    expect(statements.some((item) =>
+      item.sql.includes('plan6bii_financial_admin_job_lease_duration_ms'))).toBe(true);
+    expect(statements.some((item) =>
+      item.sql.includes('pg_advisory_xact_lock') &&
+      item.sql.includes('pale-orbit:plan6bii-financial-admin-job-lease:'))).toBe(true);
+  });
+
+  it('does not generate a capability when no target is locked', async () => {
+    const transaction = { execute: vi.fn(async () => ({ rows: [] })) };
+    const database = {
+      transaction: vi.fn(async (work: (tx: unknown) => Promise<unknown>) => work(transaction))
+    };
+    const capabilitySource = vi.fn(() => FINANCIAL_ADMIN_LEASE_CAPABILITY);
+    const repository = createPostgresJobRepository(
+      database as never,
+      {
+        pollIntervalMs: 1,
+        leaseMs: 30_000,
+        retryBaseMs: 1,
+        retryMaxMs: 1,
+        workerReadyFile: 'unused',
+        concurrency: 1
+      },
+      () => NOW,
+      'local-only',
+      { classifierVersion: 2, allocationAlgorithmVersion: 3 },
+      capabilitySource
+    );
+
+    await expect(repository.claimNext('financial-admin-worker')).resolves.toBeNull();
+    expect(capabilitySource).not.toHaveBeenCalled();
+  });
+
+  it.each([3, 8])(
+    'rotates an expired rerun request from attempt %i back to attempt one',
+    async (priorAttempts) => {
+    const calls: SQL[] = [];
+    const candidate = {
+      ...jobRow({
+        id: FINANCIAL_ADMIN_JOB_ID,
+        type: FINANCIAL_ADMIN_JOB,
+        payload: { commandId: FINANCIAL_ADMIN_COMMAND_ID },
+        deduplicationKey:
+          `commerce:financial-admin-command:${FINANCIAL_ADMIN_COMMAND_ID}:v1`,
+        status: 'running',
+        attempts: priorAttempts,
+        maxAttempts: 8,
+        lockedAt: new Date('2026-08-12T11:00:00.000Z'),
+        lockedBy: 'expired-worker',
+        lastError: 'prior safe failure',
+        rerunRequestedAt: new Date('2026-08-12T11:30:00.000Z')
+      }),
+      priorStatus: 'running' as const,
+      hadRerunRequest: true
+    };
+    const claimed = {
+      id: candidate.id,
+      type: candidate.type,
+      payload: candidate.payload,
+      deduplicationKey: candidate.deduplicationKey,
+      attempts: 1,
+      maxAttempts: candidate.maxAttempts,
+      lockedBy: 'rerun-worker'
+    };
+    const transaction = {
+      execute: vi.fn(async (query: SQL) => {
+        calls.push(query);
+        const statement = rendered(query).sql;
+        if (statement.includes('for update skip locked')) return { rows: [candidate] };
+        if (statement.includes('returning jobs.id')) return { rows: [claimed] };
+        return { rows: [] };
+      })
+    };
+    const database = {
+      transaction: vi.fn(async (work: (tx: unknown) => Promise<unknown>) => work(transaction))
+    };
+    const capabilitySource = vi.fn(() => FINANCIAL_ADMIN_LEASE_CAPABILITY);
+    const repository = createPostgresJobRepository(
+      database as never,
+      {
+        pollIntervalMs: 1,
+        leaseMs: 30_000,
+        retryBaseMs: 1,
+        retryMaxMs: 1,
+        workerReadyFile: 'unused',
+        concurrency: 1
+      },
+      () => NOW,
+      'local-only',
+      { classifierVersion: 2, allocationAlgorithmVersion: 3 },
+      capabilitySource
+    );
+
+    await expect(repository.claimNext('rerun-worker')).resolves.toEqual({
+      ...claimed,
+      financialAdminLeaseCapability: FINANCIAL_ADMIN_LEASE_CAPABILITY
+    });
+    expect(capabilitySource).toHaveBeenCalledOnce();
+    const update = calls.map((query) => rendered(query)).find((statement) =>
+      statement.sql.includes('returning jobs.id'));
+    expect(update?.sql).toContain('then 1');
+    expect(update?.sql).toContain('then null');
+    expect(update?.sql).toContain('jobs.rerun_requested_at is not null');
+    expect(update?.sql).toContain('jobs.attempts = jobs.max_attempts');
+    expect(update?.params).toEqual(expect.arrayContaining(['running', true]));
+  });
+
+  it.each([
+    { commandStatus: 'pending', terminalJobStatus: 'failed' },
+    { commandStatus: 'succeeded', terminalJobStatus: 'succeeded' }
+  ] as const)(
+    'adopts one expired final-attempt target and maps a $commandStatus command to a $terminalJobStatus job',
+    async ({ commandStatus, terminalJobStatus }) => {
+    const calls: SQL[] = [];
+    const candidate = {
+      ...jobRow({
+        id: FINANCIAL_ADMIN_JOB_ID,
+        type: FINANCIAL_ADMIN_JOB,
+        payload: { commandId: FINANCIAL_ADMIN_COMMAND_ID },
+        deduplicationKey:
+          `commerce:financial-admin-command:${FINANCIAL_ADMIN_COMMAND_ID}:v1`,
+        status: 'running',
+        attempts: 8,
+        maxAttempts: 8,
+        lockedAt: new Date('2026-08-12T11:00:00.000Z'),
+        lockedBy: 'expired-worker'
+      }),
+      priorStatus: 'running',
+      hadRerunRequest: false,
+      claimExpired: true
+    };
+    let returnedCandidate = false;
+    const transaction = {
+      execute: vi.fn(async (query: SQL) => {
+        calls.push(query);
+        const statement = rendered(query).sql;
+        if (statement.includes('for update skip locked')) {
+          if (returnedCandidate) return { rows: [] };
+          returnedCandidate = true;
+          return { rows: [candidate] };
+        }
+        if (statement.includes('from financial_admin_commands')) {
+          return { rows: [{ status: commandStatus }] };
+        }
+        if (statement.includes('returning')) return { rows: [{ id: candidate.id }] };
+        return { rows: [] };
+      })
+    };
+    const database = {
+      transaction: vi.fn(async (work: (tx: unknown) => Promise<unknown>) => work(transaction))
+    };
+    const capabilitySource = vi.fn(() => FINANCIAL_ADMIN_LEASE_CAPABILITY);
+    const repository = createPostgresJobRepository(
+      database as never,
+      {
+        pollIntervalMs: 1,
+        leaseMs: 30_000,
+        retryBaseMs: 1,
+        retryMaxMs: 1,
+        workerReadyFile: 'unused',
+        concurrency: 1
+      },
+      () => NOW,
+      'local-only',
+      { classifierVersion: 2, allocationAlgorithmVersion: 3 },
+      capabilitySource
+    );
+
+    await expect(repository.claimNext('financial-admin-worker')).resolves.toBeNull();
+    expect(capabilitySource).toHaveBeenCalledOnce();
+    expect(calls.filter((query) => rendered(query).sql.includes('for update skip locked')))
+      .toHaveLength(1);
+    expect(calls.some((query) => rendered(query).sql.includes('with exhausted as'))).toBe(false);
+    expect(calls.filter((query) =>
+      rendered(query).sql.trimStart().startsWith('update jobs')))
+      .toHaveLength(2);
+    expect(calls.filter((query) =>
+      rendered(query).sql.includes('from financial_admin_commands')))
+      .toHaveLength(1);
+    const terminalUpdate = calls.map((query) => rendered(query).sql).filter((statement) =>
+      statement.trimStart().startsWith('update jobs'))[1]!;
+    expect(terminalUpdate).toContain(`status = '${terminalJobStatus}'`);
+  });
+
+  it('uses four distinct capabilities and digests for two normal and two exhausted targets', async () => {
+    const commandIds = [1, 2, 3, 4].map((suffix) =>
+      `00000000-0000-4000-8000-${String(1_800 + suffix).padStart(12, '0')}`
+    );
+    const candidates = commandIds.map((commandId, index) => ({
+      ...jobRow({
+        id: `00000000-0000-4000-8000-${String(1_900 + index).padStart(12, '0')}`,
+        type: FINANCIAL_ADMIN_JOB,
+        payload: { commandId },
+        deduplicationKey: `commerce:financial-admin-command:${commandId}:v1`,
+        status: index < 2 ? 'pending' : 'running',
+        attempts: index < 2 ? 0 : 8,
+        maxAttempts: 8,
+        lockedAt: index < 2 ? null : new Date('2026-08-12T11:00:00.000Z'),
+        lockedBy: index < 2 ? null : `expired-worker-${index}`
+      }),
+      priorStatus: index < 2 ? 'pending' as const : 'running' as const,
+      hadRerunRequest: false,
+      claimExpired: index >= 2
+    }));
+    const capabilities = ['C', 'D', 'E', 'F'].map((value) => value.repeat(43));
+    let candidateIndex = 0;
+    let currentCandidate = candidates[0]!;
+    const calls: SQL[] = [];
+    const transaction = {
+      execute: vi.fn(async (query: SQL) => {
+        calls.push(query);
+        const statement = rendered(query).sql;
+        if (statement.includes('for update skip locked')) {
+          currentCandidate = candidates[candidateIndex++]!;
+          return { rows: [currentCandidate] };
+        }
+        if (statement.includes('returning jobs.id')) {
+          return { rows: [{
+            id: currentCandidate.id,
+            type: currentCandidate.type,
+            payload: currentCandidate.payload,
+            deduplicationKey: currentCandidate.deduplicationKey,
+            attempts: 1,
+            maxAttempts: currentCandidate.maxAttempts,
+            lockedBy: 'four-token-worker'
+          }] };
+        }
+        if (statement.includes('from financial_admin_commands')) {
+          return { rows: [{ status: 'pending' }] };
+        }
+        if (statement.includes('returning id')) {
+          return { rows: [{ id: currentCandidate.id }] };
+        }
+        return { rows: [] };
+      })
+    };
+    const database = {
+      transaction: vi.fn(async (work: (tx: unknown) => Promise<unknown>) => work(transaction))
+    };
+    let capabilityIndex = 0;
+    const capabilitySource = vi.fn(() => capabilities[capabilityIndex++]!);
+    const repository = createPostgresJobRepository(
+      database as never,
+      {
+        pollIntervalMs: 1,
+        leaseMs: 30_000,
+        retryBaseMs: 1,
+        retryMaxMs: 1,
+        workerReadyFile: 'unused',
+        concurrency: 1
+      },
+      () => NOW,
+      'local-only',
+      { classifierVersion: 2, allocationAlgorithmVersion: 3 },
+      capabilitySource
+    );
+
+    const results = [];
+    for (let index = 0; index < 4; index += 1) {
+      results.push(await repository.claimNext('four-token-worker'));
+    }
+
+    expect(results.slice(0, 2).map((result) =>
+      result?.financialAdminLeaseCapability
+    )).toEqual(capabilities.slice(0, 2));
+    expect(results.slice(2)).toEqual([null, null]);
+    expect(capabilitySource).toHaveBeenCalledTimes(4);
+    expect(new Set(capabilities).size).toBe(4);
+    expect(new Set(capabilities.map((capability) =>
+      createHash('sha256').update(capability, 'utf8').digest('hex')
+    )).size).toBe(4);
+    const renderedCalls = calls.map((query) => rendered(query));
+    for (const capability of capabilities) {
+      expect(renderedCalls.some((call) => call.params.includes(capability))).toBe(true);
+      expect(renderedCalls.every((call) => !call.sql.includes(capability))).toBe(true);
+    }
+  });
+
+  it.each([
+    { operation: 'renewLease', lock: 'pg_advisory_xact_lock_shared' },
+    { operation: 'complete', lock: 'pg_advisory_xact_lock' },
+    { operation: 'retry', lock: 'pg_advisory_xact_lock' },
+    { operation: 'permanent failure', lock: 'pg_advisory_xact_lock' }
+  ] as const)(
+    'locks the job before the lease and forwards the opaque capability for $operation',
+    async ({ operation, lock }) => {
+      const calls: SQL[] = [];
+      const running = jobRow({
+        id: FINANCIAL_ADMIN_JOB_ID,
+        type: FINANCIAL_ADMIN_JOB,
+        payload: { commandId: FINANCIAL_ADMIN_COMMAND_ID },
+        deduplicationKey:
+          `commerce:financial-admin-command:${FINANCIAL_ADMIN_COMMAND_ID}:v1`,
+        status: 'running',
+        attempts: 1,
+        maxAttempts: 8,
+        lockedAt: NOW,
+        lockedBy: 'financial-admin-worker'
+      });
+      const transaction = {
+        execute: vi.fn(async (query: SQL) => {
+          calls.push(query);
+          const statement = rendered(query).sql;
+          if (statement.includes('for update')) return { rows: [running] };
+          if (statement.includes('returning')) return { rows: [{ id: running.id }] };
+          return { rows: [] };
+        })
+      };
+      const database = {
+        transaction: vi.fn(async (work: (tx: unknown) => Promise<unknown>) => work(transaction))
+      };
+      const repository = createPostgresJobRepository(database as never, {
+        pollIntervalMs: 1,
+        leaseMs: 30_000,
+        retryBaseMs: 1,
+        retryMaxMs: 1,
+        workerReadyFile: 'unused',
+        concurrency: 1
+      });
+
+      const result = operation === 'renewLease'
+        ? repository.renewLease(
+            running.id,
+            'financial-admin-worker',
+            FINANCIAL_ADMIN_LEASE_CAPABILITY
+          )
+        : operation === 'complete'
+          ? repository.complete(
+              running.id,
+              'financial-admin-worker',
+              FINANCIAL_ADMIN_LEASE_CAPABILITY
+            )
+          : repository.fail(
+              running.id,
+              'financial-admin-worker',
+              operation === 'retry' ? 'Transient job handler failure' : 'Invalid job payload',
+              operation === 'retry',
+              FINANCIAL_ADMIN_LEASE_CAPABILITY
+            );
+      await expect(result).resolves.toBe(true);
+
+      const statements = calls.map((query) => rendered(query));
+      const rowLock = statements.findIndex((item) => item.sql.includes('for update'));
+      const capability = statements.findIndex((item) =>
+        item.sql.includes('plan6bii_financial_admin_job_capability'));
+      const advisory = statements.findIndex((item) => item.sql.includes(lock));
+      const update = statements.findIndex((item) =>
+        item.sql.trimStart().startsWith('update jobs'));
+      expect(rowLock).toBe(0);
+      expect(capability).toBeGreaterThan(rowLock);
+      expect(advisory).toBeGreaterThan(capability);
+      expect(update).toBeGreaterThan(advisory);
+      expect(statements[capability]?.params).toContain(FINANCIAL_ADMIN_LEASE_CAPABILITY);
+      if (operation === 'renewLease') {
+        expect(statements[update]?.sql).toContain('clock_timestamp()');
+      }
+    }
+  );
+
+  it('rejects missing financial-admin capabilities before a lease mutation', async () => {
+    const calls: SQL[] = [];
+    const running = jobRow({
+      id: FINANCIAL_ADMIN_JOB_ID,
+      type: FINANCIAL_ADMIN_JOB,
+      payload: { commandId: FINANCIAL_ADMIN_COMMAND_ID },
+      status: 'running',
+      attempts: 1,
+      maxAttempts: 8,
+      lockedAt: NOW,
+      lockedBy: 'financial-admin-worker'
+    });
+    const transaction = {
+      execute: vi.fn(async (query: SQL) => {
+        calls.push(query);
+        return { rows: [running] };
+      })
+    };
+    const database = {
+      transaction: vi.fn(async (work: (tx: unknown) => Promise<unknown>) => work(transaction))
+    };
+    const repository = createPostgresJobRepository(database as never, {
+      pollIntervalMs: 1,
+      leaseMs: 30_000,
+      retryBaseMs: 1,
+      retryMaxMs: 1,
+      workerReadyFile: 'unused',
+      concurrency: 1
+    });
+
+    await expect(repository.renewLease(running.id, 'financial-admin-worker'))
+      .resolves.toBe(false);
+    expect(calls).toHaveLength(1);
+    expect(rendered(calls[0]!).sql).toContain('for update');
+  });
+
+  it('does not copy the financial-admin capability into a persisted safe error', async () => {
+    const calls: SQL[] = [];
+    const running = jobRow({
+      id: FINANCIAL_ADMIN_JOB_ID,
+      type: FINANCIAL_ADMIN_JOB,
+      payload: { commandId: FINANCIAL_ADMIN_COMMAND_ID },
+      status: 'running',
+      attempts: 1,
+      maxAttempts: 8,
+      lockedAt: NOW,
+      lockedBy: 'financial-admin-worker'
+    });
+    const transaction = {
+      execute: vi.fn(async (query: SQL) => {
+        calls.push(query);
+        const statement = rendered(query).sql;
+        if (statement.includes('for update')) return { rows: [running] };
+        if (statement.includes('returning')) return { rows: [{ id: running.id }] };
+        return { rows: [] };
+      })
+    };
+    const database = {
+      transaction: vi.fn(async (work: (tx: unknown) => Promise<unknown>) => work(transaction))
+    };
+    const repository = createPostgresJobRepository(database as never, {
+      pollIntervalMs: 1,
+      leaseMs: 30_000,
+      retryBaseMs: 1,
+      retryMaxMs: 1,
+      workerReadyFile: 'unused',
+      concurrency: 1
+    });
+
+    await expect(repository.fail(
+      running.id,
+      'financial-admin-worker',
+      `unsafe ${FINANCIAL_ADMIN_LEASE_CAPABILITY}`,
+      false,
+      FINANCIAL_ADMIN_LEASE_CAPABILITY
+    )).resolves.toBe(true);
+
+    const update = calls.map((query) => rendered(query)).find((item) =>
+      item.sql.trimStart().startsWith('update jobs'));
+    expect(update?.params).not.toContain(`unsafe ${FINANCIAL_ADMIN_LEASE_CAPABILITY}`);
+    expect(update?.params).toContain('Financial administrator job failure');
   });
 });

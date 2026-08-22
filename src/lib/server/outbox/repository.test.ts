@@ -6,12 +6,14 @@ import type { JsonObject, OutboxMessageRow } from '$lib/server/db/schema';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
 
 const jobMock = vi.hoisted(() => ({
-  enqueue: vi.fn(),
+  enqueueFull: vi.fn(),
+  enqueueReference: vi.fn(),
   rows: new Map<string, { id: string }>()
 }));
 
 vi.mock('$lib/server/jobs/repository', () => ({
-  enqueueJob: jobMock.enqueue
+  enqueueJob: jobMock.enqueueFull,
+  enqueueJobReference: jobMock.enqueueReference
 }));
 
 import {
@@ -150,8 +152,9 @@ function stableInput(
 describe('enqueueOutboxMessage stable deduplication', () => {
   beforeEach(() => {
     jobMock.rows.clear();
-    jobMock.enqueue.mockReset();
-    jobMock.enqueue.mockImplementation(async (_transaction, input) => {
+    jobMock.enqueueFull.mockReset();
+    jobMock.enqueueReference.mockReset();
+    jobMock.enqueueReference.mockImplementation(async (_transaction, input) => {
       const key = input.deduplicationKey as string;
       const existing = jobMock.rows.get(key);
       if (existing) return existing;
@@ -199,9 +202,10 @@ describe('enqueueOutboxMessage stable deduplication', () => {
     expect(transaction.messages).toHaveLength(1);
     expect(transaction.safeSelectCount).toBe(2);
     expect(jobMock.rows).toHaveLength(1);
-    expect(jobMock.enqueue).toHaveBeenCalledTimes(1);
+    expect(jobMock.enqueueReference).toHaveBeenCalledTimes(1);
+    expect(jobMock.enqueueFull).not.toHaveBeenCalled();
     expect(transaction.advisoryLockCount).toBe(2);
-    expect(jobMock.enqueue).toHaveBeenLastCalledWith(
+    expect(jobMock.enqueueReference).toHaveBeenLastCalledWith(
       expect.anything(),
       expect.objectContaining({
         deduplicationKey: `outbox-key:${createHash('sha256').update(key).digest('hex')}`,

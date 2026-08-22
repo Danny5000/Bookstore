@@ -1,4 +1,5 @@
-import { and, eq, sql, type SQL } from 'drizzle-orm';
+import { randomBytes } from 'node:crypto';
+import { eq, sql, type SQL } from 'drizzle-orm';
 import type { JobConfig } from '$lib/server/config/schema';
 import type { Database } from '$lib/server/db/client';
 import { jobs, type JsonObject, type JsonValue, type JobRow } from '$lib/server/db/schema';
@@ -27,6 +28,10 @@ export interface EnqueueJobInput {
   deduplicationKey?: string | null;
   runAt?: Date;
   maxAttempts?: number;
+}
+
+export interface EnqueuedJobReference {
+  readonly id: string;
 }
 
 export type EnqueueActiveEntityJobInput =
@@ -316,6 +321,27 @@ export async function enqueueJob(
   return existing;
 }
 
+export async function enqueueJobReference(
+  database: DatabaseExecutor,
+  input: EnqueueJobInput
+): Promise<EnqueuedJobReference> {
+  const result = await database.execute<{ id: string }>(
+    jobReferenceInsertQuery(input)
+  );
+  const row = result.rows[0];
+  if (!row) {
+    if (!input.deduplicationKey) throw new Error('Job reference could not be recovered');
+    const [replayed] = await database
+      .select({ id: jobs.id })
+      .from(jobs)
+      .where(eq(jobs.deduplicationKey, input.deduplicationKey))
+      .limit(1);
+    if (!replayed) throw new Error('Job reference could not be recovered');
+    return replayed;
+  }
+  return { id: row.id };
+}
+
 export function jobInsertQuery(input: EnqueueJobInput): SQL {
   const canonicalPayload = JSON.stringify(input.payload);
   return sql`
@@ -330,6 +356,32 @@ export function jobInsertQuery(input: EnqueueJobInput): SQL {
     )
     on conflict ("deduplication_key") do nothing
     returning "id"
+  `;
+}
+
+export function jobReferenceInsertQuery(input: EnqueueJobInput): SQL {
+  const canonicalPayload = JSON.stringify(input.payload);
+  return sql`
+    with inserted as (
+      insert into "public"."jobs" (
+        "type", "payload", "deduplication_key", "run_at", "max_attempts"
+      ) values (
+        ${input.type}::text,
+        ${canonicalPayload}::jsonb,
+        ${input.deduplicationKey ?? null}::text,
+        coalesce(${input.runAt ?? null}::timestamptz, pg_catalog.now()),
+        ${input.maxAttempts ?? 5}::integer
+      )
+      on conflict ("deduplication_key") do nothing
+      returning "id"
+    )
+    select "id" from inserted
+    union all
+    select "id"
+    from "public"."jobs"
+    where "deduplication_key" = ${input.deduplicationKey ?? null}::text
+      and not exists (select 1 from inserted)
+    limit 1
   `;
 }
 
@@ -480,6 +532,116 @@ interface ClaimedJobRow extends Record<string, unknown> {
   lockedBy: string;
 }
 
+interface LockedClaimCandidate extends ClaimedJobRow {
+  status: JobRow['status'];
+  runAt: Date;
+  lockedAt: Date | null;
+  lastError: string | null;
+  rerunRequestedAt: Date | null;
+  priorStatus: 'pending' | 'running';
+  hadRerunRequest: boolean;
+}
+
+interface LockedOwnedJob extends ClaimedJobRow {
+  status: 'running';
+  runAt: Date;
+  lockedAt: Date;
+  lastError: string | null;
+  rerunRequestedAt: Date | null;
+}
+
+type FinancialAdminCapabilitySource = () => string;
+
+const FINANCIAL_ADMIN_COMMAND_JOB = 'commerce.financial-admin-command';
+const FINANCIAL_ADMIN_LEASE_CAPABILITY_PATTERN = /^[A-Za-z0-9_-]{43}$/u;
+const FINANCIAL_ADMIN_LEASE_LOCK_PREFIX =
+  'pale-orbit:plan6bii-financial-admin-job-lease:';
+
+async function queryRows<T>(
+  transaction: DatabaseTransaction,
+  query: SQL
+): Promise<T[]> {
+  const result = await transaction.execute(query) as QueryResult;
+  return (result.rows ?? []) as T[];
+}
+
+function createFinancialAdminLeaseCapability(
+  source: FinancialAdminCapabilitySource
+): string {
+  const capability = source();
+  if (!FINANCIAL_ADMIN_LEASE_CAPABILITY_PATTERN.test(capability)) {
+    throw new Error('Financial administrator job lease capability generation failed');
+  }
+  return capability;
+}
+
+async function setFinancialAdminLeaseContext(
+  transaction: DatabaseTransaction,
+  capability: string,
+  leaseDurationMs?: number
+): Promise<void> {
+  if (leaseDurationMs === undefined) {
+    await transaction.execute(sql`
+      select pg_catalog.set_config(
+        'pale_orbit.plan6bii_financial_admin_job_capability',
+        ${capability},
+        true
+      )
+    `);
+    return;
+  }
+  await transaction.execute(sql`
+    select
+      pg_catalog.set_config(
+        'pale_orbit.plan6bii_financial_admin_job_capability',
+        ${capability},
+        true
+      ),
+      pg_catalog.set_config(
+        'pale_orbit.plan6bii_financial_admin_job_lease_duration_ms',
+        ${String(leaseDurationMs)},
+        true
+      )
+  `);
+}
+
+async function lockFinancialAdminLease(
+  transaction: DatabaseTransaction,
+  jobId: string,
+  mode: 'shared' | 'exclusive'
+): Promise<void> {
+  if (mode === 'shared') {
+    await transaction.execute(sql`
+      select pg_catalog.pg_advisory_xact_lock_shared(
+        pg_catalog.hashtextextended(
+          '${sql.raw(FINANCIAL_ADMIN_LEASE_LOCK_PREFIX)}' || ${jobId}::text,
+          0
+        )
+      )
+    `);
+    return;
+  }
+  await transaction.execute(sql`
+    select pg_catalog.pg_advisory_xact_lock(
+      pg_catalog.hashtextextended(
+        '${sql.raw(FINANCIAL_ADMIN_LEASE_LOCK_PREFIX)}' || ${jobId}::text,
+        0
+      )
+    )
+  `);
+}
+
+function errorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== 'object') return undefined;
+  const direct = Reflect.get(error, 'code');
+  if (typeof direct === 'string') return direct;
+  return errorCode(Reflect.get(error, 'cause'));
+}
+
+function financialAdminAuthorityFailure(): Error {
+  return new Error('Financial administrator job lease authority failed');
+}
+
 export function createPostgresJobRepository(
   database: Database,
   config: JobConfig,
@@ -488,7 +650,9 @@ export function createPostgresJobRepository(
   classificationImplementation: FinancialClassificationImplementationVersion = {
     classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
     allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
-  }
+  },
+  financialAdminCapabilitySource: FinancialAdminCapabilitySource = () =>
+    randomBytes(32).toString('base64url')
 ): JobRepository {
   if (claimPolicy !== 'all' && claimPolicy !== 'local-only') {
     throw new Error('Invalid job claim policy');
@@ -502,6 +666,10 @@ export function createPostgresJobRepository(
     classificationImplementation.allocationAlgorithmVersion < 1 ||
     classificationImplementation.allocationAlgorithmVersion > 2_147_483_647) {
     throw new Error('Invalid financial classification implementation version');
+  }
+  if (!Number.isSafeInteger(config.leaseMs) ||
+    config.leaseMs < 1 || config.leaseMs > 86_400_000) {
+    throw new Error('Invalid job lease duration');
   }
   const claimProviderBackedJobs = claimPolicy === 'all';
   const policyAllowsJob = sql`(
@@ -673,185 +841,432 @@ export function createPostgresJobRepository(
     async claimNext(workerId): Promise<JobRecord | null> {
       const claimedAt = now();
       const expiredBefore = new Date(claimedAt.getTime() - config.leaseMs);
-      const result = await database.execute<ClaimedJobRow>(sql`
-        with exhausted as (
-          update jobs
-          set status = case when rerun_requested_at is null then 'failed'::job_status
-                            else 'pending'::job_status end,
-              run_at = case when rerun_requested_at is null then run_at else ${claimedAt} end,
-              attempts = case when rerun_requested_at is null then attempts else 0 end,
-              locked_at = null,
-              locked_by = null,
-              last_error = case when rerun_requested_at is null
-                then coalesce(last_error, 'Job lease expired after final attempt') else null end,
-              rerun_requested_at = null,
-              completed_at = case when rerun_requested_at is null
-                then ${claimedAt}::timestamptz else null::timestamptz end,
-              updated_at = ${claimedAt}
-          where status = 'running'
-            and locked_at <= ${expiredBefore}
-            and attempts >= max_attempts
-            and (${claimableJob})
-          returning id
-        ), candidate as (
-          select id, status as prior_status,
-            rerun_requested_at is not null as had_rerun_request
-          from jobs
-          where (
-            (
-              status = 'pending'
-              and run_at <= ${claimedAt}
-              and attempts < max_attempts
-            ) or (
-              status = 'running'
-              and locked_at <= ${expiredBefore}
-              and attempts < max_attempts
-            )
-          ) and (${claimableJob})
-          order by run_at asc, created_at asc
-          for update skip locked
-          limit 1
-        )
-        update jobs
-        set status = 'running',
-            attempts = case
-              when candidate.prior_status = 'running' and candidate.had_rerun_request then 1
-              else jobs.attempts + 1
-            end,
-            locked_at = ${claimedAt},
-            locked_by = ${workerId},
-            rerun_requested_at = case when candidate.prior_status = 'running'
-              then null else jobs.rerun_requested_at end,
-            last_error = case
-              when candidate.prior_status = 'running' and candidate.had_rerun_request then null
-              else jobs.last_error
-            end,
-            updated_at = ${claimedAt}
-        from candidate
-        where jobs.id = candidate.id
-        returning jobs.id,
-                  jobs.type,
-                  jobs.payload,
-                  jobs.deduplication_key as "deduplicationKey",
-                  jobs.attempts,
-                  jobs.max_attempts as "maxAttempts",
-                  jobs.locked_by as "lockedBy"
-      `);
-      return result.rows[0] ?? null;
+      let financialAdminPath = false;
+      try {
+        return await withTransaction(database, async (transaction) => {
+          const [candidate] = await queryRows<LockedClaimCandidate>(transaction, sql`
+            select
+              jobs.id,
+              jobs.type,
+              jobs.payload,
+              jobs.deduplication_key as "deduplicationKey",
+              jobs.status,
+              jobs.run_at as "runAt",
+              jobs.attempts,
+              jobs.max_attempts as "maxAttempts",
+              jobs.locked_at as "lockedAt",
+              jobs.locked_by as "lockedBy",
+              jobs.last_error as "lastError",
+              jobs.rerun_requested_at as "rerunRequestedAt",
+              jobs.status as "priorStatus",
+              jobs.rerun_requested_at is not null as "hadRerunRequest"
+            from jobs
+            where (
+              (
+                jobs.status = 'pending'
+                and (
+                  (
+                    jobs.type = ${FINANCIAL_ADMIN_COMMAND_JOB}
+                    and jobs.run_at <= pg_catalog.clock_timestamp()
+                  ) or (
+                    jobs.type <> ${FINANCIAL_ADMIN_COMMAND_JOB}
+                    and jobs.run_at <= ${claimedAt}
+                  )
+                )
+                and jobs.attempts < jobs.max_attempts
+              ) or (
+                jobs.status = 'running'
+                and (
+                  (
+                    jobs.type = ${FINANCIAL_ADMIN_COMMAND_JOB}
+                    and jobs.run_at <= pg_catalog.clock_timestamp()
+                  ) or (
+                    jobs.type <> ${FINANCIAL_ADMIN_COMMAND_JOB}
+                    and jobs.locked_at <= ${expiredBefore}
+                  )
+                )
+              )
+            ) and (${claimableJob})
+            order by jobs.run_at asc, jobs.created_at asc, jobs.id asc
+            for update skip locked
+            limit 1
+          `);
+          if (!candidate) return null;
+
+          const isFinancialAdmin = candidate.type === FINANCIAL_ADMIN_COMMAND_JOB;
+          financialAdminPath = isFinancialAdmin;
+          const isExpiredFinalAttempt = candidate.priorStatus === 'running' &&
+            candidate.attempts >= candidate.maxAttempts &&
+            !candidate.hadRerunRequest;
+
+          if (isExpiredFinalAttempt) {
+            if (isFinancialAdmin) {
+              const capability = createFinancialAdminLeaseCapability(
+                financialAdminCapabilitySource
+              );
+              await setFinancialAdminLeaseContext(
+                transaction,
+                capability,
+                config.leaseMs
+              );
+              await lockFinancialAdminLease(transaction, candidate.id, 'exclusive');
+              const adopted = await queryRows<{ id: string }>(transaction, sql`
+                update jobs
+                set locked_at = pg_catalog.clock_timestamp(),
+                    locked_by = ${workerId},
+                    rerun_requested_at = null,
+                    updated_at = pg_catalog.clock_timestamp()
+                where id = ${candidate.id}::uuid
+                  and type = ${FINANCIAL_ADMIN_COMMAND_JOB}
+                  and status = 'running'
+                  and attempts = ${candidate.attempts}
+                  and attempts >= max_attempts
+                returning id
+              `);
+              if (adopted.length !== 1) return null;
+              const [terminalCommand] = await queryRows<{
+                status: 'pending' | 'succeeded' | 'denied' | 'conflict' | 'failed';
+              }>(transaction, sql`
+                select command.status
+                from financial_admin_commands command
+                where command.job_id = ${candidate.id}::uuid
+                for update
+              `);
+              if (!terminalCommand) throw financialAdminAuthorityFailure();
+              const terminalJobStatus = terminalCommand.status === 'succeeded'
+                ? 'succeeded'
+                : 'failed';
+              const terminalStatusSql = terminalJobStatus === 'succeeded'
+                ? sql`'succeeded'::job_status`
+                : sql`'failed'::job_status`;
+              const terminalError = terminalJobStatus === 'succeeded'
+                ? sql`null::text`
+                : sql`'Job lease expired after final attempt'`;
+              const terminal = await queryRows<{ id: string }>(transaction, sql`
+                update jobs
+                set status = ${terminalStatusSql},
+                    locked_at = null,
+                    locked_by = null,
+                    last_error = ${terminalError},
+                    rerun_requested_at = null,
+                    completed_at = pg_catalog.clock_timestamp(),
+                    updated_at = pg_catalog.clock_timestamp()
+                where id = ${candidate.id}::uuid
+                  and type = ${FINANCIAL_ADMIN_COMMAND_JOB}
+                  and status = 'running'
+                  and locked_by = ${workerId}
+                  and attempts = ${candidate.attempts}
+                returning id
+              `);
+              if (terminal.length !== 1) return null;
+              return null;
+            }
+
+            await transaction.execute(sql`
+              update jobs
+              set status = case when rerun_requested_at is null
+                    then 'failed'::job_status else 'pending'::job_status end,
+                  run_at = case when rerun_requested_at is null
+                    then run_at else ${claimedAt} end,
+                  attempts = case when rerun_requested_at is null then attempts else 0 end,
+                  locked_at = null,
+                  locked_by = null,
+                  last_error = case when rerun_requested_at is null
+                    then pg_catalog.coalesce(
+                      last_error,
+                      'Job lease expired after final attempt'
+                    ) else null end,
+                  rerun_requested_at = null,
+                  completed_at = case when rerun_requested_at is null
+                    then ${claimedAt}::timestamptz else null::timestamptz end,
+                  updated_at = ${claimedAt}
+              where id = ${candidate.id}::uuid
+                and status = 'running'
+                and locked_by = ${candidate.lockedBy}
+                and attempts = ${candidate.attempts}
+                and attempts >= max_attempts
+            `);
+            return null;
+          }
+
+          let capability: string | undefined;
+          if (isFinancialAdmin) {
+            capability = createFinancialAdminLeaseCapability(
+              financialAdminCapabilitySource
+            );
+            await setFinancialAdminLeaseContext(
+              transaction,
+              capability,
+              config.leaseMs
+            );
+            await lockFinancialAdminLease(transaction, candidate.id, 'exclusive');
+          }
+          const lockTimestamp = isFinancialAdmin
+            ? sql`pg_catalog.clock_timestamp()`
+            : sql`${claimedAt}`;
+          const claimed = await queryRows<ClaimedJobRow>(transaction, sql`
+            update jobs
+            set status = 'running',
+                attempts = case
+                  when ${candidate.priorStatus} = 'running' and
+                    ${candidate.hadRerunRequest} then 1
+                  else jobs.attempts + 1
+                end,
+                locked_at = ${lockTimestamp},
+                locked_by = ${workerId},
+                rerun_requested_at = case when ${candidate.priorStatus} = 'running'
+                  then null else jobs.rerun_requested_at end,
+                last_error = case
+                  when ${candidate.priorStatus} = 'running' and
+                    ${candidate.hadRerunRequest} then null
+                  else jobs.last_error
+                end,
+                updated_at = ${lockTimestamp}
+            where jobs.id = ${candidate.id}::uuid
+              and jobs.status = ${candidate.priorStatus}::job_status
+              and jobs.attempts = ${candidate.attempts}
+              and (
+                jobs.attempts < jobs.max_attempts
+                or (
+                  ${candidate.priorStatus} = 'running'
+                  and ${candidate.hadRerunRequest}
+                  and jobs.rerun_requested_at is not null
+                  and jobs.attempts = jobs.max_attempts
+                )
+              )
+            returning jobs.id,
+                      jobs.type,
+                      jobs.payload,
+                      jobs.deduplication_key as "deduplicationKey",
+                      jobs.attempts,
+                      jobs.max_attempts as "maxAttempts",
+                      jobs.locked_by as "lockedBy"
+          `);
+          const record = claimed[0];
+          if (!record) return null;
+          return capability === undefined
+            ? record
+            : { ...record, financialAdminLeaseCapability: capability };
+        });
+      } catch (error: unknown) {
+        if (!financialAdminPath) throw error;
+        if (errorCode(error) === '55000') return null;
+        throw financialAdminAuthorityFailure();
+      }
     },
 
-    async renewLease(jobId, workerId): Promise<boolean> {
-      const renewedAt = now();
-      const [renewed] = await database
-        .update(jobs)
-        .set({ lockedAt: renewedAt, updatedAt: renewedAt })
-        .where(
-          and(
-            eq(jobs.id, jobId),
-            eq(jobs.status, 'running'),
-            eq(jobs.lockedBy, workerId)
-          )
-        )
-        .returning({ id: jobs.id });
-      return renewed !== undefined;
+    async renewLease(jobId, workerId, capability): Promise<boolean> {
+      let financialAdminPath = false;
+      try {
+        return await withTransaction(database, async (transaction) => {
+          const [job] = await queryRows<LockedOwnedJob>(transaction, sql`
+            select id, type, payload,
+              deduplication_key as "deduplicationKey",
+              status, run_at as "runAt", attempts,
+              max_attempts as "maxAttempts", locked_at as "lockedAt",
+              locked_by as "lockedBy", last_error as "lastError",
+              rerun_requested_at as "rerunRequestedAt"
+            from jobs
+            where id = ${jobId}::uuid
+              and status = 'running'
+              and locked_by = ${workerId}
+            for update
+          `);
+          if (!job) return false;
+          financialAdminPath = job.type === FINANCIAL_ADMIN_COMMAND_JOB;
+          if (!financialAdminPath) {
+            const renewedAt = now();
+            const renewed = await queryRows<{ id: string }>(transaction, sql`
+              update jobs
+              set locked_at = ${renewedAt}, updated_at = ${renewedAt}
+              where id = ${job.id}::uuid
+                and status = 'running'
+                and locked_by = ${workerId}
+              returning id
+            `);
+            return renewed.length === 1;
+          }
+          if (capability === undefined ||
+            !FINANCIAL_ADMIN_LEASE_CAPABILITY_PATTERN.test(capability)) return false;
+          await setFinancialAdminLeaseContext(transaction, capability);
+          await lockFinancialAdminLease(transaction, job.id, 'shared');
+          const renewed = await queryRows<{ id: string }>(transaction, sql`
+            update jobs
+            set locked_at = pg_catalog.clock_timestamp(),
+                updated_at = pg_catalog.clock_timestamp()
+            where id = ${job.id}::uuid
+              and type = ${FINANCIAL_ADMIN_COMMAND_JOB}
+              and status = 'running'
+              and locked_by = ${workerId}
+              and attempts = ${job.attempts}
+            returning id
+          `);
+          return renewed.length === 1;
+        });
+      } catch (error: unknown) {
+        if (!financialAdminPath) throw error;
+        if (errorCode(error) === '55000') return false;
+        throw financialAdminAuthorityFailure();
+      }
     },
 
-    async complete(jobId, workerId): Promise<boolean> {
-      return withTransaction(database, async (transaction) => {
-        const [job] = await transaction
-          .select()
-          .from(jobs)
-          .where(
-            and(
-              eq(jobs.id, jobId),
-              eq(jobs.status, 'running'),
-              eq(jobs.lockedBy, workerId)
-            )
-          )
-          .for('update')
-          .limit(1);
-        if (!job) return false;
-        const completedAt = now();
-        await transaction
-          .update(jobs)
-          .set(job.rerunRequestedAt === null ? {
-            status: 'succeeded',
-            completedAt,
-            lockedAt: null,
-            lockedBy: null,
-            lastError: null,
-            updatedAt: completedAt
-          } : {
-            status: 'pending',
-            runAt: completedAt,
-            attempts: 0,
-            completedAt: null,
-            lockedAt: null,
-            lockedBy: null,
-            lastError: null,
-            rerunRequestedAt: null,
-            updatedAt: completedAt
-          })
-          .where(eq(jobs.id, job.id));
-        return true;
-      });
+    async complete(jobId, workerId, capability): Promise<boolean> {
+      let financialAdminPath = false;
+      try {
+        return await withTransaction(database, async (transaction) => {
+          const [job] = await queryRows<LockedOwnedJob>(transaction, sql`
+            select id, type, payload,
+              deduplication_key as "deduplicationKey",
+              status, run_at as "runAt", attempts,
+              max_attempts as "maxAttempts", locked_at as "lockedAt",
+              locked_by as "lockedBy", last_error as "lastError",
+              rerun_requested_at as "rerunRequestedAt"
+            from jobs
+            where id = ${jobId}::uuid
+              and status = 'running'
+              and locked_by = ${workerId}
+            for update
+          `);
+          if (!job) return false;
+          financialAdminPath = job.type === FINANCIAL_ADMIN_COMMAND_JOB;
+          if (financialAdminPath) {
+            if (capability === undefined ||
+              !FINANCIAL_ADMIN_LEASE_CAPABILITY_PATTERN.test(capability)) return false;
+            await setFinancialAdminLeaseContext(transaction, capability);
+            await lockFinancialAdminLease(transaction, job.id, 'exclusive');
+          }
+          const completedAt = now();
+          const timestamp = financialAdminPath
+            ? sql`pg_catalog.clock_timestamp()`
+            : sql`${completedAt}`;
+          const completed = job.rerunRequestedAt === null
+            ? await queryRows<{ id: string }>(transaction, sql`
+                update jobs
+                set status = 'succeeded',
+                    completed_at = ${timestamp},
+                    locked_at = null,
+                    locked_by = null,
+                    last_error = null,
+                    updated_at = ${timestamp}
+                where id = ${job.id}::uuid
+                  and status = 'running'
+                  and locked_by = ${workerId}
+                  and attempts = ${job.attempts}
+                returning id
+              `)
+            : await queryRows<{ id: string }>(transaction, sql`
+                update jobs
+                set status = 'pending',
+                    run_at = ${timestamp},
+                    attempts = 0,
+                    completed_at = null,
+                    locked_at = null,
+                    locked_by = null,
+                    last_error = null,
+                    rerun_requested_at = null,
+                    updated_at = ${timestamp}
+                where id = ${job.id}::uuid
+                  and status = 'running'
+                  and locked_by = ${workerId}
+                  and attempts = ${job.attempts}
+                returning id
+              `);
+          return completed.length === 1;
+        });
+      } catch (error: unknown) {
+        if (!financialAdminPath) throw error;
+        if (errorCode(error) === '55000') return false;
+        throw financialAdminAuthorityFailure();
+      }
     },
 
-    async fail(jobId, workerId, safeError, retryable): Promise<boolean> {
-      return withTransaction(database, async (transaction) => {
-        const [job] = await transaction
-          .select()
-          .from(jobs)
-          .where(
-            and(
-              eq(jobs.id, jobId),
-              eq(jobs.status, 'running'),
-              eq(jobs.lockedBy, workerId)
-            )
-          )
-          .for('update')
-          .limit(1);
-        if (!job) return false;
-
-        const failedAt = now();
-        if (job.rerunRequestedAt !== null) {
-          await transaction
-            .update(jobs)
-            .set({
-              status: 'pending',
-              runAt: failedAt,
-              attempts: 0,
-              lockedAt: null,
-              lockedBy: null,
-              lastError: null,
-              rerunRequestedAt: null,
-              completedAt: null,
-              updatedAt: failedAt
-            })
-            .where(eq(jobs.id, job.id));
-          return true;
-        }
-        const exhausted = !retryable || job.attempts >= job.maxAttempts;
-        const retryDelay = computeRetryDelayMs(
-          job.attempts,
-          config.retryBaseMs,
-          config.retryMaxMs
-        );
-
-        await transaction
-          .update(jobs)
-          .set({
-            status: exhausted ? 'failed' : 'pending',
-            runAt: exhausted ? job.runAt : new Date(failedAt.getTime() + retryDelay),
-            lockedAt: null,
-            lockedBy: null,
-            lastError: safeError.slice(0, 1000),
-            completedAt: exhausted ? failedAt : null,
-            updatedAt: failedAt
-          })
-          .where(eq(jobs.id, job.id));
-        return true;
-      });
+    async fail(jobId, workerId, safeError, retryable, capability): Promise<boolean> {
+      let financialAdminPath = false;
+      try {
+        return await withTransaction(database, async (transaction) => {
+          const [job] = await queryRows<LockedOwnedJob>(transaction, sql`
+            select id, type, payload,
+              deduplication_key as "deduplicationKey",
+              status, run_at as "runAt", attempts,
+              max_attempts as "maxAttempts", locked_at as "lockedAt",
+              locked_by as "lockedBy", last_error as "lastError",
+              rerun_requested_at as "rerunRequestedAt"
+            from jobs
+            where id = ${jobId}::uuid
+              and status = 'running'
+              and locked_by = ${workerId}
+            for update
+          `);
+          if (!job) return false;
+          financialAdminPath = job.type === FINANCIAL_ADMIN_COMMAND_JOB;
+          if (financialAdminPath) {
+            if (capability === undefined ||
+              !FINANCIAL_ADMIN_LEASE_CAPABILITY_PATTERN.test(capability)) return false;
+            await setFinancialAdminLeaseContext(transaction, capability);
+            await lockFinancialAdminLease(transaction, job.id, 'exclusive');
+          }
+          const failedAt = now();
+          const timestamp = financialAdminPath
+            ? sql`pg_catalog.clock_timestamp()`
+            : sql`${failedAt}`;
+          if (job.rerunRequestedAt !== null) {
+            const requeued = await queryRows<{ id: string }>(transaction, sql`
+              update jobs
+              set status = 'pending',
+                  run_at = ${timestamp},
+                  attempts = 0,
+                  locked_at = null,
+                  locked_by = null,
+                  last_error = null,
+                  rerun_requested_at = null,
+                  completed_at = null,
+                  updated_at = ${timestamp}
+              where id = ${job.id}::uuid
+                and status = 'running'
+                and locked_by = ${workerId}
+                and attempts = ${job.attempts}
+              returning id
+            `);
+            return requeued.length === 1;
+          }
+          const exhausted = !retryable || job.attempts >= job.maxAttempts;
+          const retryDelay = computeRetryDelayMs(
+            job.attempts,
+            config.retryBaseMs,
+            config.retryMaxMs
+          );
+          const boundedSafeError = financialAdminPath && capability !== undefined &&
+            safeError.includes(capability)
+            ? 'Financial administrator job failure'
+            : safeError.slice(0, 1000);
+          const runAt = exhausted
+            ? sql`${job.runAt}`
+            : financialAdminPath
+              ? sql`pg_catalog.clock_timestamp() +
+                  (${retryDelay}::double precision * interval '1 millisecond')`
+              : sql`${new Date(failedAt.getTime() + retryDelay)}`;
+          const failed = await queryRows<{ id: string }>(transaction, sql`
+            update jobs
+            set status = ${exhausted ? 'failed' : 'pending'}::job_status,
+                run_at = ${runAt},
+                locked_at = null,
+                locked_by = null,
+                last_error = ${boundedSafeError},
+                completed_at = ${exhausted ? timestamp : sql`null::timestamptz`},
+                updated_at = ${timestamp}
+            where id = ${job.id}::uuid
+              and status = 'running'
+              and locked_by = ${workerId}
+              and attempts = ${job.attempts}
+            returning id
+          `);
+          return failed.length === 1;
+        });
+      } catch (error: unknown) {
+        if (!financialAdminPath) throw error;
+        if (errorCode(error) === '55000') return false;
+        throw financialAdminAuthorityFailure();
+      }
     }
   };
 }

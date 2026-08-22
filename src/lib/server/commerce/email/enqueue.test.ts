@@ -59,10 +59,11 @@ function harness(initial = snapshot()) {
     return { id: randomUUID() } as never;
   });
   const enqueueJob = vi.fn(async () => ({ id: randomUUID() }) as never);
+  const enqueueJobReference = vi.fn(async () => ({ id: randomUUID() }) as never);
   const loadReceiptSnapshot = vi.fn(async () => current);
   const enqueuer = createCommerceMessageEnqueuer(origin, {
     enqueueOutboxMessage,
-    enqueueJob,
+    enqueueJob: enqueueJobReference,
     loadReceiptSnapshot
   });
   return {
@@ -70,6 +71,7 @@ function harness(initial = snapshot()) {
     enqueuer,
     enqueueOutboxMessage,
     enqueueJob,
+    enqueueJobReference,
     loadReceiptSnapshot,
     setSnapshot(value: ReceiptSnapshot) { current = value; }
   };
@@ -117,13 +119,14 @@ describe('transactional commerce email enqueue', () => {
     const orderId = randomUUID();
     await test.enqueuer.enqueueGuestClaimPreparation(transaction, orderId);
 
-    expect(test.enqueueJob).toHaveBeenCalledWith(transaction, {
+    expect(test.enqueueJobReference).toHaveBeenCalledWith(transaction, {
       type: COMMERCE_CLAIM_EMAIL_JOB,
       payload: { orderId },
       deduplicationKey: `commerce:claim-email:order:${orderId}:v1`,
       maxAttempts: 8
     });
-    expect(JSON.stringify(test.enqueueJob.mock.calls)).not.toContain('@');
+    expect(test.enqueueJob).not.toHaveBeenCalled();
+    expect(JSON.stringify(test.enqueueJobReference.mock.calls)).not.toContain('@');
     expect(test.enqueueOutboxMessage).not.toHaveBeenCalled();
   });
 

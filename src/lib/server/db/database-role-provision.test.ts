@@ -1,10 +1,18 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   databaseEnvironmentForRole,
+  loadDatabaseMigrationIdentityConfig,
   loadDatabaseRoleProvisionConfig,
   provisionDatabaseRoles,
+  type DatabaseMigrationIdentityConfig,
   type DatabaseRoleProvisionClient
 } from './database-role-provision';
+
+function assertMigrationIdentityConfigType(
+  _config: DatabaseMigrationIdentityConfig
+): void {
+  // Compile-time fixture: the public type and loader export must agree once implemented.
+}
 
 const secret = (character: string) => character.repeat(40);
 const safeGroup = (rolname: string) => ({
@@ -59,6 +67,28 @@ const environment = (overrides: Record<string, string | undefined> = {}) => ({
   ...overrides
 });
 
+function captureSynchronousError(callback: () => unknown): Error {
+  try {
+    callback();
+  } catch (error) {
+    expect(error).toBeInstanceOf(Error);
+    return error as Error;
+  }
+  throw new Error('expected callback to fail');
+}
+
+function errorChainText(error: Error): string {
+  const messages: string[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  while (current instanceof Error && !seen.has(current)) {
+    seen.add(current);
+    messages.push(current.message);
+    current = current.cause;
+  }
+  return messages.join('\n');
+}
+
 const derivedCatalogTables = [
   'prose_sections', 'prose_images', 'prose_blocks', 'comic_pages',
   'revision_cover_suggestions', 'revision_ingestion_warnings'
@@ -95,6 +125,8 @@ const runtimeColumnPrivileges = [
   'jobs:INSERT:deduplication_key',
   'jobs:INSERT:run_at',
   'jobs:INSERT:max_attempts',
+  'jobs:SELECT:id',
+  'jobs:SELECT:deduplication_key',
   'guest_identities:INSERT:email',
   'guest_identities:UPDATE:updated_at',
   'outbox_messages:INSERT:id',
@@ -136,8 +168,20 @@ const workerColumnPrivileges = [
   'outbox_messages:UPDATE:last_error',
   'outbox_messages:UPDATE:delivered_at',
   'outbox_messages:UPDATE:updated_at',
-  'refund_allocation_drafts:UPDATE:id',
-  'refund_allocation_draft_items:UPDATE:id',
+  'financial_admin_commands:UPDATE:status',
+  'financial_admin_commands:UPDATE:safe_result_code',
+  'financial_admin_commands:UPDATE:safe_result',
+  'financial_admin_commands:UPDATE:updated_at',
+  'financial_admin_commands:UPDATE:completed_at',
+  'refund_allocation_drafts:UPDATE:state',
+  'refund_allocation_drafts:UPDATE:version',
+  'refund_allocation_drafts:UPDATE:updated_by_admin_id',
+  'refund_allocation_drafts:UPDATE:updated_correlation_id',
+  'refund_allocation_drafts:UPDATE:updated_at',
+  'refund_allocation_drafts:UPDATE:finalized_at',
+  'refund_allocation_drafts:UPDATE:discarded_at',
+  'refund_allocation_draft_items:UPDATE:proposed_total_presentment_minor',
+  'refund_allocation_draft_items:UPDATE:updated_at',
   'refund_allocations:UPDATE:id',
   'refund_allocation_components:UPDATE:id',
   'refund_reporting_correction_sets:UPDATE:id',
@@ -153,10 +197,250 @@ const workerColumnPrivileges = [
 
 const publicSensitiveSelectColumns = [
   'outbox_messages:payload',
-  'commerce_claim_issuances:*'
+  'commerce_claim_issuances:*',
+  'financial_admin_commands:*',
+  'financial_admin_job_claims:*',
+  'jobs:*'
 ] as const;
 
 describe('database role provisioning', () => {
+  describe('migration login identity transport', () => {
+    it('prefers the three dedicated non-secret names over ordinary application names', () => {
+      const config = loadDatabaseMigrationIdentityConfig(environment({
+        DATABASE_MIGRATION_WEB_USER: 'migration_attested_web',
+        DATABASE_MIGRATION_WORKER_USER: 'migration_attested_worker',
+        DATABASE_MIGRATION_STORAGE_CLEANUP_USER: 'migration_attested_cleanup',
+        DATABASE_USER: 'ordinary_web',
+        DATABASE_WORKER_USER: 'ordinary_worker',
+        DATABASE_STORAGE_CLEANUP_USER: 'ordinary_cleanup'
+      }));
+      assertMigrationIdentityConfigType(config);
+
+      expect(config).toEqual({
+        webUser: 'migration_attested_web',
+        workerUser: 'migration_attested_worker',
+        storageCleanupUser: 'migration_attested_cleanup'
+      });
+      expect(Object.keys(config).sort()).toEqual([
+        'storageCleanupUser',
+        'webUser',
+        'workerUser'
+      ]);
+      expect(JSON.stringify(config)).not.toMatch(/password|_file/iu);
+    });
+
+    it('falls back only to direct ordinary login names when dedicated names are absent', () => {
+      expect(loadDatabaseMigrationIdentityConfig(environment())).toEqual({
+        webUser: 'pale_orbit_web',
+        workerUser: 'pale_orbit_worker_login',
+        storageCleanupUser: 'pale_orbit_storage_cleanup_login'
+      });
+    });
+
+    it.each([
+      ['web', 'DATABASE_MIGRATION_WEB_USER_FILE'],
+      ['worker', 'DATABASE_MIGRATION_WORKER_USER_FILE'],
+      ['storage cleanup', 'DATABASE_MIGRATION_STORAGE_CLEANUP_USER_FILE']
+    ])('rejects an invented %s migration-name file even when every direct name is valid', (
+      _label,
+      inventedFileName
+    ) => {
+      const privatePath = `/run/secrets/private-${inventedFileName.toLowerCase()}`;
+      const readSecretFile = vi.fn((_path: string) => 'file_supplied_login');
+      const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      try {
+        const failure = captureSynchronousError(() => loadDatabaseMigrationIdentityConfig(environment({
+          DATABASE_MIGRATION_WEB_USER: 'migration_attested_web',
+          DATABASE_MIGRATION_WORKER_USER: 'migration_attested_worker',
+          DATABASE_MIGRATION_STORAGE_CLEANUP_USER: 'migration_attested_cleanup',
+          [inventedFileName]: privatePath
+        }), readSecretFile));
+        const observable = [
+          errorChainText(failure),
+          JSON.stringify([...info.mock.calls, ...warn.mock.calls, ...error.mock.calls])
+        ].join('\n');
+
+        expect(readSecretFile).not.toHaveBeenCalled();
+        expect(observable).not.toContain(privatePath);
+        expect(failure.message).toMatch(/migration.*login|attested.*login|migration identity/iu);
+      } finally {
+        info.mockRestore();
+        warn.mockRestore();
+        error.mockRestore();
+      }
+    });
+
+    it.each([
+      [
+        'web',
+        'DATABASE_MIGRATION_WEB_USER',
+        'DATABASE_USER',
+        'DATABASE_USER_FILE'
+      ],
+      [
+        'worker',
+        'DATABASE_MIGRATION_WORKER_USER',
+        'DATABASE_WORKER_USER',
+        'DATABASE_WORKER_USER_FILE'
+      ],
+      [
+        'storage cleanup',
+        'DATABASE_MIGRATION_STORAGE_CLEANUP_USER',
+        'DATABASE_STORAGE_CLEANUP_USER',
+        'DATABASE_STORAGE_CLEANUP_USER_FILE'
+      ]
+    ])('never resolves a missing %s attested login from an ordinary _FILE fallback', (
+      _label,
+      dedicatedName,
+      ordinaryName,
+      ordinaryFileName
+    ) => {
+      const readSecretFile = vi.fn((_path: string) => 'file_supplied_login');
+      const privatePath = `/run/secrets/${ordinaryFileName.toLowerCase()}`;
+      const source = environment({
+        [dedicatedName]: undefined,
+        [ordinaryName]: undefined,
+        [ordinaryFileName]: privatePath
+      });
+
+      const failure = captureSynchronousError(() =>
+        loadDatabaseMigrationIdentityConfig(source, readSecretFile)
+      );
+      expect(readSecretFile).not.toHaveBeenCalled();
+      expect(errorChainText(failure)).not.toContain(privatePath);
+      expect(failure.message).toMatch(/migration.*login|attested.*login|migration identity/iu);
+    });
+
+    it('accepts the exact 63-character PostgreSQL role-name boundary', () => {
+      const boundaryName = `a${'b'.repeat(62)}`;
+      expect(loadDatabaseMigrationIdentityConfig(environment({
+        DATABASE_MIGRATION_WEB_USER: boundaryName
+      })).webUser).toBe(boundaryName);
+    });
+
+    it.each([
+      ['present but empty dedicated web name', {
+        DATABASE_MIGRATION_WEB_USER: ''
+      }],
+      ['present but empty dedicated worker name', {
+        DATABASE_MIGRATION_WORKER_USER: ''
+      }],
+      ['present but empty dedicated cleanup name', {
+        DATABASE_MIGRATION_STORAGE_CLEANUP_USER: ''
+      }],
+      ['missing dedicated and direct web name', {
+        DATABASE_MIGRATION_WEB_USER: undefined,
+        DATABASE_USER: undefined
+      }],
+      ['uppercase role name', {
+        DATABASE_MIGRATION_WEB_USER: 'MigrationWeb'
+      }],
+      ['unsafe role grammar', {
+        DATABASE_MIGRATION_WORKER_USER: 'worker;set role'
+      }],
+      ['64-character role name', {
+        DATABASE_MIGRATION_WEB_USER: `a${'b'.repeat(63)}`
+      }],
+      ['reserved pg_ role', {
+        DATABASE_MIGRATION_STORAGE_CLEANUP_USER: 'pg_monitor'
+      }],
+      ['fixed runtime group', {
+        DATABASE_MIGRATION_WEB_USER: 'pale_orbit_runtime'
+      }],
+      ['fixed worker group', {
+        DATABASE_MIGRATION_WORKER_USER: 'pale_orbit_financial_worker'
+      }],
+      ['fixed cleanup group', {
+        DATABASE_MIGRATION_STORAGE_CLEANUP_USER: 'pale_orbit_storage_cleanup'
+      }],
+      ['duplicate web and worker names', {
+        DATABASE_MIGRATION_WEB_USER: 'migration_web',
+        DATABASE_MIGRATION_WORKER_USER: 'migration_web'
+      }],
+      ['duplicate worker and cleanup names', {
+        DATABASE_MIGRATION_WORKER_USER: 'migration_worker',
+        DATABASE_MIGRATION_STORAGE_CLEANUP_USER: 'migration_worker'
+      }],
+      ['duplicate web and cleanup names', {
+        DATABASE_MIGRATION_WEB_USER: 'migration_shared',
+        DATABASE_MIGRATION_STORAGE_CLEANUP_USER: 'migration_shared'
+      }],
+      ['database owner reused as web name', {
+        DATABASE_MIGRATION_WEB_USER: 'pale_orbit_owner'
+      }],
+      ['database owner reused as worker name', {
+        DATABASE_MIGRATION_WORKER_USER: 'pale_orbit_owner'
+      }],
+      ['database owner reused as cleanup name', {
+        DATABASE_MIGRATION_STORAGE_CLEANUP_USER: 'pale_orbit_owner'
+      }]
+    ])('rejects %s before migration', (_label, overrides) => {
+      expect(() => loadDatabaseMigrationIdentityConfig(environment(overrides)))
+        .toThrowError(/migration.*login|attested.*login|migration identity/iu);
+    });
+
+    it('resolves the owner identity only for distinctness without exposing owner credentials', () => {
+      const readSecretFile = vi.fn((path: string) => {
+        if (path === '/run/secrets/owner-user') return 'owner_from_file';
+        throw new Error(`unexpected secret read ${path}`);
+      });
+
+      expect(() => loadDatabaseMigrationIdentityConfig(environment({
+        DATABASE_OWNER_USER: undefined,
+        DATABASE_OWNER_USER_FILE: '/run/secrets/owner-user',
+        DATABASE_MIGRATION_WEB_USER: 'owner_from_file'
+      }), readSecretFile)).toThrowError(/migration.*login|attested.*login|migration identity/iu);
+      expect(readSecretFile).toHaveBeenCalledTimes(1);
+      expect(readSecretFile).toHaveBeenCalledWith('/run/secrets/owner-user');
+    });
+
+    it('keeps every login, credential, and file canary out of errors and logs', () => {
+      const canaries = [
+        'private_web_identity',
+        'private_worker_identity',
+        'private_cleanup_identity',
+        'private-owner-password',
+        'private-web-password',
+        'private-worker-password',
+        'private-cleanup-password',
+        '/run/secrets/private-migration-web-user',
+        '/run/secrets/private-migration-worker-user',
+        '/run/secrets/private-migration-cleanup-user'
+      ];
+      const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      try {
+        const failure = captureSynchronousError(() => loadDatabaseMigrationIdentityConfig(environment({
+          DATABASE_OWNER_USER: 'private_web_identity',
+          DATABASE_OWNER_PASSWORD: 'private-owner-password',
+          DATABASE_MIGRATION_WEB_USER: 'private_web_identity',
+          DATABASE_MIGRATION_WORKER_USER: 'private_worker_identity',
+          DATABASE_MIGRATION_STORAGE_CLEANUP_USER: 'private_cleanup_identity',
+          DATABASE_PASSWORD: 'private-web-password',
+          DATABASE_WORKER_PASSWORD: 'private-worker-password',
+          DATABASE_STORAGE_CLEANUP_PASSWORD: 'private-cleanup-password',
+          DATABASE_MIGRATION_WEB_USER_FILE: '/run/secrets/private-migration-web-user',
+          DATABASE_MIGRATION_WORKER_USER_FILE: '/run/secrets/private-migration-worker-user',
+          DATABASE_MIGRATION_STORAGE_CLEANUP_USER_FILE:
+            '/run/secrets/private-migration-cleanup-user'
+        })));
+        const observable = [
+          errorChainText(failure),
+          JSON.stringify([...info.mock.calls, ...warn.mock.calls, ...error.mock.calls])
+        ].join('\n');
+        expect(failure.message).toMatch(/migration.*login|attested.*login|migration identity/iu);
+        for (const canary of canaries) expect(observable).not.toContain(canary);
+      } finally {
+        info.mockRestore();
+        warn.mockRestore();
+        error.mockRestore();
+      }
+    });
+  });
+
   it('maps owner, worker, and storage-cleanup credentials onto the generic database contract', () => {
     const source: Record<string, string | undefined> = environment({
       DATABASE_PASSWORD_FILE: 'must-be-cleared',
@@ -361,6 +645,8 @@ describe('database role provisioning', () => {
       'entitlement_grants',
       'entitlements',
       'commerce_claim_issuances',
+      'financial_admin_commands',
+      'financial_admin_job_claims',
       ...derivedCatalogTables
     ]);
     expect(safety?.values?.[4]).toEqual([
@@ -369,6 +655,9 @@ describe('database role provisioning', () => {
       'financial_item_allocations',
       'financial_reconciliation_issues',
       'refund_allocation_components',
+      'refund_allocation_draft_items',
+      'refund_allocation_drafts',
+      'refund_allocation_finalization_effects',
       'refund_reporting_correction_items',
       'refund_reporting_correction_sets',
       'financial_classification_versions',
@@ -414,16 +703,27 @@ describe('database role provisioning', () => {
       'public.authorize_commerce_claim_issuance(text,text)',
       'public.claim_guest_purchases_after_authorization(text,text)',
       'public.outbox_message_exists_by_deduplication_key(text)',
-      'public.outbox_message_deduplication_metadata(text,text,jsonb)'
+      'public.outbox_message_deduplication_metadata(text,text,jsonb)',
+      'public.submit_financial_admin_command(uuid,text,text,text,text,jsonb)',
+      'public.financial_admin_command_status(uuid,uuid)',
+      'public.append_financial_issue_view_audit(uuid,uuid,text,text,text)',
+      'public.append_financial_refund_review_view_audit(uuid,uuid,text,text,text)',
+      'public.append_financial_payout_view_audit(uuid,uuid,text,text,text)',
+      'public.append_financial_sales_export_audit(uuid,text,text,integer,integer,integer,text,text)'
     ]);
     expect(safety?.values?.[10]).toEqual([
       'public.resolve_financial_issue_after_worker_recompute(uuid,text)',
       'public.register_commerce_claim_issuance(text,text,text,uuid,text,timestamp with time zone)',
-      'public.purge_commerce_claim_issuances()'
+      'public.purge_commerce_claim_issuances()',
+      'public.resolve_financial_issue_after_admin_command(uuid,uuid)',
+      'public.transition_administrative_recovery_grant_after_admin_command(uuid)'
     ]);
-    expect(safety?.values?.[11]).toEqual(['outbox_messages']);
+    expect(safety?.values?.[11]).toEqual([
+      'outbox_messages', 'financial_admin_commands', 'jobs'
+    ]);
     expect(safety?.values?.[12]).toEqual([
-      'commerce_claim_issuances', 'outbox_messages'
+      'commerce_claim_issuances', 'outbox_messages', 'financial_admin_commands',
+      'financial_admin_job_claims', 'jobs'
     ]);
     expect(safety?.values?.[13]).toEqual(publicSensitiveSelectColumns);
     expect(grants).toContain("privilege_row.privilege_type = 'SELECT'");
@@ -437,7 +737,17 @@ describe('database role provisioning', () => {
       /privilege_row\.object_kind = 'relation'\s+and privilege_row\.privilege_type = 'SELECT'\s+and exists \(\s+select 1\s+from pg_catalog\.pg_class sensitive_relation/u
     );
     expect(grants).toContain(
+      "'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN'"
+    );
+    expect(grants).toContain(
       'REVOKE ALL ON FUNCTION "public"."rearm_pending_stripe_event_job"(uuid) FROM "pale_orbit_web", "pale_orbit_worker_login"'
+    );
+    expect(safety?.values?.[11]).not.toContain('financial_admin_job_claims');
+    expect(safety?.values?.[9]).not.toContain(
+      'public.plan6bii_assert_financial_admin_job_lease(uuid)'
+    );
+    expect(safety?.values?.[10]).not.toContain(
+      'public.plan6bii_guard_financial_admin_job_lease()'
     );
     expect(statements.map(({ text }) => text).join('\n')).not.toContain(secret('w'));
     const cleanupSafety = statements.find(({ text }) =>

@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { PermanentCommerceError } from './errors';
 import {
@@ -68,6 +70,16 @@ describe('claimed purchase grant derivation', () => {
 });
 
 describe('claim request scope', () => {
+  it('submits runtime claim-request jobs through the reference-only enqueue seam', () => {
+    const source = readFileSync(fileURLToPath(new URL('./claims.ts', import.meta.url)), 'utf8');
+    expect(source).toMatch(
+      /import\s*\{\s*enqueueJobReference as defaultEnqueueJobReference\s*\}\s*from '\$lib\/server\/jobs\/repository'/u
+    );
+    expect(source).toContain('dependencyOverrides.enqueueJob ?? defaultEnqueueJobReference');
+    expect(source).toContain('await enqueueJob(transaction, {');
+    expect(source).not.toContain('enqueueJob as defaultEnqueueJob');
+  });
+
   it('HMACs normalized email and request IP without exposing either value', () => {
     const first = claimRequestScopeDigest({
       email: ' Reader@Example.COM ',

@@ -25,10 +25,20 @@ const ownerRestoreVerifierLauncher = `
 import { spawnSync } from 'node:child_process';
 import { databaseEnvironmentForRole } from ${JSON.stringify(databaseRoleProvisionUrl)};
 const [verifierPath, ...verifierArguments] = process.argv.slice(1);
+const migrationWebUser = process.env.DATABASE_USER;
+const migrationWorkerUser = process.env.DATABASE_WORKER_USER;
+const migrationStorageCleanupUser = process.env.DATABASE_STORAGE_CLEANUP_USER;
+if (!migrationWebUser || !migrationWorkerUser || !migrationStorageCleanupUser) {
+  throw new Error('restore verifier migration identities are required');
+}
+const ownerEnvironment = databaseEnvironmentForRole(process.env, 'owner');
+ownerEnvironment.DATABASE_MIGRATION_WEB_USER = migrationWebUser;
+ownerEnvironment.DATABASE_MIGRATION_WORKER_USER = migrationWorkerUser;
+ownerEnvironment.DATABASE_MIGRATION_STORAGE_CLEANUP_USER = migrationStorageCleanupUser;
 const result = spawnSync(
   process.execPath,
   ['--import', 'tsx', verifierPath, ...verifierArguments],
-  { env: databaseEnvironmentForRole(process.env, 'owner'), stdio: 'inherit' }
+  { env: ownerEnvironment, stdio: 'inherit' }
 );
 process.exit(result.status ?? 1);
 `;
@@ -42,9 +52,9 @@ function directNodeHarnessEnvironment(): NodeJS.ProcessEnv {
   return process.env;
 }
 
-const financialWitnessHarnessTimeoutMs = 600_000;
+const financialWitnessHarnessTimeoutMs = 1_200_000;
 const financialWitnessCloseGraceMs = 15_000;
-const financialWitnessTestTimeoutMs = 900_000;
+const financialWitnessTestTimeoutMs = 1_500_000;
 const testDatabaseProjectPattern = /^pale-orbit-test-[0-9a-f]{16}$/u;
 const testStorageDirectoryPattern = /^pale-orbit-test-storage-[A-Za-z0-9_-]+$/u;
 const composeTestFilePath = resolve(
@@ -1387,7 +1397,7 @@ describe('commerce operations contract', () => {
     expect(restoreChecks).toContain("'financial_payout_discovery_singleton'");
     expect(restoreChecks).toContain("'combined_refund_dispute_chronology_capacity'");
     const verifierConservationSql = financialVerifier.match(
-      /with fee_sums as \([\s\S]*?from conservation_counts\norder by check_name;/u
+      /with fee_sums as \([\s\S]*?from conservation_counts\r?\norder by check_name;/u
     )?.[0];
     const documentedConservationSql = fencedCodeBlocks(
       markdownSection(financialRunbook, 'Post-restore signed-conservation check'),
@@ -1405,7 +1415,7 @@ describe('commerce operations contract', () => {
     expect(verifierStructuralSql).toBeDefined();
     expect(documentedStructuralSql?.trim()).toBe(verifierStructuralSql?.trim());
     const verifierScanSql = financialVerifier.match(
-      /with pending_replay_children as \([\s\S]*?from scan_checks\norder by check_name;/u
+      /with pending_replay_children as \([\s\S]*?from scan_checks\r?\norder by check_name;/u
     )?.[0];
     const documentedScanSql = fencedCodeBlocks(
       markdownSection(financialRunbook, 'Post-restore scan-checkpoint check'),
@@ -1415,6 +1425,7 @@ describe('commerce operations contract', () => {
     expect(documentedScanSql?.trim()).toBe(verifierScanSql?.trim());
     for (const [marker, heading] of [
       ['financial_schema_object_manifest', 'Post-restore executable schema-object check'],
+      ['financial_admin_claim_job_authority', 'Post-restore financial administrator claim check'],
       ['source_evidence_projection_parity', 'Post-restore source evidence projection check'],
       ['financial_title_allocation_determinism', 'Post-restore deterministic title allocation check'],
       ['resolved_issue_audit_provenance', 'Post-restore resolved issue audit check']
@@ -1741,7 +1752,8 @@ describe('commerce operations contract', () => {
       '0008_plan6b_worker_issue_resolution.sql',
       '0009_plan6b_worker_authority_and_commerce_integrity.sql',
       '0010_plan6b_guest_claim_authority.sql',
-      '0011_plan6b_storage_cleanup_authority.sql'
+      '0011_plan6b_storage_cleanup_authority.sql',
+      '0012_plan6bii_admin_command_authority.sql'
     ]);
     const plan6bSchemaMigrations = (
       await Promise.all(
@@ -1900,9 +1912,9 @@ describe('commerce operations contract', () => {
       ).filter(Boolean)
     );
 
-    expect(documentedManifest.trim()).toBe(financialSchemaManifest.trim());
+    expect(documentedManifest).toBe(financialSchemaManifest);
     expect(financialSchemaManifest).toMatch(
-      /catalog_contract_version\s*\(\s*contract_version\s*\)\s+as\s*\(\s*values\s*\(\s*'plan6b-financial-catalog-v1'\s*\)/iu
+      /catalog_contract_version\s*\(\s*contract_version\s*\)\s+as\s*\(\s*values\s*\(\s*'plan6b-financial-catalog-v2'\s*\)/iu
     );
     expect(financialSchemaManifest).toMatch(
       /required_catalog_objects\s*\(\s*object_kind\s*,\s*schema_name\s*,\s*parent_name\s*,\s*object_name\s*,\s*identity_arguments\s*,\s*expected_fingerprint_sha256\s*,\s*expected_catalog\s*\)/iu
@@ -1974,6 +1986,7 @@ describe('commerce operations contract', () => {
       "'owner'",
       "'acl'",
       "'identity_arguments'",
+      "'kind'",
       "'config'",
       "'enabled'",
       "'valid'",
@@ -2001,6 +2014,7 @@ describe('commerce operations contract', () => {
       })
     );
     expect(catalogRows.length).toBeGreaterThan(100);
+    expect(catalogRows).toHaveLength(273);
     expect(new Set(catalogRows.map((row) =>
       `${row.kind}:${row.parent}:${row.name}:${row.arguments}`
     )).size).toBe(catalogRows.length);
@@ -2098,17 +2112,31 @@ describe('commerce operations contract', () => {
       view: 2,
       function: requiredFunctionNames.size,
       trigger: requiredTriggerKeys.size,
-      index: 59,
-      constraint: 64,
+      index: 62,
+      constraint: 67,
       column: requiredLegacyColumnKeys.size,
       enum: requiredEnumLabels.size,
       sensitive_relation_state: 4
     });
-    expect(requiredTableNames.size).toBe(21);
-    expect(requiredFunctionNames.size).toBe(30);
-    expect(requiredTriggerKeys.size).toBe(34);
+    expect(requiredTableNames.size).toBe(23);
+    expect(requiredFunctionNames.size).toBe(44);
+    expect(requiredTriggerKeys.size).toBe(39);
     expect(requiredLegacyColumnKeys.size).toBe(7);
-    expect(requiredEnumLabels.size).toBe(23);
+    expect(requiredEnumLabels.size).toBe(25);
+    expect(catalogRows.filter((row) =>
+      row.kind === 'index' && row.parent === "'financial_admin_commands'"
+    )).toHaveLength(3);
+    expect(catalogRows.filter((row) =>
+      row.kind === 'constraint' && row.parent === "'financial_admin_commands'"
+    )).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'financial_admin_commands_actor_user_id_user_id_fk' }),
+      expect.objectContaining({ name: 'financial_admin_commands_job_id_jobs_id_fk' })
+    ]));
+    expect(catalogRows.some((row) =>
+      row.kind === 'constraint' &&
+      row.parent === "'financial_admin_job_claims'" &&
+      row.name === 'financial_admin_job_claims_job_id_jobs_id_fk'
+    )).toBe(true);
     expect(forbiddenLegacyColumnKeys).toEqual(new Set([
       'disputes:reconciliation_status',
       'payments:reconciliation_status',
@@ -2174,10 +2202,13 @@ describe('commerce operations contract', () => {
       });
     }
     for (const functionName of requiredFunctionNames) {
-      expect(
-        catalogRows.some((row) => row.kind === 'function' && row.name === functionName),
-        functionName
-      ).toBe(true);
+      const functionRow = catalogRows.find((row) =>
+        row.kind === 'function' && row.name === functionName
+      );
+      expect(functionRow, functionName).toBeDefined();
+      expect(JSON.parse(functionRow?.catalog ?? '{}'), functionName).toEqual(
+        expect.objectContaining({ kind: 'f' })
+      );
     }
     for (const triggerKey of requiredTriggerKeys) {
       expect(
@@ -2187,6 +2218,273 @@ describe('commerce operations contract', () => {
         triggerKey
       ).toBe(true);
     }
+
+    const descriptorFor = (kind: string, name: string): Record<string, unknown> => {
+      const row = catalogRows.find((candidate) =>
+        candidate.kind === kind && candidate.name === name
+      );
+      expect(row, `${kind}:${name}`).toBeDefined();
+      return JSON.parse(row?.catalog ?? '{}') as Record<string, unknown>;
+    };
+    const commandsDescriptor = descriptorFor('table', 'financial_admin_commands');
+    const claimsDescriptor = descriptorFor('table', 'financial_admin_job_claims');
+    const commandsColumns = commandsDescriptor.columns as Array<Record<string, unknown>>;
+    const claimsColumns = claimsDescriptor.columns as Array<Record<string, unknown>>;
+    expect(commandsDescriptor.owner).toBe('DATABASE_OWNER');
+    expect(claimsDescriptor.owner).toBe('DATABASE_OWNER');
+    const workerCommandUpdateColumns = new Set([
+      'status',
+      'safe_result_code',
+      'safe_result',
+      'updated_at',
+      'completed_at'
+    ]);
+    const workerCommandUpdateAcl = {
+      grantee: 'pale_orbit_financial_worker',
+      grantor: 'DATABASE_OWNER',
+      grantable: false,
+      privilege: 'UPDATE'
+    };
+    expect(commandsColumns.filter((column) =>
+      Array.isArray(column.acl) && column.acl.length > 0
+    ).map((column) => column.name).sort()).toEqual(
+      [...workerCommandUpdateColumns].sort()
+    );
+    for (const column of commandsColumns) {
+      expect(column.acl, String(column.name)).toEqual(
+        workerCommandUpdateColumns.has(String(column.name))
+          ? [workerCommandUpdateAcl]
+          : []
+      );
+    }
+    expect(claimsColumns.map((column) => column.name)).not.toContain('capability_token');
+    expect(claimsColumns.every((column) =>
+      Array.isArray(column.acl) && column.acl.length === 0
+    )).toBe(true);
+    const databaseOwnerExecuteAcl = {
+      grantee: 'DATABASE_OWNER',
+      grantor: 'DATABASE_OWNER',
+      grantable: false,
+      privilege: 'EXECUTE'
+    };
+    expect(claimsDescriptor.acl).toEqual([
+      'DELETE', 'INSERT', 'MAINTAIN', 'REFERENCES',
+      'SELECT', 'TRIGGER', 'TRUNCATE', 'UPDATE'
+    ].map((privilege) => ({
+      grantee: 'DATABASE_OWNER',
+      grantor: 'DATABASE_OWNER',
+      grantable: false,
+      privilege
+    })));
+    expect((commandsDescriptor.acl as Array<Record<string, unknown>>).filter((acl) =>
+      acl.grantee !== 'DATABASE_OWNER'
+    )).toEqual([{
+      grantee: 'pale_orbit_financial_worker',
+      grantor: 'DATABASE_OWNER',
+      grantable: false,
+      privilege: 'SELECT'
+    }]);
+    expect(financialSchemaManifest).toMatch(
+      /\('relation',\s*'public',\s*null,\s*'jobs',\s*null,\s*null,\s*'pale_orbit_financial_worker',\s*'SELECT',\s*false\)/u
+    );
+    for (const runtimeJobSelectColumn of ['id', 'deduplication_key']) {
+      expect(financialSchemaManifest, runtimeJobSelectColumn).toMatch(new RegExp(
+        String.raw`\('column',\s*'public',\s*'jobs',\s*'jobs',\s*null,\s*'${runtimeJobSelectColumn}',\s*'pale_orbit_runtime',\s*'SELECT',\s*false\)`,
+        'u'
+      ));
+    }
+    expect(Array.from(
+      financialSchemaManifest.matchAll(
+        /\('column',\s*'public',\s*'jobs',\s*'jobs',\s*null,\s*'(?<column>[a-z_][a-z0-9_]*)',\s*'pale_orbit_runtime',\s*'SELECT',\s*false\)/gu
+      ),
+      (match) => match.groups?.column ?? ''
+    ).sort()).toEqual(['deduplication_key', 'id']);
+
+    const newRuntimeRoutines = new Set([
+      'submit_financial_admin_command',
+      'financial_admin_command_status',
+      'append_financial_issue_view_audit',
+      'append_financial_refund_review_view_audit',
+      'append_financial_payout_view_audit',
+      'append_financial_sales_export_audit'
+    ]);
+    const newWorkerRoutines = new Set([
+      'resolve_financial_issue_after_admin_command',
+      'transition_administrative_recovery_grant_after_admin_command'
+    ]);
+    const expectedBaseDirectAcl = financialSchemaManifest.match(
+      /\), expected_base_direct_acl\([\s\S]*?\) as \(values(?<rows>[\s\S]*?)\), expected_direct_acl\(/u
+    )?.groups?.rows ?? '';
+    const expectedApplicationExecuteRows = Array.from(
+      expectedBaseDirectAcl.matchAll(
+        /\(\s*'function'\s*,\s*'public'\s*,\s*null\s*,\s*'(?<name>[a-z_][a-z0-9_]*)'\s*,\s*'(?<arguments>[^']*)'\s*,\s*null\s*,\s*'(?<grantee>pale_orbit_runtime|pale_orbit_financial_worker)'\s*,\s*'EXECUTE'\s*,\s*false\s*\)/gu
+      ),
+      (match) => ({
+        grantee: match.groups?.grantee ?? '',
+        signature: `${match.groups?.name ?? ''}(${
+          (match.groups?.arguments ?? '').replace(/,\s*/gu, ',')
+        })`
+      })
+    );
+    expect(expectedApplicationExecuteRows.filter((row) =>
+      row.grantee === 'pale_orbit_runtime'
+    ).map((row) => row.signature).sort()).toEqual([
+      'append_financial_issue_view_audit(uuid,uuid,text,text,text)',
+      'append_financial_payout_view_audit(uuid,uuid,text,text,text)',
+      'append_financial_refund_review_view_audit(uuid,uuid,text,text,text)',
+      'append_financial_sales_export_audit(uuid,text,text,integer,integer,integer,text,text)',
+      'authorize_commerce_claim_issuance(text,text)',
+      'claim_guest_purchases_after_authorization(text,text)',
+      'financial_admin_command_status(uuid,uuid)',
+      'outbox_message_deduplication_metadata(text,text,jsonb)',
+      'outbox_message_exists_by_deduplication_key(text)',
+      'rearm_pending_stripe_event_job(uuid)',
+      'submit_financial_admin_command(uuid,text,text,text,text,jsonb)'
+    ]);
+    expect(expectedApplicationExecuteRows.filter((row) =>
+      row.grantee === 'pale_orbit_financial_worker'
+    ).map((row) => row.signature).sort()).toEqual([
+      'purge_commerce_claim_issuances()',
+      'register_commerce_claim_issuance(text,text,text,uuid,text,timestamp with time zone)',
+      'resolve_financial_issue_after_admin_command(uuid,uuid)',
+      'resolve_financial_issue_after_worker_recompute(uuid,text)',
+      'transition_administrative_recovery_grant_after_admin_command(uuid)'
+    ]);
+    expect(expectedBaseDirectAcl).not.toMatch(
+      /\('relation',\s*'public',\s*null,\s*'jobs',\s*null,\s*null,\s*'pale_orbit_runtime',\s*'SELECT'/u
+    );
+    expect(expectedBaseDirectAcl).not.toMatch(
+      /\('column',\s*'public',\s*'jobs',\s*'jobs',\s*null,\s*'payload',\s*'pale_orbit_runtime',\s*'SELECT'/u
+    );
+    expect(financialSchemaManifest).toMatch(
+      /select 'function'[\s\S]*?from pg_catalog\.pg_proc routine[\s\S]*?where namespace_row\.nspname = 'public'\s+and \(\s*grantee\.role_label in \(\s*'pale_orbit_runtime', 'pale_orbit_financial_worker'/u
+    );
+    const roleLabelSql = financialSchemaManifest.match(
+      /\), role_labels\(role_oid, role_label\) as \((?<sql>[\s\S]*?)\), catalog_relation_acl/u
+    )?.groups?.sql ?? '';
+    expect(roleLabelSql).toContain('database_row.datdba');
+    expect(roleLabelSql).not.toContain('session_user');
+    expect(roleLabelSql).not.toMatch(/rolname[^\n]*pg_database_owner/u);
+    expect(financialSchemaManifest).toMatch(
+      /namespace_row\.nspname = 'public'[\s\S]*?pg_catalog\.pg_get_userbyid\(namespace_row\.nspowner\) = 'pg_database_owner'[\s\S]*?acl\.grantor = namespace_row\.nspowner then 'DATABASE_OWNER'/u
+    );
+    for (const row of catalogRows.filter((candidate) =>
+      candidate.kind === 'function' &&
+      (newRuntimeRoutines.has(candidate.name) || newWorkerRoutines.has(candidate.name))
+    )) {
+      const descriptor = JSON.parse(row.catalog) as {
+        acl: Array<Record<string, unknown>>;
+        config: readonly string[];
+        kind: string;
+        owner: string;
+        security_definer: boolean;
+        volatility: string;
+      };
+      const applicationGrantee = newRuntimeRoutines.has(row.name)
+        ? 'pale_orbit_runtime'
+        : 'pale_orbit_financial_worker';
+      expect(descriptor, row.name).toEqual(expect.objectContaining({
+        config: ['search_path=pg_catalog'],
+        kind: 'f',
+        owner: 'DATABASE_OWNER',
+        security_definer: true,
+        volatility: 'v'
+      }));
+      expect(descriptor.acl, row.name).toEqual([
+        databaseOwnerExecuteAcl,
+        {
+          grantee: applicationGrantee,
+          grantor: 'DATABASE_OWNER',
+          grantable: false,
+          privilege: 'EXECUTE'
+        }
+      ].sort((left, right) => String(left.grantee).localeCompare(String(right.grantee))));
+    }
+    const newPrivateHelperSecurity = new Map<string, boolean>([
+      ['plan6bii_assert_financial_admin_job_lease', true],
+      ['plan6bii_guard_financial_admin_job_lease', true],
+      ['plan6bii_guard_financial_admin_command_update', true],
+      ['plan6bii_guard_financial_admin_command_delete', true],
+      ['plan6bii_guard_administrative_grant_transition', false],
+      ['plan6bii_sync_failed_financial_admin_command', true]
+    ]);
+    for (const [privateRoutine, securityDefiner] of newPrivateHelperSecurity) {
+      const descriptor = descriptorFor('function', privateRoutine);
+      expect(descriptor, privateRoutine).toEqual(expect.objectContaining({
+        acl: [databaseOwnerExecuteAcl],
+        config: ['search_path=pg_catalog'],
+        kind: 'f',
+        owner: 'DATABASE_OWNER',
+        security_definer: securityDefiner,
+        volatility: 'v'
+      }));
+    }
+    for (const [changedGuard, securityDefiner, config] of [
+      ['plan6b_guard_job_insert', true, ['search_path=pg_catalog']],
+      ['plan6b_guard_audit_insert', false, ['search_path=pg_catalog']],
+      ['plan6b_validate_issue_transition', false, []]
+    ] as const) {
+      const descriptor = descriptorFor('function', changedGuard);
+      expect(descriptor, changedGuard).toEqual(expect.objectContaining({
+        acl: [databaseOwnerExecuteAcl],
+        config,
+        kind: 'f',
+        owner: 'DATABASE_OWNER',
+        security_definer: securityDefiner,
+        volatility: 'v'
+      }));
+    }
+    expect(financialSchemaManifest).not.toContain("'capability_token'");
+    for (const defaultAclPrimitive of [
+      'actual_default_acl_identity',
+      'expected_default_acl_identity',
+      'raw_explicit_default_acl',
+      'implicit_owner_default_acl',
+      'normalized_effective_default_acl',
+      'expected_default_acl',
+      'default_acl_identity_delta',
+      'default_acl_delta'
+    ]) {
+      expect(financialSchemaManifest, defaultAclPrimitive).toContain(defaultAclPrimitive);
+    }
+    expect(financialSchemaManifest.match(/except all/giu)).toHaveLength(4);
+    const expectedDefaultAclTuples = financialSchemaManifest.match(
+      /expected_default_acl\([\s\S]*?\)\s+as\s*\(values(?<tuples>[\s\S]*?)\)\s*,\s*default_acl_delta/u
+    )?.groups?.tuples ?? '';
+    const normalizedDefaultAclTuples = expectedDefaultAclTuples.replace(/\s+/gu, ' ');
+    expect(expectedDefaultAclTuples.match(/\('DATABASE_OWNER'/gu)).toHaveLength(16);
+    for (const [namespaceName, objectType, granteeName, privileges] of [
+      ['public', 'r', 'DATABASE_OWNER', [
+        'INSERT', 'SELECT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES',
+        'TRIGGER', 'MAINTAIN'
+      ]],
+      ['public', 'r', 'pale_orbit_runtime', ['SELECT']],
+      ['public', 'S', 'DATABASE_OWNER', ['USAGE', 'SELECT', 'UPDATE']],
+      ['public', 'S', 'pale_orbit_runtime', ['USAGE', 'SELECT', 'UPDATE']],
+      ['global', 'f', 'DATABASE_OWNER', ['EXECUTE']]
+    ] as const) {
+      for (const privilege of privileges) {
+        expect(
+          normalizedDefaultAclTuples,
+          `${namespaceName}:${objectType}:${granteeName}:${privilege}`
+        ).toContain(
+          `('DATABASE_OWNER', '${namespaceName}', '${objectType}', 'DATABASE_OWNER', ` +
+          `'${granteeName}', '${privilege}', false)`
+        );
+      }
+    }
+    for (const leaseTrigger of [
+      'jobs_plan6bii_financial_admin_lease_guard',
+      'jobs_plan6bii_financial_admin_terminal_sync'
+    ]) {
+      expect(financialSchemaManifest, leaseTrigger).toContain(`'${leaseTrigger}'`);
+    }
+    expect(
+      'jobs_plan6bii_financial_admin_lease_guard'.localeCompare(
+        'jobs_plan6bii_financial_admin_terminal_sync',
+        'en'
+      )
+    ).toBeLessThan(0);
 
     expect(financialSchemaManifest).toMatch(
       /\(\s*'table'\s*,\s*'public'\s*,\s*null\s*,\s*'commerce_claim_issuances'/u
@@ -2274,7 +2572,7 @@ describe('commerce operations contract', () => {
     const boundedHarnessTimeout = ['financial', 'WitnessHarnessTimeoutMs'].join('');
     const boundedHarnessRunner = ['runBounded', 'FinancialWitnessHarness'].join('');
     const timeoutCleanup = ['cleanupTimedOut', 'FinancialWitnessHarness'].join('');
-    const timeoutLiteral = ['600', '_000'].join('');
+    const timeoutLiteral = ['1', '_200_000'].join('');
     expect(contractTestSource).toContain(`const ${boundedHarnessTimeout} = ${timeoutLiteral}`);
     expect(contractTestSource).toContain(`async function ${boundedHarnessRunner}`);
     expect(contractTestSource).toContain(`function ${timeoutCleanup}`);
@@ -2292,7 +2590,7 @@ describe('commerce operations contract', () => {
       ),
       (match) => match.groups?.table ?? ''
     ).filter(Boolean);
-    expect(new Set(lockOnlyWorkerColumns).size).toBe(13);
+    expect(new Set(lockOnlyWorkerColumns).size).toBe(11);
     expect(financialSchemaManifest).toMatch(
       /actual_direct_acl[\s\S]*acl\.privilege_type = 'UPDATE'[\s\S]*expected_lock_only_worker_columns/u
     );
@@ -2311,11 +2609,19 @@ describe('commerce operations contract', () => {
         )
       );
     }
+    for (const publicDatabasePrivilege of ['CONNECT', 'TEMPORARY']) {
+      expect(financialSchemaManifest, `PUBLIC database ${publicDatabasePrivilege}`).toMatch(
+        new RegExp(
+          `'database'\\s*,\\s*null\\s*,\\s*null\\s*,\\s*'CURRENT_DATABASE'\\s*,\\s*null\\s*,\\s*null\\s*,\\s*'PUBLIC'\\s*,\\s*'${publicDatabasePrivilege}'\\s*,\\s*false`,
+          'u'
+        )
+      );
+    }
     expect(financialSchemaManifest).toMatch(
-      /actual_direct_acl[\s\S]*pg_catalog\.pg_database[\s\S]*pg_catalog\.aclexplode\(database_row\.datacl\)[\s\S]*database_row\.datname = pg_catalog\.current_database\(\)[\s\S]*grantee_role\.rolname in \(\s*'pale_orbit_runtime',\s*'pale_orbit_financial_worker',\s*'pale_orbit_storage_cleanup'\s*\)/u
+      /actual_direct_acl[\s\S]*pg_catalog\.pg_database[\s\S]*pg_catalog\.aclexplode\(database_row\.datacl\)[\s\S]*database_row\.datname = pg_catalog\.current_database\(\)[\s\S]*acl\.grantee <> database_row\.datdba/u
     );
     expect(financialSchemaManifest).toMatch(
-      /database_direct_acl_count_mismatch[\s\S]*actual_direct_acl[\s\S]*object_kind = 'database'[\s\S]*<> 3/u
+      /database_direct_acl_count_mismatch[\s\S]*actual_direct_acl[\s\S]*object_kind = 'database'[\s\S]*<> 5/u
     );
     expect(financialSchemaManifest).toMatch(
       /missing-cleanup-connect[\s\S]*has_database_privilege\([\s\S]*pg_catalog\.current_database\(\)[\s\S]*'CONNECT'/u
@@ -2324,7 +2630,7 @@ describe('commerce operations contract', () => {
       /cleanup-login-direct-database-acl[\s\S]*pg_catalog\.pg_database[\s\S]*pg_catalog\.aclexplode\(database_row\.datacl\)[\s\S]*database_row\.datname = pg_catalog\.current_database\(\)[\s\S]*acl\.grantee = login\.oid/u
     );
     expect(financialSchemaManifest).toMatch(
-      /relation_row\.relname in \(\s*'guest_identities',\s*'outbox_messages',\s*'entitlement_grants',\s*'entitlements'\s*\)/u
+      /relation_row\.relname in \([\s\S]*?'guest_identities'[\s\S]*?'outbox_messages'[\s\S]*?'entitlement_grants'[\s\S]*?'entitlements'[\s\S]*?'jobs'[\s\S]*?'financial_admin_commands'[\s\S]*?'financial_admin_job_claims'[\s\S]*?\)/u
     );
     for (const forbiddenTypeName of forbiddenRetiredTypeNames) {
       expect(financialSchemaManifest, forbiddenTypeName).toContain(`'${forbiddenTypeName}'`);
@@ -2372,7 +2678,103 @@ describe('commerce operations contract', () => {
       );
       expect(verifierWitness, constraintName).toContain(constraintName);
     }
-    for (const witnessLabel of [
+    const financialAdminWitnessLabelAllowlist = [
+      'financial administrator four-claim one-row capability matrix',
+      'financial administrator current lease renewal',
+      'financial administrator terminal lease invalidation',
+      'cross-job financial administrator capability rejection',
+      'financial command enum order drift',
+      'financial command enum order repair',
+      'financial command table descriptor drift',
+      'financial command table descriptor repair',
+      'financial claim table descriptor drift',
+      'financial claim table descriptor repair',
+      'financial claim protected table owner drift',
+      'financial claim protected table owner repair',
+      'financial claim protected table persistence drift',
+      'financial claim protected table persistence repair',
+      'financial claim clear capability column',
+      'financial claim clear capability column repair',
+      'financial claim capability digest constraint drift',
+      'financial claim capability digest constraint repair',
+      'financial claim lifecycle constraint drift',
+      'financial claim lifecycle constraint repair',
+      'financial claim generation attempt constraint drift',
+      'financial claim generation attempt constraint repair',
+      'financial claim pending rerun authority',
+      'financial claim job attempt authority drift',
+      'financial claim job attempt authority repair',
+      'financial claim pending rerun cleanup',
+      'financial claim helper definition drift',
+      'financial claim helper definition repair',
+      'financial claim helper owner drift',
+      'financial claim helper owner repair',
+      'financial claim helper SECURITY DEFINER drift',
+      'financial claim helper SECURITY DEFINER repair',
+      'financial claim helper search_path drift',
+      'financial claim helper search_path repair',
+      'financial claim helper direct EXECUTE drift',
+      'financial claim helper direct EXECUTE repair',
+      'financial claim helper PUBLIC EXECUTE drift',
+      'financial claim helper PUBLIC EXECUTE repair',
+      'financial lease trigger disabled',
+      'financial lease trigger enabled repair',
+      'financial lease terminal trigger order drift',
+      'financial lease terminal trigger order repair',
+      'financial job guard definition drift',
+      'financial job guard definition repair',
+      'financial audit guard definition drift',
+      'financial audit guard definition repair',
+      'financial command runtime jobs.payload SELECT',
+      'financial command runtime jobs.payload SELECT repair',
+      'financial command runtime private input SELECT',
+      'financial command runtime private input SELECT repair',
+      'financial command worker private input UPDATE',
+      'financial command worker private input UPDATE repair',
+      'financial claim application table privilege',
+      'financial claim application table privilege repair',
+      'financial routine PUBLIC EXECUTE',
+      'financial routine PUBLIC EXECUTE repair',
+      'financial routine direct login EXECUTE',
+      'financial routine direct login EXECUTE repair',
+      'unexpected runtime routine EXECUTE',
+      'unexpected runtime routine EXECUTE repair',
+      'unexpected worker routine EXECUTE',
+      'unexpected worker routine EXECUTE repair',
+      'financial direct login database ACL',
+      'financial direct login database ACL repair',
+      'missing runtime financial routine EXECUTE',
+      'missing runtime financial routine EXECUTE repair',
+      'missing worker financial routine EXECUTE',
+      'missing worker financial routine EXECUTE repair',
+      'financial routine SECURITY DEFINER search_path drift',
+      'financial routine SECURITY DEFINER search_path repair',
+      'financial routine owner drift',
+      'financial routine owner repair',
+      'missing runtime future table SELECT',
+      'runtime future table SELECT repair',
+      'missing runtime future sequence privileges',
+      'runtime future sequence privileges repair',
+      'excess worker default table privilege',
+      'excess worker default table privilege repair',
+      'excess storage default privilege',
+      'excess storage default privilege repair',
+      'excess direct-login default privilege',
+      'excess direct-login default privilege repair',
+      'reintroduced PUBLIC default routine EXECUTE',
+      'PUBLIC default routine EXECUTE repair',
+      'default ACL namespace object-type drift',
+      'default ACL namespace object-type repair',
+      'default ACL grant option drift',
+      'default ACL grant option repair',
+      'default ACL owner drift',
+      'default ACL owner drift repair',
+      'default ACL grantor drift',
+      'default ACL grantor drift repair',
+      'inherited runtime SELECT on protected financial table',
+      'inherited runtime SELECT on protected financial table repair',
+      'inherited application EXECUTE on private lease helper',
+      'inherited application EXECUTE on private lease helper repair',
       'column-compatible false required view',
       'required view definition repair',
       'required function definition mismatch',
@@ -2447,9 +2849,67 @@ describe('commerce operations contract', () => {
       'missing runtime outbox INSERT ACL repair',
       'excess worker outbox UPDATE ACL',
       'excess worker outbox UPDATE ACL repair'
-    ]) {
+    ] as const;
+    for (const witnessLabel of financialAdminWitnessLabelAllowlist) {
       expect(verifierWitness, witnessLabel).toContain(witnessLabel);
     }
+    const financialAdminCatalogWitnessRegion = verifierWitness.match(
+      /async function exerciseFinancialAdminCatalogWitnesses[\s\S]*?\r?\n\}\r?\n\r?\nasync function exerciseInvariantWitnesses/u
+    )?.[0] ?? '';
+    const implementedFinancialAdminCatalogWitnessLabels = Array.from(
+      financialAdminCatalogWitnessRegion.matchAll(
+        /await expect(?:Pass|Rejection|RejectionChecks)\(\s*'(?<label>[^']+)'/gu
+      ),
+      (match) => match.groups?.label ?? ''
+    ).filter(Boolean);
+    expect(implementedFinancialAdminCatalogWitnessLabels.length).toBeGreaterThan(0);
+    for (const implementedLabel of implementedFinancialAdminCatalogWitnessLabels) {
+      expect(financialAdminWitnessLabelAllowlist, implementedLabel).toContain(
+        implementedLabel
+      );
+    }
+    const clearCapabilityPersistenceScan = verifierWitness.match(
+      /const clearPersistenceTargets = await pool\.query[\s\S]*?financial administrator clear capability was persisted/u
+    )?.[0] ?? '';
+    expect(clearCapabilityPersistenceScan).toContain('pg_catalog.pg_class');
+    expect(clearCapabilityPersistenceScan).toContain('pg_catalog.pg_namespace');
+    expect(clearCapabilityPersistenceScan).toContain('pg_catalog.pg_attribute');
+    expect(clearCapabilityPersistenceScan).toContain("namespace.nspname = 'public'");
+    expect(clearCapabilityPersistenceScan).toContain("relation.relkind in ('r', 'p')");
+    expect(clearCapabilityPersistenceScan).toContain('attribute.attnum > 0');
+    expect(clearCapabilityPersistenceScan).toContain('not attribute.attisdropped');
+    expect(clearCapabilityPersistenceScan).toContain(
+      "pg_catalog.format('%I.%I', namespace.nspname, relation.relname)"
+    );
+    expect(clearCapabilityPersistenceScan).toContain(
+      "pg_catalog.format('%I', attribute.attname)"
+    );
+    expect(clearCapabilityPersistenceScan).toContain(
+      'for (const target of clearPersistenceTargets.rows)'
+    );
+    expect(clearCapabilityPersistenceScan).toContain('${target.quotedColumn}::text');
+    expect(clearCapabilityPersistenceScan).toContain(
+      'select pg_catalog.count(*)::text as match_count'
+    );
+    expect(clearCapabilityPersistenceScan).toContain('$1::text[]');
+    expect(clearCapabilityPersistenceScan).toContain('pg_catalog.strpos(');
+    expect(clearCapabilityPersistenceScan).not.toContain('pg_catalog.position(');
+    expect(clearCapabilityPersistenceScan).toContain('coalesce(');
+    expect(clearCapabilityPersistenceScan).not.toContain('pg_catalog.coalesce(');
+    expect(clearCapabilityPersistenceScan).not.toContain('persisted_values');
+    expect(clearCapabilityPersistenceScan).not.toContain('job.payload::text');
+    expect(clearCapabilityPersistenceScan).not.toMatch(/console\.(?:debug|info|log|warn|error)/u);
+    for (const jobsColumn of ['last_error', 'locked_by', 'deduplication_key']) {
+      expect(clearCapabilityPersistenceScan, `jobs.${jobsColumn}`).toContain(
+        `'${jobsColumn}'`
+      );
+    }
+    expect(verifierWitness).toMatch(
+      /alter function public\.financial_admin_command_status\(uuid,uuid\)[\s\S]{0,100}?security invoker[\s\S]{0,200}?alter function public\.financial_admin_command_status\(uuid,uuid\)[\s\S]{0,100}?set search_path = 'public'/u
+    );
+    expect(verifierWitness).not.toMatch(
+      /create or replace function public\.financial_admin_command_status\(uuid,uuid\)[\s\S]{0,100}?returns table/u
+    );
   });
 
   it('mirrors the exact financial issue resource, code, and impact triples into restore checks', async () => {
@@ -2684,6 +3144,22 @@ describe('commerce operations contract', () => {
   });
 
   it('confines the executable verifier witness to a disposable local test database', () => {
+    for (const identity of ['Web', 'Worker', 'StorageCleanup'] as const) {
+      expect(ownerRestoreVerifierLauncher).toContain(`migration${identity}User`);
+      expect(ownerRestoreVerifierLauncher).toContain(
+        `ownerEnvironment.DATABASE_MIGRATION_${
+          identity === 'StorageCleanup' ? 'STORAGE_CLEANUP' : identity.toUpperCase()
+        }_USER = migration${identity}User`
+      );
+    }
+    expect(ownerRestoreVerifierLauncher.indexOf('const migrationWebUser'))
+      .toBeLessThan(
+        ownerRestoreVerifierLauncher.indexOf(
+          "const ownerEnvironment = databaseEnvironmentForRole"
+        )
+      );
+    expect(ownerRestoreVerifierLauncher).not.toMatch(/console\.(?:info|log).*migration\w+User/u);
+
     const baseEnvironment = {
       ...process.env,
       DATABASE_HOST: '127.0.0.1',
@@ -2725,6 +3201,30 @@ describe('commerce operations contract', () => {
     expect(malformedPort.status).not.toBe(0);
     expect(malformedPort.stderr).toContain('[restore-verifier] DATABASE_PORT is invalid');
     expect(malformedPort.stderr).not.toContain('ECONNREFUSED');
+
+    const sourceExtractorSmoke = spawnSync(
+      process.execPath,
+      [
+        '--import',
+        'tsx',
+        restoreVerifierWitnessPath,
+        '--print-financial-catalog-contract'
+      ],
+      {
+        encoding: 'utf8',
+        env: {
+          ...baseEnvironment,
+          APP_ENV: 'test',
+          DATABASE_OWNER_USER: 'pale_orbit_test',
+          DATABASE_MIGRATION_WEB_USER: 'pale_orbit_test_web',
+          DATABASE_MIGRATION_WORKER_USER: 'pale_orbit_test_worker',
+          DATABASE_MIGRATION_STORAGE_CLEANUP_USER: 'pale_orbit_test_storage_cleanup'
+        }
+      }
+    );
+    expect(sourceExtractorSmoke.status).not.toBe(0);
+    expect(sourceExtractorSmoke.stderr).toContain('ECONNREFUSED');
+    expect(sourceExtractorSmoke.stderr).not.toContain('expected one canonical');
   }, 20_000);
 
   it('times and scopes every verifier expectation on one transaction-recovered session', async () => {
@@ -2733,7 +3233,10 @@ describe('commerce operations contract', () => {
       source('scripts/verify-financial-restore.sql')
     ]);
     const verifierOutcomeSource = verifierWitness.match(
-      /async function verifierOutcome[\s\S]*?\n\}\n\nfunction financialCatalogCalibrationSql/u
+      /async function verifierOutcome[\s\S]*?\r?\n\}\r?\n\r?\nfunction financialCatalogContractSql/u
+    )?.[0] ?? '';
+    const invariantWitnessSource = verifierWitness.match(
+      /async function exerciseInvariantWitnesses\(\): Promise<void> \{[\s\S]*?\r?\n\}\r?\n\r?\ntry \{/u
     )?.[0] ?? '';
     expect(verifierOutcomeSource).not.toContain('new Pool(');
     expect(verifierOutcomeSource).toContain('persistentVerifierClient()');
@@ -2750,6 +3253,173 @@ describe('commerce operations contract', () => {
     expect(verifierWitness).toContain('[restore-verifier] END expectation');
     expect(verifierWitness.match(/verifierOutcome\(name, scope\)/gu)).toHaveLength(4);
     expect(verifierWitness).toContain('release(true)');
+    expect(verifierWitness).toContain('function exactVerifierFailureList(');
+    expect(verifierWitness).toContain('function parsedVerifierFailureList(');
+    expect(verifierWitness).toContain('actualFailures.length !== expectedFailures.length');
+    expect(verifierWitness).toContain(
+      'new Set(actualFailures).size !== actualFailures.length'
+    );
+    expect(verifierWitness).toContain(
+      'new Set(expectedFailures).size !== expectedFailures.length'
+    );
+    expect(verifierWitness).toContain('const failWitness = (message: string): never =>');
+    expect(verifierWitness).toContain('expected verifier failures ${expected} but received ${actual}');
+    expect(verifierWitness).not.toContain('failures.push(');
+    expect(verifierWitness).not.toContain('calibrationMismatches');
+    expect(verifierWitness).not.toContain('restore-verifier-calibration');
+    expect(invariantWitnessSource).not.toContain('.message');
+    expect(invariantWitnessSource).not.toContain('failures.length');
+    expect(invariantWitnessSource).not.toContain('failures.join(');
+    expect(verifierWitness).not.toContain(': ${outcome.error.message}');
+    expect(verifierWitness).not.toContain(': ${error.message}');
+    expect(verifierOutcomeSource).not.toContain('recoveryError.message');
+    expect(verifierOutcomeSource).not.toContain('String(recoveryError)');
+    expect(verifierWitness).not.toContain('error.message.includes(checkName)');
+    expect(verifierWitness).not.toContain(
+      "error.message.includes('credential_authority_missing_or_mismatched=1')"
+    );
+    expect(verifierWitness).toContain(
+      "exactVerifierFailureList(actualFailures, ['credential_authority_missing_or_mismatched=1'])"
+    );
+    expect(verifierWitness).not.toMatch(/['"][a-z_][a-z0-9_]*=['"]/u);
+    const exactWitnessFailureList = (witnessName: string): string[] => {
+      const witnessLiteral = `'${witnessName}'`;
+      expect(verifierWitness.split(witnessLiteral), witnessName).toHaveLength(2);
+      const witnessIndex = verifierWitness.indexOf(witnessLiteral);
+      const expectationStart = verifierWitness.lastIndexOf('await expectRejection', witnessIndex);
+      const expectationEnd = verifierWitness.indexOf(');', witnessIndex);
+      expect(expectationStart, witnessName).toBeGreaterThan(-1);
+      expect(expectationEnd, witnessName).toBeGreaterThan(witnessIndex);
+      return Array.from(
+        verifierWitness
+          .slice(expectationStart, expectationEnd)
+          .matchAll(/'(?<failure>[a-z_][a-z0-9_]*=[1-9][0-9]*)'/gu),
+        (match) => match.groups?.failure ?? ''
+      ).filter(Boolean).sort();
+    };
+    for (const [witnessName, exactFailures] of [
+      ['financial claim helper direct EXECUTE drift', ['financial_schema_object_manifest=1']],
+      ['financial claim helper PUBLIC EXECUTE drift', [
+        'financial_schema_object_manifest=1',
+        'storage_cleanup_effective_authority=1'
+      ]],
+      ['financial lease trigger disabled', ['financial_schema_object_manifest=1']],
+      ['financial lease terminal trigger order drift', ['financial_schema_object_manifest=1']],
+      ['financial command runtime jobs.payload SELECT', ['financial_schema_object_manifest=1']],
+      ['financial routine PUBLIC EXECUTE', [
+        'financial_schema_object_manifest=1',
+        'storage_cleanup_effective_authority=1'
+      ]],
+      ['financial routine direct login EXECUTE', ['financial_schema_object_manifest=1']],
+      ['missing runtime financial routine EXECUTE', ['financial_schema_object_manifest=1']],
+      ['missing worker financial routine EXECUTE', ['financial_schema_object_manifest=1']],
+      ['missing runtime future table SELECT', ['financial_schema_object_manifest=10']],
+      ['missing runtime future sequence privileges', ['financial_schema_object_manifest=7']],
+      ['reintroduced PUBLIC default routine EXECUTE', ['financial_schema_object_manifest=2']],
+      ['inherited application EXECUTE on private lease helper', [
+        'financial_schema_object_manifest=1'
+      ]],
+      ['claim function direct ACL mismatch', [
+        'financial_schema_object_manifest=1',
+        'storage_cleanup_effective_authority=1'
+      ]],
+      ['disabled protected constraint triggers', ['financial_schema_object_manifest=4']],
+      ['cleanup login direct grantable CONNECT', [
+        'financial_schema_object_manifest=2',
+        'storage_cleanup_effective_authority=1'
+      ]],
+      ['cleanup login direct TEMPORARY', [
+        'financial_schema_object_manifest=2',
+        'storage_cleanup_effective_authority=1'
+      ]],
+      ['itemless account allocation still requires an exact parent decision', [
+        'allocation_set_detail_classification=1',
+        'allocation_set_parent_or_chain=1'
+      ]],
+      ['itemless account allocation cannot depend on an exact unknown parent', [
+        'allocation_set_detail_classification=1',
+        'allocation_set_parent_or_chain=1'
+      ]],
+      ['published payout run ahead of authority', [
+        'published_membership_count=1',
+        'run_generation_order=1'
+      ]],
+      ['charge gross allocation cannot masquerade as another component', [
+        'financial_item_allocation_semantic_component=1',
+        'financial_title_allocation_determinism=1'
+      ]],
+      ['same-currency payment source-principal corruption', [
+        'allocation_set_provider_target=1',
+        'allocation_set_semantic_source=2',
+        'financial_title_allocation_determinism=1',
+        'source_evidence_projection_parity=1'
+      ]],
+      ['refund component chronology exceeds a bucket capacity', [
+        'combined_refund_dispute_chronology_capacity=1',
+        'refund_component_chronology_capacity=1',
+        'refund_component_deterministic_split=1'
+      ]],
+      ['same-currency primary-refund source-principal corruption', [
+        'allocation_set_provider_target=1',
+        'allocation_set_semantic_source=2'
+      ]],
+      ['pending refund gross correction cannot masquerade as a fee component', [
+        'refund_reporting_correction_history_semantics=1',
+        'refund_reporting_correction_item_semantics=1'
+      ]],
+      ['pending correction must cover every nonzero touched settlement base', [
+        'refund_reporting_correction_history_semantics=1',
+        'reporting_correction_zero_sum=1'
+      ]],
+      ['pending correction item must retain its source currency', [
+        'refund_reporting_correction_history_semantics=1',
+        'reporting_correction_zero_sum=2'
+      ]],
+      ['first dispute withdrawal presentment/source-principal corruption', [
+        'combined_refund_dispute_chronology_capacity=2',
+        'dispute_first_withdrawal_source_principal=1',
+        'dispute_item_allocation_graph=1'
+      ]],
+      ['allocation set names an unrelated existing provider source owner', [
+        'allocation_set_parent_or_chain=1',
+        'allocation_set_semantic_source=1',
+        'combined_refund_dispute_chronology_capacity=3',
+        'dispute_item_allocation_graph=1',
+        'financial_item_allocation_parent=1'
+      ]],
+      ['allocation item belongs to an unrelated existing order graph', [
+        'dispute_presentment_child_cardinality=1',
+        'financial_item_allocation_parent=1'
+      ]],
+      ['withdrawal current tip has no required dispute presentment child', [
+        'dispute_first_withdrawal_source_principal=1',
+        'dispute_presentment_child_cardinality=1'
+      ]],
+      ['withdrawal dispute presentment child cannot have a zero effect', [
+        'combined_refund_dispute_chronology_capacity=1',
+        'dispute_first_withdrawal_source_principal=1',
+        'dispute_presentment_child_cardinality=1'
+      ]],
+      ['reinstatement cannot cross an immutable withdrawal graph or reverse it twice', [
+        'combined_refund_dispute_chronology_capacity=2',
+        'dispute_item_allocation_graph=2'
+      ]],
+      ['refund and dispute events duplicate the full durable chronology tuple', [
+        'combined_refund_dispute_chronology_capacity=3'
+      ]],
+      ['reinstatement crosses its withdrawal order item', [
+        'combined_refund_dispute_chronology_capacity=1',
+        'dispute_item_allocation_graph=1'
+      ]],
+      ['refund component violates the deterministic two-bucket split', [
+        'combined_refund_dispute_chronology_capacity=1',
+        'refund_component_deterministic_split=1'
+      ]]
+    ] as const) {
+      expect(exactWitnessFailureList(witnessName), witnessName).toEqual(
+        [...exactFailures].sort()
+      );
+    }
     expect(verifierWitness).toMatch(
       /Each verifier transaction uses READ COMMITTED[\s\S]*committed witness mutations/u
     );
@@ -2806,6 +3476,9 @@ describe('commerce operations contract', () => {
         new RegExp(`${fullExpectation.replaceAll(' ', '\\s+')}[\\s\\S]{0,300}?'full'`, 'u')
       );
     }
+    expect(verifierWitness).toMatch(
+      /fresh financial schema-object manifest[\s\S]{0,200}?exerciseFinancialAdminClaimMatrix/u
+    );
     for (const [witnessName, expectedCount] of [
       ['missing financial transition trigger', 2],
       ['required trigger definition mismatch', 2],
@@ -2813,11 +3486,12 @@ describe('commerce operations contract', () => {
       ['required index definition mismatch', 2],
       ['claim constraint definition mismatch', 2],
       ['claim index definition mismatch', 2],
+      ['financial claim clear capability column', 1],
       ['database fixed-group CONNECT grant option mismatch', 1],
       ['unexpected fixed-group database TEMPORARY ACL', 2],
-      ['cleanup login direct grantable CONNECT', 1],
-      ['cleanup login direct TEMPORARY', 1],
-      ['disabled protected constraint triggers', 3],
+      ['cleanup login direct grantable CONNECT', 2],
+      ['cleanup login direct TEMPORARY', 2],
+      ['disabled protected constraint triggers', 4],
       ['enum label inventory drift', 4],
       ['sensitive relation direct ACL mismatch', 2],
       ['unsafe cleanup membership flags', 3],
@@ -2979,7 +3653,7 @@ describe('commerce operations contract', () => {
       supervisor.indexOf('cleanupTimedOutFinancialWitnessHarness')
     );
     expect(financialWitnessTestTimeoutMs - financialWitnessHarnessTimeoutMs)
-      .toBeGreaterThanOrEqual(240_000);
+      .toBe(300_000);
   });
 
   it('executes schema-object, source-parity, deterministic-allocation, audit, payout, and chronology verifier witnesses in PostgreSQL', async () => {
@@ -4040,6 +4714,14 @@ Invoke-VerifiedRestoreSession {
 `
     ].join('\n');
 
+    const windowsPowerShellEnvironment = { ...process.env };
+    // A PowerShell 7 parent may export a bundled, Core-only module path.
+    // Let Windows PowerShell rebuild its own defaults before it autoloads
+    // Microsoft.PowerShell.Utility for Get-FileHash.
+    for (const key of Object.keys(windowsPowerShellEnvironment)) {
+      if (key.toLowerCase() === 'psmodulepath') delete windowsPowerShellEnvironment[key];
+    }
+
     const runHarness = (callbackFailure: boolean, dispositionFailure: boolean) => {
       const testRoot = mkdtempSync(join(tmpdir(), 'pale-orbit-restore-wrapper-'));
       const marker = join(testRoot, 'disposition-called');
@@ -4049,7 +4731,7 @@ Invoke-VerifiedRestoreSession {
         {
           encoding: 'utf8',
           env: {
-            ...process.env,
+            ...windowsPowerShellEnvironment,
             RESTORE_TEST_ROOT: testRoot,
             RESTORE_DISPOSITION_MARKER: marker,
             RESTORE_CALLBACK_FAIL: callbackFailure ? '1' : '0',

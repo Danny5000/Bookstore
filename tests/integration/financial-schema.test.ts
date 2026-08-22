@@ -23,10 +23,12 @@ const FINANCIAL_TABLES = [
   'refund_allocation_draft_items',
   'refund_reporting_correction_sets',
   'refund_reporting_correction_items',
-  'refund_allocation_finalization_effects'
+  'refund_allocation_finalization_effects',
+  'financial_admin_commands',
+  'financial_admin_job_claims'
 ] as const;
 
-type ConstraintCode = '23001' | '23503' | '23505' | '23514';
+type ConstraintCode = '23001' | '23503' | '23505' | '23514' | '55000';
 
 interface CommerceGraph {
   adminId: string;
@@ -434,6 +436,8 @@ describe('Plan 6B financial schema', () => {
           'refund_reporting_correction_sets',
           'refund_reporting_correction_items',
           'refund_allocation_finalization_effects',
+          'financial_admin_commands',
+          'financial_admin_job_claims',
           'current_financial_projection_heads',
           'current_financial_projection_items'
         )
@@ -451,10 +455,24 @@ describe('Plan 6B financial schema', () => {
       select t.typname as enum_name, e.enumlabel as value
       from pg_type t
       join pg_enum e on e.enumtypid = t.oid
-      where t.typname in ('financial_evidence_status', 'refund_allocation_status')
+      where t.typname in (
+        'financial_admin_command_kind', 'financial_admin_command_status',
+        'financial_evidence_status', 'refund_allocation_status'
+      )
       order by t.typname, e.enumsortorder
     `);
     expect(enumValues.rows).toEqual([
+      { enum_name: 'financial_admin_command_kind', value: 'refund_draft_save' },
+      { enum_name: 'financial_admin_command_kind', value: 'refund_draft_discard' },
+      { enum_name: 'financial_admin_command_kind', value: 'refund_allocation_finalize' },
+      { enum_name: 'financial_admin_command_kind', value: 'refund_reporting_correction_create' },
+      { enum_name: 'financial_admin_command_kind', value: 'administrative_recovery_activate' },
+      { enum_name: 'financial_admin_command_kind', value: 'administrative_recovery_deactivate' },
+      { enum_name: 'financial_admin_command_status', value: 'pending' },
+      { enum_name: 'financial_admin_command_status', value: 'succeeded' },
+      { enum_name: 'financial_admin_command_status', value: 'denied' },
+      { enum_name: 'financial_admin_command_status', value: 'conflict' },
+      { enum_name: 'financial_admin_command_status', value: 'failed' },
       { enum_name: 'financial_evidence_status', value: 'pending' },
       { enum_name: 'financial_evidence_status', value: 'fee_reconciled' },
       { enum_name: 'financial_evidence_status', value: 'exception' },
@@ -484,6 +502,466 @@ describe('Plan 6B financial schema', () => {
     `);
     expect(foreignKeys.rows.length).toBeGreaterThan(0);
     expect(foreignKeys.rows.every((row) => row.delete_action === 'r')).toBe(true);
+
+    const commandJobForeignKey = await expectSingleRow(
+      databaseClient.pool.query<{
+        is_deferrable: boolean;
+        initially_deferred: boolean;
+      }>(
+        `select condeferrable as is_deferrable, condeferred as initially_deferred
+         from pg_catalog.pg_constraint
+         where conname = 'financial_admin_commands_job_id_jobs_id_fk'`
+      ),
+      'administrator command job relationship exists'
+    );
+    expect(commandJobForeignKey).toEqual({
+      is_deferrable: true,
+      initially_deferred: true
+    });
+
+    const commandAuthorityConstraints = await databaseClient.pool.query<{
+      constraint_name: string;
+      constraint_type: string;
+    }>(`
+      select constraint_row.conname as constraint_name,
+        constraint_row.contype::text as constraint_type
+      from pg_catalog.pg_constraint constraint_row
+      where constraint_row.conrelid in (
+        'public.financial_admin_commands'::regclass,
+        'public.financial_admin_job_claims'::regclass
+      )
+      order by constraint_row.conname
+    `);
+    expect(commandAuthorityConstraints.rows).toEqual(expect.arrayContaining([
+      {
+        constraint_name: 'financial_admin_commands_lifecycle_consistent',
+        constraint_type: 'c'
+      },
+      {
+        constraint_name: 'financial_admin_commands_job_id_jobs_id_fk',
+        constraint_type: 'f'
+      },
+      {
+        constraint_name: 'financial_admin_job_claims_job_id_jobs_id_fk',
+        constraint_type: 'f'
+      },
+      {
+        constraint_name: 'financial_admin_job_claims_lifecycle_consistent',
+        constraint_type: 'c'
+      }
+    ]));
+
+    const protectedIndexes = await databaseClient.pool.query<{ index_name: string }>(`
+      select index_row.indexrelid::regclass::text as index_name
+      from pg_catalog.pg_index index_row
+      where index_row.indrelid = 'public.financial_admin_commands'::regclass
+        and index_row.indisunique
+      order by index_name
+    `);
+    expect(protectedIndexes.rows.map((row) => row.index_name)).toEqual(expect.arrayContaining([
+      'financial_admin_commands_actor_idempotency_unique',
+      'financial_admin_commands_job_unique'
+    ]));
+  });
+
+  it('rejects partial, null, and mistyped administrator-command terminal results', async () => {
+    const actorId = randomUUID();
+    await databaseClient.pool.query(`
+      insert into "user" (id, name, email, email_verified)
+      values ($1, 'Command lifecycle actor', $2, true)
+    `, [actorId, `command-lifecycle-${actorId}@example.com`]);
+
+    const refundId = randomUUID();
+    const orderItemId = randomUUID();
+    const resultShapes: ReadonlyArray<{
+      kind: string;
+      code: string;
+      input: Record<string, unknown>;
+      result: Record<string, unknown>;
+    }> = [
+      {
+        kind: 'refund_draft_save', code: 'draft_saved',
+        input: {
+          kind: 'refund_draft_save', refundId, expectedVersion: null,
+          items: [{ orderItemId, totalPresentmentMinor: 10 }]
+        },
+        result: { refundId, draftVersion: 1, changed: false }
+      },
+      {
+        kind: 'refund_draft_discard', code: 'draft_discarded',
+        input: { kind: 'refund_draft_discard', refundId, expectedActiveDraftVersion: 1 },
+        result: { refundId, draftVersion: 1, changed: false }
+      },
+      {
+        kind: 'refund_allocation_finalize', code: 'allocation_finalized',
+        input: {
+          kind: 'refund_allocation_finalize', refundId, expectedActiveDraftVersion: 1,
+          previewFingerprint: 'b'.repeat(64), confirmation: 'finalize_refund_allocation'
+        },
+        result: {
+          refundId, finalizedDraftVersion: 1, accessChanged: false, emailQueued: false
+        }
+      },
+      {
+        kind: 'refund_reporting_correction_create', code: 'correction_created',
+        input: {
+          kind: 'refund_reporting_correction_create', refundId,
+          reason: 'allocation_attribution_correction', expectedNextCorrectionVersion: 1,
+          expectedBaseAllocationSetId: randomUUID(),
+          expectedSourceFingerprint: 'c'.repeat(64),
+          items: [{ orderItemId, totalPresentmentMinor: 10 }],
+          previewFingerprint: 'd'.repeat(64), confirmation: 'create_reporting_correction'
+        },
+        result: { refundId, correctionSetId: randomUUID(), correctionVersion: 1 }
+      },
+      {
+        kind: 'administrative_recovery_activate', code: 'recovery_activated',
+        input: {
+          kind: 'administrative_recovery_activate', refundId,
+          finalizationEffectId: randomUUID(), orderItemId,
+          expectedCorrectionSetId: randomUUID(), expectedCorrectionVersion: 1,
+          expectedSourceFingerprint: 'e'.repeat(64), previewFingerprint: 'f'.repeat(64),
+          confirmation: 'activate_persistent_recovery'
+        },
+        result: { recoveryGrantId: randomUUID(), accessChanged: false, emailQueued: false }
+      },
+      {
+        kind: 'administrative_recovery_deactivate', code: 'recovery_deactivated',
+        input: {
+          kind: 'administrative_recovery_deactivate', recoveryGrantId: randomUUID(),
+          recoveryReferenceId: randomUUID(),
+          expectedStateChangedAt: '2026-08-21T12:34:56.789Z',
+          confirmation: 'deactivate_persistent_recovery'
+        },
+        result: { recoveryGrantId: randomUUID(), accessChanged: false, emailQueued: false }
+      }
+    ];
+    const invalidResults: Array<{
+      label: string;
+      kind: string;
+      input: Record<string, unknown>;
+      status: string;
+      code: string | null;
+      result: unknown;
+      encodeJsonNull?: boolean;
+    }> = [];
+    for (const shape of resultShapes) {
+      invalidResults.push({
+        label: `${shape.kind} rejects an empty success result`,
+        kind: shape.kind, input: shape.input, status: 'succeeded', code: shape.code, result: {}
+      }, {
+        label: `${shape.kind} rejects a null success result code`,
+        kind: shape.kind, input: shape.input, status: 'succeeded', code: null,
+        result: shape.result
+      });
+      for (const key of Object.keys(shape.result)) {
+        const missing = { ...shape.result };
+        delete missing[key];
+        invalidResults.push({
+          label: `${shape.kind} rejects missing result ${key}`,
+          kind: shape.kind, input: shape.input, status: 'succeeded',
+          code: shape.code, result: missing
+        }, {
+          label: `${shape.kind} rejects null result ${key}`,
+          kind: shape.kind, input: shape.input, status: 'succeeded',
+          code: shape.code, result: { ...shape.result, [key]: null }
+        });
+      }
+    }
+    invalidResults.push(
+      ...[null, [], 'result', 1, true].map((result) => ({
+        label: `a ${result === null ? 'JSON-null' : Array.isArray(result) ? 'array' : typeof result} success result is rejected`,
+        kind: resultShapes[0]!.kind,
+        input: resultShapes[0]!.input,
+        status: 'succeeded',
+        code: resultShapes[0]!.code,
+        result,
+        encodeJsonNull: result === null
+      })),
+      {
+        label: 'a null denied result code is never accepted',
+        kind: resultShapes[0]!.kind,
+        input: resultShapes[0]!.input,
+        status: 'denied',
+        code: null,
+        result: null
+      },
+      {
+        label: 'a null conflict result code is never accepted',
+        kind: resultShapes[0]!.kind,
+        input: resultShapes[0]!.input,
+        status: 'conflict',
+        code: null,
+        result: null
+      },
+      {
+        label: 'a null failed result code is never accepted',
+        kind: resultShapes[0]!.kind,
+        input: resultShapes[0]!.input,
+        status: 'failed',
+        code: null,
+        result: null
+      }
+    );
+    for (const [index, invalid] of invalidResults.entries()) {
+      const jobId = randomUUID();
+      await databaseClient.pool.query(`
+        insert into jobs (id, type, payload, max_attempts)
+        values ($1, 'schema.command-lifecycle-fixture', '{}'::jsonb, 1)
+      `, [jobId]);
+      await expectConstraint(databaseClient.pool.query(`
+        insert into financial_admin_commands (
+          kind, actor_user_id, correlation_id, idempotency_key_sha256,
+          input_fingerprint_sha256, private_input, job_id, status,
+          safe_result_code, safe_result, completed_at
+        ) values (
+          $1::financial_admin_command_kind, $2, $3, $4, $5, $6::jsonb, $7,
+          $8::financial_admin_command_status, $9, $10::jsonb, clock_timestamp()
+        )
+      `, [
+        invalid.kind,
+        actorId,
+        `command-lifecycle-${randomUUID()}`,
+        (index + 1).toString(16).padStart(64, '0'),
+        'a'.repeat(64),
+        JSON.stringify(invalid.input),
+        jobId,
+        invalid.status,
+        invalid.code,
+        invalid.encodeJsonNull
+          ? 'null'
+          : invalid.result === null ? null : JSON.stringify(invalid.result)
+      ]), '23514', invalid.label);
+    }
+
+    for (const invalidTimestamp of [
+      {
+        label: 'updated timestamp cannot precede command creation',
+        status: 'pending', code: null, result: null,
+        updatedOffset: "- interval '1 second'", completedOffset: 'null'
+      },
+      {
+        label: 'terminal completion cannot precede the last update',
+        status: 'succeeded', code: 'draft_saved', result: resultShapes[0]!.result,
+        updatedOffset: '', completedOffset: "- interval '1 second'"
+      },
+      {
+        label: 'updated timestamp must be finite',
+        status: 'pending', code: null, result: null,
+        updatedOffset: 'infinity', completedOffset: 'null'
+      },
+      {
+        label: 'terminal completion timestamp must be finite',
+        status: 'succeeded', code: 'draft_saved', result: resultShapes[0]!.result,
+        updatedOffset: '', completedOffset: 'infinity'
+      }
+    ]) {
+      const jobId = randomUUID();
+      await databaseClient.pool.query(`
+        insert into jobs (id, type, payload, max_attempts)
+        values ($1, 'schema.command-timestamp-fixture', '{}'::jsonb, 1)
+      `, [jobId]);
+      const fixtureTime = new Date();
+      const updatedAt = invalidTimestamp.updatedOffset === 'infinity'
+        ? 'infinity'
+        : new Date(
+          fixtureTime.getTime() + (invalidTimestamp.updatedOffset === '' ? 0 : -1_000)
+        );
+      const completedAt = invalidTimestamp.completedOffset === 'null'
+        ? null
+        : invalidTimestamp.completedOffset === 'infinity'
+          ? 'infinity'
+          : new Date((updatedAt as Date).getTime() - 1_000);
+      await expectConstraint(databaseClient.pool.query(`
+        insert into financial_admin_commands (
+          kind, actor_user_id, correlation_id, idempotency_key_sha256,
+          input_fingerprint_sha256, private_input, job_id, status,
+          safe_result_code, safe_result, created_at, updated_at, completed_at
+        ) values (
+          'refund_draft_save', $1, $2, $3, repeat('a', 64), $4::jsonb, $5,
+          $6::financial_admin_command_status, $7, $8::jsonb, $9, $10, $11
+        )
+      `, [
+        actorId,
+        `command-timestamp-${randomUUID()}`,
+        randomUUID().replaceAll('-', '').padEnd(64, '0').slice(0, 64),
+        JSON.stringify(resultShapes[0]!.input),
+        jobId,
+        invalidTimestamp.status,
+        invalidTimestamp.code,
+        invalidTimestamp.result === null ? null : JSON.stringify(invalidTimestamp.result),
+        fixtureTime,
+        updatedAt,
+        completedAt
+      ]), '23514', invalidTimestamp.label);
+    }
+  });
+
+  it('rejects malformed private inputs even on direct owner-side command inserts', async () => {
+    const actorId = randomUUID();
+    await databaseClient.pool.query(`
+      insert into "user" (id, name, email, email_verified)
+      values ($1, 'Command input actor', $2, true)
+    `, [actorId, `command-input-${actorId}@example.com`]);
+
+    const refundId = randomUUID();
+    const orderItemId = randomUUID();
+    const shapes: ReadonlyArray<{ kind: string; input: Record<string, unknown> }> = [
+      {
+        kind: 'refund_draft_save',
+        input: {
+          kind: 'refund_draft_save', refundId, expectedVersion: null,
+          items: [{ orderItemId, totalPresentmentMinor: 10 }]
+        }
+      },
+      {
+        kind: 'refund_draft_discard',
+        input: { kind: 'refund_draft_discard', refundId, expectedActiveDraftVersion: 1 }
+      },
+      {
+        kind: 'refund_allocation_finalize',
+        input: {
+          kind: 'refund_allocation_finalize', refundId, expectedActiveDraftVersion: 1,
+          previewFingerprint: 'b'.repeat(64), confirmation: 'finalize_refund_allocation'
+        }
+      },
+      {
+        kind: 'refund_reporting_correction_create',
+        input: {
+          kind: 'refund_reporting_correction_create', refundId,
+          reason: 'allocation_attribution_correction', expectedNextCorrectionVersion: 1,
+          expectedBaseAllocationSetId: randomUUID(),
+          expectedSourceFingerprint: 'c'.repeat(64),
+          items: [{ orderItemId, totalPresentmentMinor: 10 }],
+          previewFingerprint: 'd'.repeat(64), confirmation: 'create_reporting_correction'
+        }
+      },
+      {
+        kind: 'administrative_recovery_activate',
+        input: {
+          kind: 'administrative_recovery_activate', refundId,
+          finalizationEffectId: randomUUID(), orderItemId,
+          expectedCorrectionSetId: randomUUID(), expectedCorrectionVersion: 1,
+          expectedSourceFingerprint: 'e'.repeat(64), previewFingerprint: 'f'.repeat(64),
+          confirmation: 'activate_persistent_recovery'
+        }
+      },
+      {
+        kind: 'administrative_recovery_deactivate',
+        input: {
+          kind: 'administrative_recovery_deactivate', recoveryGrantId: randomUUID(),
+          recoveryReferenceId: randomUUID(),
+          expectedStateChangedAt: '2026-08-21T12:34:56.789Z',
+          confirmation: 'deactivate_persistent_recovery'
+        }
+      }
+    ];
+    const invalidInputs: Array<{
+      label: string;
+      kind: string;
+      input: unknown;
+    }> = [];
+    for (const shape of shapes) {
+      for (const key of Object.keys(shape.input)) {
+        const missing = { ...shape.input };
+        delete missing[key];
+        invalidInputs.push({
+          label: `${shape.kind} table check rejects missing ${key}`,
+          kind: shape.kind,
+          input: missing
+        });
+        if (!(shape.kind === 'refund_draft_save' && key === 'expectedVersion')) {
+          invalidInputs.push({
+            label: `${shape.kind} table check rejects null ${key}`,
+            kind: shape.kind,
+            input: { ...shape.input, [key]: null }
+          });
+        }
+      }
+      const item = Array.isArray(shape.input.items)
+        ? shape.input.items[0] as Record<string, unknown>
+        : undefined;
+      if (item !== undefined) {
+        for (const key of Object.keys(item)) {
+          const missingItem = { ...item };
+          delete missingItem[key];
+          invalidInputs.push({
+            label: `${shape.kind} table check rejects missing item ${key}`,
+            kind: shape.kind,
+            input: { ...shape.input, items: [missingItem] }
+          }, {
+            label: `${shape.kind} table check rejects null item ${key}`,
+            kind: shape.kind,
+            input: { ...shape.input, items: [{ ...item, [key]: null }] }
+          });
+        }
+        invalidInputs.push({
+          label: `${shape.kind} table check rejects duplicate order items`,
+          kind: shape.kind,
+          input: { ...shape.input, items: [item, { ...item }] }
+        });
+        for (const invalidItems of [{}, 'items', 1, true]) {
+          invalidInputs.push({
+            label: `${shape.kind} table check rejects ${typeof invalidItems} items`,
+            kind: shape.kind,
+            input: { ...shape.input, items: invalidItems }
+          });
+        }
+        for (const invalidItem of [null, 'item', 1, true]) {
+          invalidInputs.push({
+            label: `${shape.kind} table check rejects ${String(invalidItem)} item`,
+            kind: shape.kind,
+            input: { ...shape.input, items: [invalidItem] }
+          });
+        }
+      }
+    }
+    invalidInputs.push({
+      label: 'table check rejects a kind/private-input mismatch',
+      kind: shapes[0]!.kind,
+      input: shapes[1]!.input
+    }, {
+      label: 'table check rejects a noncanonical recovery timestamp',
+      kind: shapes[5]!.kind,
+      input: { ...shapes[5]!.input, expectedStateChangedAt: '2026-08-21T12:34:56Z' }
+    });
+    for (const input of [null, [], 'private-input', 1, true]) {
+      invalidInputs.push({
+        label: `table check rejects a top-level ${input === null ? 'JSON-null' : Array.isArray(input) ? 'array' : typeof input} input`,
+        kind: shapes[0]!.kind,
+        input
+      });
+    }
+
+    for (const [index, invalid] of invalidInputs.entries()) {
+      const jobId = randomUUID();
+      const correlationId = `command-input-${randomUUID()}`;
+      const idempotencyHash = (index + 1).toString(16).padStart(64, '0');
+      await expectConstraint(databaseClient.pool.query(`
+        insert into financial_admin_commands (
+          kind, actor_user_id, correlation_id, idempotency_key_sha256,
+          input_fingerprint_sha256, private_input, job_id
+        ) values (
+          $1::financial_admin_command_kind, $2, $3, $4, repeat('a', 64), $5::jsonb, $6
+        )
+      `, [
+        invalid.kind,
+        actorId,
+        correlationId,
+        idempotencyHash,
+        JSON.stringify(invalid.input),
+        jobId
+      ]), '23514', invalid.label);
+      await expect(databaseClient.pool.query(`
+        select
+          (select count(*)::integer from financial_admin_commands
+           where actor_user_id = $1 and idempotency_key_sha256 = $2) as commands,
+          (select count(*)::integer from jobs where id = $3) as jobs,
+          (select count(*)::integer from audit_events
+           where correlation_id = $4) as audits
+      `, [actorId, idempotencyHash, jobId, correlationId]), invalid.label)
+        .resolves.toMatchObject({ rows: [{ commands: 0, jobs: 0, audits: 0 }] });
+    }
   });
 
   it('enforces the three entitlement-grant source shapes and recovery uniqueness', async () => {
@@ -499,7 +977,7 @@ describe('Plan 6B financial schema', () => {
       [preservedTitleId, graph.userId]
     );
 
-    const administrativeGrant = await expectSingleRow(
+    await expectConstraint(
       databaseClient.pool.query<{ id: string }>(
         `insert into entitlement_grants
            (title_id, user_id, source, recovery_refund_allocation_id, state, state_reason)
@@ -507,9 +985,30 @@ describe('Plan 6B financial schema', () => {
          returning id`,
         [graph.titleId, graph.userId, graph.refundAllocationId]
       ),
-      'the administrative recovery shape is accepted after migration 0007 exists'
+      '55000',
+      'administrative recovery grants require the command-bound transition routine'
     );
-    expect(administrativeGrant.id).toMatch(/^[0-9a-f-]{36}$/u);
+    const replicaQuery = async (text: string, values: unknown[] = []) => {
+      const client = await databaseClient.pool.connect();
+      try {
+        await client.query('begin');
+        await client.query(`set local session_replication_role = replica`);
+        const result = await client.query(text, values);
+        await client.query('commit');
+        return result;
+      } catch (error) {
+        await client.query('rollback');
+        throw error;
+      } finally {
+        client.release();
+      }
+    };
+    await replicaQuery(
+      `insert into entitlement_grants
+         (title_id, user_id, source, recovery_refund_allocation_id, state, state_reason)
+       values ($1, $2, 'administrative', $3, 'active', 'refund_allocation_recovery')`,
+      [graph.titleId, graph.userId, graph.refundAllocationId]
+    );
 
     const unusedTitleId = await createTitle('unused-purchase-source');
     const unusedItem = await databaseClient.pool.query<{ id: string }>(
@@ -527,7 +1026,7 @@ describe('Plan 6B financial schema', () => {
       {
         label: 'purchase grants cannot use the reserved recovery reason',
         query: () =>
-          databaseClient.pool.query(
+          replicaQuery(
             `insert into entitlement_grants
                (title_id, user_id, source, order_item_id, state, state_reason)
              values ($1, $2, 'purchase', $3, 'active', 'refund_allocation_recovery')`,
@@ -537,7 +1036,7 @@ describe('Plan 6B financial schema', () => {
       {
         label: 'purchase grants cannot carry a recovery allocation reference',
         query: () =>
-          databaseClient.pool.query(
+          replicaQuery(
             `insert into entitlement_grants
                (title_id, user_id, source, order_item_id, recovery_refund_allocation_id,
                 state, state_reason)
@@ -553,7 +1052,7 @@ describe('Plan 6B financial schema', () => {
       {
         label: 'preserved grants cannot use the reserved recovery reason',
         query: () =>
-          databaseClient.pool.query(
+          replicaQuery(
             `insert into entitlement_grants
                (title_id, user_id, source, state, state_reason)
              values ($1, $2, 'preserved', 'active', 'refund_allocation_recovery')`,
@@ -563,7 +1062,7 @@ describe('Plan 6B financial schema', () => {
       {
         label: 'preserved grants cannot carry a recovery allocation reference',
         query: () =>
-          databaseClient.pool.query(
+          replicaQuery(
             `insert into entitlement_grants
                (title_id, user_id, source, recovery_refund_allocation_id, state, state_reason)
              values ($1, $2, 'preserved', $3, 'active', 'pre_commerce_entitlement')`,
@@ -573,7 +1072,7 @@ describe('Plan 6B financial schema', () => {
       {
         label: 'administrative grants require a user',
         query: () =>
-          databaseClient.pool.query(
+          replicaQuery(
             `insert into entitlement_grants
                (title_id, source, recovery_refund_allocation_id, state, state_reason, revoked_at)
              values ($1, 'administrative', $2, 'revoked', 'refund_allocation_recovery',
@@ -584,7 +1083,7 @@ describe('Plan 6B financial schema', () => {
       {
         label: 'administrative grants cannot carry an order item',
         query: () =>
-          databaseClient.pool.query(
+          replicaQuery(
             `insert into entitlement_grants
                (title_id, user_id, source, order_item_id, recovery_refund_allocation_id,
                 state, state_reason)
@@ -601,7 +1100,7 @@ describe('Plan 6B financial schema', () => {
       {
         label: 'administrative grants require the exact reserved reason',
         query: () =>
-          databaseClient.pool.query(
+          replicaQuery(
             `insert into entitlement_grants
                (title_id, user_id, source, recovery_refund_allocation_id, state, state_reason)
              values ($1, $2, 'administrative', $3, 'active', 'manual_override')`,
@@ -611,7 +1110,7 @@ describe('Plan 6B financial schema', () => {
       {
         label: 'administrative grants require a recovery allocation reference',
         query: () =>
-          databaseClient.pool.query(
+          replicaQuery(
             `insert into entitlement_grants
                (title_id, user_id, source, state, state_reason)
              values ($1, $2, 'administrative', 'active', 'refund_allocation_recovery')`,
@@ -621,7 +1120,7 @@ describe('Plan 6B financial schema', () => {
       {
         label: 'administrative grants cannot be suspended',
         query: () =>
-          databaseClient.pool.query(
+          replicaQuery(
             `insert into entitlement_grants
                (title_id, user_id, source, recovery_refund_allocation_id, state, state_reason,
                 suspended_at)
@@ -637,7 +1136,7 @@ describe('Plan 6B financial schema', () => {
     }
 
     await expectConstraint(
-      databaseClient.pool.query(
+      replicaQuery(
         `insert into entitlement_grants
            (title_id, user_id, source, recovery_refund_allocation_id, state, state_reason)
          values ($1, $2, 'administrative', $3, 'active', 'refund_allocation_recovery')`,

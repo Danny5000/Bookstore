@@ -1,8 +1,11 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-const source = (path: string) => readFileSync(resolve(path), 'utf8').replace(/\r\n?/gu, '\n');
+const source = (path: string) => {
+  const absolute = resolve(path);
+  return existsSync(absolute) ? readFileSync(absolute, 'utf8').replace(/\r\n?/gu, '\n') : '';
+};
 
 const financialWorkerWriteTables = [
   'dispute_item_allocations',
@@ -843,7 +846,7 @@ describe('production database authority split', () => {
       entries: Array<{ idx: number; tag: string }>;
     };
 
-    expect(journal.entries.at(-1)).toMatchObject({
+    expect(journal.entries.find((entry) => entry.idx === 11)).toMatchObject({
       idx: 11,
       tag: '0011_plan6b_storage_cleanup_authority'
     });
@@ -949,5 +952,70 @@ describe('production database authority split', () => {
     expect(source('docs/storage-ingestion-and-publication.md')).toContain(
       'health probes older than `STORAGE_STAGING_RETENTION_HOURS`'
     );
+  });
+
+  it('pins Plan 6B-II command routines, runtime privacy, and worker transition authority', () => {
+    const migration = source('drizzle/0012_plan6bii_admin_command_authority.sql');
+    const provisioner = source('src/lib/server/db/database-role-provision.ts');
+    const runtimeRoutines = [
+      'submit_financial_admin_command(uuid,text,text,text,text,jsonb)',
+      'financial_admin_command_status(uuid,uuid)',
+      'append_financial_issue_view_audit(uuid,uuid,text,text,text)',
+      'append_financial_refund_review_view_audit(uuid,uuid,text,text,text)',
+      'append_financial_payout_view_audit(uuid,uuid,text,text,text)',
+      'append_financial_sales_export_audit(uuid,text,text,integer,integer,integer,text,text)'
+    ] as const;
+    const workerRoutines = [
+      'resolve_financial_issue_after_admin_command(uuid,uuid)',
+      'transition_administrative_recovery_grant_after_admin_command(uuid)'
+    ] as const;
+
+    for (const signature of runtimeRoutines) {
+      expect(provisioner).toContain(`'public.${signature}'`);
+      const [name, argumentsList] = signature.split('(');
+      expect(migration).toMatch(new RegExp(
+        `GRANT EXECUTE ON FUNCTION "public"\\."${name}"\\(${argumentsList!.replace(')', '\\)')} TO "pale_orbit_runtime"`,
+        'u'
+      ));
+    }
+    for (const signature of workerRoutines) {
+      expect(provisioner).toContain(`'public.${signature}'`);
+      expect(migration).toContain(`TO "pale_orbit_financial_worker"`);
+    }
+    expect(provisioner).toContain("'financial_admin_commands'");
+    expect(provisioner).toContain("'financial_admin_job_claims'");
+    expect(provisioner).toContain("'jobs:SELECT:id'");
+    expect(provisioner).toContain("'jobs:SELECT:deduplication_key'");
+    expect(provisioner).toContain("'jobs:*'");
+    expect(provisioner).toContain(
+      "'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN'"
+    );
+    for (const forbidden of [
+      'jobs:SELECT:payload', 'jobs:SELECT:status', 'jobs:SELECT:attempts',
+      'jobs:SELECT:last_error', 'jobs:SELECT:locked_at', 'jobs:SELECT:locked_by'
+    ]) expect(provisioner).not.toContain(`'${forbidden}'`);
+    expect(migration).toContain(
+      'REVOKE ALL ON TABLE "public"."financial_admin_commands" FROM PUBLIC, "pale_orbit_runtime", "pale_orbit_financial_worker", "pale_orbit_storage_cleanup"'
+    );
+    expect(migration).toContain(
+      'REVOKE ALL ON TABLE "public"."financial_admin_job_claims" FROM PUBLIC, "pale_orbit_runtime", "pale_orbit_financial_worker", "pale_orbit_storage_cleanup"'
+    );
+    expect(migration).toContain(
+      'GRANT SELECT ON TABLE "public"."financial_admin_commands" TO "pale_orbit_financial_worker"'
+    );
+    expect(migration).toContain(
+      'GRANT UPDATE ("status", "safe_result_code", "safe_result", "updated_at", "completed_at")'
+    );
+    for (const privateSignature of [
+      'public.plan6bii_assert_financial_admin_job_lease(uuid)',
+      'public.plan6bii_guard_financial_admin_job_lease()'
+    ]) {
+      expect(provisioner).not.toContain(`'${privateSignature}'`);
+      const [name] = privateSignature.replace('public.', '').split('(');
+      expect(migration).not.toMatch(new RegExp(
+        `GRANT EXECUTE ON FUNCTION "public"\\."${name}"`,
+        'u'
+      ));
+    }
   });
 });

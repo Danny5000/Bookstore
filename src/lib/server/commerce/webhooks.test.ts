@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { PermanentCommerceError } from './errors';
 import {
@@ -19,6 +21,14 @@ function event(type: string, objectId: string): VerifiedStripeEvent {
 }
 
 describe('supported Stripe event minimization', () => {
+  it('submits runtime Stripe jobs through the reference-only enqueue seam', () => {
+    const source = readFileSync(fileURLToPath(new URL('./webhooks.ts', import.meta.url)), 'utf8');
+    expect(source).toContain('enqueueJobReference as defaultEnqueueJobReference');
+    expect(source).toContain('enqueueJob: defaultEnqueueJobReference');
+    expect(source).toContain('await dependencies.enqueueJob(database, {');
+    expect(source).not.toContain('enqueueJob as defaultEnqueueJob');
+  });
+
   it('freezes every supported lifecycle type and retrieval mapping', () => {
     expect(SUPPORTED_STRIPE_EVENT_TYPES).toEqual([
       'checkout.session.completed',

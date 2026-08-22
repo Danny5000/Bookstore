@@ -12,6 +12,17 @@ const job: JobRecord = {
   lockedBy: 'worker-test'
 };
 
+const FINANCIAL_ADMIN_LEASE_CAPABILITY = 'A'.repeat(43);
+const financialAdminJob: JobRecord = {
+  ...job,
+  id: 'f1f46ee7-3170-40ea-bfad-d55a734bf380',
+  type: 'commerce.financial-admin-command',
+  payload: { commandId: 'f1f46ee7-3170-40ea-bfad-d55a734bf381' },
+  deduplicationKey:
+    'commerce:financial-admin-command:f1f46ee7-3170-40ea-bfad-d55a734bf381:v1',
+  financialAdminLeaseCapability: FINANCIAL_ADMIN_LEASE_CAPABILITY
+};
+
 function repositoryReturning(record: JobRecord): JobRepository {
   return {
     claimNext: vi.fn().mockResolvedValueOnce(record).mockResolvedValue(null),
@@ -414,5 +425,210 @@ describe('runWorker', () => {
       'Transient job completion failure',
       true
     );
+  });
+
+  it('forwards the financial-admin capability to heartbeat and completion without logging it', async () => {
+    const controller = new AbortController();
+    const repository = repositoryReturning(financialAdminJob);
+    const heartbeat = controlledSleep();
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    let releaseHandler!: () => void;
+    const heldHandler = new Promise<void>((resolve) => { releaseHandler = resolve; });
+
+    const running = runWorker({
+      repository,
+      handlers: new Map([[financialAdminJob.type, async () => heldHandler]]),
+      workerId: 'worker-test',
+      concurrency: 1,
+      pollIntervalMs: 1,
+      heartbeatIntervalMs: 25,
+      signal: controller.signal,
+      heartbeatSleep: heartbeat.sleep,
+      sleep: async () => controller.abort()
+    });
+
+    await vi.waitFor(() => expect(heartbeat.sleep).toHaveBeenCalledOnce());
+    heartbeat.releaseNext();
+    await vi.waitFor(() => expect(repository.renewLease).toHaveBeenCalledWith(
+      financialAdminJob.id,
+      'worker-test',
+      FINANCIAL_ADMIN_LEASE_CAPABILITY
+    ));
+    releaseHandler();
+    await running;
+
+    expect(repository.complete).toHaveBeenCalledWith(
+      financialAdminJob.id,
+      'worker-test',
+      FINANCIAL_ADMIN_LEASE_CAPABILITY
+    );
+    expect(JSON.stringify(log.mock.calls)).not.toContain(FINANCIAL_ADMIN_LEASE_CAPABILITY);
+    log.mockRestore();
+  });
+
+  it.each([
+    {
+      name: 'permanent failure',
+      record: financialAdminJob,
+      handler: async () => { throw new PermanentJobError('Invalid job payload'); },
+      expected: ['Invalid job payload', false] as const
+    },
+    {
+      name: 'transient retry',
+      record: financialAdminJob,
+      handler: async () => { throw new Error('private transient detail'); },
+      expected: ['Transient job handler failure', true] as const
+    },
+    {
+      name: 'exhausted transient failure',
+      record: { ...financialAdminJob, attempts: financialAdminJob.maxAttempts },
+      handler: async () => { throw new Error('private exhausted detail'); },
+      expected: ['Transient job handler failure', true] as const
+    }
+  ])('forwards the financial-admin capability on $name', async ({ record, handler, expected }) => {
+    const controller = new AbortController();
+    const repository = repositoryReturning(record);
+
+    await runWorker({
+      repository,
+      handlers: new Map([[record.type, handler]]),
+      workerId: 'worker-test',
+      concurrency: 1,
+      pollIntervalMs: 1,
+      heartbeatIntervalMs: 25,
+      signal: controller.signal,
+      sleep: async () => controller.abort()
+    });
+
+    expect(repository.fail).toHaveBeenCalledWith(
+      record.id,
+      'worker-test',
+      expected[0],
+      expected[1],
+      FINANCIAL_ADMIN_LEASE_CAPABILITY
+    );
+  });
+
+  it('forwards the capability to the ambiguous-completion fallback and bounds errors', async () => {
+    const controller = new AbortController();
+    const repository = repositoryReturning(financialAdminJob);
+    vi.mocked(repository.complete).mockRejectedValue(
+      new Error(`ambiguous ${FINANCIAL_ADMIN_LEASE_CAPABILITY}`)
+    );
+
+    await expect(runWorker({
+      repository,
+      handlers: new Map([[financialAdminJob.type, vi.fn().mockResolvedValue(undefined)]]),
+      workerId: 'worker-test',
+      concurrency: 1,
+      pollIntervalMs: 1,
+      heartbeatIntervalMs: 25,
+      signal: controller.signal,
+      sleep: async () => controller.abort()
+    })).resolves.toBeUndefined();
+
+    expect(repository.fail).toHaveBeenCalledWith(
+      financialAdminJob.id,
+      'worker-test',
+      'Transient job completion failure',
+      true,
+      FINANCIAL_ADMIN_LEASE_CAPABILITY
+    );
+    expect(JSON.stringify(vi.mocked(repository.fail).mock.calls))
+      .toContain(FINANCIAL_ADMIN_LEASE_CAPABILITY);
+    expect(vi.mocked(repository.fail).mock.calls[0]?.[2])
+      .not.toContain(FINANCIAL_ADMIN_LEASE_CAPABILITY);
+  });
+
+  it('forwards the capability on unknown-handler failure', async () => {
+    const controller = new AbortController();
+    const record = { ...financialAdminJob, type: 'unknown.financial-admin' };
+    const repository = repositoryReturning(record);
+
+    await runWorker({
+      repository,
+      handlers: new Map(),
+      workerId: 'worker-test',
+      concurrency: 1,
+      pollIntervalMs: 1,
+      heartbeatIntervalMs: 25,
+      signal: controller.signal,
+      sleep: async () => controller.abort()
+    });
+
+    expect(repository.fail).toHaveBeenCalledWith(
+      record.id,
+      'worker-test',
+      'No handler registered for unknown.financial-admin',
+      false,
+      FINANCIAL_ADMIN_LEASE_CAPABILITY
+    );
+  });
+
+  it.each([undefined, 'short-token'])(
+    'fails closed before the handler for an invalid financial-admin capability %s',
+    async (financialAdminLeaseCapability) => {
+    const controller = new AbortController();
+    const financialAdminJobWithoutCapability: JobRecord = {
+      id: financialAdminJob.id,
+      type: financialAdminJob.type,
+      payload: financialAdminJob.payload,
+      deduplicationKey: financialAdminJob.deduplicationKey,
+      attempts: financialAdminJob.attempts,
+      maxAttempts: financialAdminJob.maxAttempts,
+      lockedBy: financialAdminJob.lockedBy
+    };
+    const record: JobRecord = financialAdminLeaseCapability === undefined
+      ? financialAdminJobWithoutCapability
+      : { ...financialAdminJobWithoutCapability, financialAdminLeaseCapability };
+    const repository = repositoryReturning(record);
+    const handler = vi.fn().mockResolvedValue(undefined);
+
+    await expect(runWorker({
+      repository,
+      handlers: new Map([[record.type, handler]]),
+      workerId: 'worker-test',
+      concurrency: 1,
+      pollIntervalMs: 1,
+      heartbeatIntervalMs: 25,
+      signal: controller.signal,
+      sleep: async () => controller.abort()
+    })).resolves.toBeUndefined();
+
+    expect(handler).not.toHaveBeenCalled();
+    expect(repository.renewLease).not.toHaveBeenCalled();
+    expect(repository.complete).not.toHaveBeenCalled();
+    expect(repository.fail).not.toHaveBeenCalled();
+    }
+  );
+
+  it('never copies the capability into a safe handler failure or propagated error', async () => {
+    const controller = new AbortController();
+    const repository = repositoryReturning(financialAdminJob);
+    vi.mocked(repository.fail).mockRejectedValue(
+      new Error(`database detail ${FINANCIAL_ADMIN_LEASE_CAPABILITY}`)
+    );
+
+    await expect(runWorker({
+      repository,
+      handlers: new Map([[
+        financialAdminJob.type,
+        async () => {
+          throw new PermanentJobError(
+            `unsafe ${FINANCIAL_ADMIN_LEASE_CAPABILITY}`
+          );
+        }
+      ]]),
+      workerId: 'worker-test',
+      concurrency: 1,
+      pollIntervalMs: 1,
+      heartbeatIntervalMs: 25,
+      signal: controller.signal,
+      sleep: async () => controller.abort()
+    })).resolves.toBeUndefined();
+
+    const safeError = vi.mocked(repository.fail).mock.calls[0]?.[2];
+    expect(safeError).toBe('Permanent job handler failure');
+    expect(safeError).not.toContain(FINANCIAL_ADMIN_LEASE_CAPABILITY);
   });
 });

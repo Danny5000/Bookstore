@@ -47,6 +47,9 @@ const FINANCIAL_WORKER_INSERT_TABLES = [
   'financial_item_allocations',
   'financial_reconciliation_issues',
   'refund_allocation_components',
+  'refund_allocation_draft_items',
+  'refund_allocation_drafts',
+  'refund_allocation_finalization_effects',
   'refund_reporting_correction_items',
   'refund_reporting_correction_sets',
   'financial_classification_versions',
@@ -110,6 +113,8 @@ const PROTECTED_RUNTIME_WRITE_TABLES = [
   'entitlement_grants',
   'entitlements',
   'commerce_claim_issuances',
+  'financial_admin_commands',
+  'financial_admin_job_claims',
   ...WORKER_DERIVED_CATALOG_TABLES
 ] as const;
 
@@ -159,6 +164,8 @@ const RUNTIME_COLUMN_PRIVILEGES = [
   'jobs:INSERT:deduplication_key',
   'jobs:INSERT:run_at',
   'jobs:INSERT:max_attempts',
+  'jobs:SELECT:id',
+  'jobs:SELECT:deduplication_key',
   'guest_identities:INSERT:email',
   'guest_identities:UPDATE:updated_at',
   'outbox_messages:INSERT:id',
@@ -200,8 +207,20 @@ const WORKER_COLUMN_PRIVILEGES = [
   'outbox_messages:UPDATE:last_error',
   'outbox_messages:UPDATE:delivered_at',
   'outbox_messages:UPDATE:updated_at',
-  'refund_allocation_drafts:UPDATE:id',
-  'refund_allocation_draft_items:UPDATE:id',
+  'financial_admin_commands:UPDATE:status',
+  'financial_admin_commands:UPDATE:safe_result_code',
+  'financial_admin_commands:UPDATE:safe_result',
+  'financial_admin_commands:UPDATE:updated_at',
+  'financial_admin_commands:UPDATE:completed_at',
+  'refund_allocation_drafts:UPDATE:state',
+  'refund_allocation_drafts:UPDATE:version',
+  'refund_allocation_drafts:UPDATE:updated_by_admin_id',
+  'refund_allocation_drafts:UPDATE:updated_correlation_id',
+  'refund_allocation_drafts:UPDATE:updated_at',
+  'refund_allocation_drafts:UPDATE:finalized_at',
+  'refund_allocation_drafts:UPDATE:discarded_at',
+  'refund_allocation_draft_items:UPDATE:proposed_total_presentment_minor',
+  'refund_allocation_draft_items:UPDATE:updated_at',
   'refund_allocations:UPDATE:id',
   'refund_allocation_components:UPDATE:id',
   'refund_reporting_correction_sets:UPDATE:id',
@@ -220,28 +239,50 @@ const RUNTIME_EXECUTE_FUNCTIONS = [
   'public.authorize_commerce_claim_issuance(text,text)',
   'public.claim_guest_purchases_after_authorization(text,text)',
   'public.outbox_message_exists_by_deduplication_key(text)',
-  'public.outbox_message_deduplication_metadata(text,text,jsonb)'
+  'public.outbox_message_deduplication_metadata(text,text,jsonb)',
+  'public.submit_financial_admin_command(uuid,text,text,text,text,jsonb)',
+  'public.financial_admin_command_status(uuid,uuid)',
+  'public.append_financial_issue_view_audit(uuid,uuid,text,text,text)',
+  'public.append_financial_refund_review_view_audit(uuid,uuid,text,text,text)',
+  'public.append_financial_payout_view_audit(uuid,uuid,text,text,text)',
+  'public.append_financial_sales_export_audit(uuid,text,text,integer,integer,integer,text,text)'
 ] as const;
 
 const WORKER_EXECUTE_FUNCTIONS = [
   'public.resolve_financial_issue_after_worker_recompute(uuid,text)',
   'public.register_commerce_claim_issuance(text,text,text,uuid,text,timestamp with time zone)',
-  'public.purge_commerce_claim_issuances()'
+  'public.purge_commerce_claim_issuances()',
+  'public.resolve_financial_issue_after_admin_command(uuid,uuid)',
+  'public.transition_administrative_recovery_grant_after_admin_command(uuid)'
 ] as const;
 
-const WORKER_SELECT_TABLES = ['outbox_messages'] as const;
+const WORKER_SELECT_TABLES = [
+  'outbox_messages', 'financial_admin_commands', 'jobs'
+] as const;
 
 const RUNTIME_TABLE_SELECT_EXCLUSIONS = [
   'commerce_claim_issuances',
-  'outbox_messages'
+  'outbox_messages',
+  'financial_admin_commands',
+  'financial_admin_job_claims',
+  'jobs'
 ] as const;
 
 const PUBLIC_SENSITIVE_SELECT_COLUMNS = [
   'outbox_messages:payload',
-  'commerce_claim_issuances:*'
+  'commerce_claim_issuances:*',
+  'financial_admin_commands:*',
+  'financial_admin_job_claims:*',
+  'jobs:*'
 ] as const;
 
 export type DatabaseRuntimeRole = 'owner' | 'worker' | 'storage-cleanup';
+
+export interface DatabaseMigrationIdentityConfig {
+  readonly webUser: string;
+  readonly workerUser: string;
+  readonly storageCleanupUser: string;
+}
 
 export interface DatabaseRoleProvisionConfig {
   readonly host: string;
@@ -285,6 +326,62 @@ function roleName(value: string, name: string): string {
     invalid(`${name} is invalid`);
   }
   return value;
+}
+
+function invalidMigrationIdentity(): never {
+  throw new ConfigurationError('database migration login identity configuration is invalid');
+}
+
+export function loadDatabaseMigrationIdentityConfig(
+  source: EnvironmentValues,
+  readSecretFile?: SecretFileReader
+): DatabaseMigrationIdentityConfig {
+  if (source.PGOPTIONS !== undefined && source.PGOPTIONS.length > 0) {
+    invalidMigrationIdentity();
+  }
+  for (const fileName of [
+    'DATABASE_MIGRATION_WEB_USER_FILE',
+    'DATABASE_MIGRATION_WORKER_USER_FILE',
+    'DATABASE_MIGRATION_STORAGE_CLEANUP_USER_FILE'
+  ]) {
+    if (source[fileName] !== undefined) invalidMigrationIdentity();
+  }
+
+  let ownerUser: string;
+  try {
+    ownerUser = boundedText(
+      readRequiredSetting(source, 'DATABASE_OWNER_USER', readSecretFile),
+      'owner user',
+      63
+    );
+  } catch {
+    invalidMigrationIdentity();
+  }
+
+  const resolveLogin = (dedicatedName: string, ordinaryName: string): string => {
+    const value = source[dedicatedName] !== undefined
+      ? source[dedicatedName]
+      : source[ordinaryName];
+    if (value === undefined || value.length === 0) invalidMigrationIdentity();
+    try {
+      return roleName(value, 'migration login identity');
+    } catch {
+      invalidMigrationIdentity();
+    }
+  };
+
+  const identities: DatabaseMigrationIdentityConfig = {
+    webUser: resolveLogin('DATABASE_MIGRATION_WEB_USER', 'DATABASE_USER'),
+    workerUser: resolveLogin('DATABASE_MIGRATION_WORKER_USER', 'DATABASE_WORKER_USER'),
+    storageCleanupUser: resolveLogin(
+      'DATABASE_MIGRATION_STORAGE_CLEANUP_USER',
+      'DATABASE_STORAGE_CLEANUP_USER'
+    )
+  };
+  if (new Set([ownerUser, ...Object.values(identities)]).size !== 4) {
+    invalidMigrationIdentity();
+  }
+  return identities;
 }
 
 function password(value: string, name: string): string {
@@ -1019,9 +1116,9 @@ export async function provisionDatabaseRoles(
                            pg_catalog.split_part(sensitive_column.token, ':', 1)
                      )
                    or privilege_row.object_kind = 'relation'
-                     and privilege_row.privilege_type in (
-                       'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'
-                     )
+                      and privilege_row.privilege_type in (
+                        'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN'
+                      )
                    or privilege_row.object_kind like 'column:%'
                      and privilege_row.privilege_type in ('INSERT', 'UPDATE', 'REFERENCES')
                    or privilege_row.object_kind like 'column:%'

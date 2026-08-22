@@ -1,9 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { DatabaseExecutor } from '$lib/server/db/transaction';
 
-const { enqueueJob } = vi.hoisted(() => ({ enqueueJob: vi.fn() }));
+const { enqueueJob, enqueueJobReference } = vi.hoisted(() => ({
+  enqueueJob: vi.fn(),
+  enqueueJobReference: vi.fn()
+}));
 
-vi.mock('$lib/server/jobs/repository', () => ({ enqueueJob }));
+vi.mock('$lib/server/jobs/repository', () => ({ enqueueJob, enqueueJobReference }));
 
 import {
   enqueueRevisionIngestion,
@@ -27,16 +30,17 @@ describe('revision ingestion jobs', () => {
 
   it('enqueues a deterministic, deduplicated job', async () => {
     const database = {} as DatabaseExecutor;
-    enqueueJob.mockResolvedValueOnce({ id: 'job-id' });
+    enqueueJobReference.mockResolvedValueOnce({ id: 'job-id' });
 
     await expect(enqueueRevisionIngestion(database, revisionId, 3)).resolves.toEqual({
       id: 'job-id'
     });
-    expect(enqueueJob).toHaveBeenCalledWith(database, {
+    expect(enqueueJobReference).toHaveBeenCalledWith(database, {
       type: INGEST_REVISION_JOB,
       payload: { revisionId, generation: 3 },
       deduplicationKey: `catalog.ingest:${revisionId}:3`,
       maxAttempts: 5
     });
+    expect(enqueueJob).not.toHaveBeenCalled();
   });
 });

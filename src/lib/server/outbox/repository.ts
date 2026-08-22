@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { eq, sql, type SQL } from 'drizzle-orm';
 import { outboxMessages, type JsonObject, type OutboxMessageRow } from '$lib/server/db/schema';
 import type { DatabaseExecutor, DatabaseTransaction } from '$lib/server/db/transaction';
-import { enqueueJob } from '$lib/server/jobs/repository';
+import { enqueueJobReference } from '$lib/server/jobs/repository';
 
 export const OUTBOX_DISPATCH_JOB = 'outbox.dispatch';
 
@@ -144,7 +144,7 @@ export async function enqueueOutboxMessage(
   const dispatchDeduplicationKey = deduplicationKey
     ? `outbox-key:${createHash('sha256').update(deduplicationKey).digest('hex')}`
     : `outbox:${outboxId}`;
-  const job = await enqueueJob(transaction, {
+  const job = await enqueueJobReference(transaction, {
     type: OUTBOX_DISPATCH_JOB,
     payload: { outboxId },
     deduplicationKey: dispatchDeduplicationKey,

@@ -277,7 +277,12 @@ try {
         }
       : {})
   };
-  const ownerEnvironment = databaseEnvironmentForRole(webEnvironment, 'owner');
+  const ownerEnvironment: NodeJS.ProcessEnv = {
+    ...databaseEnvironmentForRole(webEnvironment, 'owner')
+  };
+  ownerEnvironment.DATABASE_MIGRATION_WEB_USER = webEnvironment.DATABASE_USER;
+  ownerEnvironment.DATABASE_MIGRATION_WORKER_USER = webEnvironment.DATABASE_WORKER_USER;
+  ownerEnvironment.DATABASE_MIGRATION_STORAGE_CLEANUP_USER = webEnvironment.DATABASE_STORAGE_CLEANUP_USER;
   delete ownerEnvironment.DATABASE_WORKER_USER;
   delete ownerEnvironment.DATABASE_WORKER_USER_FILE;
   delete ownerEnvironment.DATABASE_WORKER_PASSWORD;

@@ -1,9 +1,15 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { drizzle } from 'drizzle-orm/node-postgres';
-import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import { Pool, type PoolClient } from 'pg';
+import {
+  databaseEnvironmentForRole,
+  loadDatabaseMigrationIdentityConfig
+} from '../src/lib/server/db/database-role-provision';
+import { migrateDatabase } from '../src/lib/server/db/migrate';
+import * as databaseSchema from '../src/lib/server/db/schema';
+import { createPostgresJobRepository } from '../src/lib/server/jobs/repository';
 
 function requiredEnvironment(name: string): string {
   const value = process.env[name]?.trim();
@@ -49,9 +55,13 @@ const verifierPath = fileURLToPath(
 const workerAuthorityMigrationPath = fileURLToPath(
   new URL('../drizzle/0009_plan6b_worker_authority_and_commerce_integrity.sql', import.meta.url)
 );
-const [verifier, workerAuthorityMigration] = await Promise.all([
+const adminCommandAuthorityMigrationPath = fileURLToPath(
+  new URL('../drizzle/0012_plan6bii_admin_command_authority.sql', import.meta.url)
+);
+const [verifier, workerAuthorityMigration, adminCommandAuthorityMigration] = await Promise.all([
   readFile(verifierPath, 'utf8'),
-  readFile(workerAuthorityMigrationPath, 'utf8')
+  readFile(workerAuthorityMigrationPath, 'utf8'),
+  readFile(adminCommandAuthorityMigrationPath, 'utf8')
 ]);
 const verifierLines = verifier.split(/\r?\n/u);
 const allowedMetaCommands = ['\\set ON_ERROR_STOP on', '\\set QUIET on'];
@@ -113,6 +123,205 @@ const semanticIdentityConstraintStatement = requiredMigrationCheckConstraintStat
 );
 const semanticImpactConstraintStatement = requiredMigrationCheckConstraintStatement(
   'financial_reconciliation_issues_semantic_impact'
+);
+
+function requiredAdminCommandAuthorityStatement(
+  witnessName: string,
+  prefix: string
+): string {
+  const start = adminCommandAuthorityMigration.indexOf(prefix);
+  const endMarker = ';--> statement-breakpoint';
+  const end = adminCommandAuthorityMigration.indexOf(endMarker, start);
+  if (
+    start < 0 ||
+    end < 0 ||
+    adminCommandAuthorityMigration.indexOf(prefix, start + prefix.length) >= 0
+  ) {
+    throw new Error(`[restore-verifier] expected one canonical ${witnessName} statement`);
+  }
+  const statement = adminCommandAuthorityMigration.slice(start, end);
+  if (!statement.startsWith(prefix) || statement.includes('\0')) {
+    throw new Error(`[restore-verifier] unsafe canonical ${witnessName} statement`);
+  }
+  return statement;
+}
+
+function requiredWorkerAuthorityStatement(witnessName: string, prefix: string): string {
+  const start = workerAuthorityMigration.indexOf(prefix);
+  const endMarker = ';--> statement-breakpoint';
+  const end = workerAuthorityMigration.indexOf(endMarker, start);
+  if (
+    start < 0 ||
+    end < 0 ||
+    workerAuthorityMigration.indexOf(prefix, start + prefix.length) >= 0
+  ) {
+    throw new Error(`[restore-verifier] expected one canonical ${witnessName} statement`);
+  }
+  const statement = workerAuthorityMigration.slice(start, end);
+  if (!statement.startsWith(prefix) || statement.includes('\0')) {
+    throw new Error(`[restore-verifier] unsafe canonical ${witnessName} statement`);
+  }
+  return statement;
+}
+
+function canonicalReplaceFunctionStatement(statement: string): string {
+  if (statement.startsWith('CREATE OR REPLACE FUNCTION ')) return statement;
+  if (!statement.startsWith('CREATE FUNCTION ')) {
+    throw new Error('[restore-verifier] canonical function statement has an invalid prefix');
+  }
+  return statement.replace(/^CREATE FUNCTION /u, 'CREATE OR REPLACE FUNCTION ');
+}
+
+function requiredInlineCheckConstraintStatement(
+  witnessName: string,
+  tableName: string,
+  constraintName: string
+): string {
+  if (
+    !/^[a-z][a-z0-9_]*$/u.test(tableName) ||
+    !/^[a-z][a-z0-9_]*$/u.test(constraintName)
+  ) {
+    throw new Error('[restore-verifier] unsafe inline constraint identity');
+  }
+  const prefix = `CONSTRAINT "${constraintName}" CHECK (`;
+  const start = adminCommandAuthorityMigration.indexOf(prefix);
+  if (
+    start < 0 ||
+    adminCommandAuthorityMigration.indexOf(prefix, start + prefix.length) >= 0
+  ) {
+    throw new Error(`[restore-verifier] expected one canonical ${witnessName} clause`);
+  }
+  const openingParenthesis = start + prefix.length - 1;
+  let depth = 0;
+  let quoted: 'identifier' | 'literal' | null = null;
+  let closingParenthesis = -1;
+  for (let index = openingParenthesis; index < adminCommandAuthorityMigration.length; index += 1) {
+    const character = adminCommandAuthorityMigration[index]!;
+    const next = adminCommandAuthorityMigration[index + 1];
+    if (quoted === 'literal') {
+      if (character === "'" && next === "'") index += 1;
+      else if (character === "'") quoted = null;
+      continue;
+    }
+    if (quoted === 'identifier') {
+      if (character === '"' && next === '"') index += 1;
+      else if (character === '"') quoted = null;
+      continue;
+    }
+    if (character === "'") {
+      quoted = 'literal';
+      continue;
+    }
+    if (character === '"') {
+      quoted = 'identifier';
+      continue;
+    }
+    if (character === '(') depth += 1;
+    else if (character === ')') {
+      depth -= 1;
+      if (depth === 0) {
+        closingParenthesis = index;
+        break;
+      }
+    }
+  }
+  if (closingParenthesis < 0 || quoted !== null || depth !== 0) {
+    throw new Error(`[restore-verifier] unsafe canonical ${witnessName} clause`);
+  }
+  const clause = adminCommandAuthorityMigration.slice(start, closingParenthesis + 1);
+  if (!clause.startsWith(prefix) || clause.includes(';') || clause.includes('-->')) {
+    throw new Error(`[restore-verifier] unsafe canonical ${witnessName} clause`);
+  }
+  return `ALTER TABLE "${tableName}" ADD ${clause}`;
+}
+
+const financialClaimDigestConstraintStatement = requiredInlineCheckConstraintStatement(
+  'financial claim capability digest constraint',
+  'financial_admin_job_claims',
+  'financial_admin_job_claims_capability_sha256_valid'
+);
+const financialClaimLifecycleConstraintStatement = requiredInlineCheckConstraintStatement(
+  'financial claim lifecycle constraint',
+  'financial_admin_job_claims',
+  'financial_admin_job_claims_lifecycle_consistent'
+);
+const financialClaimGenerationConstraintStatement = requiredInlineCheckConstraintStatement(
+  'financial claim generation constraint',
+  'financial_admin_job_claims',
+  'financial_admin_job_claims_generation_positive'
+);
+const financialClaimAttemptConstraintStatement = requiredInlineCheckConstraintStatement(
+  'financial claim attempt constraint',
+  'financial_admin_job_claims',
+  'financial_admin_job_claims_attempt_positive'
+);
+const financialClaimHelperStatement = canonicalReplaceFunctionStatement(
+  requiredAdminCommandAuthorityStatement(
+    'financial claim helper',
+    'CREATE FUNCTION "public"."plan6bii_assert_financial_admin_job_lease"(uuid)'
+  )
+);
+const financialClaimHelperRevokeStatement = requiredAdminCommandAuthorityStatement(
+  'financial claim helper revoke',
+  'REVOKE ALL ON FUNCTION "public"."plan6bii_assert_financial_admin_job_lease"(uuid)'
+);
+const financialLeaseTriggerStatement = requiredAdminCommandAuthorityStatement(
+  'financial lease trigger',
+  'CREATE TRIGGER "jobs_plan6bii_financial_admin_lease_guard"'
+);
+const financialTerminalTriggerStatement = requiredAdminCommandAuthorityStatement(
+  'financial terminal trigger',
+  'CREATE TRIGGER "jobs_plan6bii_financial_admin_terminal_sync"'
+);
+const financialJobGuardStatement = canonicalReplaceFunctionStatement(
+  requiredAdminCommandAuthorityStatement(
+    'financial job guard',
+    'CREATE OR REPLACE FUNCTION "public"."plan6b_guard_job_insert"()'
+  )
+);
+const financialAuditGuardStatement = canonicalReplaceFunctionStatement(
+  requiredAdminCommandAuthorityStatement(
+    'financial audit guard',
+    'CREATE OR REPLACE FUNCTION "public"."plan6b_guard_audit_insert"()'
+  )
+);
+const financialCommandStatusFunctionStatement = canonicalReplaceFunctionStatement(
+  requiredAdminCommandAuthorityStatement(
+    'financial command status function',
+    'CREATE FUNCTION "public"."financial_admin_command_status"(uuid,uuid)'
+  )
+);
+const financialCommandStatusRevokeStatement = requiredAdminCommandAuthorityStatement(
+  'financial command status revoke',
+  'REVOKE ALL ON FUNCTION "public"."financial_admin_command_status"(uuid,uuid)'
+);
+const financialCommandStatusGrantStatement = requiredAdminCommandAuthorityStatement(
+  'financial command status grant',
+  'GRANT EXECUTE ON FUNCTION "public"."financial_admin_command_status"(uuid,uuid)'
+);
+const financialWorkerResolveGrantStatement = requiredAdminCommandAuthorityStatement(
+  'financial worker resolve grant',
+  'GRANT EXECUTE ON FUNCTION "public"."resolve_financial_issue_after_admin_command"(uuid,uuid)'
+);
+const financialJobsRuntimeSelectRevokeStatement = requiredAdminCommandAuthorityStatement(
+  'financial jobs runtime select revoke',
+  'REVOKE SELECT ON TABLE "public"."jobs" FROM "pale_orbit_runtime"'
+);
+const financialJobsRuntimeSelectGrantStatement = requiredAdminCommandAuthorityStatement(
+  'financial jobs runtime select grant',
+  'GRANT SELECT ("id", "deduplication_key") ON TABLE "public"."jobs"'
+);
+const runtimeDefaultTableSelectGrantStatement = requiredWorkerAuthorityStatement(
+  'runtime future table select grant',
+  'ALTER DEFAULT PRIVILEGES IN SCHEMA "public" GRANT SELECT ON TABLES'
+);
+const runtimeDefaultSequenceGrantStatement = requiredWorkerAuthorityStatement(
+  'runtime future sequence grant',
+  'ALTER DEFAULT PRIVILEGES IN SCHEMA "public" GRANT USAGE, SELECT, UPDATE ON SEQUENCES'
+);
+const publicDefaultRoutineRevokeStatement = requiredWorkerAuthorityStatement(
+  'PUBLIC future routine execute revoke',
+  'ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON ROUTINES FROM PUBLIC'
 );
 
 const catalogManifestBegin = uniqueBoundary(executableSql, financialCatalogManifestBegin);
@@ -212,6 +421,44 @@ interface VerifierOutcome {
   readonly rows: readonly Record<string, unknown>[];
 }
 
+const verifierFailurePattern = /^[a-z_][a-z0-9_]*=[1-9][0-9]*$/u;
+
+function parsedVerifierFailureList(error: Error): readonly string[] | null {
+  const marker = 'restore financial/credential invariant violation: ';
+  const markerIndex = error.message.indexOf(marker);
+  if (
+    markerIndex < 0 ||
+    error.message.indexOf(marker, markerIndex + marker.length) >= 0
+  ) return null;
+  const failureLine = error.message
+    .slice(markerIndex + marker.length)
+    .split(/\r?\n/u, 1)[0]
+    ?.trim();
+  if (!failureLine) return null;
+  const actualFailures = failureLine.split(', ');
+  if (
+    actualFailures.some((failure) => !verifierFailurePattern.test(failure)) ||
+    new Set(actualFailures).size !== actualFailures.length
+  ) return null;
+  return [...actualFailures].sort();
+}
+
+function exactVerifierFailureList(
+  actualFailures: readonly string[],
+  expectedFailures: readonly string[]
+): boolean {
+  if (
+    actualFailures.some((failure) => !verifierFailurePattern.test(failure)) ||
+    expectedFailures.some((failure) => !verifierFailurePattern.test(failure)) ||
+    new Set(actualFailures).size !== actualFailures.length ||
+    new Set(expectedFailures).size !== expectedFailures.length ||
+    actualFailures.length !== expectedFailures.length
+  ) return false;
+  const sortedActual = [...actualFailures].sort();
+  const sortedExpected = [...expectedFailures].sort();
+  return sortedActual.every((failure, index) => failure === sortedExpected[index]);
+}
+
 async function verifierOutcome(
   expectationName: string,
   scope: VerifierScope
@@ -234,7 +481,9 @@ async function verifierOutcome(
     };
   } catch (error) {
     outcome = {
-      error: error instanceof Error ? error : new Error(String(error)),
+      error: error instanceof Error
+        ? error
+        : new Error('[restore-verifier] verifier query rejected'),
       rows: []
     };
   }
@@ -243,14 +492,12 @@ async function verifierOutcome(
     try {
       if (outcome.error) await client.query('rollback');
       await client.query('drop table if exists pg_temp.restore_financial_checks');
-    } catch (recoveryError) {
+    } catch {
       if (verifierClient === client) verifierClient = null;
       client.release(true);
       outcome = {
         error: new Error(
-          `[restore-verifier] verifier session recovery failed after ${expectationName}: ${
-            recoveryError instanceof Error ? recoveryError.message : String(recoveryError)
-          }`
+          `[restore-verifier] verifier session recovery failed after ${expectationName}`
         ),
         rows: []
       };
@@ -341,9 +588,1153 @@ async function printCatalogContractCalibration(): Promise<void> {
   console.info('[restore-verifier] END exact financial catalog calibration JSON');
 }
 
+interface FinancialAdminMatrixState {
+  readonly attempt: number | null;
+  readonly attempts: number;
+  readonly capability_sha256: string | null;
+  readonly command_status: string;
+  readonly generation: number | null;
+  readonly id: string;
+  readonly job_status: string;
+  readonly renewed: boolean;
+  readonly state: string | null;
+}
+
+interface FinancialAdminMatrixResult {
+  readonly claimDigests: readonly [string, string, string, string];
+  readonly jobIds: readonly [string, string, string, string];
+}
+
+interface ClearPersistenceTarget {
+  readonly columnName: string;
+  readonly quotedColumn: string;
+  readonly quotedRelation: string;
+  readonly tableName: string;
+}
+
+function requireFinancialAdminWitness(condition: boolean, message: string): void {
+  if (!condition) throw new Error(`[restore-verifier] ${message}`);
+}
+
+function sameFinancialAdminMatrixState(
+  left: FinancialAdminMatrixState,
+  right: FinancialAdminMatrixState
+): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function requireOnlyFinancialAdminMatrixRowChanged(
+  before: readonly FinancialAdminMatrixState[],
+  after: readonly FinancialAdminMatrixState[],
+  changedIndex: number,
+  message: string
+): void {
+  requireFinancialAdminWitness(
+    before.length === 4 && after.length === 4,
+    `${message} returned an invalid matrix row count`
+  );
+  for (let index = 0; index < 4; index += 1) {
+    const equal = sameFinancialAdminMatrixState(before[index]!, after[index]!);
+    requireFinancialAdminWitness(
+      index === changedIndex ? !equal : equal,
+      `${message} did not change exactly one expected row`
+    );
+  }
+}
+
+async function exerciseFinancialAdminClaimMatrix(): Promise<FinancialAdminMatrixResult> {
+  const migrationIdentities = loadDatabaseMigrationIdentityConfig(process.env);
+  const workerEnvironment = databaseEnvironmentForRole(process.env, 'worker');
+  const workerUser = workerEnvironment.DATABASE_USER?.trim();
+  const workerPassword = workerEnvironment.DATABASE_PASSWORD;
+  if (
+    !workerUser ||
+    workerUser !== migrationIdentities.workerUser ||
+    typeof workerPassword !== 'string' ||
+    workerPassword.length === 0
+  ) {
+    throw new Error('[restore-verifier] financial worker witness identity is invalid');
+  }
+  const workerPool = new Pool({
+    ...databaseConfiguration,
+    user: workerUser,
+    password: workerPassword,
+    application_name: 'pale-orbit-restore-verifier-financial-worker'
+  });
+  try {
+    const actorUserId = randomUUID();
+    const refundId = randomUUID();
+    const orderItemId = randomUUID();
+    const commandIds = [randomUUID(), randomUUID(), randomUUID(), randomUUID()] as const;
+    const jobIds = [randomUUID(), randomUUID(), randomUUID(), randomUUID()] as const;
+    const privateInput = JSON.stringify({
+      kind: 'refund_draft_save',
+      refundId,
+      expectedVersion: null,
+      items: [{ orderItemId, totalPresentmentMinor: 0 }]
+    });
+    const fixture = await pool.connect();
+    try {
+      await fixture.query('begin');
+      await fixture.query('set local session_replication_role = replica');
+      await fixture.query(`
+        insert into "user" (id, name, email, email_verified)
+        values ($1, 'Financial claim witness', $2, true)
+      `, [actorUserId, `financial-claim-${actorUserId}@example.invalid`]);
+      for (const [index, jobId] of jobIds.entries()) {
+        const commandId = commandIds[index]!;
+        const pending = index < 2;
+        await fixture.query(`
+          insert into jobs (
+            id, type, payload, deduplication_key, status, run_at,
+            attempts, max_attempts, locked_at, locked_by, created_at, updated_at
+          ) values (
+            $1, 'commerce.financial-admin-command',
+            pg_catalog.jsonb_build_object('commandId', $2::uuid),
+            'commerce:financial-admin-command:' || $2::text || ':v1',
+            case when $3::boolean then 'pending'::job_status else 'running'::job_status end,
+            ('2001-01-01 00:00:00+00'::timestamptz + ($4::integer * interval '1 second')),
+            case when $3::boolean then 0 else 8 end, 8,
+            case when $3::boolean then null else pg_catalog.clock_timestamp() - interval '1 hour' end,
+            case when $3::boolean then null else 'expired-financial-claim-witness-' || $4::text end,
+            pg_catalog.clock_timestamp(), pg_catalog.clock_timestamp()
+          )
+        `, [jobId, commandId, pending, index + 1]);
+        await fixture.query(`
+          insert into financial_admin_commands (
+            id, kind, actor_user_id, correlation_id, idempotency_key_sha256,
+            input_fingerprint_sha256, private_input, job_id
+          ) values (
+            $1, 'refund_draft_save', $2,
+            'restore-financial-claim-' || $3::text,
+            $4, $5, $6::jsonb, $7
+          )
+        `, [
+          commandId,
+          actorUserId,
+          index + 1,
+          createHash('sha256').update(`idempotency:${commandId}`, 'utf8').digest('hex'),
+          createHash('sha256').update(privateInput, 'utf8').digest('hex'),
+          privateInput,
+          jobId
+        ]);
+        if (!pending) {
+          await fixture.query(`
+            insert into financial_admin_job_claims (
+              job_id, generation, attempt, capability_sha256, lease_duration_ms,
+              state, expires_at, issued_at
+            ) values (
+              $1, $2, 8, $3, 30000, 'active',
+              pg_catalog.clock_timestamp() - interval '30 minutes',
+              pg_catalog.clock_timestamp() - interval '1 hour'
+            )
+          `, [jobId, index + 1, String(index + 1).repeat(64)]);
+        }
+      }
+      await fixture.query(`
+        with terminal_clock as materialized (
+          select pg_catalog.clock_timestamp() as terminal_at
+        )
+        update financial_admin_commands
+        set status = 'succeeded', safe_result_code = 'draft_saved',
+          safe_result = $2::jsonb, updated_at = terminal_clock.terminal_at,
+          completed_at = terminal_clock.terminal_at
+        from terminal_clock
+        where id = $1
+      `, [commandIds[3], JSON.stringify({
+        refundId,
+        draftVersion: 1,
+        changed: false
+      })]);
+      await fixture.query('commit');
+    } catch (error) {
+      await fixture.query('rollback');
+      throw error;
+    } finally {
+      fixture.release();
+    }
+
+    const readState = async (): Promise<FinancialAdminMatrixState[]> => (
+      await pool.query<FinancialAdminMatrixState>(`
+        select job.id, job.status as job_status, job.attempts,
+          command.status as command_status, claim.generation, claim.attempt,
+          claim.state, claim.capability_sha256, claim.renewed_at is not null as renewed
+        from unnest($1::uuid[]) with ordinality requested(job_id, ordinal)
+        join jobs job on job.id = requested.job_id
+        join financial_admin_commands command on command.job_id = job.id
+        left join financial_admin_job_claims claim on claim.job_id = job.id
+        order by requested.ordinal
+      `, [jobIds])
+    ).rows;
+    const initial = await readState();
+    requireFinancialAdminWitness(
+      initial.length === 4 &&
+        initial[0]?.job_status === 'pending' && initial[0].attempts === 0 &&
+        initial[0].generation === null && initial[0].attempt === null &&
+        initial[1]?.job_status === 'pending' && initial[1].attempts === 0 &&
+        initial[1].generation === null && initial[1].attempt === null &&
+        initial[2]?.job_status === 'running' && initial[2].attempts === 8 &&
+        initial[2].generation === 3 && initial[2].attempt === 8 &&
+        initial[3]?.job_status === 'running' && initial[3].attempts === 8 &&
+        initial[3].generation === 4 && initial[3].attempt === 8,
+      'financial administrator four-claim one-row capability matrix baseline is invalid'
+    );
+
+    const capabilities: string[] = [];
+    const processOwnedSecretSentinel = randomBytes(32).toString('base64url');
+    const repository = createPostgresJobRepository(
+      drizzle({ client: workerPool, schema: databaseSchema }),
+      {
+        pollIntervalMs: 25,
+        leaseMs: 30_000,
+        retryBaseMs: 10,
+        retryMaxMs: 1_000,
+        workerReadyFile: 'restore-verifier-financial-worker',
+        concurrency: 1
+      },
+      () => new Date(),
+      'all',
+      { classifierVersion: 1, allocationAlgorithmVersion: 1 },
+      () => {
+        const capability = capabilities.length === 0
+          ? processOwnedSecretSentinel
+          : randomBytes(32).toString('base64url');
+        capabilities.push(capability);
+        return capability;
+      }
+    );
+    const workerId = 'restore-financial-admin-claim-witness';
+
+    const firstClaim = await repository.claimNext(workerId);
+    requireFinancialAdminWitness(
+      firstClaim?.id === jobIds[0] && firstClaim.attempts === 1,
+      'financial administrator first claim selected the wrong row'
+    );
+    const afterFirst = await readState();
+    requireOnlyFinancialAdminMatrixRowChanged(initial, afterFirst, 0, 'first financial claim');
+
+    const secondClaim = await repository.claimNext(workerId);
+    requireFinancialAdminWitness(
+      secondClaim?.id === jobIds[1] && secondClaim.attempts === 1,
+      'financial administrator second claim selected the wrong row'
+    );
+    const afterSecond = await readState();
+    requireOnlyFinancialAdminMatrixRowChanged(afterFirst, afterSecond, 1, 'second financial claim');
+
+    const thirdClaim = await repository.claimNext(workerId);
+    requireFinancialAdminWitness(
+      thirdClaim === null,
+      'financial administrator expired failed command returned a job'
+    );
+    const afterThird = await readState();
+    requireOnlyFinancialAdminMatrixRowChanged(afterSecond, afterThird, 2, 'third financial claim');
+
+    const fourthClaim = await repository.claimNext(workerId);
+    requireFinancialAdminWitness(
+      fourthClaim === null,
+      'financial administrator expired succeeded command returned a job'
+    );
+    const afterFourth = await readState();
+    requireOnlyFinancialAdminMatrixRowChanged(afterThird, afterFourth, 3, 'fourth financial claim');
+
+    requireFinancialAdminWitness(
+      capabilities.length === 4 && new Set(capabilities).size === 4,
+      'financial administrator claim capability generation was not one-per-claim'
+    );
+    const claimDigests = capabilities.map((capability) =>
+      createHash('sha256').update(capability, 'utf8').digest('hex')
+    ) as [string, string, string, string];
+    requireFinancialAdminWitness(
+      new Set(claimDigests).size === 4 &&
+        afterFourth.every((state, index) =>
+          state.capability_sha256 === claimDigests[index]
+        ),
+      'financial administrator claims did not store four distinct capability digests'
+    );
+    requireFinancialAdminWitness(
+      afterFourth[0]?.attempts === 1 && afterFourth[0].generation === 1 &&
+        afterFourth[0].attempt === 1 && afterFourth[0].state === 'active' &&
+        afterFourth[1]?.attempts === 1 && afterFourth[1].generation === 1 &&
+        afterFourth[1].attempt === 1 && afterFourth[1].state === 'active' &&
+        afterFourth[2]?.attempts === 8 && afterFourth[2].generation === 4 &&
+        afterFourth[2].attempt === 8 && afterFourth[2].state === 'invalidated' &&
+        afterFourth[2].job_status === 'failed' && afterFourth[2].command_status === 'failed' &&
+        afterFourth[3]?.attempts === 8 && afterFourth[3].generation === 5 &&
+        afterFourth[3].attempt === 8 && afterFourth[3].state === 'invalidated' &&
+        afterFourth[3].job_status === 'succeeded' &&
+        afterFourth[3].command_status === 'succeeded',
+      'financial administrator claims lost independent generation or attempt state'
+    );
+
+    requireFinancialAdminWitness(
+      !await repository.renewLease(jobIds[1], workerId, capabilities[0]),
+      'cross-job financial administrator capability rejection failed'
+    );
+    requireFinancialAdminWitness(
+      await repository.renewLease(jobIds[0], workerId, capabilities[0]),
+      'financial administrator current lease renewal failed'
+    );
+    const afterRenewal = await readState();
+    requireFinancialAdminWitness(
+      afterRenewal[0]?.renewed === true &&
+        afterRenewal[0].capability_sha256 === claimDigests[0],
+      'financial administrator current lease renewal changed capability authority'
+    );
+    requireFinancialAdminWitness(
+      await repository.fail(jobIds[0], workerId, 'claim witness cleanup', false, capabilities[0]),
+      'financial administrator terminal lease invalidation failed'
+    );
+    requireFinancialAdminWitness(
+      !await repository.renewLease(jobIds[0], workerId, capabilities[0]),
+      'financial administrator terminal lease remained renewable'
+    );
+    requireFinancialAdminWitness(
+      await repository.fail(jobIds[1], workerId, 'claim witness cleanup', false, capabilities[1]),
+      'financial administrator second terminal lease invalidation failed'
+    );
+    const finalState = await readState();
+    requireFinancialAdminWitness(
+      finalState.every((state) => state.state === 'invalidated') &&
+        finalState.every((state, index) => state.capability_sha256 === claimDigests[index]),
+      'financial administrator terminal lease invalidation lost digest authority'
+    );
+
+    const clearPersistenceTargets = await pool.query<ClearPersistenceTarget>(`
+      select
+        pg_catalog.format('%I.%I', namespace.nspname, relation.relname)
+          as "quotedRelation",
+        pg_catalog.format('%I', attribute.attname) as "quotedColumn",
+        relation.relname as "tableName",
+        attribute.attname as "columnName"
+      from pg_catalog.pg_class relation
+      join pg_catalog.pg_namespace namespace on namespace.oid = relation.relnamespace
+      join pg_catalog.pg_attribute attribute on attribute.attrelid = relation.oid
+      where namespace.nspname = 'public'
+        and relation.relkind in ('r', 'p')
+        and attribute.attnum > 0
+        and not attribute.attisdropped
+      order by relation.relname collate "C", attribute.attnum
+    `);
+    requireFinancialAdminWitness(
+      clearPersistenceTargets.rows.length > 0,
+      'financial administrator clear capability persistence target catalog was empty'
+    );
+    for (const jobsColumn of ['last_error', 'locked_by', 'deduplication_key']) {
+      requireFinancialAdminWitness(
+        clearPersistenceTargets.rows.some((target) =>
+          target.tableName === 'jobs' && target.columnName === jobsColumn
+        ),
+        `financial administrator clear capability persistence scan omitted jobs.${jobsColumn}`
+      );
+    }
+    let clearPersistenceMatchCount = 0n;
+    for (const target of clearPersistenceTargets.rows) {
+      const clearPersistence = await pool.query<{ match_count: string }>(`
+        select pg_catalog.count(*)::text as match_count
+        from ${target.quotedRelation} stored_row
+        cross join pg_catalog.unnest($1::text[]) clear(secret)
+        where pg_catalog.strpos(
+          coalesce(stored_row.${target.quotedColumn}::text, ''),
+          clear.secret
+        ) > 0
+      `, [capabilities]);
+      const matchCount = clearPersistence.rows[0]?.match_count;
+      requireFinancialAdminWitness(
+        clearPersistence.rows.length === 1 &&
+          typeof matchCount === 'string' &&
+          /^(?:0|[1-9][0-9]*)$/u.test(matchCount),
+        'financial administrator clear capability persistence scan returned an invalid count'
+      );
+      clearPersistenceMatchCount += BigInt(matchCount!);
+    }
+    requireFinancialAdminWitness(
+      clearPersistenceMatchCount === 0n,
+      'financial administrator clear capability was persisted'
+    );
+    const sentinelDigestCount = await pool.query<{ match_count: string }>(`
+      select pg_catalog.count(*)::text as match_count
+      from financial_admin_job_claims
+      where capability_sha256 = $1
+    `, [claimDigests[0]]);
+    requireFinancialAdminWitness(
+      sentinelDigestCount.rows[0]?.match_count === '1',
+      'financial administrator process-owned sentinel digest is not unique'
+    );
+    return { claimDigests, jobIds };
+  } finally {
+    await workerPool.end();
+  }
+}
+
+interface FinancialAdminCatalogWitnessContext {
+  readonly expectPass: (
+    name: string,
+    expectAllZero?: boolean,
+    scope?: VerifierScope
+  ) => Promise<void>;
+  readonly expectRejection: (
+    name: string,
+    checkName: string,
+    scope?: VerifierScope
+  ) => Promise<void>;
+  readonly expectRejectionChecks: (
+    name: string,
+    checkNames: readonly string[],
+    scope?: VerifierScope
+  ) => Promise<void>;
+  readonly matrix: FinancialAdminMatrixResult;
+}
+
+async function exerciseFinancialAdminCatalogWitnesses(
+  context: FinancialAdminCatalogWitnessContext
+): Promise<void> {
+  const { expectPass, expectRejection, expectRejectionChecks, matrix } = context;
+  const migrationIdentities = loadDatabaseMigrationIdentityConfig(process.env);
+  const quoteRole = (role: string): string => {
+    if (!/^[a-z][a-z0-9_]{0,62}$/u.test(role) || role.startsWith('pg_')) {
+      throw new Error('[restore-verifier] unsafe financial witness role');
+    }
+    return `"${role}"`;
+  };
+  const webLogin = quoteRole(migrationIdentities.webUser);
+  const databaseOwner = quoteRole(databaseUser);
+
+  const pendingRerunActorId = randomUUID();
+  const pendingRerunCommandId = randomUUID();
+  const pendingRerunJobId = randomUUID();
+  const pendingRerunRefundId = randomUUID();
+  const pendingRerunOrderItemId = randomUUID();
+  const pendingRerunPrivateInput = JSON.stringify({
+    kind: 'refund_draft_save',
+    refundId: pendingRerunRefundId,
+    expectedVersion: null,
+    items: [{ orderItemId: pendingRerunOrderItemId, totalPresentmentMinor: 0 }]
+  });
+  const withOwnerReplica = async (
+    action: (client: PoolClient) => Promise<void>
+  ): Promise<void> => {
+    const client = await pool.connect();
+    try {
+      await client.query('begin');
+      await client.query('set local session_replication_role = replica');
+      await action(client);
+      await client.query('commit');
+    } catch (error) {
+      await client.query('rollback');
+      throw error;
+    } finally {
+      client.release();
+    }
+  };
+  try {
+    await withOwnerReplica(async (client) => {
+      await client.query(`
+        insert into "user" (id, name, email, email_verified)
+        values ($1, 'Financial pending rerun witness', $2, true)
+      `, [
+        pendingRerunActorId,
+        `financial-pending-rerun-${pendingRerunActorId}@example.invalid`
+      ]);
+      await client.query(`
+        insert into jobs (
+          id, type, payload, deduplication_key, status, run_at,
+          attempts, max_attempts, locked_at, locked_by, last_error,
+          completed_at, rerun_requested_at, created_at, updated_at
+        ) values (
+          $1, 'commerce.financial-admin-command',
+          pg_catalog.jsonb_build_object('commandId', $2::uuid),
+          'commerce:financial-admin-command:' || $2::text || ':v1',
+          'pending', pg_catalog.clock_timestamp(), 0, 8,
+          null, null, null, null, null,
+          pg_catalog.clock_timestamp(), pg_catalog.clock_timestamp()
+        )
+      `, [pendingRerunJobId, pendingRerunCommandId]);
+      await client.query(`
+        insert into financial_admin_commands (
+          id, kind, actor_user_id, correlation_id, idempotency_key_sha256,
+          input_fingerprint_sha256, private_input, job_id
+        ) values (
+          $1, 'refund_draft_save', $2, $3, $4, $5, $6::jsonb, $7
+        )
+      `, [
+        pendingRerunCommandId,
+        pendingRerunActorId,
+        `restore-financial-pending-rerun-${pendingRerunCommandId}`,
+        createHash('sha256')
+          .update(`idempotency:${pendingRerunCommandId}`, 'utf8')
+          .digest('hex'),
+        createHash('sha256').update(pendingRerunPrivateInput, 'utf8').digest('hex'),
+        pendingRerunPrivateInput,
+        pendingRerunJobId
+      ]);
+      await client.query(`
+        insert into financial_admin_job_claims (
+          job_id, generation, attempt, capability_sha256, lease_duration_ms,
+          state, expires_at, issued_at
+        ) values (
+          $1, 1, 1, repeat('f', 64), 30000, 'active',
+          pg_catalog.clock_timestamp() - interval '1 hour',
+          pg_catalog.clock_timestamp() - interval '2 hours'
+        )
+      `, [pendingRerunJobId]);
+    });
+    await expectPass('financial claim pending rerun authority', true, 'full');
+
+    await withOwnerReplica(async (client) => {
+      await client.query(`
+        with witness_clock as materialized (
+          select pg_catalog.clock_timestamp() as observed_at
+        ), updated_claim as (
+          update financial_admin_job_claims claim
+          set expires_at = witness_clock.observed_at + interval '30 seconds'
+          from witness_clock
+          where claim.job_id = $1
+          returning claim.expires_at
+        )
+        update jobs job
+        set status = 'running', attempts = 2,
+          locked_at = witness_clock.observed_at,
+          locked_by = 'restore-financial-pending-rerun-witness',
+          run_at = updated_claim.expires_at,
+          updated_at = witness_clock.observed_at
+        from witness_clock, updated_claim
+        where job.id = $1
+      `, [pendingRerunJobId]);
+    });
+    await expectRejection(
+      'financial claim job attempt authority drift',
+      'financial_admin_claim_job_authority=1',
+      'full'
+    );
+    await withOwnerReplica(async (client) => {
+      await client.query(`
+        update jobs job
+        set attempts = claim.attempt,
+          updated_at = pg_catalog.clock_timestamp()
+        from financial_admin_job_claims claim
+        where job.id = claim.job_id and job.id = $1
+      `, [pendingRerunJobId]);
+    });
+    await expectPass('financial claim job attempt authority repair', true, 'full');
+  } finally {
+    await withOwnerReplica(async (client) => {
+      await client.query(
+        'delete from financial_admin_job_claims where job_id = $1',
+        [pendingRerunJobId]
+      );
+      await client.query(
+        'delete from financial_admin_commands where id = $1',
+        [pendingRerunCommandId]
+      );
+      await client.query('delete from jobs where id = $1', [pendingRerunJobId]);
+      await client.query('delete from "user" where id = $1', [pendingRerunActorId]);
+    });
+  }
+  await expectPass('financial claim pending rerun cleanup', true, 'full');
+
+  await pool.query(`
+    alter type financial_admin_command_kind
+      rename value 'refund_draft_save' to 'plan6bii_enum_order_witness';
+    alter type financial_admin_command_kind
+      rename value 'refund_draft_discard' to 'refund_draft_save';
+    alter type financial_admin_command_kind
+      rename value 'plan6bii_enum_order_witness' to 'refund_draft_discard'
+  `);
+  await expectRejection(
+    'financial command enum order drift',
+    'financial_schema_object_manifest=2'
+  );
+  await pool.query(`
+    alter type financial_admin_command_kind
+      rename value 'refund_draft_discard' to 'plan6bii_enum_order_witness';
+    alter type financial_admin_command_kind
+      rename value 'refund_draft_save' to 'refund_draft_discard';
+    alter type financial_admin_command_kind
+      rename value 'plan6bii_enum_order_witness' to 'refund_draft_save'
+  `);
+  await expectPass('financial command enum order repair', true);
+
+  await pool.query('alter table financial_admin_commands enable row level security');
+  await expectRejection(
+    'financial command table descriptor drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query('alter table financial_admin_commands disable row level security');
+  await expectPass('financial command table descriptor repair', true);
+
+  await pool.query('alter table financial_admin_job_claims enable row level security');
+  await expectRejection(
+    'financial claim table descriptor drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query('alter table financial_admin_job_claims disable row level security');
+  await expectPass('financial claim table descriptor repair', true);
+
+  await pool.query(
+    'alter table financial_admin_job_claims owner to pale_orbit_financial_worker'
+  );
+  await expectRejection(
+    'financial claim protected table owner drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`alter table financial_admin_job_claims owner to ${databaseOwner}`);
+  await expectPass('financial claim protected table owner repair', true);
+
+  await pool.query('alter table financial_admin_job_claims set unlogged');
+  await expectRejection(
+    'financial claim protected table persistence drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query('alter table financial_admin_job_claims set logged');
+  await expectPass('financial claim protected table persistence repair', true);
+
+  await pool.query('alter table financial_admin_job_claims add column capability_token text');
+  await pool.query(`
+    update financial_admin_job_claims
+    set capability_token = 'synthetic-plaintext-schema-witness'
+    where job_id = $1
+  `, [matrix.jobIds[0]]);
+  await expectRejection(
+    'financial claim clear capability column',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query('alter table financial_admin_job_claims drop column capability_token');
+  await expectPass('financial claim clear capability column repair', true);
+
+  await pool.query(`
+    alter table financial_admin_job_claims
+    drop constraint financial_admin_job_claims_capability_sha256_valid
+  `);
+  await pool.query(`
+    update financial_admin_job_claims set capability_sha256 = upper(capability_sha256)
+    where job_id = $1
+  `, [matrix.jobIds[0]]);
+  await expectRejection(
+    'financial claim capability digest constraint drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    update financial_admin_job_claims set capability_sha256 = $2
+    where job_id = $1
+  `, [matrix.jobIds[0], matrix.claimDigests[0]]);
+  await pool.query(financialClaimDigestConstraintStatement);
+  await expectPass('financial claim capability digest constraint repair', true);
+
+  await pool.query(`
+    alter table financial_admin_job_claims
+    drop constraint financial_admin_job_claims_lifecycle_consistent
+  `);
+  await pool.query(`
+    update financial_admin_job_claims set state = 'active'
+    where job_id = $1
+  `, [matrix.jobIds[0]]);
+  await expectRejection(
+    'financial claim lifecycle constraint drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    update financial_admin_job_claims set state = 'invalidated'
+    where job_id = $1
+  `, [matrix.jobIds[0]]);
+  await pool.query(financialClaimLifecycleConstraintStatement);
+  await expectPass('financial claim lifecycle constraint repair', true);
+
+  await pool.query(`
+    alter table financial_admin_job_claims
+      drop constraint financial_admin_job_claims_generation_positive,
+      drop constraint financial_admin_job_claims_attempt_positive
+  `);
+  await expectRejection(
+    'financial claim generation attempt constraint drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(financialClaimGenerationConstraintStatement);
+  await pool.query(financialClaimAttemptConstraintStatement);
+  await expectPass('financial claim generation attempt constraint repair', true);
+
+  await pool.query(`
+    create or replace function public.plan6bii_assert_financial_admin_job_lease(uuid)
+    returns void language plpgsql security invoker set search_path = 'public'
+    as $plan6bii_helper_witness$
+    begin
+      return;
+    end;
+    $plan6bii_helper_witness$
+  `);
+  await expectRejection(
+    'financial claim helper definition drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(financialClaimHelperStatement);
+  await pool.query(financialClaimHelperRevokeStatement);
+  await expectPass('financial claim helper definition repair', true);
+
+  await pool.query(`
+    alter function public.plan6bii_assert_financial_admin_job_lease(uuid)
+    owner to pale_orbit_financial_worker
+  `);
+  await expectRejection(
+    'financial claim helper owner drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    alter function public.plan6bii_assert_financial_admin_job_lease(uuid)
+    owner to ${databaseOwner}
+  `);
+  await pool.query(financialClaimHelperStatement);
+  await pool.query(financialClaimHelperRevokeStatement);
+  await expectPass('financial claim helper owner repair', true);
+
+  await pool.query(`
+    alter function public.plan6bii_assert_financial_admin_job_lease(uuid)
+    security invoker
+  `);
+  await expectRejection(
+    'financial claim helper SECURITY DEFINER drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(financialClaimHelperStatement);
+  await pool.query(financialClaimHelperRevokeStatement);
+  await expectPass('financial claim helper SECURITY DEFINER repair', true);
+
+  await pool.query(`
+    alter function public.plan6bii_assert_financial_admin_job_lease(uuid)
+    set search_path = 'public'
+  `);
+  await expectRejection(
+    'financial claim helper search_path drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(financialClaimHelperStatement);
+  await pool.query(financialClaimHelperRevokeStatement);
+  await expectPass('financial claim helper search_path repair', true);
+
+  await pool.query(`
+    grant execute on function public.plan6bii_assert_financial_admin_job_lease(uuid)
+    to pale_orbit_runtime
+  `);
+  await expectRejection(
+    'financial claim helper direct EXECUTE drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(financialClaimHelperRevokeStatement);
+  await expectPass('financial claim helper direct EXECUTE repair', true);
+
+  await pool.query(`
+    grant execute on function public.plan6bii_assert_financial_admin_job_lease(uuid)
+    to public
+  `);
+  await expectRejectionChecks(
+    'financial claim helper PUBLIC EXECUTE drift',
+    ['financial_schema_object_manifest=1', 'storage_cleanup_effective_authority=1']
+  );
+  await pool.query(financialClaimHelperRevokeStatement);
+  await expectPass('financial claim helper PUBLIC EXECUTE repair', true);
+
+  await pool.query('alter table jobs disable trigger jobs_plan6bii_financial_admin_lease_guard');
+  await expectRejection(
+    'financial lease trigger disabled',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query('drop trigger jobs_plan6bii_financial_admin_lease_guard on jobs');
+  await pool.query(financialLeaseTriggerStatement);
+  await expectPass('financial lease trigger enabled repair', true);
+
+  const reorderedTerminalTriggerStatement = financialTerminalTriggerStatement.replace(
+    '"jobs_plan6bii_financial_admin_terminal_sync"',
+    '"aa_jobs_plan6bii_financial_admin_terminal_sync"'
+  );
+  requireFinancialAdminWitness(
+    reorderedTerminalTriggerStatement !== financialTerminalTriggerStatement,
+    'financial terminal trigger source replacement was not unique'
+  );
+  await pool.query('drop trigger jobs_plan6bii_financial_admin_terminal_sync on jobs');
+  await pool.query(reorderedTerminalTriggerStatement);
+  await expectRejection(
+    'financial lease terminal trigger order drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query('drop trigger aa_jobs_plan6bii_financial_admin_terminal_sync on jobs');
+  await pool.query(financialTerminalTriggerStatement);
+  await expectPass('financial lease terminal trigger order repair', true);
+
+  await pool.query(`
+    create or replace function public.plan6b_guard_job_insert()
+    returns trigger language plpgsql security definer set search_path = 'pg_catalog'
+    as $plan6bii_job_guard_witness$
+    begin
+      return new;
+    end;
+    $plan6bii_job_guard_witness$
+  `);
+  await expectRejection(
+    'financial job guard definition drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(financialJobGuardStatement);
+  await expectPass('financial job guard definition repair', true);
+
+  await pool.query(`
+    create or replace function public.plan6b_guard_audit_insert()
+    returns trigger language plpgsql security definer set search_path = 'pg_catalog'
+    as $plan6bii_audit_guard_witness$
+    begin
+      return new;
+    end;
+    $plan6bii_audit_guard_witness$
+  `);
+  await expectRejection(
+    'financial audit guard definition drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(financialAuditGuardStatement);
+  await expectPass('financial audit guard definition repair', true);
+
+  await pool.query('grant select (payload) on table jobs to pale_orbit_runtime');
+  await expectRejection(
+    'financial command runtime jobs.payload SELECT',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query('revoke select (payload) on table jobs from pale_orbit_runtime');
+  await pool.query(financialJobsRuntimeSelectRevokeStatement);
+  await pool.query(financialJobsRuntimeSelectGrantStatement);
+  await expectPass('financial command runtime jobs.payload SELECT repair', true);
+
+  await pool.query(`
+    grant select (private_input) on table financial_admin_commands
+    to pale_orbit_runtime
+  `);
+  await expectRejection(
+    'financial command runtime private input SELECT',
+    'financial_schema_object_manifest=2'
+  );
+  await pool.query(`
+    revoke select (private_input) on table financial_admin_commands
+    from pale_orbit_runtime
+  `);
+  await expectPass('financial command runtime private input SELECT repair', true);
+
+  await pool.query(`
+    grant update (private_input) on table financial_admin_commands
+    to pale_orbit_financial_worker
+  `);
+  await expectRejection(
+    'financial command worker private input UPDATE',
+    'financial_schema_object_manifest=2'
+  );
+  await pool.query(`
+    revoke update (private_input) on table financial_admin_commands
+    from pale_orbit_financial_worker
+  `);
+  await expectPass('financial command worker private input UPDATE repair', true);
+
+  await pool.query(`
+    grant select on table financial_admin_job_claims to pale_orbit_runtime
+  `);
+  await expectRejection(
+    'financial claim application table privilege',
+    'financial_schema_object_manifest=2'
+  );
+  await pool.query(`
+    revoke select on table financial_admin_job_claims from pale_orbit_runtime
+  `);
+  await expectPass('financial claim application table privilege repair', true);
+
+  await pool.query(`
+    grant execute on function public.financial_admin_command_status(uuid,uuid) to public
+  `);
+  await expectRejectionChecks(
+    'financial routine PUBLIC EXECUTE',
+    ['financial_schema_object_manifest=1', 'storage_cleanup_effective_authority=1']
+  );
+  await pool.query(financialCommandStatusRevokeStatement);
+  await pool.query(financialCommandStatusGrantStatement);
+  await expectPass('financial routine PUBLIC EXECUTE repair', true);
+
+  await pool.query(`
+    grant execute on function public.financial_admin_command_status(uuid,uuid)
+    to ${webLogin}
+  `);
+  await expectRejection(
+    'financial routine direct login EXECUTE',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    revoke execute on function public.financial_admin_command_status(uuid,uuid)
+    from ${webLogin}
+  `);
+  await expectPass('financial routine direct login EXECUTE repair', true);
+
+  await pool.query(`
+    create function public.plan6bii_unexpected_runtime_execute_witness()
+    returns void language plpgsql security invoker set search_path = 'pg_catalog'
+    as $plan6bii_unexpected_runtime_execute_witness$
+    begin
+      return;
+    end;
+    $plan6bii_unexpected_runtime_execute_witness$;
+    revoke all on function public.plan6bii_unexpected_runtime_execute_witness()
+    from public;
+    grant execute on function public.plan6bii_unexpected_runtime_execute_witness()
+    to pale_orbit_runtime
+  `);
+  await expectRejection(
+    'unexpected runtime routine EXECUTE',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    revoke execute on function public.plan6bii_unexpected_runtime_execute_witness()
+    from pale_orbit_runtime;
+    drop function public.plan6bii_unexpected_runtime_execute_witness()
+  `);
+  await expectPass('unexpected runtime routine EXECUTE repair', true);
+
+  await pool.query(`
+    create function public.plan6bii_unexpected_worker_execute_witness()
+    returns void language plpgsql security invoker set search_path = 'pg_catalog'
+    as $plan6bii_unexpected_worker_execute_witness$
+    begin
+      return;
+    end;
+    $plan6bii_unexpected_worker_execute_witness$;
+    revoke all on function public.plan6bii_unexpected_worker_execute_witness()
+    from public;
+    grant execute on function public.plan6bii_unexpected_worker_execute_witness()
+    to pale_orbit_financial_worker
+  `);
+  await expectRejection(
+    'unexpected worker routine EXECUTE',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    revoke execute on function public.plan6bii_unexpected_worker_execute_witness()
+    from pale_orbit_financial_worker;
+    drop function public.plan6bii_unexpected_worker_execute_witness()
+  `);
+  await expectPass('unexpected worker routine EXECUTE repair', true);
+
+  await pool.query(`grant connect on database pale_orbit_test to ${webLogin}`);
+  await expectRejection(
+    'financial direct login database ACL',
+    'financial_schema_object_manifest=2'
+  );
+  await pool.query(`revoke connect on database pale_orbit_test from ${webLogin}`);
+  await expectPass('financial direct login database ACL repair', true);
+
+  await pool.query(`
+    revoke execute on function public.financial_admin_command_status(uuid,uuid)
+    from pale_orbit_runtime
+  `);
+  await expectRejection(
+    'missing runtime financial routine EXECUTE',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(financialCommandStatusGrantStatement);
+  await expectPass('missing runtime financial routine EXECUTE repair', true);
+
+  await pool.query(`
+    revoke execute on function public.resolve_financial_issue_after_admin_command(uuid,uuid)
+    from pale_orbit_financial_worker
+  `);
+  await expectRejection(
+    'missing worker financial routine EXECUTE',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(financialWorkerResolveGrantStatement);
+  await expectPass('missing worker financial routine EXECUTE repair', true);
+
+  await pool.query(`
+    alter function public.financial_admin_command_status(uuid,uuid)
+    security invoker;
+    alter function public.financial_admin_command_status(uuid,uuid)
+    set search_path = 'public'
+  `);
+  await expectRejection(
+    'financial routine SECURITY DEFINER search_path drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(financialCommandStatusFunctionStatement);
+  await pool.query(financialCommandStatusRevokeStatement);
+  await pool.query(financialCommandStatusGrantStatement);
+  await expectPass('financial routine SECURITY DEFINER search_path repair', true);
+
+  await pool.query(`
+    alter function public.financial_admin_command_status(uuid,uuid)
+    owner to pale_orbit_financial_worker
+  `);
+  await expectRejection(
+    'financial routine owner drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    alter function public.financial_admin_command_status(uuid,uuid)
+    owner to ${databaseOwner}
+  `);
+  await pool.query(financialCommandStatusFunctionStatement);
+  await pool.query(financialCommandStatusRevokeStatement);
+  await pool.query(financialCommandStatusGrantStatement);
+  await expectPass('financial routine owner repair', true);
+
+  await pool.query(`
+    alter default privileges in schema public
+    revoke select on tables from pale_orbit_runtime
+  `);
+  await expectRejection(
+    'missing runtime future table SELECT',
+    'financial_schema_object_manifest=10'
+  );
+  await pool.query(runtimeDefaultTableSelectGrantStatement);
+  await expectPass('runtime future table SELECT repair', true);
+
+  await pool.query(`
+    alter default privileges in schema public
+    revoke usage, select, update on sequences from pale_orbit_runtime
+  `);
+  await expectRejection(
+    'missing runtime future sequence privileges',
+    'financial_schema_object_manifest=7'
+  );
+  await pool.query(runtimeDefaultSequenceGrantStatement);
+  await expectPass('runtime future sequence privileges repair', true);
+
+  await pool.query(`
+    alter default privileges in schema public
+    grant select on tables to pale_orbit_financial_worker
+  `);
+  await expectRejection(
+    'excess worker default table privilege',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    alter default privileges in schema public
+    revoke select on tables from pale_orbit_financial_worker
+  `);
+  await expectPass('excess worker default table privilege repair', true);
+
+  await pool.query(`
+    alter default privileges in schema public
+    grant select on tables to pale_orbit_storage_cleanup
+  `);
+  await expectRejection(
+    'excess storage default privilege',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    alter default privileges in schema public
+    revoke select on tables from pale_orbit_storage_cleanup
+  `);
+  await expectPass('excess storage default privilege repair', true);
+
+  await pool.query(`
+    alter default privileges in schema public grant select on tables to ${webLogin}
+  `);
+  await expectRejection(
+    'excess direct-login default privilege',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    alter default privileges in schema public revoke select on tables from ${webLogin}
+  `);
+  await expectPass('excess direct-login default privilege repair', true);
+
+  await pool.query('alter default privileges grant execute on routines to public');
+  await expectRejection(
+    'reintroduced PUBLIC default routine EXECUTE',
+    'financial_schema_object_manifest=2'
+  );
+  await pool.query(publicDefaultRoutineRevokeStatement);
+  await expectPass('PUBLIC default routine EXECUTE repair', true);
+
+  await pool.query('create schema plan6bii_default_acl_witness');
+  await pool.query(`
+    alter default privileges in schema plan6bii_default_acl_witness
+    grant select on tables to pale_orbit_runtime
+  `);
+  await expectRejection(
+    'default ACL namespace object-type drift',
+    'financial_schema_object_manifest=2'
+  );
+  await pool.query(`
+    alter default privileges in schema plan6bii_default_acl_witness
+    revoke select on tables from pale_orbit_runtime
+  `);
+  await pool.query('drop schema plan6bii_default_acl_witness');
+  await expectPass('default ACL namespace object-type repair', true);
+
+  await pool.query(`
+    alter default privileges in schema public
+    revoke select on tables from pale_orbit_runtime;
+    alter default privileges in schema public
+    grant select on tables to pale_orbit_runtime with grant option
+  `);
+  await expectRejection(
+    'default ACL grant option drift',
+    'financial_schema_object_manifest=2'
+  );
+  await pool.query(`
+    alter default privileges in schema public
+    revoke select on tables from pale_orbit_runtime
+  `);
+  await pool.query(runtimeDefaultTableSelectGrantStatement);
+  await expectPass('default ACL grant option repair', true);
+
+  await pool.query(`
+    alter default privileges for role pale_orbit_financial_worker in schema public
+    grant select on tables to pale_orbit_runtime
+  `);
+  await expectRejection(
+    'default ACL owner drift',
+    'financial_schema_object_manifest=2'
+  );
+  await pool.query(`
+    alter default privileges for role pale_orbit_financial_worker in schema public
+    revoke select on tables from pale_orbit_runtime
+  `);
+  await expectPass('default ACL owner drift repair', true);
+
+  await pool.query(`
+    alter default privileges for role pale_orbit_financial_worker in schema public
+    grant select on tables to pale_orbit_storage_cleanup
+  `);
+  await expectRejection(
+    'default ACL grantor drift',
+    'financial_schema_object_manifest=2'
+  );
+  await pool.query(`
+    alter default privileges for role pale_orbit_financial_worker in schema public
+    revoke select on tables from pale_orbit_storage_cleanup
+  `);
+  await expectPass('default ACL grantor drift repair', true);
+
+  await pool.query(`
+    grant select on table financial_admin_commands to pale_orbit_runtime
+  `);
+  await expectRejection(
+    'inherited runtime SELECT on protected financial table',
+    'financial_schema_object_manifest=2'
+  );
+  await pool.query(`
+    revoke select on table financial_admin_commands from pale_orbit_runtime
+  `);
+  await expectPass('inherited runtime SELECT on protected financial table repair', true);
+
+  await pool.query(`
+    grant execute on function public.plan6bii_assert_financial_admin_job_lease(uuid)
+    to pale_orbit_financial_worker
+  `);
+  await expectRejection(
+    'inherited application EXECUTE on private lease helper',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(financialClaimHelperRevokeStatement);
+  await expectPass('inherited application EXECUTE on private lease helper repair', true);
+}
+
 async function exerciseInvariantWitnesses(): Promise<void> {
-  const failures: string[] = [];
   let verifierScope: VerifierScope = 'catalog';
+  const failWitness = (message: string): never => {
+    throw new Error(`[restore-verifier] ${message}`);
+  };
   const operationalCheckNames = [
     'failed_running_scan_permanent',
     'failed_running_scan_retry_exhausted',
@@ -351,10 +1742,9 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     'pending_replay_child_permanent',
     'pending_replay_child_retry_exhausted'
   ] as const;
-  const validateOperationalShape = (name: string, outcome: VerifierOutcome): boolean => {
+  const validateOperationalShape = (name: string, outcome: VerifierOutcome): void => {
     if (outcome.rows.length !== operationalCheckNames.length) {
-      failures.push(`${name} returned an invalid operational diagnostic row count`);
-      return false;
+      failWitness(`${name} returned an invalid operational diagnostic row count`);
     }
     for (const [index, checkName] of operationalCheckNames.entries()) {
       const row = outcome.rows[index];
@@ -362,11 +1752,28 @@ async function exerciseInvariantWitnesses(): Promise<void> {
         row?.check_name !== checkName ||
         !/^(?:0|[1-9][0-9]*)$/u.test(String(row.violation_count))
       ) {
-        failures.push(`${name} returned an invalid operational diagnostic contract`);
-        return false;
+        failWitness(`${name} returned an invalid operational diagnostic contract`);
       }
     }
-    return true;
+  };
+  const assertExactRejection = (
+    name: string,
+    error: Error | null,
+    expectedFailures: readonly string[]
+  ): void => {
+    if (!error) failWitness(`${name} unexpectedly passed`);
+    if (expectedFailures.some((failure) => !verifierFailurePattern.test(failure))) {
+      failWitness(`${name} has an invalid expected verifier failure list`);
+    }
+    const actualFailures = parsedVerifierFailureList(error);
+    if (actualFailures === null) {
+      failWitness(`${name} rejected without a valid verifier failure list`);
+    }
+    if (!exactVerifierFailureList(actualFailures, expectedFailures)) {
+      const expected = [...expectedFailures].sort().join(', ');
+      const actual = actualFailures.join(', ');
+      failWitness(`${name} expected verifier failures ${expected} but received ${actual}`);
+    }
   };
   const expectPass = async (
     name: string,
@@ -375,12 +1782,11 @@ async function exerciseInvariantWitnesses(): Promise<void> {
   ) => {
     const outcome = await verifierOutcome(name, scope);
     if (outcome.error) {
-      failures.push(`${name} unexpectedly failed: ${outcome.error.message}`);
-      return;
+      failWitness(`${name} unexpectedly failed`);
     }
-    if (!validateOperationalShape(name, outcome)) return;
+    validateOperationalShape(name, outcome);
     if (expectAllZero && outcome.rows.some((row) => row.violation_count !== '0')) {
-      failures.push(`${name} returned a nonzero operational diagnostic`);
+      failWitness(`${name} returned a nonzero operational diagnostic`);
     }
   };
   const expectRejection = async (
@@ -389,10 +1795,7 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     scope = verifierScope
   ) => {
     const { error } = await verifierOutcome(name, scope);
-    if (!error) failures.push(`${name} unexpectedly passed`);
-    else if (!error.message.includes(checkName)) {
-      failures.push(`${name} failed without ${checkName}: ${error.message}`);
-    }
+    assertExactRejection(name, error, [checkName]);
   };
   const expectRejectionChecks = async (
     name: string,
@@ -400,15 +1803,7 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     scope = verifierScope
   ) => {
     const { error } = await verifierOutcome(name, scope);
-    if (!error) {
-      failures.push(`${name} unexpectedly passed`);
-      return;
-    }
-    for (const checkName of checkNames) {
-      if (!error.message.includes(checkName)) {
-        failures.push(`${name} failed without ${checkName}: ${error.message}`);
-      }
-    }
+    assertExactRejection(name, error, checkNames);
   };
   const expectDiagnostics = async (
     name: string,
@@ -417,15 +1812,14 @@ async function exerciseInvariantWitnesses(): Promise<void> {
   ) => {
     const outcome = await verifierOutcome(name, scope);
     if (outcome.error) {
-      failures.push(`${name} unexpectedly failed: ${outcome.error.message}`);
-      return;
+      failWitness(`${name} unexpectedly failed`);
     }
-    if (!validateOperationalShape(name, outcome)) return;
+    validateOperationalShape(name, outcome);
     for (const checkName of checkNames) {
       const diagnostic = outcome.rows.find((row) =>
         row.check_name === checkName && Number(row.violation_count) > 0
       );
-      if (!diagnostic) failures.push(`${name} did not surface ${checkName}`);
+      if (!diagnostic) failWitness(`${name} did not surface ${checkName}`);
     }
   };
   const mutateAppendOnlyFixture = async (
@@ -555,6 +1949,19 @@ async function exerciseInvariantWitnesses(): Promise<void> {
   };
 
   await expectPass('fresh financial schema-object manifest', true, 'full');
+
+  const financialAdminMatrix = await exerciseFinancialAdminClaimMatrix();
+  await expectPass(
+    'financial administrator four-claim one-row capability matrix',
+    true,
+    'full'
+  );
+  await exerciseFinancialAdminCatalogWitnesses({
+    expectPass,
+    expectRejection,
+    expectRejectionChecks,
+    matrix: financialAdminMatrix
+  });
 
   const projectionHeadsViewDefinition = await requiredCatalogDefinition(
     'required view',
@@ -762,9 +2169,9 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     grant execute on function public.authorize_commerce_claim_issuance(text, text)
     to public
   `);
-  await expectRejection(
+  await expectRejectionChecks(
     'claim function direct ACL mismatch',
-    'financial_schema_object_manifest=1'
+    ['financial_schema_object_manifest=1', 'storage_cleanup_effective_authority=1']
   );
   await pool.query(`
     revoke execute on function public.authorize_commerce_claim_issuance(text, text)
@@ -930,7 +2337,7 @@ async function exerciseInvariantWitnesses(): Promise<void> {
   await pool.query('alter table public.entitlement_grants disable trigger all');
   await expectRejection(
     'disabled protected constraint triggers',
-    'financial_schema_object_manifest=3'
+    'financial_schema_object_manifest=4'
   );
   await pool.query('alter table public.entitlement_grants enable trigger all');
   await expectPass('disabled protected constraint triggers repair', true);
@@ -1145,9 +2552,9 @@ async function exerciseInvariantWitnesses(): Promise<void> {
   await pool.query(`
     grant connect on database "${databaseName}" to ${quotedCleanupLogin} with grant option
   `);
-  await expectRejection(
+  await expectRejectionChecks(
     'cleanup login direct grantable CONNECT',
-    'storage_cleanup_effective_authority=1'
+    ['financial_schema_object_manifest=2', 'storage_cleanup_effective_authority=1']
   );
   await pool.query(`
     revoke connect on database "${databaseName}" from ${quotedCleanupLogin}
@@ -1157,9 +2564,9 @@ async function exerciseInvariantWitnesses(): Promise<void> {
   await pool.query(`
     grant temporary on database "${databaseName}" to ${quotedCleanupLogin}
   `);
-  await expectRejection(
+  await expectRejectionChecks(
     'cleanup login direct TEMPORARY',
-    'storage_cleanup_effective_authority=1'
+    ['financial_schema_object_manifest=2', 'storage_cleanup_effective_authority=1']
   );
   await pool.query(`
     revoke temporary on database "${databaseName}" from ${quotedCleanupLogin}
@@ -1347,9 +2754,9 @@ async function exerciseInvariantWitnesses(): Promise<void> {
       'gross_amount', 'account', 1, 'USD', 1, 3, $3
     )
   `, [provenanceAccountSetId, provenanceBalanceId, provenanceBalanceFingerprint]);
-  await expectRejection(
+  await expectRejectionChecks(
     'itemless account allocation still requires an exact parent decision',
-    'allocation_set_parent_or_chain=1'
+    ['allocation_set_detail_classification=1', 'allocation_set_parent_or_chain=1']
   );
   await pool.query(`
     with inserted_classification as (
@@ -1371,9 +2778,9 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     provenanceBalanceId,
     provenanceBalanceFingerprint
   ]);
-  await expectRejection(
+  await expectRejectionChecks(
     'itemless account allocation cannot depend on an exact unknown parent',
-    'allocation_set_parent_or_chain=1'
+    ['allocation_set_detail_classification=1', 'allocation_set_parent_or_chain=1']
   );
   await mutateAppendOnlyFixture(`
     update financial_classification_versions set classification = 'other' where id = $1
@@ -1642,7 +3049,10 @@ async function exerciseInvariantWitnesses(): Promise<void> {
       id, payout_id, generation, state, candidate_count, page_count, safe_outcome, completed_at
     ) values ($1, $2, 3, 'published', 0, 1, 'published', now())
   `, [aheadPayoutRunId, payoutId]);
-  await expectRejection('published payout run ahead of authority', 'run_generation_order=1');
+  await expectRejectionChecks(
+    'published payout run ahead of authority',
+    ['published_membership_count=1', 'run_generation_order=1']
+  );
   await pool.query('delete from payout_import_runs where id = $1', [aheadPayoutRunId]);
 
   const replayRunId = '20000000-0000-4000-8000-000000000001';
@@ -1851,9 +3261,12 @@ async function exerciseInvariantWitnesses(): Promise<void> {
   await mutateAppendOnlyFixture(`
     update financial_item_allocations set component = 'other' where id = $1
   `, [chargeSubtotalItemId]);
-  await expectRejection(
+  await expectRejectionChecks(
     'charge gross allocation cannot masquerade as another component',
-    'financial_item_allocation_semantic_component=1'
+    [
+      'financial_item_allocation_semantic_component=1',
+      'financial_title_allocation_determinism=1'
+    ]
   );
   await mutateAppendOnlyFixture(`
     update financial_item_allocations set component = 'sale_subtotal' where id = $1
@@ -2028,7 +3441,12 @@ async function exerciseInvariantWitnesses(): Promise<void> {
   `, [chargeTransactionId]);
   await expectRejectionChecks(
     'same-currency payment source-principal corruption',
-    ['allocation_set_semantic_source=2', 'source_evidence_projection_parity=1']
+    [
+      'allocation_set_provider_target=1',
+      'allocation_set_semantic_source=2',
+      'financial_title_allocation_determinism=1',
+      'source_evidence_projection_parity=1'
+    ]
   );
   await mutateAppendOnlyFixture(`
     update stripe_balance_transactions set amount_minor = 8, net_minor = 7 where id = $1
@@ -2113,9 +3531,13 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     capacityAllocationOneId, capacityRefundOneId, firstItemId,
     capacityAllocationTwoId, capacityRefundTwoId
   ]);
-  await expectRejection(
+  await expectRejectionChecks(
     'refund component chronology exceeds a bucket capacity',
-    'refund_component_chronology_capacity=1'
+    [
+      'combined_refund_dispute_chronology_capacity=1',
+      'refund_component_chronology_capacity=1',
+      'refund_component_deterministic_split=1'
+    ]
   );
   await pool.query('set session_replication_role = replica');
   try {
@@ -2277,9 +3699,9 @@ async function exerciseInvariantWitnesses(): Promise<void> {
   await mutateAppendOnlyFixture(`
     update stripe_balance_transactions set amount_minor = -2, net_minor = -2 where id = $1
   `, [unresolvedTransactionId]);
-  await expectRejection(
+  await expectRejectionChecks(
     'same-currency primary-refund source-principal corruption',
-    'allocation_set_semantic_source=2'
+    ['allocation_set_provider_target=1', 'allocation_set_semantic_source=2']
   );
   await mutateAppendOnlyFixture(`
     update stripe_balance_transactions set amount_minor = -1, net_minor = -1 where id = $1
@@ -2607,7 +4029,7 @@ async function exerciseInvariantWitnesses(): Promise<void> {
       head.is_complete !== true ||
       head.proposed_issue_code !== null
     ) {
-      failures.push(`${name} was masked by the current correction projection`);
+      failWitness(`${name} was masked by the current correction projection`);
     }
   };
   await expectPass('refund correction component semantics baseline', true);
@@ -2616,9 +4038,12 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     update refund_reporting_correction_items set component = 'refund_fee' where id = $1
   `, [correctionSuccessorItemId]);
   await expectCurrentCorrectionHead('pending correction component corruption');
-  await expectRejection(
+  await expectRejectionChecks(
     'pending refund gross correction cannot masquerade as a fee component',
-    'refund_reporting_correction_item_semantics=1'
+    [
+      'refund_reporting_correction_history_semantics=1',
+      'refund_reporting_correction_item_semantics=1'
+    ]
   );
   await mutateAppendOnlyFixture(`
     update refund_reporting_correction_items set component = 'refund_subtotal' where id = $1
@@ -2644,9 +4069,12 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     delete from refund_reporting_correction_items where id = $1
   `, [correctionSuccessorSecondItemId]);
   await expectCurrentCorrectionHead('pending correction coverage corruption');
-  await expectRejection(
+  await expectRejectionChecks(
     'pending correction must cover every nonzero touched settlement base',
-    'refund_reporting_correction_history_semantics=1'
+    [
+      'refund_reporting_correction_history_semantics=1',
+      'reporting_correction_zero_sum=1'
+    ]
   );
   await pool.query(`
     insert into refund_reporting_correction_items (
@@ -2679,9 +4107,12 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     update refund_reporting_correction_items set currency = 'EUR' where id = $1
   `, [correctionSuccessorItemId]);
   await expectCurrentCorrectionHead('pending correction currency corruption');
-  await expectRejection(
+  await expectRejectionChecks(
     'pending correction item must retain its source currency',
-    'refund_reporting_correction_history_semantics=1'
+    [
+      'refund_reporting_correction_history_semantics=1',
+      'reporting_correction_zero_sum=2'
+    ]
   );
   await mutateAppendOnlyFixture(`
     update refund_reporting_correction_items set currency = 'USD' where id = $1
@@ -2885,9 +4316,13 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     set subtotal_effect_minor = -99, tax_effect_minor = 0, total_effect_minor = -99
     where id = $1
   `, [firstWithdrawalAllocationId]);
-  await expectRejection(
+  await expectRejectionChecks(
     'first dispute withdrawal presentment/source-principal corruption',
-    'dispute_first_withdrawal_source_principal=1'
+    [
+      'combined_refund_dispute_chronology_capacity=2',
+      'dispute_first_withdrawal_source_principal=1',
+      'dispute_item_allocation_graph=1'
+    ]
   );
   await mutateAppendOnlyFixture(`
     update dispute_item_allocations
@@ -2981,9 +4416,15 @@ async function exerciseInvariantWitnesses(): Promise<void> {
   await mutateAppendOnlyFixture(`
     update financial_allocation_sets set source_internal_id = $1 where id = $2
   `, [unrelatedDisputeId, firstWithdrawalSetId]);
-  await expectRejection(
+  await expectRejectionChecks(
     'allocation set names an unrelated existing provider source owner',
-    'allocation_set_semantic_source=1'
+    [
+      'allocation_set_parent_or_chain=1',
+      'allocation_set_semantic_source=1',
+      'combined_refund_dispute_chronology_capacity=3',
+      'dispute_item_allocation_graph=1',
+      'financial_item_allocation_parent=1'
+    ]
   );
   await mutateAppendOnlyFixture(`
     update financial_allocation_sets set source_internal_id = $1 where id = $2
@@ -2994,9 +4435,9 @@ async function exerciseInvariantWitnesses(): Promise<void> {
   await mutateAppendOnlyFixture(`
     update financial_item_allocations set order_item_id = $1 where id = $2
   `, [firstItemId, firstWithdrawalFinancialItemId]);
-  await expectRejection(
+  await expectRejectionChecks(
     'allocation item belongs to an unrelated existing order graph',
-    'financial_item_allocation_parent=1'
+    ['dispute_presentment_child_cardinality=1', 'financial_item_allocation_parent=1']
   );
   await mutateAppendOnlyFixture(`
     update financial_item_allocations set order_item_id = $1 where id = $2
@@ -3122,9 +4563,12 @@ async function exerciseInvariantWitnesses(): Promise<void> {
   await mutateAppendOnlyFixture('delete from dispute_item_allocations where id = $1', [
     childlessWithdrawalAllocationId
   ]);
-  await expectRejection(
+  await expectRejectionChecks(
     'withdrawal current tip has no required dispute presentment child',
-    'dispute_presentment_child_cardinality=1'
+    [
+      'dispute_first_withdrawal_source_principal=1',
+      'dispute_presentment_child_cardinality=1'
+    ]
   );
   await pool.query(`
     insert into dispute_item_allocations (
@@ -3145,9 +4589,13 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     set subtotal_effect_minor = 0, tax_effect_minor = 0, total_effect_minor = 0
     where id = $1
   `, [childlessWithdrawalAllocationId]);
-  await expectRejection(
+  await expectRejectionChecks(
     'withdrawal dispute presentment child cannot have a zero effect',
-    'combined_refund_dispute_chronology_capacity=1'
+    [
+      'combined_refund_dispute_chronology_capacity=1',
+      'dispute_first_withdrawal_source_principal=1',
+      'dispute_presentment_child_cardinality=1'
+    ]
   );
   await mutateAppendOnlyFixture(`
     update dispute_item_allocations
@@ -3202,9 +4650,9 @@ async function exerciseInvariantWitnesses(): Promise<void> {
   await mutateAppendOnlyFixture(`
     update dispute_item_allocations set reverses_allocation_id = $1 where id = $2
   `, [firstWithdrawalAllocationId, childlessReinstatementAllocationId]);
-  await expectRejection(
+  await expectRejectionChecks(
     'reinstatement cannot cross an immutable withdrawal graph or reverse it twice',
-    'dispute_item_allocation_graph='
+    ['combined_refund_dispute_chronology_capacity=2', 'dispute_item_allocation_graph=2']
   );
   await mutateAppendOnlyFixture(`
     update dispute_item_allocations set reverses_allocation_id = $1 where id = $2
@@ -3671,7 +5119,7 @@ async function exerciseInvariantWitnesses(): Promise<void> {
   ]);
   await expectRejection(
     'refund and dispute events duplicate the full durable chronology tuple',
-    'combined_refund_dispute_chronology_capacity='
+    'combined_refund_dispute_chronology_capacity=3'
   );
   await pool.query('set session_replication_role = replica');
   try {
@@ -3822,9 +5270,9 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     stripeDisputeId: combinedStripeDisputeId,
     transactionId: crossReinstatementTransactionId
   });
-  await expectRejection(
+  await expectRejectionChecks(
     'reinstatement crosses its withdrawal order item',
-    'combined_refund_dispute_chronology_capacity=1'
+    ['combined_refund_dispute_chronology_capacity=1', 'dispute_item_allocation_graph=1']
   );
   await pool.query('set session_replication_role = replica');
   try {
@@ -3916,22 +5364,26 @@ async function exerciseInvariantWitnesses(): Promise<void> {
       subtotal_minor, tax_minor, total_minor, currency
     ) values ($1, $2, $3, 1, 1, 2, 'USD')
   `, [splitAllocationId, splitRefundId, secondItemId]);
-  await expectRejection(
+  await expectRejectionChecks(
     'refund component violates the deterministic two-bucket split',
-    'refund_component_deterministic_split=1',
+    [
+      'combined_refund_dispute_chronology_capacity=1',
+      'refund_component_deterministic_split=1'
+    ],
     'full'
   );
 
-  if (failures.length > 0) {
-    throw new Error(`[restore-verifier] invariant witness failures: ${failures.join('; ')}`);
-  }
   console.info(
     '[restore-verifier] schema-object, issue-identity, source-parity, deterministic-allocation, audit, classification, payout, replay-child, allocation-graph, refund-component, dispute-presentment, and combined-chronology witnesses passed'
   );
 }
 
 try {
-  await migrate(drizzle({ client: pool }), { migrationsFolder: `${repositoryRoot}/drizzle` });
+  await migrateDatabase(
+    drizzle({ client: pool }),
+    loadDatabaseMigrationIdentityConfig(process.env),
+    `${repositoryRoot}/drizzle`
+  );
   if (printFinancialCatalogContract) {
     await printCatalogContractCalibration();
   } else if (exerciseFinancialInvariantWitnesses) {
@@ -3957,14 +5409,26 @@ try {
       'full'
     );
     if (error) {
+      const actualFailures = parsedVerifierFailureList(error);
       if (
         seedMissingCredentialAuthority &&
-        error.message.includes('credential_authority_missing_or_mismatched=1')
+        actualFailures !== null &&
+        exactVerifierFailureList(actualFailures, ['credential_authority_missing_or_mismatched=1'])
       ) {
         console.info('[restore-verifier] seeded credential-authority violation was rejected');
         seededViolationRejected = true;
+      } else if (seedMissingCredentialAuthority) {
+        throw new Error(
+          '[restore-verifier] seeded credential-authority check returned an unexpected failure'
+        );
+      } else if (actualFailures) {
+        throw new Error(
+          `[restore-verifier] executable restore check rejected with ${actualFailures.join(', ')}`
+        );
       } else {
-        throw error;
+        throw new Error(
+          '[restore-verifier] executable restore check failed without a valid verifier failure list'
+        );
       }
     }
     if (!seedMissingCredentialAuthority) {

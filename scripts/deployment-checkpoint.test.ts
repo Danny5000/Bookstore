@@ -149,6 +149,48 @@ describe('deployment checkpoint authenticated inputs', () => {
     expect(source).toContain("'rm', '-f', '/tmp/database.dump'");
   });
 
+  it('copies the calibrated catalog-v2 verifier and exhaustive 0012 database evidence', async () => {
+    const [source, verifier, rowCountSql, journalText] = await Promise.all([
+      readFile('scripts/deployment-checkpoint.ts', 'utf8'),
+      readFile('scripts/verify-financial-restore.sql', 'utf8'),
+      readFile('scripts/capture-restore-row-counts.sql', 'utf8'),
+      readFile('drizzle/meta/_journal.json', 'utf8')
+    ]);
+    const journal = JSON.parse(journalText) as {
+      entries: Array<{ idx: number; tag: string; when: number }>;
+    };
+
+    expect(journal.entries.map(({ idx }) => idx)).toEqual(
+      Array.from({ length: 13 }, (_value, idx) => idx)
+    );
+    expect(journal.entries.at(-1)).toMatchObject({
+      idx: 12,
+      tag: '0012_plan6bii_admin_command_authority',
+      when: 1787280731368
+    });
+
+    const journalCapture = source.match(
+      /copy \(select \* from drizzle\.__drizzle_migrations order by id\) to stdout[^'\r\n]*/iu
+    )?.[0];
+    expect(journalCapture).toBeDefined();
+    expect(journalCapture).not.toMatch(/\blimit\b/iu);
+    expect(source).toContain("readFile('scripts/verify-financial-restore.sql', 'utf8')");
+    expect(source).toContain("writeExclusive(join(root, 'verify-financial-restore.sql'), verifier)");
+
+    expect(verifier.match(/plan6b-financial-catalog-v\d+/gu)).toEqual([
+      'plan6b-financial-catalog-v2'
+    ]);
+    expect(verifier).not.toContain('plan6b-financial-catalog-v1');
+    expect(/'0{64}'/u.test(verifier)).toBe(false);
+    expect(verifier.includes('$catalog${}$catalog$')).toBe(false);
+
+    expect(rowCountSql).toContain('from pg_catalog.pg_class c');
+    expect(rowCountSql).toContain('join pg_catalog.pg_namespace n');
+    expect(rowCountSql).toMatch(/c\.relkind\s+in\s*\(\s*'r'\s*,\s*'p'\s*\)/iu);
+    expect(rowCountSql).not.toContain('financial_admin_commands');
+    expect(rowCountSql).not.toContain('financial_admin_job_claims');
+  });
+
   it('publishes one canonical current-v2 CLI and runbook flow', async () => {
     const packageJson = JSON.parse(await readFile('package.json', 'utf8')) as {
       scripts: Record<string, string>;
@@ -164,6 +206,10 @@ describe('deployment checkpoint authenticated inputs', () => {
     expect(current).toContain('npm run deployment:checkpoint -- rehearse');
     expect(current).not.toContain('npm run storage:backup-volumes');
     expect(current).not.toContain('npm run backup:bundle');
+    expect(current).toContain('plan6b-financial-catalog-v2');
+    expect(current).toContain('0012_plan6bii_admin_command_authority');
+    expect(current).toContain('financial_admin_job_claims');
+    expect(current).toContain('every ordinary or partitioned base table');
     for (const path of ['docs/database-and-workers.md', 'docs/runtime-environments.md']) {
       const runbook = await readFile(path, 'utf8');
       const production = runbook.slice(runbook.indexOf('## Production'));

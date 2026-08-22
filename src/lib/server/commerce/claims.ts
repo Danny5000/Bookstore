@@ -13,7 +13,9 @@ import {
   orderItems,
   orders
 } from '$lib/server/db/schema';
-import { enqueueJob as defaultEnqueueJob } from '$lib/server/jobs/repository';
+import {
+  enqueueJobReference as defaultEnqueueJobReference
+} from '$lib/server/jobs/repository';
 import {
   COMMERCE_CLAIM_REQUEST_JOB,
   createClaimEmailJobPayload
@@ -122,7 +124,7 @@ export interface RequestGuestClaimEmailsInput extends ClaimRequestScopeInput {
 
 export interface RequestGuestClaimEmailsDependencies {
   consumeRateLimit?: typeof defaultConsumeRateLimit;
-  enqueueJob?: typeof defaultEnqueueJob;
+  enqueueJob?: typeof defaultEnqueueJobReference;
 }
 
 export async function requestGuestClaimEmails(
@@ -142,7 +144,7 @@ export async function requestGuestClaimEmails(
     applicationSecret: input.applicationSecret
   });
   const consumeRateLimit = dependencyOverrides.consumeRateLimit ?? defaultConsumeRateLimit;
-  const enqueueJob = dependencyOverrides.enqueueJob ?? defaultEnqueueJob;
+  const enqueueJob = dependencyOverrides.enqueueJob ?? defaultEnqueueJobReference;
   if (
     !Number.isSafeInteger(input.windowSeconds) ||
     input.windowSeconds < 1 ||

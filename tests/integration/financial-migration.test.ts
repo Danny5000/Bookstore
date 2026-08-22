@@ -6,6 +6,8 @@ import { fileURLToPath } from 'node:url';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
+import type { DatabaseMigrationIdentityConfig } from '../../src/lib/server/db/database-role-provision';
+import { migrateDatabase } from '../../src/lib/server/db/migrate';
 
 type PrePlan6BInvalidFixtureKind =
   | 'zero-refund'
@@ -127,6 +129,18 @@ function unwrapPostgresError(error: unknown): { code: string; message: string } 
   return typeof code === 'string' && typeof message === 'string' ? { code, message } : null;
 }
 
+function observableErrorText(error: unknown): string {
+  const messages: string[] = [];
+  const seen = new Set<unknown>();
+  let current = error;
+  while (current instanceof Error && !seen.has(current)) {
+    seen.add(current);
+    messages.push(current.message);
+    current = current.cause;
+  }
+  return messages.join('\n');
+}
+
 function assertExpectedMigrationFailure(
   error: unknown,
   expectedReason: RegExp,
@@ -203,7 +217,7 @@ function databasePool(): Pool {
   });
 }
 
-async function createMigrationFolderThrough(maxMigrationIndex: 8 | 9 | 10 | 11): Promise<string> {
+async function createMigrationFolderThrough(maxMigrationIndex: 8 | 9 | 10 | 11 | 12): Promise<string> {
   const runId = process.env.PLAN6B_UPGRADE_RUN_ID;
   assert(runId && /^[a-f0-9]{16}$/u.test(runId), 'owned run ID is missing or invalid');
   const folder = join(
@@ -2435,6 +2449,7 @@ async function runFixedGroupAttributePreflightFixture(pool: Pool): Promise<void>
     }
   ], 'safe preexisting fixed group remains canonical through the current migration head');
   await assertStorageCleanupAuthorityUpgrade(pool);
+  await runRepairedFixtureThroughPlan6biiHead(pool, 'repaired fixed-group fixture');
 }
 
 async function expectUnexpectedNamedAuthorityFailure(
@@ -2534,6 +2549,11 @@ async function runUnexpectedNamedAuthorityPreflightFixture(pool: Pool): Promise<
     'public schema USAGE and extension-member ACLs do not block the repaired upgrade'
   );
   await assertStorageCleanupAuthorityUpgrade(pool);
+  await pool.query('revoke usage on schema public from plan6b_reporting_fixture');
+  await pool.query('revoke usage on type public.hstore from plan6b_reporting_fixture');
+  await pool.query('drop extension hstore');
+  await pool.query('drop role plan6b_reporting_fixture');
+  await runRepairedFixtureThroughPlan6biiHead(pool, 'repaired named-authority fixture');
 }
 
 async function assertFailed0011LeftNoPartialAuthority(
@@ -2658,6 +2678,1330 @@ async function runStorageCleanupAuthorityPreflightFixture(pool: Pool): Promise<v
   await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(11) });
   equal(await migrationCount(pool), 12, 'safe preexisting cleanup group permits exactly 0011');
   await assertStorageCleanupAuthorityUpgrade(pool);
+  await runRepairedFixtureThroughPlan6biiHead(pool, 'repaired storage-cleanup fixture');
+}
+
+const PLAN6BII_ROUTINES = [
+  'submit_financial_admin_command',
+  'financial_admin_command_status',
+  'append_financial_issue_view_audit',
+  'append_financial_refund_review_view_audit',
+  'append_financial_payout_view_audit',
+  'append_financial_sales_export_audit',
+  'resolve_financial_issue_after_admin_command',
+  'transition_administrative_recovery_grant_after_admin_command',
+  'plan6bii_assert_financial_admin_job_lease',
+  'plan6bii_guard_financial_admin_job_lease',
+  'plan6bii_guard_financial_admin_command_update',
+  'plan6bii_guard_financial_admin_command_delete',
+  'plan6bii_guard_administrative_grant_transition',
+  'plan6bii_sync_failed_financial_admin_command'
+] as const;
+
+const PLAN6BII_TRIGGERS = [
+  'financial_admin_commands_plan6bii_update_guard',
+  'financial_admin_commands_plan6bii_delete_guard',
+  'jobs_plan6bii_financial_admin_lease_guard',
+  'entitlement_grants_plan6bii_administrative_guard',
+  'jobs_plan6bii_financial_admin_terminal_sync'
+] as const;
+
+interface Plan6biiCatalogState {
+  enum_count: number;
+  command_table_present: boolean;
+  claim_table_present: boolean;
+  routine_count: number;
+  trigger_count: number;
+  nonowner_acl_count: number;
+  runtime_jobs_table_select: boolean;
+  runtime_job_select_columns: string[];
+}
+
+async function plan6biiCatalogState(pool: Pool): Promise<Plan6biiCatalogState> {
+  return one<Plan6biiCatalogState>(
+    pool,
+    `select
+       (select count(*)::integer
+        from pg_catalog.pg_type type_row
+        join pg_catalog.pg_namespace namespace_row
+          on namespace_row.oid = type_row.typnamespace
+        where namespace_row.nspname = 'public' and type_row.typtype = 'e'
+          and type_row.typname = any($1::text[])) as enum_count,
+       pg_catalog.to_regclass('public.financial_admin_commands') is not null
+         as command_table_present,
+       pg_catalog.to_regclass('public.financial_admin_job_claims') is not null
+         as claim_table_present,
+       (select count(*)::integer
+        from pg_catalog.pg_proc routine
+        join pg_catalog.pg_namespace namespace_row
+          on namespace_row.oid = routine.pronamespace
+        where namespace_row.nspname = 'public'
+          and routine.proname = any($2::text[])) as routine_count,
+       (select count(*)::integer
+        from pg_catalog.pg_trigger trigger_row
+        where not trigger_row.tgisinternal
+          and trigger_row.tgname = any($3::text[])) as trigger_count,
+       (select count(*)::integer
+        from pg_catalog.pg_proc routine
+        join pg_catalog.pg_namespace namespace_row
+          on namespace_row.oid = routine.pronamespace
+        cross join lateral pg_catalog.aclexplode(
+          coalesce(routine.proacl, pg_catalog.acldefault('f', routine.proowner))
+        ) acl
+        where namespace_row.nspname = 'public'
+          and routine.proname = any($2::text[])
+          and acl.privilege_type = 'EXECUTE'
+          and acl.grantee <> routine.proowner) as nonowner_acl_count,
+       has_table_privilege(
+         'pale_orbit_runtime', 'public.jobs', 'SELECT'
+       ) as runtime_jobs_table_select,
+       array(
+         select column_row.attname::text
+         from pg_catalog.pg_attribute column_row
+         where column_row.attrelid = 'public.jobs'::pg_catalog.regclass
+           and column_row.attnum > 0 and not column_row.attisdropped
+           and has_column_privilege(
+             'pale_orbit_runtime', 'public.jobs', column_row.attname, 'SELECT'
+           )
+         order by column_row.attnum
+       ) as runtime_job_select_columns`,
+    [
+      ['financial_admin_command_kind', 'financial_admin_command_status'],
+      [...PLAN6BII_ROUTINES],
+      [...PLAN6BII_TRIGGERS]
+    ]
+  );
+}
+
+const PLAN6BII_ATTESTED_IDENTITIES: DatabaseMigrationIdentityConfig = {
+  webUser: 'plan6bii_attested_web',
+  workerUser: 'plan6bii_attested_worker',
+  storageCleanupUser: 'plan6bii_attested_cleanup'
+};
+
+const PLAN6BII_ATTESTED_ROLE_EDGES = [
+  [PLAN6BII_ATTESTED_IDENTITIES.webUser, 'pale_orbit_runtime'],
+  [PLAN6BII_ATTESTED_IDENTITIES.workerUser, 'pale_orbit_financial_worker'],
+  [PLAN6BII_ATTESTED_IDENTITIES.storageCleanupUser, 'pale_orbit_storage_cleanup']
+] as const;
+
+const PLAN6BII_PUBLIC_ROLE_NAMES = new Set<string>(
+  PLAN6BII_ATTESTED_ROLE_EDGES.map(([, groupName]) => groupName)
+);
+
+async function dropPlan6biiAttestedRoles(pool: Pool): Promise<void> {
+  for (const [roleName] of [...PLAN6BII_ATTESTED_ROLE_EDGES].reverse()) {
+    await pool.query(`drop role if exists "${roleName}"`);
+  }
+}
+
+async function createPlan6biiAttestedRoles(pool: Pool, presentMask: number): Promise<void> {
+  await dropPlan6biiAttestedRoles(pool);
+  for (const [index, [roleName, groupName]] of PLAN6BII_ATTESTED_ROLE_EDGES.entries()) {
+    if ((presentMask & (1 << index)) === 0) continue;
+    await pool.query(`
+      create role "${roleName}" with login nosuperuser nocreatedb nocreaterole
+        inherit noreplication nobypassrls connection limit -1
+        password null valid until 'infinity'
+    `);
+    await pool.query(`
+      grant "${groupName}" to "${roleName}"
+      with admin false, inherit true, set false
+    `);
+  }
+}
+
+let plan6biiIdentityCaseCounter = 0;
+
+function plan6biiIdentityDatabaseName(kind: 'template' | 'case'): string {
+  const runId = process.env.PLAN6B_UPGRADE_RUN_ID;
+  assert(runId && /^[a-f0-9]{16}$/u.test(runId), 'owned run ID is missing or invalid');
+  const suffix = kind === 'template'
+    ? 'template'
+    : `case_${String(plan6biiIdentityCaseCounter += 1).padStart(3, '0')}`;
+  const name = `plan6bii_${runId}_identity_${suffix}`;
+  assert(
+    /^plan6bii_[a-f0-9]{16}_identity_(?:template|case_[0-9]{3})$/u.test(name),
+    'identity fixture database name is invalid'
+  );
+  return name;
+}
+
+function plan6biiOwnedSourceDatabaseName(): string {
+  const runId = process.env.PLAN6B_UPGRADE_RUN_ID;
+  const database = process.env.DATABASE_NAME;
+  assert(runId && /^[a-f0-9]{16}$/u.test(runId), 'owned run ID is missing or invalid');
+  assert(
+    database === `plan6b_${runId}` && /^plan6b_[a-f0-9]{16}$/u.test(database),
+    'Plan 6B-II source database is not the harness-owned database'
+  );
+  return database;
+}
+
+function plan6biiPool(database: string): Pool {
+  return new Pool({
+    host: process.env.DATABASE_HOST,
+    port: Number(process.env.DATABASE_PORT),
+    database,
+    user: process.env.DATABASE_USER,
+    password: process.env.DATABASE_PASSWORD,
+    max: 2,
+    connectionTimeoutMillis: 5_000
+  });
+}
+
+async function createPlan6biiDatabase(
+  pool: Pool,
+  database: string,
+  template: string
+): Promise<void> {
+  const owner = (await one<{ owner_name: string }>(
+    pool,
+    'select current_user as owner_name'
+  )).owner_name;
+  const statement = await formattedRoleStatement(
+    pool,
+    'create database %I with owner %I template %I',
+    database,
+    owner,
+    template
+  );
+  const connectStatement = await formattedRoleStatement(
+    pool,
+    'grant connect on database %I to %I, %I, %I',
+    database,
+    'pale_orbit_runtime',
+    'pale_orbit_financial_worker',
+    'pale_orbit_storage_cleanup'
+  );
+  let created = false;
+  try {
+    await pool.query(statement);
+    created = true;
+    await pool.query(connectStatement);
+  } catch (error) {
+    if (created) {
+      try {
+        await dropPlan6biiDatabase(pool, database);
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          'Plan 6B-II database clone finalization and cleanup both failed',
+          { cause: cleanupError }
+        );
+      }
+    }
+    throw error;
+  }
+}
+
+async function dropPlan6biiDatabase(pool: Pool, database: string): Promise<void> {
+  assert(
+    /^plan6bii_[a-f0-9]{16}_identity_(?:template|case_[0-9]{3})$/u.test(database),
+    'refusing to drop a database outside the identity fixture namespace'
+  );
+  const statement = await formattedRoleStatement(pool, 'drop database %I', database);
+  await pool.query(statement);
+}
+
+async function assertPlan6biiMigrationSettingsCleared(client: PoolClient): Promise<void> {
+  const settings = await one<{
+    web_login: string | null;
+    worker_login: string | null;
+    storage_cleanup_login: string | null;
+  }>(
+    client,
+    `select
+       pg_catalog.current_setting(
+         'pale_orbit.migration_expected_web_login', true
+       ) as web_login,
+       pg_catalog.current_setting(
+         'pale_orbit.migration_expected_worker_login', true
+       ) as worker_login,
+       pg_catalog.current_setting(
+         'pale_orbit.migration_expected_storage_cleanup_login', true
+       ) as storage_cleanup_login`
+  );
+  for (const value of Object.values(settings)) {
+    assert(value === null || value === '', 'migration login attestation survived transaction end');
+  }
+  const persisted = await one<{ persisted_setting_count: number }>(
+    client,
+    `select pg_catalog.count(*)::integer as persisted_setting_count
+     from pg_catalog.pg_db_role_setting setting_row
+     cross join lateral pg_catalog.unnest(setting_row.setconfig)
+       configured_setting(value)
+     where pg_catalog.split_part(configured_setting.value, '=', 1) = any(array[
+       'pale_orbit.migration_expected_web_login',
+       'pale_orbit.migration_expected_worker_login',
+       'pale_orbit.migration_expected_storage_cleanup_login'
+     ]::text[])`
+  );
+  equal(
+    persisted.persisted_setting_count,
+    0,
+    'migration login attestation persisted in role/database settings'
+  );
+}
+
+async function runCommittedPlan6biiAttestedMigration(
+  pool: Pool,
+  migrationsFolder: string
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await migrateDatabase(
+      drizzle(client),
+      PLAN6BII_ATTESTED_IDENTITIES,
+      migrationsFolder
+    );
+    await assertPlan6biiMigrationSettingsCleared(client);
+  } finally {
+    client.release();
+  }
+}
+
+async function runRepairedFixtureThroughPlan6biiHead(
+  pool: Pool,
+  fixture: string
+): Promise<void> {
+  await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(11) });
+  equal(await migrationCount(pool), 12, `${fixture} reaches historical prerequisite 0011`);
+  const migrationsThrough12 = await createMigrationFolderThrough(12);
+  try {
+    await createPlan6biiAttestedRoles(pool, 0b111);
+    await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough12);
+    equal(await migrationCount(pool), 13, `${fixture} reaches migration 0012 exactly once`);
+    await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough12);
+    equal(
+      await migrationCount(pool),
+      13,
+      `${fixture} second 0012 migration pass is a no-op`
+    );
+  } finally {
+    await dropPlan6biiAttestedRoles(pool);
+  }
+}
+
+type Plan6biiIdentityPrepare = (context: {
+  readonly database: string;
+  readonly client: PoolClient;
+}) => Promise<(() => Promise<void>) | undefined>;
+
+async function withPlan6biiIdentityCase(
+  pool: Pool,
+  callback: (casePool: Pool, database: string) => Promise<void>
+): Promise<void> {
+  const template = plan6biiIdentityDatabaseName('template');
+  const database = plan6biiIdentityDatabaseName('case');
+  await createPlan6biiDatabase(pool, database, template);
+  const casePool = plan6biiPool(database);
+  try {
+    await callback(casePool, database);
+  } finally {
+    await casePool.end();
+    await dropPlan6biiDatabase(pool, database);
+  }
+}
+
+async function expectPlan6biiIdentityFailure(
+  pool: Pool,
+  migrationsFolder: string,
+  fixture: string,
+  identities: DatabaseMigrationIdentityConfig = PLAN6BII_ATTESTED_IDENTITIES,
+  prepare?: Plan6biiIdentityPrepare,
+  expectedError: 'postgres' | 'context' = 'postgres'
+): Promise<void> {
+  await withPlan6biiIdentityCase(pool, async (casePool, database) => {
+    const before = await plan6biiCatalogState(casePool);
+    const client = await casePool.connect();
+    try {
+      let cleanup: (() => Promise<void>) | undefined;
+      let rejected = false;
+      try {
+        cleanup = await prepare?.({ database, client });
+        await migrateDatabase(drizzle(client), identities, migrationsFolder);
+      } catch (error) {
+        rejected = true;
+        const observable = observableErrorText(error);
+        const privateCanaries = [
+          ...Object.values(identities).filter((identity) =>
+            !PLAN6BII_PUBLIC_ROLE_NAMES.has(identity)
+          ),
+          process.env.DATABASE_PASSWORD,
+          process.env.DATABASE_PASSWORD_FILE
+        ].filter((value): value is string => typeof value === 'string' && value.length > 0);
+        for (const canary of privateCanaries) {
+          assert(!observable.includes(canary), `${fixture} must not expose private identity context`);
+        }
+        if (expectedError === 'postgres') {
+          const postgresError = unwrapPostgresError(error);
+          assert(postgresError !== null, `${fixture} must expose its PostgreSQL error`);
+          equal(postgresError.code, '42501', `${fixture} must use insufficient privilege`);
+          assert(
+            /Plan 6B-II migration login identity is not canonical/iu.test(postgresError.message),
+            `${fixture} must identify migration login attestation`
+          );
+        } else {
+          assert(
+            error instanceof Error && /pre-existing|attestation|migration identity/iu.test(error.message),
+            `${fixture} must reject the pre-existing migration context`
+          );
+        }
+      } finally {
+        await cleanup?.();
+      }
+      assert(rejected, `${fixture} unexpectedly passed login attestation`);
+      await assertPlan6biiMigrationSettingsCleared(client);
+    } finally {
+      client.release();
+    }
+    equal(await migrationCount(casePool), 12, `${fixture} leaves the journal at 0011`);
+    equal(
+      await plan6biiCatalogState(casePool),
+      before,
+      `${fixture} leaves no partial enum, table, routine, trigger, or ACL`
+    );
+  });
+}
+
+async function expectPlan6biiNonOriginSessionReplicationFailure(
+  pool: Pool,
+  migrationsFolder: string
+): Promise<void> {
+  await withPlan6biiIdentityCase(pool, async (casePool) => {
+    const before = await plan6biiCatalogState(casePool);
+    const client = await casePool.connect();
+    try {
+      let rejected = false;
+      await client.query(`set session_replication_role = replica`);
+      try {
+        await migrateDatabase(drizzle(client), PLAN6BII_ATTESTED_IDENTITIES, migrationsFolder);
+      } catch (error) {
+        rejected = true;
+        const postgresError = unwrapPostgresError(error);
+        assert(postgresError !== null, 'non-origin session must expose its PostgreSQL error');
+        equal(postgresError.code, '42501', 'non-origin session must use insufficient privilege');
+        assert(
+          /Plan 6B-II migration requires canonical owner authority/iu.test(postgresError.message),
+          'non-origin session must fail the absolute owner-authority preflight'
+        );
+      } finally {
+        await client.query(`set session_replication_role = origin`);
+      }
+      assert(rejected, 'non-origin session unexpectedly passed owner-authority preflight');
+      equal(
+        (await one<{ replication_role: string }>(
+          client,
+          `select pg_catalog.current_setting('session_replication_role') as replication_role`
+        )).replication_role,
+        'origin',
+        'non-origin fixture restores the exact canonical replication role'
+      );
+      await assertPlan6biiMigrationSettingsCleared(client);
+    } finally {
+      client.release();
+    }
+    equal(await migrationCount(casePool), 12, 'non-origin session leaves the journal at 0011');
+    equal(
+      await plan6biiCatalogState(casePool),
+      before,
+      'non-origin session leaves no partial enum, table, routine, trigger, or ACL'
+    );
+  });
+}
+
+async function expectPlan6biiIdentitySuccess(
+  pool: Pool,
+  migrationsFolder: string,
+  fixture: string
+): Promise<void> {
+  await withPlan6biiIdentityCase(pool, async (casePool) => {
+    const client = await casePool.connect();
+    try {
+      await migrateDatabase(
+        drizzle(client),
+        PLAN6BII_ATTESTED_IDENTITIES,
+        migrationsFolder
+      );
+      equal(await migrationCount(casePool), 13, `${fixture} commits 0012 exactly once`);
+      const installed = await plan6biiCatalogState(casePool);
+      equal(installed.enum_count, 2, `${fixture} installs both command enums`);
+      equal(installed.command_table_present, true, `${fixture} installs the command table`);
+      equal(installed.claim_table_present, true, `${fixture} installs the claim table`);
+      await assertPlan6biiMigrationSettingsCleared(client);
+    } finally {
+      client.release();
+    }
+  });
+}
+
+async function formattedRoleStatement(
+  pool: Pool,
+  template: string,
+  ...roleNames: string[]
+): Promise<string> {
+  const placeholders = roleNames.map((_name, index) => `$${index + 2}::text`).join(', ');
+  const result = await one<{ statement: string }>(
+    pool,
+    `select pg_catalog.format($1::text, ${placeholders}) as statement`,
+    [template, ...roleNames]
+  );
+  return result.statement;
+}
+
+async function runPlan6biiMigrationIdentityCases(
+  pool: Pool,
+  migrationsFolder: string
+): Promise<void> {
+  await createPlan6biiAttestedRoles(pool, 0b111);
+  try {
+    await expectPlan6biiIdentityFailure(pool, migrationsFolder, 'swapped web and worker identities', {
+      webUser: PLAN6BII_ATTESTED_IDENTITIES.workerUser,
+      workerUser: PLAN6BII_ATTESTED_IDENTITIES.webUser,
+      storageCleanupUser: PLAN6BII_ATTESTED_IDENTITIES.storageCleanupUser
+    });
+    await expectPlan6biiNonOriginSessionReplicationFailure(pool, migrationsFolder);
+  } finally {
+    await dropPlan6biiAttestedRoles(pool);
+  }
+
+  for (let presentMask = 0; presentMask < 8; presentMask += 1) {
+    await createPlan6biiAttestedRoles(pool, presentMask);
+    try {
+      await expectPlan6biiIdentitySuccess(
+        pool,
+        migrationsFolder,
+        `safe attested-login subset ${presentMask.toString(2).padStart(3, '0')}`
+      );
+    } finally {
+      await dropPlan6biiAttestedRoles(pool);
+    }
+  }
+
+  await pool.query(`
+    create role "${PLAN6BII_ATTESTED_IDENTITIES.webUser}" with login nosuperuser
+      nocreatedb nocreaterole inherit noreplication nobypassrls connection limit -1
+      password null valid until 'infinity'
+  `);
+  try {
+    await expectPlan6biiIdentityFailure(pool, migrationsFolder, 'attested role without edge');
+  } finally {
+    await dropPlan6biiAttestedRoles(pool);
+  }
+
+  const unexpectedLogin = 'plan6bii_unexpected_runtime_login';
+  let unexpectedLoginCreated = false;
+  let unexpectedLoginGranted = false;
+  try {
+    await pool.query(`
+      create role "${unexpectedLogin}" with login nosuperuser nocreatedb nocreaterole
+        inherit noreplication nobypassrls connection limit -1
+        password null valid until 'infinity'
+    `);
+    unexpectedLoginCreated = true;
+    await pool.query(`
+      grant "pale_orbit_runtime" to "${unexpectedLogin}"
+      with admin false, inherit true, set false
+    `);
+    unexpectedLoginGranted = true;
+    await expectPlan6biiIdentityFailure(pool, migrationsFolder, 'unknown login group member');
+  } finally {
+    try {
+      if (unexpectedLoginGranted) {
+        await pool.query(`revoke "pale_orbit_runtime" from "${unexpectedLogin}"`);
+      }
+    } finally {
+      if (unexpectedLoginCreated) await pool.query(`drop role "${unexpectedLogin}"`);
+    }
+  }
+
+  await expectPlan6biiIdentityFailure(pool, migrationsFolder, 'duplicate attested identity', {
+    ...PLAN6BII_ATTESTED_IDENTITIES,
+    workerUser: PLAN6BII_ATTESTED_IDENTITIES.webUser
+  });
+  await expectPlan6biiIdentityFailure(pool, migrationsFolder, 'reserved attested identity', {
+    ...PLAN6BII_ATTESTED_IDENTITIES,
+    webUser: 'pale_orbit_runtime'
+  });
+  await expectPlan6biiIdentityFailure(pool, migrationsFolder, 'empty attested identity', {
+    ...PLAN6BII_ATTESTED_IDENTITIES,
+    webUser: ''
+  });
+
+  await createPlan6biiAttestedRoles(pool, 0b001);
+  await pool.query(`alter role "${PLAN6BII_ATTESTED_IDENTITIES.webUser}" createdb`);
+  try {
+    await expectPlan6biiIdentityFailure(pool, migrationsFolder, 'attested role attribute drift');
+  } finally {
+    await dropPlan6biiAttestedRoles(pool);
+  }
+
+  await createPlan6biiAttestedRoles(pool, 0b001);
+  await pool.query(`
+    alter role "${PLAN6BII_ATTESTED_IDENTITIES.webUser}"
+    set application_name = 'plan6bii-role-setting-drift'
+  `);
+  try {
+    await expectPlan6biiIdentityFailure(pool, migrationsFolder, 'attested role setting drift');
+  } finally {
+    await pool.query(`alter role "${PLAN6BII_ATTESTED_IDENTITIES.webUser}" reset all`);
+    await dropPlan6biiAttestedRoles(pool);
+  }
+
+  await createPlan6biiAttestedRoles(pool, 0b001);
+  await pool.query(`
+    grant "pale_orbit_storage_cleanup" to "${PLAN6BII_ATTESTED_IDENTITIES.webUser}"
+    with admin false, inherit true, set false
+  `);
+  try {
+    await expectPlan6biiIdentityFailure(pool, migrationsFolder, 'additional login inheritance');
+  } finally {
+    await dropPlan6biiAttestedRoles(pool);
+  }
+
+  await createPlan6biiAttestedRoles(pool, 0b001);
+  await pool.query(`
+    grant "pale_orbit_runtime" to "${PLAN6BII_ATTESTED_IDENTITIES.webUser}"
+    with admin true, inherit true, set false
+  `);
+  try {
+    await expectPlan6biiIdentityFailure(pool, migrationsFolder, 'attested edge option drift');
+  } finally {
+    await dropPlan6biiAttestedRoles(pool);
+  }
+
+  const ownerSetting = 'pale_orbit.migration_expected_web_login';
+  await expectPlan6biiIdentityFailure(
+    pool,
+    migrationsFolder,
+    'database-owner role default',
+    PLAN6BII_ATTESTED_IDENTITIES,
+    async () => {
+      await pool.query(`alter role current_user set ${ownerSetting} = 'owner-default-drift'`);
+      return async () => {
+        await pool.query(`alter role current_user reset ${ownerSetting}`);
+      };
+    }
+  );
+
+  const databaseSetting = 'pale_orbit.migration_expected_worker_login';
+  await expectPlan6biiIdentityFailure(
+    pool,
+    migrationsFolder,
+    'database attestation default',
+    PLAN6BII_ATTESTED_IDENTITIES,
+    async ({ database }) => {
+      const setStatement = await formattedRoleStatement(
+        pool,
+        `alter database %I set ${databaseSetting} = 'database-default-drift'`,
+        database
+      );
+      const resetStatement = await formattedRoleStatement(
+        pool,
+        `alter database %I reset ${databaseSetting}`,
+        database
+      );
+      await pool.query(setStatement);
+      return async () => {
+        await pool.query(resetStatement);
+      };
+    }
+  );
+
+  await expectPlan6biiIdentityFailure(
+    pool,
+    migrationsFolder,
+    'pre-existing pinned-session attestation',
+    PLAN6BII_ATTESTED_IDENTITIES,
+    async ({ client }) => {
+      await client.query(
+        `select pg_catalog.set_config(
+           'pale_orbit.migration_expected_web_login', $1, false
+         )`,
+        [PLAN6BII_ATTESTED_IDENTITIES.webUser]
+      );
+      return async () => {
+        await client.query(`select pg_catalog.set_config(
+          'pale_orbit.migration_expected_web_login', '', false
+        )`);
+      };
+    },
+    'context'
+  );
+
+  const ownerEdgeRole = 'plan6bii_owner_edge_fixture';
+  let ownerEdgeRoleCreated = false;
+  let ownerEdgeRoleGranted = false;
+  let ownerName: string | undefined;
+  try {
+    await pool.query(`create role "${ownerEdgeRole}" nologin`);
+    ownerEdgeRoleCreated = true;
+    ownerName = (await one<{ owner_name: string }>(
+      pool,
+      'select current_user as owner_name'
+    )).owner_name;
+    const ownerGrant = await formattedRoleStatement(
+      pool,
+      'grant %I to %I with admin false, inherit true, set false',
+      ownerEdgeRole,
+      ownerName
+    );
+    await pool.query(ownerGrant);
+    ownerEdgeRoleGranted = true;
+    await expectPlan6biiIdentityFailure(pool, migrationsFolder, 'database-owner membership edge');
+  } finally {
+    try {
+      if (ownerEdgeRoleGranted && ownerName) {
+        const ownerRevoke = await formattedRoleStatement(
+          pool,
+          'revoke %I from %I',
+          ownerEdgeRole,
+          ownerName
+        );
+        await pool.query(ownerRevoke);
+      }
+    } finally {
+      if (ownerEdgeRoleCreated) await pool.query(`drop role "${ownerEdgeRole}"`);
+    }
+  }
+}
+
+async function assertPlan6biiMigrationIdentityAttestation(
+  pool: Pool,
+  migrationsFolder: string
+): Promise<void> {
+  plan6biiIdentityCaseCounter = 0;
+  try {
+    await runPlan6biiMigrationIdentityCases(pool, migrationsFolder);
+  } finally {
+    await dropPlan6biiAttestedRoles(pool);
+  }
+}
+
+async function expectPlan6biiCollisionFailure(
+  pool: Pool,
+  fixture: string,
+  reason: RegExp = /Plan 6B-II authority object name is already occupied/iu
+): Promise<void> {
+  const before = await plan6biiCatalogState(pool);
+  const client = await pool.connect();
+  try {
+    let rejected = false;
+    try {
+      await migrateDatabase(
+        drizzle(client),
+        PLAN6BII_ATTESTED_IDENTITIES,
+        await createMigrationFolderThrough(12)
+      );
+    } catch (error) {
+      rejected = true;
+      const postgresError = unwrapPostgresError(error);
+      assert(postgresError !== null, `${fixture} must expose its PostgreSQL error`);
+      equal(postgresError.code, '42501', `${fixture} must use insufficient privilege`);
+      assert(
+        reason.test(postgresError.message),
+        `${fixture} must identify the absolute-first authority preflight`
+      );
+    }
+    assert(rejected, `${fixture} unexpectedly migrated`);
+    await assertPlan6biiMigrationSettingsCleared(client);
+  } finally {
+    client.release();
+  }
+  equal(await migrationCount(pool), 12, `${fixture} leaves the journal at 0011`);
+  equal(
+    await plan6biiCatalogState(pool),
+    before,
+    `${fixture} leaves no partial enum, table, routine, trigger, or ACL`
+  );
+}
+
+async function runPlan6biiAdminCommandAuthorityFixture(): Promise<void> {
+  const sourceDatabase = plan6biiOwnedSourceDatabaseName();
+  const template = plan6biiIdentityDatabaseName('template');
+  let sourcePool = databasePool();
+  let sourcePoolOpen = true;
+  let pool = sourcePool;
+  let controlPool: Pool | undefined;
+  let templateCreated = false;
+  let restoreSourceConnectionsStatement: string | undefined;
+  let sourceConnectionsRestorationOwed = false;
+  let primaryFailed = false;
+  let primaryFailure: unknown;
+  let cleanupFailure: unknown;
+  try {
+    equal(await migrationCount(pool), 7, '0012 authority fixture begins at migration 0006');
+    await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(11) });
+    equal(await migrationCount(pool), 12, '0012 authority fixture applies through migration 0011');
+
+    const populationClient = await pool.connect();
+    let populated: { userId: string; titleIds: string[] };
+    try {
+      populated = await insertUserAndTitles(populationClient, 1);
+    } finally {
+      populationClient.release();
+    }
+    assert(populated.userId.length > 0 && populated.titleIds.length === 1,
+      '0011 fixture must contain durable populated rows');
+
+    const migrationsThrough12 = await createMigrationFolderThrough(12);
+    await sourcePool.end();
+    sourcePoolOpen = false;
+
+    controlPool = plan6biiPool('postgres');
+    const disableSourceConnectionsStatement = await formattedRoleStatement(
+      controlPool,
+      'alter database %I with allow_connections false',
+      sourceDatabase
+    );
+    restoreSourceConnectionsStatement = await formattedRoleStatement(
+      controlPool,
+      'alter database %I with allow_connections true',
+      sourceDatabase
+    );
+    sourceConnectionsRestorationOwed = true;
+    await controlPool.query(disableSourceConnectionsStatement);
+
+    let sourceSessionsDrained = false;
+    for (let drainAttempt = 0; drainAttempt < 20; drainAttempt += 1) {
+      await controlPool.query(
+        `select pg_catalog.pg_terminate_backend(activity.pid)
+         from pg_catalog.pg_stat_activity activity
+         where activity.datname = $1
+           and activity.pid <> pg_catalog.pg_backend_pid()`,
+        [sourceDatabase]
+      );
+      const remaining = await one<{ session_count: string }>(
+        controlPool,
+        `select pg_catalog.count(*)::text as session_count
+         from pg_catalog.pg_stat_activity activity
+         where activity.datname = $1
+           and activity.pid <> pg_catalog.pg_backend_pid()`,
+        [sourceDatabase]
+      );
+      if (remaining.session_count === '0') {
+        sourceSessionsDrained = true;
+        break;
+      }
+      if (drainAttempt < 19) await controlPool.query('select pg_catalog.pg_sleep(0.05)');
+    }
+    assert(sourceSessionsDrained, 'Plan 6B-II source database did not quiesce');
+
+    const existingTemplate = await one<{ present: boolean }>(
+      controlPool,
+      `select exists(
+         select 1 from pg_catalog.pg_database where datname = $1
+       ) as present`,
+      [template]
+    );
+    assert(!existingTemplate.present, 'identity fixture template database already exists');
+    await createPlan6biiDatabase(controlPool, template, sourceDatabase);
+    templateCreated = true;
+    await controlPool.query(restoreSourceConnectionsStatement);
+    sourceConnectionsRestorationOwed = false;
+
+    sourcePool = databasePool();
+    sourcePoolOpen = true;
+    pool = sourcePool;
+    await assertPlan6biiMigrationIdentityAttestation(controlPool, migrationsThrough12);
+    await assertPlan6biiAdminCommandAuthorityFixture(
+      pool,
+      populated,
+      migrationsThrough12
+    );
+  } catch (error) {
+    primaryFailed = true;
+    primaryFailure = error;
+  } finally {
+    const preserveFirstCleanupFailure = async (
+      cleanup: () => Promise<void>
+    ): Promise<void> => {
+      try {
+        await cleanup();
+      } catch (error) {
+        cleanupFailure ??= error;
+      }
+    };
+    if (sourcePoolOpen) {
+      await preserveFirstCleanupFailure(async () => {
+        await sourcePool.end();
+        sourcePoolOpen = false;
+      });
+    }
+    const activeControlPool = controlPool;
+    if (activeControlPool) {
+      if (sourceConnectionsRestorationOwed) {
+        await preserveFirstCleanupFailure(async () => {
+          assert(
+            restoreSourceConnectionsStatement !== undefined,
+            'Plan 6B-II source connection restoration statement is missing'
+          );
+          await activeControlPool.query(restoreSourceConnectionsStatement);
+          sourceConnectionsRestorationOwed = false;
+        });
+      }
+      if (templateCreated) {
+        await preserveFirstCleanupFailure(async () => {
+          await dropPlan6biiDatabase(activeControlPool, template);
+          templateCreated = false;
+        });
+      }
+      await preserveFirstCleanupFailure(async () => {
+        await activeControlPool.end();
+      });
+    }
+  }
+  if (primaryFailed) {
+    throw primaryFailure;
+  }
+  if (cleanupFailure !== undefined) {
+    throw cleanupFailure;
+  }
+}
+
+async function assertPlan6biiAdminCommandAuthorityFixture(
+  pool: Pool,
+  populated: { userId: string; titleIds: string[] },
+  migrationsThrough12: string
+): Promise<void> {
+  const originalPublicSchemaOwnership = await one<{
+    database_owner: string;
+    schema_owner: string;
+  }>(
+    pool,
+    `select pg_catalog.pg_get_userbyid(database_row.datdba) as database_owner,
+       pg_catalog.pg_get_userbyid(namespace_row.nspowner) as schema_owner
+     from pg_catalog.pg_database database_row
+     cross join pg_catalog.pg_namespace namespace_row
+     where database_row.datname = pg_catalog.current_database()
+       and namespace_row.nspname = 'public'`
+  );
+  equal(
+    originalPublicSchemaOwnership.schema_owner,
+    'pg_database_owner',
+    'fresh PostgreSQL 18 through-0011 public schema retains its canonical owner'
+  );
+  const restorePublicSchemaOwnerStatement = await formattedRoleStatement(
+    pool,
+    'alter schema public owner to %I',
+    originalPublicSchemaOwnership.schema_owner
+  );
+  const publicSchemaAcl = async (): Promise<Array<{
+    grantee_name: string;
+    grantor_name: string;
+    privilege_type: string;
+    is_grantable: boolean;
+  }>> => (await pool.query(`
+    with database_identity as (
+      select database_row.datdba as database_owner
+      from pg_catalog.pg_database database_row
+      where database_row.datname = pg_catalog.current_database()
+    )
+    select
+      case when privilege.grantee = 0 then 'PUBLIC'
+        when privilege.grantee in (
+          database_identity.database_owner,
+          'pg_database_owner'::pg_catalog.regrole
+        ) then 'DATABASE_OWNER'
+        else grantee_role.rolname::text end as grantee_name,
+      case when privilege.grantor in (
+          database_identity.database_owner,
+          'pg_database_owner'::pg_catalog.regrole
+        ) then 'DATABASE_OWNER'
+        else grantor_role.rolname::text end as grantor_name,
+      privilege.privilege_type::text as privilege_type,
+      privilege.is_grantable
+    from pg_catalog.pg_namespace namespace_row
+    cross join database_identity
+    cross join lateral pg_catalog.aclexplode(coalesce(
+      namespace_row.nspacl,
+      pg_catalog.acldefault('n', namespace_row.nspowner)
+    )) privilege
+    join pg_catalog.pg_roles grantor_role on grantor_role.oid = privilege.grantor
+    left join pg_catalog.pg_roles grantee_role on grantee_role.oid = privilege.grantee
+    where namespace_row.nspname = 'public'
+    order by 1, 2, 3, 4
+  `)).rows;
+  const originalPublicSchemaAcl = await publicSchemaAcl();
+
+  await pool.query(`create type public.financial_admin_command_kind as enum ('unsafe')`);
+  await expectPlan6biiCollisionFailure(pool, 'unsafe pre-existing command enum');
+  await pool.query(`drop type public.financial_admin_command_kind`);
+
+  await pool.query(`create table public.financial_admin_commands (fixture integer)`);
+  await expectPlan6biiCollisionFailure(pool, 'unsafe pre-existing command table');
+  await pool.query(`drop table public.financial_admin_commands`);
+
+  await pool.query(`create table public.financial_admin_job_claims (fixture integer)`);
+  await expectPlan6biiCollisionFailure(pool, 'unsafe pre-existing private claim table');
+  await pool.query(`drop table public.financial_admin_job_claims`);
+
+  await pool.query(`
+    create function public.submit_financial_admin_command(uuid,text,text,text,text,jsonb)
+    returns integer language sql as 'select 1'
+  `);
+  await expectPlan6biiCollisionFailure(pool, 'unsafe pre-existing command routine');
+  await pool.query(`drop function public.submit_financial_admin_command(uuid,text,text,text,text,jsonb)`);
+
+  await pool.query(`
+    create function public.plan6bii_assert_financial_admin_job_lease(uuid)
+    returns void language plpgsql as 'begin return; end'
+  `);
+  await expectPlan6biiCollisionFailure(pool, 'unsafe pre-existing private lease helper');
+  await pool.query(`drop function public.plan6bii_assert_financial_admin_job_lease(uuid)`);
+
+  await pool.query(`
+    create function public.plan6bii_collision_fixture_trigger()
+    returns trigger language plpgsql as 'begin return new; end'
+  `);
+  await pool.query(`
+    create trigger jobs_plan6bii_financial_admin_terminal_sync
+    before insert on public.jobs
+    for each row execute function public.plan6bii_collision_fixture_trigger()
+  `);
+  await expectPlan6biiCollisionFailure(pool, 'unsafe pre-existing command trigger');
+  await pool.query(`drop trigger jobs_plan6bii_financial_admin_terminal_sync on public.jobs`);
+  await pool.query(`
+    create trigger jobs_plan6bii_financial_admin_lease_guard
+    before update on public.jobs
+    for each row execute function public.plan6bii_collision_fixture_trigger()
+  `);
+  await expectPlan6biiCollisionFailure(pool, 'unsafe pre-existing private lease trigger');
+  await pool.query(`drop trigger jobs_plan6bii_financial_admin_lease_guard on public.jobs`);
+  await pool.query(`drop function public.plan6bii_collision_fixture_trigger()`);
+
+  await pool.query(`grant select on public.jobs to pale_orbit_storage_cleanup`);
+  await expectPlan6biiCollisionFailure(
+    pool,
+    'unsafe prerequisite direct ACL',
+    /Plan 6B-II prerequisite direct ACL is not canonical/iu
+  );
+  await pool.query(`revoke select on public.jobs from pale_orbit_storage_cleanup`);
+
+  await pool.query(`
+    do $plan6bii_owner_column_acl_fixture$
+    begin
+      execute pg_catalog.format(
+        'grant update (id) on public.jobs to %I', current_user
+      );
+    end
+    $plan6bii_owner_column_acl_fixture$
+  `);
+  await expectPlan6biiCollisionFailure(
+    pool,
+    'unsafe database-owner column ACL',
+    /Plan 6B-II prerequisite direct ACL is not canonical/iu
+  );
+  await pool.query(`
+    do $plan6bii_owner_column_acl_fixture$
+    begin
+      execute pg_catalog.format(
+        'revoke update (id) on public.jobs from %I', current_user
+      );
+    end
+    $plan6bii_owner_column_acl_fixture$
+  `);
+
+  await pool.query(`
+    alter default privileges in schema public
+    grant select on tables to current_user
+  `);
+  await expectPlan6biiCollisionFailure(
+    pool,
+    'redundant explicit database-owner default ACL',
+    /Plan 6B-II database owner default ACL is not canonical/iu
+  );
+  await pool.query(`
+    alter default privileges in schema public
+    revoke select on tables from current_user
+  `);
+
+  await pool.query(`
+    alter default privileges in schema public
+    grant insert on tables to pale_orbit_financial_worker
+  `);
+  await expectPlan6biiCollisionFailure(
+    pool,
+    'unsafe database-owner default ACL',
+    /Plan 6B-II database owner default ACL is not canonical/iu
+  );
+  await pool.query(`
+    alter default privileges in schema public
+    revoke insert on tables from pale_orbit_financial_worker
+  `);
+
+  await pool.query(`
+    alter default privileges for role pale_orbit_storage_cleanup in schema public
+    grant select on tables to public
+  `);
+  await expectPlan6biiCollisionFailure(
+    pool,
+    'unsafe other-owner default ACL',
+    /Plan 6B-II database owner default ACL is not canonical/iu
+  );
+  await pool.query(`
+    alter default privileges for role pale_orbit_storage_cleanup in schema public
+    revoke select on tables from public
+  `);
+
+  await pool.query(`create schema plan6bii_default_acl_fixture
+    authorization pale_orbit_storage_cleanup`);
+  await pool.query(`
+    alter default privileges for role pale_orbit_storage_cleanup
+      in schema plan6bii_default_acl_fixture
+    grant select on tables to public
+  `);
+  await expectPlan6biiCollisionFailure(
+    pool,
+    'unsafe other-namespace default ACL',
+    /Plan 6B-II database owner default ACL is not canonical/iu
+  );
+  await pool.query(`
+    alter default privileges for role pale_orbit_storage_cleanup
+      in schema plan6bii_default_acl_fixture
+    revoke select on tables from public
+  `);
+  await pool.query(`drop schema plan6bii_default_acl_fixture`);
+
+  await pool.query(`
+    grant pale_orbit_runtime to pale_orbit_financial_worker
+    with admin true, inherit true, set false
+  `);
+  await expectPlan6biiCollisionFailure(
+    pool,
+    'unsafe fixed-group membership option',
+    /Plan 6B-II migration login identity is not canonical/iu
+  );
+  await pool.query(`
+    grant pale_orbit_runtime to pale_orbit_financial_worker
+    with admin false, inherit true, set false
+  `);
+
+  await pool.query(`alter table public.jobs disable trigger jobs_plan6b_web_insert_guard`);
+  await expectPlan6biiCollisionFailure(
+    pool,
+    'disabled prerequisite job trigger',
+    /Plan 6B-II prerequisite trigger is missing, disabled, or displaced/iu
+  );
+  await pool.query(`alter table public.jobs enable trigger jobs_plan6b_web_insert_guard`);
+
+  await pool.query(`drop trigger jobs_plan6b_web_insert_guard on public.jobs`);
+  await pool.query(`
+    create trigger jobs_plan6b_web_insert_guard
+    before insert on public.jobs
+    for each row when (false)
+    execute function public.plan6b_guard_job_insert()
+  `);
+  await expectPlan6biiCollisionFailure(
+    pool,
+    'suppressed prerequisite job trigger',
+    /Plan 6B-II prerequisite trigger is missing, disabled, or displaced/iu
+  );
+  await pool.query(`drop trigger jobs_plan6b_web_insert_guard on public.jobs`);
+  await pool.query(`
+    create trigger jobs_plan6b_web_insert_guard
+    before insert on public.jobs
+    for each row execute function public.plan6b_guard_job_insert()
+  `);
+
+  await pool.query(`revoke select on public.jobs from pale_orbit_runtime`);
+  await expectPlan6biiCollisionFailure(
+    pool,
+    'missing canonical runtime jobs select',
+    /Plan 6B-II prerequisite direct ACL is not canonical/iu
+  );
+  await pool.query(`grant select on public.jobs to pale_orbit_runtime`);
+
+  await pool.query(`grant trigger on public.jobs to pale_orbit_financial_worker`);
+  await expectPlan6biiCollisionFailure(
+    pool,
+    'unsafe worker jobs trigger authority',
+    /Plan 6B-II prerequisite direct ACL is not canonical/iu
+  );
+  await pool.query(`revoke trigger on public.jobs from pale_orbit_financial_worker`);
+
+  await pool.query(`
+    grant set on parameter session_replication_role to pale_orbit_financial_worker
+  `);
+  await expectPlan6biiCollisionFailure(
+    pool,
+    'unsafe worker session-replication parameter authority',
+    /Plan 6B-II fixed role parameter ACL is not canonical/iu
+  );
+  await pool.query(`
+    revoke set on parameter session_replication_role from pale_orbit_financial_worker
+  `);
+
+  await pool.query(`
+    create function public.plan6bii_unexpected_jobs_trigger_fixture()
+    returns trigger language plpgsql as 'begin return new; end'
+  `);
+  await pool.query(`
+    create trigger plan6bii_unexpected_jobs_before_update
+    before update on public.jobs
+    for each row execute function public.plan6bii_unexpected_jobs_trigger_fixture()
+  `);
+  await expectPlan6biiCollisionFailure(
+    pool,
+    'unexpected jobs before-update trigger',
+    /Plan 6B-II prerequisite trigger is missing, disabled, or displaced/iu
+  );
+  await pool.query(`drop trigger plan6bii_unexpected_jobs_before_update on public.jobs`);
+  await pool.query(`drop function public.plan6bii_unexpected_jobs_trigger_fixture()`);
+
+  await pool.query(`alter table public.audit_events disable trigger audit_events_reject_update`);
+  await expectPlan6biiCollisionFailure(
+    pool,
+    'disabled prerequisite audit trigger',
+    /Plan 6B-II prerequisite trigger is missing, disabled, or displaced/iu
+  );
+  await pool.query(`alter table public.audit_events enable trigger audit_events_reject_update`);
+
+  await pool.query(`alter schema public owner to pale_orbit_financial_worker`);
+  await expectPlan6biiCollisionFailure(
+    pool,
+    'unexpected public schema owner',
+    /Plan 6B-II prerequisite owner is not canonical/iu
+  );
+  await pool.query(restorePublicSchemaOwnerStatement);
+  equal(
+    await publicSchemaAcl(),
+    originalPublicSchemaAcl,
+    'public schema direct ACL is restored exactly after the noncanonical-owner fixture'
+  );
+  equal(
+    (await one<{ schema_owner: string }>(
+      pool,
+      `select pg_catalog.pg_get_userbyid(namespace_row.nspowner) as schema_owner
+       from pg_catalog.pg_namespace namespace_row
+       where namespace_row.nspname = 'public'`
+    )).schema_owner,
+    originalPublicSchemaOwnership.schema_owner,
+    'public schema owner is restored exactly after the noncanonical-owner fixture'
+  );
+
+  for (const routine of [
+    'public.reject_audit_event_mutation()',
+    'public.plan6b_validate_issue_insert()'
+  ]) {
+    await pool.query(`grant execute on function ${routine} to pale_orbit_runtime`);
+    await expectPlan6biiCollisionFailure(
+      pool,
+      `unsafe runtime execute on ${routine}`,
+      /Plan 6B-II prerequisite direct ACL is not canonical/iu
+    );
+    await pool.query(`revoke execute on function ${routine} from pale_orbit_runtime`);
+  }
+
+  await pool.query(`
+    alter function public.reject_audit_event_mutation()
+    owner to pale_orbit_storage_cleanup
+  `);
+  await expectPlan6biiCollisionFailure(
+    pool,
+    'unexpected audit-mutation trigger-function owner',
+    /Plan 6B-II prerequisite owner is not canonical/iu
+  );
+  await pool.query(`alter function public.reject_audit_event_mutation() owner to current_user`);
+  await pool.query(`
+    alter function public.plan6b_validate_issue_insert()
+    owner to pale_orbit_storage_cleanup
+  `);
+  await expectPlan6biiCollisionFailure(
+    pool,
+    'unexpected issue-insert trigger-function owner',
+    /Plan 6B-II prerequisite owner is not canonical/iu
+  );
+  await pool.query(`alter function public.plan6b_validate_issue_insert() owner to current_user`);
+
+  await pool.query(`grant delete on public.stripe_events to pale_orbit_storage_cleanup`);
+  await expectPlan6biiCollisionFailure(
+    pool,
+    'unsafe Stripe-event prerequisite ACL',
+    /Plan 6B-II prerequisite direct ACL is not canonical/iu
+  );
+  await pool.query(`revoke delete on public.stripe_events from pale_orbit_storage_cleanup`);
+
+  await pool.query(`alter table public.title_revisions owner to pale_orbit_storage_cleanup`);
+  await expectPlan6biiCollisionFailure(
+    pool,
+    'unexpected title-revision prerequisite owner',
+    /Plan 6B-II prerequisite owner is not canonical/iu
+  );
+  await pool.query(`alter table public.title_revisions owner to current_user`);
+
+  await pool.query(`
+    grant execute on function public.claim_guest_purchases_after_authorization(text,text)
+    to pale_orbit_storage_cleanup
+  `);
+  await expectPlan6biiCollisionFailure(
+    pool,
+    'unsafe guest-claim prerequisite routine ACL',
+    /Plan 6B-II prerequisite direct ACL is not canonical/iu
+  );
+  await pool.query(`
+    revoke execute on function public.claim_guest_purchases_after_authorization(text,text)
+    from pale_orbit_storage_cleanup
+  `);
+
+  await pool.query(`
+    alter function public.resolve_financial_issue_after_worker_recompute(uuid,text)
+    owner to pale_orbit_storage_cleanup
+  `);
+  await expectPlan6biiCollisionFailure(
+    pool,
+    'unexpected worker-resolver prerequisite owner',
+    /Plan 6B-II prerequisite owner is not canonical/iu
+  );
+  await pool.query(`
+    alter function public.resolve_financial_issue_after_worker_recompute(uuid,text)
+    owner to current_user
+  `);
+
+  await pool.query(`revoke usage on type public.stripe_event_status from public`);
+  await expectPlan6biiCollisionFailure(
+    pool,
+    'missing public Stripe-event-status usage',
+    /Plan 6B-II prerequisite direct ACL is not canonical/iu
+  );
+  await pool.query(`grant usage on type public.stripe_event_status to public`);
+
+  await pool.query(`grant usage on type public.revision_state to pale_orbit_storage_cleanup`);
+  await expectPlan6biiCollisionFailure(
+    pool,
+    'unsafe direct revision-state ACL',
+    /Plan 6B-II prerequisite direct ACL is not canonical/iu
+  );
+  await pool.query(`revoke usage on type public.revision_state from pale_orbit_storage_cleanup`);
+
+  await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough12);
+  equal(await migrationCount(pool), 13, 'repaired 0011 database applies 0012 exactly once');
+  const installed = await plan6biiCatalogState(pool);
+  equal(installed.enum_count, 2, '0012 installs both administrator command enums');
+  equal(installed.command_table_present, true, '0012 installs the command table');
+  equal(installed.claim_table_present, true, '0012 installs the private job-claim table');
+  equal(installed.routine_count, PLAN6BII_ROUTINES.length, '0012 installs exact routines');
+  equal(installed.trigger_count, PLAN6BII_TRIGGERS.length, '0012 installs exact triggers');
+  equal(installed.runtime_jobs_table_select, false, '0012 revokes runtime full jobs SELECT');
+  equal(
+    installed.runtime_job_select_columns,
+    ['id', 'deduplication_key'],
+    '0012 leaves runtime only safe job-reference columns'
+  );
+  equal(
+    await one<{ users: string; titles: string }>(
+      pool,
+      `select
+         (select count(*)::text from public."user" where id = $1) as users,
+         (select count(*)::text from public.titles where id = $2) as titles`,
+      [populated.userId, populated.titleIds[0]]
+    ),
+    { users: '1', titles: '1' },
+    'clean populated 0011 facts survive the 0012 authority migration'
+  );
+  await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough12);
+  equal(await migrationCount(pool), 13, 'a second 0012 migrator pass is a no-op');
 }
 
 async function runValidFixture(pool: Pool): Promise<void> {
@@ -2683,9 +4027,7 @@ async function runValidFixture(pool: Pool): Promise<void> {
   await assertHistoryGuards(pool, fixture);
   await assertClaimAuthorityUpgrade(pool, fixture);
   await assertStorageCleanupAuthorityUpgrade(pool);
-
-  await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(11) });
-  equal(await migrationCount(pool), 12, 'running the migration runner again is a no-op');
+  await runRepairedFixtureThroughPlan6biiHead(pool, 'valid ordinary upgrade fixture');
 }
 
 async function runInvalidFixture(
@@ -2815,6 +4157,7 @@ async function runPostPlan6BInvalidFixture(
 
   await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(9) });
   equal(await migrationCount(pool), 10, `${kind} repair permits exactly migration 0009`);
+  await runRepairedFixtureThroughPlan6biiHead(pool, `${kind} repaired historical fixture`);
 }
 
 async function expect0010Failure(
@@ -2900,6 +4243,7 @@ async function runClaimAuthorityInvalidFixture(
   }
   await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(10) });
   equal(await migrationCount(pool), 11, `${kind} repair permits exactly migration 0010`);
+  await runRepairedFixtureThroughPlan6biiHead(pool, `${kind} repaired historical fixture`);
 }
 
 async function runClaimIdentityAuthorityInvalidFixture(pool: Pool): Promise<void> {
@@ -3017,6 +4361,7 @@ async function runClaimIdentityAuthorityInvalidFixture(pool: Pool): Promise<void
   );
   await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(10) });
   equal(await migrationCount(pool), 11, `${fixture} repair permits exactly migration 0010`);
+  await runRepairedFixtureThroughPlan6biiHead(pool, `${fixture} repaired historical fixture`);
 }
 
 async function runEntitlementProjectionInvalidFixture(pool: Pool): Promise<void> {
@@ -3082,6 +4427,7 @@ async function runEntitlementProjectionInvalidFixture(pool: Pool): Promise<void>
   );
   await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(10) });
   equal(await migrationCount(pool), 11, `${fixture} repair permits exactly migration 0010`);
+  await runRepairedFixtureThroughPlan6biiHead(pool, `${fixture} repaired historical fixture`);
 }
 
 async function main(): Promise<void> {
@@ -3116,7 +4462,8 @@ async function main(): Promise<void> {
       'legacy-paid-guest-missing-grant',
       'legacy-claimed-identity-authority',
       'legacy-entitlement-projection',
-      'storage-cleanup-authority-preflight'
+      'storage-cleanup-authority-preflight',
+      'plan6bii-admin-command-authority'
     ] as const) {
       const result = spawnSync(
         process.execPath,
@@ -3163,9 +4510,15 @@ async function main(): Promise<void> {
       rawFixture === 'legacy-paid-guest-missing-grant' ||
       rawFixture === 'legacy-claimed-identity-authority' ||
       rawFixture === 'legacy-entitlement-projection' ||
-      rawFixture === 'storage-cleanup-authority-preflight',
+      rawFixture === 'storage-cleanup-authority-preflight' ||
+      rawFixture === 'plan6bii-admin-command-authority',
     `unknown fixture ${rawFixture ?? '<missing>'}`
   );
+  if (rawFixture === 'plan6bii-admin-command-authority') {
+    await runPlan6biiAdminCommandAuthorityFixture();
+    console.info(`[financial-migration-test] ${rawFixture} fixture passed`);
+    return;
+  }
   const pool = databasePool();
   try {
     if (rawFixture === 'valid') await runValidFixture(pool);
@@ -3189,8 +4542,7 @@ async function main(): Promise<void> {
       await runEntitlementProjectionInvalidFixture(pool);
     } else if (rawFixture === 'storage-cleanup-authority-preflight') {
       await runStorageCleanupAuthorityPreflightFixture(pool);
-    }
-    else await runInvalidFixture(pool, rawFixture);
+    } else await runInvalidFixture(pool, rawFixture);
     console.info(`[financial-migration-test] ${rawFixture} fixture passed`);
   } finally {
     await pool.end();

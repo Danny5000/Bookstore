@@ -50,6 +50,29 @@ describe('atomic deployment backup bundle', () => {
     expect(JSON.parse(await readFile(join(root, 'backup-bundle.json'), 'utf8'))).toEqual(manifest);
   });
 
+  it('authenticates the current calibrated catalog-v2 verifier exactly once', async () => {
+    const verifier = await readFile('scripts/verify-financial-restore.sql', 'utf8');
+    await writeFile(join(root, 'verify-financial-restore.sql'), verifier);
+    const expectedEvidence = await hashDeploymentBackupArtifact(
+      root,
+      'verify-financial-restore.sql'
+    );
+
+    const manifest = await sealDeploymentBackupBundle(root, backupId);
+
+    expect(DEPLOYMENT_BACKUP_ARTIFACTS.filter((name) =>
+      name === 'verify-financial-restore.sql'
+    )).toHaveLength(1);
+    expect(manifest.artifacts['verify-financial-restore.sql']).toEqual(expectedEvidence);
+    expect(await readFile(join(root, 'verify-financial-restore.sql'), 'utf8')).toBe(verifier);
+    expect(verifier.match(/plan6b-financial-catalog-v\d+/gu)).toEqual([
+      'plan6b-financial-catalog-v2'
+    ]);
+    expect(verifier).not.toContain('plan6b-financial-catalog-v1');
+    expect(/'0{64}'/u.test(verifier)).toBe(false);
+    expect(verifier.includes('$catalog${}$catalog$')).toBe(false);
+  });
+
   it('does not publish a bundle manifest when any authoritative artifact is absent', async () => {
     await rm(join(root, 'publication.tar.gz'));
 

@@ -16,6 +16,8 @@ export class JobLeaseLostError extends Error {
 }
 
 type WorkerSleep = (milliseconds: number, signal: AbortSignal) => Promise<void>;
+const FINANCIAL_ADMIN_COMMAND_JOB = 'commerce.financial-admin-command';
+const FINANCIAL_ADMIN_LEASE_CAPABILITY_PATTERN = /^[A-Za-z0-9_-]{43}$/u;
 
 export type WorkerPollHook = (input: {
   now: Date;
@@ -50,6 +52,7 @@ interface HeartbeatOptions {
   repository: JobRepository;
   jobId: string;
   workerId: string;
+  financialAdminLeaseCapability?: string;
   intervalMs: number;
   signal: AbortSignal;
   sleep: WorkerSleep;
@@ -62,7 +65,13 @@ async function heartbeatLease(options: HeartbeatOptions): Promise<void> {
     try {
       await options.sleep(options.intervalMs, options.signal);
       if (options.signal.aborted) return;
-      renewed = await options.repository.renewLease(options.jobId, options.workerId);
+      renewed = options.financialAdminLeaseCapability === undefined
+        ? await options.repository.renewLease(options.jobId, options.workerId)
+        : await options.repository.renewLease(
+            options.jobId,
+            options.workerId,
+            options.financialAdminLeaseCapability
+          );
     } catch {
       if (options.signal.aborted) return;
       options.loseLease();
@@ -76,14 +85,43 @@ async function heartbeatLease(options: HeartbeatOptions): Promise<void> {
   }
 }
 
+async function failClaimedJob(
+  repository: JobRepository,
+  job: JobRecord,
+  workerId: string,
+  safeError: string,
+  retryable: boolean
+): Promise<boolean> {
+  try {
+    return job.financialAdminLeaseCapability === undefined
+      ? await repository.fail(job.id, workerId, safeError, retryable)
+      : await repository.fail(
+          job.id,
+          workerId,
+          safeError,
+          retryable,
+          job.financialAdminLeaseCapability
+        );
+  } catch (error: unknown) {
+    if (job.financialAdminLeaseCapability !== undefined) return false;
+    throw error;
+  }
+}
+
 async function runClaimedJob(
   options: WorkerJobOptions,
   job: JobRecord
 ): Promise<void> {
+  if (job.type === FINANCIAL_ADMIN_COMMAND_JOB &&
+    (job.financialAdminLeaseCapability === undefined ||
+      !FINANCIAL_ADMIN_LEASE_CAPABILITY_PATTERN.test(
+        job.financialAdminLeaseCapability
+      ))) return;
   const handler = options.handlers.get(job.type);
   if (!handler) {
-    await options.repository.fail(
-      job.id,
+    await failClaimedJob(
+      options.repository,
+      job,
       options.workerId,
       `No handler registered for ${job.type}`,
       false
@@ -111,6 +149,9 @@ async function runClaimedJob(
     repository: options.repository,
     jobId: job.id,
     workerId: options.workerId,
+    ...(job.financialAdminLeaseCapability === undefined
+      ? {}
+      : { financialAdminLeaseCapability: job.financialAdminLeaseCapability }),
     intervalMs: options.heartbeatIntervalMs,
     signal: heartbeatController.signal,
     sleep: options.heartbeatSleep ?? abortableSleep,
@@ -132,12 +173,17 @@ async function runClaimedJob(
 
   if (leaseLost) return;
   if (handlerFailed) {
-    const safeMessage = handlerError instanceof PermanentJobError
+    let safeMessage = handlerError instanceof PermanentJobError
       ? handlerError.safeMessage
       : 'Transient job handler failure';
+    if (job.financialAdminLeaseCapability !== undefined &&
+      safeMessage.includes(job.financialAdminLeaseCapability)) {
+      safeMessage = 'Permanent job handler failure';
+    }
     const retryable = !(handlerError instanceof PermanentJobError);
-    const failed = await options.repository.fail(
-      job.id,
+    const failed = await failClaimedJob(
+      options.repository,
+      job,
       options.workerId,
       safeMessage,
       retryable
@@ -147,11 +193,18 @@ async function runClaimedJob(
   }
 
   try {
-    const completed = await options.repository.complete(job.id, options.workerId);
+    const completed = job.financialAdminLeaseCapability === undefined
+      ? await options.repository.complete(job.id, options.workerId)
+      : await options.repository.complete(
+          job.id,
+          options.workerId,
+          job.financialAdminLeaseCapability
+        );
     if (!completed) loseLease();
   } catch {
-    const failed = await options.repository.fail(
-      job.id,
+    const failed = await failClaimedJob(
+      options.repository,
+      job,
       options.workerId,
       'Transient job completion failure',
       true

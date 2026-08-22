@@ -115,6 +115,82 @@ describe('routine database test harness role separation', () => {
     expect(source).toMatch(/spawnSync\(childInvocation\.command, childInvocation\.args, \{\s*env: webEnvironment,/u);
   });
 
+  it('re-adds non-secret login attestations only to the owner migration child', async () => {
+    const source = await readFile(new URL('./with-test-database.ts', import.meta.url), 'utf8');
+    const ownerDeclaration = /const ownerEnvironment: NodeJS\.ProcessEnv = \{\r?\n\s*\.\.\.databaseEnvironmentForRole\(webEnvironment, 'owner'\)\r?\n\s*\};/u
+      .exec(source);
+    const ownerProjection = ownerDeclaration?.index ?? -1;
+    const webName = source.indexOf(
+      'ownerEnvironment.DATABASE_MIGRATION_WEB_USER = webEnvironment.DATABASE_USER;'
+    );
+    const workerName = source.indexOf(
+      'ownerEnvironment.DATABASE_MIGRATION_WORKER_USER = webEnvironment.DATABASE_WORKER_USER;'
+    );
+    const cleanupName = source.indexOf(
+      'ownerEnvironment.DATABASE_MIGRATION_STORAGE_CLEANUP_USER = webEnvironment.DATABASE_STORAGE_CLEANUP_USER;'
+    );
+    const migration = source.indexOf(
+      "runChecked('npm', ['run', 'db:migrate:raw'], ownerEnvironment)"
+    );
+    const webEnvironmentLiteral = source.slice(
+      source.indexOf('const webEnvironment:'),
+      ownerProjection
+    );
+    const ownerMigrationScope = source.slice(
+      ownerProjection,
+      migration + "runChecked('npm', ['run', 'db:migrate:raw'], ownerEnvironment)".length
+    );
+    const downstream = source.slice(
+      migration + "runChecked('npm', ['run', 'db:migrate:raw'], ownerEnvironment)".length
+    );
+    const requiredOwnerCredentialDeletions = [
+      'DATABASE_WORKER_USER',
+      'DATABASE_WORKER_USER_FILE',
+      'DATABASE_WORKER_PASSWORD',
+      'DATABASE_WORKER_PASSWORD_FILE',
+      'DATABASE_STORAGE_CLEANUP_USER',
+      'DATABASE_STORAGE_CLEANUP_USER_FILE',
+      'DATABASE_STORAGE_CLEANUP_PASSWORD',
+      'DATABASE_STORAGE_CLEANUP_PASSWORD_FILE',
+      'BOOTSTRAP_ADMIN_EMAIL',
+      'BOOTSTRAP_ADMIN_EMAIL_FILE',
+      'BOOTSTRAP_ADMIN_NAME',
+      'BOOTSTRAP_ADMIN_NAME_FILE',
+      'BOOTSTRAP_ADMIN_PASSWORD',
+      'BOOTSTRAP_ADMIN_PASSWORD_FILE'
+    ];
+
+    expect(ownerProjection).toBeGreaterThan(-1);
+    expect(webName).toBeGreaterThan(ownerProjection);
+    expect(workerName).toBeGreaterThan(webName);
+    expect(cleanupName).toBeGreaterThan(workerName);
+    expect(migration).toBeGreaterThan(cleanupName);
+    expect(webEnvironmentLiteral).not.toContain('DATABASE_MIGRATION_');
+    expect(ownerMigrationScope.match(/DATABASE_MIGRATION_/gu)).toHaveLength(3);
+    expect(ownerMigrationScope).not.toMatch(/DATABASE_MIGRATION_[A-Z_]*(?:PASSWORD|_FILE)/u);
+    expect(ownerMigrationScope).not.toContain('...ownerEnvironment');
+    expect(ownerMigrationScope).not.toMatch(
+      /(?:provision|bootstrap|worker|web)Environment\s*=\s*ownerEnvironment/u
+    );
+    expect(ownerMigrationScope).not.toMatch(
+      /ownerEnvironment\.[A-Z0-9_]*(?:PASSWORD|SECRET)[A-Z0-9_]*\s*=/u
+    );
+    for (const credential of requiredOwnerCredentialDeletions) {
+      const deletion = `delete ownerEnvironment.${credential};`;
+      const deletionIndex = source.indexOf(deletion);
+      expect(deletionIndex, deletion).toBeGreaterThan(cleanupName);
+      expect(deletionIndex, deletion).toBeLessThan(migration);
+      expect(source.indexOf(deletion, migration + 1), `${deletion} after migration launch`)
+        .toBe(-1);
+    }
+    expect(downstream).not.toContain('DATABASE_MIGRATION_');
+    expect(downstream).not.toContain('ownerEnvironment');
+    expect(source.match(/DATABASE_MIGRATION_/gu)).toHaveLength(3);
+    expect(source).not.toContain('provisionEnvironment.DATABASE_MIGRATION_');
+    expect(source).not.toContain('bootstrapEnvironment.DATABASE_MIGRATION_');
+    expect(source).not.toContain('workerEnvironment.DATABASE_MIGRATION_');
+  });
+
   it('scopes migration, provisioning, and bootstrap one-shot environments to required secrets', async () => {
     const source = await readFile(new URL('./with-test-database.ts', import.meta.url), 'utf8');
     const bootstrapNames = [

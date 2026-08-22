@@ -86,9 +86,27 @@ covers,title_cover,${coverKey},${coverEntry.sha256},${coverEntry.bytes}
 publication,revision_original,${originalKey},${originalEntry.sha256},${originalEntry.bytes}
 staging,revision_staging,${stagingKey},${stagingEntry.sha256},${stagingEntry.bytes}
 `;
-const migrationJournal = `id,hash,created_at
-1,migration-hash,0
-`;
+const migrationTimestamps = [
+  1786232477025,
+  1786232478281,
+  1786241921927,
+  1786291385389,
+  1786320570009,
+  1786379056134,
+  1786407372329,
+  1786504656905,
+  1786766400000,
+  1786793164447,
+  1786810772351,
+  1786823450867,
+  1787280731368
+] as const;
+const migrationJournal = [
+  'id,hash,created_at',
+  ...migrationTimestamps.map((createdAt, index) =>
+    `${index + 1},${index.toString(16).repeat(64)},${createdAt}`
+  )
+].join('\n') + '\n';
 const rowCounts = `schema_name,table_name,row_count
 public,titles,1
 `;
@@ -477,6 +495,31 @@ describe('deployment checkpoint injected lifecycle runtime', () => {
     expect((await readdir(root)).sort()).toEqual(
       [...DEPLOYMENT_BACKUP_ARTIFACTS, 'backup-bundle.json'].sort()
     );
+    const [sourceVerifier, copiedVerifier, copiedJournal, journalText] = await Promise.all([
+      readFile('scripts/verify-financial-restore.sql', 'utf8'),
+      readFile(join(root, 'verify-financial-restore.sql'), 'utf8'),
+      readFile(join(root, 'migration-journal.csv'), 'utf8'),
+      readFile('drizzle/meta/_journal.json', 'utf8')
+    ]);
+    const journal = JSON.parse(journalText) as {
+      entries: Array<{ idx: number; tag: string; when: number }>;
+    };
+    const copiedJournalRows = copiedJournal.trimEnd().split('\n');
+    expect(copiedVerifier).toBe(sourceVerifier);
+    expect(copiedVerifier.match(/plan6b-financial-catalog-v\d+/gu)).toEqual([
+      'plan6b-financial-catalog-v2'
+    ]);
+    expect(copiedVerifier).not.toContain('plan6b-financial-catalog-v1');
+    expect(/'0{64}'/u.test(copiedVerifier)).toBe(false);
+    expect(copiedVerifier.includes('$catalog${}$catalog$')).toBe(false);
+    expect(copiedJournalRows).toHaveLength(14);
+    expect(copiedJournalRows.at(-1)).toBe(
+      `13,${'c'.repeat(64)},${String(journal.entries.at(-1)?.when)}`
+    );
+    expect(journal.entries.at(-1)).toMatchObject({
+      idx: 12,
+      tag: '0012_plan6bii_admin_command_authority'
+    });
     expect(events.slice(-2)).toEqual(['seal', 'verify']);
     expect(runtime.calls.some((args) => args.includes('pg_dump'))).toBe(true);
     expect(runtime.calls.filter((args) => archiveMode(args) === 'capture')).toHaveLength(3);

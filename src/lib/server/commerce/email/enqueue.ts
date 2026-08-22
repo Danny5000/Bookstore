@@ -7,7 +7,9 @@ import {
   type JsonObject
 } from '$lib/server/db/schema';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
-import { enqueueJob as defaultEnqueueJob } from '$lib/server/jobs/repository';
+import {
+  enqueueJobReference as defaultEnqueueJobReference
+} from '$lib/server/jobs/repository';
 import {
   enqueueOutboxMessage as defaultEnqueueOutboxMessage
 } from '$lib/server/outbox/repository';
@@ -81,13 +83,13 @@ export interface CommerceMessageEnqueuer extends PurchaseMessageEnqueuer {
 export interface CommerceMessageEnqueuerDependencies {
   loadReceiptSnapshot: typeof loadReceiptSnapshot;
   enqueueOutboxMessage: typeof defaultEnqueueOutboxMessage;
-  enqueueJob: typeof defaultEnqueueJob;
+  enqueueJob: typeof defaultEnqueueJobReference;
 }
 
 const defaultDependencies: CommerceMessageEnqueuerDependencies = {
   loadReceiptSnapshot,
   enqueueOutboxMessage: defaultEnqueueOutboxMessage,
-  enqueueJob: defaultEnqueueJob
+  enqueueJob: defaultEnqueueJobReference
 };
 
 function permanent(): never {

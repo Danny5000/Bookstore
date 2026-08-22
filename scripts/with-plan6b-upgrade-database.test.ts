@@ -168,6 +168,73 @@ function partialStartupDocker(owned: OwnedRunManifest, state: FakeDockerState): 
 }
 
 describe('Plan 6B disposable upgrade database ownership', () => {
+  it('keeps historical rollback proofs while repaired and valid flows reach 0012 once', async () => {
+    const [journalText, fixture] = await Promise.all([
+      readFile('drizzle/meta/_journal.json', 'utf8'),
+      readFile('tests/integration/financial-migration.test.ts', 'utf8')
+    ]);
+    const journal = JSON.parse(journalText) as {
+      entries: Array<{ idx: number; tag: string }>;
+    };
+    const block = (start: string, end: string): string => {
+      const startIndex = fixture.indexOf(start);
+      const endIndex = fixture.indexOf(end, startIndex + start.length);
+      expect(startIndex, start).toBeGreaterThanOrEqual(0);
+      expect(endIndex, end).toBeGreaterThan(startIndex);
+      return fixture.slice(startIndex, endIndex);
+    };
+
+    expect(journal.entries.map(({ idx }) => idx)).toEqual(
+      Array.from({ length: 13 }, (_value, idx) => idx)
+    );
+    expect(journal.entries.at(-1)).toEqual(expect.objectContaining({
+      idx: 12,
+      tag: '0012_plan6bii_admin_command_authority'
+    }));
+    expect(fixture).toContain(
+      'async function createMigrationFolderThrough(maxMigrationIndex: 8 | 9 | 10 | 11 | 12)'
+    );
+
+    const repairedHeadCall = 'await runRepairedFixtureThroughPlan6biiHead(pool';
+    for (const [start, end] of [
+      ['async function runValidFixture(', 'async function runInvalidFixture('],
+      ['async function runFixedGroupAttributePreflightFixture(',
+        'async function expectUnexpectedNamedAuthorityFailure('],
+      ['async function runUnexpectedNamedAuthorityPreflightFixture(',
+        'async function assertFailed0011LeftNoPartialAuthority('],
+      ['async function runStorageCleanupAuthorityPreflightFixture(',
+        'const PLAN6BII_ROUTINES ='],
+      ['async function runPostPlan6BInvalidFixture(', 'async function expect0010Failure('],
+      ['async function runClaimAuthorityInvalidFixture(',
+        'async function runClaimIdentityAuthorityInvalidFixture('],
+      ['async function runClaimIdentityAuthorityInvalidFixture(',
+        'async function runEntitlementProjectionInvalidFixture('],
+      ['async function runEntitlementProjectionInvalidFixture(', 'async function main(']
+    ] as const) expect(block(start, end), start).toContain(repairedHeadCall);
+
+    expect(block(
+      'async function runFixedGroupAttributePreflightFixture(',
+      'async function expectUnexpectedNamedAuthorityFailure('
+    )).toContain("rollback does not advance the 0009 journal");
+    expect(block(
+      'async function expect0010Failure(',
+      'async function runClaimAuthorityInvalidFixture('
+    )).toContain("rollback does not advance the 0010 journal");
+    expect(block(
+      'async function assertFailed0011LeftNoPartialAuthority(',
+      'async function runStorageCleanupAuthorityPreflightFixture('
+    )).toContain("rollback does not advance the 0011 journal");
+
+    const headHelper = block(
+      'async function runRepairedFixtureThroughPlan6biiHead(',
+      'type Plan6biiIdentityPrepare ='
+    );
+    expect(headHelper).toContain('createMigrationFolderThrough(12)');
+    expect(headHelper).toContain("equal(await migrationCount(pool), 13");
+    expect(headHelper.match(/runCommittedPlan6biiAttestedMigration\(/gu)).toHaveLength(2);
+    expect(headHelper).toContain('second 0012 migration pass is a no-op');
+  });
+
   it('refuses a foreign exact-name volume before Compose can mount or mutate it', async () => {
     const owned = { ...manifest(), containerId: '' };
     const exactVolume = `${owned.project}_postgres-data`;

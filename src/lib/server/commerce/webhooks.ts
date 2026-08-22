@@ -7,7 +7,7 @@ import type { Database } from '$lib/server/db/client';
 import { stripeEvents, type StripeEventRow } from '$lib/server/db/schema';
 import type { DatabaseExecutor } from '$lib/server/db/transaction';
 import {
-  enqueueJob as defaultEnqueueJob,
+  enqueueJobReference as defaultEnqueueJobReference,
   rearmPendingStripeEventJob
 } from '$lib/server/jobs/repository';
 import {
@@ -105,11 +105,11 @@ export type AcceptStripeEventResult =
   | { status: 'conflict'; stripeEventId: string };
 
 export interface AcceptStripeEventDependencies {
-  enqueueJob: typeof defaultEnqueueJob;
+  enqueueJob: typeof defaultEnqueueJobReference;
 }
 
 const defaultDependencies: AcceptStripeEventDependencies = {
-  enqueueJob: defaultEnqueueJob
+  enqueueJob: defaultEnqueueJobReference
 };
 
 function immutableDigest(value: {

@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import type { DatabaseExecutor } from '$lib/server/db/transaction';
-import { enqueueJob } from '$lib/server/jobs/repository';
+import { enqueueJobReference } from '$lib/server/jobs/repository';
 
 export const INGEST_REVISION_JOB = 'catalog.ingest_revision';
 
@@ -21,7 +21,7 @@ export function enqueueRevisionIngestion(
   generation: number
 ) {
   const payload = parseRevisionIngestionPayload({ revisionId, generation });
-  return enqueueJob(database, {
+  return enqueueJobReference(database, {
     type: INGEST_REVISION_JOB,
     payload,
     deduplicationKey: `catalog.ingest:${revisionId}:${generation}`,
