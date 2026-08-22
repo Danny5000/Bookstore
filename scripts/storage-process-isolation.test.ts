@@ -225,10 +225,13 @@ describe('storage process isolation deployment', () => {
   });
 
   it('documents one atomic DB-plus-three-volume bundle verified before readiness', () => {
-    const runbook = source('docs/storage-ingestion-and-publication.md');
+    const document = source('docs/storage-ingestion-and-publication.md');
+    const runbook = document.slice(
+      document.indexOf('## Current atomic split-volume backup and restore'),
+      document.indexOf('## Coordinated backup')
+    );
     for (const expected of [
       '## Current atomic split-volume backup and restore',
-      'docker compose --file compose.prod.yaml --profile tools rm --force app worker storage-cleanup',
       'No running or stopped container may mount',
       'database.dump',
       'staging.tar.gz',
@@ -239,12 +242,14 @@ describe('storage process isolation deployment', () => {
       'covers.manifest.json',
       'backup-bundle.json',
       'STORAGE_BACKUP_HELPER_IMAGE',
-      'npm run storage:backup-volumes -- capture',
-      'npm run storage:backup-volumes -- restore',
-      'npm run backup:bundle -- seal',
-      'npm run backup:bundle -- verify'
+      'npm run deployment:checkpoint -- capture',
+      'npm run deployment:checkpoint -- rehearse'
     ]) expect(runbook).toContain(expected);
-    expect(runbook).toMatch(/verify[^.]*all[^.]*before[^.]*readiness/iu);
+    expect(runbook).not.toContain('npm run storage:backup-volumes');
+    expect(runbook).not.toContain('npm run backup:bundle');
+    expect(runbook).toMatch(
+      /proves every restored database reference[^.]*checks maintenance liveness\/readiness only after/iu
+    );
     expect(runbook).toMatch(/scratch[^.]*health[^.]*non-authoritative/iu);
     expect(runbook).toMatch(/archive[^.]*live volume[^.]*equality/iu);
     expect(runbook).toMatch(/restored volume[^.]*manifest[^.]*equality/iu);
