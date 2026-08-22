@@ -93,6 +93,22 @@ describe('sales overview filters', () => {
     });
   });
 
+  it('treats blank optional controls from a native GET form as omitted', () => {
+    expect(parseSalesOverviewFilters(
+      salesUrl(
+        'range=30&from=&to=&titleId=&format=&presentmentCurrency=&' +
+        'settlementCurrency=&state=&sort=gross_desc'
+      ),
+      NOW
+    )).toEqual({
+      range: '30',
+      from: new Date('2026-07-21T00:00:00.000Z'),
+      to: new Date('2026-08-20T00:00:00.000Z'),
+      sort: 'gross_desc',
+      pageSize: SALES_PAGE_SIZE
+    });
+  });
+
   it.each([
     [null, 'pending', true],
     [null, 'fee_reconciled', true],
@@ -135,6 +151,8 @@ describe('sales overview filters', () => {
     ['unknown parameter', 'range=30&customerId=private'],
     ['duplicate parameter', 'range=7&range=30'],
     ['blank range', 'range='],
+    ['blank sort', 'sort='],
+    ['blank cursor', 'cursor='],
     ['unknown range', 'range=365'],
     ['preset with from', 'range=30&from=2026-01-01'],
     ['preset with to', 'range=7&to=2026-01-01'],

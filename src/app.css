@@ -59,6 +59,11 @@ button {
   color: inherit;
 }
 
+:where(a, button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 3px solid color-mix(in oklab, var(--accent) 70%, white);
+  outline-offset: 3px;
+}
+
 ::selection {
   background: var(--accent);
   color: var(--accent-ink);

@@ -63,6 +63,15 @@ const allowedParameters = new Set([
   'sort',
   'cursor'
 ]);
+const blankNativeFormParameters = new Set([
+  'from',
+  'to',
+  'titleId',
+  'format',
+  'presentmentCurrency',
+  'settlementCurrency',
+  'state'
+]);
 const canonicalCurrencySchema = z
   .string()
   .regex(/^[A-Z]{3}$/u)
@@ -134,8 +143,13 @@ function rawQuery(url: URL): Record<string, string> {
   const raw: Record<string, string> = {};
   for (const key of new Set(url.searchParams.keys())) {
     const values = url.searchParams.getAll(key);
-    if (!allowedParameters.has(key) || values.length !== 1 || values[0] === '') invalidInput();
-    raw[key] = values[0]!;
+    if (!allowedParameters.has(key) || values.length !== 1) invalidInput();
+    const value = values[0]!;
+    if (value === '') {
+      if (blankNativeFormParameters.has(key)) continue;
+      invalidInput();
+    }
+    raw[key] = value;
   }
   return raw;
 }
