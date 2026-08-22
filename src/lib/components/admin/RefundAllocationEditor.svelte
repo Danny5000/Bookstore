@@ -37,7 +37,9 @@
   ));
   const remainderMinor = $derived(detail.amountMinor - proposedTotalMinor);
 
-  function actionHref(action: 'saveDraft' | 'discardDraft'): string {
+  function actionHref(
+    action: 'saveDraft' | 'discardDraft' | 'prepareFinalize'
+  ): string {
     const marker = `?/${action}`;
     return reviewCursor === null
       ? marker
@@ -150,6 +152,16 @@
         value={detail.draft.version}
       />
       <button type="submit" class="secondary-action">Discard shared draft</button>
+    </form>
+
+    <form method="POST" action={actionHref('prepareFinalize')}>
+      <input
+        type="hidden"
+        name="expectedActiveDraftVersion"
+        value={detail.draft.version}
+      />
+      <p>Save any changes first. The preview uses the last saved shared draft.</p>
+      <button type="submit">Review finalization consequences</button>
     </form>
   {/if}
 </section>

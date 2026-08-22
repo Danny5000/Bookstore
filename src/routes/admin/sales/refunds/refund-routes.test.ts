@@ -5,13 +5,17 @@ import type {
   AdministratorActor,
   CapabilityResolver
 } from '$lib/server/auth/admin-policy';
-import type { RefundDetailDto } from '$lib/types/financial-reporting';
+import type {
+  RefundDetailDto,
+  RefundFinalizationPreviewDto
+} from '$lib/types/financial-reporting';
 import { encodeFinancialIssueCursor } from '$lib/server/commerce/reporting/review';
 
 const routeMocks = vi.hoisted(() => ({
   database: {},
   denyManage: false,
   getDetail: vi.fn(),
+  preview: vi.fn(),
   submit: vi.fn()
 }));
 
@@ -23,6 +27,9 @@ vi.mock('$lib/server/config', () => ({
 }));
 vi.mock('$lib/server/commerce/financial/refund-review/query', () => ({
   getRefundReviewDetail: routeMocks.getDetail
+}));
+vi.mock('$lib/server/commerce/financial/refund-review/finalize', () => ({
+  previewRefundFinalization: routeMocks.preview
 }));
 vi.mock('$lib/server/commerce/financial/admin-commands/repository', async (importOriginal) => ({
   ...(await importOriginal<
@@ -59,6 +66,7 @@ vi.mock('$lib/server/auth/admin-policy', async (importOriginal) => {
 
 import * as refundRoute from './[refundId]/+page.server';
 import { FinancialAdminCommandSubmissionConflictError } from '$lib/server/commerce/financial/admin-commands/repository';
+import { FinancialAdminConflictError } from '$lib/server/commerce/financial/admin-commands/handler';
 
 const ADMIN: Actor = {
   type: 'user', id: '00000000-0000-4000-8000-000000011301', roles: ['admin']
@@ -67,6 +75,7 @@ const REFUND_ID = '00000000-0000-4000-8000-000000011302';
 const ITEM_ID = '00000000-0000-4000-8000-000000011303';
 const COMMAND_ID = '00000000-0000-4000-8000-000000011304';
 const IDEMPOTENCY_KEY = '00000000-0000-4000-8000-000000011305';
+const PREVIEW_FINGERPRINT = 'a'.repeat(64);
 const REVIEW_CURSOR = encodeFinancialIssueCursor({
   actionabilityRank: 0,
   impactRank: 1,
@@ -109,6 +118,28 @@ const detail: RefundDetailDto = {
   updatedAt: '2026-08-22T12:00:00.000Z'
 };
 
+const finalizationPreview: RefundFinalizationPreviewDto = {
+  refundId: REFUND_ID,
+  expectedActiveDraftVersion: 2,
+  previewFingerprint: PREVIEW_FINGERPRINT,
+  currency: 'USD',
+  proposedTotalMinor: 500,
+  remainderMinor: 0,
+  items: [{
+    orderItemId: ITEM_ID,
+    titleId: '00000000-0000-4000-8000-000000011308',
+    soldAsTitle: 'Safe title',
+    proposedTotalMinor: 500,
+    proposedSubtotalMinor: 450,
+    proposedTaxMinor: 50,
+    wouldBeFullyRefunded: true,
+    purchaseGrantWouldBeRevoked: true,
+    otherActiveGrantPreservesAccess: false,
+    effectiveAccessWouldChange: true,
+    emailQueued: true
+  }]
+};
+
 function urlencoded(entries: readonly (readonly [string, string])[]): Request {
   const body = new URLSearchParams();
   for (const [key, value] of entries) body.append(key, value);
@@ -136,8 +167,12 @@ function actionEvent(actor: Actor, request: Request, action = 'saveDraft') {
 describe('refund review loader and async command routes', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    routeMocks.getDetail.mockReset();
+    routeMocks.preview.mockReset();
+    routeMocks.submit.mockReset();
     routeMocks.denyManage = false;
     routeMocks.getDetail.mockResolvedValue(detail);
+    routeMocks.preview.mockResolvedValue(finalizationPreview);
     routeMocks.submit.mockResolvedValue({
       commandId: COMMAND_ID,
       kind: 'refund_draft_save',
@@ -213,8 +248,40 @@ describe('refund review loader and async command routes', () => {
     if (!result) throw new Error('refund loader returned no data');
     expect(result.saveDraftIdempotencyKey).toMatch(/^[0-9a-f-]{36}$/u);
     expect(result.discardDraftIdempotencyKey).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(result.finalizeIdempotencyKey).toMatch(/^[0-9a-f-]{36}$/u);
     expect(result.saveDraftIdempotencyKey).not.toBe(result.discardDraftIdempotencyKey);
+    expect(new Set([
+      result.saveDraftIdempotencyKey,
+      result.discardDraftIdempotencyKey,
+      result.finalizeIdempotencyKey
+    ]).size).toBe(3);
   });
+
+  it.each(['prepareFinalize', 'confirmFinalize'] as const)(
+    'requires both capabilities before touching %s origin, path, return context, or body',
+    async (action) => {
+      for (const actor of [{ type: 'anonymous' } as const, ADMIN]) {
+        routeMocks.denyManage = actor === ADMIN;
+        const accesses = {
+          params: vi.fn(), url: vi.fn(), request: vi.fn(), route: vi.fn()
+        };
+        const event: Record<string, unknown> = { locals: { actor } };
+        for (const key of Object.keys(accesses) as Array<keyof typeof accesses>) {
+          Object.defineProperty(event, key, { enumerable: true, get: accesses[key] });
+        }
+
+        const result = await refundRoute.actions[action]!(event as never);
+
+        expect(result).toMatchObject({
+          status: actor === ADMIN ? 403 : 401,
+          data: { code: actor === ADMIN ? 'forbidden' : 'unauthenticated' }
+        });
+        for (const access of Object.values(accesses)) expect(access).not.toHaveBeenCalled();
+      }
+      expect(routeMocks.preview).not.toHaveBeenCalled();
+      expect(routeMocks.submit).not.toHaveBeenCalled();
+    }
+  );
 
   it.each([
     ['malformed refund', 'PRIVATE', '', 404],
@@ -287,6 +354,266 @@ describe('refund review loader and async command routes', () => {
       })
     );
     expect(result).toMatchObject({ command: { status: 'succeeded' } });
+  });
+
+  it('prepares a safe finalization preview without submitting a command', async () => {
+    const request = urlencoded([
+      ['expectedActiveDraftVersion', '2']
+    ]);
+
+    const result = await refundRoute.actions.prepareFinalize!(
+      actionEvent(ADMIN, request, 'prepareFinalize') as never
+    );
+
+    expect(routeMocks.preview).toHaveBeenCalledWith(
+      routeMocks.database,
+      ADMIN,
+      { refundId: REFUND_ID, expectedActiveDraftVersion: 2 },
+      {
+        correlationId: 'refund-route-action',
+        requestMetadata: { method: 'POST', routeId: '/admin/sales/refunds/[refundId]' }
+      }
+    );
+    expect(routeMocks.submit).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      finalizationPreview,
+      reviewCursor: REVIEW_CURSOR
+    });
+    expect(result).not.toHaveProperty('command');
+    expect(result).not.toHaveProperty('retrySubmission');
+  });
+
+  it('confirms the exact preview fingerprint through the command repository', async () => {
+    routeMocks.submit.mockResolvedValueOnce({
+      commandId: COMMAND_ID,
+      kind: 'refund_allocation_finalize',
+      status: 'pending',
+      createdAt: '2026-08-22T12:01:00.000Z'
+    });
+    const request = urlencoded([
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['expectedActiveDraftVersion', '2'],
+      ['previewFingerprint', PREVIEW_FINGERPRINT],
+      ['confirmation', 'finalize_refund_allocation']
+    ]);
+
+    const result = await refundRoute.actions.confirmFinalize!(
+      actionEvent(ADMIN, request, 'confirmFinalize') as never
+    );
+
+    expect(routeMocks.preview).not.toHaveBeenCalled();
+    expect(routeMocks.submit).toHaveBeenCalledWith(routeMocks.database, {
+      actor: ADMIN,
+      idempotencyKey: IDEMPOTENCY_KEY,
+      command: {
+        kind: 'refund_allocation_finalize',
+        refundId: REFUND_ID,
+        expectedActiveDraftVersion: 2,
+        previewFingerprint: PREVIEW_FINGERPRINT,
+        confirmation: 'finalize_refund_allocation'
+      },
+      context: {
+        correlationId: 'refund-route-action',
+        requestMetadata: { method: 'POST', routeId: '/admin/sales/refunds/[refundId]' }
+      }
+    });
+    expect(result).toMatchObject({
+      command: { kind: 'refund_allocation_finalize', status: 'pending' },
+      reviewCursor: REVIEW_CURSOR
+    });
+  });
+
+  it.each(['prepareFinalize', 'confirmFinalize'] as const)(
+    'checks same-origin before consuming the %s body',
+    async (action) => {
+      let pulled = false;
+      const request = new Request(
+        `https://books.example.test/admin/sales/refunds/${REFUND_ID}`,
+        {
+          method: 'POST',
+          headers: {
+            origin: 'https://evil.example.test',
+            'content-type': 'application/x-www-form-urlencoded'
+          },
+          body: 'unused'
+        }
+      );
+      Object.defineProperty(request, 'body', {
+        configurable: true,
+        get() {
+          pulled = true;
+          throw new Error('private body read');
+        }
+      });
+      const protectedAccesses = {
+        params: vi.fn(),
+        url: vi.fn(),
+        route: vi.fn()
+      };
+      const event: Record<string, unknown> = {
+        locals: { actor: ADMIN },
+        request
+      };
+      for (const key of Object.keys(protectedAccesses) as Array<keyof typeof protectedAccesses>) {
+        Object.defineProperty(event, key, {
+          enumerable: true,
+          get: protectedAccesses[key]
+        });
+      }
+
+      const result = await refundRoute.actions[action]!(
+        event as never
+      );
+
+      expect(result).toMatchObject({ status: 403, data: { code: 'forbidden' } });
+      expect(pulled).toBe(false);
+      for (const access of Object.values(protectedAccesses)) {
+        expect(access).not.toHaveBeenCalled();
+      }
+      expect(routeMocks.preview).not.toHaveBeenCalled();
+      expect(routeMocks.submit).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(['prepareFinalize', 'confirmFinalize'] as const)(
+    'accepts only the exact empty %s action marker before parsing the body',
+    async (action) => {
+      const request = urlencoded([
+        ['expectedActiveDraftVersion', '2']
+      ]);
+      const event = actionEvent(ADMIN, request, action);
+      event.url = new URL(`${request.url}?/${action}=private&reviewCursor=${REVIEW_CURSOR}`);
+
+      const result = await refundRoute.actions[action]!(event as never);
+
+      expect(result).toMatchObject({ status: 400, data: { code: 'invalid_request' } });
+      expect(routeMocks.preview).not.toHaveBeenCalled();
+      expect(routeMocks.submit).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([
+    ['prepareFinalize', [
+      ['expectedActiveDraftVersion', '2'],
+      ['privateExtra', 'must-not-pass']
+    ]],
+    ['confirmFinalize', [
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['expectedActiveDraftVersion', '2'],
+      ['previewFingerprint', PREVIEW_FINGERPRINT],
+      ['confirmation', 'finalize_refund_allocation'],
+      ['privateExtra', 'must-not-pass']
+    ]]
+  ] as const)('rejects unknown %s form fields before calling a domain service', async (
+    action,
+    entries
+  ) => {
+    const result = await refundRoute.actions[action]!(
+      actionEvent(ADMIN, urlencoded(entries), action) as never
+    );
+
+    expect(result).toMatchObject({
+      status: 400,
+      data: { code: 'invalid_request', retrySubmission: null }
+    });
+    expect(routeMocks.preview).not.toHaveBeenCalled();
+    expect(routeMocks.submit).not.toHaveBeenCalled();
+    expect(JSON.stringify(result)).not.toContain('must-not-pass');
+  });
+
+  it.each(['stale_state', 'not_eligible'] as const)(
+    'maps %s prepare drift to reload guidance without a command retry',
+    async (safeCode) => {
+      routeMocks.preview.mockRejectedValueOnce(new FinancialAdminConflictError(safeCode));
+      const result = await refundRoute.actions.prepareFinalize!(actionEvent(
+        ADMIN,
+        urlencoded([['expectedActiveDraftVersion', '2']]),
+        'prepareFinalize'
+      ) as never);
+
+      expect(result).toMatchObject({
+        status: 409,
+        data: { code: 'stale_state', retrySubmission: null }
+      });
+      expect(routeMocks.submit).not.toHaveBeenCalled();
+    }
+  );
+
+  it('keeps preparation rerunnable after a private availability failure', async () => {
+    routeMocks.preview.mockRejectedValueOnce(new Error('private preview detail'));
+    const result = await refundRoute.actions.prepareFinalize!(actionEvent(
+      ADMIN,
+      urlencoded([['expectedActiveDraftVersion', '2']]),
+      'prepareFinalize'
+    ) as never);
+
+    expect(result).toMatchObject({
+      status: 503,
+      data: { code: 'temporarily_unavailable', retrySubmission: null }
+    });
+    expect(result).not.toHaveProperty('data.command');
+    expect(JSON.stringify(result)).not.toContain('private preview detail');
+  });
+
+  it('preserves only the exact canonical confirm payload after an ambiguous submit', async () => {
+    routeMocks.submit.mockRejectedValueOnce(new Error('ambiguous command outcome'));
+    const request = urlencoded([
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['expectedActiveDraftVersion', '2'],
+      ['previewFingerprint', PREVIEW_FINGERPRINT],
+      ['confirmation', 'finalize_refund_allocation']
+    ]);
+
+    const result = await refundRoute.actions.confirmFinalize!(
+      actionEvent(ADMIN, request, 'confirmFinalize') as never
+    );
+
+    expect(result).toMatchObject({
+      status: 503,
+      data: {
+        code: 'temporarily_unavailable',
+        retrySubmission: {
+          action: 'confirmFinalize',
+          idempotencyKey: IDEMPOTENCY_KEY,
+          expectedActiveDraftVersion: 2,
+          previewFingerprint: PREVIEW_FINGERPRINT,
+          confirmation: 'finalize_refund_allocation'
+        }
+      }
+    });
+    expect(JSON.stringify(result)).not.toContain('ambiguous command outcome');
+  });
+
+  it('does not offer an exact retry when confirm conflicts or fails before canonical parsing', async () => {
+    routeMocks.submit.mockRejectedValueOnce(
+      new FinancialAdminCommandSubmissionConflictError()
+    );
+    const conflict = await refundRoute.actions.confirmFinalize!(
+      actionEvent(ADMIN, urlencoded([
+        ['idempotencyKey', IDEMPOTENCY_KEY],
+        ['expectedActiveDraftVersion', '2'],
+        ['previewFingerprint', PREVIEW_FINGERPRINT],
+        ['confirmation', 'finalize_refund_allocation']
+      ]), 'confirmFinalize') as never
+    );
+    expect(conflict).toMatchObject({
+      status: 409,
+      data: { code: 'stale_state', retrySubmission: null }
+    });
+
+    const malformed = await refundRoute.actions.confirmFinalize!(
+      actionEvent(ADMIN, urlencoded([
+        ['idempotencyKey', IDEMPOTENCY_KEY],
+        ['expectedActiveDraftVersion', '2'],
+        ['previewFingerprint', PREVIEW_FINGERPRINT],
+        ['confirmation', 'private-wrong-value']
+      ]), 'confirmFinalize') as never
+    );
+    expect(malformed).toMatchObject({
+      status: 400,
+      data: { code: 'invalid_request', retrySubmission: null }
+    });
+    expect(routeMocks.submit).toHaveBeenCalledTimes(1);
   });
 
   it.each([

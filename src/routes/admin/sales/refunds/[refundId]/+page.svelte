@@ -1,9 +1,13 @@
 <script lang="ts">
   import { resolve } from '$app/paths';
   import FinancialAmount from '$lib/components/admin/FinancialAmount.svelte';
+  import FinancialActionConfirmation from '$lib/components/admin/FinancialActionConfirmation.svelte';
   import FinancialActionOutcome from '$lib/components/admin/FinancialActionOutcome.svelte';
   import RefundAllocationEditor from '$lib/components/admin/RefundAllocationEditor.svelte';
-  import type { FinancialAdminCommandReferenceDto } from '$lib/types/financial-reporting';
+  import type {
+    FinancialAdminCommandReferenceDto,
+    RefundFinalizationPreviewDto
+  } from '$lib/types/financial-reporting';
   import type { ActionData, PageData } from './$types';
 
   interface Props {
@@ -30,6 +34,13 @@
         readonly action: 'discardDraft';
         readonly idempotencyKey: string;
         readonly expectedActiveDraftVersion: number;
+      }
+    | {
+        readonly action: 'confirmFinalize';
+        readonly idempotencyKey: string;
+        readonly expectedActiveDraftVersion: number;
+        readonly previewFingerprint: string;
+        readonly confirmation: 'finalize_refund_allocation';
       };
 
   let { data, form }: Props = $props();
@@ -49,7 +60,10 @@
       : `${root}?reviewCursor=${encodeURIComponent(data.reviewCursor)}`;
   }
 
-  function actionFailurePresentation(code: unknown): ActionFailurePresentation | null {
+  function actionFailurePresentation(
+    code: unknown,
+    exactRetryAvailable: boolean
+  ): ActionFailurePresentation | null {
     switch (code) {
       case 'unauthenticated':
         return {
@@ -72,10 +86,15 @@
           reloadRequired: true
         };
       case 'temporarily_unavailable':
-        return {
-          message: 'We could not confirm whether the refund request was submitted. Retry the exact request below before editing again.',
-          reloadRequired: false
-        };
+        return exactRetryAvailable
+          ? {
+              message: 'We could not confirm whether the refund request was submitted. Retry the exact request below before editing again.',
+              reloadRequired: false
+            }
+          : {
+              message: 'The refund action could not be completed. Review the current facts and try again.',
+              reloadRequired: false
+            };
       default:
         return null;
     }
@@ -98,14 +117,44 @@
       ? form.fieldErrors as Readonly<Record<string, string>>
       : {}
   );
-  const actionFailure = $derived(actionFailurePresentation(
-    form && 'code' in form ? form.code : undefined
-  ));
   const retrySubmission = $derived(
     form && 'retrySubmission' in form
       ? form.retrySubmission as RetrySubmission | null
       : null
   );
+  const finalizationPreview = $derived(
+    form && 'finalizationPreview' in form
+      ? form.finalizationPreview as RefundFinalizationPreviewDto | undefined
+      : undefined
+  );
+  const actionFailure = $derived(actionFailurePresentation(
+    form && 'code' in form ? form.code : undefined,
+    retrySubmission !== null
+  ));
+
+  function purchaseGrantConsequence(
+    item: RefundFinalizationPreviewDto['items'][number]
+  ): string {
+    return item.purchaseGrantWouldBeRevoked
+      ? 'Purchase access grant will be revoked.'
+      : 'Purchase access grant will remain unchanged.';
+  }
+
+  function effectiveAccessConsequence(
+    item: RefundFinalizationPreviewDto['items'][number]
+  ): string {
+    return item.effectiveAccessWouldChange
+      ? 'Effective access will change.'
+      : 'Effective access will remain unchanged.';
+  }
+
+  function emailConsequence(
+    item: RefundFinalizationPreviewDto['items'][number]
+  ): string {
+    return item.emailQueued
+      ? 'An access-change email will be queued.'
+      : 'No access-change email will be queued.';
+  }
 </script>
 
 <svelte:head><title>Refund allocation review · Pale Orbit Admin</title></svelte:head>
@@ -205,11 +254,27 @@
               value={item.totalPresentmentMinor}
             />
           {/each}
+        {:else if retrySubmission.action === 'discardDraft'}
+          <input
+            type="hidden"
+            name="expectedActiveDraftVersion"
+            value={retrySubmission.expectedActiveDraftVersion}
+          />
         {:else}
           <input
             type="hidden"
             name="expectedActiveDraftVersion"
             value={retrySubmission.expectedActiveDraftVersion}
+          />
+          <input
+            type="hidden"
+            name="previewFingerprint"
+            value={retrySubmission.previewFingerprint}
+          />
+          <input
+            type="hidden"
+            name="confirmation"
+            value={retrySubmission.confirmation}
           />
         {/if}
         <button type="submit">Retry this exact request</button>
@@ -221,7 +286,112 @@
     <FinancialActionOutcome command={submittedCommand} reloadHref={reloadHref()} />
   {/if}
 
-  {#if retrySubmission === null}
+  {#if retrySubmission === null && finalizationPreview !== undefined}
+    <FinancialActionConfirmation
+      headingId="refund-finalization-confirmation-heading"
+      heading="Review finalization consequences"
+      action={retryActionHref('confirmFinalize')}
+      submitLabel="Finalize this refund allocation"
+      warnings={[
+        'Finalizing makes this allocation immutable.',
+        'Finalization may revoke purchase access.',
+        'A later reporting correction does not automatically restore access.'
+      ]}
+      hiddenFields={[
+        { name: 'idempotencyKey', value: data.finalizeIdempotencyKey },
+        {
+          name: 'expectedActiveDraftVersion',
+          value: finalizationPreview.expectedActiveDraftVersion
+        },
+        { name: 'previewFingerprint', value: finalizationPreview.previewFingerprint },
+        { name: 'confirmation', value: 'finalize_refund_allocation' }
+      ]}
+    >
+      <dl class="refund-finalization-totals">
+        <div>
+          <dt>Proposed allocation total</dt>
+          <dd>
+            <FinancialAmount
+              amountMinor={finalizationPreview.proposedTotalMinor}
+              currency={finalizationPreview.currency}
+            />
+          </dd>
+        </div>
+        <div>
+          <dt>Remaining to allocate</dt>
+          <dd>
+            <FinancialAmount
+              amountMinor={finalizationPreview.remainderMinor}
+              currency={finalizationPreview.currency}
+            />
+          </dd>
+        </div>
+      </dl>
+
+      <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+      <div
+        class="sales-table-region"
+        role="region"
+        aria-label="Finalization item consequences"
+        tabindex="0"
+      >
+        <table>
+          <caption>Proposed allocation and access consequences</caption>
+          <thead>
+            <tr>
+              <th scope="col">Item</th>
+              <th scope="col">Proposed subtotal</th>
+              <th scope="col">Proposed tax</th>
+              <th scope="col">Proposed total</th>
+              <th scope="col">Access and email</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each finalizationPreview.items as item (item.orderItemId)}
+              <tr>
+                <th scope="row">{item.soldAsTitle}</th>
+                <td>
+                  <FinancialAmount
+                    amountMinor={item.proposedSubtotalMinor}
+                    currency={finalizationPreview.currency}
+                  />
+                </td>
+                <td>
+                  <FinancialAmount
+                    amountMinor={item.proposedTaxMinor}
+                    currency={finalizationPreview.currency}
+                  />
+                </td>
+                <td>
+                  <FinancialAmount
+                    amountMinor={item.proposedTotalMinor}
+                    currency={finalizationPreview.currency}
+                  />
+                </td>
+                <td>
+                  <ul class="refund-consequences">
+                    <li>
+                      {item.wouldBeFullyRefunded
+                        ? 'The item will be fully refunded.'
+                        : 'The item will remain partially refunded.'}
+                    </li>
+                    <li>{purchaseGrantConsequence(item)}</li>
+                    {#if item.otherActiveGrantPreservesAccess}
+                      <li>Another active grant preserves access.</li>
+                    {/if}
+                    <li>{effectiveAccessConsequence(item)}</li>
+                    <li>{emailConsequence(item)}</li>
+                  </ul>
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    </FinancialActionConfirmation>
+  {/if}
+
+  {#if retrySubmission === null && finalizationPreview === undefined}
     {#key data.detail}
       <RefundAllocationEditor
         detail={data.detail}
@@ -233,3 +403,22 @@
     {/key}
   {/if}
 </article>
+
+<style>
+  .refund-finalization-totals {
+    display: grid;
+    gap: 0.5rem;
+    margin: 0;
+  }
+
+  .refund-finalization-totals div {
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+
+  .refund-consequences {
+    margin: 0;
+    padding-inline-start: 1.25rem;
+  }
+</style>

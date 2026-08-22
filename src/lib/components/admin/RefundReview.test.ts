@@ -4,7 +4,8 @@ import { describe, expect, it, vi } from 'vitest';
 import type {
   FinancialAdminCommandReferenceDto,
   FinancialAdminCommandStatusDto,
-  RefundDetailDto
+  RefundDetailDto,
+  RefundFinalizationPreviewDto
 } from '$lib/types/financial-reporting';
 
 vi.mock('$app/navigation', () => ({ invalidateAll: vi.fn() }));
@@ -22,6 +23,50 @@ const DRAFT_ID = '00000000-0000-4000-8000-000000011404';
 const COMMAND_ID = '00000000-0000-4000-8000-000000011405';
 const SAVE_KEY = '00000000-0000-4000-8000-000000011406';
 const DISCARD_KEY = '00000000-0000-4000-8000-000000011407';
+const FINALIZE_KEY = '00000000-0000-4000-8000-000000011412';
+const PREVIEW_FINGERPRINT = 'b'.repeat(64);
+
+function finalizationPreview(
+  overrides: Partial<RefundFinalizationPreviewDto> = {}
+): RefundFinalizationPreviewDto {
+  return {
+    refundId: REFUND_ID,
+    expectedActiveDraftVersion: 2,
+    previewFingerprint: PREVIEW_FINGERPRINT,
+    currency: 'USD',
+    proposedTotalMinor: 500,
+    remainderMinor: 0,
+    items: [
+      {
+        orderItemId: FIRST_ITEM_ID,
+        titleId: '00000000-0000-4000-8000-000000011409',
+        soldAsTitle: 'First title',
+        proposedTotalMinor: 300,
+        proposedSubtotalMinor: 270,
+        proposedTaxMinor: 30,
+        wouldBeFullyRefunded: true,
+        purchaseGrantWouldBeRevoked: true,
+        otherActiveGrantPreservesAccess: false,
+        effectiveAccessWouldChange: true,
+        emailQueued: true
+      },
+      {
+        orderItemId: SECOND_ITEM_ID,
+        titleId: '00000000-0000-4000-8000-000000011410',
+        soldAsTitle: 'Second title',
+        proposedTotalMinor: 200,
+        proposedSubtotalMinor: 180,
+        proposedTaxMinor: 20,
+        wouldBeFullyRefunded: false,
+        purchaseGrantWouldBeRevoked: false,
+        otherActiveGrantPreservesAccess: true,
+        effectiveAccessWouldChange: false,
+        emailQueued: false
+      }
+    ],
+    ...overrides
+  };
+}
 
 function detail(overrides: Partial<RefundDetailDto> = {}): RefundDetailDto {
   return {
@@ -130,6 +175,16 @@ describe('accessible shared refund draft editor', () => {
     expect(body).toContain('Edited by another administrator');
     expect(body).toContain('2026-08-22T12:02:00.000Z');
     expect(body).not.toContain('window.confirm');
+
+    const prepareForm = body.match(
+      /<form[^>]*action="\?\/prepareFinalize&amp;reviewCursor=bounded_cursor"[^>]*>[\s\S]*?<\/form>/u
+    )?.[0];
+    expect(prepareForm).toContain('name="expectedActiveDraftVersion" value="2"');
+    expect(prepareForm).toContain('Review finalization consequences');
+    expect(prepareForm).toContain(
+      'Save any changes first. The preview uses the last saved shared draft.'
+    );
+    expect(prepareForm).not.toContain('idempotencyKey');
   });
 
   it('renders creation with a blank version and no discard control', () => {
@@ -145,6 +200,7 @@ describe('accessible shared refund draft editor', () => {
     expect(body).toContain('Draft total must equal the refund total');
     expect(body).toContain('refund-allocation-total-error');
     expect(body).not.toContain('Discard shared draft');
+    expect(body).not.toContain('Review finalization consequences');
   });
 });
 
@@ -253,7 +309,8 @@ describe('refund review page', () => {
           detail: detail(),
           reviewCursor: 'bounded_cursor',
           saveDraftIdempotencyKey: SAVE_KEY,
-          discardDraftIdempotencyKey: DISCARD_KEY
+          discardDraftIdempotencyKey: DISCARD_KEY,
+          finalizeIdempotencyKey: FINALIZE_KEY
         },
         form: { command: command(), reviewCursor: 'bounded_cursor' }
       } as never
@@ -287,7 +344,7 @@ describe('refund review page', () => {
     ],
     [
       'temporarily_unavailable',
-      'We could not confirm whether the refund request was submitted.',
+      'The refund action could not be completed.',
       false
     ]
   ])('renders the safe %s action failure accessibly', (code, message, reloadRequired) => {
@@ -297,7 +354,8 @@ describe('refund review page', () => {
           detail: detail(),
           reviewCursor: 'bounded_cursor',
           saveDraftIdempotencyKey: SAVE_KEY,
-          discardDraftIdempotencyKey: DISCARD_KEY
+          discardDraftIdempotencyKey: DISCARD_KEY,
+          finalizeIdempotencyKey: FINALIZE_KEY
         },
         form: { code, fieldErrors: {} }
       } as never
@@ -309,6 +367,95 @@ describe('refund review page', () => {
     expect(body).not.toMatch(/private|repository|stack|correlationId/iu);
   });
 
+  it('renders a native, privacy-safe finalization confirmation from the prepared preview', () => {
+    const preview = {
+      ...finalizationPreview(),
+      customerEmail: 'private-customer@example.test',
+      providerRefundId: 're_private_provider'
+    } as RefundFinalizationPreviewDto;
+    const body = render(RefundReviewPage, {
+      props: {
+        data: {
+          detail: detail(),
+          reviewCursor: 'bounded_cursor',
+          saveDraftIdempotencyKey: SAVE_KEY,
+          discardDraftIdempotencyKey: DISCARD_KEY,
+          finalizeIdempotencyKey: FINALIZE_KEY
+        },
+        form: { finalizationPreview: preview, reviewCursor: 'bounded_cursor' }
+      } as never
+    }).body;
+
+    expect(body).toContain('Review finalization consequences');
+    expect(body).toContain('Finalizing makes this allocation immutable.');
+    expect(body).toContain('Finalization may revoke purchase access.');
+    expect(body).toContain(
+      'A later reporting correction does not automatically restore access.'
+    );
+    expect(body).toContain('Proposed subtotal');
+    expect(body).toContain('Proposed tax');
+    expect(body).toContain('Proposed total');
+    for (const amount of ['2.70', '0.30', '3.00', '1.80', '0.20', '2.00']) {
+      expect(body).toContain(`+USD\u00a0${amount}`);
+    }
+    expect(body).toContain('Purchase access grant will be revoked.');
+    expect(body).toContain('Effective access will change.');
+    expect(body).toContain('An access-change email will be queued.');
+    expect(body).toContain('Purchase access grant will remain unchanged.');
+    expect(body).toContain('Another active grant preserves access.');
+    expect(body).toContain('Effective access will remain unchanged.');
+    expect(body).toContain('No access-change email will be queued.');
+    expect(body).toContain('method="POST"');
+    expect(body).toContain('?/confirmFinalize&amp;reviewCursor=bounded_cursor');
+    expect(body).toContain(`name="idempotencyKey" value="${FINALIZE_KEY}"`);
+    expect(body).toContain('name="expectedActiveDraftVersion" value="2"');
+    expect(body).toContain(
+      `name="previewFingerprint" value="${PREVIEW_FINGERPRINT}"`
+    );
+    expect(body).toContain(
+      'name="confirmation" value="finalize_refund_allocation"'
+    );
+    expect(body.match(/<form\b/gu)).toHaveLength(1);
+    expect(body.match(/<button[^>]*type="submit"/gu)).toHaveLength(1);
+    expect(body).not.toContain('?/saveDraft');
+    expect(body).not.toContain('?/discardDraft');
+    expect(body).not.toContain('?/prepareFinalize');
+    expect(body).not.toContain('window.confirm');
+    expect(body).not.toContain('private-customer@example.test');
+    expect(body).not.toContain('re_private_provider');
+
+    const source = readFileSync(
+      new URL('../../../routes/admin/sales/refunds/[refundId]/+page.svelte', import.meta.url),
+      'utf8'
+    );
+    expect(source).not.toContain('window.confirm');
+  });
+
+  it('treats preparation availability failure as rerunnable, not as a submitted command', () => {
+    const body = render(RefundReviewPage, {
+      props: {
+        data: {
+          detail: detail(),
+          reviewCursor: null,
+          saveDraftIdempotencyKey: SAVE_KEY,
+          discardDraftIdempotencyKey: DISCARD_KEY,
+          finalizeIdempotencyKey: FINALIZE_KEY
+        },
+        form: {
+          code: 'temporarily_unavailable',
+          fieldErrors: {},
+          retrySubmission: null
+        }
+      } as never
+    }).body;
+
+    expect(body).toContain('The refund action could not be completed.');
+    expect(body).toContain('Review finalization consequences');
+    expect(body).not.toContain('Retry this exact request');
+    expect(body).not.toContain('could not confirm whether the refund request was submitted');
+    expect(body).not.toContain(COMMAND_ID);
+  });
+
   it('pauses editing and preserves one exact canonical retry after an ambiguous submission', () => {
     const retryKey = '00000000-0000-4000-8000-000000011411';
     const body = render(RefundReviewPage, {
@@ -317,7 +464,8 @@ describe('refund review page', () => {
           detail: detail(),
           reviewCursor: 'bounded_cursor',
           saveDraftIdempotencyKey: SAVE_KEY,
-          discardDraftIdempotencyKey: DISCARD_KEY
+          discardDraftIdempotencyKey: DISCARD_KEY,
+          finalizeIdempotencyKey: FINALIZE_KEY
         },
         form: {
           code: 'temporarily_unavailable',
@@ -344,5 +492,47 @@ describe('refund review page', () => {
     expect(body).not.toContain(`value="${SAVE_KEY}"`);
     expect(body).not.toContain(`value="${DISCARD_KEY}"`);
     expect(body).not.toContain('Shared allocation draft');
+  });
+
+  it('renders exactly one canonical confirm retry and suppresses every new form key', () => {
+    const retryKey = '00000000-0000-4000-8000-000000011413';
+    const body = render(RefundReviewPage, {
+      props: {
+        data: {
+          detail: detail(),
+          reviewCursor: 'bounded_cursor',
+          saveDraftIdempotencyKey: SAVE_KEY,
+          discardDraftIdempotencyKey: DISCARD_KEY,
+          finalizeIdempotencyKey: FINALIZE_KEY
+        },
+        form: {
+          code: 'temporarily_unavailable',
+          fieldErrors: {},
+          retrySubmission: {
+            action: 'confirmFinalize',
+            idempotencyKey: retryKey,
+            expectedActiveDraftVersion: 2,
+            previewFingerprint: PREVIEW_FINGERPRINT,
+            confirmation: 'finalize_refund_allocation'
+          }
+        }
+      } as never
+    }).body;
+
+    expect(body.match(/<form/gu)).toHaveLength(1);
+    expect(body).toContain('?/confirmFinalize&amp;reviewCursor=bounded_cursor');
+    expect(body).toContain(`name="idempotencyKey" value="${retryKey}"`);
+    expect(body).toContain('name="expectedActiveDraftVersion" value="2"');
+    expect(body).toContain(
+      `name="previewFingerprint" value="${PREVIEW_FINGERPRINT}"`
+    );
+    expect(body).toContain(
+      'name="confirmation" value="finalize_refund_allocation"'
+    );
+    expect(body).not.toContain(`value="${SAVE_KEY}"`);
+    expect(body).not.toContain(`value="${DISCARD_KEY}"`);
+    expect(body).not.toContain(`value="${FINALIZE_KEY}"`);
+    expect(body).not.toContain('Shared allocation draft');
+    expect(body).not.toContain('Review finalization consequences');
   });
 });
