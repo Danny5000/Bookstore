@@ -1199,6 +1199,8 @@ Expected: migration 0012, provisioner parity, upgrade fixtures, and exact restor
 - Create: `src/lib/server/commerce/reporting/overview.test.ts`
 - Create: `tests/integration/financial-reporting.test.ts`
 
+**Approved implementation amendment discovered by the tax-exclusion RED:** allocation algorithm version 1 combines dispute-reinstatement subtotal and customer tax in one settlement item, so the exact Task 6 formula cannot be recovered in the read model. Before completing the reporting files, introduce allocation algorithm version 2 as a separate prerequisite commit. Preserve v1 replay behavior; in v2 allocate reinstatement settlement from the persisted withdrawal plan, map `dispute_subtotal` to positive `dispute_reinstatement`, keep positive `dispute_tax` separate, align same-currency component rounding across domains, reject unsupported/cross-version/malformed predecessors, target `c1-a2` through the existing replay activation flow, keep migration seed `c1-a1`, update exact restore/determinism evidence, and make reporting fail closed for legacy combined reinstatements. No schema migration is required.
+
 - [ ] **Step 1: Write failing pure metric truth-table tests**
 
 Require:
@@ -1294,11 +1296,13 @@ Expected: all commands exit zero; summary and page formulas agree and privacy ke
 - Create: `src/lib/components/admin/FinancialAmount.svelte`
 - Create: `src/routes/admin/sales/sales-routes.test.ts`
 - Create: `src/lib/components/admin/SalesOverview.test.ts`
+- Modify: `src/lib/server/commerce/reporting/filters.ts`
+- Modify: `src/lib/server/commerce/reporting/filters.test.ts`
 - Modify: `src/app.css`
 
 - [ ] **Step 1: Write failing route tests**
 
-Prove the Sales layout and Overview loader require `sales.read` before reading params/query or calling the service. Cover anonymous/customer denial, a mocked administrator missing `sales.read`, malformed filters/cursors as 400, safe unavailable states, normalized filters/correlation context, stable next/back/filter URLs without duplicate parameters, and the exact `SalesOverviewDto` return shape. No Overview action exists.
+Prove the Sales layout and Overview loader require `sales.read` before reading params/query or calling the service. Cover anonymous/customer denial, a mocked administrator missing `sales.read`, malformed filters/cursors as 400, blank optional controls from an unhydrated native GET form as omitted, safe unavailable states, normalized filters, stable next/back/filter URLs without duplicate parameters, and the exact `SalesOverviewDto` return shape. Blank required/default controls, duplicates, unknowns, and malformed nonblank values remain invalid. Overview is an unaudited list read, carries no request-correlation context, and has no action.
 
 - [ ] **Step 2: Write failing component and accessibility tests**
 
@@ -1310,7 +1314,7 @@ Render and assert:
 - a captioned table with scoped headers and text state labels;
 - title/creator/format, sold/refunded/net copies, presentment gross/refund/dispute values, nullable signed settlement components, estimated payout, both currencies, state, missing count, and freshness;
 - a named keyboard-focusable overflow region and semantic narrow-screen fallback;
-- empty/no-results/pending/stale/Stripe-disabled/incomplete/exception/manual/instant/reconciled states;
+- empty/no-results/pending/Stripe-disabled/incomplete/exception/fee-reconciled/payout-reconciled states, plus the exact data-through timestamp without inventing a stale threshold or the manual/instant payout-mode evidence reserved for Task 9;
 - exact copy `Settlement estimate unavailable`, `Estimated payout`, `Fee reconciled`, `Payout reconciled`, and `Needs review`; and
 - live result status, alert semantics, visible focus, reduced motion, long-title/large-negative resilience, and no color-only meaning.
 
@@ -1327,9 +1331,9 @@ Expected: FAIL because the route shell and components do not exist.
 The loader must be equivalent to:
 
 ```ts
-requireCapability(locals.actor, 'sales.read');
-const filters = parseSalesOverviewFilters(url, new Date());
-return listSalesOverview(getDatabaseClient().db, locals.actor, filters);
+requireCapability(event.locals.actor, 'sales.read');
+const filters = parseSalesOverviewFilters(event.url, new Date());
+return listSalesOverview(getDatabaseClient().db, event.locals.actor, filters);
 ```
 
 Use the existing admin shell. Keep the top-level `Sales — Upcoming` item disabled in `src/routes/admin/+layout.svelte`; direct test navigation is allowed, but enabling the product navigation is reserved for Task 17 after final clearance.
@@ -1343,7 +1347,7 @@ npx vitest run src/routes/admin/sales/sales-routes.test.ts src/lib/components/ad
 npm run check
 npm run lint
 git diff --check
-git add src/routes/admin/sales/+layout.svelte src/routes/admin/sales/+layout.server.ts src/routes/admin/sales/sales.css src/routes/admin/sales/+page.server.ts src/routes/admin/sales/+page.svelte src/lib/components/admin/SalesFilters.svelte src/lib/components/admin/SalesSummaryCards.svelte src/lib/components/admin/SalesTable.svelte src/lib/components/admin/FinancialAmount.svelte src/routes/admin/sales/sales-routes.test.ts src/lib/components/admin/SalesOverview.test.ts src/app.css
+git add src/routes/admin/sales/+layout.svelte src/routes/admin/sales/+layout.server.ts src/routes/admin/sales/sales.css src/routes/admin/sales/+page.server.ts src/routes/admin/sales/+page.svelte src/lib/components/admin/SalesFilters.svelte src/lib/components/admin/SalesSummaryCards.svelte src/lib/components/admin/SalesTable.svelte src/lib/components/admin/FinancialAmount.svelte src/routes/admin/sales/sales-routes.test.ts src/lib/components/admin/SalesOverview.test.ts src/lib/server/commerce/reporting/filters.ts src/lib/server/commerce/reporting/filters.test.ts src/app.css
 git diff --cached --check
 git commit -m "feat: add admin sales overview"
 ```
@@ -1362,6 +1366,8 @@ Expected: all commands exit zero and existing admin/catalog/audit navigation rem
 - Create: `src/routes/admin/sales/review/[issueId]/+page.svelte`
 - Create: `src/lib/components/admin/ReviewQueue.svelte`
 - Modify: `src/routes/admin/sales/sales-routes.test.ts`
+- Modify: `src/lib/components/admin/SalesOverview.test.ts`
+- Modify: `src/routes/admin/sales/sales.css`
 
 - [ ] **Step 1: Write failing operational-queue tests**
 
@@ -1391,13 +1397,13 @@ The queue is not `where state = 'open'`. It imports the already-tested `currentO
 3. current payout/source issues with the existing active-generation authority; and
 4. actionable ambiguous refunds ordered before safe read-only issues.
 
-Retired-classifier `unsupported_category` remains open immutable history but is absent from the current operational queue. Use stable keyset order `actionability -> impact -> firstObservedAt -> issueId`, page size 50, and a cursor bound to normalized filters.
+Retired-classifier `unsupported_category` remains open immutable history but is absent from the current operational queue. Task 8 accepts only an optional strict `cursor`; the normalized filter set is therefore fixed and empty. Use stable ascending keyset order `actionabilityRank -> impactRank -> firstObservedAt -> issueId`, where actionability ranks `refund_allocation_review = 0`, `wait_for_recovery = 1`, `read_only = 2` and impact ranks `exception = 0`, `pending = 1`, `informational = 2`. The opaque cursor carries a separately validated exact six-digit UTC PostgreSQL `firstObservedAt` order key and binds it back as `timestamptz`; the browser DTO may retain its ordinary millisecond ISO display timestamp. Use page size 50 and bind the cursor to that fixed normalized filter contract. The PostgreSQL witness must use non-millisecond timestamps and cross an actionability/impact page boundary so truncation cannot duplicate or loop a page.
 
 - [ ] **Step 2: Write failing audited-detail route/component tests**
 
-Detail begins a web transaction, acquires the global administrator-role lock, reloads current roles, reauthorizes `sales.read`, builds the complete safe DTO, then calls `auditFinancialIssueDetailRead` inside the same transaction before returning. Audit failure returns no successful detail. DTO fields are internal issue/resource IDs, safe code/impact/state, timestamps/count, actionability, and a named internal workflow link only; request correlation remains audit-only and is not returned in the browser DTO.
+Detail begins a web transaction, acquires the global administrator-role lock, reloads current roles, reauthorizes `sales.read`, builds the complete safe DTO, then calls `auditFinancialIssueDetailRead` inside the same transaction before returning. Audit failure returns no successful detail. DTO fields are internal issue/resource IDs, safe code/impact/state, timestamps/count, actionability, and a named internal workflow link only; request correlation remains audit-only and is not returned in the browser DTO. The existing audit client intentionally validates the browser route and translates it to migration 0012's legacy `/admin/sales/issues/{id}` routine argument; Task 8 uses that client unchanged rather than inventing new database authority.
 
-Test authorization before query/path parsing, malformed/inaccessible/missing IDs as safe 404, preserved bounded return context, semantic queue/detail labels, empty state, and no generic Resolve/provider Retry control. Only an actionable ambiguous-refund issue links to its refund workflow.
+Test authorization before query/path parsing, malformed/inaccessible/missing IDs as safe 404, preserved bounded return context, semantic queue/detail labels, empty state, and no generic Resolve/provider Retry control. Only an actionable ambiguous-refund issue links to its refund workflow. Force an invalid fixed audit context after DTO construction in the PostgreSQL witness and prove rejection returns no detail and appends no audit.
 
 - [ ] **Step 3: Run focused tests and confirm RED**
 
@@ -1420,7 +1426,7 @@ npm run test:integration -- tests/integration/financial-review.test.ts
 npm run check
 npm run lint
 git diff --check
-git add src/lib/server/commerce/reporting/review.ts src/lib/server/commerce/reporting/review.test.ts tests/integration/financial-review.test.ts src/routes/admin/sales/review src/lib/components/admin/ReviewQueue.svelte src/routes/admin/sales/sales-routes.test.ts
+git add src/lib/server/commerce/reporting/review.ts src/lib/server/commerce/reporting/review.test.ts tests/integration/financial-review.test.ts src/routes/admin/sales/review src/lib/components/admin/ReviewQueue.svelte src/routes/admin/sales/sales-routes.test.ts src/lib/components/admin/SalesOverview.test.ts src/routes/admin/sales/sales.css
 git diff --cached --check
 git commit -m "feat: add operational financial review"
 ```
@@ -1463,6 +1469,12 @@ export async function getPayoutDetail(
 Use fixed page size 50 and keyset order `providerCreatedAt desc -> internal payoutId desc`. Return internal ID, automatic/manual, standard/instant/unknown, current/reconciliation status, signed amount/currency, created/arrival/settlement labels, associated count, bookstore-linked subtotal, account-level adjustment count/amount when complete, safe failure code, current freshness/generation, and historical-membership notice. Never return provider payout/balance-transaction/source IDs.
 
 Cover automatic completed paid, pending, manual, instant, failed/canceled/reversed with retained history, unrelated account activity, incomplete run, and current generation change. Never claim that the bookstore-linked subtotal equals the full payout.
+
+The payout cursor is a bounded canonical unpadded-base64url envelope containing the exact six-digit UTC `providerCreatedAt` SQL value plus the internal payout UUID; the display timestamp remains millisecond ISO. Fetch 51 rows using the descending tuple predicate `(provider_created_at, id) < (cursor timestamp, cursor UUID)` and prove non-millisecond equal-timestamp boundaries have no gaps or duplicates. A published run's certified generation is `run.generation + 1` for the original immutable membership publication (including a zero-candidate first published run) and `run.generation` for a later exact recertification; membership is current only when that value equals the payout financial generation and the paid/completed/non-reversed facts remain current.
+
+Fail closed to the unavailable DTO branch unless every immutable member has exactly one complete current gross head and one complete current fee head in payout currency with compatible current projection evidence. Sum title-scoped non-tax gross sale/refund/dispute components plus algorithm-v2 tax-safe dispute reinstatement as the bookstore-linked subtotal; sum title-scoped fee components as fee impact and derive linked net only from those two values. Count an account-scoped adjustment once per member balance transaction and sum its signed gross-plus-fee head effects, never a payout-total delta. Manual, instant, unknown-method, unpublished, and incomplete membership remains unavailable.
+
+`reversalState` is `incomplete` when a failed/canceled payout lacks its linked failure balance transaction or a `reversed_by` reference lacks an exact reciprocal local reversal payout; it is `reversed` when complete linked failure evidence or an exact reciprocal reversal exists, otherwise `none`. For failed/canceled payouts, `reversalAmountMinor` is the signed linked failure balance-transaction amount; otherwise it is the reciprocal reversal payout amount, and incomplete evidence returns `null`. `freshnessAt` is the maximum of payout retrieval, certified run/membership publication, member import, and current allocation/correction evidence actually used; unavailable modes use payout retrieval unless later exact reversal evidence exists. Detail back links preserve only a validated payout cursor.
 
 - [ ] **Step 2: Write failing route/component and audit tests**
 

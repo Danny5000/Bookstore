@@ -25,6 +25,11 @@ import {
 } from '../ledger';
 import { lockFinancialProjectionEnrollment } from '../rebase';
 import { PermanentFinancialError } from '../errors';
+import {
+  FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+  FINANCIAL_CLASSIFIER_VERSION,
+  FINANCIAL_REPLAY_ID
+} from '../constants';
 import type {
   CurrentEffectiveAllocationProjection,
   FinancialAllocationPlan,
@@ -697,8 +702,8 @@ describe('reconcileRefundFinancialSource', () => {
     });
 
     expect(lockActiveFinancialProjectionImplementation).toHaveBeenCalledWith(transaction, {
-      classifierVersion: 1,
-      allocationAlgorithmVersion: 1
+      classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
     });
     expect(lockCanonicalPaymentPurchaseFacts).toHaveBeenCalledWith(transaction, expect.objectContaining({
       paymentId, orderId,
@@ -1352,8 +1357,11 @@ describe('recomputeLockedRefundFinancialProjection', () => {
     expect(persistFinancialAllocationReplayPlanLocked).toHaveBeenCalledTimes(2);
     for (const [, persistInput, authorized] of
       vi.mocked(persistFinancialAllocationReplayPlanLocked).mock.calls) {
-      expect(authorized).toEqual({ classifierVersion: 1, allocationAlgorithmVersion: 1 });
-      expect(persistInput.plan.allocationIdentity).toContain(':replay:c1-a1:');
+      expect(authorized).toEqual({
+        classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+        allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
+      });
+      expect(persistInput.plan.allocationIdentity).toContain(`:replay:${FINANCIAL_REPLAY_ID}:`);
     }
     expect(observeFinancialIssue).not.toHaveBeenCalled();
   });

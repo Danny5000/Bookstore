@@ -1782,6 +1782,10 @@ async function exerciseInvariantWitnesses(): Promise<void> {
   ) => {
     const outcome = await verifierOutcome(name, scope);
     if (outcome.error) {
+      const actualFailures = parsedVerifierFailureList(outcome.error);
+      if (actualFailures !== null) {
+        failWitness(`${name} unexpectedly failed with ${actualFailures.join(', ')}`);
+      }
       failWitness(`${name} unexpectedly failed`);
     }
     validateOperationalShape(name, outcome);
@@ -1852,10 +1856,13 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     return definition;
   };
   const insertDisputeEffect = async (input: {
+    readonly algorithmVersion?: 1 | 2;
     readonly allocationId: string;
+    readonly classifierVersion?: number;
     readonly disputeId: string;
     readonly effect: 'withdrawal' | 'reinstatement';
     readonly financialItemId: string;
+    readonly financialTaxItemId?: string;
     readonly fingerprintCharacter: string;
     readonly orderItemId: string;
     readonly providerCreatedAt: string;
@@ -1864,9 +1871,29 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     readonly reversesAllocationId: string | null;
     readonly setId: string;
     readonly signedSubtotalMinor: number;
+    readonly signedTaxMinor?: number;
     readonly stripeDisputeId: string;
     readonly transactionId: string;
   }) => {
+    const algorithmVersion = input.algorithmVersion ?? 1;
+    const classifierVersion = input.classifierVersion ?? 1;
+    const signedTaxMinor = input.signedTaxMinor ?? 0;
+    const signedTotalMinor = input.signedSubtotalMinor + signedTaxMinor;
+    if (
+      (algorithmVersion !== 1 && algorithmVersion !== 2) ||
+      !Number.isSafeInteger(classifierVersion) || classifierVersion < 1 ||
+      !Number.isSafeInteger(input.signedSubtotalMinor) ||
+      !Number.isSafeInteger(signedTaxMinor) || !Number.isSafeInteger(signedTotalMinor) ||
+      (input.financialTaxItemId === undefined && signedTaxMinor !== 0) ||
+      (input.effect === 'reinstatement' && algorithmVersion === 1 &&
+        input.financialTaxItemId !== undefined) ||
+      (input.effect === 'withdrawal' &&
+        (input.signedSubtotalMinor >= 0 || signedTaxMinor > 0 || signedTotalMinor >= 0)) ||
+      (input.effect === 'reinstatement' &&
+        (input.signedSubtotalMinor <= 0 || signedTaxMinor < 0 || signedTotalMinor <= 0))
+    ) {
+      throw new Error('[restore-verifier] invalid dispute-effect witness input');
+    }
     const fingerprint = input.fingerprintCharacter.repeat(64);
     const classification = input.effect === 'withdrawal'
       ? 'dispute_withdrawal'
@@ -1874,6 +1901,12 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     const component = input.effect === 'withdrawal'
       ? 'dispute_subtotal'
       : 'dispute_reinstatement';
+    const subtotalTieBreakKey = algorithmVersion === 2
+      ? `${input.orderItemId}:subtotal`
+      : `${input.allocationId}:settlement`;
+    const taxTieBreakKey = algorithmVersion === 2
+      ? `${input.orderItemId}:tax`
+      : `${input.allocationId}:tax`;
     await pool.query(`
       insert into stripe_balance_transactions (
         id, provider_id, live_mode, source_family, source_id, raw_type,
@@ -1888,7 +1921,7 @@ async function exerciseInvariantWitnesses(): Promise<void> {
       input.providerId,
       input.stripeDisputeId,
       input.effect === 'withdrawal' ? 'dispute' : 'dispute_reversal',
-      input.signedSubtotalMinor,
+      signedTotalMinor,
       input.providerCreatedAt,
       fingerprint
     ]);
@@ -1896,8 +1929,8 @@ async function exerciseInvariantWitnesses(): Promise<void> {
       insert into financial_classification_versions (
         subject_type, subject_id, classifier_version, classification,
         source_fingerprint_sha256
-      ) values ('balance_transaction', $1, 1, $2, $3)
-    `, [input.transactionId, classification, fingerprint]);
+      ) values ('balance_transaction', $1, $2, $3, $4)
+    `, [input.transactionId, classifierVersion, classification, fingerprint]);
     await pool.query(`
       insert into financial_allocation_sets (
         id, allocation_identity, balance_transaction_id, source_kind,
@@ -1906,14 +1939,16 @@ async function exerciseInvariantWitnesses(): Promise<void> {
         reversal_of_set_id
       ) values (
         $1, $2, $3, 'dispute', $4, 'gross_amount', 'title', $5, 'USD',
-        1, 1, $6, $7
+        $6, $7, $8, $9
       )
     `, [
       input.setId,
       `restore:${input.setId}`,
       input.transactionId,
       input.disputeId,
-      input.signedSubtotalMinor,
+      signedTotalMinor,
+      algorithmVersion,
+      classifierVersion,
       fingerprint,
       input.reversalOfSetId
     ]);
@@ -1928,14 +1963,28 @@ async function exerciseInvariantWitnesses(): Promise<void> {
       input.orderItemId,
       component,
       input.signedSubtotalMinor,
-      `${input.allocationId}:settlement`
+      subtotalTieBreakKey
     ]);
+    if (input.financialTaxItemId !== undefined) {
+      await pool.query(`
+        insert into financial_item_allocations (
+          id, allocation_set_id, order_item_id, component, effect_minor, currency,
+          tie_break_key
+        ) values ($1, $2, $3, 'dispute_tax', $4, 'USD', $5)
+      `, [
+        input.financialTaxItemId,
+        input.setId,
+        input.orderItemId,
+        signedTaxMinor,
+        taxTieBreakKey
+      ]);
+    }
     await pool.query(`
       insert into dispute_item_allocations (
         id, allocation_identity, dispute_id, gross_allocation_set_id, order_item_id,
         effect, reverses_allocation_id, subtotal_effect_minor, tax_effect_minor,
         total_effect_minor, currency
-      ) values ($1, $2, $3, $4, $5, $6, $7, $8, 0, $8, 'USD')
+      ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'USD')
     `, [
       input.allocationId,
       `restore:${input.allocationId}`,
@@ -1944,7 +1993,9 @@ async function exerciseInvariantWitnesses(): Promise<void> {
       input.orderItemId,
       input.effect,
       input.reversesAllocationId,
-      input.signedSubtotalMinor
+      input.signedSubtotalMinor,
+      signedTaxMinor,
+      signedTotalMinor
     ]);
   };
 
@@ -4311,6 +4362,362 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     'withdrawal, reinstatement, equal-time refund, and second withdrawal chronology',
     true
   );
+
+  const taxedV2TitleId = '48000000-0000-4000-8000-000000000001';
+  const taxedV2OrderId = '48000000-0000-4000-8000-000000000002';
+  const taxedV2OrderItemId = '48000000-0000-4000-8000-000000000003';
+  const taxedV2PaymentId = '48000000-0000-4000-8000-000000000004';
+  const taxedV2DisputeId = '48000000-0000-4000-8000-000000000005';
+  const taxedV2WithdrawalTransactionId = '48000000-0000-4000-8000-000000000006';
+  const taxedV2WithdrawalSetId = '48000000-0000-4000-8000-000000000007';
+  const taxedV2WithdrawalSubtotalItemId = '48000000-0000-4000-8000-000000000008';
+  const taxedV2WithdrawalTaxItemId = '48000000-0000-4000-8000-000000000009';
+  const taxedV2WithdrawalAllocationId = '48000000-0000-4000-8000-00000000000a';
+  const taxedV2ReinstatementTransactionId = '48000000-0000-4000-8000-00000000000b';
+  const taxedV2ReinstatementSetId = '48000000-0000-4000-8000-00000000000c';
+  const taxedV2ReinstatementSubtotalItemId =
+    '48000000-0000-4000-8000-00000000000d';
+  const taxedV2ReinstatementTaxItemId = '48000000-0000-4000-8000-00000000000e';
+  const taxedV2ReinstatementAllocationId = '48000000-0000-4000-8000-00000000000f';
+  await pool.query(`
+    insert into titles (id, slug, title, description, creator_name, format, price_minor, currency)
+    values ($1, 'restore-taxed-v2', 'Restore taxed v2', 'Witness', 'Witness',
+      'prose', 100, 'USD')
+  `, [taxedV2TitleId]);
+  await pool.query(`
+    insert into orders (
+      id, status, currency, subtotal_minor, tax_minor, total_minor,
+      client_checkout_attempt_id, quote_fingerprint_sha256, status_token_sha256
+    ) values ($1, 'checkout_pending', 'USD', 100, 10, 110,
+      '48000000-0000-4000-8000-000000000010', repeat('d', 64), repeat('e', 64))
+  `, [taxedV2OrderId]);
+  await pool.query(`
+    insert into order_items (
+      id, order_id, title_id, title_snapshot, creator_name_snapshot, format,
+      currency, unit_subtotal_minor, tax_minor, total_minor
+    ) values ($1, $2, $3, 'Restore taxed v2', 'Witness', 'prose',
+      'USD', 100, 10, 110)
+  `, [taxedV2OrderItemId, taxedV2OrderId, taxedV2TitleId]);
+  await pool.query(`
+    insert into payments (
+      id, order_id, stripe_payment_intent_id, status, amount_minor, currency, paid_at
+    ) values ($1, $2, 'pi_restore_taxed_v2', 'succeeded', 110, 'USD',
+      '2026-08-06T00:00:00.000Z')
+  `, [taxedV2PaymentId, taxedV2OrderId]);
+  await pool.query(`
+    insert into disputes (
+      id, payment_id, stripe_dispute_id, status, amount_minor, currency,
+      provider_created_at, provider_updated_at
+    ) values ($1, $2, 'dp_restore_taxed_v2', 'won', 110, 'USD',
+      '2026-08-07T00:00:00.000Z', '2026-08-08T00:00:00.000Z')
+  `, [taxedV2DisputeId, taxedV2PaymentId]);
+  await insertDisputeEffect({
+    algorithmVersion: 2,
+    allocationId: taxedV2WithdrawalAllocationId,
+    classifierVersion: 1,
+    disputeId: taxedV2DisputeId,
+    effect: 'withdrawal',
+    financialItemId: taxedV2WithdrawalSubtotalItemId,
+    financialTaxItemId: taxedV2WithdrawalTaxItemId,
+    fingerprintCharacter: 'd',
+    orderItemId: taxedV2OrderItemId,
+    providerCreatedAt: '2026-08-07T00:00:00.000Z',
+    providerId: 'bt_restore_taxed_v2_withdrawal',
+    reversalOfSetId: null,
+    reversesAllocationId: null,
+    setId: taxedV2WithdrawalSetId,
+    signedSubtotalMinor: -100,
+    signedTaxMinor: -10,
+    stripeDisputeId: 'dp_restore_taxed_v2',
+    transactionId: taxedV2WithdrawalTransactionId
+  });
+  await expectPass('algorithm-v2 taxed dispute withdrawal baseline', true);
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations
+    set effect_minor = case id when $1 then -120 else 10 end
+    where id in ($1, $2)
+  `, [taxedV2WithdrawalSubtotalItemId, taxedV2WithdrawalTaxItemId]);
+  await expectRejectionChecks(
+    'algorithm-v2 withdrawal cannot conserve through mixed-sign items',
+    [
+      'dispute_v2_withdrawal_item_sign=1',
+      'financial_title_allocation_determinism=1'
+    ]
+  );
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations
+    set effect_minor = case id when $1 then -100 else -10 end
+    where id in ($1, $2)
+  `, [taxedV2WithdrawalSubtotalItemId, taxedV2WithdrawalTaxItemId]);
+  await expectPass('algorithm-v2 withdrawal item-sign repair', true);
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations
+    set effect_minor = case id when $1 then -99 else -11 end
+    where id in ($1, $2)
+  `, [taxedV2WithdrawalSubtotalItemId, taxedV2WithdrawalTaxItemId]);
+  await expectRejection(
+    'balanced algorithm-v2 withdrawal tax redistribution is not deterministic',
+    'financial_title_allocation_determinism=1'
+  );
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations
+    set effect_minor = case id when $1 then -100 else -10 end
+    where id in ($1, $2)
+  `, [taxedV2WithdrawalSubtotalItemId, taxedV2WithdrawalTaxItemId]);
+  await expectPass('algorithm-v2 withdrawal determinism repair', true);
+  await insertDisputeEffect({
+    algorithmVersion: 2,
+    allocationId: taxedV2ReinstatementAllocationId,
+    classifierVersion: 1,
+    disputeId: taxedV2DisputeId,
+    effect: 'reinstatement',
+    financialItemId: taxedV2ReinstatementSubtotalItemId,
+    financialTaxItemId: taxedV2ReinstatementTaxItemId,
+    fingerprintCharacter: 'e',
+    orderItemId: taxedV2OrderItemId,
+    providerCreatedAt: '2026-08-08T00:00:00.000Z',
+    providerId: 'bt_restore_taxed_v2_reinstatement',
+    reversalOfSetId: taxedV2WithdrawalSetId,
+    reversesAllocationId: taxedV2WithdrawalAllocationId,
+    setId: taxedV2ReinstatementSetId,
+    signedSubtotalMinor: 100,
+    signedTaxMinor: 10,
+    stripeDisputeId: 'dp_restore_taxed_v2',
+    transactionId: taxedV2ReinstatementTransactionId
+  });
+  await expectPass('algorithm-v2 taxed dispute reinstatement baseline', true);
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations
+    set effect_minor = case id when $1 then 99 else 11 end
+    where id in ($1, $2)
+  `, [taxedV2ReinstatementSubtotalItemId, taxedV2ReinstatementTaxItemId]);
+  await expectRejectionChecks(
+    'balanced algorithm-v2 reinstatement tax redistribution is not deterministic',
+    [
+      'dispute_v2_reinstatement_component_parity=1',
+      'financial_title_allocation_determinism=1'
+    ]
+  );
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations
+    set effect_minor = case id when $1 then 100 else 10 end
+    where id in ($1, $2)
+  `, [taxedV2ReinstatementSubtotalItemId, taxedV2ReinstatementTaxItemId]);
+  await expectPass('algorithm-v2 taxed dispute reinstatement repair', true);
+  await mutateAppendOnlyFixture(`
+    update stripe_balance_transactions
+    set amount_minor = 55, net_minor = 55
+    where id = $1
+  `, [taxedV2ReinstatementTransactionId]);
+  await mutateAppendOnlyFixture(`
+    update financial_allocation_sets
+    set expected_effect_minor = 55
+    where id = $1
+  `, [taxedV2ReinstatementSetId]);
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations
+    set effect_minor = case id when $1 then 50 else 5 end
+    where id in ($1, $2)
+  `, [taxedV2ReinstatementSubtotalItemId, taxedV2ReinstatementTaxItemId]);
+  await mutateAppendOnlyFixture(`
+    update dispute_item_allocations
+    set subtotal_effect_minor = 50, tax_effect_minor = 5, total_effect_minor = 55
+    where id = $1
+  `, [taxedV2ReinstatementAllocationId]);
+  await expectPass('algorithm-v2 partial reinstatement presentment baseline', true);
+  await mutateAppendOnlyFixture(`
+    update dispute_item_allocations
+    set subtotal_effect_minor = 49, tax_effect_minor = 6, total_effect_minor = 55
+    where id = $1
+  `, [taxedV2ReinstatementAllocationId]);
+  await expectRejection(
+    'algorithm-v2 same-currency reinstatement presentment must match settlement components',
+    'dispute_v2_reinstatement_component_parity=1'
+  );
+  await mutateAppendOnlyFixture(`
+    update dispute_item_allocations
+    set subtotal_effect_minor = 50, tax_effect_minor = 5, total_effect_minor = 55
+    where id = $1
+  `, [taxedV2ReinstatementAllocationId]);
+  await expectPass('algorithm-v2 reinstatement presentment component parity repair', true);
+
+  const fxV2FirstTitleId = '48100000-0000-4000-8000-000000000001';
+  const fxV2SecondTitleId = '48100000-0000-4000-8000-000000000002';
+  const fxV2OrderId = '48100000-0000-4000-8000-000000000003';
+  const fxV2FirstItemId = '48100000-0000-4000-8000-000000000004';
+  const fxV2SecondItemId = '48100000-0000-4000-8000-000000000005';
+  const fxV2PaymentId = '48100000-0000-4000-8000-000000000006';
+  const fxV2DisputeId = '48100000-0000-4000-8000-000000000007';
+  const fxV2TransactionId = '48100000-0000-4000-8000-000000000008';
+  const fxV2SetId = '48100000-0000-4000-8000-000000000009';
+  const fxV2SubtotalItemId = '48100000-0000-4000-8000-00000000000a';
+  const fxV2ZeroTaxItemId = '48100000-0000-4000-8000-00000000000b';
+  const fxV2PresentmentAllocationId = '48100000-0000-4000-8000-00000000000c';
+  const fxV2SecondPresentmentAllocationId =
+    '48100000-0000-4000-8000-00000000000e';
+  await pool.query(`
+    insert into titles (id, slug, title, description, creator_name, format, price_minor, currency)
+    values
+      ($1, 'restore-fx-v2-first', 'Restore FX v2 first', 'Witness', 'Witness',
+        'prose', 1, 'USD'),
+      ($2, 'restore-fx-v2-second', 'Restore FX v2 second', 'Witness', 'Witness',
+        'prose', 1, 'USD')
+  `, [fxV2FirstTitleId, fxV2SecondTitleId]);
+  await pool.query(`
+    insert into orders (
+      id, status, currency, subtotal_minor, tax_minor, total_minor,
+      client_checkout_attempt_id, quote_fingerprint_sha256, status_token_sha256
+    ) values ($1, 'checkout_pending', 'USD', 2, 2, 4,
+      '48100000-0000-4000-8000-00000000000d', repeat('1', 64), repeat('2', 64))
+  `, [fxV2OrderId]);
+  await pool.query(`
+    insert into order_items (
+      id, order_id, title_id, title_snapshot, creator_name_snapshot, format,
+      currency, unit_subtotal_minor, tax_minor, total_minor
+    ) values
+      ($1, $3, $4, 'Restore FX v2 first', 'Witness', 'prose', 'USD', 1, 1, 2),
+      ($2, $3, $5, 'Restore FX v2 second', 'Witness', 'prose', 'USD', 1, 1, 2)
+  `, [
+    fxV2FirstItemId,
+    fxV2SecondItemId,
+    fxV2OrderId,
+    fxV2FirstTitleId,
+    fxV2SecondTitleId
+  ]);
+  await pool.query(`
+    insert into payments (
+      id, order_id, stripe_payment_intent_id, status, amount_minor, currency, paid_at
+    ) values ($1, $2, 'pi_restore_fx_v2', 'succeeded', 4, 'USD',
+      '2026-08-08T00:00:00.000Z')
+  `, [fxV2PaymentId, fxV2OrderId]);
+  await pool.query(`
+    insert into disputes (
+      id, payment_id, stripe_dispute_id, status, amount_minor, currency,
+      provider_created_at, provider_updated_at
+    ) values ($1, $2, 'dp_restore_fx_v2', 'open', 2, 'USD',
+      '2026-08-09T00:00:00.000Z', '2026-08-09T00:00:00.000Z')
+  `, [fxV2DisputeId, fxV2PaymentId]);
+  await insertDisputeEffect({
+    algorithmVersion: 2,
+    allocationId: fxV2PresentmentAllocationId,
+    classifierVersion: 1,
+    disputeId: fxV2DisputeId,
+    effect: 'withdrawal',
+    financialItemId: fxV2SubtotalItemId,
+    financialTaxItemId: fxV2ZeroTaxItemId,
+    fingerprintCharacter: '3',
+    orderItemId: fxV2FirstItemId,
+    providerCreatedAt: '2026-08-09T00:00:00.000Z',
+    providerId: 'bt_restore_fx_v2_withdrawal',
+    reversalOfSetId: null,
+    reversesAllocationId: null,
+    setId: fxV2SetId,
+    signedSubtotalMinor: -1,
+    signedTaxMinor: 0,
+    stripeDisputeId: 'dp_restore_fx_v2',
+    transactionId: fxV2TransactionId
+  });
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations
+    set order_item_id = $2::uuid, tie_break_key = $3::text
+    where id = $1
+  `, [
+    fxV2ZeroTaxItemId,
+    fxV2SecondItemId,
+    `${fxV2SecondItemId}:tax`
+  ]);
+  await pool.query(`
+    insert into dispute_item_allocations (
+      id, allocation_identity, dispute_id, gross_allocation_set_id, order_item_id,
+      effect, reverses_allocation_id, subtotal_effect_minor, tax_effect_minor,
+      total_effect_minor, currency
+    ) values (
+      $1, $2, $3, $4, $5, 'withdrawal', null, 0, -1, -1, 'USD'
+    )
+  `, [
+    fxV2SecondPresentmentAllocationId,
+    `restore:${fxV2SecondPresentmentAllocationId}`,
+    fxV2DisputeId,
+    fxV2SetId,
+    fxV2SecondItemId
+  ]);
+  await mutateAppendOnlyFixture(`
+    update stripe_balance_transactions
+    set currency = 'EUR', exchange_rate = 0.5,
+      exchange_source_currency = 'USD', exchange_target_currency = 'EUR'
+    where id = $1
+  `, [fxV2TransactionId]);
+  await mutateAppendOnlyFixture(`
+    update financial_allocation_sets set currency = 'EUR' where id = $1
+  `, [fxV2SetId]);
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations set currency = 'EUR'
+    where allocation_set_id = $1
+  `, [fxV2SetId]);
+  await expectPass(
+    'algorithm-v2 FX withdrawal preserves zero-rounded cross-domain membership',
+    true
+  );
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations
+    set tie_break_key = 'restore:noncanonical-v2-tax-tie'
+    where id = $1
+  `, [fxV2ZeroTaxItemId]);
+  await expectRejection(
+    'algorithm-v2 withdrawal rejects a noncanonical predecessor tie key',
+    'dispute_v2_withdrawal_component_membership=1'
+  );
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations
+    set tie_break_key = $2
+    where id = $1
+  `, [fxV2ZeroTaxItemId, `${fxV2SecondItemId}:tax`]);
+  await expectPass('algorithm-v2 withdrawal predecessor tie-key repair', true);
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations
+    set order_item_id = $2::uuid, tie_break_key = $3::text
+    where id = $1
+  `, [
+    fxV2SubtotalItemId,
+    fxV2SecondItemId,
+    `${fxV2SecondItemId}:subtotal`
+  ]);
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations
+    set order_item_id = $2::uuid, tie_break_key = $3::text
+    where id = $1
+  `, [
+    fxV2ZeroTaxItemId,
+    fxV2FirstItemId,
+    `${fxV2FirstItemId}:tax`
+  ]);
+  await expectRejectionChecks(
+    'algorithm-v2 FX withdrawal cannot change persisted component-title membership',
+    [
+      'dispute_v2_withdrawal_component_membership=1',
+      'financial_title_allocation_determinism=1'
+    ]
+  );
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations
+    set order_item_id = $2::uuid, tie_break_key = $3::text
+    where id = $1
+  `, [
+    fxV2SubtotalItemId,
+    fxV2FirstItemId,
+    `${fxV2FirstItemId}:subtotal`
+  ]);
+  await mutateAppendOnlyFixture(`
+    update financial_item_allocations
+    set order_item_id = $2::uuid, tie_break_key = $3::text
+    where id = $1
+  `, [
+    fxV2ZeroTaxItemId,
+    fxV2SecondItemId,
+    `${fxV2SecondItemId}:tax`
+  ]);
+  await expectPass('algorithm-v2 FX withdrawal component-title repair', true);
+
   await mutateAppendOnlyFixture(`
     update dispute_item_allocations
     set subtotal_effect_minor = -99, tax_effect_minor = 0, total_effect_minor = -99
@@ -5165,10 +5572,14 @@ async function exerciseInvariantWitnesses(): Promise<void> {
       id, allocation_set_id, order_item_id, component, effect_minor, currency,
       tie_break_key
     ) values (
-      '40000000-0000-4000-8000-0000000000d2', $1, $2,
-      'dispute_subtotal', -50, 'USD', 'pending-withdrawal:settlement'
+      '40000000-0000-4000-8000-0000000000d2', $1::uuid, $2::uuid,
+      'dispute_subtotal', -50, 'USD', $3::text
     )
-  `, [pendingWithdrawalSetId, combinedFirstItemId]);
+  `, [
+    pendingWithdrawalSetId,
+    combinedFirstItemId,
+    `${combinedFirstItemId}:subtotal`
+  ]);
   await pool.query(`
     insert into dispute_item_allocations (
       id, allocation_identity, dispute_id, gross_allocation_set_id, order_item_id,
@@ -5219,9 +5630,13 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     set subtotal_effect_minor = 0, tax_effect_minor = 0, total_effect_minor = 0
     where id = $1
   `, [pendingWithdrawalAllocationId]);
-  await expectRejection(
+  await expectRejectionChecks(
     'pending-version withdrawal history cannot contain a zero presentment effect',
-    'dispute_presentment_child_cardinality=1'
+    [
+      'dispute_presentment_child_cardinality=1',
+      'dispute_v2_withdrawal_component_membership=1',
+      'financial_title_allocation_determinism=1'
+    ]
   );
   await mutateAppendOnlyFixture(`
     update dispute_item_allocations

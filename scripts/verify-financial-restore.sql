@@ -2330,7 +2330,12 @@ with allowed_issue_triples(resource_type, safe_code, impact) as (values
             and i.component in ('dispute_subtotal', 'dispute_tax'))
           or (component_parent_classification.classification = 'dispute_reinstatement'
             and s.reversal_of_set_id is not null
-            and i.component = 'dispute_reinstatement')
+            and (
+              (s.algorithm_version = 1
+                and i.component = 'dispute_reinstatement')
+              or (s.algorithm_version = 2
+                and i.component in ('dispute_reinstatement', 'dispute_tax'))
+            ))
           or (component_parent_classification.classification = 'fee_credit'
             and s.reversal_of_set_id is null
             and i.component = 'fee_credit')
@@ -2608,6 +2613,136 @@ with allowed_issue_triples(resource_type, safe_code, impact) as (values
          where candidate_reversal.reverses_allocation_id = a.reverses_allocation_id
        ) <> 1
      ))
+
+  union all
+  select 'dispute_v2_withdrawal_item_sign', count(distinct s.id)::bigint
+  from financial_allocation_sets s
+  join financial_classification_versions classification
+    on classification.subject_type = 'balance_transaction'
+   and classification.subject_id = s.balance_transaction_id
+   and classification.classifier_version = s.classifier_version
+   and classification.source_fingerprint_sha256 = s.source_fingerprint_sha256
+  join financial_item_allocations item on item.allocation_set_id = s.id
+  where s.source_kind = 'dispute'
+    and s.algorithm_version = 2
+    and classification.classification = 'dispute_withdrawal'
+    and item.effect_minor > 0
+
+  union all
+  select 'dispute_v2_withdrawal_component_membership',
+    count(distinct mismatch.allocation_set_id)::bigint
+  from (
+    with eligible_withdrawals as (
+      select s.id
+      from financial_allocation_sets s
+      join financial_classification_versions classification
+        on classification.subject_type = 'balance_transaction'
+       and classification.subject_id = s.balance_transaction_id
+       and classification.classifier_version = s.classifier_version
+       and classification.source_fingerprint_sha256 = s.source_fingerprint_sha256
+      where s.source_kind = 'dispute'
+        and s.basis = 'gross_amount'
+        and s.scope = 'title'
+        and s.algorithm_version = 2
+        and s.reversal_of_set_id is null
+        and classification.classification = 'dispute_withdrawal'
+    )
+    select eligible.id as allocation_set_id
+    from eligible_withdrawals eligible
+    join financial_item_allocations settlement
+      on settlement.allocation_set_id = eligible.id
+    where settlement.tie_break_key is distinct from case settlement.component
+        when 'dispute_subtotal' then settlement.order_item_id::text || ':subtotal'
+        when 'dispute_tax' then settlement.order_item_id::text || ':tax'
+        else null
+      end
+      or not exists (
+      select 1
+      from dispute_item_allocations presentment
+      where presentment.gross_allocation_set_id = eligible.id
+        and presentment.order_item_id = settlement.order_item_id
+        and (
+          (settlement.component = 'dispute_subtotal'
+            and presentment.subtotal_effect_minor <> 0)
+          or (settlement.component = 'dispute_tax'
+            and presentment.tax_effect_minor <> 0)
+        )
+    )
+
+    union all
+    select eligible.id as allocation_set_id
+    from eligible_withdrawals eligible
+    join dispute_item_allocations presentment
+      on presentment.gross_allocation_set_id = eligible.id
+    cross join lateral (values
+      ('dispute_subtotal'::financial_component, presentment.subtotal_effect_minor),
+      ('dispute_tax'::financial_component, presentment.tax_effect_minor)
+    ) presentment_component(component, effect_minor)
+    where presentment_component.effect_minor <> 0
+      and not exists (
+        select 1
+        from financial_item_allocations settlement
+        where settlement.allocation_set_id = eligible.id
+          and settlement.order_item_id = presentment.order_item_id
+          and settlement.component = presentment_component.component
+      )
+  ) mismatch
+
+  union all
+  select 'dispute_v2_reinstatement_component_parity',
+    count(distinct mismatch.allocation_set_id)::bigint
+  from (
+    with eligible_reinstatements as (
+      select s.id
+      from financial_allocation_sets s
+      join financial_classification_versions classification
+        on classification.subject_type = 'balance_transaction'
+       and classification.subject_id = s.balance_transaction_id
+       and classification.classifier_version = s.classifier_version
+       and classification.source_fingerprint_sha256 = s.source_fingerprint_sha256
+      join disputes d on d.id = s.source_internal_id
+      where s.source_kind = 'dispute'
+        and s.basis = 'gross_amount'
+        and s.scope = 'title'
+        and s.algorithm_version = 2
+        and s.reversal_of_set_id is not null
+        and classification.classification = 'dispute_reinstatement'
+        and s.currency = d.currency
+    )
+    select eligible.id as allocation_set_id
+    from eligible_reinstatements eligible
+    join financial_item_allocations settlement
+      on settlement.allocation_set_id = eligible.id
+    left join dispute_item_allocations presentment
+      on presentment.gross_allocation_set_id = eligible.id
+     and presentment.order_item_id = settlement.order_item_id
+    where settlement.component not in ('dispute_reinstatement', 'dispute_tax')
+       or presentment.id is null
+       or settlement.effect_minor is distinct from case settlement.component
+         when 'dispute_reinstatement' then presentment.subtotal_effect_minor
+         when 'dispute_tax' then presentment.tax_effect_minor
+         else null
+       end
+
+    union all
+    select eligible.id as allocation_set_id
+    from eligible_reinstatements eligible
+    join dispute_item_allocations presentment
+      on presentment.gross_allocation_set_id = eligible.id
+    cross join lateral (values
+      ('dispute_reinstatement'::financial_component,
+        presentment.subtotal_effect_minor),
+      ('dispute_tax'::financial_component, presentment.tax_effect_minor)
+    ) presentment_component(component, effect_minor)
+    where presentment_component.effect_minor <> 0
+      and not exists (
+        select 1
+        from financial_item_allocations settlement
+        where settlement.allocation_set_id = eligible.id
+          and settlement.order_item_id = presentment.order_item_id
+          and settlement.component = presentment_component.component
+      )
+  ) mismatch
 
   union all
   select 'dispute_presentment_child_cardinality', count(distinct s.id)::bigint
@@ -3739,7 +3874,7 @@ with deterministic_sets as (
    and classification.subject_id = balance.id
    and classification.classifier_version = allocation_set.classifier_version
    and classification.source_fingerprint_sha256 = allocation_set.source_fingerprint_sha256
-  where allocation_set.algorithm_version = 1
+  where allocation_set.algorithm_version in (1, 2)
     and allocation_set.basis = 'gross_amount'
     and allocation_set.scope = 'title'
     and (
@@ -3751,6 +3886,14 @@ with deterministic_sets as (
         and allocation_set.reversal_of_set_id is null)
       or (allocation_set.source_kind = 'refund'
         and classification.classification = 'refund_failure'
+        and allocation_set.reversal_of_set_id is not null)
+      or (allocation_set.source_kind = 'dispute'
+        and allocation_set.algorithm_version = 2
+        and classification.classification = 'dispute_withdrawal'
+        and allocation_set.reversal_of_set_id is null)
+      or (allocation_set.source_kind = 'dispute'
+        and allocation_set.algorithm_version = 2
+        and classification.classification = 'dispute_reinstatement'
         and allocation_set.reversal_of_set_id is not null)
     )
 ), allocation_weights as (
@@ -3799,6 +3942,38 @@ with deterministic_sets as (
   join financial_item_allocations original_item
     on original_item.allocation_set_id = original.id
   where deterministic.classification = 'refund_failure'
+    and original_item.effect_minor <> 0
+
+  union all
+  select deterministic.id, presentment.order_item_id,
+    presentment_component.component::financial_component,
+    abs(presentment_component.effect_minor::bigint),
+    presentment.order_item_id::text || ':' || presentment_component.tie_suffix
+  from deterministic_sets deterministic
+  join dispute_item_allocations presentment
+    on presentment.gross_allocation_set_id = deterministic.id
+  cross join lateral (values
+    ('dispute_subtotal', presentment.subtotal_effect_minor, 'subtotal'),
+    ('dispute_tax', presentment.tax_effect_minor, 'tax')
+  ) presentment_component(component, effect_minor, tie_suffix)
+  where deterministic.classification = 'dispute_withdrawal'
+    and presentment_component.effect_minor <> 0
+
+  union all
+  select deterministic.id, original_item.order_item_id,
+    case original_item.component
+      when 'dispute_subtotal' then 'dispute_reinstatement'::financial_component
+      else 'dispute_tax'::financial_component
+    end,
+    abs(original_item.effect_minor::bigint),
+    original_item.tie_break_key
+  from deterministic_sets deterministic
+  join financial_allocation_sets original
+    on original.id = deterministic.reversal_of_set_id
+  join financial_item_allocations original_item
+    on original_item.allocation_set_id = original.id
+  where deterministic.classification = 'dispute_reinstatement'
+    and original_item.component in ('dispute_subtotal', 'dispute_tax')
     and original_item.effect_minor <> 0
 ), weighted_allocations as (
   select deterministic.id as allocation_set_id, deterministic.currency,

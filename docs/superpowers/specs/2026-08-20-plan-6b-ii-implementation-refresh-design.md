@@ -253,6 +253,10 @@ Incomplete projection heads remain visible. A missing item join means the metric
 
 Totals remain separated by presentment and settlement currency. Pending settlement remains explicitly pending. Account-scoped effects do not become title revenue. No mixed-currency aggregate is invented.
 
+Tax-safe dispute reinstatement requires allocation algorithm version 2. Version 1 remains immutable historical evidence, but its settlement `dispute_reinstatement` item combines customer tax with subtotal and therefore cannot support an exact tax-excluded title estimate. Version 2 allocates from the persisted withdrawal settlement plan: predecessor `dispute_subtotal` weights become positive `dispute_reinstatement` subtotal effects, while predecessor `dispute_tax` weights remain separate positive `dispute_tax` effects. Same-currency partial reinstatements use the same component-level largest-remainder order in presentment and settlement; full FX reinstatements reverse the persisted weights in each currency domain. Positive, cross-version, malformed-component, or unsupported-version predecessor evidence fails closed.
+
+The deployed target becomes `c1-a2`, reached through the existing allocation-only replay and activation authority. The migration seed remains `c1-a1`; no schema migration or direct version activation is introduced. Reporting treats a version-1 combined reinstatement as unavailable rather than estimating a subtotal/tax split. Restore verification preserves version-1 semantics while independently validating version-2 predecessor signs and component/title membership, reconstructing withdrawal settlement allocations from persisted presentment weights, and reconstructing reinstatements from the validated withdrawal settlement plan.
+
 ### 9.2 Operational Needs Review
 
 Needs Review is not a query for every historically open issue.

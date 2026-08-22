@@ -1,5 +1,10 @@
 import { eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
+import {
+  FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+  FINANCIAL_CLASSIFIER_VERSION,
+  FINANCIAL_REPLAY_ID
+} from '$lib/server/commerce/financial/constants';
 import { financialProjectionVersions, financialScanRuns, jobs } from '$lib/server/db/schema';
 import { enqueueJob, createPostgresJobRepository } from '$lib/server/jobs/repository';
 import { processFinancialScanJob } from '$lib/server/commerce/financial/scans/service';
@@ -70,9 +75,13 @@ describe('PostgreSQL jobs', () => {
     const replayRunId = crypto.randomUUID();
     const replayDigest = 'b'.repeat(64);
     await databaseClient.db.insert(financialScanRuns).values({
-      id: replayRunId, rootKey: 'commerce.financial-classification:scan:1:1',
+      id: replayRunId,
+      rootKey: `commerce.financial-classification:scan:${FINANCIAL_CLASSIFIER_VERSION}:` +
+        FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
       kind: 'classification_replay', phase: 'classification_replay_page',
-      classifierVersion: 1, allocationAlgorithmVersion: 1, replayId: 'c1-a1',
+      classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+      replayId: FINANCIAL_REPLAY_ID,
       cursorDigestSha256: replayDigest
     });
     const providerJobs = [
@@ -89,12 +98,15 @@ describe('PostgreSQL jobs', () => {
       { type: 'test.local-only', payload: {} },
       { type: 'commerce.financial-classification', payload: {
         subjectType: 'balance_transaction', subjectId: crypto.randomUUID(),
-        sourceFingerprintSha256: 'a'.repeat(64), classifierVersion: 1,
-        allocationAlgorithmVersion: 1, replayId: 'c1-a1'
+        sourceFingerprintSha256: 'a'.repeat(64),
+        classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+        allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+        replayId: FINANCIAL_REPLAY_ID
       } },
       { type: 'commerce.financial-scan', payload: {
-        kind: 'composite_replay', classifierVersion: 1,
-        allocationAlgorithmVersion: 1, replayId: 'c1-a1'
+        kind: 'composite_replay', classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+        allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+        replayId: FINANCIAL_REPLAY_ID
       } },
       { type: 'commerce.financial-scan', payload: {
         kind: 'continuation', scanRunId: replayRunId,
@@ -133,6 +145,7 @@ describe('PostgreSQL jobs', () => {
 
   it('leaves predecessor classification work and replay roots for a retaining worker', async () => {
     const due = new Date(0);
+    // These c1-a1 jobs intentionally represent retained predecessor work, not active authority.
     await enqueueJob(databaseClient.db, {
       type: 'commerce.financial-classification',
       payload: {
@@ -245,7 +258,8 @@ describe('PostgreSQL jobs', () => {
     );
     const activeWorker = createPostgresJobRepository(
       databaseClient.db, applicationConfig.jobs, () => new Date(1), 'all',
-      { classifierVersion: 1, allocationAlgorithmVersion: 1 }
+      { classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+        allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION }
     );
 
     await expect(activeWorker.claimNext('active-local-worker')).resolves.toMatchObject({
@@ -300,7 +314,8 @@ describe('PostgreSQL jobs', () => {
     });
     const activeWorker = createPostgresJobRepository(
       databaseClient.db, applicationConfig.jobs, () => currentTime, 'all',
-      { classifierVersion: 1, allocationAlgorithmVersion: 1 }
+      { classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+        allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION }
     );
     const successorWorker = createPostgresJobRepository(
       databaseClient.db, applicationConfig.jobs, () => currentTime, 'all',

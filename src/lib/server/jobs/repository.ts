@@ -972,10 +972,10 @@ export function createPostgresJobRepository(
                   locked_at = null,
                   locked_by = null,
                   last_error = case when rerun_requested_at is null
-                    then pg_catalog.coalesce(
-                      last_error,
-                      'Job lease expired after final attempt'
-                    ) else null end,
+                    then case when last_error is null
+                      then 'Job lease expired after final attempt'::text
+                      else last_error
+                    end else null::text end,
                   rerun_requested_at = null,
                   completed_at = case when rerun_requested_at is null
                     then ${claimedAt}::timestamptz else null::timestamptz end,

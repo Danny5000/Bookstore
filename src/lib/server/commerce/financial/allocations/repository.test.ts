@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { PgDialect } from 'drizzle-orm/pg-core';
+import { FINANCIAL_ALLOCATION_ALGORITHM_VERSION } from '../constants';
 import { loadCurrentEffectiveAllocationProjection, persistFinancialAllocationPlanLocked } from './repository';
 
 const ID = '11111111-1111-4111-8111-111111111111';
@@ -19,7 +20,8 @@ function input() {
   return {
     sourceKind: 'payment' as const, sourceId: ID, classificationVersion: 1, correlationId: 'repository-test',
     plan: { allocationIdentity: 'payment:one:gross', balanceTransactionId: ID, basis: 'gross_amount' as const,
-      scope: 'title' as const, currency: 'USD', expectedEffectMinor: 100, algorithmVersion: 1,
+      scope: 'title' as const, currency: 'USD', expectedEffectMinor: 100,
+      algorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
       sourceFingerprint: FP, supersedesSetId: null, reversalOfSetId: null,
       items: [{ orderItemId: ITEM, component: 'sale_subtotal' as const, effectMinor: 100, currency: 'USD', tieBreakKey: ITEM }] }
   };
@@ -51,7 +53,7 @@ describe('financial allocation repository', () => {
   it('rejects non-current classifier and algorithm versions before SQL', async () => {
     for (const candidate of [
       { ...input(), classificationVersion: 2 },
-      { ...input(), plan: { ...input().plan, algorithmVersion: 2 } }
+      { ...input(), plan: { ...input().plan, algorithmVersion: 1 } }
     ]) {
       const db = executor([]);
       await expect(persistFinancialAllocationPlanLocked(db as never, candidate))
@@ -126,7 +128,8 @@ describe('financial allocation repository', () => {
       [{ detailCount: 0, classifiedCount: 0, unknownCount: 0, detailAmountSum: '0', currencyMismatchCount: 0 }], [{ id: ID, orderId: ORDER }], [{ id: ITEM }], [{ id: setId,
         allocationIdentity: candidate.plan.allocationIdentity, balanceTransactionId: ID, sourceKind: 'payment',
         sourceId: ID, basis: 'gross_amount', scope: 'title', expectedEffectMinor: 100, currency: 'USD',
-        algorithmVersion: 1, classifierVersion: 1, sourceFingerprint: FP,
+        algorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+        classifierVersion: 1, sourceFingerprint: FP,
         supersedesSetId: null, reversalOfSetId: null }], [[...candidate.plan.items][0]]]);
     await expect(persistFinancialAllocationPlanLocked(db as never, candidate))
       .resolves.toEqual({ setId, disposition: 'unchanged' });
@@ -142,7 +145,8 @@ describe('financial allocation repository', () => {
       [{ detailCount: 0, classifiedCount: 0, unknownCount: 0, detailAmountSum: '0', currencyMismatchCount: 0 }],
       [{ id: ID, orderId: ORDER }], [{ id: ITEM }], [{ id: setId, allocationIdentity: candidate.plan.allocationIdentity,
         balanceTransactionId: ID, sourceKind: 'payment', sourceId: ID, basis: 'gross_amount', scope: 'title',
-        expectedEffectMinor: 100, currency: 'USD', algorithmVersion: 1, classifierVersion: 1,
+        expectedEffectMinor: 100, currency: 'USD',
+        algorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION, classifierVersion: 1,
         sourceFingerprint: FP, supersedesSetId: null, reversalOfSetId: null }], [reordered]]);
     await expect(persistFinancialAllocationPlanLocked(db as never, candidate))
       .resolves.toEqual({ setId, disposition: 'unchanged' });

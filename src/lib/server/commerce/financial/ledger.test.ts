@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { SQL } from 'drizzle-orm';
 import type { BalanceTransactionSnapshot } from '$lib/server/commerce/stripe/financial-types';
-import { FINANCIAL_CLASSIFIER_VERSION } from './constants';
+import {
+  FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+  FINANCIAL_CLASSIFIER_VERSION
+} from './constants';
 import { PermanentFinancialError } from './errors';
 import {
   fingerprintBalanceTransaction,
@@ -138,7 +141,8 @@ function rendered(query: SQL): { sql: string; params: unknown[] } {
 function database(
   responses: Array<unknown[] | Error>,
   authority: Record<string, unknown> = {
-    classifierVersion: 1, allocationAlgorithmVersion: 1,
+    classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+    allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
     pendingClassifierVersion: null, pendingAllocationAlgorithmVersion: null,
     pendingReplayId: null, pendingScanRunId: null
   }

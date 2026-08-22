@@ -3,6 +3,11 @@ import { eq, inArray, sql, type SQLWrapper } from 'drizzle-orm';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { expect, it } from 'vitest';
 import {
+  FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+  FINANCIAL_CLASSIFIER_VERSION,
+  FINANCIAL_REPLAY_ID
+} from '$lib/server/commerce/financial/constants';
+import {
   createFinancialScheduleEnsurer,
   ensureHourlyFinancialScan
 } from '$lib/server/commerce/financial/scans/scheduler';
@@ -83,16 +88,19 @@ it('converges concurrent workers on permanent roots and creates one new hour', a
   const now = new Date('2026-08-12T19:42:00.000Z');
   await Promise.all([
     ensureHourlyFinancialScan(databaseClient.db, {
-      now, classifierVersion: 1, allocationAlgorithmVersion: 1
+      now, classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
     }),
     ensureHourlyFinancialScan(databaseClient.db, {
-      now, classifierVersion: 1, allocationAlgorithmVersion: 1
+      now, classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
     })
   ]);
   const firstKeys = [
     'commerce.financial-scan:initial:v1',
     'commerce.financial-scan:2026-08-12T19:00:00.000Z',
-    'commerce.financial-classification:scan:1:1'
+    `commerce.financial-classification:scan:${FINANCIAL_CLASSIFIER_VERSION}:` +
+      FINANCIAL_ALLOCATION_ALGORITHM_VERSION
   ];
   expect(await databaseClient.db.select().from(jobs).where(
     inArray(jobs.deduplicationKey, firstKeys)
@@ -100,14 +108,16 @@ it('converges concurrent workers on permanent roots and creates one new hour', a
 
   await ensureHourlyFinancialScan(databaseClient.db, {
     now: new Date('2026-08-12T20:00:00.000Z'),
-    classifierVersion: 1,
-    allocationAlgorithmVersion: 2
+    classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+    allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
   });
   expect(await databaseClient.db.select().from(jobs).where(
     eq(jobs.deduplicationKey, 'commerce.financial-scan:2026-08-12T20:00:00.000Z')
   )).toHaveLength(1);
   expect(await databaseClient.db.select().from(jobs).where(
-    eq(jobs.deduplicationKey, 'commerce.financial-classification:scan:1:2')
+    eq(jobs.deduplicationKey,
+      `commerce.financial-classification:scan:${FINANCIAL_CLASSIFIER_VERSION}:` +
+        FINANCIAL_ALLOCATION_ALGORITHM_VERSION)
   )).toHaveLength(1);
 });
 
@@ -116,8 +126,9 @@ it('converges two real worker polling loops without retaining a database lease',
   const runOnePoll = async (workerId: string): Promise<void> => {
     const controller = new AbortController();
     const ensure = createFinancialScheduleEnsurer({
-      database: databaseClient.db, runtimeMode: 'stripe', classifierVersion: 1,
-      allocationAlgorithmVersion: 1
+      database: databaseClient.db, runtimeMode: 'stripe',
+      classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
     });
     await runWorker({
       repository: createPostgresJobRepository(databaseClient.db, applicationConfig.jobs),
@@ -136,7 +147,8 @@ it('converges two real worker polling loops without retaining a database lease',
   const keys = [
     'commerce.financial-scan:initial:v1',
     'commerce.financial-scan:2026-08-12T19:00:00.000Z',
-    'commerce.financial-classification:scan:1:1'
+    `commerce.financial-classification:scan:${FINANCIAL_CLASSIFIER_VERSION}:` +
+      FINANCIAL_ALLOCATION_ALGORITHM_VERSION
   ];
   expect(await databaseClient.db.select().from(jobs).where(
     inArray(jobs.deduplicationKey, keys)
@@ -467,8 +479,9 @@ it('seals a disabled composite replay behind its durable child barrier without p
   const signal = new AbortController().signal;
 
   await expect(processFinancialScanJob(dependencies, {
-    payload: { kind: 'composite_replay', classifierVersion: 1,
-      allocationAlgorithmVersion: 1, replayId: 'c1-a1' },
+    payload: { kind: 'composite_replay', classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+      replayId: FINANCIAL_REPLAY_ID },
     correlationId: 'scan-disabled-root', signal
   })).resolves.toEqual({ status: 'continued', runId: expect.any(String) });
   const [afterFirstPage] = await databaseClient.db.select().from(financialScanRuns);
@@ -517,7 +530,8 @@ it('enrolls evidence inserted after replay enumeration before allowing target ac
   });
   const [pendingVersion] = await databaseClient.db.select().from(financialProjectionVersions);
   expect(pendingVersion).toMatchObject({
-    classifierVersion: 1, allocationAlgorithmVersion: 1,
+    classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+    allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
     pendingClassifierVersion: 2, pendingAllocationAlgorithmVersion: 2,
     pendingScanRunId: sealed!.id
   });
@@ -555,7 +569,8 @@ it('enrolls evidence inserted after replay enumeration before allowing target ac
   );
   await expect(repository.claimNext('late-replay-finalizer')).resolves.toBeNull();
   expect((await databaseClient.db.select().from(financialProjectionVersions))[0])
-    .toMatchObject({ classifierVersion: 1, allocationAlgorithmVersion: 1 });
+    .toMatchObject({ classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION });
   expect((await databaseClient.db.select().from(financialScanRuns))[0])
     .toMatchObject({ state: 'running', completedAt: null });
 
@@ -678,7 +693,8 @@ it('rechecks the child barrier after a finalizer claim races an uncommitted late
   });
   expect((await databaseClient.db.select().from(financialProjectionVersions))[0])
     .toMatchObject({
-      classifierVersion: 1, allocationAlgorithmVersion: 1,
+      classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
       pendingClassifierVersion: 2, pendingAllocationAlgorithmVersion: 2,
       pendingScanRunId: sealed!.id
     });
@@ -776,7 +792,8 @@ it('serializes route publication with finalization before discovering and rearmi
   });
   expect((await databaseClient.db.select().from(financialProjectionVersions))[0])
     .toMatchObject({
-      classifierVersion: 1, allocationAlgorithmVersion: 1,
+      classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
       pendingClassifierVersion: 2, pendingAllocationAlgorithmVersion: 2,
       pendingScanRunId: sealed!.id
     });
@@ -804,7 +821,8 @@ it('refreshes the retry budget when material route evidence rearms pending work'
   const subject = createFinancialClassificationSubjectJob({
     subjectType: 'balance_transaction', subjectId: staged.balanceTransactionId,
     sourceFingerprintSha256: balance!.fingerprintSha256,
-    classifierVersion: 1, allocationAlgorithmVersion: 1
+    classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+    allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
   });
   const [insertedSubject] = await ownerDatabaseClient.db.insert(jobs).values({
     type: subject.type, payload: subject.payload as JsonObject,
@@ -834,7 +852,8 @@ it('refreshes the retry budget when material route evidence rearms pending work'
 
   const repository = createPostgresJobRepository(
     databaseClient.db, applicationConfig.jobs, () => new Date('2100-01-01T00:00:00.000Z'),
-    'local-only', { classifierVersion: 1, allocationAlgorithmVersion: 1 }
+    'local-only', { classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION }
   );
   const claimed = await repository.claimNext('retry-budget-worker');
   expect(claimed).toMatchObject({ id: insertedSubject!.id, attempts: 1 });
@@ -882,7 +901,8 @@ it('rejects a linked child with a null target field before activation', async ()
   });
   expect((await databaseClient.db.select().from(financialProjectionVersions))[0])
     .toMatchObject({
-      classifierVersion: 1, allocationAlgorithmVersion: 1,
+      classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
       pendingClassifierVersion: 2, pendingAllocationAlgorithmVersion: 2,
       pendingScanRunId: sealed!.id
     });
@@ -913,8 +933,9 @@ it('adopts an existing permanent subject job into its replay-run barrier', async
   await processFinancialScanJob({
     database: databaseClient.db, gateway, runtimeMode: 'disabled'
   }, {
-    payload: { kind: 'composite_replay', classifierVersion: 1,
-      allocationAlgorithmVersion: 1, replayId: 'c1-a1' },
+    payload: { kind: 'composite_replay', classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+      replayId: FINANCIAL_REPLAY_ID },
     correlationId: 'scan-adopt-root', signal: new AbortController().signal
   });
   const [sealed] = await databaseClient.db.select().from(financialScanRuns);
@@ -953,8 +974,9 @@ it('adopts an exhausted permanent subject without resurrecting it', async () => 
   await processFinancialScanJob({
     database: databaseClient.db, gateway, runtimeMode: 'disabled'
   }, {
-    payload: { kind: 'composite_replay', classifierVersion: 1,
-      allocationAlgorithmVersion: 1, replayId: 'c1-a1' },
+    payload: { kind: 'composite_replay', classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+      replayId: FINANCIAL_REPLAY_ID },
     correlationId: 'scan-failed-adopt-root', signal: new AbortController().signal
   });
   const [sealed] = await databaseClient.db.select().from(financialScanRuns);
@@ -984,11 +1006,12 @@ it('rearms a running permanent subject job after replay-run adoption', async () 
   const [balance] = await databaseClient.db.select().from(stripeBalanceTransactions).where(
     eq(stripeBalanceTransactions.id, staged.balanceTransactionId)
   );
+  // Seed immutable c1-a1 history explicitly; the active integration authority remains c1-a2.
   await databaseClient.db.transaction((tx) => replayFinancialClassificationLocked(tx, {
     subjectType: 'balance_transaction', subjectId: staged.balanceTransactionId,
     sourceFingerprintSha256: balance!.fingerprintSha256,
     classifierVersion: 1, allocationAlgorithmVersion: 1, replayId: 'c1-a1',
-    correlationId: 'scan-running-adopt-active-predecessor'
+    correlationId: 'scan-running-adopt-historical-predecessor'
   }));
   const ordinary = createFinancialClassificationSubjectJob({
     subjectType: 'balance_transaction', subjectId: staged.balanceTransactionId,
@@ -1062,11 +1085,12 @@ it('lets an exact pending target finish before keyset adoption links it', async 
   const [balance] = await databaseClient.db.select().from(stripeBalanceTransactions).where(
     eq(stripeBalanceTransactions.id, staged.balanceTransactionId)
   );
+  // Seed immutable c1-a1 history explicitly; the active integration authority remains c1-a2.
   await databaseClient.db.transaction((tx) => replayFinancialClassificationLocked(tx, {
     subjectType: 'balance_transaction', subjectId: staged.balanceTransactionId,
     sourceFingerprintSha256: balance!.fingerprintSha256,
     classifierVersion: 1, allocationAlgorithmVersion: 1, replayId: 'c1-a1',
-    correlationId: 'scan-pending-claim-active-predecessor'
+    correlationId: 'scan-pending-claim-historical-predecessor'
   }));
   const ordinary = createFinancialClassificationSubjectJob({
     subjectType: 'balance_transaction', subjectId: staged.balanceTransactionId,

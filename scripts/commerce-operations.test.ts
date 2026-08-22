@@ -1377,6 +1377,7 @@ describe('commerce operations contract', () => {
       'financial_fee_component_conservation',
       'refund_reporting_correction_item_semantics',
       'refund_reporting_correction_history_semantics',
+      'dispute_v2_reinstatement_component_parity',
       'dispute_presentment_child_cardinality',
       'dispute_first_withdrawal_source_principal',
       'pending_replay_child_count_mismatch',
@@ -1544,12 +1545,29 @@ describe('commerce operations contract', () => {
       "component_parent_classification.classification = 'dispute_withdrawal'",
       "i.component in ('dispute_subtotal', 'dispute_tax')",
       "component_parent_classification.classification = 'dispute_reinstatement'",
-      "i.component = 'dispute_reinstatement'",
       "component_parent_classification.classification = 'fee_credit'",
       "i.component = 'fee_credit'",
       'component_detail_classification.classification::text = i.component::text'
     ]) {
       expect(financialVerifier, componentRule).toContain(componentRule);
+    }
+    expect(financialVerifier).toMatch(
+      /component_parent_classification\.classification = 'dispute_reinstatement'[\s\S]*s\.algorithm_version = 1[\s\S]*i\.component = 'dispute_reinstatement'[\s\S]*s\.algorithm_version = 2[\s\S]*i\.component in \('dispute_reinstatement', 'dispute_tax'\)/u
+    );
+    expect(financialVerifier).toMatch(
+      /financial_title_allocation_determinism[\s\S]*classification\.classification = 'dispute_reinstatement'[\s\S]*case original_item\.component[\s\S]*when 'dispute_subtotal' then 'dispute_reinstatement'::financial_component[\s\S]*else 'dispute_tax'::financial_component[\s\S]*original_item\.component in \('dispute_subtotal', 'dispute_tax'\)/u
+    );
+    expect(financialVerifier).toMatch(
+      /financial_title_allocation_determinism[\s\S]*classification\.classification = 'dispute_withdrawal'[\s\S]*join dispute_item_allocations presentment[\s\S]*'dispute_subtotal'[\s\S]*presentment\.subtotal_effect_minor[\s\S]*'dispute_tax'[\s\S]*presentment\.tax_effect_minor/u
+    );
+    for (const v2DisputeRule of [
+      "'dispute_v2_withdrawal_item_sign'",
+      "'dispute_v2_withdrawal_component_membership'",
+      'item.effect_minor > 0',
+      'settlement.tie_break_key is distinct from case settlement.component',
+      'presentment_component.effect_minor <> 0'
+    ]) {
+      expect(financialVerifier, v2DisputeRule).toContain(v2DisputeRule);
     }
     expect(financialVerifier).toMatch(
       /component_detail_classification\.source_fingerprint_sha256\s*=\s*component_detail\.fingerprint_sha256/u
@@ -3264,6 +3282,9 @@ describe('commerce operations contract', () => {
     );
     expect(verifierWitness).toContain('const failWitness = (message: string): never =>');
     expect(verifierWitness).toContain('expected verifier failures ${expected} but received ${actual}');
+    expect(invariantWitnessSource).toMatch(
+      /if \(outcome\.error\) \{\s*const actualFailures = parsedVerifierFailureList\(outcome\.error\);\s*if \(actualFailures !== null\) \{\s*failWitness\(`\$\{name\} unexpectedly failed with \$\{actualFailures\.join\(', '\)\}`\);\s*\}\s*failWitness\(`\$\{name\} unexpectedly failed`\);\s*\}/u
+    );
     expect(verifierWitness).not.toContain('failures.push(');
     expect(verifierWitness).not.toContain('calibrationMismatches');
     expect(verifierWitness).not.toContain('restore-verifier-calibration');
@@ -3375,6 +3396,10 @@ describe('commerce operations contract', () => {
         'refund_reporting_correction_history_semantics=1',
         'reporting_correction_zero_sum=2'
       ]],
+      ['balanced algorithm-v2 reinstatement tax redistribution is not deterministic', [
+        'dispute_v2_reinstatement_component_parity=1',
+        'financial_title_allocation_determinism=1'
+      ]],
       ['first dispute withdrawal presentment/source-principal corruption', [
         'combined_refund_dispute_chronology_capacity=2',
         'dispute_first_withdrawal_source_principal=1',
@@ -3406,6 +3431,14 @@ describe('commerce operations contract', () => {
       ]],
       ['refund and dispute events duplicate the full durable chronology tuple', [
         'combined_refund_dispute_chronology_capacity=3'
+      ]],
+      ['pending-version withdrawal history cannot contain a zero presentment effect', [
+        'dispute_presentment_child_cardinality=1',
+        'dispute_v2_withdrawal_component_membership=1',
+        'financial_title_allocation_determinism=1'
+      ]],
+      ['algorithm-v2 same-currency reinstatement presentment must match settlement components', [
+        'dispute_v2_reinstatement_component_parity=1'
       ]],
       ['reinstatement crosses its withdrawal order item', [
         'combined_refund_dispute_chronology_capacity=1',

@@ -25,8 +25,10 @@ import {
 import { createFinancialClassificationSubjectJob } from '$lib/server/commerce/financial/jobs';
 import {
   loadCurrentEffectiveAllocationProjection,
-  persistFinancialAllocationPlanLocked
+  persistFinancialAllocationPlanLocked,
+  persistFinancialAllocationReplayPlanLocked
 } from '$lib/server/commerce/financial/allocations/repository';
+import { FINANCIAL_ALLOCATION_ALGORITHM_VERSION } from '$lib/server/commerce/financial/constants';
 import { observeFinancialIssue } from '$lib/server/commerce/financial/issues';
 import { lockOrder } from '$lib/server/commerce/lock';
 import { lockPaymentPurchaseFacts } from '$lib/server/commerce/reconciliation';
@@ -84,13 +86,31 @@ async function activateProjectionVersionForFixture(
   `);
 }
 
+async function resetProjectionVersionForFixture(input: {
+  classifierVersion: number;
+  allocationAlgorithmVersion: number;
+  correlationId: string;
+}): Promise<void> {
+  await ownerDatabaseClient.db.execute(sql`truncate table financial_projection_versions`);
+  await ownerDatabaseClient.db.execute(sql`
+    insert into financial_projection_versions
+      (singleton, classifier_version, allocation_algorithm_version,
+        activation_correlation_id)
+    values (true, ${input.classifierVersion}, ${input.allocationAlgorithmVersion},
+      ${input.correlationId})
+  `);
+}
+
 function deferred<Value>() {
   let resolve!: (value: Value) => void;
   const promise = new Promise<Value>((done) => { resolve = done; });
   return { promise, resolve };
 }
 
-async function adjustmentFixture(label: string) {
+async function adjustmentFixture(
+  label: string,
+  algorithmVersion = FINANCIAL_ALLOCATION_ALGORITHM_VERSION
+) {
   const suffix = `${label}_${randomUUID().replaceAll('-', '')}`;
   const staged = await stageBalanceTransaction(databaseClient.db, {
     id: `txn_${suffix}`, livemode: false, sourceFamily: 'adjustment', sourceId: null,
@@ -106,17 +126,24 @@ async function adjustmentFixture(label: string) {
   )).rows[0]!.fingerprint_sha256;
   const common = {
     balanceTransactionId: staged.balanceTransactionId, scope: 'account' as const,
-    currency: 'USD', algorithmVersion: 1, sourceFingerprint: fingerprint,
+    currency: 'USD', algorithmVersion, sourceFingerprint: fingerprint,
     supersedesSetId: null, reversalOfSetId: null, items: []
   };
+  const persist = (transaction: DatabaseTransaction,
+    input: Parameters<typeof persistFinancialAllocationPlanLocked>[1]) =>
+    algorithmVersion === FINANCIAL_ALLOCATION_ALGORITHM_VERSION
+      ? persistFinancialAllocationPlanLocked(transaction, input)
+      : persistFinancialAllocationReplayPlanLocked(transaction, input, {
+          classifierVersion: 1, allocationAlgorithmVersion: algorithmVersion
+        });
   const roots = await databaseClient.db.transaction(async (tx) => [
-    await persistFinancialAllocationPlanLocked(tx, {
+    await persist(tx, {
       sourceKind: 'adjustment', sourceId: staged.balanceTransactionId,
       classificationVersion: 1, correlationId: `${label}-gross`,
       plan: { ...common, allocationIdentity: `adjustment:${suffix}:gross`,
         basis: 'gross_amount', expectedEffectMinor: 25 }
     }),
-    await persistFinancialAllocationPlanLocked(tx, {
+    await persist(tx, {
       sourceKind: 'adjustment', sourceId: staged.balanceTransactionId,
       classificationVersion: 1, correlationId: `${label}-fee`,
       plan: { ...common, allocationIdentity: `adjustment:${suffix}:fee`,
@@ -166,7 +193,7 @@ async function legacyUnknownAdjustmentFixture(label: string) {
 async function chargeFixture(
   label: string,
   withRefund = false,
-  seedVersionOne = true,
+  seedCurrentVersion = true,
   withFeeDetail = false
 ) {
   const suffix = `${label}_${randomUUID().replaceAll('-', '')}`;
@@ -236,10 +263,10 @@ async function chargeFixture(
     : undefined;
   const common = {
     balanceTransactionId: staged.balanceTransactionId, scope: 'title' as const,
-    currency: 'USD', algorithmVersion: 1, sourceFingerprint: fingerprint,
-    supersedesSetId: null, reversalOfSetId: null
+    currency: 'USD', algorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+    sourceFingerprint: fingerprint, supersedesSetId: null, reversalOfSetId: null
   };
-  if (seedVersionOne) await databaseClient.db.transaction(async (tx) => {
+  if (seedCurrentVersion) await databaseClient.db.transaction(async (tx) => {
     await persistFinancialAllocationPlanLocked(tx, {
       sourceKind: 'payment', sourceId: payment.id, classificationVersion: 1,
       correlationId: `${label}-gross`, plan: {
@@ -424,11 +451,80 @@ async function stagedDisputeEvidence(
     fingerprint };
 }
 
+async function taxedDisputeReplayGraph(label: string) {
+  const suffix = `${label}_${randomUUID().replaceAll('-', '')}`;
+  const paidAt = new Date('2026-08-12T00:00:00.000Z');
+  const withdrawalAt = new Date('2026-08-12T00:05:00.000Z');
+  const reinstatementAt = new Date('2026-08-12T00:06:00.000Z');
+  const [guest] = await ownerDatabaseClient.db.insert(guestIdentities).values({
+    email: `${suffix}@example.com`
+  }).returning();
+  if (!guest) throw new Error('Expected taxed replay guest fixture');
+  const [title] = await ownerDatabaseClient.db.insert(titles).values({
+    slug: `taxed-replay-${randomUUID()}`, title: 'Taxed replay title',
+    description: 'Taxed replay description', creatorName: 'Taxed replay creator',
+    format: 'prose', priceMinor: 100, currency: 'USD', visibility: 'private'
+  }).returning();
+  if (!title) throw new Error('Expected taxed replay title fixture');
+  const [order] = await ownerDatabaseClient.db.insert(orders).values({
+    status: 'paid', guestIdentityId: guest.id, purchaseEmail: guest.email,
+    currency: 'USD', subtotalMinor: 100, taxMinor: 10, totalMinor: 110,
+    clientCheckoutAttemptId: randomUUID(), quoteFingerprintSha256: '4'.repeat(64),
+    stripeCheckoutSessionId: `cs_${suffix}`, statusTokenSha256: '5'.repeat(64),
+    checkoutExpiresAt: new Date('2026-08-12T00:30:00.000Z'), paidAt
+  }).returning();
+  if (!order) throw new Error('Expected taxed replay order fixture');
+  const [item] = await ownerDatabaseClient.db.insert(orderItems).values({
+    orderId: order.id, titleId: title.id, titleSnapshot: title.title,
+    creatorNameSnapshot: title.creatorName, format: 'prose', currency: 'USD',
+    unitSubtotalMinor: 100, taxMinor: 10, totalMinor: 110,
+    stripeLineItemId: `li_${suffix}`
+  }).returning();
+  const [payment] = await ownerDatabaseClient.db.insert(payments).values({
+    orderId: order.id, stripePaymentIntentId: `pi_${suffix}`,
+    stripeLatestChargeId: `ch_${suffix}`, status: 'succeeded', amountMinor: 110,
+    currency: 'USD', paymentMethodCategory: 'card', paidAt
+  }).returning();
+  if (!item || !payment) throw new Error('Expected taxed replay purchase fixture');
+  const providerDisputeId = `dp_${suffix}`;
+  const [dispute] = await databaseClient.db.insert(disputes).values({
+    paymentId: payment.id, stripeDisputeId: providerDisputeId, status: 'open',
+    amountMinor: 110, currency: 'USD', reason: 'fraudulent',
+    providerCreatedAt: withdrawalAt, providerUpdatedAt: withdrawalAt
+  }).returning();
+  if (!dispute) throw new Error('Expected taxed replay dispute fixture');
+  return { disputeId: dispute.id, orderItemId: item.id, providerDisputeId,
+    withdrawalAt, reinstatementAt };
+}
+
+async function stageTaxedDisputeReplayBalance(
+  graph: Awaited<ReturnType<typeof taxedDisputeReplayGraph>>,
+  label: string,
+  effect: 'withdrawal' | 'reinstatement'
+) {
+  const withdrawal = effect === 'withdrawal';
+  const staged = await stageBalanceTransaction(databaseClient.db, {
+    id: `txn_${label}_${randomUUID().replaceAll('-', '')}`,
+    livemode: false, sourceFamily: 'dispute', sourceId: graph.providerDisputeId,
+    rawType: 'adjustment', reportingCategory: withdrawal ? 'dispute' : 'dispute_reversal',
+    balanceType: 'payments', amountMinor: withdrawal ? -110 : 110, feeMinor: 0,
+    netMinor: withdrawal ? -110 : 110, currency: 'USD', status: 'available',
+    createdAt: withdrawal ? graph.withdrawalAt : graph.reinstatementAt,
+    availableAt: new Date('2026-08-12T01:00:00.000Z'), exchangeRate: null,
+    exchangeSourceCurrency: null, exchangeTargetCurrency: null, feeDetails: []
+  }, { correlationId: `${label}-stage` });
+  const fingerprint = (await databaseClient.pool.query<{ fingerprint_sha256: string }>(
+    'select fingerprint_sha256 from stripe_balance_transactions where id=$1',
+    [staged.balanceTransactionId]
+  )).rows[0]!.fingerprint_sha256;
+  return { balanceTransactionId: staged.balanceTransactionId, fingerprint };
+}
+
 async function replayFixtureSubject(
   fixture: { balanceTransactionId: string; fingerprint: string },
   correlationId: string,
   classifierVersion = 1,
-  allocationAlgorithmVersion = 1
+  allocationAlgorithmVersion = FINANCIAL_ALLOCATION_ALGORITHM_VERSION
 ): Promise<void> {
   await replayFinancialClassification({
     database: workerDatabaseClient.db,
@@ -631,6 +727,288 @@ describe('financial classifier and allocation-version replay', () => {
     ]);
   });
 
+  it('activates tax-safe c1-a2 dispute successors without mutating c1-a1 history', async () => {
+    await resetProjectionVersionForFixture({
+      classifierVersion: 1, allocationAlgorithmVersion: 1,
+      correlationId: 'reclassification-tax-safe-seed-c1-a1'
+    });
+    await expect(databaseClient.pool.query<{
+      classifier_version: number; allocation_algorithm_version: number;
+      activation_correlation_id: string;
+    }>(`select classifier_version, allocation_algorithm_version,
+          activation_correlation_id
+        from financial_projection_versions where singleton=true`)).resolves.toMatchObject({
+      rows: [{ classifier_version: 1, allocation_algorithm_version: 1,
+        activation_correlation_id: 'reclassification-tax-safe-seed-c1-a1' }]
+    });
+
+    const graph = await taxedDisputeReplayGraph('reclassification-tax-safe');
+    const withdrawal = await stageTaxedDisputeReplayBalance(
+      graph, 'reclassification-tax-safe-withdrawal', 'withdrawal'
+    );
+    await replayFixtureSubject(
+      withdrawal, 'reclassification-tax-safe-withdrawal-c1-a1', 1, 1
+    );
+    await databaseClient.db.update(disputes).set({
+      status: 'won', providerUpdatedAt: graph.reinstatementAt
+    }).where(eq(disputes.id, graph.disputeId));
+    const reinstatement = await stageTaxedDisputeReplayBalance(
+      graph, 'reclassification-tax-safe-reinstatement', 'reinstatement'
+    );
+    await replayFixtureSubject(
+      reinstatement, 'reclassification-tax-safe-reinstatement-c1-a1', 1, 1
+    );
+
+    type AllocationSetRow = {
+      id: string; provider_id: string; basis: 'gross_amount' | 'fee';
+      expected_effect_minor: number; algorithm_version: number; classifier_version: number;
+      supersedes_set_id: string | null; reversal_of_set_id: string | null;
+    };
+    type AllocationItemRow = {
+      provider_id: string; allocation_set_id: string; order_item_id: string;
+      component: string; effect_minor: number; currency: string;
+    };
+    const loadVersionedSets = (algorithmVersion: number) =>
+      databaseClient.pool.query<AllocationSetRow>(
+        `select allocation.id, balance.provider_id, allocation.basis,
+           allocation.expected_effect_minor, allocation.algorithm_version,
+           allocation.classifier_version, allocation.supersedes_set_id,
+           allocation.reversal_of_set_id
+         from financial_allocation_sets allocation
+         join stripe_balance_transactions balance
+           on balance.id=allocation.balance_transaction_id
+         where allocation.source_kind='dispute'
+           and allocation.source_internal_id=$1
+           and allocation.algorithm_version=$2
+         order by balance.provider_created_at, balance.provider_id,
+           case allocation.basis when 'gross_amount' then 0 else 1 end`,
+        [graph.disputeId, algorithmVersion]
+      );
+    const loadVersionedItems = (algorithmVersion: number) =>
+      databaseClient.pool.query<AllocationItemRow>(
+        `select balance.provider_id, item.allocation_set_id, item.order_item_id,
+           item.component, item.effect_minor, item.currency
+         from financial_item_allocations item
+         join financial_allocation_sets allocation on allocation.id=item.allocation_set_id
+         join stripe_balance_transactions balance
+           on balance.id=allocation.balance_transaction_id
+         where allocation.source_kind='dispute'
+           and allocation.source_internal_id=$1
+           and allocation.algorithm_version=$2
+         order by balance.provider_created_at, balance.provider_id,
+           item.order_item_id, item.component`,
+        [graph.disputeId, algorithmVersion]
+      );
+    const loadImmutableV1History = async () => ({
+      sets: (await databaseClient.pool.query<Record<string, unknown>>(
+        `select allocation.* from financial_allocation_sets allocation
+         where allocation.source_kind='dispute'
+           and allocation.source_internal_id=$1 and allocation.algorithm_version=1
+         order by allocation.id`, [graph.disputeId]
+      )).rows,
+      items: (await databaseClient.pool.query<Record<string, unknown>>(
+        `select item.* from financial_item_allocations item
+         join financial_allocation_sets allocation on allocation.id=item.allocation_set_id
+         where allocation.source_kind='dispute'
+           and allocation.source_internal_id=$1 and allocation.algorithm_version=1
+         order by item.allocation_set_id, item.id`, [graph.disputeId]
+      )).rows
+    });
+    const v1Sets = (await loadVersionedSets(1)).rows;
+    const v1Items = (await loadVersionedItems(1)).rows;
+    expect(v1Sets).toHaveLength(4);
+    expect(v1Sets.every((row) => row.classifier_version === 1 &&
+      row.algorithm_version === 1)).toBe(true);
+    expect(v1Items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ provider_id: expect.stringContaining('withdrawal'),
+        order_item_id: graph.orderItemId, component: 'dispute_subtotal', effect_minor: -100 }),
+      expect.objectContaining({ provider_id: expect.stringContaining('withdrawal'),
+        order_item_id: graph.orderItemId, component: 'dispute_tax', effect_minor: -10 }),
+      expect.objectContaining({ provider_id: expect.stringContaining('reinstatement'),
+        order_item_id: graph.orderItemId, component: 'dispute_reinstatement',
+        effect_minor: 110 })
+    ]));
+    expect(v1Items).toHaveLength(3);
+    const v1HistoryBefore = await loadImmutableV1History();
+    const v1WithdrawalGross = v1Sets.find((row) =>
+      row.provider_id.includes('withdrawal') && row.basis === 'gross_amount');
+    const v1ReinstatementGross = v1Sets.find((row) =>
+      row.provider_id.includes('reinstatement') && row.basis === 'gross_amount');
+    if (!v1WithdrawalGross || !v1ReinstatementGross) {
+      throw new Error('Expected complete c1-a1 dispute history');
+    }
+    expect(v1ReinstatementGross.reversal_of_set_id).toBe(v1WithdrawalGross.id);
+
+    const pending = await startOrResumeFinancialScan(databaseClient.db, {
+      kind: 'composite_replay', classifierVersion: 1,
+      allocationAlgorithmVersion: 2, replayId: 'c1-a2'
+    });
+    const page = await loadClassificationReplayPage(databaseClient.db, pending, 100);
+    expect(page.hasMore).toBe(false);
+    const children = page.data.map((subject) => createFinancialClassificationSubjectJob({
+      ...subject, classifierVersion: 1, allocationAlgorithmVersion: 2,
+      scanRunId: pending.id
+    }));
+    expect(children).toHaveLength(2);
+    expect(children.map((child) => child.payload.subjectId)).toEqual(expect.arrayContaining([
+      withdrawal.balanceTransactionId, reinstatement.balanceTransactionId
+    ]));
+    const sealed = await commitFinancialScanPage(databaseClient.db, {
+      runId: pending.id, expectedPhase: 'classification_replay_page',
+      expectedCheckpoint: null, expectedPageCount: 0,
+      nextPhase: 'classification_replay_page', nextCheckpoint: null,
+      processedCount: page.data.length, children, complete: true
+    });
+    await expect(databaseClient.pool.query<{
+      classifier_version: number; allocation_algorithm_version: number;
+      pending_classifier_version: number | null;
+      pending_allocation_algorithm_version: number | null;
+      pending_replay_id: string | null; pending_scan_run_id: string | null;
+    }>(`select classifier_version, allocation_algorithm_version,
+          pending_classifier_version, pending_allocation_algorithm_version,
+          pending_replay_id, pending_scan_run_id
+        from financial_projection_versions where singleton=true`)).resolves.toMatchObject({
+      rows: [{ classifier_version: 1, allocation_algorithm_version: 1,
+        pending_classifier_version: 1, pending_allocation_algorithm_version: 2,
+        pending_replay_id: 'c1-a2', pending_scan_run_id: pending.id }]
+    });
+
+    const childBySubject = new Map(children.map((child) =>
+      [child.payload.subjectId, child] as const));
+    const orderedChildren = [withdrawal.balanceTransactionId, reinstatement.balanceTransactionId]
+      .map((subjectId) => childBySubject.get(subjectId));
+    if (orderedChildren.some((child) => child === undefined)) {
+      throw new Error('Expected both c1-a2 dispute replay children');
+    }
+    for (const child of orderedChildren) {
+      await replayFinancialClassification({
+        database: workerDatabaseClient.db, targetClassifierVersion: 1,
+        targetAllocationAlgorithmVersion: 2
+      }, {
+        payload: child!.payload,
+        correlationId: `reclassification-tax-safe-c1-a2-${child!.payload.subjectId}`,
+        signal: new AbortController().signal
+      });
+      await databaseClient.pool.query(
+        `update jobs set status='succeeded', attempts=1, completed_at=now(),
+           locked_at=null, locked_by=null, last_error=null
+         where deduplication_key=$1`, [child!.deduplicationKey]
+      );
+    }
+
+    const v2HistoryBeforeRetry = {
+      sets: (await databaseClient.pool.query<Record<string, unknown>>(
+        `select allocation.* from financial_allocation_sets allocation
+         where allocation.source_kind='dispute'
+           and allocation.source_internal_id=$1 and allocation.algorithm_version=2
+         order by allocation.id`, [graph.disputeId]
+      )).rows,
+      items: (await databaseClient.pool.query<Record<string, unknown>>(
+        `select item.* from financial_item_allocations item
+         join financial_allocation_sets allocation on allocation.id=item.allocation_set_id
+         where allocation.source_kind='dispute'
+           and allocation.source_internal_id=$1 and allocation.algorithm_version=2
+         order by item.allocation_set_id, item.id`, [graph.disputeId]
+      )).rows
+    };
+    const reinstatementChild = childBySubject.get(reinstatement.balanceTransactionId);
+    if (!reinstatementChild) throw new Error('Expected c1-a2 reinstatement child');
+    await replayFinancialClassification({
+      database: workerDatabaseClient.db, targetClassifierVersion: 1,
+      targetAllocationAlgorithmVersion: 2
+    }, {
+      payload: reinstatementChild.payload,
+      correlationId: 'reclassification-tax-safe-c1-a2-reinstatement-retry',
+      signal: new AbortController().signal
+    });
+    expect({
+      sets: (await databaseClient.pool.query<Record<string, unknown>>(
+        `select allocation.* from financial_allocation_sets allocation
+         where allocation.source_kind='dispute'
+           and allocation.source_internal_id=$1 and allocation.algorithm_version=2
+         order by allocation.id`, [graph.disputeId]
+      )).rows,
+      items: (await databaseClient.pool.query<Record<string, unknown>>(
+        `select item.* from financial_item_allocations item
+         join financial_allocation_sets allocation on allocation.id=item.allocation_set_id
+         where allocation.source_kind='dispute'
+           and allocation.source_internal_id=$1 and allocation.algorithm_version=2
+         order by item.allocation_set_id, item.id`, [graph.disputeId]
+      )).rows
+    }).toEqual(v2HistoryBeforeRetry);
+
+    await expect(finalizeFinancialReplay(databaseClient.db, {
+      runId: pending.id, expectedCursorDigestSha256: sealed.cursorDigestSha256!,
+      expectedPageCount: sealed.pageCount, classifierVersion: 1,
+      allocationAlgorithmVersion: 2,
+      correlationId: 'reclassification-tax-safe-activate-c1-a2'
+    })).resolves.toMatchObject({ state: 'completed', safeOutcome: 'completed' });
+
+    expect(await loadImmutableV1History()).toEqual(v1HistoryBefore);
+    const v2Sets = (await loadVersionedSets(2)).rows;
+    const v2Items = (await loadVersionedItems(2)).rows;
+    expect(v2Sets).toHaveLength(4);
+    expect(v2Sets.every((row) => row.classifier_version === 1 &&
+      row.algorithm_version === 2)).toBe(true);
+    const v2WithdrawalGross = v2Sets.find((row) =>
+      row.provider_id.includes('withdrawal') && row.basis === 'gross_amount');
+    const v2ReinstatementGross = v2Sets.find((row) =>
+      row.provider_id.includes('reinstatement') && row.basis === 'gross_amount');
+    if (!v2WithdrawalGross || !v2ReinstatementGross) {
+      throw new Error('Expected complete c1-a2 dispute successors');
+    }
+    expect(v2WithdrawalGross.supersedes_set_id).toBe(v1WithdrawalGross.id);
+    expect(v2ReinstatementGross.supersedes_set_id).toBe(v1ReinstatementGross.id);
+    expect(v2ReinstatementGross.reversal_of_set_id).toBe(v2WithdrawalGross.id);
+    expect(v2Items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ provider_id: expect.stringContaining('withdrawal'),
+        allocation_set_id: v2WithdrawalGross.id, order_item_id: graph.orderItemId,
+        component: 'dispute_subtotal', effect_minor: -100, currency: 'USD' }),
+      expect.objectContaining({ provider_id: expect.stringContaining('withdrawal'),
+        allocation_set_id: v2WithdrawalGross.id, order_item_id: graph.orderItemId,
+        component: 'dispute_tax', effect_minor: -10, currency: 'USD' }),
+      expect.objectContaining({ provider_id: expect.stringContaining('reinstatement'),
+        allocation_set_id: v2ReinstatementGross.id, order_item_id: graph.orderItemId,
+        component: 'dispute_reinstatement', effect_minor: 100, currency: 'USD' }),
+      expect.objectContaining({ provider_id: expect.stringContaining('reinstatement'),
+        allocation_set_id: v2ReinstatementGross.id, order_item_id: graph.orderItemId,
+        component: 'dispute_tax', effect_minor: 10, currency: 'USD' })
+    ]));
+    expect(v2Items).toHaveLength(4);
+
+    await expect(databaseClient.pool.query<{
+      classifier_version: number; allocation_algorithm_version: number;
+      pending_replay_id: string | null; pending_scan_run_id: string | null;
+      activation_correlation_id: string;
+    }>(`select classifier_version, allocation_algorithm_version,
+          pending_replay_id, pending_scan_run_id, activation_correlation_id
+        from financial_projection_versions where singleton=true`)).resolves.toMatchObject({
+      rows: [{ classifier_version: 1, allocation_algorithm_version: 2,
+        pending_replay_id: null, pending_scan_run_id: null,
+        activation_correlation_id: 'reclassification-tax-safe-activate-c1-a2' }]
+    });
+    const current = await loadCurrentEffectiveAllocationProjection(databaseClient.db, {
+      balanceTransactionIds: [withdrawal.balanceTransactionId,
+        reinstatement.balanceTransactionId]
+    });
+    expect(current).toHaveLength(4);
+    expect(current.every((head) => head.status === 'complete')).toBe(true);
+    expect(new Set(current.flatMap((head) => head.status === 'complete'
+      ? [head.baseSetId] : []))).toEqual(new Set(v2Sets.map((row) => row.id)));
+    const currentReinstatement = current.find((head) =>
+      head.status === 'complete' && head.balanceTransactionId === reinstatement.balanceTransactionId &&
+      head.basis === 'gross_amount');
+    expect(currentReinstatement).toMatchObject({
+      status: 'complete', baseSetId: v2ReinstatementGross.id, expectedEffectMinor: 110,
+      items: expect.arrayContaining([
+        expect.objectContaining({ orderItemId: graph.orderItemId,
+          component: 'dispute_reinstatement', effectMinor: 100 }),
+        expect.objectContaining({ orderItemId: graph.orderItemId,
+          component: 'dispute_tax', effectMinor: 10 })
+      ])
+    });
+  }, 20_000);
+
   it('uses active markers while one deployed worker replays dispute-to-refund dependencies', async () => {
     const graph = await correctionRebaseGraph('reclassification-job-ordering');
     const refund = await finalizedRefundEvidence(
@@ -640,7 +1018,8 @@ describe('financial classifier and allocation-version replay', () => {
     const activeSpec = createFinancialClassificationSubjectJob({
       subjectType: 'balance_transaction', subjectId: refund.balanceTransactionId,
       sourceFingerprintSha256: refund.fingerprint,
-      classifierVersion: 1, allocationAlgorithmVersion: 1
+      classifierVersion: 1,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
     });
     const activeQueued = await enqueueJob(databaseClient.db, {
       ...activeSpec, payload: activeSpec.payload as never, runAt: new Date(0)
@@ -819,11 +1198,13 @@ describe('financial classifier and allocation-version replay', () => {
 
     const c3 = await startOrResumeFinancialScan(databaseClient.db, {
       kind: 'composite_replay', classifierVersion: 3,
-      allocationAlgorithmVersion: 3, replayId: 'c3-a3'
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+      replayId: 'c3-a2'
     });
     const c3Page = await loadClassificationReplayPage(databaseClient.db, c3, 100);
     const c3Children = c3Page.data.map((subject) => createFinancialClassificationSubjectJob({
-      ...subject, classifierVersion: 3, allocationAlgorithmVersion: 3,
+      ...subject, classifierVersion: 3,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
       scanRunId: c3.id
     }));
     const c3Sealed = await commitFinancialScanPage(databaseClient.db, {
@@ -836,7 +1217,7 @@ describe('financial classifier and allocation-version replay', () => {
       candidate.payload.subjectId !== refund.balanceTransactionId)) {
       await replayFinancialClassification({
         database: databaseClient.db, targetClassifierVersion: 3,
-        targetAllocationAlgorithmVersion: 3
+        targetAllocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
       }, {
         payload: child.payload,
         correlationId: `reclassification-historical-scan-id-c3-${child.payload.subjectId}`,
@@ -866,7 +1247,8 @@ describe('financial classifier and allocation-version replay', () => {
     const now = new Date('2099-08-14T12:00:00.000Z');
     const c3Repository = createPostgresJobRepository(
       databaseClient.db, applicationConfig.jobs, () => now, 'all',
-      { classifierVersion: 3, allocationAlgorithmVersion: 3 }
+      { classifierVersion: 3,
+        allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION }
     );
     await expect(loadCurrentEffectiveAllocationProjection(databaseClient.db, {
       balanceTransactionIds: [refund.balanceTransactionId]
@@ -882,12 +1264,13 @@ describe('financial classifier and allocation-version replay', () => {
       id: expect.any(String),
       payload: expect.objectContaining({
         subjectId: refund.balanceTransactionId, scanRunId: c3.id,
-        classifierVersion: 3, allocationAlgorithmVersion: 3
+        classifierVersion: 3,
+        allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
       })
     });
     await expect(replayFinancialClassification({
       database: databaseClient.db, targetClassifierVersion: 3,
-      targetAllocationAlgorithmVersion: 3
+      targetAllocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
     }, {
       payload: c3Claim!.payload as never,
       correlationId: 'reclassification-historical-scan-id-replay-c3',
@@ -903,7 +1286,7 @@ describe('financial classifier and allocation-version replay', () => {
     await expect(finalizeFinancialReplay(databaseClient.db, {
       runId: c3.id, expectedCursorDigestSha256: c3Sealed.cursorDigestSha256!,
       expectedPageCount: c3Sealed.pageCount, classifierVersion: 3,
-      allocationAlgorithmVersion: 3,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
       correlationId: 'reclassification-historical-scan-id-activate-c3'
     })).resolves.toMatchObject({ state: 'completed', safeOutcome: 'completed' });
     await expect(c3Repository.complete(finalizer!.id, finalizerWorker)).resolves.toBe(true);
@@ -918,7 +1301,7 @@ describe('financial classifier and allocation-version replay', () => {
     });
     await expect(replayFinancialClassification({
       database: databaseClient.db, targetClassifierVersion: 3,
-      targetAllocationAlgorithmVersion: 3
+      targetAllocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
     }, {
       payload: c2Cleanup!.payload as never,
       correlationId: 'reclassification-historical-scan-id-cleanup-c2',
@@ -958,7 +1341,8 @@ describe('financial classifier and allocation-version replay', () => {
         createFinancialClassificationSubjectJob({
           subjectType: 'balance_transaction', subjectId: fixture.balanceTransactionId,
           sourceFingerprintSha256: fixture.fingerprint,
-          classifierVersion: 1, allocationAlgorithmVersion: 1
+          classifierVersion: 1,
+          allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
         }));
     });
 
@@ -976,7 +1360,8 @@ describe('financial classifier and allocation-version replay', () => {
     const spec = createFinancialClassificationSubjectJob({
       subjectType: 'balance_transaction', subjectId: fixture.balanceTransactionId,
       sourceFingerprintSha256: fixture.fingerprint,
-      classifierVersion: 1, allocationAlgorithmVersion: 1
+      classifierVersion: 1,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
     });
     await databaseClient.db.transaction((transaction) =>
       rearmFinancialClassificationJob(transaction, spec)
@@ -1001,11 +1386,17 @@ describe('financial classifier and allocation-version replay', () => {
   });
 
   it('orders a claimed pending replay behind finalization and recovers only at its target version', async () => {
+    await resetProjectionVersionForFixture({
+      classifierVersion: 1, allocationAlgorithmVersion: 1,
+      correlationId: 'reclassification-finalized-upgrade-order-seed-c1-a1'
+    });
     const graph = await correctionRebaseGraph('reclassification-finalized-upgrade-order');
     const refund = await finalizedRefundEvidence(
       graph, 'reclassification-finalized-upgrade-order-refund', [50, 50], 'draft'
     );
-    await replayFixtureSubject(refund, 'reclassification-finalized-upgrade-order-c1');
+    await replayFixtureSubject(
+      refund, 'reclassification-finalized-upgrade-order-c1', 1, 1
+    );
     await expect(databaseClient.pool.query<{
       classifier_version: number; algorithm_version: number; scope: string;
     }>(`select classifier_version, algorithm_version, scope
@@ -1279,7 +1670,8 @@ describe('financial classifier and allocation-version replay', () => {
           pending_classifier_version,
           pending_allocation_algorithm_version
         from financial_projection_versions where singleton=true`)).resolves.toMatchObject({ rows: [{
-      classifier_version: 1, algorithm_version: 1,
+      classifier_version: 1,
+      algorithm_version: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
       pending_classifier_version: 2, pending_allocation_algorithm_version: 2
     }] });
     await expect(loadCurrentEffectiveAllocationProjection(databaseClient.db, {
@@ -1323,7 +1715,7 @@ describe('financial classifier and allocation-version replay', () => {
     const disputeGross = await databaseClient.pool.query<{ id: string }>(
       `select id from financial_allocation_sets
        where balance_transaction_id=$1 and basis='gross_amount'
-         and classifier_version=1 and algorithm_version=1`,
+         and classifier_version=1 and algorithm_version=2`,
       [withdrawal.balanceTransactionId]
     );
     expect(disputeGross.rows).toHaveLength(1);
@@ -1339,7 +1731,8 @@ describe('financial classifier and allocation-version replay', () => {
     await replayFixtureSubject(withdrawal, 'reclassification-dispute-exposure-revalidated');
     const refundRepository = createPostgresJobRepository(
       databaseClient.db, applicationConfig.jobs, () => new Date(), 'all',
-      { classifierVersion: 1, allocationAlgorithmVersion: 1 }
+      { classifierVersion: 1,
+        allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION }
     );
     await databaseClient.pool.query(
       `update jobs set run_at='2200-01-01T00:00:00.000Z'
@@ -1350,11 +1743,11 @@ describe('financial classifier and allocation-version replay', () => {
     const refundClaim = await refundRepository.claimNext(refundWorker);
     expect(refundClaim).toMatchObject({ payload: expect.objectContaining({
       subjectId: refund.balanceTransactionId, classifierVersion: 1,
-      allocationAlgorithmVersion: 1
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
     }) });
     await expect(replayFinancialClassification({
       database: workerDatabaseClient.db, targetClassifierVersion: 1,
-      targetAllocationAlgorithmVersion: 1
+      targetAllocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
     }, {
       payload: refundClaim!.payload as never,
       correlationId: 'reclassification-refund-dependency-recovered',
@@ -1449,7 +1842,7 @@ describe('financial classifier and allocation-version replay', () => {
          (allocation_identity, balance_transaction_id, source_kind, source_internal_id,
           basis, scope, expected_effect_minor, currency, algorithm_version,
           classifier_version, source_fingerprint_sha256)
-       values ($1, $2, 'dispute', $3, 'gross_amount', 'title', 0, 'USD', 1, 1, $4)
+       values ($1, $2, 'dispute', $3, 'gross_amount', 'title', 0, 'USD', 2, 1, $4)
        returning id`,
       [`fee-credit-rogue:${feeCredit.disputeId}:${randomUUID()}`,
         feeCredit.balanceTransactionId, feeCredit.disputeId, feeCredit.fingerprint]
@@ -1490,7 +1883,7 @@ describe('financial classifier and allocation-version replay', () => {
          (allocation_identity, balance_transaction_id, source_kind, source_internal_id,
           basis, scope, expected_effect_minor, currency, algorithm_version,
           classifier_version, source_fingerprint_sha256)
-       values ($1, $2, 'dispute', $3, 'gross_amount', 'account', 0, 'USD', 1, 1, $4)`,
+       values ($1, $2, 'dispute', $3, 'gross_amount', 'account', 0, 'USD', 2, 1, $4)`,
       [`dispute-raw-fork:${withdrawal.disputeId}:${randomUUID()}`,
         withdrawal.balanceTransactionId, withdrawal.disputeId, 'f'.repeat(64)]
     );
@@ -1507,7 +1900,11 @@ describe('financial classifier and allocation-version replay', () => {
   });
 
   it('appends a target decision and successor sets without editing version-one history', async () => {
-    const fixture = await adjustmentFixture('reclassification-append');
+    await resetProjectionVersionForFixture({
+      classifierVersion: 1, allocationAlgorithmVersion: 1,
+      correlationId: 'reclassification-append-seed-c1-a1'
+    });
+    const fixture = await adjustmentFixture('reclassification-append', 1);
     const result = await databaseClient.db.transaction(async (tx) => {
       await activateProjectionVersionForFixture(tx, {
         classifierVersion: 2, allocationAlgorithmVersion: 3,
@@ -1841,12 +2238,14 @@ describe('financial classifier and allocation-version replay', () => {
     if (!grossSetId) throw new Error('Expected gross allocation set');
     const forkRepository = createPostgresJobRepository(
       databaseClient.db, applicationConfig.jobs, () => new Date(), 'all',
-      { classifierVersion: 1, allocationAlgorithmVersion: 1 }
+      { classifierVersion: 1,
+        allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION }
     );
     const forkMarker = createFinancialClassificationSubjectJob({
       subjectType: 'balance_transaction', subjectId: fixture.balanceTransactionId,
       sourceFingerprintSha256: fixture.fingerprint,
-      classifierVersion: 1, allocationAlgorithmVersion: 1
+      classifierVersion: 1,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
     });
     await enqueueJob(databaseClient.db, {
       ...forkMarker, payload: forkMarker.payload as never, runAt: new Date(0)
@@ -1855,11 +2254,11 @@ describe('financial classifier and allocation-version replay', () => {
     const forkClaim = await forkRepository.claimNext(forkWorker);
     expect(forkClaim).toMatchObject({ payload: expect.objectContaining({
       subjectId: fixture.balanceTransactionId, classifierVersion: 1,
-      allocationAlgorithmVersion: 1
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
     }) });
     await expect(replayFinancialClassification({
       database: databaseClient.db, targetClassifierVersion: 1,
-      targetAllocationAlgorithmVersion: 1
+      targetAllocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
     }, {
       payload: forkClaim!.payload as never,
       correlationId: 'reclassification-fail-closed-marker-run',
@@ -1923,7 +2322,7 @@ describe('financial classifier and allocation-version replay', () => {
     const fixture = await adjustmentFixture('reclassification-pending-decision-fork');
     await startOrResumeFinancialScan(databaseClient.db, {
       kind: 'composite_replay', classifierVersion: 2,
-      allocationAlgorithmVersion: 1, replayId: 'c2-a1'
+      allocationAlgorithmVersion: 2, replayId: 'c2-a2'
     });
     await databaseClient.db.transaction((tx) => appendClassificationDecisionLocked(tx, {
       subjectType: 'balance_transaction', subjectId: fixture.balanceTransactionId,
@@ -1936,7 +2335,7 @@ describe('financial classifier and allocation-version replay', () => {
       replayFinancialClassificationLocked(tx, {
         subjectType: 'balance_transaction', subjectId: fixture.balanceTransactionId,
         sourceFingerprintSha256: fixture.fingerprint, classifierVersion: 2,
-        allocationAlgorithmVersion: 1, replayId: 'c2-a1',
+        allocationAlgorithmVersion: 2, replayId: 'c2-a2',
         correlationId: 'reclassification-pending-fork-replay'
       }))).resolves.toEqual({ status: 'exception',
         subjectId: fixture.balanceTransactionId,
@@ -1969,14 +2368,16 @@ describe('financial classifier and allocation-version replay', () => {
     const oldGross = await insertRefundAllocationSet({
       label: 'correction-issue-scope-old-gross', refundId: target.refundId,
       balanceTransactionId: target.balanceTransactionId, fingerprint: target.fingerprint,
-      expectedEffectMinor: -100, classifierVersion: 1, algorithmVersion: 1,
+      expectedEffectMinor: -100, classifierVersion: 1,
+      algorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
       items: [{ orderItemId: graph.itemA, effectMinor: -50 },
         { orderItemId: graph.itemB, effectMinor: -50 }]
     });
     await insertRefundAllocationSet({
       label: 'correction-issue-scope-old-fee', refundId: target.refundId,
       balanceTransactionId: target.balanceTransactionId, fingerprint: target.fingerprint,
-      expectedEffectMinor: 0, classifierVersion: 1, algorithmVersion: 1,
+      expectedEffectMinor: 0, classifierVersion: 1,
+      algorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
       basis: 'fee', items: []
     });
     const correction = await insertRefundCorrection({
@@ -2065,7 +2466,8 @@ describe('financial classifier and allocation-version replay', () => {
     const targetOld = await insertRefundAllocationSet({
       label: 'capacity-target-old', refundId: target.refundId,
       balanceTransactionId: target.balanceTransactionId, fingerprint: target.fingerprint,
-      expectedEffectMinor: -50, classifierVersion: 1, algorithmVersion: 1,
+      expectedEffectMinor: -50, classifierVersion: 1,
+      algorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
       items: [{ orderItemId: graph.itemA, effectMinor: -20 },
         { orderItemId: graph.itemB, effectMinor: -30 }]
     });
@@ -2127,7 +2529,8 @@ describe('financial classifier and allocation-version replay', () => {
     const oldGross = await insertRefundAllocationSet({
       label: 'pending-correction-old', refundId: target.refundId,
       balanceTransactionId: target.balanceTransactionId, fingerprint: target.fingerprint,
-      expectedEffectMinor: -100, classifierVersion: 1, algorithmVersion: 1,
+      expectedEffectMinor: -100, classifierVersion: 1,
+      algorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
       items: [{ orderItemId: graph.itemA, effectMinor: -50 },
         { orderItemId: graph.itemB, effectMinor: -50 }]
     });
@@ -2182,7 +2585,8 @@ describe('financial classifier and allocation-version replay', () => {
     const targetOld = await insertRefundAllocationSet({
       label: 'omitted-target-old', refundId: target.refundId,
       balanceTransactionId: target.balanceTransactionId, fingerprint: target.fingerprint,
-      expectedEffectMinor: -100, classifierVersion: 1, algorithmVersion: 1,
+      expectedEffectMinor: -100, classifierVersion: 1,
+      algorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
       items: [{ orderItemId: graph.itemA, effectMinor: -50 },
         { orderItemId: graph.itemB, effectMinor: -50 }]
     });

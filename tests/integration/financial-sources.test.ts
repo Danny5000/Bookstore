@@ -3,6 +3,11 @@ import { and, eq, inArray, or, sql } from 'drizzle-orm';
 import { describe, expect, it, vi } from 'vitest';
 import type { StripeCommerceGateway } from '$lib/server/commerce/stripe/types';
 import { PermanentCommerceError } from '$lib/server/commerce/errors';
+import {
+  FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+  FINANCIAL_CLASSIFIER_VERSION,
+  FINANCIAL_REPLAY_ID
+} from '$lib/server/commerce/financial/constants';
 import { createFixtureStripeGateway } from '$lib/server/commerce/stripe/fixture-gateway';
 import { reconcilePaymentFinancialSource } from '$lib/server/commerce/financial/sources/payment';
 import { reconcileRefundFinancialSource } from '$lib/server/commerce/financial/sources/refund';
@@ -144,8 +149,8 @@ describe('payment financial source', () => {
     const sets = await databaseClient.db.select().from(financialAllocationSets)
       .where(eq(financialAllocationSets.sourceInternalId, fixture.payment.id));
     expect(sets.map((set) => set.allocationIdentity).sort()).toEqual([
-      `payment:${fixture.payment.id}:${sets[0]!.balanceTransactionId}:replay:c1-a1:fee`,
-      `payment:${fixture.payment.id}:${sets[0]!.balanceTransactionId}:replay:c1-a1:gross`
+      `payment:${fixture.payment.id}:${sets[0]!.balanceTransactionId}:replay:${FINANCIAL_REPLAY_ID}:fee`,
+      `payment:${fixture.payment.id}:${sets[0]!.balanceTransactionId}:replay:${FINANCIAL_REPLAY_ID}:gross`
     ].sort());
     const allocations = await databaseClient.db.select({ effectMinor: financialItemAllocations.effectMinor })
       .from(financialItemAllocations).innerJoin(financialAllocationSets, eq(
@@ -583,7 +588,8 @@ describe('payment financial source', () => {
       allocationIdentity: `payment:${fixture.payment.id}:${staged.balanceTransactionId}:fee`,
       balanceTransactionId: staged.balanceTransactionId, sourceKind: 'payment',
       sourceInternalId: fixture.payment.id, basis: 'fee', scope: 'title', expectedEffectMinor: -69,
-      currency: 'USD', algorithmVersion: 1, classifierVersion: 1,
+      currency: 'USD', algorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+      classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
       sourceFingerprintSha256: stored.fingerprintSha256
     });
     const stripe = createFixtureStripeGateway();
@@ -832,7 +838,8 @@ describe('refund and dispute financial sources', () => {
     const spec = createFinancialClassificationSubjectJob({
       subjectType: 'balance_transaction', subjectId: balance.id,
       sourceFingerprintSha256: balance.fingerprintSha256,
-      classifierVersion: 1, allocationAlgorithmVersion: 1
+      classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
     });
     const updated = await databaseClient.db.update(jobs).set({
       status: 'succeeded', attempts: 1, completedAt: new Date(),
@@ -1323,13 +1330,15 @@ describe('refund and dispute financial sources', () => {
     if (!laterBalance) throw new Error('Expected persisted later withdrawal');
     await expect(replayFinancialClassification({
       database: databaseClient.db,
-      targetClassifierVersion: 1,
-      targetAllocationAlgorithmVersion: 1
+      targetClassifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      targetAllocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
     }, {
       payload: {
         subjectType: 'balance_transaction', subjectId: laterBalance.id,
         sourceFingerprintSha256: laterBalance.fingerprintSha256,
-        classifierVersion: 1, allocationAlgorithmVersion: 1, replayId: 'c1-a1'
+        classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+        allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+        replayId: FINANCIAL_REPLAY_ID
       },
       correlationId: `dispute-rewithdrawal-replay-${fixture.suffix}`,
       signal: new AbortController().signal
@@ -1906,7 +1915,8 @@ describe('refund and dispute financial sources', () => {
     const refundProjectionSpec = createFinancialClassificationSubjectJob({
       subjectType: 'balance_transaction', subjectId: refundBalance.id,
       sourceFingerprintSha256: refundBalance.fingerprintSha256,
-      classifierVersion: 1, allocationAlgorithmVersion: 1
+      classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
     });
     await databaseClient.db.update(jobs).set({
       status: 'succeeded', attempts: 7, completedAt: refundAt,
@@ -1949,13 +1959,15 @@ describe('refund and dispute financial sources', () => {
     for (const subject of replaySubjects) {
       await expect(replayFinancialClassification({
         database: databaseClient.db,
-        targetClassifierVersion: 1,
-        targetAllocationAlgorithmVersion: 1
+        targetClassifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+        targetAllocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
       }, {
         payload: {
           subjectType: 'balance_transaction', subjectId: subject.id,
           sourceFingerprintSha256: subject.fingerprint,
-          classifierVersion: 1, allocationAlgorithmVersion: 1, replayId: 'c1-a1'
+          classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+          allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+          replayId: FINANCIAL_REPLAY_ID
         },
         correlationId: `interleaved-replay-${subject.id}`,
         signal: new AbortController().signal

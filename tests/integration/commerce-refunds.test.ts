@@ -5,6 +5,11 @@ import { createCommerceMessageEnqueuer } from '$lib/server/commerce/email/enqueu
 import { parseCommerceEmailPayload } from '$lib/server/commerce/email/payload';
 import { PermanentCommerceError } from '$lib/server/commerce/errors';
 import {
+  FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+  FINANCIAL_CLASSIFIER_VERSION,
+  FINANCIAL_REPLAY_ID
+} from '$lib/server/commerce/financial/constants';
+import {
   FINANCIAL_CLASSIFICATION_JOB,
   FINANCIAL_SOURCE_JOB,
   createFinancialClassificationSubjectJob,
@@ -252,8 +257,8 @@ async function drainRefundFinancialJobs(gateway: StripeCommerceGateway): Promise
     })],
     [FINANCIAL_CLASSIFICATION_JOB, createFinancialClassificationHandler({
       database: workerDatabaseClient.db,
-      targetClassifierVersion: 1,
-      targetAllocationAlgorithmVersion: 1
+      targetClassifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      targetAllocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
     })],
     [OUTBOX_DISPATCH_JOB, async () => {}]
   ]);
@@ -280,7 +285,7 @@ describe('canonical refund fulfillment', () => {
     );
 
     const [refund] = await databaseClient.db.select().from(refunds);
-    const queued = await databaseClient.db.select().from(jobs).where(eq(
+    const queued = await ownerDatabaseClient.db.select().from(jobs).where(eq(
       jobs.type,
       FINANCIAL_SOURCE_JOB
     ));
@@ -420,7 +425,7 @@ describe('canonical refund fulfillment', () => {
       processedAt: expect.any(Date)
     });
     const [refund] = await databaseClient.db.select().from(refunds);
-    expect(await databaseClient.db.select().from(jobs).where(eq(
+    expect(await ownerDatabaseClient.db.select().from(jobs).where(eq(
       jobs.type,
       FINANCIAL_SOURCE_JOB
     ))).toEqual([expect.objectContaining({
@@ -469,7 +474,9 @@ describe('canonical refund fulfillment', () => {
       replayFinancialClassificationLocked(tx, {
         subjectType: 'balance_transaction', subjectId: staged.balanceTransactionId,
         sourceFingerprintSha256: balance!.fingerprint_sha256,
-        classifierVersion: 1, allocationAlgorithmVersion: 1, replayId: 'c1-a1',
+        classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+        allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+        replayId: FINANCIAL_REPLAY_ID,
         correlationId: 'refund-components-replay'
       }))).resolves.toMatchObject({ status: 'replayed' });
     await expect(loadCurrentEffectiveAllocationProjection(workerDatabaseClient.db, {
@@ -782,9 +789,10 @@ describe('canonical refund fulfillment', () => {
     const projectionSpec = createFinancialClassificationSubjectJob({
       subjectType: 'balance_transaction', subjectId: staged.balanceTransactionId,
       sourceFingerprintSha256: balance!.fingerprintSha256,
-      classifierVersion: 1, allocationAlgorithmVersion: 1
+      classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
     });
-    const [existingProjectionJob] = (await databaseClient.db.select().from(jobs)).filter((job) =>
+    const [existingProjectionJob] = (await ownerDatabaseClient.db.select().from(jobs)).filter((job) =>
       job.type === projectionSpec.type && job.deduplicationKey === projectionSpec.deduplicationKey
     );
     const projectionJobId = existingProjectionJob?.id ?? (await ownerDatabaseClient.db.insert(jobs)
@@ -796,7 +804,7 @@ describe('canonical refund fulfillment', () => {
       status: 'succeeded', attempts: 1, completedAt: now, lastError: null
     }).where(eq(jobs.id, projectionJobId));
     for (const sourceId of [stableRefund.id, ambiguousRefund.id]) {
-      const [sourceJob] = (await databaseClient.db.select().from(jobs)).filter((job) =>
+      const [sourceJob] = (await ownerDatabaseClient.db.select().from(jobs)).filter((job) =>
         job.type === FINANCIAL_SOURCE_JOB &&
         (job.payload as { sourceId?: unknown }).sourceId === sourceId
       );
@@ -859,7 +867,7 @@ describe('canonical refund fulfillment', () => {
       }
       expect(remaining).toEqual({ subtotalMinor: 0n, taxMinor: 0n });
     }
-    expect((await databaseClient.db.select().from(jobs).where(eq(jobs.id, projectionJobId)))[0])
+    expect((await ownerDatabaseClient.db.select().from(jobs).where(eq(jobs.id, projectionJobId)))[0])
       .toMatchObject({ status: 'pending', attempts: 0, lastError: null });
     expect(beforeDrain).toEqual(expect.arrayContaining([
       expect.objectContaining({
@@ -878,7 +886,7 @@ describe('canonical refund fulfillment', () => {
         financialEvidenceStatus: 'pending'
       })
     ]));
-    const sourceJobsBeforeDrain = (await databaseClient.db.select().from(jobs)).filter((job) =>
+    const sourceJobsBeforeDrain = (await ownerDatabaseClient.db.select().from(jobs)).filter((job) =>
       job.type === FINANCIAL_SOURCE_JOB
     );
     const graphJobs = sourceJobsBeforeDrain.filter((job) =>
@@ -953,13 +961,13 @@ describe('canonical refund fulfillment', () => {
       refund.allocationStatus === 'finalized' &&
       refund.financialEvidenceStatus === 'fee_reconciled'
     )).toBe(true);
-    expect((await databaseClient.db.select().from(jobs)).every((job) =>
+    expect((await ownerDatabaseClient.db.select().from(jobs)).every((job) =>
       job.status === 'succeeded'
     )).toBe(true);
 
-    const jobsBeforeExactReplay = await databaseClient.db.select().from(jobs);
+    const jobsBeforeExactReplay = await ownerDatabaseClient.db.select().from(jobs);
     await fulfillRefundEvent(workerDatabaseClient.db, currentInput, dependencies());
-    expect(await databaseClient.db.select().from(jobs)).toEqual(jobsBeforeExactReplay);
+    expect(await ownerDatabaseClient.db.select().from(jobs)).toEqual(jobsBeforeExactReplay);
     expect((await databaseClient.db.select().from(entitlementGrants))
       .every((grant) => grant.state === 'revoked')).toBe(true);
   });
@@ -1176,7 +1184,7 @@ describe('canonical refund fulfillment', () => {
       expect((await databaseClient.db.select().from(stripeEvents))[0]?.status).toBe('pending');
       expect(await databaseClient.db.select().from(auditEvents)).toHaveLength(0);
       expect(await ownerDatabaseClient.db.select().from(outboxMessages)).toHaveLength(0);
-      expect(await databaseClient.db.select().from(jobs).where(eq(
+      expect(await ownerDatabaseClient.db.select().from(jobs).where(eq(
         jobs.type,
         FINANCIAL_SOURCE_JOB
       ))).toHaveLength(0);
@@ -1190,7 +1198,7 @@ describe('canonical refund fulfillment', () => {
       const event = await createRefundEvent(`re_test_${randomUUID()}`);
       const input = snapshots(fixture, event, 500);
       await fulfillRefundEvent(workerDatabaseClient.db, input, dependencies());
-      const [queued] = await databaseClient.db.select().from(jobs).where(eq(
+      const [queued] = await ownerDatabaseClient.db.select().from(jobs).where(eq(
         jobs.type,
         FINANCIAL_SOURCE_JOB
       ));
@@ -1212,11 +1220,11 @@ describe('canonical refund fulfillment', () => {
             completedAt: now,
             updatedAt: now
           }).where(eq(jobs.id, queued.id));
-      const [before] = await databaseClient.db.select().from(jobs).where(eq(jobs.id, queued.id));
+      const [before] = await ownerDatabaseClient.db.select().from(jobs).where(eq(jobs.id, queued.id));
 
       await fulfillRefundEvent(workerDatabaseClient.db, input, dependencies());
 
-      expect(await databaseClient.db.select().from(jobs).where(eq(
+      expect(await ownerDatabaseClient.db.select().from(jobs).where(eq(
         jobs.type,
         FINANCIAL_SOURCE_JOB
       ))).toEqual([before]);

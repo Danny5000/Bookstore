@@ -377,6 +377,288 @@ describe('buildDisputeAllocationPlan', () => {
     })), 'allocation_mismatch');
   });
 
+  it('preserves legacy reinstatement items in v1 and separates subtotal from tax in v2', () => {
+    const withdrawalGrossPlan: FinancialAllocationPlan = {
+      ...persistedWithdrawal(),
+      expectedEffectMinor: -110,
+      items: [
+        { orderItemId: 'item-a', component: 'dispute_subtotal', effectMinor: -100,
+          currency: 'USD', tieBreakKey: 'item-a:subtotal' },
+        { orderItemId: 'item-a', component: 'dispute_tax', effectMinor: -10,
+          currency: 'USD', tieBreakKey: 'item-a:tax' }
+      ]
+    };
+    const v2WithdrawalGrossPlan = { ...withdrawalGrossPlan, algorithmVersion: 2 };
+    const priorPresentmentEffects: PresentmentEffect[] = [{
+      allocationId: 'withdrawal-taxed', withdrawalSetId: 'set-withdrawal-1',
+      disputeId: 'dispute-1', providerCreatedAt: '2026-08-01T00:00:00.000Z',
+      providerTransactionId: 'txn-withdrawal-taxed', orderItemId: 'item-a',
+      subtotalMinor: -100, taxMinor: -10, presentmentCurrency: 'USD',
+      effect: 'withdrawal', reversalOfAllocationId: null
+    }];
+    const reinstatement = {
+      effect: 'reinstatement', balanceTransactionId: 'bt-taxed-reinstatement',
+      providerTransactionId: 'txn-taxed-reinstatement',
+      providerCreatedAt: '2026-08-03T00:00:00.000Z',
+      allocationIdentityPrefix: 'dispute:dispute-1:bt-taxed-reinstatement',
+      amountMinor: 110, feeMinor: 0, netMinor: 110,
+      disputeAmountMinor: 110, presentmentAmountMinor: 110, feeDetails: [],
+      reversesSetId: 'set-withdrawal-1', withdrawalSetId: null,
+      withdrawalGrossPlan, priorPresentmentEffects,
+      paymentItems: [{
+        orderItemId: 'item-a', subtotalMinor: 100, taxMinor: 10,
+        presentmentCurrency: 'USD'
+      }],
+      finalizedRefunds: []
+    };
+
+    expect(build(baseInput({ ...reinstatement, algorithmVersion: 1 })).plans[0].items)
+      .toEqual([expect.objectContaining({
+        orderItemId: 'item-a', component: 'dispute_reinstatement', effectMinor: 110
+      })]);
+    expect(build(baseInput({
+      ...reinstatement, withdrawalGrossPlan: v2WithdrawalGrossPlan, algorithmVersion: 2
+    })).plans[0].items)
+      .toEqual([
+        expect.objectContaining({
+          orderItemId: 'item-a', component: 'dispute_reinstatement', effectMinor: 100
+        }),
+        expect.objectContaining({
+          orderItemId: 'item-a', component: 'dispute_tax', effectMinor: 10
+        })
+      ]);
+    expect(build(baseInput({
+      ...reinstatement, algorithmVersion: 2, amountMinor: 55, netMinor: 55,
+      disputeAmountMinor: 55, presentmentAmountMinor: 55,
+      withdrawalGrossPlan: v2WithdrawalGrossPlan
+    })).plans[0].items).toEqual([
+      expect.objectContaining({
+        orderItemId: 'item-a', component: 'dispute_reinstatement', effectMinor: 50
+      }),
+      expect.objectContaining({
+        orderItemId: 'item-a', component: 'dispute_tax', effectMinor: 5
+      })
+    ]);
+    expectSafeFailure(
+      () => build(baseInput({ ...reinstatement, algorithmVersion: 3 })),
+      'source_linkage_mismatch'
+    );
+    expectSafeFailure(
+      () => build(baseInput({ ...reinstatement, algorithmVersion: 2 })),
+      'source_linkage_mismatch'
+    );
+    for (const items of [
+      [
+        { orderItemId: 'item-a', component: 'dispute_subtotal', effectMinor: -120,
+          currency: 'USD', tieBreakKey: 'item-a:subtotal' },
+        { orderItemId: 'item-a', component: 'dispute_tax', effectMinor: 10,
+          currency: 'USD', tieBreakKey: 'item-a:tax' }
+      ],
+      [
+        { orderItemId: 'item-a', component: 'dispute_subtotal', effectMinor: -110,
+          currency: 'USD', tieBreakKey: 'item-a:subtotal' },
+        { orderItemId: 'item-a', component: 'dispute_tax', effectMinor: 0,
+          currency: 'USD', tieBreakKey: 'item-a:tax' }
+      ],
+      [
+        { orderItemId: 'item-a', component: 'dispute_subtotal', effectMinor: -100,
+          currency: 'USD', tieBreakKey: 'forged:subtotal' },
+        { orderItemId: 'item-a', component: 'dispute_tax', effectMinor: -10,
+          currency: 'USD', tieBreakKey: 'forged:tax' }
+      ]
+    ] as const) {
+      expectSafeFailure(() => build(baseInput({
+        ...reinstatement,
+        algorithmVersion: 2,
+        withdrawalGrossPlan: { ...v2WithdrawalGrossPlan, items }
+      })), 'source_linkage_mismatch');
+    }
+  });
+
+  it('uses the persisted settlement withdrawal components for a v2 FX reinstatement', () => {
+    const withdrawalGrossPlan: FinancialAllocationPlan = {
+      ...persistedWithdrawal(),
+      algorithmVersion: 2, currency: 'EUR', expectedEffectMinor: -99,
+      items: [
+        { orderItemId: 'item-a', component: 'dispute_subtotal', effectMinor: -89,
+          currency: 'EUR', tieBreakKey: 'item-a:subtotal' },
+        { orderItemId: 'item-a', component: 'dispute_tax', effectMinor: -10,
+          currency: 'EUR', tieBreakKey: 'item-a:tax' }
+      ]
+    };
+    const priorPresentmentEffects: PresentmentEffect[] = [{
+      allocationId: 'withdrawal-taxed-fx', withdrawalSetId: 'set-withdrawal-1',
+      disputeId: 'dispute-1', providerCreatedAt: '2026-08-01T00:00:00.000Z',
+      providerTransactionId: 'txn-withdrawal-taxed-fx', orderItemId: 'item-a',
+      subtotalMinor: -100, taxMinor: -10, presentmentCurrency: 'USD',
+      effect: 'withdrawal', reversalOfAllocationId: null
+    }];
+
+    const result = build(baseInput({
+      algorithmVersion: 2, effect: 'reinstatement', settlementCurrency: 'EUR',
+      balanceTransactionId: 'bt-taxed-fx-reinstatement',
+      providerTransactionId: 'txn-taxed-fx-reinstatement',
+      providerCreatedAt: '2026-08-03T00:00:00.000Z',
+      allocationIdentityPrefix: 'dispute:dispute-1:bt-taxed-fx-reinstatement',
+      amountMinor: 99, feeMinor: 0, netMinor: 99,
+      disputeAmountMinor: 110, presentmentAmountMinor: 110, feeDetails: [],
+      reversesSetId: 'set-withdrawal-1', withdrawalSetId: null,
+      withdrawalGrossPlan, priorPresentmentEffects,
+      paymentItems: [{
+        orderItemId: 'item-a', subtotalMinor: 100, taxMinor: 10,
+        presentmentCurrency: 'USD'
+      }],
+      finalizedRefunds: []
+    }));
+
+    expect(result.plans[0].items).toEqual([
+      expect.objectContaining({
+        orderItemId: 'item-a', component: 'dispute_reinstatement', effectMinor: 89,
+        currency: 'EUR'
+      }),
+      expect.objectContaining({
+        orderItemId: 'item-a', component: 'dispute_tax', effectMinor: 10,
+        currency: 'EUR'
+      })
+    ]);
+
+    const oneCent = build(baseInput({
+      algorithmVersion: 2, effect: 'reinstatement', settlementCurrency: 'EUR',
+      balanceTransactionId: 'bt-one-cent-fx-reinstatement',
+      providerTransactionId: 'txn-one-cent-fx-reinstatement',
+      providerCreatedAt: '2026-08-03T00:00:00.000Z',
+      allocationIdentityPrefix: 'dispute:dispute-1:bt-one-cent-fx-reinstatement',
+      amountMinor: 1, feeMinor: 0, netMinor: 1,
+      disputeAmountMinor: 2, presentmentAmountMinor: 2, feeDetails: [],
+      reversesSetId: 'set-withdrawal-1', withdrawalSetId: null,
+      withdrawalGrossPlan: {
+        ...withdrawalGrossPlan, expectedEffectMinor: -1,
+        items: [
+          { orderItemId: 'item-a', component: 'dispute_subtotal', effectMinor: -1,
+            currency: 'EUR', tieBreakKey: 'item-a:subtotal' },
+          { orderItemId: 'item-a', component: 'dispute_tax', effectMinor: 0,
+            currency: 'EUR', tieBreakKey: 'item-a:tax' }
+        ]
+      },
+      priorPresentmentEffects: [{
+        ...priorPresentmentEffects[0]!, subtotalMinor: -1, taxMinor: -1
+      }],
+      paymentItems: [{
+        orderItemId: 'item-a', subtotalMinor: 1, taxMinor: 1,
+        presentmentCurrency: 'USD'
+      }],
+      finalizedRefunds: []
+    }));
+    expect(oneCent.plans[0].items).toEqual([
+      expect.objectContaining({
+        component: 'dispute_reinstatement', effectMinor: 1, currency: 'EUR'
+      })
+    ]);
+    expect(oneCent.presentmentEffects).toEqual([
+      expect.objectContaining({ subtotalMinor: 1, taxMinor: 1 })
+    ]);
+  });
+
+  it('rejects a v2 FX predecessor whose settlement components belong to another title', () => {
+    const withdrawalGrossPlan: FinancialAllocationPlan = {
+      ...persistedWithdrawal(),
+      algorithmVersion: 2, currency: 'EUR', expectedEffectMinor: -99,
+      items: [
+        { orderItemId: 'item-b', component: 'dispute_subtotal', effectMinor: -89,
+          currency: 'EUR', tieBreakKey: 'item-b:subtotal' },
+        { orderItemId: 'item-b', component: 'dispute_tax', effectMinor: -10,
+          currency: 'EUR', tieBreakKey: 'item-b:tax' }
+      ]
+    };
+
+    expectSafeFailure(() => build(baseInput({
+      algorithmVersion: 2, effect: 'reinstatement', settlementCurrency: 'EUR',
+      balanceTransactionId: 'bt-cross-title-fx-reinstatement',
+      providerTransactionId: 'txn-cross-title-fx-reinstatement',
+      providerCreatedAt: '2026-08-03T00:00:00.000Z',
+      allocationIdentityPrefix: 'dispute:dispute-1:bt-cross-title-fx-reinstatement',
+      amountMinor: 99, feeMinor: 0, netMinor: 99,
+      disputeAmountMinor: 110, presentmentAmountMinor: 110, feeDetails: [],
+      reversesSetId: 'set-withdrawal-1', withdrawalSetId: null,
+      withdrawalGrossPlan,
+      priorPresentmentEffects: [{
+        allocationId: 'withdrawal-taxed-fx', withdrawalSetId: 'set-withdrawal-1',
+        disputeId: 'dispute-1', providerCreatedAt: '2026-08-01T00:00:00.000Z',
+        providerTransactionId: 'txn-withdrawal-taxed-fx', orderItemId: 'item-a',
+        subtotalMinor: -100, taxMinor: -10, presentmentCurrency: 'USD',
+        effect: 'withdrawal', reversalOfAllocationId: null
+      }],
+      paymentItems: [{
+        orderItemId: 'item-a', subtotalMinor: 100, taxMinor: 10,
+        presentmentCurrency: 'USD'
+      }],
+      finalizedRefunds: []
+    })), 'source_linkage_mismatch');
+  });
+
+  it('keeps v2 same-currency partial reinstatement rounding aligned across domains', () => {
+    const withdrawalGrossPlan: FinancialAllocationPlan = {
+      ...persistedWithdrawal(), algorithmVersion: 2, expectedEffectMinor: -4,
+      items: [
+        { orderItemId: 'item-a', component: 'dispute_subtotal', effectMinor: -1,
+          currency: 'USD', tieBreakKey: 'item-a:subtotal' },
+        { orderItemId: 'item-a', component: 'dispute_tax', effectMinor: -1,
+          currency: 'USD', tieBreakKey: 'item-a:tax' },
+        { orderItemId: 'item-b', component: 'dispute_subtotal', effectMinor: -1,
+          currency: 'USD', tieBreakKey: 'item-b:subtotal' },
+        { orderItemId: 'item-b', component: 'dispute_tax', effectMinor: -1,
+          currency: 'USD', tieBreakKey: 'item-b:tax' }
+      ]
+    };
+    const priorPresentmentEffects: PresentmentEffect[] = [
+      {
+        allocationId: 'withdrawal-a', withdrawalSetId: 'set-withdrawal-1',
+        disputeId: 'dispute-1', providerCreatedAt: '2026-08-01T00:00:00.000Z',
+        providerTransactionId: 'txn-withdrawal', orderItemId: 'item-a',
+        subtotalMinor: -1, taxMinor: -1, presentmentCurrency: 'USD',
+        effect: 'withdrawal', reversalOfAllocationId: null
+      },
+      {
+        allocationId: 'withdrawal-b', withdrawalSetId: 'set-withdrawal-1',
+        disputeId: 'dispute-1', providerCreatedAt: '2026-08-01T00:00:00.000Z',
+        providerTransactionId: 'txn-withdrawal', orderItemId: 'item-b',
+        subtotalMinor: -1, taxMinor: -1, presentmentCurrency: 'USD',
+        effect: 'withdrawal', reversalOfAllocationId: null
+      }
+    ];
+
+    const result = build(baseInput({
+      algorithmVersion: 2, effect: 'reinstatement',
+      balanceTransactionId: 'bt-v2-partial-rounding',
+      providerTransactionId: 'txn-v2-partial-rounding',
+      providerCreatedAt: '2026-08-03T00:00:00.000Z',
+      allocationIdentityPrefix: 'dispute:dispute-1:bt-v2-partial-rounding',
+      amountMinor: 2, feeMinor: 0, netMinor: 2,
+      disputeAmountMinor: 2, presentmentAmountMinor: 2, feeDetails: [],
+      reversesSetId: 'set-withdrawal-1', withdrawalSetId: null,
+      withdrawalGrossPlan, priorPresentmentEffects,
+      paymentItems: [
+        { orderItemId: 'item-a', subtotalMinor: 1, taxMinor: 1,
+          presentmentCurrency: 'USD' },
+        { orderItemId: 'item-b', subtotalMinor: 1, taxMinor: 1,
+          presentmentCurrency: 'USD' }
+      ],
+      finalizedRefunds: []
+    }));
+
+    expect(result.presentmentEffects).toEqual([
+      expect.objectContaining({ orderItemId: 'item-a', subtotalMinor: 1, taxMinor: 1 })
+    ]);
+    expect(result.plans[0].items.filter((item) => item.effectMinor !== 0)).toEqual([
+      expect.objectContaining({
+        orderItemId: 'item-a', component: 'dispute_reinstatement', effectMinor: 1
+      }),
+      expect.objectContaining({
+        orderItemId: 'item-a', component: 'dispute_tax', effectMinor: 1
+      })
+    ]);
+  });
+
   it('omits zero withdrawal effects so one-cent two-weight chronology remains replayable', () => {
     const withdrawal = build(baseInput({
       amountMinor: -1, feeMinor: 0, netMinor: -1,
@@ -506,6 +788,88 @@ describe('buildDisputeAllocationPlan', () => {
     expect(credit.plans[0].items.every((item) => item.component === 'fee_credit' && item.effectMinor > 0)).toBe(true);
     expect(credit.plans[1].items).toEqual([]);
     expect(build(baseInput({ feeMinor: 0, netMinor: -600, feeDetails: [] })).plans[1].items).toEqual([]);
+  });
+
+  it('rejects unsupported allocation versions before every dispute effect branch', () => {
+    expectSafeFailure(
+      () => build(baseInput({ algorithmVersion: 3 })),
+      'source_linkage_mismatch'
+    );
+    expectSafeFailure(() => build(baseInput({
+      algorithmVersion: 3,
+      effect: 'fee_credit', amountMinor: 15, feeMinor: 0, netMinor: 15,
+      disputeAmountMinor: 15, presentmentAmountMinor: 15, feeDetails: [],
+      reversesFeeSetId: 'set-withdrawal-fee',
+      withdrawalFeePlan: {
+        ...persistedWithdrawal(), basis: 'fee', expectedEffectMinor: -15,
+        algorithmVersion: 3,
+        items: [{
+          orderItemId: 'item-a', component: 'dispute_fee', effectMinor: -15,
+          currency: 'USD', tieBreakKey: 'item-a:dispute_fee'
+        }]
+      }
+    })), 'source_linkage_mismatch');
+  });
+
+  it('requires v2 fee-credit predecessor version and signs while allowing zero weights', () => {
+    const withdrawalFeePlan: FinancialAllocationPlan = {
+      ...persistedWithdrawal(), basis: 'fee', expectedEffectMinor: -15,
+      algorithmVersion: 2,
+      items: [
+        { orderItemId: 'item-a', component: 'dispute_fee', effectMinor: -15,
+          currency: 'USD', tieBreakKey: 'item-a:dispute_fee' },
+        { orderItemId: 'item-b', component: 'provider_fee_tax', effectMinor: 0,
+          currency: 'USD', tieBreakKey: 'item-b:provider_fee_tax' }
+      ]
+    };
+    const feeCredit = {
+      algorithmVersion: 2,
+      effect: 'fee_credit', amountMinor: 15, feeMinor: 0, netMinor: 15,
+      disputeAmountMinor: 15, presentmentAmountMinor: 15, feeDetails: [],
+      balanceTransactionId: 'bt-v2-fee-credit',
+      providerTransactionId: 'txn-v2-fee-credit',
+      providerCreatedAt: '2026-08-03T00:00:00.000Z',
+      allocationIdentityPrefix: 'dispute:dispute-1:bt-v2-fee-credit',
+      reversesFeeSetId: 'set-withdrawal-fee', withdrawalFeePlan
+    };
+
+    expect(build(baseInput(feeCredit)).plans[0].items).toEqual([
+      expect.objectContaining({ component: 'fee_credit', effectMinor: 15 })
+    ]);
+    expectSafeFailure(() => build(baseInput({
+      ...feeCredit,
+      withdrawalFeePlan: { ...withdrawalFeePlan, algorithmVersion: 1 }
+    })), 'source_linkage_mismatch');
+    expectSafeFailure(() => build(baseInput({
+      ...feeCredit,
+      withdrawalFeePlan: {
+        ...withdrawalFeePlan,
+        items: [
+          { ...withdrawalFeePlan.items[0]!, effectMinor: -20 },
+          { ...withdrawalFeePlan.items[1]!, effectMinor: 5 }
+        ]
+      }
+    })), 'source_linkage_mismatch');
+    expectSafeFailure(() => build(baseInput({
+      ...feeCredit,
+      withdrawalFeePlan: {
+        ...withdrawalFeePlan,
+        items: [
+          { ...withdrawalFeePlan.items[0]!, component: 'sale_tax' },
+          withdrawalFeePlan.items[1]!
+        ]
+      }
+    })), 'source_linkage_mismatch');
+    expectSafeFailure(() => build(baseInput({
+      ...feeCredit,
+      withdrawalFeePlan: {
+        ...withdrawalFeePlan,
+        items: [
+          { ...withdrawalFeePlan.items[0]!, tieBreakKey: 'forged:fee' },
+          withdrawalFeePlan.items[1]!
+        ]
+      }
+    })), 'source_linkage_mismatch');
   });
 
   it('fails closed for a partial FX reinstatement without exact presentment evidence', () => {

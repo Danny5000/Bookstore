@@ -36,7 +36,7 @@ beforeEach(async () => {
   await ownerDatabaseClient.db.execute(sql`
     insert into financial_projection_versions
       (singleton, classifier_version, allocation_algorithm_version, activation_correlation_id)
-    values (true, 1, 1, 'integration-reset-c1-a1')
+    values (true, 1, 2, 'integration-reset-c1-a2')
   `);
   await ownerDatabaseClient.db.execute(sql`
     insert into financial_payout_discovery_state (singleton, covered_through)

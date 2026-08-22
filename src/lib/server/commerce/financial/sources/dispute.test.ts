@@ -29,6 +29,10 @@ import {
 import { lockFinancialProjectionEnrollment } from '../rebase';
 import { PermanentFinancialError } from '../errors';
 import {
+  FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+  FINANCIAL_CLASSIFIER_VERSION
+} from '../constants';
+import {
   recomputeLockedDisputeFinancialProjectionForVersion,
   reconcileDisputeFinancialSource
 } from './dispute';
@@ -702,7 +706,7 @@ describe('versioned locked dispute projection replay', () => {
       projectionLocks: projectionLockRows({ balanceTransactions: [
         { id: balanceId, fingerprintSha256: fingerprint }
       ] }), correlationId: 'dispute-replay-durable-allocation-error'
-    }, { classifierVersion: 2, allocationAlgorithmVersion: 3, replayId: 'c2-a3' }))
+    }, { classifierVersion: 2, allocationAlgorithmVersion: 2, replayId: 'c2-a2' }))
       .resolves.toEqual({ status: 'exception', safeCode: 'allocation_mismatch' });
 
     expect(rolledBack).toBe(true);
@@ -1079,8 +1083,8 @@ describe('reconcileDisputeFinancialSource', () => {
       })
     );
     expect(lockActiveFinancialProjectionImplementation).toHaveBeenCalledWith(tx, {
-      classifierVersion: 1,
-      allocationAlgorithmVersion: 1
+      classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
     });
     expect(vi.mocked(lockActiveFinancialProjectionImplementation).mock.invocationCallOrder[0])
       .toBeLessThan(vi.mocked(lockCanonicalPaymentPurchaseFacts).mock.invocationCallOrder[0]!);

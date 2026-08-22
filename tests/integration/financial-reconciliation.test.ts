@@ -2,6 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import {
+  FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+  FINANCIAL_CLASSIFIER_VERSION
+} from '$lib/server/commerce/financial/constants';
+import {
   createFinancialClassificationHandler
 } from '$lib/server/commerce/financial/handlers/classification';
 import { createFinancialPayoutHandler } from '$lib/server/commerce/financial/handlers/payout';
@@ -240,8 +244,8 @@ async function createPaidPurchase(settlementCurrency: 'USD' | 'EUR'): Promise<Pu
 function financialHandlers(
   gateway: StripeCommerceGateway,
   versions: { classifierVersion: number; allocationAlgorithmVersion: number } = {
-    classifierVersion: 1,
-    allocationAlgorithmVersion: 1
+    classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+    allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
   }
 ): ReadonlyMap<string, JobHandler> {
   return new Map([
@@ -272,7 +276,10 @@ async function drainFinancialJobs(
   classificationImplementation: {
     readonly classifierVersion: number;
     readonly allocationAlgorithmVersion: number;
-  } = { classifierVersion: 1, allocationAlgorithmVersion: 1 }
+  } = {
+    classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+    allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
+  }
 ): Promise<readonly string[]> {
   const repository = createPostgresJobRepository(
     databaseClient.db,
@@ -1676,7 +1683,7 @@ describe('financial reconciliation acceptance', () => {
 
     const replayImplementation = {
       classifierVersion: 2,
-      allocationAlgorithmVersion: 1
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
     } as const;
     const replaySpec = createFinancialCompositeReplayScanJob(replayImplementation);
     const queued = await enqueueJob(databaseClient.db, {
@@ -1695,7 +1702,10 @@ describe('financial reconciliation acceptance', () => {
       .where(eq(jobs.id, queued.id)))[0]).toMatchObject({ status: 'succeeded', attempts: 1 });
     expect(completedReplayJobs).toHaveLength(3);
     expect(await databaseClient.db.select().from(financialProjectionVersions)).toEqual([
-      expect.objectContaining({ classifierVersion: 2, allocationAlgorithmVersion: 1 })
+      expect.objectContaining({
+        classifierVersion: 2,
+        allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
+      })
     ]);
     expect((await databaseClient.db.select({
       classifierVersion: financialClassificationVersions.classifierVersion,
@@ -1719,7 +1729,7 @@ describe('financial reconciliation acceptance', () => {
         expect.objectContaining({
           basis: oldSet.basis,
           classifierVersion: 2,
-          algorithmVersion: 1,
+          algorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
           expectedEffectMinor: oldSet.expectedEffectMinor,
           scope: 'account'
         })

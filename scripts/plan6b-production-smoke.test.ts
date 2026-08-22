@@ -59,6 +59,8 @@ const safeRuntime = (): DisabledRuntimeEvidence => ({
   classificationRunCount: 1,
   classificationRunCompletedCount: 1,
   pendingProjectionVersionCount: 0,
+  activeClassifierVersion: 1,
+  activeAllocationAlgorithmVersion: 2,
   providerLedgerSubjectCount: 0
 });
 
@@ -240,6 +242,7 @@ describe('Plan 6B production smoke ownership', () => {
       { classificationContinuationUnsafeCount: 1 },
       { classificationRunCount: 0 }, { classificationRunCompletedCount: 0 },
       { pendingProjectionVersionCount: 1 },
+      { activeClassifierVersion: 2 }, { activeAllocationAlgorithmVersion: 1 },
       { storefrontStatus: 200 }, { commerceStatus: 200 }
     ]) {
       const calls: string[] = [];
@@ -296,7 +299,7 @@ describe('Plan 6B production smoke ownership', () => {
       new URL('./plan6b-production-smoke.ts', import.meta.url),
       'utf8'
     );
-    expect(source).toContain("          ),\n          'providerLedgerSubjectCount',");
+    expect(source).toMatch(/ {10}\),\r?\n {10}'providerLedgerSubjectCount',/u);
     expect(source).toContain('from stripe_balance_transactions');
     expect(source).toContain('from stripe_balance_transaction_fee_details');
     expect(source).not.toContain('from financial_balance_transactions');
@@ -614,6 +617,7 @@ describe('Plan 6B production smoke ownership', () => {
   it('inspects app and worker mounts plus /run/secrets instead of trusting environment alone', async () => {
     const runs: readonly string[][] = [];
     const mutableRuns = runs as string[][];
+    const queries: string[] = [];
     const appId = 'a'.repeat(64);
     const workerId = 'b'.repeat(64);
     const postgresId = 'c'.repeat(64);
@@ -642,6 +646,7 @@ describe('Plan 6B production smoke ownership', () => {
         }
         if (args[0] === 'port') return { status: 0, stdout: '' };
         if (args.includes('psql')) {
+          queries.push(String(args.at(-1)));
           return {
             status: 0,
             stdout: JSON.stringify({
@@ -655,6 +660,8 @@ describe('Plan 6B production smoke ownership', () => {
               classificationRunCount: 1,
               classificationRunCompletedCount: 1,
               pendingProjectionVersionCount: 0,
+              activeClassifierVersion: 1,
+              activeAllocationAlgorithmVersion: 2,
               providerLedgerSubjectCount: 0
             })
           };
@@ -674,6 +681,8 @@ describe('Plan 6B production smoke ownership', () => {
       appHasStripeSecret: true,
       workerHasStripeSecret: false
     });
+    expect(queries[0]).toContain("'activeClassifierVersion'");
+    expect(queries[0]).toContain("'activeAllocationAlgorithmVersion'");
     for (const service of ['app', 'worker']) {
       expect(mutableRuns.some((args) =>
         args.includes('exec') && args.includes(service) && args.some((arg) => arg.includes('/run/secrets'))
@@ -772,6 +781,8 @@ describe('Plan 6B production smoke ownership', () => {
               classificationRunCount: 1,
               classificationRunCompletedCount: jobSnapshot === 1 ? 0 : 1,
               pendingProjectionVersionCount: 0,
+              activeClassifierVersion: 1,
+              activeAllocationAlgorithmVersion: jobSnapshot === 1 ? 1 : 2,
               providerLedgerSubjectCount: 0
             })
           };

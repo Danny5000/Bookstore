@@ -8,6 +8,11 @@ import { reconcilePaymentFinancialSource } from '$lib/server/commerce/financial/
 import { createFinancialClassificationHandler } from '$lib/server/commerce/financial/handlers/classification';
 import { FINANCIAL_CLASSIFICATION_JOB } from '$lib/server/commerce/financial/jobs';
 import {
+  FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+  FINANCIAL_CLASSIFIER_VERSION,
+  FINANCIAL_REPLAY_ID
+} from '$lib/server/commerce/financial/constants';
+import {
   loadCurrentPayoutEvidence,
   persistPayoutImportPage,
   publishPayoutMembership,
@@ -58,6 +63,16 @@ import { createPostgresJobRepository } from '$lib/server/jobs/repository';
 
 const dialect = new PgDialect();
 const CLAIM_FIRST = new Date('2000-01-01T00:00:00.000Z');
+const ACTIVE_CLASSIFICATION_IMPLEMENTATION = {
+  classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+  allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+  replayId: FINANCIAL_REPLAY_ID
+} as const;
+const C2_A2_CLASSIFICATION_IMPLEMENTATION = {
+  classifierVersion: 2,
+  allocationAlgorithmVersion: 2,
+  replayId: 'c2-a2'
+} as const;
 
 function rendered(query: unknown): string {
   return dialect.sqlToQuery((query as SQLWrapper).getSQL()).sql;
@@ -123,14 +138,15 @@ function databasePausedBeforeAdvisory(
 
 async function claimActiveParentClassificationJob(
   subjectId: string,
-  workerId: string,
-  version = 1
+  workerId: string
 ) {
   const [balance] = await databaseClient.db.select().from(stripeBalanceTransactions).where(
     eq(stripeBalanceTransactions.id, subjectId)
   );
   if (!balance) throw new Error('Expected the classification subject balance transaction');
-  const deduplicationKey = `financial:classification:${version}:${version}:` +
+  const implementation = ACTIVE_CLASSIFICATION_IMPLEMENTATION;
+  const deduplicationKey = `financial:classification:${implementation.classifierVersion}:` +
+    `${implementation.allocationAlgorithmVersion}:` +
     `balance_transaction:${subjectId}:${balance.fingerprintSha256}`;
   const matches = (await databaseClient.db.select().from(jobs).where(
     eq(jobs.deduplicationKey, deduplicationKey)
@@ -140,9 +156,9 @@ async function claimActiveParentClassificationJob(
     job.payload.subjectType === 'balance_transaction' &&
     job.payload.subjectId === subjectId &&
     job.payload.sourceFingerprintSha256 === balance.fingerprintSha256 &&
-    job.payload.classifierVersion === version &&
-    job.payload.allocationAlgorithmVersion === version &&
-    job.payload.replayId === `c${version}-a${version}`
+    job.payload.classifierVersion === implementation.classifierVersion &&
+    job.payload.allocationAlgorithmVersion === implementation.allocationAlgorithmVersion &&
+    job.payload.replayId === implementation.replayId
   );
   expect(matches).toHaveLength(1);
   const target = matches[0];
@@ -153,12 +169,15 @@ async function claimActiveParentClassificationJob(
     applicationConfig.jobs,
     () => new Date(),
     'local-only',
-    { classifierVersion: version, allocationAlgorithmVersion: version }
+    {
+      classifierVersion: implementation.classifierVersion,
+      allocationAlgorithmVersion: implementation.allocationAlgorithmVersion
+    }
   );
   const claimed = await repository.claimNext(workerId);
   expect(claimed).toMatchObject({ id: target.id, type: FINANCIAL_CLASSIFICATION_JOB });
   if (!claimed) throw new Error('Expected the parent classification job to be claimable');
-  return { repository, claimed, workerId, version };
+  return { repository, claimed, workerId, implementation };
 }
 
 async function handleAndCompleteParentClassificationJob(
@@ -167,8 +186,8 @@ async function handleAndCompleteParentClassificationJob(
 ) {
   const handler = createFinancialClassificationHandler({
     database,
-    targetClassifierVersion: claim.version,
-    targetAllocationAlgorithmVersion: claim.version
+    targetClassifierVersion: claim.implementation.classifierVersion,
+    targetAllocationAlgorithmVersion: claim.implementation.allocationAlgorithmVersion
   });
   await handler(claim.claimed, new AbortController().signal);
   expect(await claim.repository.complete(claim.claimed.id, claim.workerId)).toBe(true);
@@ -179,11 +198,10 @@ async function handleAndCompleteParentClassificationJob(
 
 async function runActiveParentClassificationJob(
   subjectId: string,
-  workerId: string,
-  version = 1
+  workerId: string
 ) {
   const completed = await handleAndCompleteParentClassificationJob(
-    await claimActiveParentClassificationJob(subjectId, workerId, version)
+    await claimActiveParentClassificationJob(subjectId, workerId)
   );
   expect(completed).toMatchObject({
     status: 'succeeded', rerunRequestedAt: null, completedAt: expect.any(Date)
@@ -1043,9 +1061,7 @@ it('rejects noncanonical signs for payout-member account fallback classification
       subjectType: 'balance_transaction',
       subjectId: stored.id,
       sourceFingerprintSha256: stored.fingerprintSha256,
-      classifierVersion: 1,
-      allocationAlgorithmVersion: 1,
-      replayId: 'c1-a1',
+      ...ACTIVE_CLASSIFICATION_IMPLEMENTATION,
       correlationId: `unrelated-sign-replay-${cases[index]!.label}-${suffix}`
     })), cases[index]!.label).rejects.toMatchObject({
       name: 'PermanentFinancialError',
@@ -1347,7 +1363,7 @@ it('retries account fallback when a bookstore charge link commits before routing
     return replayFinancialClassificationLocked(proxy as DatabaseTransaction, {
       subjectType: 'balance_transaction', subjectId: balance.id,
       sourceFingerprintSha256: balance.fingerprintSha256,
-      classifierVersion: 1, allocationAlgorithmVersion: 1, replayId: 'c1-a1',
+      ...ACTIVE_CLASSIFICATION_IMPLEMENTATION,
       correlationId: `recheck-link-stale-${suffix}`
     });
   });
@@ -1575,12 +1591,12 @@ it('supersedes a refund-failure account fallback with title reversal lineage aft
   const primary = balances.find((row) => row.providerId === primarySnapshot.id);
   const failure = balances.find((row) => row.providerId === failureSnapshot.id);
   if (!primary || !failure) throw new Error('Expected late-link refund balances');
-  const replay = (balance: typeof failure, correlationId: string, version = 1) =>
+  const replayAtC2A2 = (balance: typeof failure, correlationId: string) =>
     databaseClient.db.transaction((tx) => replayFinancialClassificationLocked(tx, {
       subjectType: 'balance_transaction', subjectId: balance.id,
       sourceFingerprintSha256: balance.fingerprintSha256,
-      classifierVersion: version, allocationAlgorithmVersion: version,
-      replayId: `c${version}-a${version}`, correlationId
+      ...C2_A2_CLASSIFICATION_IMPLEMENTATION,
+      correlationId
     }));
 
   await runActiveParentClassificationJob(
@@ -1671,9 +1687,11 @@ it('supersedes a refund-failure account fallback with title reversal lineage aft
     correlationId: `late-refund-c2-root-${suffix}`,
     signal: new AbortController().signal
   });
-  await replay(primary, `late-refund-c2-primary-${suffix}`, 2);
-  await replay(failure, `late-refund-c2-failure-${suffix}`, 2);
-  await expect(replay(failure, `late-refund-c2-exact-${suffix}`, 2)).resolves.toMatchObject({
+  await replayAtC2A2(primary, `late-refund-c2-primary-${suffix}`);
+  await replayAtC2A2(failure, `late-refund-c2-failure-${suffix}`);
+  await expect(replayAtC2A2(
+    failure, `late-refund-c2-exact-${suffix}`
+  )).resolves.toMatchObject({
     status: 'unchanged', subjectId: failure.id
   });
   const c2RefundSets = (await databaseClient.db.select().from(financialAllocationSets).where(
@@ -1734,12 +1752,12 @@ it('supersedes a dispute-reinstatement account fallback with title reversal line
   const withdrawal = balances.find((row) => row.providerId === withdrawalSnapshot.id);
   const reinstatement = balances.find((row) => row.providerId === reinstatementSnapshot.id);
   if (!withdrawal || !reinstatement) throw new Error('Expected late-link dispute balances');
-  const replay = (balance: typeof reinstatement, correlationId: string, version = 1) =>
+  const replayAtC2A2 = (balance: typeof reinstatement, correlationId: string) =>
     databaseClient.db.transaction((tx) => replayFinancialClassificationLocked(tx, {
       subjectType: 'balance_transaction', subjectId: balance.id,
       sourceFingerprintSha256: balance.fingerprintSha256,
-      classifierVersion: version, allocationAlgorithmVersion: version,
-      replayId: `c${version}-a${version}`, correlationId
+      ...C2_A2_CLASSIFICATION_IMPLEMENTATION,
+      correlationId
     }));
 
   await runActiveParentClassificationJob(
@@ -1820,10 +1838,10 @@ it('supersedes a dispute-reinstatement account fallback with title reversal line
     correlationId: `late-dispute-c2-root-${suffix}`,
     signal: new AbortController().signal
   });
-  await replay(withdrawal, `late-dispute-c2-withdrawal-${suffix}`, 2);
-  await replay(reinstatement, `late-dispute-c2-reinstatement-${suffix}`, 2);
-  await expect(replay(
-    reinstatement, `late-dispute-c2-exact-${suffix}`, 2
+  await replayAtC2A2(withdrawal, `late-dispute-c2-withdrawal-${suffix}`);
+  await replayAtC2A2(reinstatement, `late-dispute-c2-reinstatement-${suffix}`);
+  await expect(replayAtC2A2(
+    reinstatement, `late-dispute-c2-exact-${suffix}`
   )).resolves.toMatchObject({ status: 'unchanged', subjectId: reinstatement.id });
   const c2DisputeSets = (await databaseClient.db.select().from(financialAllocationSets).where(
     inArray(financialAllocationSets.balanceTransactionId, [withdrawal.id, reinstatement.id])

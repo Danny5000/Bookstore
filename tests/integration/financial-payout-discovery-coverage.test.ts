@@ -2,6 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { eq, sql } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import {
+  FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+  FINANCIAL_CLASSIFIER_VERSION
+} from '$lib/server/commerce/financial/constants';
+import {
   processFinancialScanJob
 } from '$lib/server/commerce/financial/scans/service';
 import {
@@ -118,8 +122,8 @@ describe('durable payout discovery coverage', () => {
 
     expect(await databaseClient.db.select().from(financialProjectionVersions)).toEqual([
       expect.objectContaining({
-        classifierVersion: 1,
-        allocationAlgorithmVersion: 1,
+        classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+        allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
         pendingClassifierVersion: 2,
         pendingAllocationAlgorithmVersion: 3
       })

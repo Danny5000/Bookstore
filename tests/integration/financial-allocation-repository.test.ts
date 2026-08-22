@@ -2,6 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { stageBalanceTransaction } from '$lib/server/commerce/financial/ledger';
+import {
+  FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+  FINANCIAL_CLASSIFIER_VERSION
+} from '$lib/server/commerce/financial/constants';
 import { loadCurrentEffectiveAllocationProjection, persistFinancialAllocationPlanLocked } from '$lib/server/commerce/financial/allocations/repository';
 import { financialAllocationSets, financialItemAllocations, guestIdentities, orderItems, orders, payments, titles } from '$lib/server/db/schema';
 import {
@@ -49,9 +53,10 @@ describe('financial allocation repository', () => {
        where type='commerce.financial-classification'
          and payload->>'subjectType'='balance_transaction'
          and payload->>'subjectId'=$1
-         and (payload->>'classifierVersion')::integer=1
-         and (payload->>'allocationAlgorithmVersion')::integer=1`,
-      [staged.balanceTransactionId]
+         and (payload->>'classifierVersion')::integer=$2
+         and (payload->>'allocationAlgorithmVersion')::integer=$3`,
+      [staged.balanceTransactionId, FINANCIAL_CLASSIFIER_VERSION,
+        FINANCIAL_ALLOCATION_ALGORITHM_VERSION]
     );
     expect(marker.rows).toEqual([{ status: 'pending' }]);
 
@@ -92,13 +97,16 @@ describe('financial allocation repository', () => {
     }, { correlationId: 'allocation-repository-persist' });
     const fingerprint = (await databaseClient.pool.query<{ fingerprint_sha256: string }>(
       'select fingerprint_sha256 from stripe_balance_transactions where id=$1', [staged.balanceTransactionId])).rows[0]!.fingerprint_sha256;
-    const common = { balanceTransactionId: staged.balanceTransactionId, currency: 'USD', algorithmVersion: 1,
+    const common = { balanceTransactionId: staged.balanceTransactionId, currency: 'USD',
+      algorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
       sourceFingerprint: fingerprint, supersedesSetId: null, reversalOfSetId: null };
-    const gross = { sourceKind: 'payment' as const, sourceId: payment.id, classificationVersion: 1,
+    const gross = { sourceKind: 'payment' as const, sourceId: payment.id,
+      classificationVersion: FINANCIAL_CLASSIFIER_VERSION,
       correlationId: 'allocation-repository-gross', plan: { ...common, allocationIdentity: `payment:${payment.id}:gross`,
         basis: 'gross_amount' as const, scope: 'title' as const, expectedEffectMinor: 100,
         items: [{ orderItemId: itemId, component: 'sale_subtotal' as const, effectMinor: 100, currency: 'USD', tieBreakKey: itemId }] } };
-    const fee = { sourceKind: 'payment' as const, sourceId: payment.id, classificationVersion: 1,
+    const fee = { sourceKind: 'payment' as const, sourceId: payment.id,
+      classificationVersion: FINANCIAL_CLASSIFIER_VERSION,
       correlationId: 'allocation-repository-fee', plan: { ...common, allocationIdentity: `payment:${payment.id}:fee`,
         basis: 'fee' as const, scope: 'title' as const, expectedEffectMinor: 0, items: [] } };
     const inserted = await databaseClient.db.transaction(async (tx) => [
@@ -110,7 +118,8 @@ describe('financial allocation repository', () => {
     ])).resolves.toEqual(inserted.map((entry) => ({ ...entry, disposition: 'unchanged' })));
     await expect(databaseClient.db.transaction((tx) => persistFinancialAllocationPlanLocked(tx, {
       sourceKind: 'adjustment', sourceId: staged.balanceTransactionId,
-      classificationVersion: 1, correlationId: 'allocation-repository-owner-downgrade',
+      classificationVersion: FINANCIAL_CLASSIFIER_VERSION,
+      correlationId: 'allocation-repository-owner-downgrade',
       plan: {
         ...common, allocationIdentity: `adjustment:${staged.balanceTransactionId}:wrong-owner`,
         basis: 'gross_amount', scope: 'account', expectedEffectMinor: 100, items: [],
@@ -128,9 +137,10 @@ describe('financial allocation repository', () => {
             basis, scope, expected_effect_minor, currency, algorithm_version,
             classifier_version, source_fingerprint_sha256, supersedes_set_id)
          values ($1, $2, 'adjustment', $2, 'gross_amount', 'account', 100, 'USD',
-           1, 1, $3, $4)`,
+           $5, $6, $3, $4)`,
         [`adjustment:${staged.balanceTransactionId}:direct-wrong-owner`,
-          staged.balanceTransactionId, fingerprint, inserted[0]!.setId]
+          staged.balanceTransactionId, fingerprint, inserted[0]!.setId,
+          FINANCIAL_ALLOCATION_ALGORITHM_VERSION, FINANCIAL_CLASSIFIER_VERSION]
       )).rejects.toMatchObject({ code: '23514' });
     } finally {
       await direct.query('rollback');
@@ -158,10 +168,11 @@ describe('financial allocation repository', () => {
             basis, scope, expected_effect_minor, currency, algorithm_version,
             classifier_version, source_fingerprint_sha256)
          values ($1, $2, $3, 'adjustment', $3, 'gross_amount', 'account', 100,
-           'USD', 1, 1, $4)`,
+           'USD', $5, $6, $4)`,
         [missingPredecessorId,
           `adjustment:${missingBalanceId}:missing-classification-root`,
-          missingBalanceId, missingFingerprint]
+          missingBalanceId, missingFingerprint,
+          FINANCIAL_ALLOCATION_ALGORITHM_VERSION, FINANCIAL_CLASSIFIER_VERSION]
       );
       await expect(missingEvidence.query(
         `insert into financial_allocation_sets
@@ -169,10 +180,11 @@ describe('financial allocation repository', () => {
             basis, scope, expected_effect_minor, currency, algorithm_version,
             classifier_version, source_fingerprint_sha256, supersedes_set_id)
          values ($1, $2, 'payment', $3, 'gross_amount', 'title', 100, 'USD',
-           1, 1, $4, $5)`,
+           $6, $7, $4, $5)`,
         [`payment:${payment.id}:missing-classification-successor`,
           missingBalanceId, payment.id, missingFingerprint,
-          missingPredecessorId]
+          missingPredecessorId, FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+          FINANCIAL_CLASSIFIER_VERSION]
       )).rejects.toMatchObject({ code: '23514' });
     } finally {
       await missingEvidence.query('rollback');
@@ -234,10 +246,12 @@ describe('financial allocation repository', () => {
       )).rows[0]!.fingerprint_sha256));
     const planFor = (index: number, allocationIdentity: string, supersedesSetId: string | null,
       reversalOfSetId: string | null) => ({ sourceKind: 'payment' as const, sourceId: payment.id,
-      classificationVersion: 1, correlationId: allocationIdentity, plan: {
+      classificationVersion: FINANCIAL_CLASSIFIER_VERSION,
+      correlationId: allocationIdentity, plan: {
         allocationIdentity, balanceTransactionId: staged[index]!.balanceTransactionId,
         basis: 'gross_amount' as const, scope: 'title' as const, currency: 'USD', expectedEffectMinor: 100,
-        algorithmVersion: 1, sourceFingerprint: fingerprints[index]!, supersedesSetId, reversalOfSetId,
+        algorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+        sourceFingerprint: fingerprints[index]!, supersedesSetId, reversalOfSetId,
         items: [{ orderItemId: itemId, component: 'sale_subtotal' as const, effectMinor: 100,
           currency: 'USD', tieBreakKey: itemId }]
       } });
@@ -279,12 +293,14 @@ describe('financial allocation repository', () => {
       )).rows[0]!.fingerprint_sha256));
     const identity = `adjustment:shared-identity:${suffix}`;
     const plans = staged.map(({ balanceTransactionId }, index) => ({
-      sourceKind: 'adjustment' as const, sourceId: balanceTransactionId, classificationVersion: 1,
+      sourceKind: 'adjustment' as const, sourceId: balanceTransactionId,
+      classificationVersion: FINANCIAL_CLASSIFIER_VERSION,
       correlationId: `allocation-identity-race-${index}`, plan: {
         allocationIdentity: identity, balanceTransactionId,
         basis: (index === 0 ? 'gross_amount' : 'fee') as 'gross_amount' | 'fee',
         scope: 'account' as const, currency: 'USD', expectedEffectMinor: index === 0 ? 100 : 0,
-        algorithmVersion: 1, sourceFingerprint: fingerprints[index]!, supersedesSetId: null,
+        algorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+        sourceFingerprint: fingerprints[index]!, supersedesSetId: null,
         reversalOfSetId: null, items: []
       }
     }));

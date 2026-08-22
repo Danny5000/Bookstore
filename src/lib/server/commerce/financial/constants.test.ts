@@ -21,7 +21,7 @@ describe('financial constants', () => {
   });
 
   it('keys replay from both classifier and allocation algorithm versions', () => {
-    expect(FINANCIAL_ALLOCATION_ALGORITHM_VERSION).toBe(1);
-    expect(FINANCIAL_REPLAY_ID).toBe('c1-a1');
+    expect(FINANCIAL_ALLOCATION_ALGORITHM_VERSION).toBe(2);
+    expect(FINANCIAL_REPLAY_ID).toBe('c1-a2');
   });
 });

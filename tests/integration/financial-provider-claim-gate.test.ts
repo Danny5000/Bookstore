@@ -3,6 +3,11 @@ import { eq } from 'drizzle-orm';
 import { expect, it } from 'vitest';
 import { persistFinancialAllocationPlanLocked } from '$lib/server/commerce/financial/allocations/repository';
 import {
+  FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+  FINANCIAL_CLASSIFIER_VERSION,
+  FINANCIAL_REPLAY_ID
+} from '$lib/server/commerce/financial/constants';
+import {
   createFinancialClassificationSubjectJob,
   createFinancialSourceEventJob
 } from '$lib/server/commerce/financial/jobs';
@@ -133,7 +138,7 @@ async function providerProjectionFixture() {
     balanceTransactionId: staged.balanceTransactionId,
     scope: 'title' as const,
     currency: 'USD',
-    algorithmVersion: 1,
+    algorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
     sourceFingerprint: fingerprint,
     supersedesSetId: null,
     reversalOfSetId: null
@@ -142,12 +147,12 @@ async function providerProjectionFixture() {
     await persistFinancialAllocationPlanLocked(transaction, {
       sourceKind: 'payment',
       sourceId: payment.id,
-      classificationVersion: 1,
+      classificationVersion: FINANCIAL_CLASSIFIER_VERSION,
       correlationId: `claim-gate-gross-c1-${suffix}`,
       plan: {
         ...common,
         allocationIdentity:
-          `payment:${payment.id}:${staged.balanceTransactionId}:replay:c1-a1:gross`,
+          `payment:${payment.id}:${staged.balanceTransactionId}:replay:${FINANCIAL_REPLAY_ID}:gross`,
         basis: 'gross_amount',
         expectedEffectMinor: 100,
         items: [{
@@ -162,12 +167,12 @@ async function providerProjectionFixture() {
     await persistFinancialAllocationPlanLocked(transaction, {
       sourceKind: 'payment',
       sourceId: payment.id,
-      classificationVersion: 1,
+      classificationVersion: FINANCIAL_CLASSIFIER_VERSION,
       correlationId: `claim-gate-fee-c1-${suffix}`,
       plan: {
         ...common,
         allocationIdentity:
-          `payment:${payment.id}:${staged.balanceTransactionId}:replay:c1-a1:fee`,
+          `payment:${payment.id}:${staged.balanceTransactionId}:replay:${FINANCIAL_REPLAY_ID}:fee`,
         basis: 'fee',
         expectedEffectMinor: 0,
         items: []
@@ -314,7 +319,8 @@ it('defers an active provider refresh after successor writes, then converges und
     applicationConfig.jobs,
     () => claimTime,
     'all',
-    { classifierVersion: 1, allocationAlgorithmVersion: 1 }
+    { classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION }
   );
   const successorWorker = createPostgresJobRepository(
     databaseClient.db,
@@ -468,7 +474,8 @@ it('retries a source claimed before pending registration when it reaches project
     applicationConfig.jobs,
     () => claimTime,
     'all',
-    { classifierVersion: 1, allocationAlgorithmVersion: 1 }
+    { classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION }
   );
   const queued = await enqueueJob(databaseClient.db, {
     ...createFinancialSourceEventJob({
