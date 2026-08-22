@@ -574,7 +574,8 @@ async function insertRefundAllocationSet(input: {
 async function insertRefundCorrection(input: {
   label: string; refundId: string; baseSetId: string; fingerprint: string; adminId: string;
   items: readonly { domain: 'settlement' | 'presentment'; sourceSetId: string | null;
-    orderItemId: string; approvedMinor: number; deltaMinor: number }[];
+    orderItemId: string; approvedMinor: number; deltaMinor: number;
+    stableTieBreakKey?: string }[];
 }) {
   const correction = await databaseClient.pool.query<{ id: string }>(
     `insert into refund_reporting_correction_sets
@@ -591,7 +592,8 @@ async function insertRefundCorrection(input: {
           currency, approved_absolute_minor, delta_minor, stable_tie_break_key)
        values ($1, $2, $3, $4, 'refund_subtotal', 'USD', $5, $6, $7)`,
       [correction.rows[0]!.id, item.domain, item.sourceSetId, item.orderItemId,
-        item.approvedMinor, item.deltaMinor, `${input.label}-${index}`]
+        item.approvedMinor, item.deltaMinor,
+        item.stableTieBreakKey ?? `${input.label}-${index}`]
     );
   }
   return correction.rows[0]!.id;
@@ -2358,6 +2360,332 @@ describe('financial classifier and allocation-version replay', () => {
       expect.objectContaining({ basis: 'gross_amount', status: 'complete' }),
       expect.objectContaining({ basis: 'fee', status: 'complete' })
     ]);
+  });
+
+  it('rebases a compatible approved correction through production classifier replay', async () => {
+    await resetProjectionVersionForFixture({
+      classifierVersion: 1,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+      correlationId: 'reclassification-production-correction-compatible-seed'
+    });
+    const graph = await correctionRebaseGraph(
+      'reclassification-production-correction-compatible'
+    );
+    const target = await finalizedRefundEvidence(
+      graph, 'production-correction-compatible-target', [50, 50]
+    );
+    await databaseClient.db.transaction((tx) => appendClassificationDecisionLocked(tx, {
+      subjectType: 'balance_transaction', subjectId: target.balanceTransactionId,
+      classifierVersion: 1, sourceFingerprint: target.fingerprint,
+      decision: { status: 'classified', classification: 'refund',
+        impact: 'informational' },
+      correlationId: 'reclassification-production-correction-compatible-classify-v1'
+    }));
+    const oldGross = await insertRefundAllocationSet({
+      label: 'production-correction-compatible-old-gross', refundId: target.refundId,
+      balanceTransactionId: target.balanceTransactionId, fingerprint: target.fingerprint,
+      expectedEffectMinor: -100, classifierVersion: 1,
+      algorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+      items: [{ orderItemId: graph.itemA, effectMinor: -60 },
+        { orderItemId: graph.itemB, effectMinor: -40 }]
+    });
+    const oldFee = await insertRefundAllocationSet({
+      label: 'production-correction-compatible-old-fee', refundId: target.refundId,
+      balanceTransactionId: target.balanceTransactionId, fingerprint: target.fingerprint,
+      expectedEffectMinor: 0, classifierVersion: 1,
+      algorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+      basis: 'fee', items: []
+    });
+    const correctionLabel = 'production-correction-compatible-approved';
+    const oldCorrection = await insertRefundCorrection({
+      label: correctionLabel, refundId: target.refundId,
+      baseSetId: oldGross, fingerprint: target.fingerprint, adminId: graph.adminId,
+      items: [
+        { domain: 'settlement', sourceSetId: oldGross, orderItemId: graph.itemA,
+          approvedMinor: -80, deltaMinor: -20,
+          stableTieBreakKey: `settlement:gross:${graph.itemA}:refund_subtotal` },
+        { domain: 'settlement', sourceSetId: oldGross, orderItemId: graph.itemB,
+          approvedMinor: -20, deltaMinor: 20,
+          stableTieBreakKey: `settlement:gross:${graph.itemB}:refund_subtotal` },
+        { domain: 'presentment', sourceSetId: null, orderItemId: graph.itemA,
+          approvedMinor: 80, deltaMinor: 30,
+          stableTieBreakKey: `presentment:${graph.itemA}:refund_subtotal` },
+        { domain: 'presentment', sourceSetId: null, orderItemId: graph.itemB,
+          approvedMinor: 20, deltaMinor: -30,
+          stableTieBreakKey: `presentment:${graph.itemB}:refund_subtotal` }
+      ]
+    });
+    await expect(loadCurrentEffectiveAllocationProjection(databaseClient.db, {
+      balanceTransactionIds: [target.balanceTransactionId]
+    })).resolves.toEqual([
+      expect.objectContaining({ status: 'complete', basis: 'gross_amount',
+        baseSetId: oldGross, compatibleCorrectionTipId: oldCorrection,
+        items: expect.arrayContaining([
+          expect.objectContaining({ orderItemId: graph.itemA, effectMinor: -80 }),
+          expect.objectContaining({ orderItemId: graph.itemB, effectMinor: -20 })
+        ]) }),
+      expect.objectContaining({ status: 'complete', basis: 'fee',
+        baseSetId: oldFee, compatibleCorrectionTipId: oldCorrection, items: [] })
+    ]);
+
+    const replayCorrelationId = 'reclassification-production-correction-compatible-replay';
+    await expect(replayFinancialClassification({
+      database: workerDatabaseClient.db,
+      targetClassifierVersion: 2,
+      targetAllocationAlgorithmVersion: 3
+    }, replayInput(target, replayCorrelationId))).resolves.toBeUndefined();
+
+    const replacements = await databaseClient.pool.query<{
+      id: string; basis: 'gross_amount' | 'fee'; supersedes_set_id: string | null;
+    }>(`select id, basis, supersedes_set_id
+        from financial_allocation_sets
+        where balance_transaction_id=$1 and classifier_version=2 and algorithm_version=3
+        order by basis`, [target.balanceTransactionId]);
+    expect(replacements.rows).toHaveLength(2);
+    const newGross = replacements.rows.find((row) => row.basis === 'gross_amount');
+    const newFee = replacements.rows.find((row) => row.basis === 'fee');
+    expect(newGross).toMatchObject({ supersedes_set_id: oldGross });
+    expect(newFee).toMatchObject({ supersedes_set_id: oldFee });
+    if (!newGross || !newFee) throw new Error('Expected both correction replay successors');
+    await expect(databaseClient.pool.query<{
+      order_item_id: string; effect_minor: number;
+    }>(`select order_item_id, effect_minor from financial_item_allocations
+        where allocation_set_id=$1 order by order_item_id`, [newGross.id]))
+      .resolves.toMatchObject({ rows: expect.arrayContaining([
+        { order_item_id: graph.itemA, effect_minor: -50 },
+        { order_item_id: graph.itemB, effect_minor: -50 }
+      ]) });
+
+    const successors = await databaseClient.pool.query<{
+      id: string; correction_version: number; kind: string;
+      base_allocation_set_id: string; predecessor_correction_set_id: string | null;
+      source_fingerprint_sha256: string; approved_by_admin_id: string;
+      created_by_admin_id: string | null;
+    }>(`select id, correction_version, kind, base_allocation_set_id,
+          predecessor_correction_set_id, source_fingerprint_sha256,
+          approved_by_admin_id, created_by_admin_id
+        from refund_reporting_correction_sets
+        where predecessor_correction_set_id=$1`, [oldCorrection]);
+    expect(successors.rows).toEqual([expect.objectContaining({
+      correction_version: 2,
+      kind: 'classifier_rebase',
+      base_allocation_set_id: newGross.id,
+      predecessor_correction_set_id: oldCorrection,
+      source_fingerprint_sha256: target.fingerprint,
+      approved_by_admin_id: graph.adminId,
+      created_by_admin_id: null
+    })]);
+    const newCorrection = successors.rows[0]!.id;
+    const rebasedItems = await databaseClient.pool.query<{
+      domain: 'settlement' | 'presentment'; source_allocation_set_id: string | null;
+      order_item_id: string; approved_absolute_minor: number; delta_minor: number;
+      stable_tie_break_key: string;
+    }>(`select domain, source_allocation_set_id, order_item_id,
+          approved_absolute_minor, delta_minor, stable_tie_break_key
+        from refund_reporting_correction_items
+        where correction_set_id=$1 order by stable_tie_break_key`, [newCorrection]);
+    expect(rebasedItems.rows).toHaveLength(4);
+    expect(rebasedItems.rows).toEqual(expect.arrayContaining([
+      { domain: 'settlement', source_allocation_set_id: newGross.id,
+        order_item_id: graph.itemA, approved_absolute_minor: -80, delta_minor: -30,
+        stable_tie_break_key: `settlement:gross:${graph.itemA}:refund_subtotal` },
+      { domain: 'settlement', source_allocation_set_id: newGross.id,
+        order_item_id: graph.itemB, approved_absolute_minor: -20, delta_minor: 30,
+        stable_tie_break_key: `settlement:gross:${graph.itemB}:refund_subtotal` },
+      { domain: 'presentment', source_allocation_set_id: null,
+        order_item_id: graph.itemA, approved_absolute_minor: 80, delta_minor: 30,
+        stable_tie_break_key: `presentment:${graph.itemA}:refund_subtotal` },
+      { domain: 'presentment', source_allocation_set_id: null,
+        order_item_id: graph.itemB, approved_absolute_minor: 20, delta_minor: -30,
+        stable_tie_break_key: `presentment:${graph.itemB}:refund_subtotal` }
+    ]));
+
+    await databaseClient.db.transaction((tx) => activateProjectionVersionForFixture(tx, {
+      classifierVersion: 2, allocationAlgorithmVersion: 3,
+      correlationId: 'reclassification-production-correction-compatible-activate'
+    }));
+    await expect(loadCurrentEffectiveAllocationProjection(databaseClient.db, {
+      balanceTransactionIds: [target.balanceTransactionId]
+    })).resolves.toEqual([
+      expect.objectContaining({ status: 'complete', basis: 'gross_amount',
+        baseSetId: newGross.id, compatibleCorrectionTipId: newCorrection,
+        items: expect.arrayContaining([
+          expect.objectContaining({ orderItemId: graph.itemA, effectMinor: -80 }),
+          expect.objectContaining({ orderItemId: graph.itemB, effectMinor: -20 })
+        ]) }),
+      expect.objectContaining({ status: 'complete', basis: 'fee',
+        baseSetId: newFee.id, compatibleCorrectionTipId: newCorrection, items: [] })
+    ]);
+    await expect(databaseClient.pool.query<{
+      action: string; outcome: string; resource_id: string; correlation_id: string;
+    }>(`select action, outcome, resource_id::text, correlation_id
+        from audit_events where correlation_id=$1 and action='financial.correction.rebased'`,
+      [replayCorrelationId])).resolves.toMatchObject({ rows: [{
+        action: 'financial.correction.rebased', outcome: 'succeeded',
+        resource_id: newCorrection, correlation_id: replayCorrelationId
+      }] });
+  });
+
+  it('fails closed when production replay cannot preserve the approved correction', async () => {
+    await resetProjectionVersionForFixture({
+      classifierVersion: 1,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+      correlationId: 'reclassification-production-correction-incompatible-seed'
+    });
+    const graph = await correctionRebaseGraph(
+      'reclassification-production-correction-incompatible'
+    );
+    const target = await finalizedRefundEvidence(
+      graph, 'production-correction-incompatible-target', [50, 50]
+    );
+    await databaseClient.db.transaction((tx) => appendClassificationDecisionLocked(tx, {
+      subjectType: 'balance_transaction', subjectId: target.balanceTransactionId,
+      classifierVersion: 1, sourceFingerprint: target.fingerprint,
+      decision: { status: 'classified', classification: 'refund',
+        impact: 'informational' },
+      correlationId: 'reclassification-production-correction-incompatible-classify-v1'
+    }));
+    const oldGross = await insertRefundAllocationSet({
+      label: 'production-correction-incompatible-old-gross', refundId: target.refundId,
+      balanceTransactionId: target.balanceTransactionId, fingerprint: target.fingerprint,
+      expectedEffectMinor: -100, classifierVersion: 1,
+      algorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+      items: [{ orderItemId: graph.itemA, effectMinor: -100 }]
+    });
+    const oldFee = await insertRefundAllocationSet({
+      label: 'production-correction-incompatible-old-fee', refundId: target.refundId,
+      balanceTransactionId: target.balanceTransactionId, fingerprint: target.fingerprint,
+      expectedEffectMinor: 0, classifierVersion: 1,
+      algorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+      basis: 'fee', items: []
+    });
+    const oldCorrection = await insertRefundCorrection({
+      label: 'production-correction-incompatible-approved', refundId: target.refundId,
+      baseSetId: oldGross, fingerprint: target.fingerprint, adminId: graph.adminId,
+      items: [
+        { domain: 'settlement', sourceSetId: oldGross, orderItemId: graph.itemA,
+          approvedMinor: -100, deltaMinor: 0,
+          stableTieBreakKey: `settlement:gross:${graph.itemA}:refund_subtotal` },
+        { domain: 'presentment', sourceSetId: null, orderItemId: graph.itemA,
+          approvedMinor: 50, deltaMinor: 0,
+          stableTieBreakKey: `presentment:${graph.itemA}:refund_subtotal` },
+        { domain: 'presentment', sourceSetId: null, orderItemId: graph.itemB,
+          approvedMinor: 50, deltaMinor: 0,
+          stableTieBreakKey: `presentment:${graph.itemB}:refund_subtotal` }
+      ]
+    });
+    await expect(loadCurrentEffectiveAllocationProjection(databaseClient.db, {
+      balanceTransactionIds: [target.balanceTransactionId]
+    })).resolves.toEqual([
+      expect.objectContaining({ status: 'complete', basis: 'gross_amount',
+        baseSetId: oldGross, compatibleCorrectionTipId: oldCorrection,
+        items: [{ orderItemId: graph.itemA, component: 'refund_subtotal',
+          effectMinor: -100, currency: 'USD' }] }),
+      expect.objectContaining({ status: 'complete', basis: 'fee',
+        baseSetId: oldFee, compatibleCorrectionTipId: oldCorrection, items: [] })
+    ]);
+
+    const replayCorrelationId = 'reclassification-production-correction-incompatible-replay';
+    await expect(replayFinancialClassification({
+      database: workerDatabaseClient.db,
+      targetClassifierVersion: 2,
+      targetAllocationAlgorithmVersion: 3
+    }, replayInput(target, replayCorrelationId))).resolves.toBeUndefined();
+    const replacements = await databaseClient.pool.query<{
+      id: string; basis: 'gross_amount' | 'fee'; supersedes_set_id: string | null;
+    }>(`select id, basis, supersedes_set_id
+        from financial_allocation_sets
+        where balance_transaction_id=$1 and classifier_version=2 and algorithm_version=3
+        order by basis`, [target.balanceTransactionId]);
+    expect(replacements.rows).toHaveLength(2);
+    const newGross = replacements.rows.find((row) => row.basis === 'gross_amount');
+    const newFee = replacements.rows.find((row) => row.basis === 'fee');
+    expect(newGross).toMatchObject({ supersedes_set_id: oldGross });
+    expect(newFee).toMatchObject({ supersedes_set_id: oldFee });
+    if (!newGross || !newFee) throw new Error('Expected incompatible replay replacements');
+    await expect(databaseClient.pool.query<{
+      order_item_id: string; effect_minor: number;
+    }>(`select order_item_id, effect_minor from financial_item_allocations
+        where allocation_set_id=$1 order by order_item_id`, [newGross.id]))
+      .resolves.toMatchObject({ rows: expect.arrayContaining([
+        { order_item_id: graph.itemA, effect_minor: -50 },
+        { order_item_id: graph.itemB, effect_minor: -50 }
+      ]) });
+    await expect(databaseClient.pool.query<{ count: string }>(
+      `select count(*)::text as count from refund_reporting_correction_sets
+       where predecessor_correction_set_id=$1`, [oldCorrection]
+    )).resolves.toMatchObject({ rows: [{ count: '0' }] });
+    await expect(databaseClient.pool.query<{
+      basis: 'gross_amount' | 'fee'; resource_id: string;
+    }>(`select allocation.basis, issue.resource_id::text
+        from financial_reconciliation_issues issue
+        join financial_allocation_sets allocation on allocation.id=issue.resource_id
+        where allocation.balance_transaction_id=$1
+          and issue.safe_code='correction_rebase_required' and issue.state='open'
+        order by allocation.basis`, [target.balanceTransactionId]))
+      .resolves.toMatchObject({ rows: [
+        { basis: 'gross_amount', resource_id: newGross.id },
+        { basis: 'fee', resource_id: newFee.id }
+      ] });
+
+    await databaseClient.db.transaction((tx) => activateProjectionVersionForFixture(tx, {
+      classifierVersion: 2, allocationAlgorithmVersion: 3,
+      correlationId: 'reclassification-production-correction-incompatible-activate'
+    }));
+    await expect(databaseClient.pool.query<{
+      basis: 'gross_amount' | 'fee'; base_set_id: string | null;
+      compatible_correction_tip_id: string | null; expected_effect_minor: number | null;
+      is_complete: boolean; missing_source_count: number; proposed_issue_code: string | null;
+    }>(`select basis, base_set_id, compatible_correction_tip_id,
+          expected_effect_minor, is_complete, missing_source_count, proposed_issue_code
+        from current_financial_projection_heads where balance_transaction_id=$1
+        order by case basis when 'gross_amount' then 0 else 1 end`,
+      [target.balanceTransactionId])).resolves.toMatchObject({ rows: [
+        { basis: 'gross_amount', base_set_id: null, compatible_correction_tip_id: null,
+          expected_effect_minor: null, is_complete: false, missing_source_count: 1,
+          proposed_issue_code: 'correction_rebase_required' },
+        { basis: 'fee', base_set_id: null, compatible_correction_tip_id: null,
+          expected_effect_minor: null, is_complete: false, missing_source_count: 1,
+          proposed_issue_code: 'correction_rebase_required' }
+      ] });
+    await expect(loadCurrentEffectiveAllocationProjection(databaseClient.db, {
+      balanceTransactionIds: [target.balanceTransactionId]
+    })).resolves.toEqual([
+      { status: 'exception', balanceTransactionId: target.balanceTransactionId,
+        basis: 'gross_amount', safeCode: 'correction_rebase_required' },
+      { status: 'exception', balanceTransactionId: target.balanceTransactionId,
+        basis: 'fee', safeCode: 'correction_rebase_required' }
+    ]);
+    await expect(databaseClient.pool.query<{ count: string }>(
+      `select count(*)::text as count from current_financial_projection_items
+       where balance_transaction_id=$1`, [target.balanceTransactionId]
+    )).resolves.toMatchObject({ rows: [{ count: '0' }] });
+
+    await expect(replayFinancialClassification({
+      database: workerDatabaseClient.db,
+      targetClassifierVersion: 2,
+      targetAllocationAlgorithmVersion: 3
+    }, replayInput(target,
+      'reclassification-production-correction-incompatible-retry')))
+      .resolves.toBeUndefined();
+    await expect(databaseClient.pool.query<{
+      correction_successors: string; open_issues: string; failed_audits: string;
+    }>(`select
+          (select count(*)::text from refund_reporting_correction_sets
+           where predecessor_correction_set_id=$1) as correction_successors,
+          (select count(*)::text from financial_reconciliation_issues issue
+           join financial_allocation_sets allocation on allocation.id=issue.resource_id
+           where allocation.balance_transaction_id=$2
+             and issue.safe_code='correction_rebase_required'
+             and issue.state='open') as open_issues,
+          (select count(*)::text from audit_events
+           where action='financial.correction.rebase_failed'
+             and correlation_id in ($3, $4)) as failed_audits`, [
+      oldCorrection, target.balanceTransactionId, replayCorrelationId,
+      'reclassification-production-correction-incompatible-retry'
+    ])).resolves.toMatchObject({ rows: [{
+      correction_successors: '0', open_issues: '2', failed_audits: '2'
+    }] });
   });
 
   it('scopes a correction rebase failure to its exact replacement set', async () => {

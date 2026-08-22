@@ -12,10 +12,16 @@ import {
   parseRefundDraftSaveRequest,
   parseRefundFinalizationConfirmRequest,
   parseRefundFinalizationPrepareRequest,
+  parseRefundReportingCorrectionConfirmRequest,
+  parseRefundReportingCorrectionPrepareRequest,
   parseRefundReviewReturnContext,
   RefundReviewInputError
 } from '$lib/server/commerce/financial/refund-review/inputs';
 import { previewRefundFinalization } from '$lib/server/commerce/financial/refund-review/finalize';
+import {
+  getReportingCorrectionSeed,
+  previewReportingCorrection
+} from '$lib/server/commerce/financial/refund-review/corrections';
 import { getRefundReviewDetail } from '$lib/server/commerce/financial/refund-review/query';
 import { getDatabaseClient } from '$lib/server/db/runtime';
 import { assertSameOrigin } from '$lib/server/http/strict-json';
@@ -43,7 +49,9 @@ type RefundAction =
   | 'saveDraft'
   | 'discardDraft'
   | 'prepareFinalize'
-  | 'confirmFinalize';
+  | 'confirmFinalize'
+  | 'prepareCorrection'
+  | 'confirmCorrection';
 
 type RetrySubmission =
   | {
@@ -66,6 +74,20 @@ type RetrySubmission =
       readonly expectedActiveDraftVersion: number;
       readonly previewFingerprint: string;
       readonly confirmation: 'finalize_refund_allocation';
+    }
+  | {
+      readonly action: 'confirmCorrection';
+      readonly idempotencyKey: string;
+      readonly reason: 'allocation_attribution_correction';
+      readonly expectedNextCorrectionVersion: number;
+      readonly expectedBaseAllocationSetId: string;
+      readonly expectedSourceFingerprint: string;
+      readonly items: readonly {
+        readonly orderItemId: string;
+        readonly totalPresentmentMinor: number;
+      }[];
+      readonly previewFingerprint: string;
+      readonly confirmation: 'create_reporting_correction';
     };
 
 function actionReturnContext(url: URL, action: RefundAction) {
@@ -88,19 +110,28 @@ export const load: PageServerLoad = async (event) => {
     const refundId = requireFinancialRouteUuid(event.params.refundId);
     const returnContext = parseRefundReviewReturnContext(event.url);
     const context = createFinancialRequestContext(event.request, event.route.id);
+    const database = getDatabaseClient().db;
     const detail = await getRefundReviewDetail(
-      getDatabaseClient().db,
+      database,
       actor,
       refundId,
       context
     );
     if (detail === null) throw new FinancialRouteError('not_found');
+    const reportingCorrectionSeed = await getReportingCorrectionSeed(
+      database,
+      actor,
+      refundId,
+      context
+    );
     return {
       detail,
+      reportingCorrectionSeed,
       reviewCursor: returnContext.reviewCursor,
       saveDraftIdempotencyKey: randomUUID(),
       discardDraftIdempotencyKey: randomUUID(),
-      finalizeIdempotencyKey: randomUUID()
+      finalizeIdempotencyKey: randomUUID(),
+      correctionIdempotencyKey: randomUUID()
     };
   } catch (cause: unknown) {
     failLoadSafely(cause);
@@ -231,9 +262,110 @@ async function confirmFinalization(
   }
 }
 
+async function prepareCorrection(
+  event: Parameters<Actions['saveDraft']>[0]
+) {
+  try {
+    const actor = requireRefundManagement(event.locals.actor);
+    assertSameOrigin(event.request);
+    const refundId = requireFinancialRouteUuid(event.params.refundId);
+    const returnContext = actionReturnContext(event.url, 'prepareCorrection');
+    const input = await parseRefundReportingCorrectionPrepareRequest(
+      event.request,
+      refundId
+    );
+    const reportingCorrectionPreview = await previewReportingCorrection(
+      getDatabaseClient().db,
+      actor,
+      input,
+      createFinancialRequestContext(event.request, event.route.id)
+    );
+    return {
+      reportingCorrectionPreview,
+      reviewCursor: returnContext.reviewCursor
+    };
+  } catch (cause: unknown) {
+    const failure = financialActionFailure(
+      cause instanceof FinancialAdminConflictError
+        ? new FinancialRouteError('stale_state')
+        : cause
+    );
+    const itemField = cause instanceof RefundReviewInputError
+      ? cause.fieldKey
+      : null;
+    return fail(failure.status, {
+      code: failure.code,
+      fieldErrors: failure.code === 'invalid_request'
+        ? itemField === null
+          ? { form: 'Check each reporting attribution and prepare again.' }
+          : {
+              form: 'Check the highlighted reporting attribution and prepare again.',
+              [itemField]: 'Enter a whole amount from 0 through 99,999,999.'
+            }
+        : {},
+      retrySubmission: null
+    });
+  }
+}
+
+async function confirmCorrection(
+  event: Parameters<Actions['saveDraft']>[0]
+) {
+  let retrySubmission: Extract<RetrySubmission, { action: 'confirmCorrection' }> | null = null;
+  try {
+    const actor = requireRefundManagement(event.locals.actor);
+    assertSameOrigin(event.request);
+    const refundId = requireFinancialRouteUuid(event.params.refundId);
+    const returnContext = actionReturnContext(event.url, 'confirmCorrection');
+    const submission = await parseRefundReportingCorrectionConfirmRequest(
+      event.request,
+      refundId
+    );
+    retrySubmission = {
+      action: 'confirmCorrection',
+      idempotencyKey: submission.idempotencyKey,
+      reason: submission.command.reason,
+      expectedNextCorrectionVersion: submission.command.expectedNextCorrectionVersion,
+      expectedBaseAllocationSetId: submission.command.expectedBaseAllocationSetId,
+      expectedSourceFingerprint: submission.command.expectedSourceFingerprint,
+      items: submission.command.items,
+      previewFingerprint: submission.command.previewFingerprint,
+      confirmation: submission.command.confirmation
+    };
+    const command = await submitFinancialAdminCommand(getDatabaseClient().db, {
+      actor,
+      idempotencyKey: submission.idempotencyKey,
+      command: submission.command,
+      context: createFinancialRequestContext(event.request, event.route.id)
+    });
+    return { command, reviewCursor: returnContext.reviewCursor };
+  } catch (cause: unknown) {
+    const failure = financialActionFailure(cause);
+    const itemField = cause instanceof RefundReviewInputError
+      ? cause.fieldKey
+      : null;
+    return fail(failure.status, {
+      code: failure.code,
+      fieldErrors: failure.code === 'invalid_request'
+        ? itemField === null
+          ? { form: 'Reload current reporting facts and prepare the correction again.' }
+          : {
+              form: 'Check the highlighted reporting attribution and prepare again.',
+              [itemField]: 'Enter a whole amount from 0 through 99,999,999.'
+            }
+        : {},
+      retrySubmission: failure.code === 'temporarily_unavailable'
+        ? retrySubmission
+        : null
+    });
+  }
+}
+
 export const actions: Actions = {
   saveDraft: (event) => submitDraft(event, 'saveDraft'),
   discardDraft: (event) => submitDraft(event, 'discardDraft'),
   prepareFinalize: prepareFinalization,
-  confirmFinalize: confirmFinalization
+  confirmFinalize: confirmFinalization,
+  prepareCorrection,
+  confirmCorrection
 };

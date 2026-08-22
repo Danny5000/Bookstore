@@ -5,7 +5,9 @@ import type {
   FinancialAdminCommandReferenceDto,
   FinancialAdminCommandStatusDto,
   RefundDetailDto,
-  RefundFinalizationPreviewDto
+  RefundFinalizationPreviewDto,
+  RefundReportingCorrectionPreviewDto,
+  RefundReportingCorrectionSeedDto
 } from '$lib/types/financial-reporting';
 
 vi.mock('$app/navigation', () => ({ invalidateAll: vi.fn() }));
@@ -14,6 +16,7 @@ vi.mock('$app/paths', () => ({ resolve: (path: string) => path }));
 import RefundAllocationEditor from './RefundAllocationEditor.svelte';
 import FinancialActionOutcome from './FinancialActionOutcome.svelte';
 import FinancialCommandStatus from './FinancialCommandStatus.svelte';
+import ReportingCorrectionEditor from './ReportingCorrectionEditor.svelte';
 import RefundReviewPage from '../../../routes/admin/sales/refunds/[refundId]/+page.svelte';
 
 const REFUND_ID = '00000000-0000-4000-8000-000000011401';
@@ -24,7 +27,11 @@ const COMMAND_ID = '00000000-0000-4000-8000-000000011405';
 const SAVE_KEY = '00000000-0000-4000-8000-000000011406';
 const DISCARD_KEY = '00000000-0000-4000-8000-000000011407';
 const FINALIZE_KEY = '00000000-0000-4000-8000-000000011412';
+const CORRECTION_KEY = '00000000-0000-4000-8000-000000011413';
+const BASE_ALLOCATION_SET_ID = '00000000-0000-4000-8000-000000011414';
+const RAW_CORRECTION_SET_ID = '00000000-0000-4000-8000-000000011415';
 const PREVIEW_FINGERPRINT = 'b'.repeat(64);
+const SOURCE_FINGERPRINT = 'c'.repeat(64);
 
 function finalizationPreview(
   overrides: Partial<RefundFinalizationPreviewDto> = {}
@@ -62,6 +69,115 @@ function finalizationPreview(
         otherActiveGrantPreservesAccess: true,
         effectiveAccessWouldChange: false,
         emailQueued: false
+      }
+    ],
+    ...overrides
+  };
+}
+
+function correctionSeed(
+  overrides: Partial<RefundReportingCorrectionSeedDto> = {}
+): RefundReportingCorrectionSeedDto {
+  return {
+    refundId: REFUND_ID,
+    reason: 'allocation_attribution_correction',
+    expectedNextCorrectionVersion: 2,
+    expectedBaseAllocationSetId: BASE_ALLOCATION_SET_ID,
+    expectedSourceFingerprint: SOURCE_FINGERPRINT,
+    rawPredecessorCorrectionSetId: RAW_CORRECTION_SET_ID,
+    compatibleCorrectionSetId: RAW_CORRECTION_SET_ID,
+    baselineKind: 'compatible_correction',
+    currentReportingComplete: true,
+    currency: 'USD',
+    settlementCurrency: 'USD',
+    baselineTotalMinor: 500,
+    eligible: true,
+    ineligibleReason: null,
+    items: [
+      {
+        orderItemId: FIRST_ITEM_ID,
+        titleId: '00000000-0000-4000-8000-000000011409',
+        soldAsTitle: 'First title',
+        baselineTotalMinor: 300,
+        baselineSubtotalMinor: 270,
+        baselineTaxMinor: 30,
+        baselineSettlementGrossMinor: 285,
+        baselineRefundFeeImpactMinor: -15
+      },
+      {
+        orderItemId: SECOND_ITEM_ID,
+        titleId: '00000000-0000-4000-8000-000000011410',
+        soldAsTitle: 'Second title',
+        baselineTotalMinor: 200,
+        baselineSubtotalMinor: 180,
+        baselineTaxMinor: 20,
+        baselineSettlementGrossMinor: 190,
+        baselineRefundFeeImpactMinor: -10
+      }
+    ],
+    ...overrides
+  };
+}
+
+function correctionPreview(
+  overrides: Partial<RefundReportingCorrectionPreviewDto> = {}
+): RefundReportingCorrectionPreviewDto {
+  return {
+    refundId: REFUND_ID,
+    expectedBaseAllocationSetId: BASE_ALLOCATION_SET_ID,
+    rawPredecessorCorrectionSetId: RAW_CORRECTION_SET_ID,
+    compatibleCorrectionSetId: RAW_CORRECTION_SET_ID,
+    expectedNextCorrectionVersion: 2,
+    expectedSourceFingerprint: SOURCE_FINGERPRINT,
+    previewFingerprint: PREVIEW_FINGERPRINT,
+    baselineKind: 'compatible_correction',
+    currentReportingComplete: true,
+    proposedReportingComplete: true,
+    compatibilityRepair: false,
+    currency: 'USD',
+    settlementCurrency: 'USD',
+    baselineTotalMinor: 500,
+    proposedTotalMinor: 500,
+    eligible: true,
+    ineligibleReason: null,
+    items: [
+      {
+        orderItemId: FIRST_ITEM_ID,
+        titleId: '00000000-0000-4000-8000-000000011409',
+        soldAsTitle: 'First title',
+        baselineTotalMinor: 300,
+        baselineSubtotalMinor: 270,
+        baselineTaxMinor: 30,
+        proposedTotalMinor: 325,
+        proposedSubtotalMinor: 290,
+        proposedTaxMinor: 35,
+        subtotalDisplayDeltaMinor: 20,
+        taxDisplayDeltaMinor: 5,
+        baselineSettlementGrossMinor: 285,
+        proposedSettlementGrossMinor: 305,
+        settlementGrossDisplayDeltaMinor: 20,
+        baselineRefundFeeImpactMinor: -15,
+        proposedRefundFeeImpactMinor: -14,
+        refundFeeImpactDisplayDeltaMinor: 1
+      },
+      {
+        orderItemId: SECOND_ITEM_ID,
+        titleId: '00000000-0000-4000-8000-000000011410',
+        soldAsTitle: 'Second title',
+        baselineTotalMinor: 200,
+        baselineSubtotalMinor: 180,
+        baselineTaxMinor: 20,
+        proposedTotalMinor: 175,
+        proposedSubtotalMinor: 160,
+        proposedTaxMinor: 15,
+        subtotalDisplayDeltaMinor: -20,
+        taxDisplayDeltaMinor: -5,
+        baselineSettlementGrossMinor: 190,
+        proposedSettlementGrossMinor: 170,
+        settlementGrossDisplayDeltaMinor: -20,
+        baselineRefundFeeImpactMinor: -10,
+        proposedRefundFeeImpactMinor: -11,
+        refundFeeImpactDisplayDeltaMinor: -1
       }
     ],
     ...overrides
@@ -204,6 +320,193 @@ describe('accessible shared refund draft editor', () => {
   });
 });
 
+describe('append-only reporting correction editor', () => {
+  it('renders the eligible seed as a keyboard-native, field-linked full-item prepare form', () => {
+    const body = render(ReportingCorrectionEditor, {
+      props: {
+        seed: correctionSeed(),
+        preview: undefined,
+        confirmIdempotencyKey: CORRECTION_KEY,
+        reviewCursor: 'bounded_cursor',
+        fieldErrors: { [FIRST_ITEM_ID]: 'Enter a valid attribution amount.' }
+      }
+    }).body;
+
+    expect(body).toContain('Reporting attribution correction');
+    expect(body).toContain('Reporting only — this does not restore or revoke access.');
+    expect(body).toMatch(/Current reporting:<\/strong>\s*Complete/u);
+    expect(body).toMatch(/Baseline:<\/strong>\s*Compatible correction/u);
+    expect(body).toContain('?/prepareCorrection&amp;reviewCursor=bounded_cursor');
+    expect(body).toContain('name="reason" value="allocation_attribution_correction"');
+    expect(body).toContain('name="expectedNextCorrectionVersion" value="2"');
+    expect(body).toContain(
+      `name="expectedBaseAllocationSetId" value="${BASE_ALLOCATION_SET_ID}"`
+    );
+    expect(body).toContain(
+      `name="expectedSourceFingerprint" value="${SOURCE_FINGERPRINT}"`
+    );
+    expect(body.match(/name="orderItemId"/gu)).toHaveLength(2);
+    expect(body.match(/name="totalPresentmentMinor"/gu)).toHaveLength(2);
+    expect(body).toContain(`name="orderItemId" value="${FIRST_ITEM_ID}"`);
+    expect(body).toMatch(/type="number"[^>]*min="0"[^>]*max="99999999"[^>]*step="1"/u);
+    expect(body).toContain('aria-describedby=');
+    expect(body).toContain('Enter a valid attribution amount.');
+    expect(body).toMatch(new RegExp(
+      `id="reporting-correction-${FIRST_ITEM_ID}"[^>]*autofocus`,
+      'u'
+    ));
+    expect(body.match(/autofocus/gu)).toHaveLength(1);
+    expect(body).toContain('Review reporting correction');
+    expect(body).not.toContain('idempotencyKey');
+    expect(body).not.toContain('window.confirm');
+  });
+
+  it.each([
+    ['provider_evidence_pending', 'Provider evidence is still pending.'],
+    ['immutable_conflict', 'The immutable reporting evidence is inconsistent.'],
+    ['not_finalized', 'Finalize this refund allocation before correcting reporting.']
+  ] as const)('shows safe %s guidance without a mutation form', (ineligibleReason, copy) => {
+    const body = render(ReportingCorrectionEditor, {
+      props: {
+        seed: correctionSeed({
+          eligible: false,
+          ineligibleReason,
+          expectedNextCorrectionVersion: null,
+          expectedBaseAllocationSetId: null,
+          expectedSourceFingerprint: null,
+          rawPredecessorCorrectionSetId: null,
+          compatibleCorrectionSetId: null,
+          baselineKind: null,
+          currency: null,
+          settlementCurrency: null,
+          baselineTotalMinor: null,
+          items: []
+        }),
+        preview: undefined,
+        confirmIdempotencyKey: CORRECTION_KEY,
+        reviewCursor: null
+      }
+    }).body;
+
+    expect(body).toContain(copy);
+    expect(body).toContain('Reporting only — this does not restore or revoke access.');
+    expect(body).not.toContain('<form');
+    expect(body).not.toContain(CORRECTION_KEY);
+  });
+
+  it('renders old, proposed, and display deltas with one explicit native confirmation', () => {
+    const body = render(ReportingCorrectionEditor, {
+      props: {
+        seed: correctionSeed(),
+        preview: correctionPreview(),
+        confirmIdempotencyKey: CORRECTION_KEY,
+        reviewCursor: 'bounded_cursor'
+      }
+    }).body;
+
+    expect(body).toContain('Review reporting correction');
+    expect(body).toMatch(/Current reporting:<\/strong>\s*Complete/u);
+    expect(body).toMatch(/Proposed reporting:<\/strong>\s*Complete/u);
+    expect(body).toContain('Baseline subtotal');
+    expect(body).toContain('Proposed subtotal');
+    expect(body).toContain('Subtotal change');
+    expect(body).toContain('Tax change');
+    expect(body).toContain('Settlement gross change');
+    expect(body).toContain('Refund fee impact change');
+    expect(body).toContain('Append this reporting correction');
+    expect(body).toContain('?/confirmCorrection&amp;reviewCursor=bounded_cursor');
+    expect(body).toContain(`name="idempotencyKey" value="${CORRECTION_KEY}"`);
+    expect(body).toContain('name="reason" value="allocation_attribution_correction"');
+    expect(body).toContain('name="expectedNextCorrectionVersion" value="2"');
+    expect(body).toContain(
+      `name="expectedBaseAllocationSetId" value="${BASE_ALLOCATION_SET_ID}"`
+    );
+    expect(body).toContain(
+      `name="expectedSourceFingerprint" value="${SOURCE_FINGERPRINT}"`
+    );
+    expect(body.match(/name="orderItemId"/gu)).toHaveLength(2);
+    expect(body).toContain('name="totalPresentmentMinor" value="325"');
+    expect(body).toContain('name="totalPresentmentMinor" value="175"');
+    expect(body).toContain(`name="previewFingerprint" value="${PREVIEW_FINGERPRINT}"`);
+    expect(body).toContain('name="confirmation" value="create_reporting_correction"');
+    expect(body.match(/<form\b/gu)).toHaveLength(1);
+    expect(body.match(/<button[^>]*type="submit"/gu)).toHaveLength(1);
+    expect(body).not.toContain('?/prepareCorrection');
+    expect(body).not.toContain('window.confirm');
+
+    const source = readFileSync(
+      new URL('./ReportingCorrectionEditor.svelte', import.meta.url),
+      'utf8'
+    );
+    expect(source).toContain('overflow-x: auto');
+    expect(source).toContain('role="region"');
+    expect(source).not.toMatch(/window\.confirm|fetch\(|use:enhance/iu);
+  });
+
+  it('keeps a numeric-zero raw-history repair confirmable and explains append-only history', () => {
+    const repairedItems = correctionPreview().items.map((item) => ({
+      ...item,
+      proposedTotalMinor: item.baselineTotalMinor,
+      proposedSubtotalMinor: item.baselineSubtotalMinor,
+      proposedTaxMinor: item.baselineTaxMinor,
+      subtotalDisplayDeltaMinor: 0,
+      taxDisplayDeltaMinor: 0,
+      proposedSettlementGrossMinor: item.baselineSettlementGrossMinor,
+      settlementGrossDisplayDeltaMinor: 0,
+      proposedRefundFeeImpactMinor: item.baselineRefundFeeImpactMinor,
+      refundFeeImpactDisplayDeltaMinor: 0
+    }));
+    const body = render(ReportingCorrectionEditor, {
+      props: {
+        seed: correctionSeed({
+          rawPredecessorCorrectionSetId: RAW_CORRECTION_SET_ID,
+          compatibleCorrectionSetId: null,
+          baselineKind: 'immutable_base',
+          currentReportingComplete: false
+        }),
+        preview: correctionPreview({
+          compatibleCorrectionSetId: null,
+          baselineKind: 'immutable_base',
+          currentReportingComplete: false,
+          proposedReportingComplete: true,
+          compatibilityRepair: true,
+          items: repairedItems
+        }),
+        confirmIdempotencyKey: CORRECTION_KEY,
+        reviewCursor: null
+      }
+    }).body;
+
+    expect(body).toContain('Raw-history compatibility repair');
+    expect(body).toContain('This appends a compatible successor; it does not rewrite correction history.');
+    expect(body).toMatch(/Current reporting:<\/strong>\s*Incomplete/u);
+    expect(body).toMatch(/Proposed reporting:<\/strong>\s*Complete/u);
+    expect(body).toContain('Append this reporting correction');
+    expect(body).toContain('name="totalPresentmentMinor" value="300"');
+    expect(body).toContain('name="totalPresentmentMinor" value="200"');
+  });
+
+  it('renders already-complete no-change guidance without a confirmation form', () => {
+    const body = render(ReportingCorrectionEditor, {
+      props: {
+        seed: correctionSeed(),
+        preview: correctionPreview({
+          previewFingerprint: null,
+          eligible: false,
+          ineligibleReason: 'no_change',
+          compatibilityRepair: false
+        }),
+        confirmIdempotencyKey: CORRECTION_KEY,
+        reviewCursor: null
+      }
+    }).body;
+
+    expect(body).toContain('The proposed attribution already matches complete reporting.');
+    expect(body).not.toContain('<form');
+    expect(body).not.toContain(CORRECTION_KEY);
+  });
+});
+
 describe('safe financial command outcome and polling', () => {
   it('renders a non-JavaScript-safe command reference, status, reload link, and live region', () => {
     const body = render(FinancialActionOutcome, {
@@ -310,7 +613,9 @@ describe('refund review page', () => {
           reviewCursor: 'bounded_cursor',
           saveDraftIdempotencyKey: SAVE_KEY,
           discardDraftIdempotencyKey: DISCARD_KEY,
-          finalizeIdempotencyKey: FINALIZE_KEY
+          finalizeIdempotencyKey: FINALIZE_KEY,
+          reportingCorrectionSeed: correctionSeed(),
+          correctionIdempotencyKey: CORRECTION_KEY
         },
         form: { command: command(), reviewCursor: 'bounded_cursor' }
       } as never
@@ -322,6 +627,9 @@ describe('refund review page', () => {
     expect(body).toContain('Open issues');
     expect(body).toContain('/admin/sales/review?cursor=bounded_cursor');
     expect(body).toContain(COMMAND_ID);
+    expect(body).not.toContain('Shared allocation draft');
+    expect(body).not.toContain('Reporting attribution correction');
+    expect(body).not.toMatch(/<form\b/gu);
     expect(body).not.toMatch(/customer@example|stripe_|provider_private|adminId|correlationId/iu);
 
     const source = readFileSync(
@@ -355,7 +663,9 @@ describe('refund review page', () => {
           reviewCursor: 'bounded_cursor',
           saveDraftIdempotencyKey: SAVE_KEY,
           discardDraftIdempotencyKey: DISCARD_KEY,
-          finalizeIdempotencyKey: FINALIZE_KEY
+          finalizeIdempotencyKey: FINALIZE_KEY,
+          reportingCorrectionSeed: correctionSeed(),
+          correctionIdempotencyKey: CORRECTION_KEY
         },
         form: { code, fieldErrors: {} }
       } as never
@@ -380,7 +690,9 @@ describe('refund review page', () => {
           reviewCursor: 'bounded_cursor',
           saveDraftIdempotencyKey: SAVE_KEY,
           discardDraftIdempotencyKey: DISCARD_KEY,
-          finalizeIdempotencyKey: FINALIZE_KEY
+          finalizeIdempotencyKey: FINALIZE_KEY,
+          reportingCorrectionSeed: correctionSeed(),
+          correctionIdempotencyKey: CORRECTION_KEY
         },
         form: { finalizationPreview: preview, reviewCursor: 'bounded_cursor' }
       } as never
@@ -431,6 +743,35 @@ describe('refund review page', () => {
     expect(source).not.toContain('window.confirm');
   });
 
+  it('renders only the prepared reporting-correction confirmation and its safe seed context', () => {
+    const body = render(RefundReviewPage, {
+      props: {
+        data: {
+          detail: detail({ allocationStatus: 'finalized', draft: null }),
+          reportingCorrectionSeed: correctionSeed(),
+          reviewCursor: 'bounded_cursor',
+          saveDraftIdempotencyKey: SAVE_KEY,
+          discardDraftIdempotencyKey: DISCARD_KEY,
+          finalizeIdempotencyKey: FINALIZE_KEY,
+          correctionIdempotencyKey: CORRECTION_KEY
+        },
+        form: {
+          reportingCorrectionPreview: correctionPreview(),
+          reviewCursor: 'bounded_cursor'
+        }
+      } as never
+    }).body;
+
+    expect(body).toContain('Review reporting correction');
+    expect(body).toContain('Reporting only — this does not restore or revoke access.');
+    expect(body).toContain('?/confirmCorrection&amp;reviewCursor=bounded_cursor');
+    expect(body).toContain(`name="idempotencyKey" value="${CORRECTION_KEY}"`);
+    expect(body).not.toContain('Shared allocation draft');
+    expect(body).not.toContain('?/prepareFinalize');
+    expect(body).not.toContain('?/prepareCorrection');
+    expect(body.match(/<form\b/gu)).toHaveLength(1);
+  });
+
   it('treats preparation availability failure as rerunnable, not as a submitted command', () => {
     const body = render(RefundReviewPage, {
       props: {
@@ -439,7 +780,9 @@ describe('refund review page', () => {
           reviewCursor: null,
           saveDraftIdempotencyKey: SAVE_KEY,
           discardDraftIdempotencyKey: DISCARD_KEY,
-          finalizeIdempotencyKey: FINALIZE_KEY
+          finalizeIdempotencyKey: FINALIZE_KEY,
+          reportingCorrectionSeed: correctionSeed(),
+          correctionIdempotencyKey: CORRECTION_KEY
         },
         form: {
           code: 'temporarily_unavailable',
@@ -465,7 +808,9 @@ describe('refund review page', () => {
           reviewCursor: 'bounded_cursor',
           saveDraftIdempotencyKey: SAVE_KEY,
           discardDraftIdempotencyKey: DISCARD_KEY,
-          finalizeIdempotencyKey: FINALIZE_KEY
+          finalizeIdempotencyKey: FINALIZE_KEY,
+          reportingCorrectionSeed: correctionSeed(),
+          correctionIdempotencyKey: CORRECTION_KEY
         },
         form: {
           code: 'temporarily_unavailable',
@@ -503,7 +848,9 @@ describe('refund review page', () => {
           reviewCursor: 'bounded_cursor',
           saveDraftIdempotencyKey: SAVE_KEY,
           discardDraftIdempotencyKey: DISCARD_KEY,
-          finalizeIdempotencyKey: FINALIZE_KEY
+          finalizeIdempotencyKey: FINALIZE_KEY,
+          reportingCorrectionSeed: correctionSeed(),
+          correctionIdempotencyKey: CORRECTION_KEY
         },
         form: {
           code: 'temporarily_unavailable',
@@ -534,5 +881,74 @@ describe('refund review page', () => {
     expect(body).not.toContain(`value="${FINALIZE_KEY}"`);
     expect(body).not.toContain('Shared allocation draft');
     expect(body).not.toContain('Review finalization consequences');
+  });
+
+  it('renders one explicit exact correction retry with all sorted values and no automatic submit path', () => {
+    const retryKey = '00000000-0000-4000-8000-000000011416';
+    const body = render(RefundReviewPage, {
+      props: {
+        data: {
+          detail: detail({ allocationStatus: 'finalized', draft: null }),
+          reportingCorrectionSeed: correctionSeed(),
+          reviewCursor: 'bounded_cursor',
+          saveDraftIdempotencyKey: SAVE_KEY,
+          discardDraftIdempotencyKey: DISCARD_KEY,
+          finalizeIdempotencyKey: FINALIZE_KEY,
+          correctionIdempotencyKey: CORRECTION_KEY
+        },
+        form: {
+          code: 'temporarily_unavailable',
+          fieldErrors: {},
+          retrySubmission: {
+            action: 'confirmCorrection',
+            idempotencyKey: retryKey,
+            reason: 'allocation_attribution_correction',
+            expectedNextCorrectionVersion: 2,
+            expectedBaseAllocationSetId: BASE_ALLOCATION_SET_ID,
+            expectedSourceFingerprint: SOURCE_FINGERPRINT,
+            items: [
+              { orderItemId: FIRST_ITEM_ID, totalPresentmentMinor: 0 },
+              { orderItemId: SECOND_ITEM_ID, totalPresentmentMinor: 500 }
+            ],
+            previewFingerprint: PREVIEW_FINGERPRINT,
+            confirmation: 'create_reporting_correction'
+          }
+        }
+      } as never
+    }).body;
+
+    expect(body.match(/<form\b/gu)).toHaveLength(1);
+    expect(body).toContain('?/confirmCorrection&amp;reviewCursor=bounded_cursor');
+    expect(body).toContain(`name="idempotencyKey" value="${retryKey}"`);
+    expect(body).toContain('name="reason" value="allocation_attribution_correction"');
+    expect(body).toContain('name="expectedNextCorrectionVersion" value="2"');
+    expect(body).toContain(
+      `name="expectedBaseAllocationSetId" value="${BASE_ALLOCATION_SET_ID}"`
+    );
+    expect(body).toContain(
+      `name="expectedSourceFingerprint" value="${SOURCE_FINGERPRINT}"`
+    );
+    expect(body.match(/name="orderItemId"/gu)).toHaveLength(2);
+    expect(body).toContain(`name="orderItemId" value="${FIRST_ITEM_ID}"`);
+    expect(body).toContain('name="totalPresentmentMinor" value="0"');
+    expect(body).toContain(`name="orderItemId" value="${SECOND_ITEM_ID}"`);
+    expect(body).toContain('name="totalPresentmentMinor" value="500"');
+    expect(body).toContain(`name="previewFingerprint" value="${PREVIEW_FINGERPRINT}"`);
+    expect(body).toContain('name="confirmation" value="create_reporting_correction"');
+    expect(body).not.toContain(CORRECTION_KEY);
+    expect(body).not.toContain('Reporting attribution correction');
+    expect(body).not.toContain('Shared allocation draft');
+
+    const pageSource = readFileSync(
+      new URL('../../../routes/admin/sales/refunds/[refundId]/+page.svelte', import.meta.url),
+      'utf8'
+    );
+    const editorSource = readFileSync(
+      new URL('./ReportingCorrectionEditor.svelte', import.meta.url),
+      'utf8'
+    );
+    expect(`${pageSource}\n${editorSource}`).not.toMatch(
+      /requestSubmit|\.submit\(|fetch\(|use:enhance|onMount/iu
+    );
   });
 });

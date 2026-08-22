@@ -321,56 +321,123 @@ export interface RefundFinalizationPreviewDto {
   readonly items: readonly RefundFinalizationItemPreviewDto[];
 }
 
+export const REFUND_REPORTING_CORRECTION_SEED_ITEM_DTO_KEYS = [
+  'orderItemId',
+  'titleId',
+  'soldAsTitle',
+  'baselineTotalMinor',
+  'baselineSubtotalMinor',
+  'baselineTaxMinor',
+  'baselineSettlementGrossMinor',
+  'baselineRefundFeeImpactMinor'
+] as const;
+
+export interface RefundReportingCorrectionSeedItemDto {
+  readonly orderItemId: string;
+  readonly titleId: string;
+  readonly soldAsTitle: string;
+  readonly baselineTotalMinor: number;
+  readonly baselineSubtotalMinor: number;
+  readonly baselineTaxMinor: number;
+  readonly baselineSettlementGrossMinor: number | null;
+  readonly baselineRefundFeeImpactMinor: number | null;
+}
+
+export const REFUND_REPORTING_CORRECTION_SEED_DTO_KEYS = [
+  'refundId',
+  'reason',
+  'expectedNextCorrectionVersion',
+  'expectedBaseAllocationSetId',
+  'expectedSourceFingerprint',
+  'rawPredecessorCorrectionSetId',
+  'compatibleCorrectionSetId',
+  'baselineKind',
+  'currentReportingComplete',
+  'currency',
+  'settlementCurrency',
+  'baselineTotalMinor',
+  'eligible',
+  'ineligibleReason',
+  'items'
+] as const;
+
+export interface RefundReportingCorrectionSeedDto {
+  readonly refundId: string;
+  readonly reason: 'allocation_attribution_correction';
+  readonly expectedNextCorrectionVersion: number | null;
+  readonly expectedBaseAllocationSetId: string | null;
+  readonly expectedSourceFingerprint: string | null;
+  readonly rawPredecessorCorrectionSetId: string | null;
+  readonly compatibleCorrectionSetId: string | null;
+  readonly baselineKind: 'immutable_base' | 'compatible_correction' | null;
+  readonly currentReportingComplete: boolean;
+  readonly currency: string | null;
+  readonly settlementCurrency: string | null;
+  readonly baselineTotalMinor: number | null;
+  readonly eligible: boolean;
+  readonly ineligibleReason:
+    | 'provider_evidence_pending'
+    | 'immutable_conflict'
+    | 'not_finalized'
+    | null;
+  readonly items: readonly RefundReportingCorrectionSeedItemDto[];
+}
+
 export const REFUND_CORRECTION_ITEM_PREVIEW_DTO_KEYS = [
   'orderItemId',
   'titleId',
   'soldAsTitle',
-  'currentTotalMinor',
-  'currentSubtotalMinor',
-  'currentTaxMinor',
+  'baselineTotalMinor',
+  'baselineSubtotalMinor',
+  'baselineTaxMinor',
   'proposedTotalMinor',
   'proposedSubtotalMinor',
   'proposedTaxMinor',
-  'subtotalDeltaMinor',
-  'taxDeltaMinor',
-  'currentSettlementGrossMinor',
+  'subtotalDisplayDeltaMinor',
+  'taxDisplayDeltaMinor',
+  'baselineSettlementGrossMinor',
   'proposedSettlementGrossMinor',
-  'settlementGrossDeltaMinor',
-  'currentRefundFeeImpactMinor',
+  'settlementGrossDisplayDeltaMinor',
+  'baselineRefundFeeImpactMinor',
   'proposedRefundFeeImpactMinor',
-  'refundFeeImpactDeltaMinor'
+  'refundFeeImpactDisplayDeltaMinor'
 ] as const;
 
 export interface RefundCorrectionItemPreviewDto {
   readonly orderItemId: string;
   readonly titleId: string;
   readonly soldAsTitle: string;
-  readonly currentTotalMinor: number;
-  readonly currentSubtotalMinor: number;
-  readonly currentTaxMinor: number;
+  readonly baselineTotalMinor: number;
+  readonly baselineSubtotalMinor: number;
+  readonly baselineTaxMinor: number;
   readonly proposedTotalMinor: number;
   readonly proposedSubtotalMinor: number;
   readonly proposedTaxMinor: number;
-  readonly subtotalDeltaMinor: number;
-  readonly taxDeltaMinor: number;
-  readonly currentSettlementGrossMinor: number | null;
+  readonly subtotalDisplayDeltaMinor: number;
+  readonly taxDisplayDeltaMinor: number;
+  readonly baselineSettlementGrossMinor: number | null;
   readonly proposedSettlementGrossMinor: number | null;
-  readonly settlementGrossDeltaMinor: number | null;
-  readonly currentRefundFeeImpactMinor: number | null;
+  readonly settlementGrossDisplayDeltaMinor: number | null;
+  readonly baselineRefundFeeImpactMinor: number | null;
   readonly proposedRefundFeeImpactMinor: number | null;
-  readonly refundFeeImpactDeltaMinor: number | null;
+  readonly refundFeeImpactDisplayDeltaMinor: number | null;
 }
 
 export const REFUND_REPORTING_CORRECTION_PREVIEW_DTO_KEYS = [
   'refundId',
   'expectedBaseAllocationSetId',
-  'expectedCorrectionSetId',
-  'expectedCorrectionVersion',
+  'rawPredecessorCorrectionSetId',
+  'compatibleCorrectionSetId',
+  'expectedNextCorrectionVersion',
   'expectedSourceFingerprint',
   'previewFingerprint',
+  'baselineKind',
+  'currentReportingComplete',
+  'proposedReportingComplete',
+  'compatibilityRepair',
   'currency',
   'settlementCurrency',
-  'currentTotalMinor',
+  'baselineTotalMinor',
   'proposedTotalMinor',
   'eligible',
   'ineligibleReason',
@@ -380,16 +447,26 @@ export const REFUND_REPORTING_CORRECTION_PREVIEW_DTO_KEYS = [
 export interface RefundReportingCorrectionPreviewDto {
   readonly refundId: string;
   readonly expectedBaseAllocationSetId: string;
-  readonly expectedCorrectionSetId: string | null;
-  readonly expectedCorrectionVersion: number;
+  readonly rawPredecessorCorrectionSetId: string | null;
+  readonly compatibleCorrectionSetId: string | null;
+  readonly expectedNextCorrectionVersion: number;
   readonly expectedSourceFingerprint: string;
-  readonly previewFingerprint: string;
+  readonly previewFingerprint: string | null;
+  readonly baselineKind: 'immutable_base' | 'compatible_correction';
+  readonly currentReportingComplete: boolean;
+  readonly proposedReportingComplete: boolean;
+  readonly compatibilityRepair: boolean;
   readonly currency: string;
   readonly settlementCurrency: string | null;
-  readonly currentTotalMinor: number;
+  readonly baselineTotalMinor: number;
   readonly proposedTotalMinor: number;
   readonly eligible: boolean;
-  readonly ineligibleReason: 'provider_evidence_pending' | 'immutable_conflict' | 'not_finalized' | null;
+  readonly ineligibleReason:
+    | 'provider_evidence_pending'
+    | 'immutable_conflict'
+    | 'not_finalized'
+    | 'no_change'
+    | null;
   readonly items: readonly RefundCorrectionItemPreviewDto[];
 }
 
@@ -647,6 +724,8 @@ export const FINANCIAL_REPORTING_DTO_KEYSETS = {
   refundDraft: REFUND_DRAFT_DTO_KEYS,
   refundFinalizationItemPreview: REFUND_FINALIZATION_ITEM_PREVIEW_DTO_KEYS,
   refundFinalizationPreview: REFUND_FINALIZATION_PREVIEW_DTO_KEYS,
+  refundReportingCorrectionSeedItem: REFUND_REPORTING_CORRECTION_SEED_ITEM_DTO_KEYS,
+  refundReportingCorrectionSeed: REFUND_REPORTING_CORRECTION_SEED_DTO_KEYS,
   refundCorrectionItemPreview: REFUND_CORRECTION_ITEM_PREVIEW_DTO_KEYS,
   refundReportingCorrectionPreview: REFUND_REPORTING_CORRECTION_PREVIEW_DTO_KEYS,
   administrativeRecoveryPreview: ADMINISTRATIVE_RECOVERY_PREVIEW_DTO_KEYS,

@@ -7,15 +7,20 @@ import type {
 } from '$lib/server/auth/admin-policy';
 import type {
   RefundDetailDto,
-  RefundFinalizationPreviewDto
+  RefundFinalizationPreviewDto,
+  RefundReportingCorrectionPreviewDto,
+  RefundReportingCorrectionSeedDto
 } from '$lib/types/financial-reporting';
 import { encodeFinancialIssueCursor } from '$lib/server/commerce/reporting/review';
 
 const routeMocks = vi.hoisted(() => ({
   database: {},
+  denyRead: false,
   denyManage: false,
   getDetail: vi.fn(),
+  getCorrectionSeed: vi.fn(),
   preview: vi.fn(),
+  previewCorrection: vi.fn(),
   submit: vi.fn()
 }));
 
@@ -30,6 +35,10 @@ vi.mock('$lib/server/commerce/financial/refund-review/query', () => ({
 }));
 vi.mock('$lib/server/commerce/financial/refund-review/finalize', () => ({
   previewRefundFinalization: routeMocks.preview
+}));
+vi.mock('$lib/server/commerce/financial/refund-review/corrections', () => ({
+  getReportingCorrectionSeed: routeMocks.getCorrectionSeed,
+  previewReportingCorrection: routeMocks.previewCorrection
 }));
 vi.mock('$lib/server/commerce/financial/admin-commands/repository', async (importOriginal) => ({
   ...(await importOriginal<
@@ -52,10 +61,11 @@ vi.mock('$lib/server/auth/admin-policy', async (importOriginal) => {
       resolver?: CapabilityResolver
     ): asserts actor is AdministratorActor {
       if (
-        routeMocks.denyManage &&
         actor.type === 'user' &&
-        actor.roles.includes('admin') &&
-        capability === 'reconciliation.manage'
+        actor.roles.includes('admin') && (
+          (routeMocks.denyRead && capability === 'sales.read') ||
+          (routeMocks.denyManage && capability === 'reconciliation.manage')
+        )
       ) {
         throw new actual.AuthorizationError('forbidden', 403);
       }
@@ -75,7 +85,10 @@ const REFUND_ID = '00000000-0000-4000-8000-000000011302';
 const ITEM_ID = '00000000-0000-4000-8000-000000011303';
 const COMMAND_ID = '00000000-0000-4000-8000-000000011304';
 const IDEMPOTENCY_KEY = '00000000-0000-4000-8000-000000011305';
+const BASE_ALLOCATION_SET_ID = '00000000-0000-4000-8000-000000011309';
+const CORRECTION_SET_ID = '00000000-0000-4000-8000-000000011310';
 const PREVIEW_FINGERPRINT = 'a'.repeat(64);
+const SOURCE_FINGERPRINT = 'b'.repeat(64);
 const REVIEW_CURSOR = encodeFinancialIssueCursor({
   actionabilityRank: 0,
   impactRank: 1,
@@ -140,6 +153,72 @@ const finalizationPreview: RefundFinalizationPreviewDto = {
   }]
 };
 
+const correctionSeed: RefundReportingCorrectionSeedDto = {
+  refundId: REFUND_ID,
+  reason: 'allocation_attribution_correction',
+  expectedNextCorrectionVersion: 2,
+  expectedBaseAllocationSetId: BASE_ALLOCATION_SET_ID,
+  expectedSourceFingerprint: SOURCE_FINGERPRINT,
+  rawPredecessorCorrectionSetId: CORRECTION_SET_ID,
+  compatibleCorrectionSetId: CORRECTION_SET_ID,
+  baselineKind: 'compatible_correction',
+  currentReportingComplete: true,
+  currency: 'USD',
+  settlementCurrency: 'USD',
+  baselineTotalMinor: 500,
+  eligible: true,
+  ineligibleReason: null,
+  items: [{
+    orderItemId: ITEM_ID,
+    titleId: '00000000-0000-4000-8000-000000011308',
+    soldAsTitle: 'Safe title',
+    baselineTotalMinor: 500,
+    baselineSubtotalMinor: 450,
+    baselineTaxMinor: 50,
+    baselineSettlementGrossMinor: 475,
+    baselineRefundFeeImpactMinor: -25
+  }]
+};
+
+const correctionPreview: RefundReportingCorrectionPreviewDto = {
+  refundId: REFUND_ID,
+  expectedBaseAllocationSetId: BASE_ALLOCATION_SET_ID,
+  rawPredecessorCorrectionSetId: CORRECTION_SET_ID,
+  compatibleCorrectionSetId: CORRECTION_SET_ID,
+  expectedNextCorrectionVersion: 2,
+  expectedSourceFingerprint: SOURCE_FINGERPRINT,
+  previewFingerprint: PREVIEW_FINGERPRINT,
+  baselineKind: 'compatible_correction',
+  currentReportingComplete: true,
+  proposedReportingComplete: true,
+  compatibilityRepair: false,
+  currency: 'USD',
+  settlementCurrency: 'USD',
+  baselineTotalMinor: 500,
+  proposedTotalMinor: 500,
+  eligible: true,
+  ineligibleReason: null,
+  items: [{
+    orderItemId: ITEM_ID,
+    titleId: '00000000-0000-4000-8000-000000011308',
+    soldAsTitle: 'Safe title',
+    baselineTotalMinor: 500,
+    baselineSubtotalMinor: 450,
+    baselineTaxMinor: 50,
+    proposedTotalMinor: 500,
+    proposedSubtotalMinor: 440,
+    proposedTaxMinor: 60,
+    subtotalDisplayDeltaMinor: -10,
+    taxDisplayDeltaMinor: 10,
+    baselineSettlementGrossMinor: 475,
+    proposedSettlementGrossMinor: 470,
+    settlementGrossDisplayDeltaMinor: -5,
+    baselineRefundFeeImpactMinor: -25,
+    proposedRefundFeeImpactMinor: -20,
+    refundFeeImpactDisplayDeltaMinor: 5
+  }]
+};
+
 function urlencoded(entries: readonly (readonly [string, string])[]): Request {
   const body = new URLSearchParams();
   for (const [key, value] of entries) body.append(key, value);
@@ -168,11 +247,16 @@ describe('refund review loader and async command routes', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     routeMocks.getDetail.mockReset();
+    routeMocks.getCorrectionSeed.mockReset();
     routeMocks.preview.mockReset();
+    routeMocks.previewCorrection.mockReset();
     routeMocks.submit.mockReset();
+    routeMocks.denyRead = false;
     routeMocks.denyManage = false;
     routeMocks.getDetail.mockResolvedValue(detail);
+    routeMocks.getCorrectionSeed.mockResolvedValue(correctionSeed);
     routeMocks.preview.mockResolvedValue(finalizationPreview);
+    routeMocks.previewCorrection.mockResolvedValue(correctionPreview);
     routeMocks.submit.mockResolvedValue({
       commandId: COMMAND_ID,
       kind: 'refund_draft_save',
@@ -199,6 +283,28 @@ describe('refund review loader and async command routes', () => {
     }
     expect(routeMocks.getDetail).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ['sales.read', 'denyRead'],
+    ['reconciliation.manage', 'denyManage']
+  ] as const)(
+    'requires %s before the loader reads an identifier or invokes either service',
+    async (_capability, deniedFlag) => {
+      routeMocks[deniedFlag] = true;
+      const accesses = {
+        params: vi.fn(), url: vi.fn(), request: vi.fn(), route: vi.fn()
+      };
+      const event: Record<string, unknown> = { locals: { actor: ADMIN } };
+      for (const key of Object.keys(accesses) as Array<keyof typeof accesses>) {
+        Object.defineProperty(event, key, { enumerable: true, get: accesses[key] });
+      }
+
+      await expect(refundRoute.load(event as never)).rejects.toMatchObject({ status: 403 });
+      for (const access of Object.values(accesses)) expect(access).not.toHaveBeenCalled();
+      expect(routeMocks.getDetail).not.toHaveBeenCalled();
+      expect(routeMocks.getCorrectionSeed).not.toHaveBeenCalled();
+    }
+  );
 
   it('requires both action capabilities before origin, path, return context, or body parsing', async () => {
     for (const actor of [{ type: 'anonymous' } as const, ADMIN]) {
@@ -244,17 +350,32 @@ describe('refund review loader and async command routes', () => {
         requestMetadata: { method: 'GET', routeId: '/admin/sales/refunds/[refundId]' }
       }
     );
-    expect(result).toMatchObject({ detail, reviewCursor: REVIEW_CURSOR });
+    expect(routeMocks.getCorrectionSeed).toHaveBeenCalledWith(
+      routeMocks.database,
+      ADMIN,
+      REFUND_ID,
+      {
+        correlationId: 'refund-route-load',
+        requestMetadata: { method: 'GET', routeId: '/admin/sales/refunds/[refundId]' }
+      }
+    );
+    expect(result).toMatchObject({
+      detail,
+      reportingCorrectionSeed: correctionSeed,
+      reviewCursor: REVIEW_CURSOR
+    });
     if (!result) throw new Error('refund loader returned no data');
     expect(result.saveDraftIdempotencyKey).toMatch(/^[0-9a-f-]{36}$/u);
     expect(result.discardDraftIdempotencyKey).toMatch(/^[0-9a-f-]{36}$/u);
     expect(result.finalizeIdempotencyKey).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(result.correctionIdempotencyKey).toMatch(/^[0-9a-f-]{36}$/u);
     expect(result.saveDraftIdempotencyKey).not.toBe(result.discardDraftIdempotencyKey);
     expect(new Set([
       result.saveDraftIdempotencyKey,
       result.discardDraftIdempotencyKey,
-      result.finalizeIdempotencyKey
-    ]).size).toBe(3);
+      result.finalizeIdempotencyKey,
+      result.correctionIdempotencyKey
+    ]).size).toBe(4);
   });
 
   it.each(['prepareFinalize', 'confirmFinalize'] as const)(
@@ -279,6 +400,128 @@ describe('refund review loader and async command routes', () => {
         for (const access of Object.values(accesses)) expect(access).not.toHaveBeenCalled();
       }
       expect(routeMocks.preview).not.toHaveBeenCalled();
+      expect(routeMocks.submit).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(['prepareCorrection', 'confirmCorrection'] as const)(
+    'checks same-origin before consuming the %s body',
+    async (action) => {
+      let pulled = false;
+      const request = new Request(
+        `https://books.example.test/admin/sales/refunds/${REFUND_ID}`,
+        {
+          method: 'POST',
+          headers: {
+            origin: 'https://evil.example.test',
+            'content-type': 'application/x-www-form-urlencoded'
+          },
+          body: 'unused'
+        }
+      );
+      Object.defineProperty(request, 'body', {
+        configurable: true,
+        get() {
+          pulled = true;
+          throw new Error('private body read');
+        }
+      });
+      const protectedAccesses = { params: vi.fn(), url: vi.fn(), route: vi.fn() };
+      const event: Record<string, unknown> = { locals: { actor: ADMIN }, request };
+      for (const key of Object.keys(protectedAccesses) as Array<keyof typeof protectedAccesses>) {
+        Object.defineProperty(event, key, { enumerable: true, get: protectedAccesses[key] });
+      }
+
+      const result = await refundRoute.actions[action]!(event as never);
+
+      expect(result).toMatchObject({ status: 403, data: { code: 'forbidden' } });
+      expect(pulled).toBe(false);
+      for (const access of Object.values(protectedAccesses)) expect(access).not.toHaveBeenCalled();
+      expect(routeMocks.previewCorrection).not.toHaveBeenCalled();
+      expect(routeMocks.submit).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(['prepareCorrection', 'confirmCorrection'] as const)(
+    'accepts only the exact empty %s action marker before parsing the body',
+    async (action) => {
+      const request = urlencoded([
+        ['reason', 'allocation_attribution_correction']
+      ]);
+      const event = actionEvent(ADMIN, request, action);
+      event.url = new URL(`${request.url}?/${action}=private&reviewCursor=${REVIEW_CURSOR}`);
+
+      const result = await refundRoute.actions[action]!(event as never);
+
+      expect(result).toMatchObject({ status: 400, data: { code: 'invalid_request' } });
+      expect(routeMocks.previewCorrection).not.toHaveBeenCalled();
+      expect(routeMocks.submit).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([
+    ['prepareCorrection', [
+      ['reason', 'allocation_attribution_correction'],
+      ['expectedNextCorrectionVersion', '2'],
+      ['expectedBaseAllocationSetId', BASE_ALLOCATION_SET_ID],
+      ['expectedSourceFingerprint', SOURCE_FINGERPRINT],
+      ['orderItemId', ITEM_ID],
+      ['totalPresentmentMinor', '500'],
+      ['privateExtra', 'must-not-pass']
+    ]],
+    ['confirmCorrection', [
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['reason', 'allocation_attribution_correction'],
+      ['expectedNextCorrectionVersion', '2'],
+      ['expectedBaseAllocationSetId', BASE_ALLOCATION_SET_ID],
+      ['expectedSourceFingerprint', SOURCE_FINGERPRINT],
+      ['orderItemId', ITEM_ID],
+      ['totalPresentmentMinor', '500'],
+      ['previewFingerprint', PREVIEW_FINGERPRINT],
+      ['confirmation', 'create_reporting_correction'],
+      ['privateExtra', 'must-not-pass']
+    ]]
+  ] as const)('rejects unknown %s fields before a correction service call', async (
+    action,
+    entries
+  ) => {
+    const result = await refundRoute.actions[action]!(
+      actionEvent(ADMIN, urlencoded(entries), action) as never
+    );
+
+    expect(result).toMatchObject({
+      status: 400,
+      data: { code: 'invalid_request', retrySubmission: null }
+    });
+    expect(routeMocks.previewCorrection).not.toHaveBeenCalled();
+    expect(routeMocks.submit).not.toHaveBeenCalled();
+    expect(JSON.stringify(result)).not.toContain('must-not-pass');
+  });
+
+  it.each([
+    ['prepareCorrection', 'denyRead'],
+    ['prepareCorrection', 'denyManage'],
+    ['confirmCorrection', 'denyRead'],
+    ['confirmCorrection', 'denyManage']
+  ] as const)(
+    'requires the independently denied capability before touching %s input (%s)',
+    async (action, deniedFlag) => {
+      routeMocks[deniedFlag] = true;
+      const accesses = {
+        params: vi.fn(), url: vi.fn(), request: vi.fn(), route: vi.fn()
+      };
+      const event: Record<string, unknown> = { locals: { actor: ADMIN } };
+      for (const key of Object.keys(accesses) as Array<keyof typeof accesses>) {
+        Object.defineProperty(event, key, { enumerable: true, get: accesses[key] });
+      }
+
+      const actionHandler = refundRoute.actions[action];
+      expect(actionHandler).toBeTypeOf('function');
+      const result = await actionHandler!(event as never);
+
+      expect(result).toMatchObject({ status: 403, data: { code: 'forbidden' } });
+      for (const access of Object.values(accesses)) expect(access).not.toHaveBeenCalled();
+      expect(routeMocks.previewCorrection).not.toHaveBeenCalled();
       expect(routeMocks.submit).not.toHaveBeenCalled();
     }
   );
@@ -421,6 +664,260 @@ describe('refund review loader and async command routes', () => {
       command: { kind: 'refund_allocation_finalize', status: 'pending' },
       reviewCursor: REVIEW_CURSOR
     });
+  });
+
+  it('prepares a reporting correction from the exact full item set without submitting', async () => {
+    const request = urlencoded([
+      ['reason', 'allocation_attribution_correction'],
+      ['expectedNextCorrectionVersion', '2'],
+      ['expectedBaseAllocationSetId', BASE_ALLOCATION_SET_ID],
+      ['expectedSourceFingerprint', SOURCE_FINGERPRINT],
+      ['orderItemId', ITEM_ID],
+      ['totalPresentmentMinor', '500']
+    ]);
+
+    const result = await refundRoute.actions.prepareCorrection!(
+      actionEvent(ADMIN, request, 'prepareCorrection') as never
+    );
+
+    expect(routeMocks.previewCorrection).toHaveBeenCalledWith(
+      routeMocks.database,
+      ADMIN,
+      {
+        refundId: REFUND_ID,
+        reason: 'allocation_attribution_correction',
+        expectedNextCorrectionVersion: 2,
+        expectedBaseAllocationSetId: BASE_ALLOCATION_SET_ID,
+        expectedSourceFingerprint: SOURCE_FINGERPRINT,
+        items: [{ orderItemId: ITEM_ID, totalPresentmentMinor: 500 }]
+      },
+      {
+        correlationId: 'refund-route-action',
+        requestMetadata: { method: 'POST', routeId: '/admin/sales/refunds/[refundId]' }
+      }
+    );
+    expect(routeMocks.submit).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      reportingCorrectionPreview: correctionPreview,
+      reviewCursor: REVIEW_CURSOR
+    });
+  });
+
+  it('confirms a reporting correction with only route-derived identity and approved values', async () => {
+    routeMocks.submit.mockResolvedValueOnce({
+      commandId: COMMAND_ID,
+      kind: 'refund_reporting_correction_create',
+      status: 'pending',
+      createdAt: '2026-08-22T12:01:00.000Z'
+    });
+    const request = urlencoded([
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['reason', 'allocation_attribution_correction'],
+      ['expectedNextCorrectionVersion', '2'],
+      ['expectedBaseAllocationSetId', BASE_ALLOCATION_SET_ID],
+      ['expectedSourceFingerprint', SOURCE_FINGERPRINT],
+      ['orderItemId', ITEM_ID],
+      ['totalPresentmentMinor', '500'],
+      ['previewFingerprint', PREVIEW_FINGERPRINT],
+      ['confirmation', 'create_reporting_correction']
+    ]);
+
+    const result = await refundRoute.actions.confirmCorrection!(
+      actionEvent(ADMIN, request, 'confirmCorrection') as never
+    );
+
+    expect(routeMocks.previewCorrection).not.toHaveBeenCalled();
+    expect(routeMocks.submit).toHaveBeenCalledWith(routeMocks.database, {
+      actor: ADMIN,
+      idempotencyKey: IDEMPOTENCY_KEY,
+      command: {
+        kind: 'refund_reporting_correction_create',
+        refundId: REFUND_ID,
+        reason: 'allocation_attribution_correction',
+        expectedNextCorrectionVersion: 2,
+        expectedBaseAllocationSetId: BASE_ALLOCATION_SET_ID,
+        expectedSourceFingerprint: SOURCE_FINGERPRINT,
+        items: [{ orderItemId: ITEM_ID, totalPresentmentMinor: 500 }],
+        previewFingerprint: PREVIEW_FINGERPRINT,
+        confirmation: 'create_reporting_correction'
+      },
+      context: {
+        correlationId: 'refund-route-action',
+        requestMetadata: { method: 'POST', routeId: '/admin/sales/refunds/[refundId]' }
+      }
+    });
+    expect(result).toMatchObject({
+      command: { kind: 'refund_reporting_correction_create', status: 'pending' },
+      reviewCursor: REVIEW_CURSOR
+    });
+  });
+
+  it('returns an already-terminal identical correction replay without another route-side mutation', async () => {
+    routeMocks.submit.mockResolvedValueOnce({
+      commandId: COMMAND_ID,
+      kind: 'refund_reporting_correction_create',
+      status: 'succeeded',
+      createdAt: '2026-08-22T12:01:00.000Z'
+    });
+    const request = urlencoded([
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['reason', 'allocation_attribution_correction'],
+      ['expectedNextCorrectionVersion', '2'],
+      ['expectedBaseAllocationSetId', BASE_ALLOCATION_SET_ID],
+      ['expectedSourceFingerprint', SOURCE_FINGERPRINT],
+      ['orderItemId', ITEM_ID],
+      ['totalPresentmentMinor', '500'],
+      ['previewFingerprint', PREVIEW_FINGERPRINT],
+      ['confirmation', 'create_reporting_correction']
+    ]);
+
+    const result = await refundRoute.actions.confirmCorrection!(
+      actionEvent(ADMIN, request, 'confirmCorrection') as never
+    );
+
+    expect(result).toMatchObject({
+      command: {
+        commandId: COMMAND_ID,
+        kind: 'refund_reporting_correction_create',
+        status: 'succeeded'
+      },
+      reviewCursor: REVIEW_CURSOR
+    });
+    expect(routeMocks.submit).toHaveBeenCalledTimes(1);
+    expect(routeMocks.previewCorrection).not.toHaveBeenCalled();
+  });
+
+  it('freezes every canonical correction confirmation field after an ambiguous submit', async () => {
+    routeMocks.submit.mockRejectedValueOnce(new Error('ambiguous correction outcome'));
+    const request = urlencoded([
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['reason', 'allocation_attribution_correction'],
+      ['expectedNextCorrectionVersion', '2'],
+      ['expectedBaseAllocationSetId', BASE_ALLOCATION_SET_ID],
+      ['expectedSourceFingerprint', SOURCE_FINGERPRINT],
+      ['orderItemId', ITEM_ID],
+      ['totalPresentmentMinor', '500'],
+      ['previewFingerprint', PREVIEW_FINGERPRINT],
+      ['confirmation', 'create_reporting_correction']
+    ]);
+
+    const result = await refundRoute.actions.confirmCorrection!(
+      actionEvent(ADMIN, request, 'confirmCorrection') as never
+    );
+
+    expect(result).toMatchObject({
+      status: 503,
+      data: {
+        code: 'temporarily_unavailable',
+        retrySubmission: {
+          action: 'confirmCorrection',
+          idempotencyKey: IDEMPOTENCY_KEY,
+          reason: 'allocation_attribution_correction',
+          expectedNextCorrectionVersion: 2,
+          expectedBaseAllocationSetId: BASE_ALLOCATION_SET_ID,
+          expectedSourceFingerprint: SOURCE_FINGERPRINT,
+          items: [{ orderItemId: ITEM_ID, totalPresentmentMinor: 500 }],
+          previewFingerprint: PREVIEW_FINGERPRINT,
+          confirmation: 'create_reporting_correction'
+        }
+      }
+    });
+    expect(JSON.stringify(result)).not.toContain('ambiguous correction outcome');
+  });
+
+  it.each(['pending', 'succeeded'] as const)(
+    'replays the exact frozen correction payload and recovers its %s command',
+    async (status) => {
+      const entries = [
+        ['idempotencyKey', IDEMPOTENCY_KEY],
+        ['reason', 'allocation_attribution_correction'],
+        ['expectedNextCorrectionVersion', '2'],
+        ['expectedBaseAllocationSetId', BASE_ALLOCATION_SET_ID],
+        ['expectedSourceFingerprint', SOURCE_FINGERPRINT],
+        ['orderItemId', ITEM_ID],
+        ['totalPresentmentMinor', '500'],
+        ['previewFingerprint', PREVIEW_FINGERPRINT],
+        ['confirmation', 'create_reporting_correction']
+      ] as const;
+      routeMocks.submit
+        .mockRejectedValueOnce(new Error('ambiguous correction outcome'))
+        .mockResolvedValueOnce({
+          commandId: COMMAND_ID,
+          kind: 'refund_reporting_correction_create',
+          status,
+          createdAt: '2026-08-22T12:01:00.000Z'
+        });
+
+      const ambiguous = await refundRoute.actions.confirmCorrection!(
+        actionEvent(ADMIN, urlencoded(entries), 'confirmCorrection') as never
+      );
+      expect(ambiguous).toMatchObject({
+        status: 503,
+        data: { retrySubmission: { action: 'confirmCorrection' } }
+      });
+      const firstSubmission = routeMocks.submit.mock.calls[0];
+
+      const recovered = await refundRoute.actions.confirmCorrection!(
+        actionEvent(ADMIN, urlencoded(entries), 'confirmCorrection') as never
+      );
+
+      expect(routeMocks.submit).toHaveBeenCalledTimes(2);
+      expect(routeMocks.submit.mock.calls[1]).toEqual(firstSubmission);
+      expect(recovered).toMatchObject({
+        command: {
+          commandId: COMMAND_ID,
+          kind: 'refund_reporting_correction_create',
+          status
+        },
+        reviewCursor: REVIEW_CURSOR
+      });
+    }
+  );
+
+  it('does not freeze a correction retry for stale preparation or same-key payload drift', async () => {
+    routeMocks.previewCorrection.mockRejectedValueOnce(
+      new FinancialAdminConflictError('stale_state')
+    );
+    const prepared = await refundRoute.actions.prepareCorrection!(actionEvent(
+      ADMIN,
+      urlencoded([
+        ['reason', 'allocation_attribution_correction'],
+        ['expectedNextCorrectionVersion', '2'],
+        ['expectedBaseAllocationSetId', BASE_ALLOCATION_SET_ID],
+        ['expectedSourceFingerprint', SOURCE_FINGERPRINT],
+        ['orderItemId', ITEM_ID],
+        ['totalPresentmentMinor', '500']
+      ]),
+      'prepareCorrection'
+    ) as never);
+    expect(prepared).toMatchObject({
+      status: 409,
+      data: { code: 'stale_state', retrySubmission: null }
+    });
+
+    routeMocks.submit.mockRejectedValueOnce(
+      new FinancialAdminCommandSubmissionConflictError()
+    );
+    const confirmed = await refundRoute.actions.confirmCorrection!(actionEvent(
+      ADMIN,
+      urlencoded([
+        ['idempotencyKey', IDEMPOTENCY_KEY],
+        ['reason', 'allocation_attribution_correction'],
+        ['expectedNextCorrectionVersion', '2'],
+        ['expectedBaseAllocationSetId', BASE_ALLOCATION_SET_ID],
+        ['expectedSourceFingerprint', SOURCE_FINGERPRINT],
+        ['orderItemId', ITEM_ID],
+        ['totalPresentmentMinor', '500'],
+        ['previewFingerprint', PREVIEW_FINGERPRINT],
+        ['confirmation', 'create_reporting_correction']
+      ]),
+      'confirmCorrection'
+    ) as never);
+    expect(confirmed).toMatchObject({
+      status: 409,
+      data: { code: 'stale_state', retrySubmission: null }
+    });
+    expect(routeMocks.submit).toHaveBeenCalledTimes(1);
   });
 
   it.each(['prepareFinalize', 'confirmFinalize'] as const)(

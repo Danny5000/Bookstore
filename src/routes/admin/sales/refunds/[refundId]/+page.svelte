@@ -4,9 +4,11 @@
   import FinancialActionConfirmation from '$lib/components/admin/FinancialActionConfirmation.svelte';
   import FinancialActionOutcome from '$lib/components/admin/FinancialActionOutcome.svelte';
   import RefundAllocationEditor from '$lib/components/admin/RefundAllocationEditor.svelte';
+  import ReportingCorrectionEditor from '$lib/components/admin/ReportingCorrectionEditor.svelte';
   import type {
     FinancialAdminCommandReferenceDto,
-    RefundFinalizationPreviewDto
+    RefundFinalizationPreviewDto,
+    RefundReportingCorrectionPreviewDto
   } from '$lib/types/financial-reporting';
   import type { ActionData, PageData } from './$types';
 
@@ -41,6 +43,20 @@
         readonly expectedActiveDraftVersion: number;
         readonly previewFingerprint: string;
         readonly confirmation: 'finalize_refund_allocation';
+      }
+    | {
+        readonly action: 'confirmCorrection';
+        readonly idempotencyKey: string;
+        readonly reason: 'allocation_attribution_correction';
+        readonly expectedNextCorrectionVersion: number;
+        readonly expectedBaseAllocationSetId: string;
+        readonly expectedSourceFingerprint: string;
+        readonly items: readonly {
+          readonly orderItemId: string;
+          readonly totalPresentmentMinor: number;
+        }[];
+        readonly previewFingerprint: string;
+        readonly confirmation: 'create_reporting_correction';
       };
 
   let { data, form }: Props = $props();
@@ -125,6 +141,11 @@
   const finalizationPreview = $derived(
     form && 'finalizationPreview' in form
       ? form.finalizationPreview as RefundFinalizationPreviewDto | undefined
+      : undefined
+  );
+  const reportingCorrectionPreview = $derived(
+    form && 'reportingCorrectionPreview' in form
+      ? form.reportingCorrectionPreview as RefundReportingCorrectionPreviewDto | undefined
       : undefined
   );
   const actionFailure = $derived(actionFailurePresentation(
@@ -260,12 +281,47 @@
             name="expectedActiveDraftVersion"
             value={retrySubmission.expectedActiveDraftVersion}
           />
-        {:else}
+        {:else if retrySubmission.action === 'confirmFinalize'}
           <input
             type="hidden"
             name="expectedActiveDraftVersion"
             value={retrySubmission.expectedActiveDraftVersion}
           />
+          <input
+            type="hidden"
+            name="previewFingerprint"
+            value={retrySubmission.previewFingerprint}
+          />
+          <input
+            type="hidden"
+            name="confirmation"
+            value={retrySubmission.confirmation}
+          />
+        {:else}
+          <input type="hidden" name="reason" value={retrySubmission.reason} />
+          <input
+            type="hidden"
+            name="expectedNextCorrectionVersion"
+            value={retrySubmission.expectedNextCorrectionVersion}
+          />
+          <input
+            type="hidden"
+            name="expectedBaseAllocationSetId"
+            value={retrySubmission.expectedBaseAllocationSetId}
+          />
+          <input
+            type="hidden"
+            name="expectedSourceFingerprint"
+            value={retrySubmission.expectedSourceFingerprint}
+          />
+          {#each retrySubmission.items as item (item.orderItemId)}
+            <input type="hidden" name="orderItemId" value={item.orderItemId} />
+            <input
+              type="hidden"
+              name="totalPresentmentMinor"
+              value={item.totalPresentmentMinor}
+            />
+          {/each}
           <input
             type="hidden"
             name="previewFingerprint"
@@ -391,12 +447,31 @@
     </FinancialActionConfirmation>
   {/if}
 
-  {#if retrySubmission === null && finalizationPreview === undefined}
+  {#if submittedCommand === undefined &&
+    retrySubmission === null &&
+    finalizationPreview === undefined &&
+    reportingCorrectionPreview === undefined &&
+    (data.detail.allocationStatus === 'needs_review' || data.detail.allocationStatus === 'draft')}
     {#key data.detail}
       <RefundAllocationEditor
         detail={data.detail}
         saveIdempotencyKey={data.saveDraftIdempotencyKey}
         discardIdempotencyKey={data.discardDraftIdempotencyKey}
+        reviewCursor={data.reviewCursor}
+        {fieldErrors}
+      />
+    {/key}
+  {/if}
+
+  {#if submittedCommand === undefined &&
+    retrySubmission === null &&
+    finalizationPreview === undefined &&
+    data.reportingCorrectionSeed !== null}
+    {#key data.reportingCorrectionSeed}
+      <ReportingCorrectionEditor
+        seed={data.reportingCorrectionSeed}
+        preview={reportingCorrectionPreview}
+        confirmIdempotencyKey={data.correctionIdempotencyKey}
         reviewCursor={data.reviewCursor}
         {fieldErrors}
       />

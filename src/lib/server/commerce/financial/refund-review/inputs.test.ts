@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
+  parseRefundReportingCorrectionConfirmRequest,
+  parseRefundReportingCorrectionPrepareRequest,
   parseRefundFinalizationConfirmRequest,
   parseRefundFinalizationPrepareRequest,
   parseRefundDraftDiscardRequest,
@@ -206,6 +208,136 @@ describe('refund finalization form input', () => {
     ]]
   ] as const)('rejects %s', async (_label, entries) => {
     await expect(parseRefundFinalizationConfirmRequest(
+      formRequest(entries), REFUND_ID
+    )).rejects.toMatchObject({ name: 'RefundReviewInputError' });
+  });
+});
+
+describe('refund reporting-correction form input', () => {
+  const BASE_ALLOCATION_SET_ID = '00000000-0000-4000-8000-000000011005';
+  const SOURCE_FINGERPRINT = 'b'.repeat(64);
+  const PREVIEW_FINGERPRINT = 'c'.repeat(64);
+  const prepareEntries = [
+    ['reason', 'allocation_attribution_correction'],
+    ['expectedNextCorrectionVersion', '4'],
+    ['expectedBaseAllocationSetId', BASE_ALLOCATION_SET_ID],
+    ['expectedSourceFingerprint', SOURCE_FINGERPRINT],
+    ['orderItemId', SECOND_ITEM_ID],
+    ['totalPresentmentMinor', '125'],
+    ['orderItemId', FIRST_ITEM_ID],
+    ['totalPresentmentMinor', '0']
+  ] as const;
+
+  it('parses only syntax and sorts the exact complete prepare payload', async () => {
+    await expect(parseRefundReportingCorrectionPrepareRequest(
+      formRequest(prepareEntries), REFUND_ID
+    )).resolves.toEqual({
+      refundId: REFUND_ID,
+      reason: 'allocation_attribution_correction',
+      expectedNextCorrectionVersion: 4,
+      expectedBaseAllocationSetId: BASE_ALLOCATION_SET_ID,
+      expectedSourceFingerprint: SOURCE_FINGERPRINT,
+      items: [
+        { orderItemId: FIRST_ITEM_ID, totalPresentmentMinor: 0 },
+        { orderItemId: SECOND_ITEM_ID, totalPresentmentMinor: 125 }
+      ]
+    });
+  });
+
+  it('parses the fixed confirm command without accepting either derived tip ID', async () => {
+    await expect(parseRefundReportingCorrectionConfirmRequest(formRequest([
+      ...prepareEntries,
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['previewFingerprint', PREVIEW_FINGERPRINT],
+      ['confirmation', 'create_reporting_correction']
+    ]), REFUND_ID)).resolves.toEqual({
+      idempotencyKey: IDEMPOTENCY_KEY,
+      command: {
+        kind: 'refund_reporting_correction_create',
+        refundId: REFUND_ID,
+        reason: 'allocation_attribution_correction',
+        expectedNextCorrectionVersion: 4,
+        expectedBaseAllocationSetId: BASE_ALLOCATION_SET_ID,
+        expectedSourceFingerprint: SOURCE_FINGERPRINT,
+        items: [
+          { orderItemId: FIRST_ITEM_ID, totalPresentmentMinor: 0 },
+          { orderItemId: SECOND_ITEM_ID, totalPresentmentMinor: 125 }
+        ],
+        previewFingerprint: PREVIEW_FINGERPRINT,
+        confirmation: 'create_reporting_correction'
+      }
+    });
+  });
+
+  it.each([
+    ['wrong reason', prepareEntries.map((entry) =>
+      entry[0] === 'reason' ? ['reason', 'free-form'] as const : entry)],
+    ['noncanonical version', prepareEntries.map((entry) =>
+      entry[0] === 'expectedNextCorrectionVersion'
+        ? ['expectedNextCorrectionVersion', '04'] as const : entry)],
+    ['uppercase source fingerprint', prepareEntries.map((entry) =>
+      entry[0] === 'expectedSourceFingerprint'
+        ? ['expectedSourceFingerprint', SOURCE_FINGERPRINT.toUpperCase()] as const : entry)],
+    ['duplicate scalar', [...prepareEntries, ['reason', 'allocation_attribution_correction']]],
+    ['unpaired item arrays', prepareEntries.filter((entry) =>
+      !(entry[0] === 'totalPresentmentMinor' && entry[1] === '0'))],
+    ['duplicate item ID', prepareEntries.map((entry) =>
+      entry[0] === 'orderItemId' && entry[1] === SECOND_ITEM_ID
+        ? ['orderItemId', FIRST_ITEM_ID] as const : entry)],
+    ['unknown key', [...prepareEntries, ['rawPredecessorCorrectionSetId', FIRST_ITEM_ID]]]
+  ] as const)('rejects %s prepare data', async (_label, entries) => {
+    await expect(parseRefundReportingCorrectionPrepareRequest(
+      formRequest(entries), REFUND_ID
+    )).rejects.toMatchObject({ name: 'RefundReviewInputError' });
+  });
+
+  it.each([
+    ['uppercase preview fingerprint', [
+      ...prepareEntries,
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['previewFingerprint', PREVIEW_FINGERPRINT.toUpperCase()],
+      ['confirmation', 'create_reporting_correction']
+    ]],
+    ['wrong confirmation', [
+      ...prepareEntries,
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['previewFingerprint', PREVIEW_FINGERPRINT],
+      ['confirmation', 'yes']
+    ]],
+    ['derived tip', [
+      ...prepareEntries,
+      ['idempotencyKey', IDEMPOTENCY_KEY],
+      ['previewFingerprint', PREVIEW_FINGERPRINT],
+      ['confirmation', 'create_reporting_correction'],
+      ['compatibleCorrectionSetId', FIRST_ITEM_ID]
+    ]]
+  ] as const)('rejects %s confirm data', async (_label, entries) => {
+    await expect(parseRefundReportingCorrectionConfirmRequest(
+      formRequest(entries), REFUND_ID
+    )).rejects.toMatchObject({ name: 'RefundReviewInputError' });
+  });
+
+  it('accepts the syntactic 25-item bound and rejects the 26th item', async () => {
+    const entries = [
+      ['reason', 'allocation_attribution_correction'],
+      ['expectedNextCorrectionVersion', '1'],
+      ['expectedBaseAllocationSetId', BASE_ALLOCATION_SET_ID],
+      ['expectedSourceFingerprint', SOURCE_FINGERPRINT]
+    ] as [string, string][];
+    for (let index = 1; index <= 25; index += 1) {
+      entries.push(
+        ['orderItemId', `00000000-0000-4000-8000-${index.toString().padStart(12, '0')}`],
+        ['totalPresentmentMinor', '0']
+      );
+    }
+    await expect(parseRefundReportingCorrectionPrepareRequest(
+      formRequest(entries), REFUND_ID
+    )).resolves.toMatchObject({ items: expect.arrayContaining([expect.any(Object)]) });
+    entries.push(
+      ['orderItemId', '00000000-0000-4000-8000-000000000026'],
+      ['totalPresentmentMinor', '0']
+    );
+    await expect(parseRefundReportingCorrectionPrepareRequest(
       formRequest(entries), REFUND_ID
     )).rejects.toMatchObject({ name: 'RefundReviewInputError' });
   });

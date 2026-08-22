@@ -1,10 +1,30 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { eq, sql } from 'drizzle-orm';
 import type { PoolClient } from 'pg';
 import { describe, expect, it } from 'vitest';
+import type { AdministratorActor } from '$lib/server/auth/admin-policy';
+import { createCommerceMessageEnqueuer } from '$lib/server/commerce/email/enqueue';
 import { appendClassificationDecisionLocked } from '$lib/server/commerce/financial/classification';
-import { FINANCIAL_CLASSIFIER_VERSION } from '$lib/server/commerce/financial/constants';
-import { FinancialAdminConflictError } from '$lib/server/commerce/financial/admin-commands/handler';
+import {
+  createFinancialAdminCommandExecutors
+} from '$lib/server/commerce/financial/admin-commands/executors';
+import {
+  FINANCIAL_ADMIN_COMMAND_JOB,
+  FinancialAdminConflictError,
+  createFinancialAdminCommandHandler,
+  type FinancialAdminCommandExecutor
+} from '$lib/server/commerce/financial/admin-commands/handler';
+import {
+  submitFinancialAdminCommand
+} from '$lib/server/commerce/financial/admin-commands/repository';
+import {
+  persistFinancialAllocationPlanLocked
+} from '$lib/server/commerce/financial/allocations/repository';
+import {
+  FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+  FINANCIAL_CLASSIFIER_VERSION
+} from '$lib/server/commerce/financial/constants';
+import { observeFinancialIssue } from '$lib/server/commerce/financial/issues';
 import { stageBalanceTransaction } from '$lib/server/commerce/financial/ledger';
 import {
   lockFinancialProjectionRows,
@@ -14,6 +34,8 @@ import {
 import {
   lockFinancialProjectionAuthority
 } from '$lib/server/commerce/financial/rebase';
+import { executeReportingCorrectionCreate } from
+  '$lib/server/commerce/financial/refund-review/corrections';
 import { executeRefundAllocationFinalize } from '$lib/server/commerce/financial/refund-review/finalize';
 import { lockOrder } from '$lib/server/commerce/lock';
 import { lockPaymentPurchaseFacts } from '$lib/server/commerce/reconciliation';
@@ -24,6 +46,8 @@ import {
   payments,
   payoutImportRunEntries,
   payoutImportRuns,
+  refundAllocationComponents,
+  refundAllocations,
   refunds,
   stripeBalanceTransactions,
   stripePayoutBalanceTransactions,
@@ -32,13 +56,18 @@ import {
   user
 } from '$lib/server/db/schema';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
+import { createPostgresJobRepository } from '$lib/server/jobs/repository';
+import { runWorker } from '$lib/server/jobs/runner';
 import {
+  applicationConfig,
+  databaseClient as runtimeDatabaseClient,
   ownerDatabaseClient,
   workerDatabaseClient as databaseClient
 } from './database';
 
 const fixtureTime = new Date('2026-08-01T00:00:00.000Z');
 const LOCK_PROBE_REPETITIONS = [1, 2, 3] as const;
+const correctionAccessMessages = createCommerceMessageEnqueuer(applicationConfig.origin);
 
 interface Deferred<T> {
   readonly promise: Promise<T>;
@@ -47,6 +76,7 @@ interface Deferred<T> {
 
 interface PurchaseFixture {
   readonly grantId: string;
+  readonly itemId: string;
   readonly orderId: string;
   readonly paymentId: string;
   readonly refundId: string;
@@ -65,6 +95,152 @@ interface Blocker {
   readonly client: PoolClient;
   readonly pid: number;
   released: boolean;
+}
+
+type CorrectionBarrierStageId =
+  | 'projection-authority'
+  | 'order-advisory'
+  | 'order-row'
+  | 'payment-row'
+  | 'refund-row'
+  | 'projection-enrollment'
+  | `payout-advisory-${number}`
+  | `payout-row-${number}`
+  | `balance-transaction-advisory-${number}`
+  | `balance-transaction-row-${number}`
+  | `classification-advisory-${number}`
+  | `classification-row-${number}`
+  | `allocation-advisory-${number}`
+  | `allocation-row-${number}`
+  | `issue-advisory-${number}`
+  | `issue-row-${number}`;
+
+type CorrectionBarrierBlockerSlot = 0 | 1;
+
+interface CorrectionBarrierStage {
+  readonly id: CorrectionBarrierStageId;
+  readonly blockerSlot: CorrectionBarrierBlockerSlot;
+  readonly query: string;
+  readonly parameters: readonly unknown[];
+  readonly expectedQueryFragment: string;
+  readonly expectedLock:
+    | { readonly kind: 'advisory' }
+    | { readonly kind: 'relation'; readonly relation: string };
+}
+
+interface CorrectionBarrierBlocker {
+  readonly client: PoolClient;
+  readonly pid: number;
+  released: boolean;
+}
+
+interface CorrectionBarrier {
+  readonly blockers: readonly [CorrectionBarrierBlocker, CorrectionBarrierBlocker];
+  readonly stages: readonly CorrectionBarrierStage[];
+  nextRelease: number;
+  closed: boolean;
+}
+
+interface ObservedPostgresLock {
+  readonly locktype: string;
+  readonly database: number | null;
+  readonly relation: string | null;
+  readonly page: number | null;
+  readonly tuple: number | null;
+  readonly classid: number | null;
+  readonly objid: number | null;
+  readonly objsubid: number | null;
+  readonly virtualxid: string | null;
+  readonly transactionid: string | null;
+  readonly mode: string;
+  readonly granted: boolean;
+}
+
+const correctionMutationRelations = new Set([
+  'audit_events',
+  'financial_admin_commands',
+  'financial_allocation_sets',
+  'financial_item_allocations',
+  'financial_projection_versions',
+  'financial_reconciliation_issues',
+  'refund_reporting_correction_items',
+  'refund_reporting_correction_sets',
+  'refunds'
+]);
+
+const mutationRelationLockModes = new Set([
+  'RowExclusiveLock',
+  'ShareUpdateExclusiveLock',
+  'ShareLock',
+  'ShareRowExclusiveLock',
+  'ExclusiveLock',
+  'AccessExclusiveLock'
+]);
+
+interface CorrectionLockFixture {
+  readonly purchase: PurchaseFixture;
+  readonly actor: AdministratorActor;
+  readonly commandId: string;
+  readonly refundIds: readonly string[];
+  readonly payoutIds: readonly string[];
+  readonly balanceTransactions: readonly { readonly id: string }[];
+  readonly classifications: readonly {
+    readonly id: string;
+    readonly subjectId: string;
+  }[];
+  readonly allocationSets: readonly {
+    readonly id: string;
+    readonly balanceTransactionId: string;
+    readonly basis: 'gross_amount' | 'fee';
+  }[];
+  readonly issues: readonly {
+    readonly id: string;
+    readonly resourceId: string;
+  }[];
+}
+
+interface CorrectionProjectionFixture {
+  readonly balanceTransactionId: string;
+  readonly classificationId: string;
+  readonly grossAllocationSetId: string;
+  readonly feeAllocationSetId: string;
+}
+
+interface CorrectionWorkerProbe {
+  readonly operation: Promise<void>;
+  abort(): void;
+}
+
+interface CorrectionDomainSnapshot {
+  readonly refunds: string;
+  readonly refund_allocations: string;
+  readonly refund_components: string;
+  readonly correction_sets: string;
+  readonly correction_items: string;
+  readonly payouts: string;
+  readonly payout_memberships: string;
+  readonly balance_transactions: string;
+  readonly fee_details: string;
+  readonly classifications: string;
+  readonly allocation_sets: string;
+  readonly allocation_items: string;
+  readonly projection_heads: string;
+  readonly issues: string;
+  readonly grants: string;
+  readonly entitlements: string;
+  readonly outbox: string;
+  readonly correction_audits: string;
+  readonly issue_resolution_audits: string;
+}
+
+interface CorrectionCommandLifecycle {
+  readonly command_status: string;
+  readonly safe_result_code: string | null;
+  readonly safe_result: unknown;
+  readonly job_status: string;
+  readonly attempts: number;
+  readonly last_error: string | null;
+  readonly command_audit_count: number;
 }
 
 interface RefundFinalizationProbeSnapshot {
@@ -143,6 +319,22 @@ async function configureProbe(
 
 function observe(promise: Promise<unknown>): void {
   void promise.catch(() => undefined);
+}
+
+async function within<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  timeoutMessage: string
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+  });
+  try {
+    return await Promise.race([operation, timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 function rejectionCode(reason: unknown): string | undefined {
@@ -244,6 +436,228 @@ async function releaseBlocker(blocker: Blocker): Promise<void> {
   }
 }
 
+function correctionSavepoint(id: CorrectionBarrierStageId): string {
+  return `correction_${id.replaceAll('-', '_')}`;
+}
+
+async function beginCorrectionBarrier(
+  applicationName: string,
+  stages: readonly CorrectionBarrierStage[]
+): Promise<CorrectionBarrier> {
+  const blockers: CorrectionBarrierBlocker[] = [];
+  try {
+    for (const slot of [0, 1] as const) {
+      const client = await databaseClient.pool.connect();
+      try {
+        await client.query('begin');
+        await client.query("select set_config('application_name', $1, true)", [
+          `${applicationName}-${slot}`
+        ]);
+        await client.query("select set_config('lock_timeout', '5s', true)");
+        const pidResult = await client.query<{ pid: number }>(
+          'select pg_backend_pid() as pid'
+        );
+        const pid = pidResult.rows[0]?.pid;
+        if (typeof pid !== 'number') throw new Error('missing correction barrier pid');
+        blockers.push({ client, pid, released: false });
+      } catch (error) {
+        client.release(true);
+        throw error;
+      }
+    }
+    for (const slot of [0, 1] as const) {
+      const blocker = blockers[slot];
+      if (!blocker) throw new Error(`missing correction blocker ${slot}`);
+      const assigned = stages.filter((stage) => stage.blockerSlot === slot);
+      for (const stage of [...assigned].reverse()) {
+        await blocker.client.query(`savepoint ${correctionSavepoint(stage.id)}`);
+        await blocker.client.query(stage.query, [...stage.parameters]);
+      }
+    }
+    if (blockers.length !== 2) throw new Error('missing correction barrier blockers');
+    return {
+      blockers: blockers as [CorrectionBarrierBlocker, CorrectionBarrierBlocker],
+      stages,
+      nextRelease: 0,
+      closed: false
+    };
+  } catch (error) {
+    await Promise.allSettled(blockers.map(async (blocker) => {
+      await blocker.client.query('rollback').catch(() => undefined);
+      if (!blocker.released) {
+        blocker.released = true;
+        blocker.client.release();
+      }
+    }));
+    throw error;
+  }
+}
+
+async function releaseCorrectionBarrierStage(
+  barrier: CorrectionBarrier,
+  stage: CorrectionBarrierStage
+): Promise<void> {
+  if (barrier.closed || barrier.stages[barrier.nextRelease]?.id !== stage.id) {
+    throw new Error(`Correction barrier release is out of order at ${stage.id}`);
+  }
+  const blocker = barrier.blockers[stage.blockerSlot];
+  const savepoint = correctionSavepoint(stage.id);
+  await blocker.client.query(`rollback to savepoint ${savepoint}`);
+  await blocker.client.query(`release savepoint ${savepoint}`);
+  barrier.nextRelease += 1;
+}
+
+async function releaseCorrectionBarrier(barrier: CorrectionBarrier): Promise<void> {
+  if (barrier.closed) return;
+  barrier.closed = true;
+  const results = await Promise.allSettled(barrier.blockers.map(async (blocker, slot) => {
+    if (blocker.released) return;
+    blocker.released = true;
+    try {
+      await within(
+        blocker.client.query('rollback'),
+        5_000,
+        `Timed out releasing correction barrier blocker ${slot}`
+      );
+      blocker.client.release();
+    } catch (error) {
+      blocker.client.release(true);
+      throw error;
+    }
+  }));
+  const rejected = results.find((result) => result.status === 'rejected');
+  if (rejected?.status === 'rejected') throw rejected.reason;
+}
+
+async function readPostgresLocks(pid: number): Promise<readonly ObservedPostgresLock[]> {
+  const result = await databaseClient.pool.query<ObservedPostgresLock>(`
+    select locktype, database, relation::regclass::text as relation, page, tuple,
+      classid, objid, objsubid, virtualxid, transactionid::text as transactionid,
+      mode, granted
+    from pg_locks where pid = $1
+    order by locktype, database, relation, page, tuple, classid, objid, objsubid,
+      virtualxid, transactionid, mode, granted
+  `, [pid]);
+  return result.rows;
+}
+
+function sameAdvisoryIdentity(
+  left: ObservedPostgresLock,
+  right: ObservedPostgresLock
+): boolean {
+  return left.locktype === 'advisory' && right.locktype === 'advisory' &&
+    left.database === right.database && left.classid === right.classid &&
+    left.objid === right.objid && left.objsubid === right.objsubid;
+}
+
+function sameTransactionIdentity(
+  left: ObservedPostgresLock,
+  right: ObservedPostgresLock
+): boolean {
+  return left.locktype === 'transactionid' && right.locktype === 'transactionid' &&
+    left.transactionid !== null && left.transactionid === right.transactionid;
+}
+
+function sameTupleIdentity(
+  left: ObservedPostgresLock,
+  right: ObservedPostgresLock
+): boolean {
+  return left.locktype === 'tuple' && right.locktype === 'tuple' &&
+    left.database === right.database && left.relation === right.relation &&
+    left.page === right.page && left.tuple === right.tuple;
+}
+
+function expectNoGrantedCorrectionMutationLocks(
+  locks: readonly ObservedPostgresLock[],
+  stage: CorrectionBarrierStage
+): void {
+  const prematureMutationLocks = locks.flatMap((lock) => {
+    const relation = lock.relation?.replace(/^public[.]/u, '') ?? null;
+    return lock.locktype === 'relation' && lock.granted && relation !== null &&
+      correctionMutationRelations.has(relation) && mutationRelationLockModes.has(lock.mode)
+      ? [`${relation}:${lock.mode}`]
+      : [];
+  }).sort();
+  expect(
+    prematureMutationLocks,
+    `executor acquired mutation locks before completing ${stage.id}`
+  ).toEqual([]);
+}
+
+async function waitForCorrectionBarrierStage(
+  operation: Promise<unknown>,
+  pid: number,
+  applicationName: string,
+  barrier: CorrectionBarrier,
+  stage: CorrectionBarrierStage
+): Promise<void> {
+  const blocker = barrier.blockers[stage.blockerSlot];
+  const wait = async () => {
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const result = await databaseClient.pool.query<{
+        blockers: number[];
+        query: string;
+        waitEvent: string | null;
+        waitEventType: string | null;
+      }>(`
+        select pg_blocking_pids(pid) as blockers, query,
+          wait_event as "waitEvent", wait_event_type as "waitEventType"
+        from pg_stat_activity
+        where pid = $1 and application_name = $2
+      `, [pid, applicationName]);
+      const row = result.rows[0];
+      if (row?.waitEventType === 'Lock' && row.blockers.includes(blocker.pid)) {
+        const normalized = row.query.replace(/\s+/gu, ' ').toLowerCase();
+        expect(normalized).toContain(stage.expectedQueryFragment.toLowerCase());
+        const [waitingLocks, blockingLocks] = await Promise.all([
+          readPostgresLocks(pid),
+          readPostgresLocks(blocker.pid)
+        ]);
+        expect(waitingLocks.some((lock) => !lock.granted)).toBe(true);
+        expectNoGrantedCorrectionMutationLocks(waitingLocks, stage);
+        if (stage.expectedLock.kind === 'advisory') {
+          expect(row.waitEvent).toBe('advisory');
+          const waiting = waitingLocks.find((lock) =>
+            lock.locktype === 'advisory' && !lock.granted
+          );
+          expect(waiting).toBeDefined();
+          expect(blockingLocks.some((lock) =>
+            lock.granted && waiting !== undefined && sameAdvisoryIdentity(waiting, lock)
+          )).toBe(true);
+        } else {
+          const expectedRelation = stage.expectedLock.relation;
+          expect(['transactionid', 'tuple']).toContain(row.waitEvent);
+          expect(waitingLocks.some((lock) =>
+            lock.relation === expectedRelation
+          )).toBe(true);
+          expect(blockingLocks.some((lock) =>
+            lock.granted && lock.relation === expectedRelation
+          )).toBe(true);
+          const waiting = waitingLocks.find((lock) =>
+            lock.locktype === row.waitEvent && !lock.granted
+          );
+          expect(waiting).toBeDefined();
+          expect(blockingLocks.some((lock) => lock.granted && waiting !== undefined &&
+            (row.waitEvent === 'transactionid'
+              ? sameTransactionIdentity(waiting, lock)
+              : sameTupleIdentity(waiting, lock))
+          )).toBe(true);
+        }
+        return;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`Expected ${applicationName} at correction barrier ${stage.id}`);
+  };
+  await Promise.race([
+    wait(),
+    operation.then(
+      () => { throw new Error(`${applicationName} completed before ${stage.id}`); },
+      (error: unknown) => { throw error; }
+    )
+  ]);
+}
+
 async function createPurchaseFixture(sourceId: string): Promise<PurchaseFixture> {
   const userId = randomUUID();
   const titleId = randomUUID();
@@ -330,6 +744,7 @@ async function createPurchaseFixture(sourceId: string): Promise<PurchaseFixture>
   if (!grant) throw new Error('Expected entitlement fixture');
   return {
     grantId: grant.id,
+    itemId,
     orderId,
     paymentId: payment.id,
     refundId: refund.id,
@@ -445,6 +860,601 @@ async function createPayoutFixture(
     );
   }
   return { payoutId: payout.id, runId: run.id, generation };
+}
+
+async function createCorrectionProjectionFixture(input: {
+  readonly label: string;
+  readonly refundId: string;
+  readonly stripeRefundId: string;
+  readonly orderItemId: string;
+  readonly totalMinor: number;
+}): Promise<CorrectionProjectionFixture> {
+  const source = snapshot({
+    sourceFamily: 'refund',
+    sourceId: input.stripeRefundId,
+    amountMinor: -input.totalMinor,
+    feeMinor: 0
+  });
+  const staged = await stageBalanceTransaction(databaseClient.db, source, {
+    correlationId: `${input.label}-stage`
+  });
+  const [balance] = await databaseClient.db.select({
+    fingerprint: stripeBalanceTransactions.fingerprintSha256
+  }).from(stripeBalanceTransactions)
+    .where(eq(stripeBalanceTransactions.id, staged.balanceTransactionId));
+  if (!balance) throw new Error('Expected correction balance transaction');
+
+  const projection = await databaseClient.db.transaction(async (transaction) => {
+    const classification = await appendClassificationDecisionLocked(transaction, {
+      subjectType: 'balance_transaction',
+      subjectId: staged.balanceTransactionId,
+      classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      sourceFingerprint: balance.fingerprint,
+      decision: {
+        status: 'classified',
+        classification: 'refund',
+        impact: 'informational'
+      },
+      correlationId: `${input.label}-classification`
+    });
+    const commonPlan = {
+      balanceTransactionId: staged.balanceTransactionId,
+      scope: 'title' as const,
+      currency: 'USD',
+      algorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+      sourceFingerprint: balance.fingerprint,
+      supersedesSetId: null,
+      reversalOfSetId: null
+    };
+    const gross = await persistFinancialAllocationPlanLocked(transaction, {
+      sourceKind: 'refund',
+      sourceId: input.refundId,
+      classificationVersion: FINANCIAL_CLASSIFIER_VERSION,
+      correlationId: `${input.label}-gross`,
+      plan: {
+        ...commonPlan,
+        allocationIdentity: `${input.label}:gross:${input.refundId}`,
+        basis: 'gross_amount',
+        expectedEffectMinor: -input.totalMinor,
+        items: [{
+          orderItemId: input.orderItemId,
+          component: 'refund_subtotal',
+          effectMinor: -input.totalMinor,
+          currency: 'USD',
+          tieBreakKey: `correction-lock:${input.refundId}:refund_subtotal`
+        }]
+      }
+    });
+    const fee = await persistFinancialAllocationPlanLocked(transaction, {
+      sourceKind: 'refund',
+      sourceId: input.refundId,
+      classificationVersion: FINANCIAL_CLASSIFIER_VERSION,
+      correlationId: `${input.label}-fee`,
+      plan: {
+        ...commonPlan,
+        allocationIdentity: `${input.label}:fee:${input.refundId}`,
+        basis: 'fee',
+        expectedEffectMinor: 0,
+        items: []
+      }
+    });
+    return { classificationId: classification.id, grossSetId: gross.setId,
+      feeSetId: fee.setId };
+  });
+  return {
+    balanceTransactionId: staged.balanceTransactionId,
+    classificationId: projection.classificationId,
+    grossAllocationSetId: projection.grossSetId,
+    feeAllocationSetId: projection.feeSetId
+  };
+}
+
+async function createCorrectionLockFixture(label: string): Promise<CorrectionLockFixture> {
+  const purchase = await createPurchaseFixture(`ch_correction_${randomUUID()}`);
+  await ownerDatabaseClient.pool.query(
+    `insert into user_roles (user_id, role) values ($1, 'admin')`,
+    [purchase.userId]
+  );
+  const totalMinor = 50;
+  await ownerDatabaseClient.db.update(refunds).set({
+    status: 'succeeded',
+    amountMinor: totalMinor,
+    allocationStatus: 'finalized',
+    financialEvidenceStatus: 'fee_reconciled'
+  }).where(eq(refunds.id, purchase.refundId));
+  const siblingStripeRefundId = `re_correction_sibling_${randomUUID()}`;
+  const [siblingRefund] = await ownerDatabaseClient.db.insert(refunds).values({
+    paymentId: purchase.paymentId,
+    stripeRefundId: siblingStripeRefundId,
+    status: 'succeeded',
+    amountMinor: totalMinor,
+    currency: 'USD',
+    reason: 'requested_by_customer',
+    providerCreatedAt: new Date(fixtureTime.getTime() + 1_000),
+    allocationStatus: 'finalized',
+    financialEvidenceStatus: 'fee_reconciled'
+  }).returning();
+  if (!siblingRefund) throw new Error('Expected sibling correction refund');
+  const allocationRows = await ownerDatabaseClient.db.insert(refundAllocations).values([
+    {
+      refundId: purchase.refundId,
+      orderItemId: purchase.itemId,
+      amountMinor: totalMinor,
+      source: 'administrative' as const
+    },
+    {
+      refundId: siblingRefund.id,
+      orderItemId: purchase.itemId,
+      amountMinor: totalMinor,
+      source: 'administrative' as const
+    }
+  ]).returning({ id: refundAllocations.id, refundId: refundAllocations.refundId });
+  const targetAllocation = allocationRows.find((row) => row.refundId === purchase.refundId);
+  const siblingAllocation = allocationRows.find((row) => row.refundId === siblingRefund.id);
+  if (!targetAllocation || !siblingAllocation) {
+    throw new Error('Expected both correction refund allocations');
+  }
+  await ownerDatabaseClient.db.insert(refundAllocationComponents).values([
+    {
+      refundAllocationId: targetAllocation.id,
+      refundId: purchase.refundId,
+      orderItemId: purchase.itemId,
+      subtotalMinor: totalMinor,
+      taxMinor: 0,
+      totalMinor,
+      currency: 'USD'
+    },
+    {
+      refundAllocationId: siblingAllocation.id,
+      refundId: siblingRefund.id,
+      orderItemId: purchase.itemId,
+      subtotalMinor: totalMinor,
+      taxMinor: 0,
+      totalMinor,
+      currency: 'USD'
+    }
+  ]);
+
+  const targetProjection = await createCorrectionProjectionFixture({
+    label: `${label}-target`,
+    refundId: purchase.refundId,
+    stripeRefundId: purchase.stripeRefundId,
+    orderItemId: purchase.itemId,
+    totalMinor
+  });
+  const siblingProjection = await createCorrectionProjectionFixture({
+    label: `${label}-sibling`,
+    refundId: siblingRefund.id,
+    stripeRefundId: siblingStripeRefundId,
+    orderItemId: purchase.itemId,
+    totalMinor
+  });
+  const projections = [targetProjection, siblingProjection] as const;
+  const issues = [];
+  for (const [index, projection] of projections.entries()) {
+    const issue = await databaseClient.db.transaction((transaction) =>
+      observeFinancialIssue(transaction, {
+        resourceType: 'allocation_set',
+        resourceId: projection.grossAllocationSetId,
+        safeCode: 'correction_rebase_required',
+        impact: 'exception',
+        actor: { type: 'system', id: 'financial-worker' },
+        correlationId: `${label}-issue-${index + 1}`
+      })
+    );
+    issues.push({ id: issue.id, resourceId: projection.grossAllocationSetId });
+  }
+  const payouts = [];
+  for (const projection of projections) {
+    payouts.push(await createPayoutFixture([projection.balanceTransactionId], true));
+  }
+  const actor: AdministratorActor = {
+    type: 'user', id: purchase.userId, roles: ['admin']
+  };
+  const submitted = await submitFinancialAdminCommand(runtimeDatabaseClient.db, {
+    actor,
+    idempotencyKey: randomUUID(),
+    command: {
+      kind: 'refund_reporting_correction_create',
+      refundId: purchase.refundId,
+      reason: 'allocation_attribution_correction',
+      expectedNextCorrectionVersion: 1,
+      expectedBaseAllocationSetId: targetProjection.grossAllocationSetId,
+      expectedSourceFingerprint: 'f'.repeat(64),
+      items: [{ orderItemId: purchase.itemId, totalPresentmentMinor: totalMinor }],
+      previewFingerprint: 'e'.repeat(64),
+      confirmation: 'create_reporting_correction'
+    },
+    context: { correlationId: `${label}-command` }
+  });
+  if (submitted.status !== 'pending') throw new Error('Expected pending correction command');
+  return {
+    purchase,
+    actor,
+    commandId: submitted.commandId,
+    refundIds: [purchase.refundId, siblingRefund.id],
+    payoutIds: payouts.map((payout) => payout.payoutId),
+    balanceTransactions: projections.map((projection) => ({
+      id: projection.balanceTransactionId
+    })),
+    classifications: projections.map((projection) => ({
+      id: projection.classificationId,
+      subjectId: projection.balanceTransactionId
+    })),
+    allocationSets: projections.flatMap((projection) => [
+      { id: projection.grossAllocationSetId,
+        balanceTransactionId: projection.balanceTransactionId,
+        basis: 'gross_amount' as const },
+      { id: projection.feeAllocationSetId,
+        balanceTransactionId: projection.balanceTransactionId,
+        basis: 'fee' as const }
+    ]),
+    issues
+  };
+}
+
+async function readCorrectionDomainSnapshot(
+  fixture: CorrectionLockFixture
+): Promise<CorrectionDomainSnapshot> {
+  const result = await ownerDatabaseClient.pool.query<CorrectionDomainSnapshot>(`
+    select
+      coalesce((select jsonb_agg(to_jsonb(refund) order by refund.id)::text
+        from refunds refund where refund.id = any($1::uuid[])), '[]') as refunds,
+      coalesce((select jsonb_agg(to_jsonb(allocation) order by allocation.id)::text
+        from refund_allocations allocation
+        where allocation.refund_id = any($1::uuid[])), '[]')
+        as refund_allocations,
+      coalesce((select jsonb_agg(to_jsonb(component) order by component.id)::text
+        from refund_allocation_components component
+        where component.refund_id = any($1::uuid[])), '[]')
+        as refund_components,
+      coalesce((select jsonb_agg(to_jsonb(correction) order by correction.id)::text
+        from refund_reporting_correction_sets correction
+        where correction.refund_id = any($1::uuid[])), '[]')
+        as correction_sets,
+      coalesce((select jsonb_agg(to_jsonb(item) order by item.id)::text
+        from refund_reporting_correction_items item
+        join refund_reporting_correction_sets correction on correction.id = item.correction_set_id
+        where correction.refund_id = any($1::uuid[])), '[]') as correction_items,
+      coalesce((select jsonb_agg(to_jsonb(payout) order by payout.id)::text
+        from stripe_payouts payout where payout.id = any($8::uuid[])), '[]') as payouts,
+      coalesce((select jsonb_agg(to_jsonb(membership)
+          order by membership.payout_id, membership.balance_transaction_id)::text
+        from stripe_payout_balance_transactions membership
+        where membership.payout_id = any($8::uuid[])
+          and membership.balance_transaction_id = any($2::uuid[])), '[]')
+        as payout_memberships,
+      coalesce((select jsonb_agg(to_jsonb(balance) order by balance.id)::text
+        from stripe_balance_transactions balance
+        where balance.id = any($2::uuid[])), '[]')
+        as balance_transactions,
+      coalesce((select jsonb_agg(to_jsonb(detail) order by detail.id)::text
+        from stripe_balance_transaction_fee_details detail
+        where detail.balance_transaction_id = any($2::uuid[])), '[]') as fee_details,
+      coalesce((select jsonb_agg(to_jsonb(classification) order by classification.id)::text
+        from financial_classification_versions classification
+        where (classification.subject_type = 'balance_transaction'
+            and classification.subject_id = any($2::uuid[]))
+          or (classification.subject_type = 'fee_detail' and classification.subject_id in (
+            select detail.id from stripe_balance_transaction_fee_details detail
+            where detail.balance_transaction_id = any($2::uuid[])
+          ))), '[]') as classifications,
+      coalesce((select jsonb_agg(to_jsonb(allocation) order by allocation.id)::text
+        from financial_allocation_sets allocation
+        where allocation.balance_transaction_id = any($2::uuid[])),
+        '[]') as allocation_sets,
+      coalesce((select jsonb_agg(to_jsonb(item) order by item.id)::text
+        from financial_item_allocations item
+        join financial_allocation_sets allocation on allocation.id = item.allocation_set_id
+        where allocation.balance_transaction_id = any($2::uuid[])), '[]')
+        as allocation_items,
+      coalesce((select jsonb_agg(to_jsonb(head)
+          order by head.balance_transaction_id, head.basis)::text
+        from current_financial_projection_heads head
+        where head.balance_transaction_id = any($2::uuid[])), '[]') as projection_heads,
+      coalesce((select jsonb_agg(to_jsonb(issue) order by issue.id)::text
+        from financial_reconciliation_issues issue
+        where issue.id = any($3::uuid[])), '[]') as issues,
+      coalesce((select jsonb_agg(to_jsonb(grant_row) order by grant_row.id)::text
+        from entitlement_grants grant_row where grant_row.id = $4), '[]') as grants,
+      coalesce((select jsonb_agg(to_jsonb(entitlement) order by entitlement.id)::text
+        from entitlements entitlement
+        where entitlement.user_id = $5 and entitlement.title_id = $6), '[]') as entitlements,
+      coalesce((select jsonb_agg(to_jsonb(message) order by message.id)::text
+        from outbox_messages message
+        where message.deduplication_key = $7), '[]') as outbox,
+      coalesce((select jsonb_agg(to_jsonb(audit) order by audit.id)::text
+        from audit_events audit where audit.action = 'financial.refund_correction.created'
+          and ((audit.before ->> 'refundId') in (
+              select id::text from unnest($1::uuid[]) as refund_id(id)
+            ) or (audit.after ->> 'refundId') in (
+              select id::text from unnest($1::uuid[]) as refund_id(id)
+            ))), '[]')
+        as correction_audits,
+      coalesce((select jsonb_agg(to_jsonb(audit) order by audit.id)::text
+        from audit_events audit where audit.action = 'financial.issue.resolved'
+          and audit.resource_type = 'financial_issue' and audit.resource_id in (
+            select id::text from unnest($3::uuid[]) as issue_id(id)
+          )), '[]')
+        as issue_resolution_audits
+  `, [
+    fixture.refundIds,
+    fixture.balanceTransactions.map((balance) => balance.id),
+    fixture.issues.map((issue) => issue.id),
+    fixture.purchase.grantId,
+    fixture.purchase.userId,
+    fixture.purchase.titleId,
+    `commerce:access-change:event:${fixture.commandId}:v1`,
+    fixture.payoutIds
+  ]);
+  const row = result.rows[0];
+  if (!row || result.rows.length !== 1) {
+    throw new Error('Expected one reporting-correction domain snapshot');
+  }
+  return row;
+}
+
+async function readCorrectionCommandLifecycle(
+  commandId: string
+): Promise<CorrectionCommandLifecycle> {
+  const result = await ownerDatabaseClient.pool.query<CorrectionCommandLifecycle>(`
+    select command.status::text as command_status,
+      command.safe_result_code, command.safe_result,
+      job.status::text as job_status, job.attempts, job.last_error,
+      (select count(*)::integer from audit_events audit
+        where audit.action = 'financial.admin_command.conflict'
+          and audit.resource_id = command.id::text) as command_audit_count
+    from financial_admin_commands command
+    join jobs job on job.id = command.job_id
+    where command.id = $1
+  `, [commandId]);
+  const row = result.rows[0];
+  if (!row || result.rows.length !== 1) {
+    throw new Error('Expected one reporting-correction command lifecycle');
+  }
+  return row;
+}
+
+function unexpectedFinancialAdminExecutor(label: string): FinancialAdminCommandExecutor {
+  return async () => {
+    throw new Error(`Unexpected ${label} executor in reporting-correction lock probe`);
+  };
+}
+
+function runCorrectionWorkerProbe(
+  applicationName: string,
+  fixture: CorrectionLockFixture,
+  entered: Deferred<number>
+): CorrectionWorkerProbe {
+  const reportingCorrection: FinancialAdminCommandExecutor = async (context, command) => {
+    if (command.kind !== 'refund_reporting_correction_create') {
+      throw new Error('Reporting-correction probe received another command kind');
+    }
+    await configureProbe(context.transaction, applicationName, entered);
+    return executeReportingCorrectionCreate(context, command);
+  };
+  const handler = createFinancialAdminCommandHandler({
+    database: databaseClient.db,
+    executors: createFinancialAdminCommandExecutors({
+      refundDraftSave: unexpectedFinancialAdminExecutor('draft-save'),
+      refundDraftDiscard: unexpectedFinancialAdminExecutor('draft-discard'),
+      refundAllocationFinalize: unexpectedFinancialAdminExecutor('refund-finalization'),
+      refundReportingCorrectionCreate: reportingCorrection,
+      administrativeRecoveryActivate: unexpectedFinancialAdminExecutor('recovery-activate'),
+      administrativeRecoveryDeactivate: unexpectedFinancialAdminExecutor('recovery-deactivate')
+    }),
+    accessMessages: correctionAccessMessages
+  });
+  const leaseCapability = createHash('sha256')
+    .update(`reporting-correction-lock:${fixture.commandId}`)
+    .digest('base64url');
+  const repository = createPostgresJobRepository(
+    databaseClient.db,
+    { ...applicationConfig.jobs, leaseMs: 60_000 },
+    undefined,
+    'local-only',
+    {
+      classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
+    },
+    () => leaseCapability
+  );
+  const controller = new AbortController();
+  let polls = 0;
+  const operation = runWorker({
+    repository,
+    handlers: new Map([[FINANCIAL_ADMIN_COMMAND_JOB, handler]]),
+    workerId: `correction-lock-${fixture.commandId}`,
+    concurrency: 1,
+    pollIntervalMs: 1,
+    heartbeatIntervalMs: 250,
+    signal: controller.signal,
+    beforePoll: async () => {
+      polls += 1;
+      if (polls === 2) controller.abort();
+    }
+  });
+  return { operation, abort: () => controller.abort() };
+}
+
+async function waitForCorrectionExecutorEntry(
+  entered: Deferred<number>,
+  probe: CorrectionWorkerProbe
+): Promise<number> {
+  return within(
+    Promise.race([
+      entered.promise,
+      probe.operation.then(
+        () => { throw new Error('Correction worker completed before executor entry'); },
+        (error: unknown) => { throw error; }
+      )
+    ]),
+    5_000,
+    'Timed out waiting for reporting-correction executor entry'
+  );
+}
+
+function correctionBarrierStages(
+  fixture: CorrectionLockFixture
+): readonly CorrectionBarrierStage[] {
+  const compareText = (left: string, right: string) => left < right ? -1 : left > right ? 1 : 0;
+  const blockerSlot = (index: number): CorrectionBarrierBlockerSlot =>
+    index % 2 === 0 ? 0 : 1;
+  const payoutIds = [...fixture.payoutIds].sort(compareText);
+  const balanceTransactionIds = fixture.balanceTransactions.map((row) => row.id)
+    .sort(compareText);
+  const classifications = [...fixture.classifications].sort((left, right) =>
+    compareText(left.subjectId, right.subjectId)
+  );
+  const allocationAdvisories = [...fixture.allocationSets].sort((left, right) => {
+    const byBalance = compareText(left.balanceTransactionId, right.balanceTransactionId);
+    if (byBalance !== 0) return byBalance;
+    return left.basis === right.basis ? 0 : left.basis === 'gross_amount' ? -1 : 1;
+  });
+  const allocationRows = [...fixture.allocationSets].sort((left, right) => {
+    const byBalance = compareText(left.balanceTransactionId, right.balanceTransactionId);
+    return byBalance === 0 ? compareText(left.id, right.id) : byBalance;
+  });
+  const issues = [...fixture.issues].sort((left, right) =>
+    compareText(left.resourceId, right.resourceId)
+  );
+  return [
+    {
+      id: 'projection-authority',
+      blockerSlot: 0,
+      query: `select singleton from financial_projection_versions
+        where singleton = true for update`,
+      parameters: [],
+      expectedQueryFragment: 'from financial_projection_versions',
+      expectedLock: { kind: 'relation', relation: 'financial_projection_versions' }
+    },
+    {
+      id: 'order-advisory',
+      blockerSlot: 0,
+      query: 'select pg_advisory_xact_lock(hashtextextended($1, 0))',
+      parameters: [`pale-orbit:commerce:order:${fixture.purchase.orderId}`],
+      expectedQueryFragment: 'pg_advisory_xact_lock',
+      expectedLock: { kind: 'advisory' }
+    },
+    {
+      id: 'order-row',
+      blockerSlot: 0,
+      query: 'select id from orders where id = $1 for update',
+      parameters: [fixture.purchase.orderId],
+      expectedQueryFragment: 'from orders',
+      expectedLock: { kind: 'relation', relation: 'orders' }
+    },
+    {
+      id: 'payment-row',
+      blockerSlot: 0,
+      query: 'select id from payments where id = $1 for update',
+      parameters: [fixture.purchase.paymentId],
+      expectedQueryFragment: 'from payments',
+      expectedLock: { kind: 'relation', relation: 'payments' }
+    },
+    {
+      id: 'refund-row',
+      blockerSlot: 0,
+      query: 'select id from refunds where id = $1 for update',
+      parameters: [fixture.purchase.refundId],
+      expectedQueryFragment: 'from "refunds"',
+      expectedLock: { kind: 'relation', relation: 'refunds' }
+    },
+    {
+      id: 'projection-enrollment',
+      blockerSlot: 0,
+      query: 'select pg_advisory_xact_lock(hashtextextended($1, 0))',
+      parameters: ['pale-orbit:financial:replay-enrollment'],
+      expectedQueryFragment: 'pg_advisory_xact_lock',
+      expectedLock: { kind: 'advisory' }
+    },
+    ...payoutIds.map((payoutId, index): CorrectionBarrierStage => ({
+      id: `payout-advisory-${index + 1}`,
+      blockerSlot: blockerSlot(index),
+      query: 'select pg_advisory_xact_lock(hashtextextended($1, 0))',
+      parameters: [`pale-orbit:financial:payout:${payoutId}`],
+      expectedQueryFragment: 'pg_advisory_xact_lock',
+      expectedLock: { kind: 'advisory' }
+    })),
+    ...payoutIds.map((payoutId, index): CorrectionBarrierStage => ({
+      id: `payout-row-${index + 1}`,
+      blockerSlot: blockerSlot(index),
+      query: 'select id from stripe_payouts where id = $1 for update',
+      parameters: [payoutId],
+      expectedQueryFragment: 'order by id for update',
+      expectedLock: { kind: 'relation', relation: 'stripe_payouts' }
+    })),
+    ...balanceTransactionIds.map((id, index): CorrectionBarrierStage => ({
+      id: `balance-transaction-advisory-${index + 1}`,
+      blockerSlot: blockerSlot(index),
+      query: 'select pg_advisory_xact_lock(hashtextextended($1, 0))',
+      parameters: [`pale-orbit:financial:balance-transaction:${id}`],
+      expectedQueryFragment: 'pg_advisory_xact_lock',
+      expectedLock: { kind: 'advisory' }
+    })),
+    ...balanceTransactionIds.map((id, index): CorrectionBarrierStage => ({
+      id: `balance-transaction-row-${index + 1}`,
+      blockerSlot: blockerSlot(index),
+      query: 'select id from stripe_balance_transactions where id = $1 for update',
+      parameters: [id],
+      expectedQueryFragment: 'order by id for update',
+      expectedLock: { kind: 'relation', relation: 'stripe_balance_transactions' }
+    })),
+    ...classifications.map((classification, index): CorrectionBarrierStage => ({
+      id: `classification-advisory-${index + 1}`,
+      blockerSlot: blockerSlot(index),
+      query: 'select pg_advisory_xact_lock(hashtextextended($1, 0))',
+      parameters: [
+        `pale-orbit:financial:classification:balance_transaction:${classification.subjectId}`
+      ],
+      expectedQueryFragment: 'pg_advisory_xact_lock',
+      expectedLock: { kind: 'advisory' }
+    })),
+    ...classifications.map((classification, index): CorrectionBarrierStage => ({
+      id: `classification-row-${index + 1}`,
+      blockerSlot: blockerSlot(index),
+      query: 'select id from financial_classification_versions where id = $1 for update',
+      parameters: [classification.id],
+      expectedQueryFragment: 'order by subject_type, subject_id, classifier_version for update',
+      expectedLock: { kind: 'relation', relation: 'financial_classification_versions' }
+    })),
+    ...allocationAdvisories.map((allocation, index): CorrectionBarrierStage => ({
+      id: `allocation-advisory-${index + 1}`,
+      blockerSlot: blockerSlot(index),
+      query: 'select pg_advisory_xact_lock(hashtextextended($1, 0))',
+      parameters: [
+        `pale-orbit:financial:allocation:${allocation.balanceTransactionId}:${allocation.basis}`
+      ],
+      expectedQueryFragment: 'pg_advisory_xact_lock',
+      expectedLock: { kind: 'advisory' }
+    })),
+    ...allocationRows.map((allocation, index): CorrectionBarrierStage => ({
+      id: `allocation-row-${index + 1}`,
+      blockerSlot: blockerSlot(index),
+      query: 'select id from financial_allocation_sets where id = $1 for update',
+      parameters: [allocation.id],
+      expectedQueryFragment: 'order by balance_transaction_id, id for update',
+      expectedLock: { kind: 'relation', relation: 'financial_allocation_sets' }
+    })),
+    ...issues.map((issue, index): CorrectionBarrierStage => ({
+      id: `issue-advisory-${index + 1}`,
+      blockerSlot: blockerSlot(index),
+      query: 'select pg_advisory_xact_lock(hashtext($1))',
+      parameters: [
+        `pale-orbit:financial:issue:allocation_set:${issue.resourceId}:correction_rebase_required`
+      ],
+      expectedQueryFragment: 'pg_advisory_xact_lock',
+      expectedLock: { kind: 'advisory' }
+    })),
+    ...issues.map((issue, index): CorrectionBarrierStage => ({
+      id: `issue-row-${index + 1}`,
+      blockerSlot: blockerSlot(index),
+      query: 'select id from financial_reconciliation_issues where id = $1 for update',
+      parameters: [issue.id],
+      expectedQueryFragment: 'select id from financial_reconciliation_issues',
+      expectedLock: { kind: 'relation', relation: 'financial_reconciliation_issues' }
+    }))
+  ];
 }
 
 async function lockPurchaseFinancialProjection(
@@ -741,6 +1751,100 @@ describe.each(LOCK_PROBE_REPETITIONS)('financial lock ordering (repetition %i)',
       ]);
     }
   }, 15_000);
+
+  it('holds the real reporting-correction executor at every canonical lock without domain mutation', async () => {
+    expect(lockFinancialProjectionRows.toString().replace(/\s+/gu, ' ').toLowerCase())
+      .toContain('order by resource_type, resource_id, safe_code for update');
+    const fixture = await createCorrectionLockFixture(
+      `correction-lock-${randomUUID()}`
+    );
+    expect({
+      payouts: new Set(fixture.payoutIds).size,
+      balanceTransactions: new Set(
+        fixture.balanceTransactions.map((row) => row.id)
+      ).size,
+      classifications: new Set(
+        fixture.classifications.map((row) => row.subjectId)
+      ).size,
+      allocations: new Set(fixture.allocationSets.map((row) => row.id)).size,
+      issues: new Set(fixture.issues.map((row) => row.resourceId)).size
+    }).toEqual({
+      payouts: 2,
+      balanceTransactions: 2,
+      classifications: 2,
+      allocations: 4,
+      issues: 2
+    });
+    const stages = correctionBarrierStages(fixture);
+    const barrier = await beginCorrectionBarrier(
+      probeName('correction-blocker', fixture.commandId),
+      stages
+    );
+    let probe: CorrectionWorkerProbe | undefined;
+    let testError: unknown;
+    let barrierCleanupError: unknown;
+    try {
+      const before = await readCorrectionDomainSnapshot(fixture);
+      const applicationName = probeName('correction-executor', fixture.commandId);
+      const entered = deferred<number>();
+      probe = runCorrectionWorkerProbe(applicationName, fixture, entered);
+      observe(probe.operation);
+      const executorPid = await waitForCorrectionExecutorEntry(entered, probe);
+      for (const stage of stages) {
+        await waitForCorrectionBarrierStage(
+          probe.operation, executorPid, applicationName, barrier, stage
+        );
+        expect(await readCorrectionCommandLifecycle(fixture.commandId)).toMatchObject({
+          command_status: 'pending',
+          safe_result_code: null,
+          safe_result: null,
+          job_status: 'running',
+          attempts: 1,
+          last_error: null,
+          command_audit_count: 0
+        });
+        expect(await readCorrectionDomainSnapshot(fixture)).toEqual(before);
+        await releaseCorrectionBarrierStage(barrier, stage);
+      }
+      await expect(within(
+        probe.operation,
+        10_000,
+        'Timed out waiting for reporting-correction worker completion'
+      )).resolves.toBeUndefined();
+      expect(await readCorrectionDomainSnapshot(fixture)).toEqual(before);
+      expect(await readCorrectionCommandLifecycle(fixture.commandId)).toEqual({
+        command_status: 'conflict',
+        safe_result_code: 'stale_state',
+        safe_result: null,
+        job_status: 'failed',
+        attempts: 1,
+        last_error: 'Financial administrator command conflicted with current state.',
+        command_audit_count: 1
+      });
+    } catch (error) {
+      testError = error;
+    } finally {
+      probe?.abort();
+      try {
+        const cleanup = await within(
+          Promise.allSettled([
+            releaseCorrectionBarrier(barrier),
+            ...(probe ? [probe.operation] : [])
+          ]),
+          7_500,
+          'Timed out cleaning up reporting-correction lock probe'
+        );
+        const barrierCleanup = cleanup[0];
+        if (barrierCleanup?.status === 'rejected') {
+          barrierCleanupError = barrierCleanup.reason;
+        }
+      } catch (error) {
+        barrierCleanupError = error;
+      }
+    }
+    if (testError !== undefined) throw testError;
+    if (barrierCleanupError !== undefined) throw barrierCleanupError;
+  }, 45_000);
 
   it('locks active projection authority before the finalization order graph', async () => {
     const purchase = await createPurchaseFixture(`ch_finalize_authority_${randomUUID()}`);

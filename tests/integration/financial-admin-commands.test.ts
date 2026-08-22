@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import { setTimeout as delay } from "node:timers/promises";
 import { describe, expect, it, vi } from "vitest";
 import type { AdministratorActor } from "$lib/server/auth/admin-policy";
 import { setAdminRole } from "$lib/server/auth/roles";
@@ -67,6 +66,35 @@ async function expectPostgresCode(
     return;
   }
   throw new Error(`Expected PostgreSQL error ${expectedCode}`);
+}
+
+async function expireJobLeaseForFixture(jobId: string): Promise<void> {
+  const client = await ownerDatabaseClient.pool.connect();
+  try {
+    await client.query("begin");
+    await client.query("set local session_replication_role = replica");
+    const claim = await client.query(
+      `update financial_admin_job_claims
+       set expires_at = issued_at + interval '1 millisecond'
+       where job_id = $1`,
+      [jobId],
+    );
+    const expired = await client.query(
+      `update jobs
+       set locked_at = clock_timestamp() - interval '10 seconds',
+         run_at = clock_timestamp() - interval '10 seconds'
+       where id = $1`,
+      [jobId],
+    );
+    expect(claim.rowCount).toBe(1);
+    expect(expired.rowCount).toBe(1);
+    await client.query("commit");
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function createAdministrator(label: string): Promise<AdministratorActor> {
@@ -623,7 +651,7 @@ describe("financial administrator command PostgreSQL lifecycle", () => {
     let capabilityIndex = 0;
     const postgresRepository = createPostgresJobRepository(
       workerDatabaseClient.db,
-      { ...applicationConfig.jobs, leaseMs: 60 },
+      { ...applicationConfig.jobs, leaseMs: 5_000 },
       undefined,
       "local-only",
       { classifierVersion: 1, allocationAlgorithmVersion: 1 },
@@ -659,7 +687,7 @@ describe("financial administrator command PostgreSQL lifecycle", () => {
       attempts: 1,
     });
 
-    await delay(100);
+    await expireJobLeaseForFixture(firstClaim!.id);
     const observations: RepositoryObservations = {
       claims: [],
       renewals: 0,

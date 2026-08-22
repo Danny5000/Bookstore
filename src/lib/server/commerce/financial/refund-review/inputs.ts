@@ -12,6 +12,7 @@ const SAFE_MONEY_MAX = 99_999_999;
 const POSTGRES_INTEGER_MAX = 2_147_483_647;
 const CANONICAL_UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const SHA256 = /^[a-f0-9]{64}$/u;
 const CANONICAL_INTEGER = /^(?:0|[1-9][0-9]*)$/u;
 const URLENCODED_CONTENT_TYPE =
   /^application\/x-www-form-urlencoded(?:\s*;\s*charset\s*=\s*utf-8)?$/iu;
@@ -47,6 +48,21 @@ export interface RefundFinalizationSubmission {
   >;
 }
 
+export type ReportingCorrectionPrepareInput = Omit<
+  Extract<FinancialAdminPrivateCommand, {
+    kind: 'refund_reporting_correction_create';
+  }>,
+  'kind' | 'previewFingerprint' | 'confirmation'
+>;
+
+export interface RefundReportingCorrectionSubmission {
+  readonly idempotencyKey: string;
+  readonly command: Extract<
+    FinancialAdminPrivateCommand,
+    { kind: 'refund_reporting_correction_create' }
+  >;
+}
+
 export class RefundReviewInputError extends Error {
   readonly fieldKey: string | null;
 
@@ -65,6 +81,11 @@ function invalidInput(fieldKey: string | null = null): never {
 
 function canonicalUuid(value: string | undefined): string {
   if (value === undefined || !CANONICAL_UUID.test(value)) return invalidInput();
+  return value;
+}
+
+function canonicalSha256(value: string | undefined): string {
+  if (value === undefined || !SHA256.test(value)) return invalidInput();
   return value;
 }
 
@@ -256,6 +277,98 @@ export async function parseRefundFinalizationConfirmRequest(
         POSTGRES_INTEGER_MAX
       ),
       previewFingerprint: exactlyOne(input, 'previewFingerprint'),
+      confirmation
+    })
+  };
+}
+
+const REPORTING_CORRECTION_PREPARE_KEYS = new Set([
+  'reason',
+  'expectedNextCorrectionVersion',
+  'expectedBaseAllocationSetId',
+  'expectedSourceFingerprint',
+  'orderItemId',
+  'totalPresentmentMinor'
+]);
+
+function parseReportingCorrectionInput(
+  input: URLSearchParams,
+  refundId: string
+): ReportingCorrectionPrepareInput {
+  const reason = exactlyOne(input, 'reason');
+  if (reason !== 'allocation_attribution_correction') return invalidInput();
+  const itemIds = input.getAll('orderItemId');
+  const amounts = input.getAll('totalPresentmentMinor');
+  if (
+    itemIds.length < 1 ||
+    itemIds.length > MAX_COMMAND_ITEMS ||
+    itemIds.length !== amounts.length
+  ) return invalidInput();
+
+  const seen = new Set<string>();
+  const items = itemIds.map((value, index) => {
+    const orderItemId = canonicalUuid(value);
+    if (seen.has(orderItemId)) return invalidInput();
+    seen.add(orderItemId);
+    return {
+      orderItemId,
+      totalPresentmentMinor: canonicalInteger(
+        amounts[index],
+        0,
+        SAFE_MONEY_MAX,
+        orderItemId
+      )
+    };
+  }).sort((left, right) => left.orderItemId.localeCompare(right.orderItemId));
+
+  return {
+    refundId: canonicalUuid(refundId),
+    reason,
+    expectedNextCorrectionVersion: canonicalInteger(
+      exactlyOne(input, 'expectedNextCorrectionVersion'),
+      1,
+      POSTGRES_INTEGER_MAX
+    ),
+    expectedBaseAllocationSetId: canonicalUuid(
+      exactlyOne(input, 'expectedBaseAllocationSetId')
+    ),
+    expectedSourceFingerprint: canonicalSha256(
+      exactlyOne(input, 'expectedSourceFingerprint')
+    ),
+    items
+  };
+}
+
+export async function parseRefundReportingCorrectionPrepareRequest(
+  request: Request,
+  refundId: string
+): Promise<ReportingCorrectionPrepareInput> {
+  const input = await readForm(request);
+  exactKeys(input, REPORTING_CORRECTION_PREPARE_KEYS);
+  return parseReportingCorrectionInput(input, refundId);
+}
+
+export async function parseRefundReportingCorrectionConfirmRequest(
+  request: Request,
+  refundId: string
+): Promise<RefundReportingCorrectionSubmission> {
+  const input = await readForm(request);
+  exactKeys(input, new Set([
+    ...REPORTING_CORRECTION_PREPARE_KEYS,
+    'idempotencyKey',
+    'previewFingerprint',
+    'confirmation'
+  ]));
+  const prepare = parseReportingCorrectionInput(input, refundId);
+  const confirmation = exactlyOne(input, 'confirmation');
+  if (confirmation !== 'create_reporting_correction') return invalidInput();
+  const idempotencyKey = canonicalUuid(exactlyOne(input, 'idempotencyKey'));
+  return {
+    idempotencyKey,
+    command: privateCommand({
+      kind: 'refund_reporting_correction_create',
+      ...prepare,
+      previewFingerprint: canonicalSha256(exactlyOne(input, 'previewFingerprint')),
       confirmation
     })
   };

@@ -17,6 +17,7 @@ import {
 import {
   observeFinancialIssue,
   resolveFinancialIssueAfterAdminCommand,
+  resolveFinancialIssueAfterReportingCorrectionCommand,
   resolveFinancialIssueAfterRecompute
 } from '../issues';
 import {
@@ -42,6 +43,7 @@ import type {
 import {
   recomputeLockedRefundFinancialProjection,
   recomputeLockedRefundFinancialProjectionForAdminCommand,
+  recomputeLockedRefundFinancialProjectionForReportingCorrectionCommand,
   recomputeLockedRefundFinancialProjectionForVersion,
   reconcileRefundFinancialSource
 } from './refund';
@@ -67,6 +69,7 @@ vi.mock('../allocations/repository', () => ({
 vi.mock('../issues', () => ({
   observeFinancialIssue: vi.fn(),
   resolveFinancialIssueAfterAdminCommand: vi.fn(),
+  resolveFinancialIssueAfterReportingCorrectionCommand: vi.fn(),
   resolveFinancialIssueAfterRecompute: vi.fn()
 }));
 vi.mock('$lib/server/audit/service', () => ({ appendAuditEvent: vi.fn() }));
@@ -750,6 +753,7 @@ describe('recomputeLockedRefundFinancialProjection', () => {
     vi.clearAllMocks();
     vi.mocked(resolveFinancialIssueAfterRecompute).mockResolvedValue(null);
     vi.mocked(resolveFinancialIssueAfterAdminCommand).mockResolvedValue(null);
+    vi.mocked(resolveFinancialIssueAfterReportingCorrectionCommand).mockResolvedValue(null);
     let persistedIndex = 0;
     vi.mocked(persistFinancialAllocationPlanLocked).mockImplementation(async () => ({
       setId: `00000000-0000-4000-8000-${String(400 + persistedIndex++).padStart(12, '0')}`,
@@ -838,6 +842,7 @@ describe('recomputeLockedRefundFinancialProjection', () => {
       commandId: adminCommandId,
       issueId: adminIssueHighId
     });
+    expect(resolveFinancialIssueAfterReportingCorrectionCommand).not.toHaveBeenCalled();
     expect(resolveFinancialIssueAfterRecompute).not.toHaveBeenCalled();
 
     const issueQuery = vi.mocked(transaction.execute).mock.calls
@@ -893,6 +898,74 @@ describe('recomputeLockedRefundFinancialProjection', () => {
       })
     );
     expect(resolveFinancialIssueAfterAdminCommand).not.toHaveBeenCalled();
+    expect(resolveFinancialIssueAfterReportingCorrectionCommand).not.toHaveBeenCalled();
+  });
+
+  it('uses only reporting-correction issue authority for a correction command', async () => {
+    const balance = canonicalBalance();
+    const transaction = projectionTransaction({
+      balances: [balance],
+      history: [{
+        refundId,
+        providerRefundId: 're_refund_trace',
+        providerCreatedAt: createdAt,
+        refundStatus: 'succeeded',
+        allocationStatus: 'finalized',
+        refundAllocationId: allocationId,
+        orderItemId: itemId,
+        subtotalMinor: 400,
+        taxMinor: 100,
+        currency: 'USD'
+      }],
+      feeDetails: { [balanceId]: [{ amountMinor: 10, classification: 'refund_fee' }] },
+      currentSets: [
+        {
+          id: selectedGrossSetId, allocationIdentity: 'selected-old-gross',
+          balanceTransactionId: balanceId, sourceKind: 'refund', sourceId: refundId,
+          basis: 'gross_amount', scope: 'title', currency: 'USD',
+          expectedEffectMinor: -500, classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+          algorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+          sourceFingerprint: fingerprint, supersedesSetId: null, reversalOfSetId: null,
+          isTargetTip: true, isGlobalTip: true
+        },
+        {
+          id: selectedFeeSetId, allocationIdentity: 'selected-old-fee',
+          balanceTransactionId: balanceId, sourceKind: 'refund', sourceId: refundId,
+          basis: 'fee', scope: 'title', currency: 'USD', expectedEffectMinor: -10,
+          classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+          algorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+          sourceFingerprint: fingerprint, supersedesSetId: null, reversalOfSetId: null,
+          isTargetTip: true, isGlobalTip: true
+        }
+      ],
+      openAdminIssues: [{ id: adminIssueLowId }]
+    });
+    vi.mocked(loadCurrentEffectiveAllocationProjection).mockResolvedValue(
+      completeProjections([balance])
+    );
+    vi.mocked(resolveFinancialIssueAfterReportingCorrectionCommand).mockResolvedValue({
+      id: adminIssueLowId,
+      safeCode: 'correction_rebase_required',
+      impact: 'exception'
+    } as never);
+
+    await expect(recomputeLockedRefundFinancialProjectionForReportingCorrectionCommand(
+      transaction,
+      lockedInput(),
+      [selectedGrossSetId, selectedFeeSetId],
+      adminCommandId
+    )).resolves.toMatchObject({
+      status: 'reconciled',
+      refundId,
+      resolvedIssueIds: [adminIssueLowId]
+    });
+
+    expect(resolveFinancialIssueAfterReportingCorrectionCommand).toHaveBeenCalledWith(
+      transaction,
+      { commandId: adminCommandId, issueId: adminIssueLowId }
+    );
+    expect(resolveFinancialIssueAfterAdminCommand).not.toHaveBeenCalled();
+    expect(resolveFinancialIssueAfterRecompute).not.toHaveBeenCalled();
   });
 
   it('rolls back administrator issue transitions when the unmasked projection is incomplete', async () => {

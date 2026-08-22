@@ -46,6 +46,7 @@ import { PermanentFinancialError, RetryableFinancialError } from '../errors';
 import {
   observeFinancialIssue,
   resolveFinancialIssueAfterAdminCommand,
+  resolveFinancialIssueAfterReportingCorrectionCommand,
   resolveFinancialIssueAfterRecompute
 } from '../issues';
 import {
@@ -193,7 +194,7 @@ interface RefundProjectionVersion {
 
 type RefundProjectionVersionTarget = RefundProjectionVersion & (
   | { readonly mode: 'ordinary' | 'replay' }
-  | { readonly mode: 'admin'; readonly commandId: string }
+  | { readonly mode: 'admin' | 'correction'; readonly commandId: string }
 );
 
 interface PersistedRefundProjectionPlan {
@@ -871,7 +872,8 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
   if (ordinarySelectedSetIds.some((id) => !UUID.test(id)) ||
     new Set(ordinarySelectedSetIds).size !== ordinarySelectedSetIds.length ||
     (target.mode === 'replay' && ordinarySelectedSetIds.length > 0) ||
-    (target.mode === 'admin' && !UUID.test(target.commandId))) {
+    ((target.mode === 'admin' || target.mode === 'correction') &&
+      !UUID.test(target.commandId))) {
     invalidLockedInput();
   }
   const [localState] = await rows(transaction, sql`
@@ -1396,7 +1398,7 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
               });
             }
           }
-        } else if (target.mode === 'admin') {
+        } else if (target.mode === 'admin' || target.mode === 'correction') {
           const allocationSetScope = validatedSelectedSetIds.length === 0
             ? sql`false`
             : sql`(
@@ -1421,9 +1423,11 @@ async function recomputeLockedRefundFinancialProjectionAtVersion(
             order by admin_issue.id
           `));
           for (const issueId of openIssueIds) {
-            const resolved = await resolveFinancialIssueAfterAdminCommand(projectionTx, {
-              commandId: target.commandId,
-              issueId
+            const resolveIssue = target.mode === 'correction'
+              ? resolveFinancialIssueAfterReportingCorrectionCommand
+              : resolveFinancialIssueAfterAdminCommand;
+            const resolved = await resolveIssue(projectionTx, {
+              commandId: target.commandId, issueId
             });
             if (resolved) resolvedProjectionIssues.push({
               id: resolved.id, safeCode: resolved.safeCode, impact: resolved.impact
@@ -1621,6 +1625,21 @@ export async function recomputeLockedRefundFinancialProjectionForAdminCommand(
     allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
     replayId: FINANCIAL_REPLAY_ID,
     mode: 'admin',
+    commandId
+  }, lockedAndRevalidatedOrdinarySelectedSetIds) as Promise<RefundFinancialRecomputeResult>;
+}
+
+export async function recomputeLockedRefundFinancialProjectionForReportingCorrectionCommand(
+  transaction: DatabaseTransaction,
+  input: LockedRefundProjectionInput,
+  lockedAndRevalidatedOrdinarySelectedSetIds: readonly string[],
+  commandId: string
+): Promise<RefundFinancialRecomputeResult> {
+  return recomputeLockedRefundFinancialProjectionAtVersion(transaction, input, {
+    classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+    allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+    replayId: FINANCIAL_REPLAY_ID,
+    mode: 'correction',
     commandId
   }, lockedAndRevalidatedOrdinarySelectedSetIds) as Promise<RefundFinancialRecomputeResult>;
 }
