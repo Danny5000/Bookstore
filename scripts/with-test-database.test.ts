@@ -307,8 +307,8 @@ describe('routine database test harness role separation', () => {
       'utf8'
     );
 
-    expect(databaseSource).toContain(
-      "databaseEnvironmentForRole(process.env, 'worker')"
+    expect(databaseSource).toMatch(
+      /databaseEnvironmentForRole\(\s*process\.env,\s*['"]worker['"]\s*\)/u
     );
     expect(playwrightConfigSource).toContain(
       'assertIsolatedTestDatabaseEnvironment(process.env)'
@@ -316,7 +316,10 @@ describe('routine database test harness role separation', () => {
     expect(databaseSource).toContain('assertIsolatedTestDatabaseEnvironment(process.env)');
     expect(databaseSource).toContain('readonly workerDb: Database');
     expect(databaseSource).toContain('workerDatabase.transaction((transaction) =>');
-    expect(databaseSource).toContain('await Promise.all([client.end(), workerClient.end()])');
+    expect(databaseSource).toContain('const results = await Promise.allSettled(');
+    expect(databaseSource).toMatch(
+      /await closeClients\(\s*\[ownerFixtureClient,\s*workerClient,\s*client\],/u
+    );
     expect(commerceHarnessSource).toContain(
       'createStripeEventHandler(database.workerDb, fixture.gateway'
     );

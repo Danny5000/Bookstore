@@ -33,8 +33,10 @@ describe('process secret scope', () => {
     expect(source('src/lib/server/config/index.ts')).toContain(
       'cachedConfiguration ??= loadWebApplicationConfig(env)'
     );
-    expect(source('src/worker.ts')).toContain(
-      'loadWorkerApplicationConfig(databaseEnvironmentForRole(process.env, \'worker\'))'
+    const workerEntrypoint = source('src/worker.ts');
+    expect(workerEntrypoint).toContain('const rawWorkerEnvironment = process.env;');
+    expect(workerEntrypoint).toMatch(
+      /loadWorkerApplicationConfig\(\s*databaseEnvironmentForRole\(rawWorkerEnvironment,\s*['"]worker['"]\)\s*\)/u
     );
     const migrationEntrypoint = source('src/migrate.ts');
     expect(migrationEntrypoint).toContain(

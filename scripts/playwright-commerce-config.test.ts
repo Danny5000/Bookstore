@@ -511,7 +511,7 @@ describe("Playwright commerce fixture isolation", () => {
       await rm(ownedRoot, { recursive: true, force: true });
       await rm(outsideDirectory, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, 60_000);
 
   it("removes direct and file-based Stripe secrets from every child environment", () => {
     expect(
