@@ -942,3 +942,98 @@ describe('Local payout list and audited detail', () => {
     expect(salesCss).toMatch(/@media\s*\(max-width:\s*700px\)[\s\S]*\.payout-detail-grid/iu);
   });
 });
+
+describe('Sales presentation privacy allowlists', () => {
+  it('renders approved DTO fields while ignoring nested operational and identity canaries', () => {
+    const privateFields = {
+      privateCommandJson: 'private_command_json_canary_15a',
+      idempotencyKey: 'private_idempotency_canary_15a',
+      jobId: 'private_job_id_canary_15a',
+      attempts: 'private_attempt_count_canary_15a',
+      leaseCapability: 'private_lease_capability_canary_15a',
+      capabilityDigest: 'private_capability_digest_canary_15a',
+      claimGeneration: 'private_claim_generation_canary_15a',
+      claimExpiresAt: 'private_claim_expiry_canary_15a',
+      lastError: 'private_last_error_canary_15a',
+      stripeSecret: 'sk_live_private_canary_15a',
+      chargeProviderId: 'ch_private_canary_15a',
+      refundProviderId: 're_private_canary_15a',
+      disputeProviderId: 'dp_private_canary_15a',
+      payoutProviderId: 'po_private_canary_15a',
+      providerBody: 'private_provider_body_canary_15a',
+      claimProof: 'private_claim_proof_canary_15a',
+      authToken: 'private_auth_token_canary_15a',
+      password: 'private_password_canary_15a',
+      resetToken: 'private_reset_token_canary_15a',
+      magicLinkToken: 'private_magic_token_canary_15a',
+      email: 'private-sales-15a@example.test',
+      ipAddress: '198.51.100.115',
+      userAgent: 'private_user_agent_canary_15a',
+      sqlError: 'private_sql_error_canary_15a',
+      stackTrace: 'private_stack_trace_canary_15a',
+      databaseRole: 'private_database_role_canary_15a',
+      filesystemPath: 'C:/private/financial-canary-15a.json'
+    } as const;
+    const taintedIssue = {
+      ...financialIssue({ safeReason: 'Approved issue reason.' }),
+      ...privateFields
+    };
+    const taintedPayout = { ...payoutDetail(), ...privateFields };
+    const artifacts = [
+      render(SalesOverview, {
+        props: {
+          data: {
+            ...overview({
+              rows: [{
+                ...completeRow({ currentTitle: 'Approved sales title' }),
+                ...privateFields
+              }],
+              summaries: [{ ...completeSummary(), ...privateFields }]
+            }),
+            ...privateFields,
+            canExport: false
+          } as never
+        }
+      }).body,
+      render(NeedsReview, {
+        props: {
+          data: {
+            issues: [taintedIssue],
+            currentCursor: null,
+            nextCursor: null,
+            ...privateFields
+          } as never
+        }
+      }).body,
+      render(FinancialIssueDetail, {
+        props: {
+          data: { issue: taintedIssue, currentCursor: null, ...privateFields } as never
+        }
+      }).body,
+      render(Payouts, {
+        props: {
+          data: {
+            payouts: [taintedPayout],
+            currentCursor: null,
+            nextCursor: null,
+            ...privateFields
+          } as never
+        }
+      }).body,
+      render(PayoutDetail, {
+        props: {
+          data: { payout: taintedPayout, currentCursor: null, ...privateFields } as never
+        }
+      }).body
+    ];
+
+    expect(artifacts[0]).toContain('Approved sales title');
+    expect(artifacts[1]).toContain('Approved issue reason.');
+    expect(artifacts[4]).toContain(taintedPayout.payoutId);
+    for (const artifact of artifacts) {
+      for (const privateValue of Object.values(privateFields)) {
+        expect(artifact).not.toContain(privateValue);
+      }
+    }
+  });
+});

@@ -27,11 +27,16 @@ const routeMocks = vi.hoisted(() => ({
   listFinancialIssues: vi.fn(),
   getFinancialIssueDetail: vi.fn(),
   listPayouts: vi.fn(),
-  getPayoutDetail: vi.fn()
+  getPayoutDetail: vi.fn(),
+  getFinancialAdminCommandStatus: vi.fn()
 }));
 
 vi.mock('$lib/server/db/runtime', () => ({
   getDatabaseClient: () => ({ db: routeMocks.database })
+}));
+
+vi.mock('$lib/server/config', () => ({
+  getApplicationConfig: () => ({ origin: 'https://books.example.test' })
 }));
 
 vi.mock('$lib/server/auth/admin-policy', async (importOriginal) => {
@@ -48,15 +53,14 @@ vi.mock('$lib/server/auth/admin-policy', async (importOriginal) => {
       capability: AdminCapability,
       capabilityResolver?: CapabilityResolver
     ): asserts actor is AdministratorActor {
-      if (
-        actor.type === 'user' &&
-        actor.roles.includes('admin') &&
-        ((routeMocks.denySalesReadForAdmin && capability === 'sales.read') ||
-          (routeMocks.denySalesExportForAdmin && capability === 'sales.export'))
-      ) {
-        throw new actual.AuthorizationError('forbidden', 403);
-      }
-      requireActualCapability(actor, capability, capabilityResolver);
+      const baseResolver = capabilityResolver ?? actual.capabilitiesForRoles;
+      const resolver: CapabilityResolver = (roles) => {
+        const capabilities = new Set(baseResolver(roles));
+        if (routeMocks.denySalesReadForAdmin) capabilities.delete('sales.read');
+        if (routeMocks.denySalesExportForAdmin) capabilities.delete('sales.export');
+        return capabilities;
+      };
+      requireActualCapability(actor, capability, resolver);
     }
   };
 });
@@ -88,6 +92,13 @@ vi.mock('$lib/server/commerce/reporting/payouts', async (importOriginal) => {
   };
 });
 
+vi.mock('$lib/server/commerce/financial/admin-commands/repository', async (importOriginal) => ({
+  ...(await importOriginal<
+    typeof import('$lib/server/commerce/financial/admin-commands/repository')
+  >()),
+  getFinancialAdminCommandStatus: routeMocks.getFinancialAdminCommandStatus
+}));
+
 import { load as loadSalesLayout } from './+layout.server';
 import * as overviewRoute from './+page.server';
 import * as exportRoute from './export.csv/+server';
@@ -95,6 +106,7 @@ import * as reviewRoute from './review/+page.server';
 import * as reviewDetailRoute from './review/[issueId]/+page.server';
 import * as payoutsRoute from './payouts/+page.server';
 import * as payoutDetailRoute from './payouts/[payoutId]/+page.server';
+import * as commandStatusRoute from './commands/[commandId]/+server';
 
 const admin: Actor = { type: 'user', id: randomUUID(), roles: ['admin'] };
 const customer: Actor = { type: 'user', id: randomUUID(), roles: ['customer'] };
@@ -185,6 +197,190 @@ function pageEvent(actor: Actor, url: URL | (() => URL)) {
   });
   return event;
 }
+
+const COMMAND_STATUS_ID = '00000000-0000-4000-8000-000000009901';
+
+function trackedSalesEvent(actor: Actor, path: string) {
+  const request = new Request(`https://books.example.test${path}`, {
+    headers: { origin: 'https://books.example.test', 'x-request-id': 'task-15-route-matrix' }
+  });
+  const params = {
+    issueId: issueDetail.issueId,
+    payoutId: payoutDetail.payoutId
+  } as Record<string, string>;
+  const commandId = vi.fn(() => COMMAND_STATUS_ID);
+  Object.defineProperty(params, 'commandId', { enumerable: true, get: commandId });
+  const values = {
+    params,
+    url: new URL(request.url),
+    request,
+    route: { id: path.split('?')[0] ?? null }
+  };
+  const accesses = {
+    params: vi.fn(() => values.params),
+    url: vi.fn(() => values.url),
+    request: vi.fn(() => values.request),
+    route: vi.fn(() => values.route),
+    commandId
+  };
+  const event: Record<string, unknown> = { locals: { actor } };
+  for (const key of Object.keys(accesses) as Array<keyof typeof accesses>) {
+    Object.defineProperty(event, key, { enumerable: true, get: accesses[key] });
+  }
+  return { event, accesses };
+}
+
+async function capturedRouteStatus(operation: () => unknown): Promise<number> {
+  try {
+    const result = await operation();
+    return result instanceof Response ? result.status : 200;
+  } catch (cause: unknown) {
+    return (cause as { status?: number }).status ?? 500;
+  }
+}
+
+const salesReadActorCases = [
+  { actorLabel: 'anonymous visitor', actor: anonymous, denyRead: false, status: 401 },
+  { actorLabel: 'customer', actor: customer, denyRead: false, status: 403 },
+  { actorLabel: 'administrator missing sales.read', actor: admin, denyRead: true, status: 403 },
+  { actorLabel: 'fully authorized administrator', actor: admin, denyRead: false, status: 200 }
+] as const;
+
+describe('complete Task 7–14 Sales capability matrix', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    routeMocks.denySalesReadForAdmin = false;
+    routeMocks.denySalesExportForAdmin = false;
+    routeMocks.listSalesOverview.mockReset().mockResolvedValue(overviewDto);
+    routeMocks.canExportSalesOverview.mockReset().mockReturnValue(true);
+    routeMocks.exportSalesCsv.mockReset().mockResolvedValue({
+      bytes: new TextEncoder().encode('currentTitle\r\nSafe title\r\n'),
+      filename: 'sales.csv',
+      rowCount: 1
+    });
+    routeMocks.listFinancialIssues.mockReset().mockResolvedValue(reviewDto);
+    routeMocks.getFinancialIssueDetail.mockReset().mockResolvedValue(issueDetail);
+    routeMocks.listPayouts.mockReset().mockResolvedValue(payoutDto);
+    routeMocks.getPayoutDetail.mockReset().mockResolvedValue(payoutDetail);
+    routeMocks.getFinancialAdminCommandStatus.mockReset().mockResolvedValue({
+      commandId: COMMAND_STATUS_ID,
+      kind: 'refund_draft_save',
+      status: 'pending',
+      resultCode: null,
+      result: null,
+      createdAt: '2026-08-22T12:00:00.000Z',
+      updatedAt: '2026-08-22T12:00:00.000Z',
+      completedAt: null
+    });
+  });
+
+  it.each(salesReadActorCases)(
+    'applies sales.read to the Sales layout for $actorLabel',
+    async ({ actor, denyRead, status }) => {
+      routeMocks.denySalesReadForAdmin = denyRead;
+      expect(await capturedRouteStatus(() => loadSalesLayout({ locals: { actor } } as never)))
+        .toBe(status);
+    }
+  );
+
+  const readSurfaces = [
+    {
+      surface: 'Sales overview loader',
+      path: '/admin/sales',
+      invoke: (event: Record<string, unknown>) => overviewRoute.load(event as never),
+      service: routeMocks.listSalesOverview
+    },
+    {
+      surface: 'issue list loader',
+      path: '/admin/sales/review',
+      invoke: (event: Record<string, unknown>) => reviewRoute.load(event as never),
+      service: routeMocks.listFinancialIssues
+    },
+    {
+      surface: 'issue detail loader',
+      path: `/admin/sales/review/${issueDetail.issueId}`,
+      invoke: (event: Record<string, unknown>) => reviewDetailRoute.load(event as never),
+      service: routeMocks.getFinancialIssueDetail
+    },
+    {
+      surface: 'payout list loader',
+      path: '/admin/sales/payouts',
+      invoke: (event: Record<string, unknown>) => payoutsRoute.load(event as never),
+      service: routeMocks.listPayouts
+    },
+    {
+      surface: 'payout detail loader',
+      path: `/admin/sales/payouts/${payoutDetail.payoutId}`,
+      invoke: (event: Record<string, unknown>) => payoutDetailRoute.load(event as never),
+      service: routeMocks.getPayoutDetail
+    },
+    {
+      surface: 'command status endpoint',
+      path: `/admin/sales/commands/${COMMAND_STATUS_ID}`,
+      invoke: (event: Record<string, unknown>) => commandStatusRoute.GET(event as never),
+      service: routeMocks.getFinancialAdminCommandStatus
+    }
+  ] as const;
+
+  it.each(readSurfaces.flatMap((surface) =>
+    salesReadActorCases.map((actorCase) => ({ ...surface, ...actorCase }))))(
+    'applies sales.read to $surface for $actorLabel before parsing request state',
+    async ({ actor, denyRead, status, path, invoke, service }) => {
+      routeMocks.denySalesReadForAdmin = denyRead;
+      const { event, accesses } = trackedSalesEvent(actor, path);
+
+      expect(await capturedRouteStatus(() => invoke(event))).toBe(status);
+
+      if (status === 200) {
+        expect(Object.values(accesses).some((access) => access.mock.calls.length > 0)).toBe(true);
+        expect(service).toHaveBeenCalledOnce();
+      } else if (path.includes('/commands/')) {
+        expect(accesses.commandId).not.toHaveBeenCalled();
+        expect(service).not.toHaveBeenCalled();
+      } else {
+        for (const access of Object.values(accesses)) expect(access).not.toHaveBeenCalled();
+        expect(service).not.toHaveBeenCalled();
+      }
+    }
+  );
+
+  it.each([
+    { actorLabel: 'anonymous visitor', actor: anonymous, denied: 'none', status: 401 },
+    { actorLabel: 'customer', actor: customer, denied: 'none', status: 403 },
+    {
+      actorLabel: 'administrator missing sales.read',
+      actor: admin,
+      denied: 'sales.read',
+      status: 403
+    },
+    {
+      actorLabel: 'administrator missing sales.export',
+      actor: admin,
+      denied: 'sales.export',
+      status: 403
+    },
+    { actorLabel: 'fully authorized administrator', actor: admin, denied: 'none', status: 200 }
+  ] as const)(
+    'applies both CSV capabilities for $actorLabel before parsing filters or audit context',
+    async ({ actor, denied, status }) => {
+      routeMocks.denySalesReadForAdmin = denied === 'sales.read';
+      routeMocks.denySalesExportForAdmin = denied === 'sales.export';
+      const { event, accesses } = trackedSalesEvent(actor, '/admin/sales/export.csv');
+
+      expect(await capturedRouteStatus(() => exportRoute.GET(event as never))).toBe(status);
+
+      if (status === 200) {
+        for (const access of [accesses.url, accesses.request, accesses.route]) {
+          expect(access).toHaveBeenCalled();
+        }
+        expect(routeMocks.exportSalesCsv).toHaveBeenCalledOnce();
+      } else {
+        for (const access of Object.values(accesses)) expect(access).not.toHaveBeenCalled();
+        expect(routeMocks.exportSalesCsv).not.toHaveBeenCalled();
+      }
+    }
+  );
+});
 
 describe('Sales route authorization', () => {
   beforeEach(() => {

@@ -109,6 +109,64 @@ describe('process secret scope', () => {
     expect(worker).toMatch(/^\s+- smtp_password\s*$/mu);
   });
 
+  it('keeps the production web and financial worker database credentials mutually isolated', () => {
+    const compose = source('compose.prod.yaml');
+    const app = serviceBlock(compose, 'app');
+    const worker = serviceBlock(compose, 'worker');
+    const appEnvironment = environmentKeys(app);
+    const workerEnvironment = environmentKeys(worker);
+
+    expect(appEnvironment).toContain('DATABASE_USER');
+    expect(appEnvironment).toContain('DATABASE_PASSWORD_FILE');
+    expect(appEnvironment).not.toContain('DATABASE_WORKER_USER');
+    expect(appEnvironment).not.toContain('DATABASE_WORKER_PASSWORD_FILE');
+    expect(secretNames(app)).toContain('database_password');
+    expect(secretNames(app)).not.toContain('database_worker_password');
+
+    expect(workerEnvironment).toContain('DATABASE_WORKER_USER');
+    expect(workerEnvironment).toContain('DATABASE_WORKER_PASSWORD_FILE');
+    expect(workerEnvironment).not.toContain('DATABASE_USER');
+    expect(workerEnvironment).not.toContain('DATABASE_PASSWORD_FILE');
+    expect(secretNames(worker)).toContain('database_worker_password');
+    expect(secretNames(worker)).not.toContain('database_password');
+
+    for (const block of [app, worker]) {
+      expect(block).not.toContain('DATABASE_OWNER_');
+      expect(block).not.toContain('DATABASE_STORAGE_CLEANUP_');
+    }
+  });
+
+  it('never promotes the financial-admin lease bearer into configuration or diagnostic output', () => {
+    const configurationSources = [
+      '.env.example',
+      'compose.prod.yaml',
+      'compose.dev.yaml',
+      'src/lib/server/config/index.ts',
+      'src/lib/server/config/load.ts',
+      'src/lib/server/config/schema.ts'
+    ].map(source);
+    for (const configuration of configurationSources) {
+      expect(configuration).not.toMatch(
+        /FINANCIAL_ADMIN[^\n]*(?:CAPABILITY|DIGEST|GENERATION|EXPIR)/iu
+      );
+    }
+
+    const diagnosticCalls = [
+      ...source('src/worker.ts').matchAll(
+        /console\.(?:log|info|warn|error)\s*\([\s\S]*?\);/gu
+      ),
+      ...source('src/lib/server/jobs/runner.ts').matchAll(
+        /console\.(?:log|info|warn|error)\s*\([\s\S]*?\);/gu
+      )
+    ].map((match) => match[0]);
+    expect(diagnosticCalls.length).toBeGreaterThan(0);
+    for (const diagnostic of diagnosticCalls) {
+      expect(diagnostic).not.toMatch(
+        /financialAdminLeaseCapability|capabilityDigest|last_error|lastError|\.message|\.stack|workerReadyFile|process\.env/iu
+      );
+    }
+  });
+
   it('gives migration only database settings and bootstrap only database plus bootstrap input', () => {
     const compose = source('compose.prod.yaml');
     const migrate = serviceBlock(compose, 'migrate');

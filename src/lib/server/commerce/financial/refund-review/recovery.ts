@@ -12,9 +12,10 @@ import { parseFinancialAdminPrivateCommand, type FinancialAdminPrivateCommand } 
 import {
   FinancialAdminConflictError,
   FinancialAdminDeniedError,
-  FinancialAdminPermanentError,
-  type FinancialAdminCommandExecutorContext
-} from '$lib/server/commerce/financial/admin-commands/handler';
+  FinancialAdminPermanentError
+} from '$lib/server/commerce/financial/admin-commands/errors';
+import type { FinancialAdminCommandExecutorContext } from
+  '$lib/server/commerce/financial/admin-commands/handler';
 import {
   assertGrantTransitionAllowed,
   projectEffectiveEntitlement

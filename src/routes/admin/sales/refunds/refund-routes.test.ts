@@ -71,27 +71,29 @@ vi.mock('$lib/server/auth/admin-policy', async (importOriginal) => {
       capability: AdminCapability,
       resolver?: CapabilityResolver
     ): asserts actor is AdministratorActor {
-      if (
-        actor.type === 'user' &&
-        actor.roles.includes('admin') && (
-          (routeMocks.denyRead && capability === 'sales.read') ||
-          (routeMocks.denyManage && capability === 'reconciliation.manage')
-        )
-      ) {
-        throw new actual.AuthorizationError('forbidden', 403);
-      }
-      original(actor, capability, resolver);
+      const baseResolver = resolver ?? actual.capabilitiesForRoles;
+      const capabilityResolver: CapabilityResolver = (roles) => {
+        const capabilities = new Set(baseResolver(roles));
+        if (routeMocks.denyRead) capabilities.delete('sales.read');
+        if (routeMocks.denyManage) capabilities.delete('reconciliation.manage');
+        return capabilities;
+      };
+      original(actor, capability, capabilityResolver);
     }
   };
 });
 
 import * as refundRoute from './[refundId]/+page.server';
 import { FinancialAdminCommandSubmissionConflictError } from '$lib/server/commerce/financial/admin-commands/repository';
-import { FinancialAdminConflictError } from '$lib/server/commerce/financial/admin-commands/handler';
+import { FinancialAdminConflictError } from '$lib/server/commerce/financial/admin-commands/errors';
 
 const ADMIN: Actor = {
   type: 'user', id: '00000000-0000-4000-8000-000000011301', roles: ['admin']
 };
+const CUSTOMER: Actor = {
+  type: 'user', id: '00000000-0000-4000-8000-000000011300', roles: ['customer']
+};
+const ANONYMOUS: Actor = { type: 'anonymous' };
 const REFUND_ID = '00000000-0000-4000-8000-000000011302';
 const ITEM_ID = '00000000-0000-4000-8000-000000011303';
 const COMMAND_ID = '00000000-0000-4000-8000-000000011304';
@@ -315,6 +317,152 @@ function actionEvent(actor: Actor, request: Request, action = 'saveDraft') {
   };
 }
 
+const refundActionInputs = {
+  saveDraft: [
+    ['idempotencyKey', IDEMPOTENCY_KEY],
+    ['expectedVersion', ''],
+    ['orderItemId', ITEM_ID],
+    ['totalPresentmentMinor', '500']
+  ],
+  discardDraft: [
+    ['idempotencyKey', IDEMPOTENCY_KEY],
+    ['expectedActiveDraftVersion', '2']
+  ],
+  prepareFinalize: [['expectedActiveDraftVersion', '2']],
+  confirmFinalize: [
+    ['idempotencyKey', IDEMPOTENCY_KEY],
+    ['expectedActiveDraftVersion', '2'],
+    ['previewFingerprint', PREVIEW_FINGERPRINT],
+    ['confirmation', 'finalize_refund_allocation']
+  ],
+  prepareCorrection: [
+    ['reason', 'allocation_attribution_correction'],
+    ['expectedNextCorrectionVersion', '2'],
+    ['expectedBaseAllocationSetId', BASE_ALLOCATION_SET_ID],
+    ['expectedSourceFingerprint', SOURCE_FINGERPRINT],
+    ['orderItemId', ITEM_ID],
+    ['totalPresentmentMinor', '500']
+  ],
+  confirmCorrection: [
+    ['idempotencyKey', IDEMPOTENCY_KEY],
+    ['reason', 'allocation_attribution_correction'],
+    ['expectedNextCorrectionVersion', '2'],
+    ['expectedBaseAllocationSetId', BASE_ALLOCATION_SET_ID],
+    ['expectedSourceFingerprint', SOURCE_FINGERPRINT],
+    ['orderItemId', ITEM_ID],
+    ['totalPresentmentMinor', '500'],
+    ['previewFingerprint', PREVIEW_FINGERPRINT],
+    ['confirmation', 'create_reporting_correction']
+  ],
+  prepareRecoveryActivation: [
+    ['finalizationEffectId', FINALIZATION_EFFECT_ID],
+    ['orderItemId', ITEM_ID],
+    ['expectedCorrectionSetId', CORRECTION_SET_ID],
+    ['expectedCorrectionVersion', '2'],
+    ['expectedSourceFingerprint', SOURCE_FINGERPRINT]
+  ],
+  confirmRecoveryActivation: [
+    ['idempotencyKey', IDEMPOTENCY_KEY],
+    ['finalizationEffectId', FINALIZATION_EFFECT_ID],
+    ['orderItemId', ITEM_ID],
+    ['expectedCorrectionSetId', CORRECTION_SET_ID],
+    ['expectedCorrectionVersion', '2'],
+    ['expectedSourceFingerprint', SOURCE_FINGERPRINT],
+    ['previewFingerprint', PREVIEW_FINGERPRINT],
+    ['confirmation', 'activate_persistent_recovery']
+  ],
+  prepareRecoveryDeactivation: [
+    ['recoveryGrantId', RECOVERY_GRANT_ID],
+    ['recoveryReferenceId', RECOVERY_REFERENCE_ID],
+    ['expectedStateChangedAt', EXPECTED_STATE_CHANGED_AT]
+  ],
+  confirmRecoveryDeactivation: [
+    ['idempotencyKey', IDEMPOTENCY_KEY],
+    ['recoveryGrantId', RECOVERY_GRANT_ID],
+    ['recoveryReferenceId', RECOVERY_REFERENCE_ID],
+    ['expectedStateChangedAt', EXPECTED_STATE_CHANGED_AT],
+    ['confirmation', 'deactivate_persistent_recovery']
+  ]
+} as const;
+
+type RefundActionName = keyof typeof refundActionInputs;
+
+function trackedRefundActionEvent(actor: Actor, action: RefundActionName) {
+  const request = urlencoded(refundActionInputs[action]);
+  const body = vi.spyOn(request, 'body', 'get');
+  const values = {
+    params: { refundId: REFUND_ID },
+    url: new URL(`${request.url}?reviewCursor=${REVIEW_CURSOR}&/${action}`),
+    request,
+    route: { id: '/admin/sales/refunds/[refundId]' }
+  };
+  const accesses = {
+    params: vi.fn(() => values.params),
+    url: vi.fn(() => values.url),
+    request: vi.fn(() => values.request),
+    route: vi.fn(() => values.route)
+  };
+  const event: Record<string, unknown> = { locals: { actor } };
+  for (const key of Object.keys(accesses) as Array<keyof typeof accesses>) {
+    Object.defineProperty(event, key, { enumerable: true, get: accesses[key] });
+  }
+  return { event, accesses, body };
+}
+
+function trackedRefundLoadEvent(actor: Actor) {
+  const request = new Request(
+    `https://books.example.test/admin/sales/refunds/${REFUND_ID}?reviewCursor=${REVIEW_CURSOR}`,
+    { headers: { 'x-request-id': 'task-15-refund-loader' } }
+  );
+  const values = {
+    params: { refundId: REFUND_ID },
+    url: new URL(request.url),
+    request,
+    route: { id: '/admin/sales/refunds/[refundId]' }
+  };
+  const accesses = {
+    params: vi.fn(() => values.params),
+    url: vi.fn(() => values.url),
+    request: vi.fn(() => values.request),
+    route: vi.fn(() => values.route)
+  };
+  const event: Record<string, unknown> = { locals: { actor } };
+  for (const key of Object.keys(accesses) as Array<keyof typeof accesses>) {
+    Object.defineProperty(event, key, { enumerable: true, get: accesses[key] });
+  }
+  return { event, accesses };
+}
+
+async function captureRefundRouteResult(operation: () => unknown) {
+  try {
+    return { status: 200, value: await operation() };
+  } catch (cause: unknown) {
+    return { status: (cause as { status?: number }).status ?? 500, value: cause };
+  }
+}
+
+const refundActionActorCases = [
+  {
+    actorLabel: 'anonymous visitor', actor: ANONYMOUS, denied: 'none', status: 401
+  },
+  { actorLabel: 'customer', actor: CUSTOMER, denied: 'none', status: 403 },
+  {
+    actorLabel: 'administrator missing sales.read',
+    actor: ADMIN,
+    denied: 'sales.read',
+    status: 403
+  },
+  {
+    actorLabel: 'administrator missing reconciliation.manage',
+    actor: ADMIN,
+    denied: 'reconciliation.manage',
+    status: 403
+  },
+  {
+    actorLabel: 'fully authorized administrator', actor: ADMIN, denied: 'none', status: 200
+  }
+] as const;
+
 describe('refund review loader and async command routes', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -343,45 +491,122 @@ describe('refund review loader and async command routes', () => {
     });
   });
 
-  it('requires both capabilities before touching path, URL, request, or domain services', async () => {
-    for (const actor of [{ type: 'anonymous' } as const, ADMIN]) {
-      routeMocks.denyManage = actor === ADMIN;
-      const accesses = {
-        params: vi.fn(), url: vi.fn(), request: vi.fn(), route: vi.fn()
-      };
-      const event: Record<string, unknown> = { locals: { actor } };
-      for (const key of Object.keys(accesses) as Array<keyof typeof accesses>) {
-        Object.defineProperty(event, key, { enumerable: true, get: accesses[key] });
-      }
-
-      await expect(refundRoute.load(event as never)).rejects.toMatchObject({
-        status: actor === ADMIN ? 403 : 401
-      });
-      for (const access of Object.values(accesses)) expect(access).not.toHaveBeenCalled();
-    }
-    expect(routeMocks.getDetail).not.toHaveBeenCalled();
-  });
-
   it.each([
-    ['sales.read', 'denyRead'],
-    ['reconciliation.manage', 'denyManage']
+    {
+      actorLabel: 'anonymous visitor',
+      actor: ANONYMOUS,
+      denied: 'none',
+      status: 401,
+      canManageReconciliation: null
+    },
+    {
+      actorLabel: 'customer',
+      actor: CUSTOMER,
+      denied: 'none',
+      status: 403,
+      canManageReconciliation: null
+    },
+    {
+      actorLabel: 'administrator missing sales.read',
+      actor: ADMIN,
+      denied: 'sales.read',
+      status: 403,
+      canManageReconciliation: null
+    },
+    {
+      actorLabel: 'sales.read-only administrator',
+      actor: ADMIN,
+      denied: 'reconciliation.manage',
+      status: 200,
+      canManageReconciliation: false
+    },
+    {
+      actorLabel: 'fully authorized administrator',
+      actor: ADMIN,
+      denied: 'none',
+      status: 200,
+      canManageReconciliation: true
+    }
   ] as const)(
-    'requires %s before the loader reads an identifier or invokes either service',
-    async (_capability, deniedFlag) => {
-      routeMocks[deniedFlag] = true;
-      const accesses = {
-        params: vi.fn(), url: vi.fn(), request: vi.fn(), route: vi.fn()
-      };
-      const event: Record<string, unknown> = { locals: { actor: ADMIN } };
-      for (const key of Object.keys(accesses) as Array<keyof typeof accesses>) {
-        Object.defineProperty(event, key, { enumerable: true, get: accesses[key] });
+    'applies the refund-detail sales.read policy for $actorLabel before parsing',
+    async ({ actor, denied, status, canManageReconciliation }) => {
+      routeMocks.denyRead = denied === 'sales.read';
+      routeMocks.denyManage = denied === 'reconciliation.manage';
+      const { event, accesses } = trackedRefundLoadEvent(actor);
+
+      const result = await captureRefundRouteResult(() => refundRoute.load(event as never));
+
+      expect(result.status).toBe(status);
+      if (status !== 200) {
+        for (const access of Object.values(accesses)) expect(access).not.toHaveBeenCalled();
+        expect(routeMocks.getDetail).not.toHaveBeenCalled();
+        expect(routeMocks.getCorrectionSeed).not.toHaveBeenCalled();
+        expect(routeMocks.getRecoverySeed).not.toHaveBeenCalled();
+        return;
       }
 
-      await expect(refundRoute.load(event as never)).rejects.toMatchObject({ status: 403 });
-      for (const access of Object.values(accesses)) expect(access).not.toHaveBeenCalled();
-      expect(routeMocks.getDetail).not.toHaveBeenCalled();
-      expect(routeMocks.getCorrectionSeed).not.toHaveBeenCalled();
-      expect(routeMocks.getRecoverySeed).not.toHaveBeenCalled();
+      for (const access of Object.values(accesses)) expect(access).toHaveBeenCalled();
+      expect(routeMocks.getDetail).toHaveBeenCalledOnce();
+      expect(result.value).toMatchObject({ detail, canManageReconciliation });
+      if (canManageReconciliation) {
+        expect(routeMocks.getCorrectionSeed).toHaveBeenCalledOnce();
+        expect(routeMocks.getRecoverySeed).toHaveBeenCalledOnce();
+      } else {
+        expect(routeMocks.getCorrectionSeed).not.toHaveBeenCalled();
+        expect(routeMocks.getRecoverySeed).not.toHaveBeenCalled();
+        expect(result.value).toMatchObject({
+          reportingCorrectionSeed: null,
+          administrativeRecoverySeed: null,
+          saveDraftIdempotencyKey: null,
+          discardDraftIdempotencyKey: null,
+          finalizeIdempotencyKey: null,
+          correctionIdempotencyKey: null,
+          recoveryActivationIdempotencyKey: null,
+          recoveryDeactivationIdempotencyKey: null
+        });
+      }
+    }
+  );
+
+  it.each((Object.keys(refundActionInputs) as RefundActionName[]).flatMap((action) =>
+    refundActionActorCases.map((actorCase) => ({ action, ...actorCase }))))(
+    'applies both mutation capabilities to $action for $actorLabel before parsing',
+    async ({ action, actor, denied, status }) => {
+      routeMocks.denyRead = denied === 'sales.read';
+      routeMocks.denyManage = denied === 'reconciliation.manage';
+      const { event, accesses, body } = trackedRefundActionEvent(actor, action);
+      const handler = refundRoute.actions[action];
+      expect(handler).toBeTypeOf('function');
+
+      const result = await handler!(event as never);
+      const actualStatus = result !== null && typeof result === 'object' && 'status' in result
+        ? result.status
+        : 200;
+
+      expect(actualStatus).toBe(status);
+      if (status !== 200) {
+        for (const access of Object.values(accesses)) expect(access).not.toHaveBeenCalled();
+        expect(body).not.toHaveBeenCalled();
+        expect(routeMocks.preview).not.toHaveBeenCalled();
+        expect(routeMocks.previewCorrection).not.toHaveBeenCalled();
+        expect(routeMocks.previewRecoveryActivation).not.toHaveBeenCalled();
+        expect(routeMocks.previewRecoveryDeactivation).not.toHaveBeenCalled();
+        expect(routeMocks.submit).not.toHaveBeenCalled();
+        return;
+      }
+
+      for (const access of Object.values(accesses)) expect(access).toHaveBeenCalled();
+      expect(body).toHaveBeenCalled();
+      const expectedService = action === 'prepareFinalize'
+        ? routeMocks.preview
+        : action === 'prepareCorrection'
+          ? routeMocks.previewCorrection
+          : action === 'prepareRecoveryActivation'
+            ? routeMocks.previewRecoveryActivation
+            : action === 'prepareRecoveryDeactivation'
+              ? routeMocks.previewRecoveryDeactivation
+              : routeMocks.submit;
+      expect(expectedService).toHaveBeenCalledOnce();
     }
   );
 

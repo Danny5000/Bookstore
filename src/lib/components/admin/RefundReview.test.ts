@@ -12,6 +12,7 @@ import type {
   RefundReportingCorrectionPreviewDto,
   RefundReportingCorrectionSeedDto
 } from '$lib/types/financial-reporting';
+import type { PageData as RefundReviewPageData } from '../../../routes/admin/sales/refunds/[refundId]/$types';
 
 vi.mock('$app/navigation', () => ({ invalidateAll: vi.fn() }));
 vi.mock('$app/paths', () => ({ resolve: (path: string) => path }));
@@ -923,10 +924,93 @@ describe('safe financial command outcome and polling', () => {
 });
 
 describe('refund review page', () => {
+  it('keeps sales.read-only detail visible without rendering reconciliation controls', () => {
+    const body = render(RefundReviewPage, {
+      props: {
+        data: {
+          detail: detail(),
+          reviewCursor: null,
+          canManageReconciliation: false,
+          saveDraftIdempotencyKey: SAVE_KEY,
+          discardDraftIdempotencyKey: DISCARD_KEY,
+          finalizeIdempotencyKey: FINALIZE_KEY,
+          reportingCorrectionSeed: correctionSeed(),
+          correctionIdempotencyKey: CORRECTION_KEY,
+          administrativeRecoverySeed: recoverySeed(),
+          recoveryActivationIdempotencyKey: RECOVERY_ACTIVATION_KEY,
+          recoveryDeactivationIdempotencyKey: RECOVERY_DEACTIVATION_KEY
+        }
+      } as never
+    }).body;
+
+    expect(body).toContain('Refund allocation review');
+    expect(body).toContain('First title');
+    expect(body).toContain('Second title');
+    expect(body).not.toContain('<form');
+    expect(body).not.toContain('Save shared draft');
+    expect(body).not.toContain('Prepare finalization');
+    expect(body).not.toContain('Prepare reporting correction');
+    expect(body).not.toContain('Prepare recovery');
+    for (const privateFormIdentity of [
+      SAVE_KEY,
+      DISCARD_KEY,
+      FINALIZE_KEY,
+      CORRECTION_KEY,
+      RECOVERY_ACTIVATION_KEY,
+      RECOVERY_DEACTIVATION_KEY
+    ]) {
+      expect(body).not.toContain(privateFormIdentity);
+    }
+  });
+
+  it('fails closed when casted PageData omits or undefines the reconciliation capability', () => {
+    const mutationBearingData = {
+      detail: detail(),
+      reviewCursor: null,
+      saveDraftIdempotencyKey: SAVE_KEY,
+      discardDraftIdempotencyKey: DISCARD_KEY,
+      finalizeIdempotencyKey: FINALIZE_KEY,
+      reportingCorrectionSeed: correctionSeed(),
+      correctionIdempotencyKey: CORRECTION_KEY,
+      administrativeRecoverySeed: recoverySeed(),
+      recoveryActivationIdempotencyKey: RECOVERY_ACTIVATION_KEY,
+      recoveryDeactivationIdempotencyKey: RECOVERY_DEACTIVATION_KEY
+    };
+    const missingCapability = mutationBearingData as unknown as RefundReviewPageData;
+    const undefinedCapability = {
+      ...mutationBearingData,
+      canManageReconciliation: undefined
+    } as unknown as RefundReviewPageData;
+
+    for (const pageData of [missingCapability, undefinedCapability]) {
+      const body = render(RefundReviewPage, {
+        props: { data: pageData }
+      } as never).body;
+
+      expect(body).toContain('Refund allocation review');
+      expect(body).not.toContain('<form');
+      expect(body).not.toContain('Save shared draft');
+      expect(body).not.toContain('Prepare finalization');
+      expect(body).not.toContain('Prepare reporting correction');
+      expect(body).not.toContain('Prepare recovery');
+      for (const privateFormIdentity of [
+        SAVE_KEY,
+        DISCARD_KEY,
+        FINALIZE_KEY,
+        CORRECTION_KEY,
+        RECOVERY_ACTIVATION_KEY,
+        RECOVERY_DEACTIVATION_KEY
+      ]) {
+        expect(body).not.toContain(privateFormIdentity);
+      }
+    }
+  });
+
   it('renders safe facts, shared editor, back context, and action outcome without private data', () => {
     const body = render(RefundReviewPage, {
       props: {
         data: {
+          canManageReconciliation: true,
           detail: detail(),
           reviewCursor: 'bounded_cursor',
           saveDraftIdempotencyKey: SAVE_KEY,
@@ -981,6 +1065,7 @@ describe('refund review page', () => {
     const body = render(RefundReviewPage, {
       props: {
         data: {
+          canManageReconciliation: true,
           detail: detail(),
           reviewCursor: 'bounded_cursor',
           saveDraftIdempotencyKey: SAVE_KEY,
@@ -1008,6 +1093,7 @@ describe('refund review page', () => {
     const body = render(RefundReviewPage, {
       props: {
         data: {
+          canManageReconciliation: true,
           detail: detail(),
           reviewCursor: 'bounded_cursor',
           saveDraftIdempotencyKey: SAVE_KEY,
@@ -1069,6 +1155,7 @@ describe('refund review page', () => {
     const body = render(RefundReviewPage, {
       props: {
         data: {
+          canManageReconciliation: true,
           detail: detail({ allocationStatus: 'finalized', draft: null }),
           reportingCorrectionSeed: correctionSeed(),
           reviewCursor: 'bounded_cursor',
@@ -1098,6 +1185,7 @@ describe('refund review page', () => {
     const body = render(RefundReviewPage, {
       props: {
         data: {
+          canManageReconciliation: true,
           detail: detail({ allocationStatus: 'finalized', draft: null }),
           reportingCorrectionSeed: correctionSeed(),
           administrativeRecoverySeed: recoverySeed(),
@@ -1133,6 +1221,7 @@ describe('refund review page', () => {
     const body = render(RefundReviewPage, {
       props: {
         data: {
+          canManageReconciliation: true,
           detail: detail({ allocationStatus: 'finalized', draft: null }),
           reportingCorrectionSeed: correctionSeed(),
           administrativeRecoverySeed: recoverySeed(),
@@ -1167,6 +1256,7 @@ describe('refund review page', () => {
     const body = render(RefundReviewPage, {
       props: {
         data: {
+          canManageReconciliation: true,
           detail: detail(),
           reviewCursor: null,
           saveDraftIdempotencyKey: SAVE_KEY,
@@ -1195,6 +1285,7 @@ describe('refund review page', () => {
     const body = render(RefundReviewPage, {
       props: {
         data: {
+          canManageReconciliation: true,
           detail: detail(),
           reviewCursor: 'bounded_cursor',
           saveDraftIdempotencyKey: SAVE_KEY,
@@ -1235,6 +1326,7 @@ describe('refund review page', () => {
     const body = render(RefundReviewPage, {
       props: {
         data: {
+          canManageReconciliation: true,
           detail: detail(),
           reviewCursor: 'bounded_cursor',
           saveDraftIdempotencyKey: SAVE_KEY,
@@ -1279,6 +1371,7 @@ describe('refund review page', () => {
     const body = render(RefundReviewPage, {
       props: {
         data: {
+          canManageReconciliation: true,
           detail: detail({ allocationStatus: 'finalized', draft: null }),
           reportingCorrectionSeed: correctionSeed(),
           reviewCursor: 'bounded_cursor',
@@ -1379,6 +1472,7 @@ describe('refund review page', () => {
     const body = render(RefundReviewPage, {
       props: {
         data: {
+          canManageReconciliation: true,
           detail: detail({ allocationStatus: 'finalized', draft: null }),
           reportingCorrectionSeed: correctionSeed(),
           administrativeRecoverySeed: recoverySeed(),
@@ -1443,5 +1537,102 @@ describe('refund review page', () => {
       'utf8'
     );
     expect(pageSource).not.toMatch(/requestSubmit|\.submit\(|fetch\(|use:enhance/iu);
+  });
+});
+
+describe('refund presentation privacy allowlists', () => {
+  it('ignores private route, command, job, provider, identity, and operational values', () => {
+    const privateFields = {
+      privateCommandJson: 'private_command_json_canary_15b',
+      persistedIdempotencyKey: 'private_idempotency_canary_15b',
+      jobId: 'private_job_id_canary_15b',
+      attempts: 'private_attempt_count_canary_15b',
+      leaseCapability: 'private_lease_capability_canary_15b',
+      capabilityDigest: 'private_capability_digest_canary_15b',
+      claimGeneration: 'private_claim_generation_canary_15b',
+      claimExpiresAt: 'private_claim_expiry_canary_15b',
+      lastError: 'private_last_error_canary_15b',
+      stripeSecret: 'sk_live_private_canary_15b',
+      chargeProviderId: 'ch_private_canary_15b',
+      refundProviderId: 're_private_canary_15b',
+      disputeProviderId: 'dp_private_canary_15b',
+      payoutProviderId: 'po_private_canary_15b',
+      providerBody: 'private_provider_body_canary_15b',
+      claimProof: 'private_claim_proof_canary_15b',
+      authToken: 'private_auth_token_canary_15b',
+      password: 'private_password_canary_15b',
+      resetToken: 'private_reset_token_canary_15b',
+      magicLinkToken: 'private_magic_token_canary_15b',
+      email: 'private-refund-15b@example.test',
+      ipAddress: '198.51.100.116',
+      userAgent: 'private_user_agent_canary_15b',
+      sqlError: 'private_sql_error_canary_15b',
+      stackTrace: 'private_stack_trace_canary_15b',
+      databaseRole: 'private_database_role_canary_15b',
+      filesystemPath: 'C:/private/financial-canary-15b.json'
+    } as const;
+    const safeDetail = detail();
+    const taintedDetail = {
+      ...safeDetail,
+      items: safeDetail.items.map((item) => ({ ...item, ...privateFields })),
+      ...privateFields
+    };
+    const safeCorrectionSeed = correctionSeed();
+    const taintedCorrectionSeed = {
+      ...safeCorrectionSeed,
+      items: safeCorrectionSeed.items.map((item) => ({ ...item, ...privateFields })),
+      ...privateFields
+    };
+    const safeRecoverySeed = recoverySeed();
+    const taintedRecoverySeed = {
+      ...safeRecoverySeed,
+      activationCandidates: safeRecoverySeed.activationCandidates.map((candidate) => ({
+        ...candidate,
+        ...privateFields
+      })),
+      deactivationCandidates: safeRecoverySeed.deactivationCandidates.map((candidate) => ({
+        ...candidate,
+        ...privateFields
+      })),
+      ...privateFields
+    };
+    const editorBody = render(RefundReviewPage, {
+      props: {
+        data: {
+          detail: taintedDetail,
+          reviewCursor: null,
+          canManageReconciliation: true,
+          saveDraftIdempotencyKey: SAVE_KEY,
+          discardDraftIdempotencyKey: DISCARD_KEY,
+          finalizeIdempotencyKey: FINALIZE_KEY,
+          reportingCorrectionSeed: taintedCorrectionSeed,
+          correctionIdempotencyKey: CORRECTION_KEY,
+          administrativeRecoverySeed: taintedRecoverySeed,
+          recoveryActivationIdempotencyKey: RECOVERY_ACTIVATION_KEY,
+          recoveryDeactivationIdempotencyKey: RECOVERY_DEACTIVATION_KEY,
+          ...privateFields
+        }
+      } as never
+    }).body;
+    const statusBody = render(FinancialCommandStatus, {
+      props: {
+        command: {
+          ...command({ status: 'succeeded' }),
+          updatedAt: '2026-08-22T12:05:00.000Z',
+          resultCode: 'draft_saved',
+          result: { refundId: REFUND_ID, draftVersion: 2, changed: true },
+          completedAt: '2026-08-22T12:05:00.000Z',
+          ...privateFields
+        } as FinancialAdminCommandStatusDto
+      }
+    }).body;
+
+    expect(editorBody).toContain('First title');
+    expect(statusBody).toContain('Succeeded');
+    for (const artifact of [editorBody, statusBody]) {
+      for (const privateValue of Object.values(privateFields)) {
+        expect(artifact).not.toContain(privateValue);
+      }
+    }
   });
 });

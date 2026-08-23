@@ -149,12 +149,12 @@ export async function submitFinancialAdminCommand(
   input: SubmitFinancialAdminCommandInput,
   dependencies: FinancialAuthorizationDependencies = {}
 ): Promise<FinancialAdminCommandReferenceDto> {
-  const idempotencyKey = canonicalUuidSchema.parse(input.idempotencyKey);
   const kind = commandKind(input.command);
 
   // This check intentionally precedes private-command canonicalization and hashing.
   requireFinancialCommandSubmissionCapabilities(input.actor, kind, dependencies);
 
+  const idempotencyKey = canonicalUuidSchema.parse(input.idempotencyKey);
   const actorId = canonicalUuidSchema.parse(input.actor.id);
   const correlationId = correlationIdSchema.parse(input.context.correlationId);
   const command = parseFinancialAdminPrivateCommand(input.command);

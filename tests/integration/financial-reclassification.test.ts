@@ -1,7 +1,20 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { eq, sql, type SQLWrapper } from 'drizzle-orm';
 import { PgDialect } from 'drizzle-orm/pg-core';
+import type { PoolClient } from 'pg';
 import { describe, expect, it } from 'vitest';
+import type { AdministratorActor } from '$lib/server/auth/admin-policy';
+import { createCommerceMessageEnqueuer } from '$lib/server/commerce/email/enqueue';
+import { createFinancialAdminCommandExecutors } from
+  '$lib/server/commerce/financial/admin-commands/executors';
+import {
+  createFinancialAdminCommandHandler,
+  type FinancialAdminCommandExecutor
+} from '$lib/server/commerce/financial/admin-commands/handler';
+import { submitFinancialAdminCommand } from
+  '$lib/server/commerce/financial/admin-commands/repository';
+import { executeRefundAllocationFinalize } from
+  '$lib/server/commerce/financial/refund-review/finalize';
 import type { Database } from '$lib/server/db/client';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
 import {
@@ -41,18 +54,27 @@ import {
   enqueueJob,
   rearmFinancialClassificationJob
 } from '$lib/server/jobs/repository';
+import { PermanentJobError } from '$lib/server/jobs/runner';
 import {
   financialClassificationVersions,
   stripeBalanceTransactions
 } from '$lib/server/db/schema/financial-provider';
 import {
   applicationConfig,
+  databaseClient as runtimeDatabaseClient,
   ownerDatabaseClient,
   workerDatabaseClient,
   workerDatabaseClient as databaseClient
 } from './database';
 
 const dialect = new PgDialect();
+const accessMessages = createCommerceMessageEnqueuer(applicationConfig.origin);
+
+interface NamedBlocker {
+  readonly client: PoolClient;
+  readonly pid: number;
+  open: boolean;
+}
 
 function rendered(query: unknown): string {
   return dialect.sqlToQuery((query as SQLWrapper).getSQL()).sql;
@@ -105,6 +127,123 @@ function deferred<Value>() {
   let resolve!: (value: Value) => void;
   const promise = new Promise<Value>((done) => { resolve = done; });
   return { promise, resolve };
+}
+
+async function within<Value>(
+  operation: Promise<Value>,
+  timeoutMs: number,
+  timeoutMessage: string
+): Promise<Value> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+  });
+  try {
+    return await Promise.race([operation, timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function namedTransactionDatabase(
+  database: Database,
+  applicationName: string,
+  entered: ReturnType<typeof deferred<number>>
+): Database {
+  return new Proxy(database, {
+    get(target, property) {
+      if (property === 'transaction') {
+        return (work: (transaction: DatabaseTransaction) => Promise<unknown>) =>
+          database.transaction(async (transaction) => {
+            await transaction.execute(sql`
+              select set_config('application_name', ${applicationName}, true)
+            `);
+            await transaction.execute(sql`select set_config('lock_timeout', '5s', true)`);
+            const result = await transaction.execute(sql<{ pid: number }>`
+              select pg_backend_pid() as pid
+            `);
+            const pid = result.rows[0]?.pid;
+            if (typeof pid !== 'number' || !Number.isSafeInteger(pid)) {
+              throw new Error('Expected a named transaction backend PID');
+            }
+            entered.resolve(pid);
+            return work(transaction);
+          });
+      }
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  });
+}
+
+async function beginOrderAdvisoryBlocker(
+  applicationName: string,
+  orderId: string
+): Promise<NamedBlocker> {
+  const client = await ownerDatabaseClient.pool.connect();
+  try {
+    await client.query('begin');
+    await client.query("select set_config('application_name', $1, true)", [applicationName]);
+    await client.query("select set_config('lock_timeout', '5s', true)");
+    const pidResult = await client.query<{ pid: number }>('select pg_backend_pid() as pid');
+    const pid = pidResult.rows[0]?.pid;
+    if (typeof pid !== 'number' || !Number.isSafeInteger(pid)) {
+      throw new Error('Expected an order blocker backend PID');
+    }
+    await client.query(
+      'select pg_advisory_xact_lock(hashtextextended($1, 0))',
+      [`pale-orbit:commerce:order:${orderId}`]
+    );
+    return { client, pid, open: true };
+  } catch (error) {
+    try {
+      await within(
+        client.query('rollback'),
+        5_000,
+        `Timed out rolling back failed blocker ${applicationName}`
+      );
+      client.release();
+    } catch {
+      client.release(true);
+    }
+    throw error;
+  }
+}
+
+async function releaseNamedBlocker(blocker: NamedBlocker): Promise<void> {
+  if (!blocker.open) return;
+  blocker.open = false;
+  try {
+    await within(
+      blocker.client.query('rollback'),
+      5_000,
+      `Timed out releasing blocker PID ${blocker.pid}`
+    );
+    blocker.client.release();
+  } catch (error) {
+    blocker.client.release(true);
+    throw error;
+  }
+}
+
+async function createReclassificationAdministrator(label: string): Promise<AdministratorActor> {
+  const id = randomUUID();
+  await ownerDatabaseClient.pool.query(
+    `insert into "user" (id, name, email, email_verified)
+     values ($1, $2, $3, true)`,
+    [id, 'Reclassification finalizer', `${label}-${id}@example.test`]
+  );
+  await ownerDatabaseClient.pool.query(
+    `insert into user_roles (user_id, role) values ($1, 'admin')`,
+    [id]
+  );
+  return { type: 'user', id, roles: ['admin'] };
+}
+
+function unexpectedAdminExecutor(label: string): FinancialAdminCommandExecutor {
+  return async () => {
+    throw new Error(`Unexpected ${label} executor in finalization/replay race`);
+  };
 }
 
 async function adjustmentFixture(
@@ -630,7 +769,11 @@ function versionBarrierDatabase(arrivalCount: number): Database {
                   gated = true;
                   arrivals += 1;
                   if (arrivals === arrivalCount) reached.resolve();
-                  await reached.promise;
+                  await within(
+                    reached.promise,
+                    5_000,
+                    'Timed out waiting for all version-barrier transactions'
+                  );
                 }
                 return tx.execute(query as never);
               };
@@ -644,17 +787,137 @@ function versionBarrierDatabase(arrivalCount: number): Database {
   } as unknown as Database;
 }
 
-async function waitForBlockedPid(pid: number, queryFragment: string): Promise<number[]> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    const result = await databaseClient.pool.query<{
-      query: string; blockers: number[];
-    }>(`select query, pg_blocking_pids(pid) as blockers
-        from pg_stat_activity where pid=$1`, [pid]);
-    const row = result.rows[0];
-    if (row?.query.includes(queryFragment) && row.blockers.length > 0) return row.blockers;
-    await new Promise((resolve) => setTimeout(resolve, 20));
+interface RealFinalizationProbe {
+  readonly commandId: string;
+  readonly jobId: string;
+  readonly operation: Promise<unknown | null>;
+}
+
+async function runRealFinalizationProbe(input: {
+  readonly actor: AdministratorActor;
+  readonly refundId: string;
+  readonly applicationName: string;
+  readonly entered: ReturnType<typeof deferred<number>>;
+}): Promise<RealFinalizationProbe> {
+  const submitted = await submitFinancialAdminCommand(runtimeDatabaseClient.db, {
+    actor: input.actor,
+    idempotencyKey: randomUUID(),
+    command: {
+      kind: 'refund_allocation_finalize',
+      refundId: input.refundId,
+      expectedActiveDraftVersion: 1,
+      previewFingerprint: 'e'.repeat(64),
+      confirmation: 'finalize_refund_allocation'
+    },
+    context: { correlationId: `reclassification-finalization-${input.refundId}` }
+  });
+  expect(submitted.status).toBe('pending');
+  const projection = await ownerDatabaseClient.pool.query<{
+    classifierVersion: number;
+    allocationAlgorithmVersion: number;
+  }>(`
+    select classifier_version as "classifierVersion",
+      allocation_algorithm_version as "allocationAlgorithmVersion"
+    from financial_projection_versions where singleton = true
+  `);
+  const active = projection.rows[0];
+  if (!active) throw new Error('Expected active financial projection version');
+  const capability = createHash('sha256')
+    .update(`reclassification-finalization:${submitted.commandId}`)
+    .digest('base64url');
+  const repository = createPostgresJobRepository(
+    workerDatabaseClient.db,
+    { ...applicationConfig.jobs, leaseMs: 60_000 },
+    undefined,
+    'local-only',
+    active,
+    () => capability
+  );
+  const workerId = `reclassification-finalizer-${submitted.commandId}`;
+  const job = await repository.claimNext(workerId);
+  expect(job).not.toBeNull();
+  expect(job?.payload).toEqual({ commandId: submitted.commandId });
+  if (!job?.financialAdminLeaseCapability) {
+    throw new Error('Expected claimed finalization lease capability');
   }
-  throw new Error(`Timed out waiting for replay pid ${pid} at ${queryFragment}`);
+  const finalization: FinancialAdminCommandExecutor = async (context, command) => {
+    if (command.kind !== 'refund_allocation_finalize') {
+      throw new Error('Finalization probe received another command kind');
+    }
+    return executeRefundAllocationFinalize(context, command);
+  };
+  const handler = createFinancialAdminCommandHandler({
+    database: namedTransactionDatabase(
+      workerDatabaseClient.db,
+      input.applicationName,
+      input.entered
+    ),
+    executors: createFinancialAdminCommandExecutors({
+      refundDraftSave: unexpectedAdminExecutor('draft-save'),
+      refundDraftDiscard: unexpectedAdminExecutor('draft-discard'),
+      refundAllocationFinalize: finalization,
+      refundReportingCorrectionCreate: unexpectedAdminExecutor('correction'),
+      administrativeRecoveryActivate: unexpectedAdminExecutor('recovery-activate'),
+      administrativeRecoveryDeactivate: unexpectedAdminExecutor('recovery-deactivate')
+    }),
+    accessMessages
+  });
+  const operation = (async (): Promise<unknown | null> => {
+    let caught: unknown | null = null;
+    try {
+      await handler(job, new AbortController().signal);
+      expect(await repository.complete(
+        job.id,
+        workerId,
+        job.financialAdminLeaseCapability
+      )).toBe(true);
+    } catch (error: unknown) {
+      caught = error;
+      expect(await repository.fail(
+        job.id,
+        workerId,
+        error instanceof PermanentJobError
+          ? error.safeMessage
+          : 'Transient finalization/replay race failure',
+        !(error instanceof PermanentJobError),
+        job.financialAdminLeaseCapability
+      )).toBe(true);
+    }
+    return caught;
+  })();
+  void operation.catch(() => undefined);
+  return { commandId: submitted.commandId, jobId: job.id, operation };
+}
+
+async function waitForBlockedPid(input: {
+  readonly pid: number;
+  readonly applicationName: string;
+  readonly blockerPid: number;
+  readonly queryFragment: string;
+}): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const result = await ownerDatabaseClient.pool.query<{
+      query: string;
+      blockers: number[];
+      waitEventType: string | null;
+    }>(`select query, pg_blocking_pids(pid) as blockers,
+          wait_event_type as "waitEventType"
+        from pg_stat_activity where pid=$1 and application_name=$2`, [
+      input.pid,
+      input.applicationName
+    ]);
+    const row = result.rows[0];
+    if (row?.waitEventType === 'Lock') {
+      expect(row.blockers).toEqual([input.blockerPid]);
+      expect(row.query.replace(/\s+/gu, ' ').toLowerCase())
+        .toContain(input.queryFragment.toLowerCase());
+      return;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(
+    `Timed out waiting for ${input.applicationName} at ${input.queryFragment}`
+  );
 }
 
 describe('financial classifier and allocation-version replay', () => {
@@ -2172,67 +2435,105 @@ describe('financial classifier and allocation-version replay', () => {
     expect(targetRows.rows).toHaveLength(4);
   });
 
-  it('keeps a refund-finalization purchase mutation ahead of replay without deadlock', async () => {
+  it('keeps classifier rebase behind real finalization projection authority before purchase', async () => {
     const fixture = await chargeFixture('reclassification-finalization-barrier', true);
     if (!fixture.refundId) throw new Error('Expected refund barrier fixture');
-    const finalizerLocked = deferred<void>();
-    const releaseFinalizer = deferred<void>();
-    const finalization = databaseClient.db.transaction(async (tx) => {
-      await lockOrder(tx, fixture.orderId);
-      const [order] = await tx.select().from(orders)
-        .where(eq(orders.id, fixture.orderId)).for('update');
-      const [payment] = await tx.select().from(payments)
-        .where(eq(payments.id, fixture.paymentId)).for('update');
-      if (!order || !payment) throw new Error('Expected finalization purchase roots');
-      await lockPaymentPurchaseFacts(tx, payment, order);
-      finalizerLocked.resolve();
-      await releaseFinalizer.promise;
-      await tx.update(refunds).set({ allocationStatus: 'finalized' })
-        .where(eq(refunds.id, fixture.refundId!));
-    });
-    await finalizerLocked.promise;
-
+    const actor = await createReclassificationAdministrator('finalization-replay-race');
+    const blockerName = `finalization-order-blocker-${fixture.orderId.slice(0, 12)}`;
+    const finalizerName = `real-finalization-${fixture.refundId.slice(0, 12)}`;
+    const replayName = `classifier-rebase-${fixture.balanceTransactionId.slice(0, 12)}`;
+    const orderBlocker = await beginOrderAdvisoryBlocker(blockerName, fixture.orderId);
+    const finalizerEntered = deferred<number>();
     const replayPid = deferred<number>();
-    const replayDatabase = {
-      transaction: (work: (tx: never) => Promise<unknown>) =>
-        databaseClient.db.transaction(async (tx) => {
-          let captured = false;
-          const proxy = new Proxy(tx, {
-            get(target, property) {
-              if (property === 'execute') {
-                return async (query: unknown) => {
-                  const result = await tx.execute(query as never);
-                  if (!captured && rendered(query).includes('from financial_projection_versions')) {
-                    captured = true;
-                    const pid = await tx.execute(sql<{ pid: number }>`select pg_backend_pid() as pid`);
-                    const value = (pid.rows[0] as { pid?: unknown } | undefined)?.pid;
-                    if (typeof value !== 'number') throw new Error('Expected replay backend pid');
-                    replayPid.resolve(value);
-                  }
-                  return result;
-                };
-              }
-              const value = Reflect.get(target, property, target) as unknown;
-              return typeof value === 'function' ? value.bind(target) : value;
-            }
-          });
-          return work(proxy as never);
-        })
-    } as unknown as Database;
-    const replay = replayFinancialClassification({
-      database: replayDatabase, targetClassifierVersion: 2,
-      targetAllocationAlgorithmVersion: 3
-    }, replayInput(fixture, 'reclassification-finalization-replay'));
-    const pid = await replayPid.promise;
-    await expect(waitForBlockedPid(pid, 'pg_advisory_xact_lock')).resolves.toEqual(
-      expect.arrayContaining([expect.any(Number)])
-    );
-    releaseFinalizer.resolve();
-    await expect(Promise.all([finalization, replay])).resolves.toEqual([undefined, undefined]);
-    const [refund] = await databaseClient.db.select().from(refunds)
-      .where(eq(refunds.id, fixture.refundId));
-    expect(refund?.allocationStatus).toBe('finalized');
-  }, 15_000);
+    let finalization: RealFinalizationProbe | undefined;
+    let replay: Promise<void> | undefined;
+    try {
+      finalization = await runRealFinalizationProbe({
+        actor,
+        refundId: fixture.refundId,
+        applicationName: finalizerName,
+        entered: finalizerEntered
+      });
+      const finalizerPid = await within(
+        finalizerEntered.promise,
+        5_000,
+        'Timed out waiting for real finalization handler transaction'
+      );
+      await waitForBlockedPid({
+        pid: finalizerPid,
+        applicationName: finalizerName,
+        blockerPid: orderBlocker.pid,
+        queryFragment: 'pg_advisory_xact_lock'
+      });
+
+      replay = replayFinancialClassification({
+        database: namedTransactionDatabase(databaseClient.db, replayName, replayPid),
+        targetClassifierVersion: 2,
+        targetAllocationAlgorithmVersion: 3
+      }, replayInput(fixture, 'reclassification-finalization-replay'));
+      void replay.catch(() => undefined);
+      const classifierPid = await within(
+        replayPid.promise,
+        5_000,
+        'Timed out waiting for classifier-rebase transaction'
+      );
+      await waitForBlockedPid({
+        pid: classifierPid,
+        applicationName: replayName,
+        blockerPid: finalizerPid,
+        queryFragment: 'from financial_projection_versions'
+      });
+
+      await releaseNamedBlocker(orderBlocker);
+      const [finalizationError] = await Promise.all([
+        within(finalization.operation, 10_000, 'Timed out completing real finalization'),
+        within(replay, 10_000, 'Timed out completing classifier rebase')
+      ]);
+      expect(finalizationError).toBeInstanceOf(PermanentJobError);
+      expect((finalizationError as PermanentJobError).safeMessage)
+        .toBe('Financial administrator command permanently failed.');
+      const command = await ownerDatabaseClient.pool.query<{
+        commandStatus: string;
+        safeResultCode: string | null;
+        safeResult: unknown;
+        jobStatus: string;
+        attempts: number;
+        lastError: string | null;
+        auditActions: string[];
+      }>(`
+        select command.status::text as "commandStatus",
+          command.safe_result_code as "safeResultCode",
+          command.safe_result as "safeResult",
+          job.status::text as "jobStatus", job.attempts,
+          job.last_error as "lastError",
+          coalesce((
+            select array_agg(audit.action order by audit.id)
+            from audit_events audit
+            where audit.resource_type = 'financial_admin_command'
+              and audit.resource_id = command.id::text
+              and audit.action like 'financial.admin_command.%'
+          ), array[]::text[]) as "auditActions"
+        from financial_admin_commands command
+        join jobs job on job.id = command.job_id
+        where command.id = $1
+      `, [finalization.commandId]);
+      expect(command.rows).toEqual([{
+        commandStatus: 'failed',
+        safeResultCode: 'command_failed',
+        safeResult: null,
+        jobStatus: 'failed',
+        attempts: 1,
+        lastError: 'Financial administrator command permanently failed.',
+        auditActions: ['financial.admin_command.failed']
+      }]);
+    } finally {
+      await within(Promise.allSettled([
+        releaseNamedBlocker(orderBlocker),
+        ...(finalization ? [finalization.operation] : []),
+        ...(replay ? [replay] : [])
+      ]), 7_500, 'Timed out cleaning up finalization/classifier-rebase probes');
+    }
+  }, 20_000);
 
   it('does not let a superseded-set correction diagnostic override a global classification fork', async () => {
     const fixture = await adjustmentFixture('reclassification-fail-closed');

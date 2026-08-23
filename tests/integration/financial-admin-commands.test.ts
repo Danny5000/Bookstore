@@ -1,11 +1,18 @@
-import { createHash, randomUUID } from "node:crypto";
+import { execFile, type ExecFileException } from "node:child_process";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { inspect } from "node:util";
+import type { Browser, BrowserContext, Page } from "@playwright/test";
+import { render } from "svelte/server";
 import { describe, expect, it, vi } from "vitest";
 import type { AdministratorActor } from "$lib/server/auth/admin-policy";
 import { setAdminRole } from "$lib/server/auth/roles";
+import { appendAuditEvent } from "$lib/server/audit/service";
 import { createCommerceMessageEnqueuer } from "$lib/server/commerce/email/enqueue";
 import { createFinancialAdminCommandExecutors } from "$lib/server/commerce/financial/admin-commands/executors";
 import {
   FINANCIAL_ADMIN_COMMAND_JOB,
+  FinancialAdminConflictError,
   createFinancialAdminCommandHandler,
   type FinancialAdminCommandExecutor,
 } from "$lib/server/commerce/financial/admin-commands/handler";
@@ -14,16 +21,28 @@ import {
   submitFinancialAdminCommand,
 } from "$lib/server/commerce/financial/admin-commands/repository";
 import type { FinancialAdminPrivateCommand } from "$lib/server/commerce/financial/admin-commands/contracts";
+import { exportSalesCsv } from "$lib/server/commerce/reporting/csv";
+import { databaseEnvironmentForRole } from "$lib/server/db/database-role-provision";
 import { createPostgresJobRepository } from "$lib/server/jobs/repository";
 import { PermanentJobError, runWorker } from "$lib/server/jobs/runner";
 import type { JobRecord, JobRepository } from "$lib/server/jobs/types";
-import type { FinancialAdminCommandKind } from "$lib/types/financial-reporting";
+import {
+  FINANCIAL_ADMIN_COMMAND_KINDS,
+  FINANCIAL_ADMIN_SUCCESS_CODE_BY_KIND,
+  parseFinancialAdminCommandStatus,
+  type FinancialAdminCommandKind,
+  type FinancialAdminCommandSafeResultDto,
+} from "$lib/types/financial-reporting";
+import { assertCommercePrivacy } from "../e2e/commerce-privacy";
 import {
   applicationConfig,
   databaseClient,
   ownerDatabaseClient,
   workerDatabaseClient,
 } from "./database";
+
+vi.mock("$app/navigation", () => ({ invalidateAll: vi.fn() }));
+vi.mock("$app/paths", () => ({ resolve: (path: string) => path }));
 
 const FORBIDDEN_STATUS_FIELDS =
   /jobId|payload|attempts|lastError|privateInput|actorUserId|internalError/iu;
@@ -40,6 +59,118 @@ function deferred(): Deferred {
     resolve = done;
   });
   return { promise, resolve };
+}
+
+async function within<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  timeoutMessage: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+  });
+  try {
+    return await Promise.race([operation, timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+interface RestoreVerifierOutput {
+  readonly error: ExecFileException | null;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+function runExecutableRestoreVerifier(): Promise<RestoreVerifierOutput> {
+  const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
+  const verifierPath = fileURLToPath(
+    new URL("../../scripts/execute-financial-restore-verifier.ts", import.meta.url),
+  );
+  const migrationWebUser = process.env.DATABASE_USER?.trim();
+  const migrationWorkerUser = process.env.DATABASE_WORKER_USER?.trim();
+  const migrationStorageCleanupUser =
+    process.env.DATABASE_STORAGE_CLEANUP_USER?.trim();
+  if (
+    !migrationWebUser ||
+    !migrationWorkerUser ||
+    !migrationStorageCleanupUser
+  ) {
+    throw new Error("Restore verifier migration identities are unavailable");
+  }
+  const ownerEnvironment = {
+    ...databaseEnvironmentForRole(process.env, "owner"),
+    DATABASE_MIGRATION_WEB_USER: migrationWebUser,
+    DATABASE_MIGRATION_WORKER_USER: migrationWorkerUser,
+    DATABASE_MIGRATION_STORAGE_CLEANUP_USER: migrationStorageCleanupUser,
+  };
+  return new Promise((resolve) => {
+    execFile(
+      process.execPath,
+      ["--import", "tsx", verifierPath],
+      {
+        cwd: repositoryRoot,
+        encoding: "utf8",
+        env: ownerEnvironment,
+        killSignal: "SIGKILL",
+        maxBuffer: 32 * 1024 * 1024,
+        timeout: 45_000,
+        windowsHide: true,
+      },
+      (error, stdout, stderr) => {
+        resolve({
+          error,
+          stdout: String(stdout),
+          stderr: String(stderr),
+        });
+      },
+    );
+  });
+}
+
+async function closeBrowserEvidenceResources(input: {
+  readonly page: Page | undefined;
+  readonly context: BrowserContext | undefined;
+  readonly browser: Browser | undefined;
+}): Promise<unknown | undefined> {
+  const operations: readonly [string, (() => Promise<void>) | undefined][] = [
+    [
+      "Timed out closing the sentinel browser page",
+      input.page === undefined ? undefined : () => input.page!.close(),
+    ],
+    [
+      "Timed out closing the sentinel browser context",
+      input.context === undefined ? undefined : () => input.context!.close(),
+    ],
+    [
+      "Timed out closing the sentinel browser",
+      input.browser === undefined ? undefined : () => input.browser!.close(),
+    ],
+  ];
+  let failure: unknown;
+  for (const [message, operation] of operations) {
+    if (operation === undefined) continue;
+    try {
+      await within(operation(), 5_000, message);
+    } catch (error: unknown) {
+      failure ??= error;
+    }
+  }
+  return failure;
+}
+
+function assertSentinelAbsent(
+  artifact: string,
+  value: string,
+  privateValues: readonly string[],
+): void {
+  const normalized = value.toLowerCase();
+  if (privateValues.some((privateValue) =>
+    privateValue.length > 0 && normalized.includes(privateValue.toLowerCase())
+  )) {
+    throw new Error(`Sensitive financial sentinel detected in ${artifact}`);
+  }
 }
 
 function capability(label: string): string {
@@ -126,9 +257,155 @@ function draftCommand(): FinancialAdminPrivateCommand & {
   };
 }
 
-async function submitDraft(
+interface CommandLifecycleCase {
+  readonly command: FinancialAdminPrivateCommand;
+  readonly mutationAction: string;
+  readonly mutationResourceType: string;
+  readonly mutationResourceId: string;
+  readonly safeResult: FinancialAdminCommandSafeResultDto;
+}
+
+function commandLifecycleCase(
+  kind: FinancialAdminCommandKind,
+): CommandLifecycleCase {
+  const refundId = randomUUID();
+  switch (kind) {
+    case "refund_draft_save": {
+      return {
+        command: {
+          kind,
+          refundId,
+          expectedVersion: null,
+          items: [{ orderItemId: randomUUID(), totalPresentmentMinor: 725 }],
+        },
+        mutationAction: "financial.refund_draft.created",
+        mutationResourceType: "refund_allocation_draft",
+        mutationResourceId: randomUUID(),
+        safeResult: { refundId, draftVersion: 1, changed: true },
+      };
+    }
+    case "refund_draft_discard": {
+      return {
+        command: {
+          kind,
+          refundId,
+          expectedActiveDraftVersion: 4,
+        },
+        mutationAction: "financial.refund_draft.discarded",
+        mutationResourceType: "refund_allocation_draft",
+        mutationResourceId: randomUUID(),
+        safeResult: { refundId, draftVersion: 5, changed: true },
+      };
+    }
+    case "refund_allocation_finalize": {
+      return {
+        command: {
+          kind,
+          refundId,
+          expectedActiveDraftVersion: 2,
+          previewFingerprint: "1".repeat(64),
+          confirmation: "finalize_refund_allocation",
+        },
+        mutationAction: "financial.refund_allocation.finalized",
+        mutationResourceType: "refund",
+        mutationResourceId: refundId,
+        safeResult: {
+          refundId,
+          finalizedDraftVersion: 3,
+          accessChanged: true,
+          emailQueued: true,
+        },
+      };
+    }
+    case "refund_reporting_correction_create": {
+      const correctionSetId = randomUUID();
+      return {
+        command: {
+          kind,
+          refundId,
+          reason: "allocation_attribution_correction",
+          expectedNextCorrectionVersion: 2,
+          expectedBaseAllocationSetId: randomUUID(),
+          expectedSourceFingerprint: "2".repeat(64),
+          items: [{ orderItemId: randomUUID(), totalPresentmentMinor: 725 }],
+          previewFingerprint: "3".repeat(64),
+          confirmation: "create_reporting_correction",
+        },
+        mutationAction: "financial.refund_correction.created",
+        mutationResourceType: "refund_reporting_correction_set",
+        mutationResourceId: correctionSetId,
+        safeResult: { refundId, correctionSetId, correctionVersion: 2 },
+      };
+    }
+    case "administrative_recovery_activate": {
+      const recoveryGrantId = randomUUID();
+      return {
+        command: {
+          kind,
+          refundId,
+          finalizationEffectId: randomUUID(),
+          orderItemId: randomUUID(),
+          expectedCorrectionSetId: randomUUID(),
+          expectedCorrectionVersion: 2,
+          expectedSourceFingerprint: "4".repeat(64),
+          previewFingerprint: "5".repeat(64),
+          confirmation: "activate_persistent_recovery",
+        },
+        mutationAction: "financial.recovery_grant.activated",
+        mutationResourceType: "entitlement_grant",
+        mutationResourceId: recoveryGrantId,
+        safeResult: {
+          recoveryGrantId,
+          accessChanged: true,
+          emailQueued: true,
+        },
+      };
+    }
+    case "administrative_recovery_deactivate": {
+      const recoveryGrantId = randomUUID();
+      return {
+        command: {
+          kind,
+          recoveryGrantId,
+          recoveryReferenceId: randomUUID(),
+          expectedStateChangedAt: "2026-08-22T12:34:56.789Z",
+          confirmation: "deactivate_persistent_recovery",
+        },
+        mutationAction: "financial.recovery_grant.deactivated",
+        mutationResourceType: "entitlement_grant",
+        mutationResourceId: recoveryGrantId,
+        safeResult: {
+          recoveryGrantId,
+          accessChanged: true,
+          emailQueued: true,
+        },
+      };
+    }
+    default: {
+      kind satisfies never;
+      throw new Error("Unhandled financial administrator command kind");
+    }
+  }
+}
+
+function executorsWithEveryCommand(
+  executor: FinancialAdminCommandExecutor,
+): ReadonlyMap<FinancialAdminCommandKind, FinancialAdminCommandExecutor> {
+  const bind = (): FinancialAdminCommandExecutor =>
+    (context, command) => executor(context, command);
+  return createFinancialAdminCommandExecutors({
+    refundDraftSave: bind(),
+    refundDraftDiscard: bind(),
+    refundAllocationFinalize: bind(),
+    refundReportingCorrectionCreate: bind(),
+    administrativeRecoveryActivate: bind(),
+    administrativeRecoveryDeactivate: bind(),
+  });
+}
+
+async function submitCommand(
   actor: AdministratorActor,
-  command: FinancialAdminPrivateCommand & { kind: "refund_draft_save" },
+  command: FinancialAdminPrivateCommand,
   idempotencyKey = randomUUID(),
   correlationId = `financial-admin-${randomUUID()}`,
 ) {
@@ -138,6 +415,15 @@ async function submitDraft(
     command,
     context: { correlationId },
   });
+}
+
+async function submitDraft(
+  actor: AdministratorActor,
+  command: FinancialAdminPrivateCommand & { kind: "refund_draft_save" },
+  idempotencyKey = randomUUID(),
+  correlationId = `financial-admin-${randomUUID()}`,
+) {
+  return submitCommand(actor, command, idempotencyKey, correlationId);
 }
 
 function executorsWithDraftSave(
@@ -224,8 +510,8 @@ async function runSingleClaim(
   handler: ReturnType<typeof createFinancialAdminCommandHandler>,
   workerId: string,
   heartbeatIntervalMs = 20,
+  controller = new AbortController(),
 ): Promise<void> {
-  const controller = new AbortController();
   let polls = 0;
   await runWorker({
     repository,
@@ -269,6 +555,121 @@ async function commandAndJob(commandId: string) {
       [commandId],
     )
   ).rows[0]!;
+}
+
+interface CommandAuditRow {
+  readonly actor_type: string;
+  readonly actor_id: string | null;
+  readonly action: string;
+  readonly outcome: string;
+  readonly resource_type: string;
+  readonly resource_id: string | null;
+  readonly correlation_id: string;
+  readonly request_metadata: unknown;
+  readonly before: unknown;
+  readonly after: unknown;
+}
+
+async function commandAuditRows(
+  commandId: string,
+  actionPattern = "financial.admin_command.%",
+): Promise<readonly CommandAuditRow[]> {
+  return (
+    await ownerDatabaseClient.pool.query<CommandAuditRow>(
+      `
+      select actor_type, actor_id, action, outcome, resource_type, resource_id,
+        correlation_id, request_metadata, before, "after"
+      from audit_events
+      where resource_id = $1 and action like $2
+      order by id
+    `,
+      [commandId, actionPattern],
+    )
+  ).rows;
+}
+
+async function expectNoSentinelPersistenceLeaks(
+  secret: string,
+  secretDigest: string,
+): Promise<void> {
+  const secretLeak = await ownerDatabaseClient.pool.query<{
+    job_leaks: number;
+    command_leaks: number;
+    claim_leaks: number;
+    audit_leaks: number;
+    outbox_leaks: number;
+    digest_public_leaks: number;
+  }>(
+    `
+    select
+      (select count(*)::integer from jobs
+       where row_to_json(jobs)::text like '%' || $1 || '%') as job_leaks,
+      (select count(*)::integer from financial_admin_commands
+       where row_to_json(financial_admin_commands)::text like '%' || $1 || '%')
+        as command_leaks,
+      (select count(*)::integer from financial_admin_job_claims
+       where row_to_json(financial_admin_job_claims)::text like '%' || $1 || '%')
+        as claim_leaks,
+      (select count(*)::integer from audit_events
+       where row_to_json(audit_events)::text like '%' || $1 || '%') as audit_leaks,
+      (select count(*)::integer from outbox_messages
+       where row_to_json(outbox_messages)::text like '%' || $1 || '%') as outbox_leaks,
+      (
+        (select count(*)::integer from jobs
+         where row_to_json(jobs)::text like '%' || $2 || '%') +
+        (select count(*)::integer from financial_admin_commands
+         where row_to_json(financial_admin_commands)::text like '%' || $2 || '%') +
+        (select count(*)::integer from audit_events
+         where row_to_json(audit_events)::text like '%' || $2 || '%') +
+        (select count(*)::integer from outbox_messages
+         where row_to_json(outbox_messages)::text like '%' || $2 || '%')
+      ) as digest_public_leaks
+  `,
+    [secret, secretDigest],
+  );
+  expect(secretLeak.rows).toEqual([
+    {
+      job_leaks: 0,
+      command_leaks: 0,
+      claim_leaks: 0,
+      audit_leaks: 0,
+      outbox_leaks: 0,
+      digest_public_leaks: 0,
+    },
+  ]);
+}
+
+function expectMinimalTerminalAudit(input: {
+  readonly auditRows: readonly CommandAuditRow[];
+  readonly actor: AdministratorActor;
+  readonly commandId: string;
+  readonly commandKind: FinancialAdminCommandKind;
+  readonly correlationId: string;
+  readonly status: "denied" | "conflict" | "failed";
+  readonly safeResultCode:
+    | "capability_revoked"
+    | "stale_state"
+    | "not_eligible"
+    | "invalid_command"
+    | "command_failed";
+}): void {
+  expect(input.auditRows).toEqual([
+    {
+      actor_type: "user",
+      actor_id: input.actor.id,
+      action: `financial.admin_command.${input.status}`,
+      outcome: input.status === "denied" ? "denied" : "failed",
+      resource_type: "financial_admin_command",
+      resource_id: input.commandId,
+      correlation_id: input.correlationId,
+      request_metadata: null,
+      before: null,
+      after: {
+        commandKind: input.commandKind,
+        safeResultCode: input.safeResultCode,
+      },
+    },
+  ]);
 }
 
 describe("financial administrator command PostgreSQL lifecycle", () => {
@@ -471,6 +872,268 @@ describe("financial administrator command PostgreSQL lifecycle", () => {
     ).resolves.toBeNull();
   });
 
+  it.each(FINANCIAL_ADMIN_COMMAND_KINDS)(
+    "commits the fixed %s mutation audit with the submitting actor and terminal result exactly once",
+    async (kind) => {
+      const actor = await createAdministrator(`success-${kind}`);
+      const lifecycle = commandLifecycleCase(kind);
+      const correlationId = `financial-admin-success-${randomUUID()}`;
+      const submitted = await submitCommand(
+        actor,
+        lifecycle.command,
+        randomUUID(),
+        correlationId,
+      );
+      const executor = vi.fn<FinancialAdminCommandExecutor>(
+        async (context, command) => {
+          expect(command).toEqual(lifecycle.command);
+          expect(context.commandId).toBe(submitted.commandId);
+          expect(context.actor).toMatchObject({ type: "user", id: actor.id });
+          expect(context.actor.roles).toContain("admin");
+          expect(context.correlationId).toBe(correlationId);
+          await appendAuditEvent(context.transaction, {
+            actor: context.actor,
+            action: lifecycle.mutationAction,
+            outcome: "succeeded",
+            resourceType: lifecycle.mutationResourceType,
+            resourceId: lifecycle.mutationResourceId,
+            correlationId: context.correlationId,
+            after: {
+              commandId: context.commandId,
+              commandKind: command.kind,
+            },
+          });
+          return lifecycle.safeResult;
+        },
+      );
+      const handler = createFinancialAdminCommandHandler({
+        database: workerDatabaseClient.db,
+        executors: executorsWithEveryCommand(executor),
+        accessMessages,
+      });
+      const workerId = `financial-admin-success-${kind}`;
+      const repository = createPostgresJobRepository(
+        workerDatabaseClient.db,
+        { ...applicationConfig.jobs, leaseMs: 5_000 },
+        undefined,
+        "local-only",
+        { classifierVersion: 1, allocationAlgorithmVersion: 1 },
+        () => capability(`success-${kind}`),
+      );
+      const job = await repository.claimNext(workerId);
+      expect(job).toMatchObject({
+        type: FINANCIAL_ADMIN_COMMAND_JOB,
+        payload: { commandId: submitted.commandId },
+      });
+
+      await handler(job!, new AbortController().signal);
+      expect(executor).toHaveBeenCalledOnce();
+      expect(await commandAndJob(submitted.commandId)).toMatchObject({
+        command_status: "succeeded",
+        safe_result_code: FINANCIAL_ADMIN_SUCCESS_CODE_BY_KIND[kind],
+        safe_result: lifecycle.safeResult,
+        job_status: "running",
+        attempts: 1,
+      });
+      const mutationAudits = await ownerDatabaseClient.pool.query(
+        `
+        select actor_type, actor_id, action, outcome, resource_type, resource_id,
+          correlation_id, request_metadata, before, "after"
+        from audit_events
+        where correlation_id = $1 and action = $2
+        order by id
+      `,
+        [correlationId, lifecycle.mutationAction],
+      );
+      expect(mutationAudits.rows).toEqual([
+        {
+          actor_type: "user",
+          actor_id: actor.id,
+          action: lifecycle.mutationAction,
+          outcome: "succeeded",
+          resource_type: lifecycle.mutationResourceType,
+          resource_id: lifecycle.mutationResourceId,
+          correlation_id: correlationId,
+          request_metadata: null,
+          before: null,
+          after: {
+            commandId: submitted.commandId,
+            commandKind: kind,
+          },
+        },
+      ]);
+      expect(await commandAuditRows(submitted.commandId)).toEqual([]);
+
+      await handler(job!, new AbortController().signal);
+      expect(executor).toHaveBeenCalledOnce();
+      await expect(
+        ownerDatabaseClient.pool.query(
+          `select count(*)::integer as count from audit_events
+           where correlation_id = $1 and action = $2`,
+          [correlationId, lifecycle.mutationAction],
+        ),
+      ).resolves.toMatchObject({ rows: [{ count: 1 }] });
+      await expect(
+        repository.complete(
+          job!.id,
+          workerId,
+          job!.financialAdminLeaseCapability,
+        ),
+      ).resolves.toBe(true);
+      expect(await commandAndJob(submitted.commandId)).toMatchObject({
+        command_status: "succeeded",
+        job_status: "succeeded",
+      });
+    },
+  );
+
+  it("commits a freshly evaluated semantic no-op without a mutation audit and replays terminally", async () => {
+    const actor = await createAdministrator("semantic-no-op");
+    const command = draftCommand();
+    const correlationId = `financial-admin-no-op-${randomUUID()}`;
+    const submitted = await submitDraft(
+      actor,
+      command,
+      randomUUID(),
+      correlationId,
+    );
+    const executor = vi.fn<FinancialAdminCommandExecutor>(async () => ({
+      refundId: command.refundId,
+      draftVersion: 7,
+      changed: false,
+    }));
+    const handler = createFinancialAdminCommandHandler({
+      database: workerDatabaseClient.db,
+      executors: executorsWithDraftSave(executor),
+      accessMessages,
+    });
+    const workerId = "financial-admin-no-op-worker";
+    const repository = createPostgresJobRepository(
+      workerDatabaseClient.db,
+      { ...applicationConfig.jobs, leaseMs: 5_000 },
+      undefined,
+      "local-only",
+      { classifierVersion: 1, allocationAlgorithmVersion: 1 },
+      () => capability("semantic-no-op"),
+    );
+    const job = await repository.claimNext(workerId);
+    expect(job?.payload).toEqual({ commandId: submitted.commandId });
+
+    await handler(job!, new AbortController().signal);
+    await handler(job!, new AbortController().signal);
+    expect(executor).toHaveBeenCalledOnce();
+    expect(await commandAndJob(submitted.commandId)).toMatchObject({
+      command_status: "succeeded",
+      safe_result_code: "draft_saved",
+      safe_result: {
+        refundId: command.refundId,
+        draftVersion: 7,
+        changed: false,
+      },
+      job_status: "running",
+    });
+    await expect(
+      ownerDatabaseClient.pool.query(
+        `select count(*)::integer as count from audit_events
+         where correlation_id = $1 and action like 'financial.refund_draft.%'`,
+        [correlationId],
+      ),
+    ).resolves.toMatchObject({ rows: [{ count: 0 }] });
+    await expect(
+      repository.complete(
+        job!.id,
+        workerId,
+        job!.financialAdminLeaseCapability,
+      ),
+    ).resolves.toBe(true);
+  });
+
+  it("rolls back a tentative mutation audit and persists one minimized conflict audit", async () => {
+    const actor = await createAdministrator("conflict-audit");
+    const lifecycle = commandLifecycleCase("refund_draft_save");
+    const command = lifecycle.command as Extract<
+      FinancialAdminPrivateCommand,
+      { kind: "refund_draft_save" }
+    >;
+    const correlationId = `financial-admin-conflict-${randomUUID()}`;
+    const submitted = await submitCommand(
+      actor,
+      command,
+      randomUUID(),
+      correlationId,
+    );
+    const executor = vi.fn<FinancialAdminCommandExecutor>(
+      async (context, command) => {
+        await appendAuditEvent(context.transaction, {
+          actor: context.actor,
+          action: lifecycle.mutationAction,
+          outcome: "succeeded",
+          resourceType: lifecycle.mutationResourceType,
+          resourceId: lifecycle.mutationResourceId,
+          correlationId: context.correlationId,
+          after: {
+            commandId: context.commandId,
+            commandKind: command.kind,
+          },
+        });
+        throw new FinancialAdminConflictError("stale_state");
+      },
+    );
+    const handler = createFinancialAdminCommandHandler({
+      database: workerDatabaseClient.db,
+      executors: executorsWithEveryCommand(executor),
+      accessMessages,
+    });
+    const repository = createPostgresJobRepository(
+      workerDatabaseClient.db,
+      { ...applicationConfig.jobs, leaseMs: 5_000 },
+      undefined,
+      "local-only",
+      { classifierVersion: 1, allocationAlgorithmVersion: 1 },
+      () => capability("conflict-audit"),
+    );
+    const job = await repository.claimNext("financial-admin-conflict-worker");
+    expect(job?.payload).toEqual({ commandId: submitted.commandId });
+
+    await expect(
+      handler(job!, new AbortController().signal),
+    ).rejects.toBeInstanceOf(PermanentJobError);
+    expect(await commandAndJob(submitted.commandId)).toMatchObject({
+      command_status: "conflict",
+      safe_result_code: "stale_state",
+      safe_result: null,
+      job_status: "running",
+      attempts: 1,
+    });
+    await expect(
+      ownerDatabaseClient.pool.query(
+        `select count(*)::integer as count from audit_events
+         where correlation_id = $1 and action = $2`,
+        [correlationId, lifecycle.mutationAction],
+      ),
+    ).resolves.toMatchObject({ rows: [{ count: 0 }] });
+    const conflictAudits = await commandAuditRows(submitted.commandId);
+    expectMinimalTerminalAudit({
+      auditRows: conflictAudits,
+      actor,
+      commandId: submitted.commandId,
+      commandKind: command.kind,
+      correlationId,
+      status: "conflict",
+      safeResultCode: "stale_state",
+    });
+    const minimized = JSON.stringify(conflictAudits);
+    expect(minimized).not.toContain(command.refundId);
+    expect(minimized).not.toContain(command.items[0]!.orderItemId);
+    expect(minimized).not.toContain("privateInput");
+
+    await expect(
+      handler(job!, new AbortController().signal),
+    ).rejects.toBeInstanceOf(PermanentJobError);
+    expect(executor).toHaveBeenCalledOnce();
+    expect(await commandAuditRows(submitted.commandId)).toEqual(conflictAudits);
+  });
+
   it("runs a claimed local-only command with heartbeat renewal and serializes concurrent demotion", async () => {
     const actor = await createAdministrator("runner-target");
     const roleAdministrator = await createAdministrator(
@@ -480,10 +1143,20 @@ describe("financial administrator command PostgreSQL lifecycle", () => {
     const submitted = await submitDraft(actor, command);
     const executorStarted = deferred();
     const releaseExecutor = deferred();
-    const secret = capability("runner-success-secret-sentinel");
+    const secret = randomBytes(32).toString("base64url");
+    const secretDigest = createHash("sha256").update(secret).digest("hex");
+    const privateSentinelValues = [secret, secretDigest] as const;
+    const capturedErrors: unknown[][] = [];
+    const errorSpy = vi.spyOn(console, "error").mockImplementation((...values) => {
+      capturedErrors.push(values);
+    });
     const executor = vi.fn<FinancialAdminCommandExecutor>(async () => {
       executorStarted.resolve();
-      await releaseExecutor.promise;
+      await within(
+        releaseExecutor.promise,
+        10_000,
+        "Timed out waiting to release the sentinel command executor",
+      );
       return { refundId: command.refundId, draftVersion: 1, changed: true };
     });
     const handler = createFinancialAdminCommandHandler({
@@ -506,129 +1179,308 @@ describe("financial administrator command PostgreSQL lifecycle", () => {
       failures: 0,
     };
     const repository = observeRepository(postgresRepository, observations);
+    const workerController = new AbortController();
     const worker = runSingleClaim(
       repository,
       handler,
       "financial-admin-success-worker",
       10,
+      workerController,
     );
+    let demotion: ReturnType<typeof setAdminRole> | undefined;
+    let roleRegranted = false;
+    let runtimeDatabaseMocked = false;
+    let browser: Browser | undefined;
+    let browserContext: BrowserContext | undefined;
+    let browserPage: Page | undefined;
+    let testFailure: unknown;
+    let cleanupFailure: unknown;
+    try {
+      await within(
+        executorStarted.promise,
+        5_000,
+        "Timed out waiting for the sentinel command executor",
+      );
+      let demotionSettled = false;
+      demotion = setAdminRole(databaseClient.db, {
+        actor: roleAdministrator,
+        targetUserId: actor.id,
+        enabled: false,
+        correlationId: `financial-admin-demotion-${randomUUID()}`,
+      }).finally(() => {
+        demotionSettled = true;
+      });
 
-    await executorStarted.promise;
-    let demotionSettled = false;
-    const demotion = setAdminRole(databaseClient.db, {
-      actor: roleAdministrator,
-      targetUserId: actor.id,
-      enabled: false,
-      correlationId: `financial-admin-demotion-${randomUUID()}`,
-    }).finally(() => {
-      demotionSettled = true;
-    });
+      await vi.waitFor(() => expect(observations.renewals).toBeGreaterThan(0), {
+        timeout: 2_000,
+        interval: 10,
+      });
+      expect(demotionSettled).toBe(false);
+      releaseExecutor.resolve();
+      await within(
+        Promise.all([worker, demotion]),
+        10_000,
+        "Timed out joining the sentinel worker and administrator demotion",
+      );
 
-    await vi.waitFor(() => expect(observations.renewals).toBeGreaterThan(0), {
-      timeout: 2_000,
-      interval: 10,
-    });
-    expect(demotionSettled).toBe(false);
-    releaseExecutor.resolve();
-    await Promise.all([worker, demotion]);
-
-    expect(executor).toHaveBeenCalledOnce();
-    expect(observations.claims).toHaveLength(1);
-    expect(observations.claims[0]).toMatchObject({
-      type: FINANCIAL_ADMIN_COMMAND_JOB,
-      payload: { commandId: submitted.commandId },
-      financialAdminLeaseCapability: secret,
-    });
-    expect(observations.renewals).toBeGreaterThan(0);
-    expect(observations.completions).toBe(1);
-    expect(observations.failures).toBe(0);
-    expect(await commandAndJob(submitted.commandId)).toMatchObject({
-      command_status: "succeeded",
-      safe_result_code: "draft_saved",
-      safe_result: {
-        refundId: command.refundId,
-        draftVersion: 1,
-        changed: true,
-      },
-      job_status: "succeeded",
-      attempts: 1,
-      last_error: null,
-    });
-    await expect(
-      ownerDatabaseClient.pool.query(
-        `
-      select count(*)::integer as count from audit_events
-      where action like 'financial.admin_command.%' and resource_id = $1
-    `,
-        [submitted.commandId],
-      ),
-    ).resolves.toMatchObject({ rows: [{ count: 0 }] });
-
-    const secretLeak = await ownerDatabaseClient.pool.query<{
-      job_leaks: number;
-      command_leaks: number;
-      claim_leaks: number;
-      audit_leaks: number;
-    }>(
-      `
-      select
-        (select count(*)::integer from jobs
-         where row_to_json(jobs)::text like '%' || $1 || '%') as job_leaks,
-        (select count(*)::integer from financial_admin_commands
-         where row_to_json(financial_admin_commands)::text like '%' || $1 || '%')
-          as command_leaks,
-        (select count(*)::integer from financial_admin_job_claims
-         where row_to_json(financial_admin_job_claims)::text like '%' || $1 || '%')
-          as claim_leaks,
-        (select count(*)::integer from audit_events
-         where row_to_json(audit_events)::text like '%' || $1 || '%') as audit_leaks
-    `,
-      [secret],
-    );
-    expect(secretLeak.rows).toEqual([
-      {
-        job_leaks: 0,
-        command_leaks: 0,
-        claim_leaks: 0,
-        audit_leaks: 0,
-      },
-    ]);
-    await expect(
-      ownerDatabaseClient.pool.query(
-        `
-      select state, capability_sha256, invalidated_at is not null as invalidated
-      from financial_admin_job_claims where job_id = $1
-    `,
-        [(await commandAndJob(submitted.commandId)).job_id],
-      ),
-    ).resolves.toMatchObject({
-      rows: [
-        {
-          state: "invalidated",
-          capability_sha256: createHash("sha256").update(secret).digest("hex"),
-          invalidated: true,
+      expect(executor).toHaveBeenCalledOnce();
+      expect(observations.claims).toHaveLength(1);
+      const observedClaim = observations.claims[0];
+      if (
+        observedClaim?.type !== FINANCIAL_ADMIN_COMMAND_JOB ||
+        observedClaim.payload.commandId !== submitted.commandId ||
+        observedClaim.financialAdminLeaseCapability !== secret
+      ) {
+        throw new Error("The sentinel claim did not preserve its in-memory capability");
+      }
+      expect(observations.renewals).toBeGreaterThan(0);
+      expect(observations.completions).toBe(1);
+      expect(observations.failures).toBe(0);
+      expect(await commandAndJob(submitted.commandId)).toMatchObject({
+        command_status: "succeeded",
+        safe_result_code: "draft_saved",
+        safe_result: {
+          refundId: command.refundId,
+          draftVersion: 1,
+          changed: true,
         },
-      ],
-    });
+        job_status: "succeeded",
+        attempts: 1,
+        last_error: null,
+      });
+      await expect(
+        ownerDatabaseClient.pool.query(
+          `
+        select count(*)::integer as count from audit_events
+        where action like 'financial.admin_command.%' and resource_id = $1
+      `,
+          [submitted.commandId],
+        ),
+      ).resolves.toMatchObject({ rows: [{ count: 0 }] });
 
-    await setAdminRole(databaseClient.db, {
-      actor: roleAdministrator,
-      targetUserId: actor.id,
-      enabled: true,
-      correlationId: `financial-admin-regrant-${randomUUID()}`,
-    });
-    const status = await getFinancialAdminCommandStatus(
-      databaseClient.db,
-      actor,
-      submitted.commandId,
-    );
-    expect(status).toMatchObject({
-      status: "succeeded",
-      resultCode: "draft_saved",
-      result: { refundId: command.refundId, draftVersion: 1, changed: true },
-    });
-    expect(JSON.stringify(status)).not.toMatch(FORBIDDEN_STATUS_FIELDS);
-  }, 15_000);
+      await expectNoSentinelPersistenceLeaks(secret, secretDigest);
+      const capturedErrorText = inspect(capturedErrors, { depth: null });
+      assertSentinelAbsent(
+        "captured errors",
+        capturedErrorText,
+        privateSentinelValues,
+      );
+      const claimState = await ownerDatabaseClient.pool.query<{
+        state: string;
+        capability_sha256: string;
+        invalidated: boolean;
+      }>(
+        `
+        select state, capability_sha256, invalidated_at is not null as invalidated
+        from financial_admin_job_claims where job_id = $1
+      `,
+        [(await commandAndJob(submitted.commandId)).job_id],
+      );
+      if (
+        claimState.rows.length !== 1 ||
+        claimState.rows[0]?.state !== "invalidated" ||
+        claimState.rows[0]?.capability_sha256 !== secretDigest ||
+        claimState.rows[0]?.invalidated !== true
+      ) {
+        throw new Error("The sentinel claim did not retain its exact invalidated digest");
+      }
+
+      await setAdminRole(databaseClient.db, {
+        actor: roleAdministrator,
+        targetUserId: actor.id,
+        enabled: true,
+        correlationId: `financial-admin-regrant-${randomUUID()}`,
+      });
+      roleRegranted = true;
+      const status = await getFinancialAdminCommandStatus(
+        databaseClient.db,
+        actor,
+        submitted.commandId,
+      );
+      expect(status).toMatchObject({
+        status: "succeeded",
+        resultCode: "draft_saved",
+        result: { refundId: command.refundId, draftVersion: 1, changed: true },
+      });
+      expect(JSON.stringify(status)).not.toMatch(FORBIDDEN_STATUS_FIELDS);
+      assertCommercePrivacy(
+        "financial status",
+        status,
+        privateSentinelValues,
+      );
+
+      vi.doMock("$lib/server/db/runtime", () => ({
+        getDatabaseClient: () => databaseClient,
+      }));
+      runtimeDatabaseMocked = true;
+      const statusRoute = await import(
+        "../../src/routes/admin/sales/commands/[commandId]/+server"
+      );
+      const statusUrl = new URL(
+        `/admin/sales/commands/${submitted.commandId}`,
+        applicationConfig.origin,
+      );
+      const endpointResponse = await statusRoute.GET({
+        locals: { actor },
+        params: { commandId: submitted.commandId },
+        request: new Request(statusUrl, {
+          headers: {
+            origin: statusUrl.origin,
+            "sec-fetch-site": "same-origin",
+          },
+        }),
+      } as never);
+      if (!(endpointResponse instanceof Response)) {
+        throw new Error("Financial command status endpoint returned no Response");
+      }
+      const endpointHeaders = Object.fromEntries(endpointResponse.headers.entries());
+      const endpointBody = await endpointResponse.text();
+      expect(endpointResponse.status).toBe(200);
+      assertCommercePrivacy(
+        "financial status",
+        { body: endpointBody, headers: endpointHeaders },
+        privateSentinelValues,
+      );
+      const endpointStatus = parseFinancialAdminCommandStatus(
+        JSON.parse(endpointBody) as unknown,
+      );
+
+      const { default: FinancialCommandStatus } = await import(
+        "$lib/components/admin/FinancialCommandStatus.svelte"
+      );
+      const statusHtml = render(FinancialCommandStatus, {
+        props: { command: endpointStatus },
+      }).body;
+      assertCommercePrivacy(
+        "financial html",
+        statusHtml,
+        privateSentinelValues,
+      );
+
+      const { chromium } = await import("@playwright/test");
+      browser = await chromium.launch({ headless: true, timeout: 15_000 });
+      browserContext = await within(
+        browser.newContext(),
+        5_000,
+        "Timed out creating the sentinel browser context",
+      );
+      browserPage = await within(
+        browserContext.newPage(),
+        5_000,
+        "Timed out creating the sentinel browser page",
+      );
+      await within(
+        browserPage.setContent(statusHtml, { waitUntil: "domcontentloaded" }),
+        10_000,
+        "Timed out loading the sentinel status HTML",
+      );
+      const [browserHtml, browserText] = await Promise.all([
+        within(
+          browserPage.content(),
+          5_000,
+          "Timed out reading the sentinel browser HTML",
+        ),
+        within(
+          browserPage.locator("body").innerText(),
+          5_000,
+          "Timed out reading the sentinel browser text",
+        ),
+      ]);
+      assertCommercePrivacy(
+        "financial browser",
+        { html: browserHtml, text: browserText },
+        privateSentinelValues,
+      );
+
+      const csvExport = await exportSalesCsv(
+        databaseClient.db,
+        actor,
+        { range: "all", sort: "gross_desc", pageSize: 50 },
+        {
+          correlationId: `financial-admin-sentinel-export-${randomUUID()}`,
+          requestMetadata: {
+            method: "GET",
+            routeId: "/admin/sales/export.csv",
+          },
+        },
+      );
+      const csvText = new TextDecoder().decode(csvExport.bytes);
+      assertCommercePrivacy(
+        "financial csv",
+        csvText,
+        privateSentinelValues,
+      );
+
+      const restoreVerifier = await runExecutableRestoreVerifier();
+      assertSentinelAbsent(
+        "restore-verifier stdout",
+        restoreVerifier.stdout,
+        privateSentinelValues,
+      );
+      assertSentinelAbsent(
+        "restore-verifier stderr",
+        restoreVerifier.stderr,
+        privateSentinelValues,
+      );
+      if (restoreVerifier.error !== null) {
+        throw new Error("Executable restore verifier did not exit cleanly");
+      }
+      expect(restoreVerifier.stdout).toContain(
+        "[restore-verifier] executable SQL returned zero structural violations",
+      );
+      await expectNoSentinelPersistenceLeaks(secret, secretDigest);
+    } catch (error: unknown) {
+      testFailure = error;
+    } finally {
+      if (runtimeDatabaseMocked) vi.doUnmock("$lib/server/db/runtime");
+      const browserCleanupFailure = await closeBrowserEvidenceResources({
+        page: browserPage,
+        context: browserContext,
+        browser,
+      });
+      cleanupFailure ??= browserCleanupFailure;
+      workerController.abort();
+      releaseExecutor.resolve();
+      const cleanup = await Promise.allSettled([
+        within(worker, 5_000, "Timed out cleaning up the sentinel command worker"),
+        ...(demotion === undefined
+          ? []
+          : [within(demotion, 5_000, "Timed out cleaning up sentinel demotion")]),
+      ]);
+      const workerCleanupFailure = cleanup.find(
+        (outcome): outcome is PromiseRejectedResult => outcome.status === "rejected",
+      )?.reason;
+      cleanupFailure ??= workerCleanupFailure;
+      if (demotion !== undefined && !roleRegranted) {
+        try {
+          await within(
+            setAdminRole(databaseClient.db, {
+              actor: roleAdministrator,
+              targetUserId: actor.id,
+              enabled: true,
+              correlationId: `financial-admin-regrant-cleanup-${randomUUID()}`,
+            }),
+            5_000,
+            "Timed out restoring the sentinel administrator role",
+          );
+        } catch (error: unknown) {
+          cleanupFailure ??= error;
+        }
+      }
+      try {
+        assertSentinelAbsent(
+          "captured errors after artifact generation and cleanup",
+          inspect(capturedErrors, { depth: null }),
+          privateSentinelValues,
+        );
+      } catch (error: unknown) {
+        cleanupFailure ??= error;
+      }
+      errorSpy.mockRestore();
+    }
+    if (testFailure !== undefined) throw testFailure;
+    if (cleanupFailure !== undefined) throw cleanupFailure;
+  }, 90_000);
 
   it("denies a demoted administrator, then safely replays the crash window with a rotated token", async () => {
     const actor = await createAdministrator("denied-target");
@@ -636,7 +1488,13 @@ describe("financial administrator command PostgreSQL lifecycle", () => {
       "denied-role-authority",
     );
     const command = draftCommand();
-    const submitted = await submitDraft(actor, command);
+    const correlationId = `financial-admin-denied-${randomUUID()}`;
+    const submitted = await submitDraft(
+      actor,
+      command,
+      randomUUID(),
+      correlationId,
+    );
     await setAdminRole(databaseClient.db, {
       actor: roleAdministrator,
       targetUserId: actor.id,
@@ -714,15 +1572,20 @@ describe("financial administrator command PostgreSQL lifecycle", () => {
       job_status: "failed",
       attempts: 2,
     });
-    await expect(
-      ownerDatabaseClient.pool.query(
-        `
-      select count(*)::integer as count from audit_events
-      where action = 'financial.admin_command.denied' and resource_id = $1
-    `,
-        [submitted.commandId],
-      ),
-    ).resolves.toMatchObject({ rows: [{ count: 1 }] });
+    const deniedAudits = await commandAuditRows(submitted.commandId);
+    expectMinimalTerminalAudit({
+      auditRows: deniedAudits,
+      actor,
+      commandId: submitted.commandId,
+      commandKind: command.kind,
+      correlationId,
+      status: "denied",
+      safeResultCode: "capability_revoked",
+    });
+    const minimized = JSON.stringify(deniedAudits);
+    expect(minimized).not.toContain(command.refundId);
+    expect(minimized).not.toContain(command.items[0]!.orderItemId);
+    expect(minimized).not.toContain("privateInput");
     const linked = await commandAndJob(submitted.commandId);
     await expect(
       postgresRepository.renewLease(
@@ -736,7 +1599,13 @@ describe("financial administrator command PostgreSQL lifecycle", () => {
   it("retries transient executor failures and synchronizes failed/command_failed only at exhaustion", async () => {
     const actor = await createAdministrator("transient-owner");
     const command = draftCommand();
-    const submitted = await submitDraft(actor, command);
+    const correlationId = `financial-admin-failed-${randomUUID()}`;
+    const submitted = await submitDraft(
+      actor,
+      command,
+      randomUUID(),
+      correlationId,
+    );
     const issuedTokens: string[] = [];
     let generation = 0;
     const postgresRepository = createPostgresJobRepository(
@@ -756,10 +1625,10 @@ describe("financial administrator command PostgreSQL lifecycle", () => {
         return token;
       },
     );
+    const privateOperationalDetail =
+      "private operational detail must remain transient and hidden";
     const executor = vi.fn<FinancialAdminCommandExecutor>(async () => {
-      throw new Error(
-        "private operational detail must remain transient and hidden",
-      );
+      throw new Error(privateOperationalDetail);
     });
     const handler = createFinancialAdminCommandHandler({
       database: workerDatabaseClient.db,
@@ -807,17 +1676,23 @@ describe("financial administrator command PostgreSQL lifecycle", () => {
       attempts: 8,
       last_error: "Transient job handler failure",
     });
-    await expect(
-      ownerDatabaseClient.pool.query(
-        `
-      select count(*)::integer as count from audit_events
-      where action = 'financial.admin_command.failed' and resource_id = $1
-    `,
-        [submitted.commandId],
-      ),
-    ).resolves.toMatchObject({ rows: [{ count: 1 }] });
+    const failedAudits = await commandAuditRows(submitted.commandId);
+    expectMinimalTerminalAudit({
+      auditRows: failedAudits,
+      actor,
+      commandId: submitted.commandId,
+      commandKind: command.kind,
+      correlationId,
+      status: "failed",
+      safeResultCode: "command_failed",
+    });
+    const minimized = JSON.stringify(failedAudits);
+    expect(minimized).not.toContain(command.refundId);
+    expect(minimized).not.toContain(command.items[0]!.orderItemId);
+    expect(minimized).not.toContain(privateOperationalDetail);
+    expect(minimized).not.toContain("privateInput");
     const persisted = JSON.stringify(await commandAndJob(submitted.commandId));
     for (const token of issuedTokens) expect(persisted).not.toContain(token);
-    expect(persisted).not.toContain("private operational detail");
+    expect(persisted).not.toContain(privateOperationalDetail);
   }, 20_000);
 });

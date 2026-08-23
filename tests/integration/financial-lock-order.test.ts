@@ -17,6 +17,8 @@ import {
 import {
   submitFinancialAdminCommand
 } from '$lib/server/commerce/financial/admin-commands/repository';
+import type { FinancialAdminPrivateCommand } from
+  '$lib/server/commerce/financial/admin-commands/contracts';
 import {
   persistFinancialAllocationPlanLocked
 } from '$lib/server/commerce/financial/allocations/repository';
@@ -32,16 +34,22 @@ import {
   type FinancialProjectionLockInput
 } from '$lib/server/commerce/financial/locks';
 import {
-  lockFinancialProjectionAuthority
+  lockFinancialProjectionAuthority,
+  replayFinancialClassification
 } from '$lib/server/commerce/financial/rebase';
 import { executeReportingCorrectionCreate } from
   '$lib/server/commerce/financial/refund-review/corrections';
+import {
+  executeRefundDraftDiscard,
+  executeRefundDraftSave
+} from '$lib/server/commerce/financial/refund-review/drafts';
 import { executeRefundAllocationFinalize } from '$lib/server/commerce/financial/refund-review/finalize';
 import { executeAdministrativeRecoveryActivate } from
   '$lib/server/commerce/financial/refund-review/recovery';
 import { lockOrder } from '$lib/server/commerce/lock';
 import { lockPaymentPurchaseFacts } from '$lib/server/commerce/reconciliation';
 import {
+  disputes,
   entitlementGrants,
   orderItems,
   orders,
@@ -57,9 +65,10 @@ import {
   titles,
   user
 } from '$lib/server/db/schema';
+import type { Database } from '$lib/server/db/client';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
 import { createPostgresJobRepository } from '$lib/server/jobs/repository';
-import { runWorker } from '$lib/server/jobs/runner';
+import { PermanentJobError, runWorker } from '$lib/server/jobs/runner';
 import {
   applicationConfig,
   databaseClient as runtimeDatabaseClient,
@@ -99,12 +108,32 @@ interface Blocker {
   released: boolean;
 }
 
+interface DraftTailLockSet {
+  readonly balanceTransactionId: string;
+  readonly payoutId: string;
+  readonly classificationId: string;
+  readonly allocationSets: readonly {
+    readonly id: string;
+    readonly basis: 'gross_amount' | 'fee';
+  }[];
+  readonly issueId: string;
+  readonly issueResourceId: string;
+  readonly currentCorrectionSetId: string;
+}
+
 type CorrectionBarrierStageId =
+  | 'administrator-role-advisory'
+  | 'financial-admin-job-lease'
+  | 'command-row'
   | 'projection-authority'
   | 'order-advisory'
   | 'order-row'
   | 'payment-row'
   | 'refund-row'
+  | `refund-allocation-row-${number}`
+  | `refund-component-row-${number}`
+  | 'current-correction-row'
+  | 'order-item-row'
   | 'projection-enrollment'
   | `payout-advisory-${number}`
   | `payout-row-${number}`
@@ -184,8 +213,14 @@ interface CorrectionLockFixture {
   readonly actor: AdministratorActor;
   readonly commandId: string;
   readonly refundIds: readonly string[];
+  readonly refundAllocationIds: readonly string[];
+  readonly refundComponentIds: readonly string[];
+  readonly currentCorrectionSetId: string;
   readonly payoutIds: readonly string[];
-  readonly balanceTransactions: readonly { readonly id: string }[];
+  readonly balanceTransactions: readonly {
+    readonly id: string;
+    readonly fingerprint: string;
+  }[];
   readonly classifications: readonly {
     readonly id: string;
     readonly subjectId: string;
@@ -204,6 +239,7 @@ interface CorrectionLockFixture {
 interface CorrectionProjectionFixture {
   readonly balanceTransactionId: string;
   readonly classificationId: string;
+  readonly fingerprint: string;
   readonly grossAllocationSetId: string;
   readonly feeAllocationSetId: string;
 }
@@ -213,8 +249,24 @@ interface CorrectionWorkerProbe {
   abort(): void;
 }
 
+interface PreparedCorrectionWorkerProbe {
+  readonly jobId: string;
+  start(): CorrectionWorkerProbe;
+  dispose(): Promise<void>;
+}
+
 interface RecoveryWorkerProbe extends CorrectionWorkerProbe {
   readonly commandId: string;
+}
+
+interface RefundCommandWorkerProbe extends CorrectionWorkerProbe {
+  readonly commandId: string;
+}
+
+interface PreparedRefundCommandWorkerProbe {
+  readonly commandId: string;
+  start(): RefundCommandWorkerProbe;
+  dispose(): Promise<void>;
 }
 
 interface CorrectionDomainSnapshot {
@@ -247,6 +299,17 @@ interface CorrectionCommandLifecycle {
   readonly attempts: number;
   readonly last_error: string | null;
   readonly command_audit_count: number;
+}
+
+interface AdminCommandTerminalLifecycle {
+  readonly commandKind: string;
+  readonly commandStatus: string;
+  readonly safeResultCode: string | null;
+  readonly safeResult: unknown;
+  readonly jobStatus: string;
+  readonly attempts: number;
+  readonly lastError: string | null;
+  readonly auditActions: string[];
 }
 
 interface RefundFinalizationProbeSnapshot {
@@ -323,6 +386,26 @@ async function configureProbe(
   return pid;
 }
 
+function namedTransactionDatabase(
+  database: Database,
+  applicationName: string,
+  entered: Deferred<number>
+): Database {
+  return new Proxy(database, {
+    get(target, property) {
+      if (property === 'transaction') {
+        return (work: (transaction: DatabaseTransaction) => Promise<unknown>) =>
+          database.transaction(async (transaction) => {
+            await configureProbe(transaction, applicationName, entered);
+            return work(transaction);
+          });
+      }
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  });
+}
+
 function observe(promise: Promise<unknown>): void {
   void promise.catch(() => undefined);
 }
@@ -375,7 +458,7 @@ async function waitForBlockedQuery(
   queryFragment: string
 ): Promise<readonly number[]> {
   for (let attempt = 0; attempt < 200; attempt += 1) {
-    const result = await databaseClient.pool.query<{
+    const result = await ownerDatabaseClient.pool.query<{
       blockers: number[];
       query: string;
       waitEventType: string | null;
@@ -426,8 +509,16 @@ async function beginBlocker(
     await client.query(query, [...parameters]);
     return { client, pid, released: false };
   } catch (error) {
-    await client.query('rollback').catch(() => undefined);
-    client.release();
+    try {
+      await within(
+        client.query('rollback'),
+        5_000,
+        `Timed out rolling back failed blocker ${applicationName}`
+      );
+      client.release();
+    } catch {
+      client.release(true);
+    }
     throw error;
   }
 }
@@ -436,9 +527,104 @@ async function releaseBlocker(blocker: Blocker): Promise<void> {
   if (blocker.released) return;
   blocker.released = true;
   try {
-    await blocker.client.query('rollback');
-  } finally {
+    await within(
+      blocker.client.query('rollback'),
+      5_000,
+      `Timed out releasing blocker PID ${blocker.pid}`
+    );
     blocker.client.release();
+  } catch (error) {
+    blocker.client.release(true);
+    throw error;
+  }
+}
+
+async function beginDraftTailBlocker(
+  applicationName: string,
+  purchase: PurchaseFixture,
+  tail: DraftTailLockSet
+): Promise<Blocker> {
+  const blocker = await beginBlocker(
+    applicationName,
+    `select singleton from financial_projection_versions
+      where singleton = true for update`,
+    []
+  );
+  try {
+    await blocker.client.query(
+      'select pg_advisory_xact_lock(hashtextextended($1, 0))',
+      ['pale-orbit:financial:replay-enrollment']
+    );
+    await blocker.client.query(
+      'select pg_advisory_xact_lock(hashtextextended($1, 0))',
+      [`pale-orbit:financial:payout:${tail.payoutId}`]
+    );
+    await blocker.client.query(
+      'select id from stripe_payouts where id = $1 for update',
+      [tail.payoutId]
+    );
+    await blocker.client.query(
+      'select pg_advisory_xact_lock(hashtextextended($1, 0))',
+      [`pale-orbit:financial:balance-transaction:${tail.balanceTransactionId}`]
+    );
+    await blocker.client.query(
+      'select id from stripe_balance_transactions where id = $1 for update',
+      [tail.balanceTransactionId]
+    );
+    await blocker.client.query(
+      'select pg_advisory_xact_lock(hashtextextended($1, 0))',
+      [
+        `pale-orbit:financial:classification:balance_transaction:` +
+          tail.balanceTransactionId
+      ]
+    );
+    await blocker.client.query(
+      'select id from financial_classification_versions where id = $1 for update',
+      [tail.classificationId]
+    );
+    for (const allocation of [...tail.allocationSets].sort((left, right) =>
+      left.basis === right.basis ? 0 : left.basis === 'gross_amount' ? -1 : 1
+    )) {
+      await blocker.client.query(
+        'select pg_advisory_xact_lock(hashtextextended($1, 0))',
+        [
+          `pale-orbit:financial:allocation:${tail.balanceTransactionId}:` +
+            allocation.basis
+        ]
+      );
+    }
+    await blocker.client.query(
+      `select id from financial_allocation_sets
+       where id = any($1::uuid[]) order by id for update`,
+      [tail.allocationSets.map((allocation) => allocation.id).sort()]
+    );
+    await blocker.client.query(
+      'select pg_advisory_xact_lock(hashtext($1))',
+      [
+        `pale-orbit:financial:issue:allocation_set:${tail.issueResourceId}:` +
+          'correction_rebase_required'
+      ]
+    );
+    await blocker.client.query(
+      'select id from financial_reconciliation_issues where id = $1 for update',
+      [tail.issueId]
+    );
+    await blocker.client.query(
+      'select id from refund_reporting_correction_sets where id = $1 for update',
+      [tail.currentCorrectionSetId]
+    );
+    await blocker.client.query(
+      'select pg_advisory_xact_lock(hashtextextended($1, 0))',
+      [`pale-orbit:commerce:entitlement:${purchase.userId}:${purchase.titleId}`]
+    );
+    await blocker.client.query(
+      'select id from entitlement_grants where id = $1 for update',
+      [purchase.grantId]
+    );
+    return blocker;
+  } catch (error) {
+    await releaseBlocker(blocker).catch(() => undefined);
+    throw error;
   }
 }
 
@@ -488,13 +674,20 @@ async function beginCorrectionBarrier(
       closed: false
     };
   } catch (error) {
-    await Promise.allSettled(blockers.map(async (blocker) => {
-      await blocker.client.query('rollback').catch(() => undefined);
-      if (!blocker.released) {
-        blocker.released = true;
+    await within(Promise.allSettled(blockers.map(async (blocker) => {
+      if (blocker.released) return;
+      blocker.released = true;
+      try {
+        await within(
+          blocker.client.query('rollback'),
+          5_000,
+          `Timed out rolling back correction blocker PID ${blocker.pid}`
+        );
         blocker.client.release();
+      } catch {
+        blocker.client.release(true);
       }
-    }));
+    })), 7_500, 'Timed out cleaning up failed correction-barrier setup');
     throw error;
   }
 }
@@ -508,8 +701,10 @@ async function releaseCorrectionBarrierStage(
   }
   const blocker = barrier.blockers[stage.blockerSlot];
   const savepoint = correctionSavepoint(stage.id);
-  await blocker.client.query(`rollback to savepoint ${savepoint}`);
-  await blocker.client.query(`release savepoint ${savepoint}`);
+  await within((async () => {
+    await blocker.client.query(`rollback to savepoint ${savepoint}`);
+    await blocker.client.query(`release savepoint ${savepoint}`);
+  })(), 5_000, `Timed out releasing correction barrier stage ${stage.id}`);
   barrier.nextRelease += 1;
 }
 
@@ -536,7 +731,7 @@ async function releaseCorrectionBarrier(barrier: CorrectionBarrier): Promise<voi
 }
 
 async function readPostgresLocks(pid: number): Promise<readonly ObservedPostgresLock[]> {
-  const result = await databaseClient.pool.query<ObservedPostgresLock>(`
+  const result = await ownerDatabaseClient.pool.query<ObservedPostgresLock>(`
     select locktype, database, relation::regclass::text as relation, page, tuple,
       classid, objid, objsubid, virtualxid, transactionid::text as transactionid,
       mode, granted
@@ -600,7 +795,7 @@ async function waitForCorrectionBarrierStage(
   const blocker = barrier.blockers[stage.blockerSlot];
   const wait = async () => {
     for (let attempt = 0; attempt < 200; attempt += 1) {
-      const result = await databaseClient.pool.query<{
+      const result = await ownerDatabaseClient.pool.query<{
         blockers: number[];
         query: string;
         waitEvent: string | null;
@@ -612,7 +807,8 @@ async function waitForCorrectionBarrierStage(
         where pid = $1 and application_name = $2
       `, [pid, applicationName]);
       const row = result.rows[0];
-      if (row?.waitEventType === 'Lock' && row.blockers.includes(blocker.pid)) {
+      if (row?.waitEventType === 'Lock') {
+        expect(row.blockers).toEqual([blocker.pid]);
         const normalized = row.query.replace(/\s+/gu, ' ').toLowerCase();
         expect(normalized).toContain(stage.expectedQueryFragment.toLowerCase());
         const [waitingLocks, blockingLocks] = await Promise.all([
@@ -950,9 +1146,41 @@ async function createCorrectionProjectionFixture(input: {
   return {
     balanceTransactionId: staged.balanceTransactionId,
     classificationId: projection.classificationId,
+    fingerprint: balance.fingerprint,
     grossAllocationSetId: projection.grossSetId,
     feeAllocationSetId: projection.feeSetId
   };
+}
+
+async function createCurrentCorrectionSentinel(
+  approvedByAdminId: string,
+  label: string
+): Promise<string> {
+  const purchase = await createPurchaseFixture(`ch_${label}_${randomUUID()}`);
+  const projection = await createCorrectionProjectionFixture({
+    label,
+    refundId: purchase.refundId,
+    stripeRefundId: purchase.stripeRefundId,
+    orderItemId: purchase.itemId,
+    totalMinor: 100
+  });
+  const result = await databaseClient.pool.query<{ id: string }>(`
+    insert into refund_reporting_correction_sets (
+      refund_id, correction_version, kind, base_allocation_set_id,
+      source_fingerprint_sha256, approved_by_admin_id, created_by_admin_id,
+      correlation_id
+    ) values ($1, 1, 'allocation_attribution_correction', $2, $3, $4, $4, $5)
+    returning id
+  `, [
+    purchase.refundId,
+    projection.grossAllocationSetId,
+    projection.fingerprint,
+    approvedByAdminId,
+    `${label}-current-correction`
+  ]);
+  const id = result.rows[0]?.id;
+  if (typeof id !== 'string') throw new Error('Expected current-correction sentinel');
+  return id;
 }
 
 async function createCorrectionLockFixture(label: string): Promise<CorrectionLockFixture> {
@@ -1000,7 +1228,7 @@ async function createCorrectionLockFixture(label: string): Promise<CorrectionLoc
   if (!targetAllocation || !siblingAllocation) {
     throw new Error('Expected both correction refund allocations');
   }
-  await ownerDatabaseClient.db.insert(refundAllocationComponents).values([
+  const componentRows = await ownerDatabaseClient.db.insert(refundAllocationComponents).values([
     {
       refundAllocationId: targetAllocation.id,
       refundId: purchase.refundId,
@@ -1019,7 +1247,7 @@ async function createCorrectionLockFixture(label: string): Promise<CorrectionLoc
       totalMinor,
       currency: 'USD'
     }
-  ]);
+  ]).returning({ id: refundAllocationComponents.id });
 
   const targetProjection = await createCorrectionProjectionFixture({
     label: `${label}-target`,
@@ -1036,6 +1264,24 @@ async function createCorrectionLockFixture(label: string): Promise<CorrectionLoc
     totalMinor
   });
   const projections = [targetProjection, siblingProjection] as const;
+  const currentCorrection = await databaseClient.pool.query<{ id: string }>(`
+    insert into refund_reporting_correction_sets (
+      refund_id, correction_version, kind, base_allocation_set_id,
+      source_fingerprint_sha256, approved_by_admin_id, created_by_admin_id,
+      correlation_id
+    ) values ($1, 1, 'allocation_attribution_correction', $2, $3, $4, $4, $5)
+    returning id
+  `, [
+    purchase.refundId,
+    targetProjection.grossAllocationSetId,
+    targetProjection.fingerprint,
+    purchase.userId,
+    `${label}-current-correction`
+  ]);
+  const currentCorrectionSetId = currentCorrection.rows[0]?.id;
+  if (typeof currentCorrectionSetId !== 'string') {
+    throw new Error('Expected current reporting-correction fixture');
+  }
   const issues = [];
   for (const [index, projection] of projections.entries()) {
     const issue = await databaseClient.db.transaction((transaction) =>
@@ -1064,7 +1310,7 @@ async function createCorrectionLockFixture(label: string): Promise<CorrectionLoc
       kind: 'refund_reporting_correction_create',
       refundId: purchase.refundId,
       reason: 'allocation_attribution_correction',
-      expectedNextCorrectionVersion: 1,
+      expectedNextCorrectionVersion: 2,
       expectedBaseAllocationSetId: targetProjection.grossAllocationSetId,
       expectedSourceFingerprint: 'f'.repeat(64),
       items: [{ orderItemId: purchase.itemId, totalPresentmentMinor: totalMinor }],
@@ -1079,9 +1325,13 @@ async function createCorrectionLockFixture(label: string): Promise<CorrectionLoc
     actor,
     commandId: submitted.commandId,
     refundIds: [purchase.refundId, siblingRefund.id],
+    refundAllocationIds: allocationRows.map((row) => row.id),
+    refundComponentIds: componentRows.map((row) => row.id),
+    currentCorrectionSetId,
     payoutIds: payouts.map((payout) => payout.payoutId),
     balanceTransactions: projections.map((projection) => ({
-      id: projection.balanceTransactionId
+      id: projection.balanceTransactionId,
+      fingerprint: projection.fingerprint
     })),
     classifications: projections.map((projection) => ({
       id: projection.classificationId,
@@ -1221,26 +1471,70 @@ async function readCorrectionCommandLifecycle(
   return row;
 }
 
+async function readAdminCommandTerminalLifecycle(
+  commandId: string
+): Promise<AdminCommandTerminalLifecycle> {
+  const result = await ownerDatabaseClient.pool.query<AdminCommandTerminalLifecycle>(`
+    select command.kind::text as "commandKind",
+      command.status::text as "commandStatus",
+      command.safe_result_code as "safeResultCode",
+      command.safe_result as "safeResult",
+      job.status::text as "jobStatus", job.attempts,
+      job.last_error as "lastError",
+      coalesce((
+        select array_agg(audit.action order by audit.id)
+        from audit_events audit
+        where audit.resource_type = 'financial_admin_command'
+          and audit.resource_id = command.id::text
+          and audit.action like 'financial.admin_command.%'
+      ), array[]::text[]) as "auditActions"
+    from financial_admin_commands command
+    join jobs job on job.id = command.job_id
+    where command.id = $1
+  `, [commandId]);
+  const row = result.rows[0];
+  if (!row || result.rows.length !== 1) {
+    throw new Error('Expected one financial administrator command lifecycle');
+  }
+  return row;
+}
+
+function expectConflictLifecycle(
+  lifecycle: AdminCommandTerminalLifecycle,
+  commandKind: string,
+  safeResultCode: 'not_eligible' | 'stale_state'
+): void {
+  expect(lifecycle).toEqual({
+    commandKind,
+    commandStatus: 'conflict',
+    safeResultCode,
+    safeResult: null,
+    jobStatus: 'failed',
+    attempts: 1,
+    lastError: 'Financial administrator command conflicted with current state.',
+    auditActions: ['financial.admin_command.conflict']
+  });
+}
+
 function unexpectedFinancialAdminExecutor(label: string): FinancialAdminCommandExecutor {
   return async () => {
     throw new Error(`Unexpected ${label} executor in reporting-correction lock probe`);
   };
 }
 
-function runCorrectionWorkerProbe(
+async function prepareCorrectionWorkerProbe(
   applicationName: string,
   fixture: CorrectionLockFixture,
   entered: Deferred<number>
-): CorrectionWorkerProbe {
+): Promise<PreparedCorrectionWorkerProbe> {
   const reportingCorrection: FinancialAdminCommandExecutor = async (context, command) => {
     if (command.kind !== 'refund_reporting_correction_create') {
       throw new Error('Reporting-correction probe received another command kind');
     }
-    await configureProbe(context.transaction, applicationName, entered);
     return executeReportingCorrectionCreate(context, command);
   };
   const handler = createFinancialAdminCommandHandler({
-    database: databaseClient.db,
+    database: namedTransactionDatabase(databaseClient.db, applicationName, entered),
     executors: createFinancialAdminCommandExecutors({
       refundDraftSave: unexpectedFinancialAdminExecutor('draft-save'),
       refundDraftDiscard: unexpectedFinancialAdminExecutor('draft-discard'),
@@ -1265,22 +1559,194 @@ function runCorrectionWorkerProbe(
     },
     () => leaseCapability
   );
-  const controller = new AbortController();
-  let polls = 0;
-  const operation = runWorker({
-    repository,
-    handlers: new Map([[FINANCIAL_ADMIN_COMMAND_JOB, handler]]),
-    workerId: `correction-lock-${fixture.commandId}`,
-    concurrency: 1,
-    pollIntervalMs: 1,
-    heartbeatIntervalMs: 250,
-    signal: controller.signal,
-    beforePoll: async () => {
-      polls += 1;
-      if (polls === 2) controller.abort();
+  const workerId = `correction-lock-${fixture.commandId}`;
+  const job = await repository.claimNext(workerId);
+  expect(job).not.toBeNull();
+  expect(job?.payload).toEqual({ commandId: fixture.commandId });
+  if (!job?.financialAdminLeaseCapability) {
+    throw new Error('Expected reporting-correction lease capability');
+  }
+  let started = false;
+  return {
+    jobId: job.id,
+    start: () => {
+      if (started) throw new Error('Reporting-correction probe already started');
+      started = true;
+      const controller = new AbortController();
+      const operation = (async () => {
+        try {
+          await handler(job, controller.signal);
+          if (!await repository.complete(
+            job.id,
+            workerId,
+            job.financialAdminLeaseCapability
+          )) {
+            throw new Error('Reporting-correction job completion lost its lease');
+          }
+        } catch (error: unknown) {
+          const failed = await repository.fail(
+            job.id,
+            workerId,
+            error instanceof PermanentJobError
+              ? error.safeMessage
+              : 'Transient reporting-correction lock probe failure',
+            !(error instanceof PermanentJobError),
+            job.financialAdminLeaseCapability
+          );
+          if (!failed) throw error;
+        }
+      })();
+      observe(operation);
+      return { operation, abort: () => controller.abort() };
+    },
+    dispose: async () => {
+      if (started) return;
+      started = true;
+      if (!await repository.fail(
+        job.id,
+        workerId,
+        'Reporting-correction lock probe setup was abandoned.',
+        false,
+        job.financialAdminLeaseCapability
+      )) {
+        throw new Error('Unable to dispose reporting-correction lock probe');
+      }
     }
+  };
+}
+
+async function prepareRefundCommandWorkerProbe(
+  applicationName: string,
+  purchase: PurchaseFixture,
+  command: Extract<FinancialAdminPrivateCommand, {
+    kind: 'refund_draft_save' | 'refund_draft_discard' | 'refund_allocation_finalize';
+  }>,
+  entered: Deferred<number>
+): Promise<PreparedRefundCommandWorkerProbe> {
+  const submitted = await submitFinancialAdminCommand(runtimeDatabaseClient.db, {
+    actor: { type: 'user', id: purchase.userId, roles: ['admin'] },
+    idempotencyKey: randomUUID(),
+    command,
+    context: { correlationId: `${applicationName}-${purchase.refundId}` }
   });
-  return { operation, abort: () => controller.abort() };
+  expect(submitted.status).toBe('pending');
+  const named = (
+    expectedKind: typeof command.kind,
+    executor: FinancialAdminCommandExecutor
+  ): FinancialAdminCommandExecutor => async (context, privateCommand) => {
+    if (privateCommand.kind !== expectedKind) {
+      throw new Error(`${applicationName} received another command kind`);
+    }
+    return executor(context, privateCommand);
+  };
+  const handler = createFinancialAdminCommandHandler({
+    database: namedTransactionDatabase(databaseClient.db, applicationName, entered),
+    executors: createFinancialAdminCommandExecutors({
+      refundDraftSave: named(
+        'refund_draft_save',
+        executeRefundDraftSave as FinancialAdminCommandExecutor
+      ),
+      refundDraftDiscard: named(
+        'refund_draft_discard',
+        executeRefundDraftDiscard as FinancialAdminCommandExecutor
+      ),
+      refundAllocationFinalize: named(
+        'refund_allocation_finalize',
+        executeRefundAllocationFinalize as FinancialAdminCommandExecutor
+      ),
+      refundReportingCorrectionCreate: unexpectedFinancialAdminExecutor('correction'),
+      administrativeRecoveryActivate: unexpectedFinancialAdminExecutor('recovery-activate'),
+      administrativeRecoveryDeactivate: unexpectedFinancialAdminExecutor('recovery-deactivate')
+    }),
+    accessMessages: correctionAccessMessages
+  });
+  const repository = createPostgresJobRepository(
+    databaseClient.db,
+    { ...applicationConfig.jobs, leaseMs: 60_000 },
+    undefined,
+    'local-only',
+    {
+      classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
+    },
+    () => createHash('sha256')
+      .update(`${applicationName}:${submitted.commandId}`)
+      .digest('base64url')
+  );
+  const workerId = `${applicationName}-${submitted.commandId}`;
+  const job = await repository.claimNext(workerId);
+  expect(job).not.toBeNull();
+  expect(job?.payload).toEqual({ commandId: submitted.commandId });
+  if (!job?.financialAdminLeaseCapability) {
+    throw new Error('Expected refund-command lease capability');
+  }
+  let started = false;
+  return {
+    commandId: submitted.commandId,
+    start: () => {
+      if (started) throw new Error(`${applicationName} probe already started`);
+      started = true;
+      const controller = new AbortController();
+      const operation = (async () => {
+        try {
+          await handler(job, controller.signal);
+          if (!await repository.complete(
+            job.id,
+            workerId,
+            job.financialAdminLeaseCapability
+          )) {
+            throw new Error('Refund-command job completion lost its lease');
+          }
+        } catch (error: unknown) {
+          const failed = await repository.fail(
+            job.id,
+            workerId,
+            error instanceof PermanentJobError
+              ? error.safeMessage
+              : 'Transient refund-command lock probe failure',
+            !(error instanceof PermanentJobError),
+            job.financialAdminLeaseCapability
+          );
+          if (!failed) throw error;
+        }
+      })();
+      observe(operation);
+      return {
+        commandId: submitted.commandId,
+        operation,
+        abort: () => controller.abort()
+      };
+    },
+    dispose: async () => {
+      if (started) return;
+      started = true;
+      if (!await repository.fail(
+        job.id,
+        workerId,
+        'Refund-command lock probe setup was abandoned.',
+        false,
+        job.financialAdminLeaseCapability
+      )) {
+        throw new Error('Unable to dispose refund-command lock probe');
+      }
+    }
+  };
+}
+
+async function runRefundCommandWorkerProbe(
+  applicationName: string,
+  purchase: PurchaseFixture,
+  command: Extract<FinancialAdminPrivateCommand, {
+    kind: 'refund_draft_save' | 'refund_draft_discard' | 'refund_allocation_finalize';
+  }>,
+  entered: Deferred<number>
+): Promise<RefundCommandWorkerProbe> {
+  return (await prepareRefundCommandWorkerProbe(
+    applicationName,
+    purchase,
+    command,
+    entered
+  )).start();
 }
 
 async function runRecoveryWorkerProbe(
@@ -1380,7 +1846,8 @@ async function waitForCorrectionExecutorEntry(
 }
 
 function correctionBarrierStages(
-  fixture: CorrectionLockFixture
+  fixture: CorrectionLockFixture,
+  jobId: string
 ): readonly CorrectionBarrierStage[] {
   const compareText = (left: string, right: string) => left < right ? -1 : left > right ? 1 : 0;
   const blockerSlot = (index: number): CorrectionBarrierBlockerSlot =>
@@ -1403,7 +1870,34 @@ function correctionBarrierStages(
   const issues = [...fixture.issues].sort((left, right) =>
     compareText(left.resourceId, right.resourceId)
   );
+  const refundAllocationIds = [...fixture.refundAllocationIds].sort(compareText);
+  const refundComponentIds = [...fixture.refundComponentIds].sort(compareText);
   return [
+    {
+      id: 'administrator-role-advisory',
+      blockerSlot: 0,
+      query: `select pg_advisory_xact_lock(
+        hashtext('pale-orbit:user-roles:admin'))`,
+      parameters: [],
+      expectedQueryFragment: 'pg_advisory_xact_lock',
+      expectedLock: { kind: 'advisory' }
+    },
+    {
+      id: 'financial-admin-job-lease',
+      blockerSlot: 0,
+      query: `select pg_advisory_xact_lock(hashtextextended($1, 0))`,
+      parameters: [`pale-orbit:plan6bii-financial-admin-job-lease:${jobId}`],
+      expectedQueryFragment: 'pg_advisory_xact_lock_shared',
+      expectedLock: { kind: 'advisory' }
+    },
+    {
+      id: 'command-row',
+      blockerSlot: 0,
+      query: 'select id from financial_admin_commands where id = $1 for update',
+      parameters: [fixture.commandId],
+      expectedQueryFragment: 'from "public"."financial_admin_commands"',
+      expectedLock: { kind: 'relation', relation: 'financial_admin_commands' }
+    },
     {
       id: 'projection-authority',
       blockerSlot: 0,
@@ -1444,6 +1938,38 @@ function correctionBarrierStages(
       parameters: [fixture.purchase.refundId],
       expectedQueryFragment: 'from "refunds"',
       expectedLock: { kind: 'relation', relation: 'refunds' }
+    },
+    ...refundAllocationIds.map((id, index): CorrectionBarrierStage => ({
+      id: `refund-allocation-row-${index + 1}`,
+      blockerSlot: blockerSlot(index),
+      query: 'select id from refund_allocations where id = $1 for update',
+      parameters: [id],
+      expectedQueryFragment: 'from "refund_allocations"',
+      expectedLock: { kind: 'relation', relation: 'refund_allocations' }
+    })),
+    ...refundComponentIds.map((id, index): CorrectionBarrierStage => ({
+      id: `refund-component-row-${index + 1}`,
+      blockerSlot: blockerSlot(index),
+      query: 'select id from refund_allocation_components where id = $1 for update',
+      parameters: [id],
+      expectedQueryFragment: 'from "refund_allocation_components"',
+      expectedLock: { kind: 'relation', relation: 'refund_allocation_components' }
+    })),
+    {
+      id: 'current-correction-row',
+      blockerSlot: 0,
+      query: 'select id from refund_reporting_correction_sets where id = $1 for update',
+      parameters: [fixture.currentCorrectionSetId],
+      expectedQueryFragment: 'from "refund_reporting_correction_sets"',
+      expectedLock: { kind: 'relation', relation: 'refund_reporting_correction_sets' }
+    },
+    {
+      id: 'order-item-row',
+      blockerSlot: 1,
+      query: 'select id from order_items where id = $1 for update',
+      parameters: [fixture.purchase.itemId],
+      expectedQueryFragment: 'from "order_items"',
+      expectedLock: { kind: 'relation', relation: 'order_items' }
     },
     {
       id: 'projection-enrollment',
@@ -1643,6 +2169,30 @@ async function replayClassification(
   });
 }
 
+async function replayClassifierRebase(
+  applicationName: string,
+  balanceTransactionId: string,
+  fingerprint: string,
+  entered: Deferred<number>
+): Promise<void> {
+  await replayFinancialClassification({
+    database: namedTransactionDatabase(databaseClient.db, applicationName, entered),
+    targetClassifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+    targetAllocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
+  }, {
+    payload: {
+      subjectType: 'balance_transaction',
+      subjectId: balanceTransactionId,
+      sourceFingerprintSha256: fingerprint,
+      classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+      replayId: `c${FINANCIAL_CLASSIFIER_VERSION}-a${FINANCIAL_ALLOCATION_ALGORITHM_VERSION}`
+    },
+    correlationId: `financial-lock-classifier-rebase-${balanceTransactionId}`,
+    signal: new AbortController().signal
+  });
+}
+
 async function publishPayout(
   applicationName: string,
   payout: PayoutFixture,
@@ -1690,25 +2240,39 @@ describe.each(LOCK_PROBE_REPETITIONS)('financial lock ordering (repetition %i)',
         issueKeys: []
       }, sourceEntered);
       observe(sourceProjection);
-      const sourcePid = await sourceEntered.promise;
-      expect(await waitForBlockedQuery(sourcePid, sourceName, 'from stripe_payouts')).toContain(blocker.pid);
+      const sourcePid = await within(
+        sourceEntered.promise,
+        5_000,
+        'Timed out waiting for payout-source projection entry'
+      );
+      expect(await waitForBlockedQuery(sourcePid, sourceName, 'from stripe_payouts'))
+        .toEqual([blocker.pid]);
 
       impactProjection = lockPayoutImpactProjection(impactName, purchase, payout, impactEntered);
       observe(impactProjection);
-      const impactPid = await impactEntered.promise;
-      expect(await waitForBlockedQuery(impactPid, impactName, 'pg_advisory_xact_lock')).toContain(sourcePid);
+      const impactPid = await within(
+        impactEntered.promise,
+        5_000,
+        'Timed out waiting for payout-impact projection entry'
+      );
+      expect(await waitForBlockedQuery(impactPid, impactName, 'pg_advisory_xact_lock'))
+        .toEqual([sourcePid]);
 
       await releaseBlocker(blocker);
       assertFulfilled(
         ['payment source projection', 'payout-impact projection'],
-        await Promise.allSettled([sourceProjection, impactProjection])
+        await within(
+          Promise.allSettled([sourceProjection, impactProjection]),
+          7_500,
+          'Timed out completing payout-impact/source projections'
+        )
       );
     } finally {
-      await releaseBlocker(blocker).catch(() => undefined);
-      await Promise.allSettled([
+      await within(Promise.allSettled([
+        releaseBlocker(blocker),
         ...(sourceProjection ? [sourceProjection] : []),
         ...(impactProjection ? [impactProjection] : [])
-      ]);
+      ]), 7_500, 'Timed out cleaning up payout-impact/source probes');
     }
   }, 15_000);
 
@@ -1740,12 +2304,16 @@ describe.each(LOCK_PROBE_REPETITIONS)('financial lock ordering (repetition %i)',
         classifierEntered
       );
       observe(classifierReplay);
-      const classifierPid = await classifierEntered.promise;
+      const classifierPid = await within(
+        classifierEntered.promise,
+        5_000,
+        'Timed out waiting for classifier-rebase entry'
+      );
       expect(await waitForBlockedOperation(classifierReplay,
         classifierPid,
         classifierName,
         'from financial_classification_versions'
-      )).toContain(blocker.pid);
+      )).toEqual([blocker.pid]);
 
       sourceReplay = lockPurchaseFinancialProjection(sourceName, purchase, {
         payoutGenerations: [],
@@ -1754,24 +2322,32 @@ describe.each(LOCK_PROBE_REPETITIONS)('financial lock ordering (repetition %i)',
         issueKeys: []
       }, sourceEntered);
       observe(sourceReplay);
-      const sourcePid = await sourceEntered.promise;
+      const sourcePid = await within(
+        sourceEntered.promise,
+        5_000,
+        'Timed out waiting for source-projection entry'
+      );
       expect(await waitForBlockedOperation(sourceReplay,
         sourcePid,
         sourceName,
         'from stripe_balance_transactions'
-      )).toContain(classifierPid);
+      )).toEqual([classifierPid]);
 
       await releaseBlocker(blocker);
       assertFulfilled(
         ['classifier replay', 'source replay'],
-        await Promise.allSettled([classifierReplay, sourceReplay])
+        await within(
+          Promise.allSettled([classifierReplay, sourceReplay]),
+          7_500,
+          'Timed out completing classifier/source replay probes'
+        )
       );
     } finally {
-      await releaseBlocker(blocker).catch(() => undefined);
-      await Promise.allSettled([
+      await within(Promise.allSettled([
+        releaseBlocker(blocker),
         ...(classifierReplay ? [classifierReplay] : []),
         ...(sourceReplay ? [sourceReplay] : [])
-      ]);
+      ]), 7_500, 'Timed out cleaning up classifier/source replay probes');
     }
   }, 15_000);
 
@@ -1799,12 +2375,16 @@ describe.each(LOCK_PROBE_REPETITIONS)('financial lock ordering (repetition %i)',
     try {
       publication = publishPayout(publisherName, publicationPayout, publisherEntered);
       observe(publication);
-      const publisherPid = await publisherEntered.promise;
+      const publisherPid = await within(
+        publisherEntered.promise,
+        5_000,
+        'Timed out waiting for payout-publication entry'
+      );
       expect(await waitForBlockedQuery(
         publisherPid,
         publisherName,
         'pg_advisory_xact_lock'
-      )).toContain(blocker.pid);
+      )).toEqual([blocker.pid]);
 
       reverseProjection = lockPurchaseFinancialProjection(projectionName, purchase, {
         payoutGenerations: [{
@@ -1816,24 +2396,32 @@ describe.each(LOCK_PROBE_REPETITIONS)('financial lock ordering (repetition %i)',
         issueKeys: []
       }, projectionEntered);
       observe(reverseProjection);
-      const projectionPid = await projectionEntered.promise;
+      const projectionPid = await within(
+        projectionEntered.promise,
+        5_000,
+        'Timed out waiting for reverse-order projection entry'
+      );
       expect(await waitForBlockedQuery(
         projectionPid,
         projectionName,
         'pg_advisory_xact_lock'
-      )).toContain(publisherPid);
+      )).toEqual([publisherPid]);
 
       await releaseBlocker(blocker);
       assertFulfilled(
         ['payout publication', 'reverse-input projection'],
-        await Promise.allSettled([publication, reverseProjection])
+        await within(
+          Promise.allSettled([publication, reverseProjection]),
+          7_500,
+          'Timed out completing payout-publication/reverse-projection probes'
+        )
       );
     } finally {
-      await releaseBlocker(blocker).catch(() => undefined);
-      await Promise.allSettled([
+      await within(Promise.allSettled([
+        releaseBlocker(blocker),
         ...(publication ? [publication] : []),
         ...(reverseProjection ? [reverseProjection] : [])
-      ]);
+      ]), 7_500, 'Timed out cleaning up payout-publication/reverse-projection probes');
     }
   }, 15_000);
 
@@ -1860,20 +2448,34 @@ describe.each(LOCK_PROBE_REPETITIONS)('financial lock ordering (repetition %i)',
       allocations: 4,
       issues: 2
     });
-    const stages = correctionBarrierStages(fixture);
-    const barrier = await beginCorrectionBarrier(
-      probeName('correction-blocker', fixture.commandId),
-      stages
+    const applicationName = probeName('correction-executor', fixture.commandId);
+    const entered = deferred<number>();
+    const preparedProbe = await prepareCorrectionWorkerProbe(
+      applicationName,
+      fixture,
+      entered
     );
+    const stages = correctionBarrierStages(fixture, preparedProbe.jobId);
+    let barrier: CorrectionBarrier;
+    try {
+      barrier = await beginCorrectionBarrier(
+        probeName('correction-blocker', fixture.commandId),
+        stages
+      );
+    } catch (error) {
+      await within(
+        preparedProbe.dispose(),
+        5_000,
+        'Timed out disposing correction probe after barrier setup failure'
+      ).catch(() => undefined);
+      throw error;
+    }
     let probe: CorrectionWorkerProbe | undefined;
     let testError: unknown;
     let barrierCleanupError: unknown;
     try {
       const before = await readCorrectionDomainSnapshot(fixture);
-      const applicationName = probeName('correction-executor', fixture.commandId);
-      const entered = deferred<number>();
-      probe = runCorrectionWorkerProbe(applicationName, fixture, entered);
-      observe(probe.operation);
+      probe = preparedProbe.start();
       const executorPid = await waitForCorrectionExecutorEntry(entered, probe);
       for (const stage of stages) {
         await waitForCorrectionBarrierStage(
@@ -1914,6 +2516,7 @@ describe.each(LOCK_PROBE_REPETITIONS)('financial lock ordering (repetition %i)',
         const cleanup = await within(
           Promise.allSettled([
             releaseCorrectionBarrier(barrier),
+            preparedProbe.dispose(),
             ...(probe ? [probe.operation] : [])
           ]),
           7_500,
@@ -1963,29 +2566,41 @@ describe.each(LOCK_PROBE_REPETITIONS)('financial lock ordering (repetition %i)',
         finalizationEntered
       );
       observe(finalization);
-      const finalizationPid = await finalizationEntered.promise;
+      const finalizationPid = await within(
+        finalizationEntered.promise,
+        5_000,
+        'Timed out waiting for refund-finalization entry'
+      );
       expect(await waitForBlockedOperation(
         finalization,
         finalizationPid,
         finalizationName,
         'pg_advisory_xact_lock'
-      )).toContain(blocker.pid);
+      )).toEqual([blocker.pid]);
 
       competingAuthority = lockProjectionAuthority(
         competingAuthorityName,
         authorityEntered
       );
       observe(competingAuthority);
-      const competingAuthorityPid = await authorityEntered.promise;
+      const competingAuthorityPid = await within(
+        authorityEntered.promise,
+        5_000,
+        'Timed out waiting for competing projection-authority entry'
+      );
       expect(await waitForBlockedOperation(
         competingAuthority,
         competingAuthorityPid,
         competingAuthorityName,
         'from financial_projection_versions'
-      )).toContain(finalizationPid);
+      )).toEqual([finalizationPid]);
 
       await releaseBlocker(blocker);
-      const outcomes = await Promise.allSettled([finalization, competingAuthority]);
+      const outcomes = await within(
+        Promise.allSettled([finalization, competingAuthority]),
+        7_500,
+        'Timed out completing finalization/projection-authority probes'
+      );
       assertFulfilled(
         ['refund finalization', 'competing projection authority'],
         outcomes
@@ -1993,11 +2608,11 @@ describe.each(LOCK_PROBE_REPETITIONS)('financial lock ordering (repetition %i)',
       expect(outcomes[0]).toEqual({ status: 'fulfilled', value: 'not_eligible' });
       expect(await readRefundFinalizationProbeSnapshot(purchase, commandId)).toEqual(before);
     } finally {
-      await releaseBlocker(blocker).catch(() => undefined);
-      await Promise.allSettled([
+      await within(Promise.allSettled([
+        releaseBlocker(blocker),
         ...(finalization ? [finalization] : []),
         ...(competingAuthority ? [competingAuthority] : [])
-      ]);
+      ]), 7_500, 'Timed out cleaning up finalization/projection-authority probes');
     }
   }, 15_000);
 
@@ -2018,26 +2633,34 @@ describe.each(LOCK_PROBE_REPETITIONS)('financial lock ordering (repetition %i)',
     try {
       recovery = await runRecoveryWorkerProbe(recoveryName, purchase, recoveryEntered);
       observe(recovery.operation);
-      const recoveryPid = await recoveryEntered.promise;
+      const recoveryPid = await within(
+        recoveryEntered.promise,
+        5_000,
+        'Timed out waiting for recovery entry'
+      );
       expect(await waitForBlockedOperation(
         recovery.operation,
         recoveryPid,
         recoveryName,
         'transition_administrative_recovery_grant_after_admin_command'
-      )).toContain(blocker.pid);
+      )).toEqual([blocker.pid]);
       expect(await readRefundFinalizationProbeSnapshot(
         purchase, recovery.commandId
       )).toEqual(before);
 
       competingAuthority = lockProjectionAuthority(authorityName, authorityEntered);
       observe(competingAuthority);
-      const authorityPid = await authorityEntered.promise;
+      const authorityPid = await within(
+        authorityEntered.promise,
+        5_000,
+        'Timed out waiting for recovery projection-authority competitor'
+      );
       expect(await waitForBlockedOperation(
         competingAuthority,
         authorityPid,
         authorityName,
         'from financial_projection_versions'
-      )).toContain(recoveryPid);
+      )).toEqual([recoveryPid]);
       expect(await readRefundFinalizationProbeSnapshot(
         purchase, recovery.commandId
       )).toEqual(before);
@@ -2045,7 +2668,11 @@ describe.each(LOCK_PROBE_REPETITIONS)('financial lock ordering (repetition %i)',
       await releaseBlocker(blocker);
       assertFulfilled(
         ['administrative recovery', 'competing projection authority'],
-        await Promise.allSettled([recovery.operation, competingAuthority])
+        await within(
+          Promise.allSettled([recovery.operation, competingAuthority]),
+          7_500,
+          'Timed out completing recovery/projection-authority probes'
+        )
       );
       expect(await readRefundFinalizationProbeSnapshot(
         purchase, recovery.commandId
@@ -2058,11 +2685,11 @@ describe.each(LOCK_PROBE_REPETITIONS)('financial lock ordering (repetition %i)',
       });
     } finally {
       recovery?.abort();
-      await releaseBlocker(blocker).catch(() => undefined);
-      await Promise.allSettled([
+      await within(Promise.allSettled([
+        releaseBlocker(blocker),
         ...(recovery ? [recovery.operation] : []),
         ...(competingAuthority ? [competingAuthority] : [])
-      ]);
+      ]), 7_500, 'Timed out cleaning up recovery/projection-authority probes');
     }
   }, 20_000);
 
@@ -2095,12 +2722,16 @@ describe.each(LOCK_PROBE_REPETITIONS)('financial lock ordering (repetition %i)',
         refundEntered
       );
       observe(refundFinalization);
-      const refundPid = await refundEntered.promise;
+      const refundPid = await within(
+        refundEntered.promise,
+        5_000,
+        'Timed out waiting for refund-finalization projection entry'
+      );
       expect(await waitForBlockedOperation(refundFinalization,
         refundPid,
         refundName,
         'from stripe_balance_transactions'
-      )).toContain(financialBlocker.pid);
+      )).toEqual([financialBlocker.pid]);
 
       scopeBlocker = await beginBlocker(
         probeName('refund-scope-blocker', purchase.grantId),
@@ -2119,7 +2750,7 @@ describe.each(LOCK_PROBE_REPETITIONS)('financial lock ordering (repetition %i)',
         refundPid,
         refundName,
         'pg_advisory_xact_lock'
-      )).toContain(scopeBlocker.pid);
+      )).toEqual([scopeBlocker.pid]);
 
       await releaseBlocker(scopeBlocker);
       expect(await waitForBlockedOperation(
@@ -2127,18 +2758,22 @@ describe.each(LOCK_PROBE_REPETITIONS)('financial lock ordering (repetition %i)',
         refundPid,
         refundName,
         'from "entitlement_grants"'
-      )).toContain(grantBlocker.pid);
+      )).toEqual([grantBlocker.pid]);
 
       await releaseBlocker(grantBlocker);
-      await expect(refundFinalization).resolves.toBe('not_eligible');
+      await expect(within(
+        refundFinalization,
+        7_500,
+        'Timed out completing finalization/entitlement probe'
+      )).resolves.toBe('not_eligible');
       expect(await readRefundFinalizationProbeSnapshot(purchase, commandId)).toEqual(before);
     } finally {
-      await releaseBlocker(financialBlocker).catch(() => undefined);
-      if (scopeBlocker) await releaseBlocker(scopeBlocker).catch(() => undefined);
-      if (grantBlocker) await releaseBlocker(grantBlocker).catch(() => undefined);
-      await Promise.allSettled([
+      await within(Promise.allSettled([
+        releaseBlocker(financialBlocker),
+        ...(scopeBlocker ? [releaseBlocker(scopeBlocker)] : []),
+        ...(grantBlocker ? [releaseBlocker(grantBlocker)] : []),
         ...(refundFinalization ? [refundFinalization] : [])
-      ]);
+      ]), 7_500, 'Timed out cleaning up finalization/entitlement probes');
     }
   }, 15_000);
 
@@ -2161,7 +2796,13 @@ describe.each(LOCK_PROBE_REPETITIONS)('financial lock ordering (repetition %i)',
       "'pale-orbit:financial:classification:balance_transaction:'",
       "'pale-orbit:financial:allocation:'",
       "'pale-orbit:financial:issue:'",
+      'from "public"."refund_allocation_finalization_effects"',
+      'from "public"."refund_allocations"',
+      'from "public"."refund_reporting_correction_sets"',
+      'from "public"."financial_allocation_sets"',
       "'pale-orbit:commerce:entitlement:'",
+      'from "public"."current_financial_projection_heads"',
+      'target_head.compatible_correction_tip_id = correction_row.id',
       'insert into "public"."entitlement_grants"'
     ] as const;
     let cursor = -1;
@@ -2172,4 +2813,557 @@ describe.each(LOCK_PROBE_REPETITIONS)('financial lock ordering (repetition %i)',
       cursor = position;
     }
   });
+});
+
+describe('financial administrator command race topology', () => {
+  it('lets real draft save and discard stop after the purchase graph', async () => {
+    const purchase = await createPurchaseFixture(`ch_draft_tail_${randomUUID()}`);
+    await ownerDatabaseClient.pool.query(
+      `insert into user_roles (user_id, role) values ($1, 'admin')`,
+      [purchase.userId]
+    );
+    await ownerDatabaseClient.db.update(refunds).set({
+      status: 'succeeded',
+      allocationStatus: 'needs_review'
+    }).where(eq(refunds.id, purchase.refundId));
+    const projection = await createCorrectionProjectionFixture({
+      label: `draft-tail-${purchase.refundId}`,
+      refundId: purchase.refundId,
+      stripeRefundId: purchase.stripeRefundId,
+      orderItemId: purchase.itemId,
+      totalMinor: 100
+    });
+    const payout = await createPayoutFixture(
+      [projection.balanceTransactionId],
+      true
+    );
+    const issue = await databaseClient.db.transaction((transaction) =>
+      observeFinancialIssue(transaction, {
+        resourceType: 'allocation_set',
+        resourceId: projection.grossAllocationSetId,
+        safeCode: 'correction_rebase_required',
+        impact: 'exception',
+        actor: { type: 'system', id: 'financial-worker' },
+        correlationId: `draft-tail-issue-${purchase.refundId}`
+      })
+    );
+    // A correction on this payment is part of the purchase graph that drafts intentionally lock.
+    // Hold a different current-tip row to prove draft execution has no unscoped tail query.
+    const currentCorrectionSetId = await createCurrentCorrectionSentinel(
+      purchase.userId,
+      `draft-tail-${purchase.refundId}`
+    );
+    const blockerName = probeName('draft-tail-blocker', purchase.refundId);
+    const blocker = await beginDraftTailBlocker(
+      blockerName,
+      purchase,
+      {
+        balanceTransactionId: projection.balanceTransactionId,
+        payoutId: payout.payoutId,
+        classificationId: projection.classificationId,
+        allocationSets: [
+          { id: projection.grossAllocationSetId, basis: 'gross_amount' },
+          { id: projection.feeAllocationSetId, basis: 'fee' }
+        ],
+        issueId: issue.id,
+        issueResourceId: projection.grossAllocationSetId,
+        currentCorrectionSetId
+      }
+    );
+    let save: RefundCommandWorkerProbe | undefined;
+    let discard: RefundCommandWorkerProbe | undefined;
+    try {
+      const blockerActivity = await ownerDatabaseClient.pool.query<{
+        applicationName: string;
+        state: string;
+      }>(`
+        select application_name as "applicationName", state
+        from pg_stat_activity where pid = $1
+      `, [blocker.pid]);
+      expect(blockerActivity.rows).toEqual([{
+        applicationName: blockerName,
+        state: 'idle in transaction'
+      }]);
+
+      const saveName = probeName('draft-save-tail', purchase.refundId);
+      const saveEntered = deferred<number>();
+      save = await runRefundCommandWorkerProbe(saveName, purchase, {
+        kind: 'refund_draft_save',
+        refundId: purchase.refundId,
+        expectedVersion: null,
+        items: [{ orderItemId: purchase.itemId, totalPresentmentMinor: 100 }]
+      }, saveEntered);
+      await within(
+        saveEntered.promise,
+        5_000,
+        'Timed out waiting for draft-save handler entry'
+      );
+      await within(
+        save.operation,
+        10_000,
+        'Draft save attempted a projection, financial, or entitlement tail lock'
+      );
+      await expect(ownerDatabaseClient.pool.query(
+        `select status::text, safe_result_code from financial_admin_commands where id = $1`,
+        [save.commandId]
+      )).resolves.toMatchObject({
+        rows: [{ status: 'succeeded', safe_result_code: 'draft_saved' }]
+      });
+
+      const discardName = probeName('draft-discard-tail', purchase.refundId);
+      const discardEntered = deferred<number>();
+      discard = await runRefundCommandWorkerProbe(discardName, purchase, {
+        kind: 'refund_draft_discard',
+        refundId: purchase.refundId,
+        expectedActiveDraftVersion: 1
+      }, discardEntered);
+      await within(
+        discardEntered.promise,
+        5_000,
+        'Timed out waiting for draft-discard handler entry'
+      );
+      await within(
+        discard.operation,
+        10_000,
+        'Draft discard attempted a projection, financial, or entitlement tail lock'
+      );
+      await expect(ownerDatabaseClient.pool.query(
+        `select status::text, safe_result_code from financial_admin_commands where id = $1`,
+        [discard.commandId]
+      )).resolves.toMatchObject({
+        rows: [{ status: 'succeeded', safe_result_code: 'draft_discarded' }]
+      });
+    } finally {
+      save?.abort();
+      discard?.abort();
+      await within(Promise.allSettled([
+        releaseBlocker(blocker),
+        ...(save ? [save.operation] : []),
+        ...(discard ? [discard.operation] : [])
+      ]), 7_500, 'Timed out cleaning up draft stopping-point probe');
+    }
+  }, 25_000);
+
+  it('serializes draft save before finalization at the administrator prefix (race 4)', async () => {
+    const purchase = await createPurchaseFixture(`ch_draft_finalize_${randomUUID()}`);
+    await ownerDatabaseClient.pool.query(
+      `insert into user_roles (user_id, role) values ($1, 'admin')`,
+      [purchase.userId]
+    );
+    await ownerDatabaseClient.db.update(refunds).set({
+      status: 'succeeded',
+      allocationStatus: 'needs_review'
+    }).where(eq(refunds.id, purchase.refundId));
+    const blocker = await beginBlocker(
+      probeName('draft-finalize-order-blocker', purchase.orderId),
+      'select pg_advisory_xact_lock(hashtextextended($1, 0))',
+      [`pale-orbit:commerce:order:${purchase.orderId}`]
+    );
+    const draftName = probeName('race4-draft-save', purchase.refundId);
+    const finalizationName = probeName('race4-finalization', purchase.refundId);
+    const draftEntered = deferred<number>();
+    const finalizationEntered = deferred<number>();
+    let draft: RefundCommandWorkerProbe | undefined;
+    let finalization: RefundCommandWorkerProbe | undefined;
+    let preparedDraft: PreparedRefundCommandWorkerProbe | undefined;
+    let preparedFinalization: PreparedRefundCommandWorkerProbe | undefined;
+    try {
+      preparedDraft = await prepareRefundCommandWorkerProbe(draftName, purchase, {
+        kind: 'refund_draft_save',
+        refundId: purchase.refundId,
+        expectedVersion: null,
+        items: [{ orderItemId: purchase.itemId, totalPresentmentMinor: 100 }]
+      }, draftEntered);
+      preparedFinalization = await prepareRefundCommandWorkerProbe(
+        finalizationName,
+        purchase,
+        {
+          kind: 'refund_allocation_finalize',
+          refundId: purchase.refundId,
+          expectedActiveDraftVersion: 1,
+          previewFingerprint: 'e'.repeat(64),
+          confirmation: 'finalize_refund_allocation'
+        },
+        finalizationEntered
+      );
+      draft = preparedDraft.start();
+      const draftPid = await within(
+        draftEntered.promise,
+        5_000,
+        'Timed out waiting for race-4 draft handler'
+      );
+      expect(await waitForBlockedOperation(
+        draft.operation,
+        draftPid,
+        draftName,
+        'pg_advisory_xact_lock'
+      )).toEqual([blocker.pid]);
+
+      finalization = preparedFinalization.start();
+      const finalizationPid = await within(
+        finalizationEntered.promise,
+        5_000,
+        'Timed out waiting for race-4 finalization handler'
+      );
+      expect(await waitForBlockedOperation(
+        finalization.operation,
+        finalizationPid,
+        finalizationName,
+        'pg_advisory_xact_lock'
+      )).toEqual([draftPid]);
+
+      await releaseBlocker(blocker);
+      assertFulfilled(
+        ['draft save command', 'finalization command'],
+        await within(
+          Promise.allSettled([draft.operation, finalization.operation]),
+          7_500,
+          'Timed out completing race-4 command probes'
+        )
+      );
+      const lifecycle = await ownerDatabaseClient.pool.query<{
+        id: string;
+        status: string;
+        safeResultCode: string | null;
+        lastError: string | null;
+      }>(`
+        select command.id, command.status::text as status,
+          command.safe_result_code as "safeResultCode", job.last_error as "lastError"
+        from financial_admin_commands command
+        join jobs job on job.id = command.job_id
+        where command.id = any($1::uuid[]) order by command.id
+      `, [[draft.commandId, finalization.commandId]]);
+      expect(lifecycle.rows).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          id: draft.commandId,
+          status: 'succeeded',
+          safeResultCode: 'draft_saved',
+          lastError: null
+        }),
+        expect.objectContaining({
+          id: finalization.commandId,
+          status: 'conflict',
+          lastError: expect.not.stringContaining('deadlock')
+        })
+      ]));
+    } finally {
+      draft?.abort();
+      finalization?.abort();
+      await within(Promise.allSettled([
+        releaseBlocker(blocker),
+        ...(preparedDraft ? [preparedDraft.dispose()] : []),
+        ...(preparedFinalization ? [preparedFinalization.dispose()] : []),
+        ...(draft ? [draft.operation] : []),
+        ...(finalization ? [finalization.operation] : [])
+      ]), 7_500, 'Timed out cleaning up race-4 probes');
+    }
+  }, 25_000);
+
+  it('serializes finalization before correction at the administrator prefix (race 5)', async () => {
+    const correctionFixture = await createCorrectionLockFixture(
+      `race5-correction-${randomUUID()}`
+    );
+    const correctionName = probeName('race5-correction', correctionFixture.commandId);
+    const correctionEntered = deferred<number>();
+    const preparedCorrection = await prepareCorrectionWorkerProbe(
+      correctionName,
+      correctionFixture,
+      correctionEntered
+    );
+    let purchase: PurchaseFixture;
+    let blocker: Blocker;
+    try {
+      purchase = await createPurchaseFixture(`ch_race5_finalize_${randomUUID()}`);
+      await ownerDatabaseClient.pool.query(
+        `insert into user_roles (user_id, role) values ($1, 'admin')`,
+        [purchase.userId]
+      );
+      blocker = await beginBlocker(
+        probeName('race5-order-blocker', purchase.orderId),
+        'select pg_advisory_xact_lock(hashtextextended($1, 0))',
+        [`pale-orbit:commerce:order:${purchase.orderId}`]
+      );
+    } catch (error) {
+      await within(
+        preparedCorrection.dispose(),
+        5_000,
+        'Timed out disposing race-5 correction setup'
+      ).catch(() => undefined);
+      throw error;
+    }
+    const finalizationName = probeName('race5-finalization', purchase.refundId);
+    const finalizationEntered = deferred<number>();
+    let finalization: RefundCommandWorkerProbe | undefined;
+    let correction: CorrectionWorkerProbe | undefined;
+    try {
+      finalization = await runRefundCommandWorkerProbe(finalizationName, purchase, {
+        kind: 'refund_allocation_finalize',
+        refundId: purchase.refundId,
+        expectedActiveDraftVersion: 1,
+        previewFingerprint: 'e'.repeat(64),
+        confirmation: 'finalize_refund_allocation'
+      }, finalizationEntered);
+      const finalizationPid = await within(
+        finalizationEntered.promise,
+        5_000,
+        'Timed out waiting for race-5 finalization handler'
+      );
+      expect(await waitForBlockedOperation(
+        finalization.operation,
+        finalizationPid,
+        finalizationName,
+        'pg_advisory_xact_lock'
+      )).toEqual([blocker.pid]);
+
+      correction = preparedCorrection.start();
+      const correctionPid = await within(
+        correctionEntered.promise,
+        5_000,
+        'Timed out waiting for race-5 correction handler'
+      );
+      expect(await waitForBlockedOperation(
+        correction.operation,
+        correctionPid,
+        correctionName,
+        'pg_advisory_xact_lock'
+      )).toEqual([finalizationPid]);
+
+      await releaseBlocker(blocker);
+      assertFulfilled(
+        ['finalization command', 'correction command'],
+        await within(
+          Promise.allSettled([finalization.operation, correction.operation]),
+          7_500,
+          'Timed out completing race-5 command probes'
+        )
+      );
+      expectConflictLifecycle(
+        await readAdminCommandTerminalLifecycle(finalization.commandId),
+        'refund_allocation_finalize',
+        'not_eligible'
+      );
+      expectConflictLifecycle(
+        await readAdminCommandTerminalLifecycle(correctionFixture.commandId),
+        'refund_reporting_correction_create',
+        'stale_state'
+      );
+    } finally {
+      finalization?.abort();
+      correction?.abort();
+      await within(Promise.allSettled([
+        releaseBlocker(blocker),
+        preparedCorrection.dispose(),
+        ...(finalization ? [finalization.operation] : []),
+        ...(correction ? [correction.operation] : [])
+      ]), 7_500, 'Timed out cleaning up race-5 probes');
+    }
+  }, 30_000);
+
+  it('keeps classifier rebase behind correction projection authority (race 6)', async () => {
+    const fixture = await createCorrectionLockFixture(`race6-${randomUUID()}`);
+    const correctionName = probeName('race6-correction', fixture.commandId);
+    const correctionEntered = deferred<number>();
+    const prepared = await prepareCorrectionWorkerProbe(
+      correctionName,
+      fixture,
+      correctionEntered
+    );
+    let blocker: Blocker;
+    try {
+      blocker = await beginBlocker(
+        probeName('race6-order-blocker', fixture.purchase.orderId),
+        'select pg_advisory_xact_lock(hashtextextended($1, 0))',
+        [`pale-orbit:commerce:order:${fixture.purchase.orderId}`]
+      );
+    } catch (error) {
+      await within(
+        prepared.dispose(),
+        5_000,
+        'Timed out disposing race-6 correction setup'
+      ).catch(() => undefined);
+      throw error;
+    }
+    const replayName = probeName(
+      'race6-classifier-rebase',
+      fixture.balanceTransactions[0]!.id
+    );
+    const replayEntered = deferred<number>();
+    let correction: CorrectionWorkerProbe | undefined;
+    let replay: Promise<void> | undefined;
+    try {
+      correction = prepared.start();
+      const correctionPid = await within(
+        correctionEntered.promise,
+        5_000,
+        'Timed out waiting for race-6 correction handler'
+      );
+      expect(await waitForBlockedOperation(
+        correction.operation,
+        correctionPid,
+        correctionName,
+        'pg_advisory_xact_lock'
+      )).toEqual([blocker.pid]);
+
+      const target = fixture.balanceTransactions[0]!;
+      replay = replayClassifierRebase(
+        replayName,
+        target.id,
+        target.fingerprint,
+        replayEntered
+      );
+      observe(replay);
+      const replayPid = await within(
+        replayEntered.promise,
+        5_000,
+        'Timed out waiting for race-6 classifier rebase'
+      );
+      expect(await waitForBlockedOperation(
+        replay,
+        replayPid,
+        replayName,
+        'from financial_projection_versions'
+      )).toEqual([correctionPid]);
+
+      await releaseBlocker(blocker);
+      assertFulfilled(
+        ['correction command', 'classifier rebase'],
+        await within(
+          Promise.allSettled([correction.operation, replay]),
+          7_500,
+          'Timed out completing race-6 command probes'
+        )
+      );
+      expectConflictLifecycle(
+        await readAdminCommandTerminalLifecycle(fixture.commandId),
+        'refund_reporting_correction_create',
+        'stale_state'
+      );
+    } finally {
+      correction?.abort();
+      await within(Promise.allSettled([
+        releaseBlocker(blocker),
+        prepared.dispose(),
+        ...(correction ? [correction.operation] : []),
+        ...(replay ? [replay] : [])
+      ]), 7_500, 'Timed out cleaning up race-6 probes');
+    }
+  }, 30_000);
+
+  it('orders recovery against correction and refund/dispute rows (race 7)', async () => {
+    const correctionFixture = await createCorrectionLockFixture(
+      `race7-correction-${randomUUID()}`
+    );
+    const correctionName = probeName('race7-correction', correctionFixture.commandId);
+    const correctionEntered = deferred<number>();
+    const preparedCorrection = await prepareCorrectionWorkerProbe(
+      correctionName,
+      correctionFixture,
+      correctionEntered
+    );
+    let purchase: PurchaseFixture;
+    let refundBlocker: Blocker | undefined;
+    let disputeBlocker: Blocker | undefined;
+    try {
+      purchase = await createPurchaseFixture(`ch_race7_recovery_${randomUUID()}`);
+      const [dispute] = await ownerDatabaseClient.db.insert(disputes).values({
+        paymentId: purchase.paymentId,
+        stripeDisputeId: `dp_race7_${randomUUID()}`,
+        status: 'open',
+        amountMinor: 100,
+        currency: 'USD',
+        reason: 'fraudulent',
+        providerCreatedAt: fixtureTime,
+        providerUpdatedAt: fixtureTime
+      }).returning();
+      if (!dispute) throw new Error('Expected race-7 dispute fixture');
+      refundBlocker = await beginBlocker(
+        probeName('race7-refund-reconcile', purchase.refundId),
+        'select id from refunds where id = $1 for update',
+        [purchase.refundId]
+      );
+      disputeBlocker = await beginBlocker(
+        probeName('race7-dispute-reconcile', dispute.id),
+        'select id from disputes where id = $1 for update',
+        [dispute.id]
+      );
+    } catch (error) {
+      if (refundBlocker) await releaseBlocker(refundBlocker).catch(() => undefined);
+      if (disputeBlocker) await releaseBlocker(disputeBlocker).catch(() => undefined);
+      await within(
+        preparedCorrection.dispose(),
+        5_000,
+        'Timed out disposing race-7 correction setup'
+      ).catch(() => undefined);
+      throw error;
+    }
+    const recoveryName = probeName('race7-recovery', purchase.refundId);
+    const recoveryEntered = deferred<number>();
+    let recovery: RecoveryWorkerProbe | undefined;
+    let correction: CorrectionWorkerProbe | undefined;
+    try {
+      recovery = await runRecoveryWorkerProbe(recoveryName, purchase, recoveryEntered);
+      const recoveryPid = await within(
+        recoveryEntered.promise,
+        5_000,
+        'Timed out waiting for race-7 recovery executor'
+      );
+      expect(await waitForBlockedOperation(
+        recovery.operation,
+        recoveryPid,
+        recoveryName,
+        'transition_administrative_recovery_grant_after_admin_command'
+      )).toEqual([refundBlocker.pid]);
+
+      correction = preparedCorrection.start();
+      const correctionPid = await within(
+        correctionEntered.promise,
+        5_000,
+        'Timed out waiting for race-7 correction handler'
+      );
+      expect(await waitForBlockedOperation(
+        correction.operation,
+        correctionPid,
+        correctionName,
+        'pg_advisory_xact_lock'
+      )).toEqual([recoveryPid]);
+
+      await releaseBlocker(refundBlocker);
+      expect(await waitForBlockedOperation(
+        recovery.operation,
+        recoveryPid,
+        recoveryName,
+        'transition_administrative_recovery_grant_after_admin_command'
+      )).toEqual([disputeBlocker.pid]);
+
+      await releaseBlocker(disputeBlocker);
+      assertFulfilled(
+        ['administrative recovery', 'correction command'],
+        await within(
+          Promise.allSettled([recovery.operation, correction.operation]),
+          7_500,
+          'Timed out completing race-7 command probes'
+        )
+      );
+      expectConflictLifecycle(
+        await readAdminCommandTerminalLifecycle(recovery.commandId),
+        'administrative_recovery_activate',
+        'stale_state'
+      );
+      expectConflictLifecycle(
+        await readAdminCommandTerminalLifecycle(correctionFixture.commandId),
+        'refund_reporting_correction_create',
+        'stale_state'
+      );
+    } finally {
+      recovery?.abort();
+      correction?.abort();
+      await within(Promise.allSettled([
+        releaseBlocker(refundBlocker),
+        releaseBlocker(disputeBlocker),
+        preparedCorrection.dispose(),
+        ...(recovery ? [recovery.operation] : []),
+        ...(correction ? [correction.operation] : [])
+      ]), 7_500, 'Timed out cleaning up race-7 probes');
+    }
+  }, 30_000);
 });

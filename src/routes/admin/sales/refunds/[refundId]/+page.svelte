@@ -160,6 +160,7 @@
       ? form.retrySubmission as RetrySubmission | null
       : null
   );
+  const canManageReconciliation = $derived(data.canManageReconciliation === true);
   const finalizationPreview = $derived(
     form && 'finalizationPreview' in form
       ? form.finalizationPreview as RefundFinalizationPreviewDto | undefined
@@ -285,7 +286,7 @@
     </div>
   {/if}
 
-  {#if retrySubmission !== null}
+  {#if canManageReconciliation && retrySubmission !== null}
     <section class="sales-notice" aria-labelledby="refund-retry-heading">
       <h2 id="refund-retry-heading">Resolve the uncertain submission</h2>
       <p>Editing is paused so this retry keeps the original idempotency identity and values.</p>
@@ -429,7 +430,10 @@
     <FinancialActionOutcome command={submittedCommand} reloadHref={reloadHref()} />
   {/if}
 
-  {#if retrySubmission === null && finalizationPreview !== undefined}
+  {#if canManageReconciliation &&
+    retrySubmission === null &&
+    finalizationPreview !== undefined &&
+    data.finalizeIdempotencyKey !== null}
     <FinancialActionConfirmation
       headingId="refund-finalization-confirmation-heading"
       heading="Review finalization consequences"
@@ -534,12 +538,15 @@
     </FinancialActionConfirmation>
   {/if}
 
-  {#if submittedCommand === undefined &&
+  {#if canManageReconciliation &&
+    submittedCommand === undefined &&
     retrySubmission === null &&
     finalizationPreview === undefined &&
     reportingCorrectionPreview === undefined &&
     administrativeRecoveryActivationPreview === undefined &&
     administrativeRecoveryDeactivationPreview === undefined &&
+    data.saveDraftIdempotencyKey !== null &&
+    data.discardDraftIdempotencyKey !== null &&
     (data.detail.allocationStatus === 'needs_review' || data.detail.allocationStatus === 'draft')}
     {#key data.detail}
       <RefundAllocationEditor
@@ -552,11 +559,13 @@
     {/key}
   {/if}
 
-  {#if submittedCommand === undefined &&
+  {#if canManageReconciliation &&
+    submittedCommand === undefined &&
     retrySubmission === null &&
     finalizationPreview === undefined &&
     administrativeRecoveryActivationPreview === undefined &&
     administrativeRecoveryDeactivationPreview === undefined &&
+    data.correctionIdempotencyKey !== null &&
     data.reportingCorrectionSeed !== null}
     {#key data.reportingCorrectionSeed}
       <ReportingCorrectionEditor
@@ -569,12 +578,15 @@
     {/key}
   {/if}
 
-  {#if submittedCommand === undefined &&
+  {#if canManageReconciliation &&
+    submittedCommand === undefined &&
     retrySubmission === null &&
     finalizationPreview === undefined &&
     reportingCorrectionPreview === undefined &&
     data.administrativeRecoverySeed !== null &&
-    data.administrativeRecoverySeed !== undefined}
+    data.administrativeRecoverySeed !== undefined &&
+    data.recoveryActivationIdempotencyKey !== null &&
+    data.recoveryDeactivationIdempotencyKey !== null}
     {#key data.administrativeRecoverySeed}
       <AdministrativeRecoveryActions
         seed={data.administrativeRecoverySeed}

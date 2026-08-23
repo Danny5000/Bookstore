@@ -2704,20 +2704,30 @@ Expected after implementation: both tests pass, all six and only six kinds are r
 ### Task 15: Harden authorization, audit atomicity, privacy, and lock ordering across every surface
 
 **Files:**
+- Modify: `docs/superpowers/plans/2026-08-20-backend-plan-6b-ii-admin-resolution-reporting-refresh.md`
 - Create: `tests/integration/financial-authorization-audit.test.ts`
 - Create: `tests/integration/financial-admin-command-races.test.ts`
+- Create: `src/lib/server/commerce/financial/admin-commands/errors.ts`
+- Modify: `src/lib/server/commerce/financial/admin-commands/handler.ts`
+- Modify: `src/lib/server/commerce/financial/admin-commands/repository.ts`
+- Modify: `src/lib/server/commerce/financial/refund-review/finalize.ts`
+- Modify: `src/lib/server/commerce/financial/refund-review/corrections.ts`
+- Modify: `src/lib/server/commerce/financial/refund-review/recovery.ts`
 - Modify: `tests/integration/audit-query.test.ts`
 - Modify: `tests/integration/financial-admin-commands.test.ts`
 - Modify: `tests/integration/financial-lock-order.test.ts`
 - Modify: `tests/integration/financial-reclassification.test.ts`
 - Modify: `src/routes/admin/sales/sales-routes.test.ts`
 - Modify: `src/routes/admin/sales/refunds/refund-routes.test.ts`
+- Modify: `src/routes/admin/sales/refunds/[refundId]/+page.server.ts`
+- Modify: `src/routes/admin/sales/refunds/[refundId]/+page.svelte`
 - Modify: `src/lib/components/admin/SalesOverview.test.ts`
 - Modify: `src/lib/components/admin/RefundReview.test.ts`
 - Modify: `scripts/commerce-privacy.test.ts`
 - Modify: `tests/e2e/commerce-privacy.ts`
 - Modify: `scripts/process-secret-scope.test.ts`
 - Modify: `scripts/storage-process-isolation.test.ts`
+- Modify: `vitest.integration.config.ts`
 
 - [ ] **Step 1: Write the complete route/service/command capability matrix**
 
@@ -2804,6 +2814,53 @@ Expected: the new matrix, audit, race, or privacy assertions fail until every cr
 
 Fix the exact route/service/lock/audit/privacy defect demonstrated by each RED. The Files and commit list for this hardening task intentionally begin with test surfaces only. If a RED proves that a production file must change, stop before editing, amend this task through review to add that exact production path to both **Files** and Step 7's literal `git add` command, then make the minimal fix. Do not leave a production correction unstaged or hide it behind a directory/wildcard add. Do not grant web table DML, give routes a worker/owner client, weaken exact failure counts, replace PID witnesses with sleeps, or add generic redaction after serialization.
 
+Reviewed RED amendment (2026-08-22): the complete capability matrix proved that refund
+detail requires only `sales.read`, while mutation seed generation and every form require
+`reconciliation.manage`; the loader currently requires both and the page has no
+read-only presentation gate. The process-isolation scan also proved that the refund web
+route imports the worker handler module solely for its conflict error. The bounded
+correction therefore adds a neutral command-error module, updates the handler to consume
+and re-export those identities, imports the neutral error from the web route, returns an
+explicit `canManageReconciliation` flag with no mutation seeds or idempotency identities
+for a read-only administrator, and gates every mutation form on that flag. Only the four
+production paths added above are authorized by this amendment.
+
+Reviewed RED amendment (2026-08-22): the all-six command capability matrix proved
+that `submitFinancialAdminCommand` parses a malformed idempotency key before checking
+the submitting administrator's command capabilities. The bounded correction moves only
+that canonical UUID parse behind the existing pre-transaction capability check in
+`admin-commands/repository.ts`; command-kind selection remains the minimum input needed
+to select the fixed capability policy, and private-command parsing/hashing remains after
+authorization. No database routine, route, handler, executor, or DTO contract changes.
+
+Reviewed RED amendment (2026-08-22): independent pre-commit dependency review proved
+that the refund route's preview modules still value-import the three command error
+classes from `admin-commands/handler`, so the web graph transitively loads the worker
+handler despite the direct route import having moved to the neutral error module. The
+bounded correction updates only `refund-review/finalize.ts`, `corrections.ts`, and
+`recovery.ts` to value-import those errors from `admin-commands/errors.ts` while retaining
+`FinancialAdminCommandExecutorContext` as a type-only handler import. Extend the existing
+process-isolation test with an explicit route-reachable dependency assertion so a future
+value import cannot recreate this web-to-worker edge. No executor composition, runtime
+behavior, database authority, or DTO changes.
+
+Reviewed RED amendment (2026-08-22): independent privacy review proved that the fresh
+lease sentinel's real claim/handler/heartbeat/terminal witness covered persisted rows,
+captured errors, and the repository status DTO, while the HTML, CSV, browser, and
+restore-output assertions used unrelated fabricated canaries. Extend that same
+integration witness to invoke the real command-status `GET` endpoint with the real actor
+and command, decode and scan its response body and headers, server-render the production
+command-status component, load that rendered HTML into a headless browser, and scan both
+`page.content()` and visible body text. Produce and decode bytes through the real bounded
+Sales CSV export. Run the executable restore-verifier mode against that same disposable
+database and capture and scan both stdout and stderr. Scan every decoded artifact for
+the one in-memory capability and its digest. Browser/context/page closure belongs in
+`finally`; the verifier subprocess must have a bounded timeout and termination. Add the
+SvelteKit transform to `vitest.integration.config.ts` solely so the Node integration
+suite can import and server-render the production component; do not add a capability
+injection, environment variable, file, log field, or other clear-secret transport. This
+is evidence-only and does not alter application runtime behavior.
+
 - [ ] **Step 7: Run GREEN and commit**
 
 ```powershell
@@ -2812,7 +2869,8 @@ npm run test:integration -- tests/integration/financial-authorization-audit.test
 npm run check
 npm run lint
 git diff --check
-git add tests/integration/financial-authorization-audit.test.ts tests/integration/financial-admin-command-races.test.ts tests/integration/audit-query.test.ts tests/integration/financial-admin-commands.test.ts tests/integration/financial-lock-order.test.ts tests/integration/financial-reclassification.test.ts src/routes/admin/sales/sales-routes.test.ts src/routes/admin/sales/refunds/refund-routes.test.ts src/lib/components/admin/SalesOverview.test.ts src/lib/components/admin/RefundReview.test.ts scripts/commerce-privacy.test.ts tests/e2e/commerce-privacy.ts scripts/process-secret-scope.test.ts scripts/storage-process-isolation.test.ts
+git add docs/superpowers/plans/2026-08-20-backend-plan-6b-ii-admin-resolution-reporting-refresh.md tests/integration/financial-authorization-audit.test.ts tests/integration/financial-admin-command-races.test.ts tests/integration/audit-query.test.ts tests/integration/financial-admin-commands.test.ts tests/integration/financial-lock-order.test.ts tests/integration/financial-reclassification.test.ts src/lib/server/commerce/financial/admin-commands/errors.ts src/lib/server/commerce/financial/admin-commands/handler.ts src/lib/server/commerce/financial/admin-commands/repository.ts src/lib/server/commerce/financial/refund-review/finalize.ts src/lib/server/commerce/financial/refund-review/corrections.ts src/lib/server/commerce/financial/refund-review/recovery.ts src/routes/admin/sales/sales-routes.test.ts src/routes/admin/sales/refunds/refund-routes.test.ts src/lib/components/admin/SalesOverview.test.ts src/lib/components/admin/RefundReview.test.ts scripts/commerce-privacy.test.ts tests/e2e/commerce-privacy.ts scripts/process-secret-scope.test.ts scripts/storage-process-isolation.test.ts vitest.integration.config.ts
+git add -- ':(literal)src/routes/admin/sales/refunds/[refundId]/+page.server.ts' ':(literal)src/routes/admin/sales/refunds/[refundId]/+page.svelte'
 # Run every additional literal git add command introduced by a reviewed Step 6 plan amendment.
 git diff --cached --check
 git commit -m "test: harden financial administrator boundaries"

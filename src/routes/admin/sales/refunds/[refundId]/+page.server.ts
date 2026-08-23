@@ -1,12 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { error, fail } from '@sveltejs/kit';
 import {
+  AuthorizationError,
   requireCapability,
   type Actor,
   type AdministratorActor
 } from '$lib/server/auth/admin-policy';
 import { submitFinancialAdminCommand } from '$lib/server/commerce/financial/admin-commands/repository';
-import { FinancialAdminConflictError } from '$lib/server/commerce/financial/admin-commands/handler';
+import { FinancialAdminConflictError } from '$lib/server/commerce/financial/admin-commands/errors';
 import {
   parseRefundDraftDiscardRequest,
   parseRefundDraftSaveRequest,
@@ -47,6 +48,21 @@ function requireRefundManagement(actor: Actor): AdministratorActor {
   requireCapability(actor, 'sales.read');
   requireCapability(actor, 'reconciliation.manage');
   return actor;
+}
+
+function requireRefundRead(actor: Actor): AdministratorActor {
+  requireCapability(actor, 'sales.read');
+  return actor;
+}
+
+function canManageRefund(actor: AdministratorActor): boolean {
+  try {
+    requireCapability(actor, 'reconciliation.manage');
+    return true;
+  } catch (cause: unknown) {
+    if (cause instanceof AuthorizationError && cause.code === 'forbidden') return false;
+    throw cause;
+  }
 }
 
 function failLoadSafely(cause: unknown): never {
@@ -138,7 +154,8 @@ function actionReturnContext(url: URL, action: RefundAction) {
 
 export const load: PageServerLoad = async (event) => {
   try {
-    const actor = requireRefundManagement(event.locals.actor);
+    const actor = requireRefundRead(event.locals.actor);
+    const canManageReconciliation = canManageRefund(actor);
     const refundId = requireFinancialRouteUuid(event.params.refundId);
     const returnContext = parseRefundReviewReturnContext(event.url);
     const context = createFinancialRequestContext(event.request, event.route.id);
@@ -150,29 +167,24 @@ export const load: PageServerLoad = async (event) => {
       context
     );
     if (detail === null) throw new FinancialRouteError('not_found');
-    const reportingCorrectionSeed = await getReportingCorrectionSeed(
-      database,
-      actor,
-      refundId,
-      context
-    );
-    const administrativeRecoverySeed = await getAdministrativeRecoverySeed(
-      database,
-      actor,
-      refundId,
-      context
-    );
+    const reportingCorrectionSeed = canManageReconciliation
+      ? await getReportingCorrectionSeed(database, actor, refundId, context)
+      : null;
+    const administrativeRecoverySeed = canManageReconciliation
+      ? await getAdministrativeRecoverySeed(database, actor, refundId, context)
+      : null;
     return {
       detail,
+      canManageReconciliation,
       reportingCorrectionSeed,
       administrativeRecoverySeed,
       reviewCursor: returnContext.reviewCursor,
-      saveDraftIdempotencyKey: randomUUID(),
-      discardDraftIdempotencyKey: randomUUID(),
-      finalizeIdempotencyKey: randomUUID(),
-      correctionIdempotencyKey: randomUUID(),
-      recoveryActivationIdempotencyKey: randomUUID(),
-      recoveryDeactivationIdempotencyKey: randomUUID()
+      saveDraftIdempotencyKey: canManageReconciliation ? randomUUID() : null,
+      discardDraftIdempotencyKey: canManageReconciliation ? randomUUID() : null,
+      finalizeIdempotencyKey: canManageReconciliation ? randomUUID() : null,
+      correctionIdempotencyKey: canManageReconciliation ? randomUUID() : null,
+      recoveryActivationIdempotencyKey: canManageReconciliation ? randomUUID() : null,
+      recoveryDeactivationIdempotencyKey: canManageReconciliation ? randomUUID() : null
     };
   } catch (cause: unknown) {
     failLoadSafely(cause);

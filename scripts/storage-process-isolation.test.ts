@@ -1,8 +1,168 @@
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { dirname, join, relative, resolve } from 'node:path';
+import * as ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
 const source = (path: string) => readFileSync(resolve(path), 'utf8');
+
+function runtimeSourceFiles(root: string): readonly string[] {
+  const files: string[] = [];
+  const visit = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        visit(path);
+      } else if (
+        /[.](?:[cm]?js|svelte|ts)$/u.test(entry.name) &&
+        !/[.](?:test|spec)[.](?:[cm]?js|ts)$/u.test(entry.name)
+      ) {
+        files.push(path);
+      }
+    }
+  };
+  visit(resolve(root));
+  return files.sort();
+}
+
+function runtimeScriptFragments(path: string, contents: string): readonly string[] {
+  if (!path.endsWith('.svelte')) return [contents];
+  return [...contents.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/gu)]
+    .map((match) => match[1] ?? '');
+}
+
+function hasRuntimeImportBinding(clause: ts.ImportClause | undefined): boolean {
+  return clause === undefined || !clause.isTypeOnly;
+}
+
+function runtimeCallModuleSpecifier(node: ts.Node): string | undefined {
+  if (!ts.isCallExpression(node)) return undefined;
+  const firstArgument = node.arguments[0];
+  if (firstArgument === undefined || !ts.isStringLiteralLike(firstArgument)) {
+    return undefined;
+  }
+  if (node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+    return firstArgument.text;
+  }
+  if (
+    node.arguments.length === 1 &&
+    ts.isIdentifier(node.expression) &&
+    node.expression.text === 'require'
+  ) {
+    return firstArgument.text;
+  }
+  return undefined;
+}
+
+function runtimeModuleSpecifiersFromSource(
+  path: string,
+  contents: string
+): readonly string[] {
+  const specifiers = new Set<string>();
+  for (const fragment of runtimeScriptFragments(path, contents)) {
+    const syntax = ts.createSourceFile(
+      path,
+      fragment,
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.TS
+    );
+    const visit = (node: ts.Node): void => {
+      const callSpecifier = runtimeCallModuleSpecifier(node);
+      if (
+        ts.isImportDeclaration(node) &&
+        ts.isStringLiteral(node.moduleSpecifier) &&
+        hasRuntimeImportBinding(node.importClause)
+      ) {
+        specifiers.add(node.moduleSpecifier.text);
+      } else if (
+        ts.isExportDeclaration(node) &&
+        node.moduleSpecifier !== undefined &&
+        ts.isStringLiteral(node.moduleSpecifier) &&
+        !node.isTypeOnly
+      ) {
+        specifiers.add(node.moduleSpecifier.text);
+      } else if (
+        ts.isImportEqualsDeclaration(node) &&
+        !node.isTypeOnly &&
+        ts.isExternalModuleReference(node.moduleReference) &&
+        node.moduleReference.expression !== undefined &&
+        ts.isStringLiteral(node.moduleReference.expression)
+      ) {
+        specifiers.add(node.moduleReference.expression.text);
+      } else if (callSpecifier !== undefined) {
+        specifiers.add(callSpecifier);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(syntax);
+  }
+  return [...specifiers].sort();
+}
+
+function runtimeModuleSpecifiers(path: string): readonly string[] {
+  return runtimeModuleSpecifiersFromSource(path, source(path));
+}
+
+function resolveRuntimeModule(importer: string, rawSpecifier: string): string | undefined {
+  const specifier = rawSpecifier.split(/[?#]/u, 1)[0] ?? '';
+  const base = specifier.startsWith('$lib/')
+    ? resolve('src/lib', specifier.slice('$lib/'.length))
+    : specifier.startsWith('.')
+      ? resolve(dirname(importer), specifier)
+      : undefined;
+  if (base === undefined) return undefined;
+  const candidates = [
+    base,
+    `${base}.ts`,
+    `${base}.svelte`,
+    `${base}.js`,
+    `${base}.mjs`,
+    join(base, 'index.ts'),
+    join(base, 'index.svelte'),
+    join(base, 'index.js'),
+    ...(base.endsWith('.js') ? [`${base.slice(0, -3)}.ts`] : [])
+  ];
+  return candidates.find((candidate) =>
+    existsSync(candidate) && statSync(candidate).isFile()
+  );
+}
+
+interface RuntimeImportGraph {
+  readonly files: ReadonlySet<string>;
+  chainTo(path: string): string;
+}
+
+function runtimeValueImportGraph(entryFiles: readonly string[]): RuntimeImportGraph {
+  const files = new Set<string>();
+  const parent = new Map<string, string | null>();
+  const pending = entryFiles.map((path) => resolve(path));
+  for (const entry of pending) parent.set(entry, null);
+
+  while (pending.length > 0) {
+    const current = pending.shift()!;
+    if (files.has(current)) continue;
+    files.add(current);
+    for (const specifier of runtimeModuleSpecifiers(current)) {
+      const dependency = resolveRuntimeModule(current, specifier);
+      if (dependency === undefined || parent.has(dependency)) continue;
+      parent.set(dependency, current);
+      pending.push(dependency);
+    }
+  }
+
+  return {
+    files,
+    chainTo(path) {
+      const chain: string[] = [];
+      let current: string | null | undefined = resolve(path);
+      while (current !== undefined && current !== null) {
+        chain.push(relative(process.cwd(), current).replaceAll('\\', '/'));
+        current = parent.get(current);
+      }
+      return chain.reverse().join(' -> ');
+    }
+  };
+}
 
 function serviceBlock(compose: string, name: string): string {
   const match = new RegExp(
@@ -21,6 +181,30 @@ const storageEnvironment = [
 ] as const;
 
 describe('storage process isolation deployment', () => {
+  it('traverses every emitted import/export edge under verbatim module syntax', () => {
+    expect(runtimeModuleSpecifiersFromSource('runtime-edge-fixture.ts', `
+      import type { DeclarationOnlyImport } from './declaration-import';
+      export type { DeclarationOnlyExport } from './declaration-export';
+      import {} from './empty-import';
+      import { type InlineImport } from './inline-import';
+      export {} from './empty-export';
+      export { type InlineExport } from './inline-export';
+      import './side-effect-import';
+      void import(\`$lib/server/dynamic-import\`);
+      require(\`./template-require\`);
+      void import('./dynamic-options', { with: { type: 'json' } });
+    `)).toEqual([
+      '$lib/server/dynamic-import',
+      './dynamic-options',
+      './empty-export',
+      './empty-import',
+      './inline-export',
+      './inline-import',
+      './side-effect-import',
+      './template-require'
+    ]);
+  });
+
   it('mounts publication read-only in web and all persistent roots read-write in worker', () => {
     const compose = source('compose.prod.yaml');
     const app = serviceBlock(compose, 'app');
@@ -258,6 +442,17 @@ describe('storage process isolation deployment', () => {
   it('composes all six financial administrator executors only in the worker root', () => {
     const worker = source('src/worker.ts');
     const web = source('src/hooks.server.ts');
+    const webRuntimeSources = [
+      resolve('src/hooks.server.ts'),
+      ...runtimeSourceFiles('src/routes'),
+      ...runtimeSourceFiles('src/lib/components/admin')
+    ];
+    const refundRouteReachableExecutorModules = [
+      'src/lib/server/commerce/financial/refund-review/finalize.ts',
+      'src/lib/server/commerce/financial/refund-review/corrections.ts',
+      'src/lib/server/commerce/financial/refund-review/recovery.ts'
+    ];
+    const webRuntimeGraph = runtimeValueImportGraph(webRuntimeSources);
 
     for (const expected of [
       'createFinancialAdminCommandExecutors',
@@ -276,9 +471,61 @@ describe('storage process isolation deployment', () => {
 
     expect(worker.match(/createFinancialAdminCommandExecutors\s*\(/gu)).toHaveLength(1);
     expect(worker.match(/createFinancialAdminCommandHandler\s*\(/gu)).toHaveLength(1);
+    for (const [dependency, executor] of [
+      ['refundDraftSave', 'executeRefundDraftSave'],
+      ['refundDraftDiscard', 'executeRefundDraftDiscard'],
+      ['refundAllocationFinalize', 'executeRefundAllocationFinalize'],
+      ['refundReportingCorrectionCreate', 'executeReportingCorrectionCreate'],
+      ['administrativeRecoveryActivate', 'executeAdministrativeRecoveryActivate'],
+      ['administrativeRecoveryDeactivate', 'executeAdministrativeRecoveryDeactivate']
+    ] as const) {
+      expect(worker).toMatch(
+        new RegExp(`${dependency}:\\s*${executor}\\s+as\\s+FinancialAdminCommandExecutor`, 'u')
+      );
+    }
     expect(worker).toMatch(
       /\[FINANCIAL_ADMIN_COMMAND_JOB,\s*financialAdminCommandHandler\]/u
     );
     expect(web).not.toMatch(/financial-admin-command|DATABASE_WORKER|financial_worker/iu);
+
+    for (const path of webRuntimeSources) {
+      const runtimeSource = source(path);
+      const forbiddenMatch = runtimeSource.match(
+        /admin-commands\/(?:executors|handler)|createFinancialAdminCommandExecutors|createFinancialAdminCommandHandler|FINANCIAL_ADMIN_COMMAND_JOB|executeRefundDraftSave|executeRefundDraftDiscard|executeRefundAllocationFinalize|executeReportingCorrectionCreate|executeAdministrativeRecoveryActivate|executeAdministrativeRecoveryDeactivate|financialAdminLeaseCapability|DATABASE_WORKER|pale_orbit_financial_worker/iu
+      )?.[0] ?? null;
+      expect(forbiddenMatch, relative(process.cwd(), path)).toBeNull();
+    }
+
+    for (const path of [
+      'src/lib/server/commerce/financial/admin-commands/handler.ts',
+      'src/lib/server/commerce/financial/admin-commands/executors.ts'
+    ]) {
+      const resolvedPath = resolve(path);
+      expect(
+        webRuntimeGraph.files.has(resolvedPath),
+        webRuntimeGraph.chainTo(resolvedPath)
+      ).toBe(false);
+    }
+    expect(webRuntimeGraph.files.has(resolve(
+      'src/lib/server/commerce/financial/admin-commands/errors.ts'
+    ))).toBe(true);
+
+    for (const path of refundRouteReachableExecutorModules) {
+      expect(webRuntimeGraph.files.has(resolve(path)), path).toBe(true);
+      const moduleSource = source(path);
+      const valueImportSource = moduleSource.replace(
+        /import\s+type\s+\{[^}]*\}\s+from\s+['"][^'"]+['"];?/gu,
+        ''
+      );
+      expect(valueImportSource, path).not.toMatch(
+        /from\s+['"]\$lib\/server\/commerce\/financial\/admin-commands\/(?:handler|executors)['"]/u
+      );
+      expect(moduleSource, path).toContain(
+        "from '$lib/server/commerce/financial/admin-commands/errors'"
+      );
+      expect(moduleSource, path).toMatch(
+        /import\s+type\s+\{\s*FinancialAdminCommandExecutorContext\s*\}\s+from\s+['"]\$lib\/server\/commerce\/financial\/admin-commands\/handler['"]/u
+      );
+    }
   });
 });
