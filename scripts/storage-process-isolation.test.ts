@@ -164,6 +164,16 @@ function runtimeValueImportGraph(entryFiles: readonly string[]): RuntimeImportGr
   };
 }
 
+function directRuntimeValueImporters(
+  target: string,
+  sourceFiles: readonly string[]
+): readonly string[] {
+  const resolvedTarget = resolve(target);
+  return sourceFiles.filter((importer) => runtimeModuleSpecifiers(importer).some(
+    (specifier) => resolveRuntimeModule(importer, specifier) === resolvedTarget
+  )).map((importer) => relative(process.cwd(), importer).replaceAll('\\', '/')).sort();
+}
+
 function serviceBlock(compose: string, name: string): string {
   const match = new RegExp(
     `^  ${name}:\\r?\\n([\\s\\S]*?)(?=^  [a-z][a-z0-9-]*:|^secrets:|^networks:|^volumes:)`,
@@ -203,6 +213,192 @@ describe('storage process isolation deployment', () => {
       './side-effect-import',
       './template-require'
     ]);
+  });
+
+  it('value-imports the test worker controller only from the worker process root', () => {
+    const controllerPath = 'src/lib/server/jobs/test-worker-control.ts';
+    const resolvedControllerPath = resolve(controllerPath);
+    expect(
+      existsSync(resolvedControllerPath),
+      `Missing import-safe test worker controller at ${controllerPath}`
+    ).toBe(true);
+
+    const workerSource = source('src/worker.ts');
+    expect(workerSource).toMatch(
+      /import\s+\{[^}]*\bcreateTestWorkerControl\b[^}]*\}\s+from\s+['"]\$lib\/server\/jobs\/test-worker-control['"]/u
+    );
+    expect(workerSource.match(/\bcreateTestWorkerControl\s*\(/gu)).toHaveLength(1);
+    expect(workerSource).toContain('const rawWorkerEnvironment = process.env;');
+    expect(workerSource).toContain(
+      "databaseEnvironmentForRole(rawWorkerEnvironment, 'worker')"
+    );
+    expect(workerSource).toMatch(
+      /createTestWorkerControl\(\{\s*environment:\s*rawWorkerEnvironment,\s*concurrency:\s*config\.jobs\.concurrency,\s*abortWorker:/u
+    );
+
+    const productionRuntimeSources = runtimeSourceFiles('src');
+    expect(directRuntimeValueImporters(
+      controllerPath,
+      productionRuntimeSources
+    )).toEqual(['src/worker.ts']);
+
+    const workerGraph = runtimeValueImportGraph([resolve('src/worker.ts')]);
+    expect(
+      workerGraph.files.has(resolvedControllerPath),
+      workerGraph.chainTo(resolvedControllerPath)
+    ).toBe(true);
+
+    const controllerGraph = runtimeValueImportGraph([resolvedControllerPath]);
+    expect(controllerGraph.files.has(resolve(
+      'src/lib/server/commerce/financial/admin-commands/errors.ts'
+    ))).toBe(true);
+    for (const forbiddenPath of [
+      'src/lib/server/commerce/financial/admin-commands/handler.ts',
+      'src/lib/server/commerce/financial/admin-commands/executors.ts'
+    ]) {
+      expect(
+        controllerGraph.files.has(resolve(forbiddenPath)),
+        controllerGraph.chainTo(resolve(forbiddenPath))
+      ).toBe(false);
+    }
+
+    const webGraph = runtimeValueImportGraph([
+      resolve('src/hooks.server.ts'),
+      ...runtimeSourceFiles('src/routes'),
+      ...runtimeSourceFiles('src/lib/components')
+    ]);
+    expect(
+      webGraph.files.has(resolvedControllerPath),
+      webGraph.chainTo(resolvedControllerPath)
+    ).toBe(false);
+
+    const cleanupGraph = runtimeValueImportGraph([resolve('src/cleanup-storage.ts')]);
+    expect(
+      cleanupGraph.files.has(resolvedControllerPath),
+      cleanupGraph.chainTo(resolvedControllerPath)
+    ).toBe(false);
+
+    const controllerCreation = workerSource.indexOf('createTestWorkerControl({');
+    const executorDecoration = workerSource.indexOf(
+      'testWorkerControl.decorateFinancialAdminExecutors('
+    );
+    const handlerCreation = workerSource.indexOf(
+      'createFinancialAdminCommandHandler({'
+    );
+    expect(executorDecoration).toBeGreaterThan(controllerCreation);
+    expect(handlerCreation).toBeGreaterThan(executorDecoration);
+
+    const pollStart = workerSource.indexOf('async function prepareWorkerPoll(');
+    const shutdownStart = workerSource.indexOf('function requestShutdown()');
+    const pollSource = workerSource.slice(pollStart, shutdownStart);
+    expect(pollSource).toContain('await prepareTestWorkerPoll({');
+    expect(pollSource).toContain('control: testWorkerControl');
+    expect(pollSource).toContain('signal: context.signal');
+    expect(pollSource).toContain('maintenance: async () => {');
+    expect(pollSource).toContain('purgeCommerceClaimIssuances(databaseClient.db)');
+    expect(pollSource).toContain('await ensureFinancialSchedule(context);');
+
+    const runWorkerCall = workerSource.indexOf('await runWorker({');
+    const throwIfFailed = workerSource.indexOf(
+      'testWorkerControl.throwIfFailed();',
+      runWorkerCall
+    );
+    const catchStart = workerSource.indexOf('} catch (error: unknown)', runWorkerCall);
+    expect(runWorkerCall).toBeGreaterThan(-1);
+    expect(throwIfFailed).toBeGreaterThan(runWorkerCall);
+    expect(throwIfFailed).toBeLessThan(catchStart);
+  }, 30_000);
+
+  it('launches the controller-capable worker only with the owned isolated test environment', () => {
+    const harness = source('scripts/with-test-database.ts');
+    for (const expected of [
+      "const runId = randomBytes(8).toString('hex');",
+      'const project = `pale-orbit-test-${runId}`;',
+      "const testStoragePrefix = join(resolve(tmpdir()), 'pale-orbit-test-storage-');",
+      'const testStorageRoot = await mkdtemp(testStoragePrefix);',
+      "const workerReadyFile = join(testStorageRoot, 'worker.ready');",
+      "if (flag === '--worker') withWorker = true;",
+      "APP_ENV: 'test'",
+      'PALE_ORBIT_TEST_PROJECT: project',
+      "DATABASE_HOST: '127.0.0.1'",
+      "DATABASE_NAME: 'pale_orbit_test'",
+      "DATABASE_WORKER_USER: 'pale_orbit_test_worker'",
+      "WORKER_CONCURRENCY: '1'",
+      'WORKER_READY_FILE: workerReadyFile',
+      "const workerEnvironment = databaseEnvironmentForRole(webEnvironment, 'worker');",
+      "spawn(process.execPath, ['--import', 'tsx', 'src/worker.ts']",
+      'if (withWorker) worker = await startWorker(workerEnvironment);',
+      'env: webEnvironment'
+    ]) {
+      expect(harness).toContain(expected);
+    }
+
+    const workerEnvironmentStart = harness.indexOf(
+      "const workerEnvironment = databaseEnvironmentForRole(webEnvironment, 'worker');"
+    );
+    const workerSpawn = harness.indexOf(
+      'if (withWorker) worker = await startWorker(workerEnvironment);'
+    );
+    expect(workerEnvironmentStart).toBeGreaterThan(-1);
+    expect(workerSpawn).toBeGreaterThan(workerEnvironmentStart);
+    for (const setting of [
+      'DATABASE_USER',
+      'DATABASE_USER_FILE',
+      'DATABASE_PASSWORD',
+      'DATABASE_PASSWORD_FILE',
+      'DATABASE_OWNER_USER',
+      'DATABASE_OWNER_USER_FILE',
+      'DATABASE_OWNER_PASSWORD',
+      'DATABASE_OWNER_PASSWORD_FILE'
+    ]) {
+      const deletion = harness.indexOf(`delete workerEnvironment.${setting};`);
+      expect(deletion, setting).toBeGreaterThan(workerEnvironmentStart);
+      expect(deletion, setting).toBeLessThan(workerSpawn);
+    }
+
+    expect(harness).not.toMatch(
+      /\b(?:TEST_)?WORKER_(?:CONTROL|REQUEST|PAUSE|RELEASE|ACK(?:NOWLEDGEMENT)?)_FILE\b/u
+    );
+  });
+
+  it('keeps every web, cleanup, production, and non-test composition unable to enable control', () => {
+    const production = source('compose.prod.yaml');
+    const development = source('compose.dev.yaml');
+    const testServices = source('compose.test.yaml');
+    const exampleEnvironment = source('.env.example');
+    const playwright = source('playwright.config.ts');
+    const productionServices = ['app', 'worker', 'storage-cleanup'].map(
+      (name) => serviceBlock(production, name)
+    );
+    const developmentServices = ['app', 'worker', 'storage-cleanup'].map(
+      (name) => serviceBlock(development, name)
+    );
+
+    for (const block of productionServices) {
+      expect(block).toContain('APP_ENV: production');
+      expect(block).not.toContain('PALE_ORBIT_TEST_PROJECT');
+      expect(block).not.toContain('pale-orbit-test-storage-');
+    }
+    for (const block of developmentServices) {
+      expect(block).toContain('DATABASE_HOST: postgres');
+      expect(block).not.toContain('PALE_ORBIT_TEST_PROJECT');
+      expect(block).not.toContain('pale-orbit-test-storage-');
+    }
+
+    expect(testServices).not.toMatch(/^ {2}(?:app|worker|storage-cleanup):/mu);
+    expect(exampleEnvironment).toContain('APP_ENV=development');
+    expect(exampleEnvironment).not.toContain('PALE_ORBIT_TEST_PROJECT');
+    expect(playwright).toContain(
+      "command: 'npm run dev -- --host 127.0.0.1 --port 4173'"
+    );
+    expect(playwright).not.toContain('src/worker.ts');
+    expect(playwright).not.toContain('$lib/server/jobs/test-worker-control');
+
+    const callerSelectedControlSetting =
+      /\b(?:TEST_)?WORKER_(?:CONTROL|REQUEST|PAUSE|RELEASE|ACK(?:NOWLEDGEMENT)?)_FILE\b/u;
+    for (const sourceText of [production, development, exampleEnvironment, playwright]) {
+      expect(sourceText).not.toMatch(callerSelectedControlSetting);
+    }
   });
 
   it('mounts publication read-only in web and all persistent roots read-write in worker', () => {

@@ -85,6 +85,10 @@ import { INGEST_REVISION_JOB } from '$lib/server/ingestion/job';
 import { ingestionLimitsFromConfig } from '$lib/server/ingestion/limits';
 import { createPostgresJobRepository } from '$lib/server/jobs/repository';
 import { runWorker } from '$lib/server/jobs/runner';
+import {
+  createTestWorkerControl,
+  prepareTestWorkerPoll
+} from '$lib/server/jobs/test-worker-control';
 import type { JobHandler } from '$lib/server/jobs/types';
 import {
   createOutboxDispatchHandler,
@@ -94,9 +98,17 @@ import { OUTBOX_DISPATCH_JOB } from '$lib/server/outbox/repository';
 import { createObjectStorage } from '$lib/server/storage/factory';
 import { probeStorage } from '$lib/server/storage/health';
 
-const config = loadWorkerApplicationConfig(databaseEnvironmentForRole(process.env, 'worker'));
-const databaseClient = createDatabaseClient(config.database);
+const rawWorkerEnvironment = process.env;
+const config = loadWorkerApplicationConfig(
+  databaseEnvironmentForRole(rawWorkerEnvironment, 'worker')
+);
 const controller = new AbortController();
+const testWorkerControl = createTestWorkerControl({
+  environment: rawWorkerEnvironment,
+  concurrency: config.jobs.concurrency,
+  abortWorker: (reason) => controller.abort(reason)
+});
+const databaseClient = createDatabaseClient(config.database);
 const workerId = `${hostname()}:${process.pid}:${randomUUID()}`;
 const emailTransport = createNodemailerEmailTransport(config.smtp);
 const storage = createObjectStorage(config.storage);
@@ -167,18 +179,21 @@ const financialClassificationHandler = createFinancialClassificationHandler({
   targetClassifierVersion: FINANCIAL_CLASSIFIER_VERSION,
   targetAllocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
 });
-const financialAdminCommandExecutors = createFinancialAdminCommandExecutors({
-  refundDraftSave: executeRefundDraftSave as FinancialAdminCommandExecutor,
-  refundDraftDiscard: executeRefundDraftDiscard as FinancialAdminCommandExecutor,
-  refundAllocationFinalize:
-    executeRefundAllocationFinalize as FinancialAdminCommandExecutor,
-  refundReportingCorrectionCreate:
-    executeReportingCorrectionCreate as FinancialAdminCommandExecutor,
-  administrativeRecoveryActivate:
-    executeAdministrativeRecoveryActivate as FinancialAdminCommandExecutor,
-  administrativeRecoveryDeactivate:
-    executeAdministrativeRecoveryDeactivate as FinancialAdminCommandExecutor
-});
+const financialAdminCommandExecutors =
+  testWorkerControl.decorateFinancialAdminExecutors(
+    createFinancialAdminCommandExecutors({
+      refundDraftSave: executeRefundDraftSave as FinancialAdminCommandExecutor,
+      refundDraftDiscard: executeRefundDraftDiscard as FinancialAdminCommandExecutor,
+      refundAllocationFinalize:
+        executeRefundAllocationFinalize as FinancialAdminCommandExecutor,
+      refundReportingCorrectionCreate:
+        executeReportingCorrectionCreate as FinancialAdminCommandExecutor,
+      administrativeRecoveryActivate:
+        executeAdministrativeRecoveryActivate as FinancialAdminCommandExecutor,
+      administrativeRecoveryDeactivate:
+        executeAdministrativeRecoveryDeactivate as FinancialAdminCommandExecutor
+    })
+  );
 const financialAdminCommandHandler = createFinancialAdminCommandHandler({
   database: databaseClient.db,
   executors: financialAdminCommandExecutors,
@@ -236,12 +251,18 @@ let nextClaimIssuancePurgeAt = 0;
 async function prepareWorkerPoll(
   context: Parameters<typeof ensureFinancialSchedule>[0]
 ): Promise<void> {
-  const observedAt = context.now.getTime();
-  if (observedAt >= nextClaimIssuancePurgeAt) {
-    await purgeCommerceClaimIssuances(databaseClient.db);
-    nextClaimIssuancePurgeAt = observedAt + 60_000;
-  }
-  await ensureFinancialSchedule(context);
+  await prepareTestWorkerPoll({
+    control: testWorkerControl,
+    signal: context.signal,
+    maintenance: async () => {
+      const observedAt = context.now.getTime();
+      if (observedAt >= nextClaimIssuancePurgeAt) {
+        await purgeCommerceClaimIssuances(databaseClient.db);
+        nextClaimIssuancePurgeAt = observedAt + 60_000;
+      }
+      await ensureFinancialSchedule(context);
+    }
+  });
 }
 
 function requestShutdown(): void {
@@ -266,6 +287,7 @@ try {
     beforePoll: prepareWorkerPoll,
     signal: controller.signal
   });
+  testWorkerControl.throwIfFailed();
 } catch (error: unknown) {
   console.error('[worker] stopped unexpectedly', {
     name: error instanceof Error ? error.name : 'UnknownError'
