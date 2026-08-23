@@ -1,5 +1,9 @@
 # Storage, ingestion, publication, and recovery
 
+**Status:** Plan 6B candidate — independent review pending
+
+The unified Plan 6B candidate is migrated through `0013`: migration `0012` retains its historical eight callable public boundary routines and `0013` adds the final ninth. Its exact pairwise-distinct database principals are `DATABASE_OWNER_USER`, `DATABASE_USER`, `DATABASE_WORKER_USER`, and `DATABASE_STORAGE_CLEANUP_USER`; web submit/status/audit authority remains separate from worker mutation authority. The release-evidence sequence is migrate → provision → checkpoint capture → distinct-engine rehearsal → smoke, and the current 14-artifact checkpoint contract remains indivisible. Production stays in maintenance mode with Stripe disabled, while the global `Sales — Upcoming` item remains unlinked pending review. Plan 7 owns production activation and operability. See [financial reconciliation and reporting](financial-reconciliation-and-reporting.md).
+
 ## Safety boundaries
 
 Publication files are private application data. `STORAGE_PROVIDER=local` routes each complete logical key to exactly one persistent root: staging uploads and transient health probes use `STORAGE_STAGING_ROOT`; immutable originals, derived publications, and the fixed publication readiness sentinel use `STORAGE_PUBLICATION_ROOT`; title covers use `STORAGE_COVERS_ROOT`. Development uses the ignored `.data/storage-staging`, `.data/storage-publication`, and `.data/storage-covers` directories. Production mounts the private `book_staging`, `book_publication`, and `book_covers` volumes. The web process has read-write access to staging and covers but read-only access to publication; the worker and bounded cleanup process have read-write access to all three. Caddy receives none of these volumes. Browser data and audit summaries never contain storage keys or physical roots.

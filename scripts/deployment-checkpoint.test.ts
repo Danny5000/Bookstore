@@ -224,7 +224,7 @@ describe('deployment checkpoint authenticated inputs', () => {
     }
   });
 
-  it('builds a positive synthetic allowlist that cannot inherit Compose, PG, file, or Stripe overrides', () => {
+  it('builds a positive synthetic allowlist that cannot inherit Compose, PG, file, or Stripe overrides', async () => {
     const environment = createSyntheticRehearsalEnvironment({
       appImage: image,
       postgresImage: image,
@@ -245,6 +245,34 @@ describe('deployment checkpoint authenticated inputs', () => {
     expect(environment).not.toHaveProperty('DOCKER_HOST');
     expect(environment).not.toHaveProperty('STRIPE_SECRET_KEY');
     expect(environment.DATABASE_PASSWORD).not.toBe('production');
+
+    expect(environment).toMatchObject({
+      DATABASE_OWNER_USER: 'pale_orbit_rehearsal_owner',
+      DATABASE_USER: 'pale_orbit_rehearsal_web',
+      DATABASE_WORKER_USER: 'pale_orbit_rehearsal_worker',
+      DATABASE_STORAGE_CLEANUP_USER: 'pale_orbit_rehearsal_cleanup'
+    });
+    const compose = await readFile('compose.prod.yaml', 'utf8');
+    const service = (name: string): string => compose.match(new RegExp(
+      `^  ${name}:\\r?\\n[\\s\\S]*?(?=^  [a-z][a-z0-9-]*:|^networks:|^volumes:|^secrets:)`,
+      'mu'
+    ))?.[0] ?? '';
+    const migration = service('migrate');
+    expect(migration).toContain(
+      'DATABASE_MIGRATION_WEB_USER: ${DATABASE_USER:?DATABASE_USER must be set}'
+    );
+    expect(migration).toContain(
+      'DATABASE_MIGRATION_WORKER_USER: ${DATABASE_WORKER_USER:?DATABASE_WORKER_USER must be set}'
+    );
+    expect(migration).toContain(
+      'DATABASE_MIGRATION_STORAGE_CLEANUP_USER: ${DATABASE_STORAGE_CLEANUP_USER:?DATABASE_STORAGE_CLEANUP_USER must be set}'
+    );
+    expect(migration).not.toMatch(/^\s+DATABASE_PASSWORD(?:_FILE)?:/mu);
+    for (const name of [
+      'app', 'worker', 'database-role-provision', 'bootstrap-admin', 'storage-cleanup'
+    ]) {
+      expect(service(name), name).not.toContain('DATABASE_MIGRATION_');
+    }
   });
 
   it('copies then re-verifies an owned snapshot and rejects source mutation before Docker can consume it', async () => {

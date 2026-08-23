@@ -1,5 +1,9 @@
 # Authentication and email operations
 
+**Status:** Plan 6B candidate — independent review pending
+
+The unified Plan 6B candidate adds direct administrator financial review and audited command workflows without changing the authentication or email authority below. Its migration chain ends at `0013`, with the historical eight callable routines retained by `0012` and nine in the final surface. The exact four pairwise-distinct principals are `DATABASE_OWNER_USER`, `DATABASE_USER`, `DATABASE_WORKER_USER`, and `DATABASE_STORAGE_CLEANUP_USER`: the web principal submits commands, reads owner-scoped status, and records route-authorized audit evidence, while only the worker executes protected mutations. Release evidence remains migrate → provision → checkpoint capture → distinct-engine rehearsal → smoke. Production remains in maintenance mode with Stripe disabled; Plan 7 owns activation and operability. See [financial reconciliation and reporting](financial-reconciliation-and-reporting.md).
+
 ## Architecture and ownership
 
 Better Auth owns credential hashing; token creation and validation for email verification, password reset, and magic links; database sessions; cookies; trusted-origin checks; and endpoint rate limits. Pale Orbit Press owns the one-use email-verification markers, `customer` and `admin` roles, guest identities, authorization policy, append-only audit events, versioned email payloads, and PostgreSQL outbox delivery. Every authenticated user has the durable `customer` role; an `admin` role adds access to the protected `/admin` routes. A paid guest identity remains separate and has no account access until a verified same-email account completes the commerce claim flow.
@@ -111,7 +115,7 @@ The public `ORIGIN` must be the exact HTTPS origin served by Caddy. Better Auth 
 
 Native verification, reset, and magic-link action URLs carry one-use bearer tokens in their request targets: reset places its token in the URL path, while verification and magic-link actions use query strings. Caddy's default runtime logger filters `request>uri` by deleting it, and Caddy access logging remains disabled so the edge does not retain those URLs. Access logs must not be enabled without an equivalent URI filter that deletes `request>uri` or replaces it with `REDACTED`; application-side no-secret logging rules remain required as defense in depth.
 
-Production remains in maintenance mode after Plan 6A. Catalog, storage, commerce, guest claims, customer libraries, full entitled reading, and original downloads are durable; Plan 6B financial reporting and the Plan 7 launch gate remain prerequisites before storefront activation is considered.
+Production remains in maintenance mode after Plan 6A. Catalog, storage, commerce, guest claims, customer libraries, full entitled reading, and original downloads are durable. Plan 6B financial reporting is implemented as an independent-review candidate whose global Sales link remains disabled; Plan 7 remains the production launch and operability gate.
 
 Authentication email contains text/HTML only. EPUB and CBZ/ZIP originals are never attached to email; entitled delivery is re-authorized and streamed by the application as documented in [customer library, reader state, and original downloads](customer-library-and-reader.md).
 

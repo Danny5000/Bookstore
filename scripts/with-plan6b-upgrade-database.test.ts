@@ -169,9 +169,10 @@ function partialStartupDocker(owned: OwnedRunManifest, state: FakeDockerState): 
 
 describe('Plan 6B disposable upgrade database ownership', () => {
   it('keeps historical rollback proofs while repaired and valid flows reach 0013 once', async () => {
-    const [journalText, fixture] = await Promise.all([
+    const [journalText, fixture, packageText] = await Promise.all([
       readFile('drizzle/meta/_journal.json', 'utf8'),
-      readFile('tests/integration/financial-migration.test.ts', 'utf8')
+      readFile('tests/integration/financial-migration.test.ts', 'utf8'),
+      readFile('package.json', 'utf8')
     ]);
     const journal = JSON.parse(journalText) as {
       entries: Array<{ idx: number; tag: string }>;
@@ -191,6 +192,13 @@ describe('Plan 6B disposable upgrade database ownership', () => {
       idx: 13,
       tag: '0013_plan6bii_reporting_correction_authority'
     }));
+    const packageManifest = JSON.parse(packageText) as { scripts: Record<string, string> };
+    expect(packageManifest.scripts['test:plan6b-upgrade']).toBe(
+      'tsx scripts/with-plan6b-upgrade-database.ts --phase-command tsx tests/integration/financial-migration.test.ts'
+    );
+    expect(packageManifest.scripts['smoke:plan6b'])
+      .toBe('node --import tsx scripts/plan6b-production-smoke.ts');
+    expect(Object.hasOwn(packageManifest.scripts, 'smoke:plan6b-i')).toBe(false);
     expect(fixture).toContain(
       'maxMigrationIndex: 8 | 9 | 10 | 11 | 12 | 13'
     );

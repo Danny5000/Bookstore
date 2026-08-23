@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
   Actor,
@@ -30,6 +31,17 @@ const routeMocks = vi.hoisted(() => ({
   getPayoutDetail: vi.fn(),
   getFinancialAdminCommandStatus: vi.fn()
 }));
+
+describe('Sales candidate navigation boundary', () => {
+  it('keeps the global Sales — Upcoming item disabled while direct candidate routes remain review-only', () => {
+    const adminLayout = readFileSync(new URL('../+layout.svelte', import.meta.url), 'utf8');
+    const adminLinks = adminLayout.match(/<a\b[\s\S]*?<\/a>/giu) ?? [];
+
+    expect(adminLayout).toContain('<span>Sales <small>Upcoming</small></span>');
+    expect(adminLinks.some((link) => /\bSales\b/u.test(link))).toBe(false);
+    expect(adminLayout).not.toMatch(/<a\b[^>]*\/admin\/sales/iu);
+  });
+});
 
 vi.mock('$lib/server/db/runtime', () => ({
   getDatabaseClient: () => ({ db: routeMocks.database })

@@ -6,14 +6,17 @@ import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
+  parsePlan6bSmokeStage,
   runProductionSmoke,
   validateVerifiedProductionImageLease,
+  type Plan6bSmokeStage,
   type ProductionImageLeaseConsumer,
   type VerifiedProductionImageLease
 } from './plan6b-production-smoke';
 
 export interface FixtureProbeManifest {
-  readonly version: 1;
+  readonly version: 2;
+  readonly stage: Plan6bSmokeStage;
   readonly runId: string;
   readonly ownershipToken: string;
   readonly project: string;
@@ -43,6 +46,12 @@ export interface FixtureProbeEvidence {
   readonly unsafeFinancialJobCount: number;
   readonly externalStripeRequestCount: number;
   readonly workerReady: boolean;
+  readonly administratorCommandSucceeded: boolean;
+  readonly administratorWorkerClaimObserved: boolean;
+  readonly administratorSalesReflectionObserved: boolean;
+  readonly administratorAuditReflectionObserved: boolean;
+  readonly webPrivateInputDenied: boolean;
+  readonly webDraftMutationDenied: boolean;
 }
 
 export interface FixtureProbeOperations {
@@ -54,9 +63,11 @@ export interface FixtureProbeOperations {
   startDependencies(manifest: FixtureProbeManifest): Promise<void>;
   migrate(manifest: FixtureProbeManifest): Promise<void>;
   provisionRoles(manifest: FixtureProbeManifest): Promise<void>;
+  bootstrapAdministrator(manifest: FixtureProbeManifest): Promise<void>;
   seedPublishedTitles(manifest: FixtureProbeManifest): Promise<void>;
   startRuntime(manifest: FixtureProbeManifest): Promise<void>;
   exerciseQuoteAndCheckout(manifest: FixtureProbeManifest): Promise<void>;
+  exerciseAdministratorCommand(manifest: FixtureProbeManifest): Promise<void>;
   inspect(
     manifest: FixtureProbeManifest,
     lease: VerifiedProductionImageLease
@@ -77,7 +88,8 @@ export interface FixtureProbeCommandRuntime {
   capture(
     argumentsToCapture: readonly string[],
     environment: NodeJS.ProcessEnv,
-    allowFailure?: boolean
+    allowFailure?: boolean,
+    standardInput?: string
   ): Promise<FixtureProbeCommandResult>;
 }
 
@@ -102,7 +114,7 @@ export interface FixtureProbeDockerDependencies {
 }
 
 export interface FixtureProbeRunDependencies {
-  readonly createManifest: () => Promise<FixtureProbeManifest>;
+  readonly createManifest: (stage: Plan6bSmokeStage) => Promise<FixtureProbeManifest>;
   readonly createOperations: (manifest: FixtureProbeManifest) => FixtureProbeOperations;
   readonly report: (
     message: '[plan6b-fixture] complete',
@@ -118,17 +130,24 @@ export interface FixtureProbeRunDependencies {
 
 export interface FixtureProbeCliDependencies {
   readonly runProduction: (
+    stage: Plan6bSmokeStage,
     consumeImage: ProductionImageLeaseConsumer
   ) => Promise<unknown>;
   readonly runFixture: (
+    stage: Plan6bSmokeStage,
     lease: VerifiedProductionImageLease
   ) => Promise<FixtureProbeEvidence>;
 }
 
-const RUN_PREFIX = 'pale-orbit-plan6b-fixture-';
+const FIXTURE_STAGE = '6b-ii' satisfies Plan6bSmokeStage;
+const RUN_PREFIX = `pale-orbit-plan6b-${FIXTURE_STAGE}-fixture-`;
 const TEMP_PREFIX = join(resolve(tmpdir()), RUN_PREFIX);
 const STRIPE_ATTEMPT_COUNTER_DIRECTORY = '/var/lib/pale-orbit/stripe-attempts';
 const STRIPE_ATTEMPT_COUNTER_FILE = `${STRIPE_ATTEMPT_COUNTER_DIRECTORY}/count`;
+const ADMINISTRATOR_PASSWORD_FILE_NAME = 'bootstrap-admin-password';
+const ADMINISTRATOR_CONTAINER_PASSWORD_FILE = '/run/secrets/bootstrap_admin_password';
+const ADMINISTRATOR_SESSION_FILE = '/tmp/plan6b-fixture-administrator-session';
+const PRIVATE_STANDARD_INPUT_LIMIT_BYTES = 16 * 1024;
 const STRIPE_ATTEMPT_CANARY_SERVER = `const fs=require('node:fs');
 const net=require('node:net');
 const file=${JSON.stringify(STRIPE_ATTEMPT_COUNTER_FILE)};
@@ -148,6 +167,7 @@ const STRIPE_ATTEMPT_CANARY_READ = `const fs=require('node:fs');
 process.stdout.write(fs.readFileSync(${JSON.stringify(STRIPE_ATTEMPT_COUNTER_FILE)},'utf8').trim());`;
 const MANIFEST_KEYS = [
   'version',
+  'stage',
   'runId',
   'ownershipToken',
   'project',
@@ -175,7 +195,13 @@ const EVIDENCE_KEYS = [
   'completedFinancialScanCount',
   'unsafeFinancialJobCount',
   'externalStripeRequestCount',
-  'workerReady'
+  'workerReady',
+  'administratorCommandSucceeded',
+  'administratorWorkerClaimObserved',
+  'administratorSalesReflectionObserved',
+  'administratorAuditReflectionObserved',
+  'webPrivateInputDenied',
+  'webDraftMutationDenied'
 ] as const;
 
 function fixtureError(message: string): Error {
@@ -209,7 +235,10 @@ function exactPath(actual: string, expected: string, description: string): void 
 export function validateFixtureProbeManifest(manifest: FixtureProbeManifest): void {
   assert(typeof manifest === 'object' && manifest !== null, 'owned-run manifest is invalid');
   exactOwnKeys(manifest, MANIFEST_KEYS, 'owned-run manifest');
-  assert(manifest.version === 1, 'owned-run manifest version is invalid');
+  assert(
+    manifest.version === 2 && manifest.stage === FIXTURE_STAGE,
+    'owned-run manifest version or stage is invalid'
+  );
   assert(/^[a-f0-9]{16}$/u.test(manifest.runId), 'owned-run manifest run ID is invalid');
   assert(
     /^[a-f0-9]{32}$/u.test(manifest.ownershipToken),
@@ -220,7 +249,7 @@ export function validateFixtureProbeManifest(manifest: FixtureProbeManifest): vo
     'owned-run manifest project is invalid'
   );
   assert(
-    manifest.imageTag === `pale-orbit:plan6b-i-fixture-${manifest.runId}`,
+    manifest.imageTag === `pale-orbit:plan6b-${manifest.stage}-fixture-${manifest.runId}`,
     'owned-run manifest image tag is invalid'
   );
   assert(manifest.webHost === '127.0.0.1', 'web endpoint is not loopback');
@@ -243,7 +272,8 @@ export function validateFixtureProbeManifest(manifest: FixtureProbeManifest): vo
 export function renderFixtureProbeOverride(manifest: FixtureProbeManifest): string {
   validateFixtureProbeManifest(manifest);
   const labels = `com.paleorbit.plan6b-fixture.run: ${manifest.runId}
-      com.paleorbit.plan6b-fixture.owner: ${manifest.ownershipToken}`;
+      com.paleorbit.plan6b-fixture.owner: ${manifest.ownershipToken}
+      com.paleorbit.plan6b-fixture.stage: ${manifest.stage}`;
   return `x-fixture-environment: &fixture-environment
   NODE_ENV: production
   APP_ENV: test
@@ -404,6 +434,30 @@ services:
       timeout: 3s
       retries: 60
       start_period: 5s
+  bootstrap-admin:
+    profiles: [tools]
+    image: ${manifest.imageTag}
+    command: [node, build/services/bootstrap-admin.js]
+    environment:
+      <<: *fixture-environment
+      DATABASE_USER: pale_orbit_fixture_web
+      DATABASE_PASSWORD: plan6b_fixture_web_password_000000000000
+      DATABASE_OWNER_USER: ""
+      DATABASE_OWNER_PASSWORD: ""
+      DATABASE_WORKER_USER: ""
+      DATABASE_WORKER_PASSWORD: ""
+      DATABASE_STORAGE_CLEANUP_USER: ""
+      DATABASE_STORAGE_CLEANUP_PASSWORD: ""
+      BOOTSTRAP_ADMIN_EMAIL: ${fixtureAdministratorEmail(manifest)}
+      BOOTSTRAP_ADMIN_NAME: Plan 6B Fixture Administrator
+      BOOTSTRAP_ADMIN_PASSWORD_FILE: ${ADMINISTRATOR_CONTAINER_PASSWORD_FILE}
+    secrets:
+      - bootstrap_admin_password
+    labels:
+      ${labels}
+    depends_on:
+      postgres:
+        condition: service_healthy
   migrate:
     profiles: [tools]
     image: ${manifest.imageTag}
@@ -412,12 +466,9 @@ services:
       <<: *fixture-environment
       DATABASE_OWNER_USER: pale_orbit_test
       DATABASE_OWNER_PASSWORD: plan6b_fixture_owner_password_0000000000
-      DATABASE_USER: ""
-      DATABASE_PASSWORD: ""
-      DATABASE_WORKER_USER: ""
-      DATABASE_WORKER_PASSWORD: ""
-      DATABASE_STORAGE_CLEANUP_USER: ""
-      DATABASE_STORAGE_CLEANUP_PASSWORD: ""
+      DATABASE_MIGRATION_WEB_USER: pale_orbit_fixture_web
+      DATABASE_MIGRATION_WORKER_USER: pale_orbit_fixture_worker
+      DATABASE_MIGRATION_STORAGE_CLEANUP_USER: pale_orbit_fixture_storage_cleanup
     labels:
       ${labels}
     depends_on:
@@ -460,6 +511,9 @@ volumes:
   book_covers:
     labels:
       ${labels}
+secrets:
+  bootstrap_admin_password:
+    file: ${JSON.stringify(fixtureAdministratorPasswordFile(manifest))}
 `;
 }
 
@@ -630,6 +684,32 @@ function fixtureUuid(manifest: FixtureProbeManifest, purpose: string): string {
   return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`;
 }
 
+function fixtureAdministratorEmail(manifest: FixtureProbeManifest): string {
+  return `administrator-${manifest.runId}@plan6b-fixture.invalid`;
+}
+
+function fixtureAdministratorPasswordFile(manifest: FixtureProbeManifest): string {
+  return join(manifest.tempDirectory, ADMINISTRATOR_PASSWORD_FILE_NAME);
+}
+
+async function readFixtureAdministratorPassword(
+  manifest: FixtureProbeManifest
+): Promise<string> {
+  let password: string;
+  try {
+    password = await readFile(fixtureAdministratorPasswordFile(manifest), 'utf8');
+  } catch {
+    throw fixtureError('administrator credential is unavailable');
+  }
+  assert(
+    /^P6b![A-Za-z0-9_-]{43}Aa1$/u.test(password) &&
+      Buffer.byteLength(password, 'utf8') <= 128 &&
+      !password.includes(manifest.ownershipToken),
+    'administrator credential is invalid'
+  );
+  return password;
+}
+
 function seedFixtureSql(manifest: FixtureProbeManifest): string {
   const customerId = fixtureUuid(manifest, 'customer');
   const titleOneId = fixtureUuid(manifest, 'title-one');
@@ -673,6 +753,97 @@ update titles set active_revision_id = case id
   when '${titleTwoId}' then '${revisionTwoId}'::uuid
 end, updated_at = now() where id in ('${titleOneId}', '${titleTwoId}');
 commit;`;
+}
+
+function seedAdministratorRefundSql(manifest: FixtureProbeManifest): string {
+  const customerId = fixtureUuid(manifest, 'customer');
+  const titleOneId = fixtureUuid(manifest, 'title-one');
+  const titleTwoId = fixtureUuid(manifest, 'title-two');
+  const orderId = fixtureUuid(manifest, 'administrator-order');
+  const orderItemOneId = fixtureUuid(manifest, 'administrator-order-item-one');
+  const orderItemTwoId = fixtureUuid(manifest, 'administrator-order-item-two');
+  const paymentId = fixtureUuid(manifest, 'administrator-payment');
+  const refundId = fixtureUuid(manifest, 'administrator-refund');
+  const issueId = fixtureUuid(manifest, 'administrator-issue');
+  const checkoutAttemptId = fixtureUuid(manifest, 'administrator-checkout-attempt');
+  return `begin;
+insert into orders (
+  id, status, initiating_user_id, purchase_email, currency, subtotal_minor,
+  tax_minor, total_minor, client_checkout_attempt_id, quote_fingerprint_sha256,
+  status_token_sha256, paid_at
+) values (
+  '${orderId}', 'paid', '${customerId}', '${manifest.runId}@plan6b-fixture.invalid',
+  'USD', 3000, 0, 3000, '${checkoutAttemptId}', repeat('c', 64), repeat('d', 64),
+  statement_timestamp() - interval '2 minutes'
+);
+insert into order_items (
+  id, order_id, title_id, title_snapshot, creator_name_snapshot, format,
+  currency, unit_subtotal_minor, tax_minor, total_minor
+) values
+  ('${orderItemOneId}', '${orderId}', '${titleOneId}', 'Plan 6B Fixture One',
+   'Plan 6B Fixture Author', 'prose', 'USD', 1200, 0, 1200),
+  ('${orderItemTwoId}', '${orderId}', '${titleTwoId}', 'Plan 6B Fixture Two',
+   'Plan 6B Fixture Author', 'prose', 'USD', 1800, 0, 1800);
+insert into payments (
+  id, order_id, stripe_payment_intent_id, stripe_latest_charge_id, status,
+  amount_minor, currency, paid_at, financial_evidence_status
+) values (
+  '${paymentId}', '${orderId}', 'pi_fixture_${manifest.runId}',
+  'ch_fixture_${manifest.runId}', 'succeeded', 3000, 'USD',
+  statement_timestamp() - interval '2 minutes', 'pending'
+);
+insert into refunds (
+  id, payment_id, stripe_refund_id, status, amount_minor, currency,
+  provider_created_at, allocation_status, financial_evidence_status
+) values (
+  '${refundId}', '${paymentId}', 're_fixture_${manifest.runId}', 'succeeded',
+  1000, 'USD', statement_timestamp() - interval '1 minute', 'needs_review', 'pending'
+);
+insert into financial_reconciliation_issues (
+  id, resource_type, resource_id, safe_code, impact, correlation_id
+) values (
+  '${issueId}', 'refund', '${refundId}', 'allocation_incomplete', 'pending',
+  '${manifest.runId}-fixture-refund'
+);
+commit;`;
+}
+
+function initialFinancialScanEvidenceSql(): string {
+  return `select json_build_object(
+  'completedFinancialScanCount', (
+    select count(*)::int from financial_scan_runs
+    where root_key = 'commerce.financial-scan:initial:v1'
+      and kind = 'initial_backfill' and state = 'completed' and safe_outcome = 'completed'
+      and processed_count = 0 and enqueued_count = 0 and page_count = 3
+  )
+)::text`;
+}
+
+function webCommandBoundarySql(): string {
+  return `begin;
+set local role pale_orbit_fixture_web;
+do $boundary$
+begin
+  begin
+    perform private_input from financial_admin_commands limit 1;
+    raise exception using errcode = 'P0001', message = 'web-private-input-boundary-failed';
+  exception when insufficient_privilege then null;
+  end;
+  begin
+    update refund_allocation_drafts set version = version where false;
+    raise exception using errcode = 'P0001', message = 'web-draft-mutation-boundary-failed';
+  exception when insufficient_privilege then null;
+  end;
+end
+$boundary$;
+rollback;`;
+}
+
+function administratorCommandDiscoverySql(): string {
+  return `select json_build_object(
+  'administratorCommandCount', count(*)::int,
+  'commandId', case when count(*) = 1 then min(id)::text else null end
+)::text from financial_admin_commands`;
 }
 
 function record(value: unknown, description: string): Record<string, unknown> {
@@ -749,6 +920,10 @@ function exactOwnershipLabels(
   assert(
     labels['com.paleorbit.plan6b-fixture.owner'] === manifest.ownershipToken,
     'observed resource owner label is foreign'
+  );
+  assert(
+    labels['com.paleorbit.plan6b-fixture.stage'] === manifest.stage,
+    'observed resource stage label is foreign'
   );
 }
 
@@ -867,6 +1042,24 @@ function financialEvidenceSql(manifest: FixtureProbeManifest): string {
   const titleOneId = fixtureUuid(manifest, 'title-one');
   const titleTwoId = fixtureUuid(manifest, 'title-two');
   const customerId = fixtureUuid(manifest, 'customer');
+  const administratorRefundId = fixtureUuid(manifest, 'administrator-refund');
+  const administratorItems = [
+    {
+      orderItemId: fixtureUuid(manifest, 'administrator-order-item-one'),
+      totalPresentmentMinor: 600
+    },
+    {
+      orderItemId: fixtureUuid(manifest, 'administrator-order-item-two'),
+      totalPresentmentMinor: 400
+    }
+  ].sort((left, right) => left.orderItemId.localeCompare(right.orderItemId));
+  const administratorPrivateItems = administratorItems.map((item) =>
+    `jsonb_build_object('orderItemId', '${item.orderItemId}', ` +
+      `'totalPresentmentMinor', ${item.totalPresentmentMinor})`
+  ).join(',\n          ');
+  const administratorDraftTuples = administratorItems.map((item) =>
+    `('${item.orderItemId}'::uuid, ${item.totalPresentmentMinor})`
+  ).join(',\n            ');
   return `select json_build_object(
   'acceptedOrderCount', (
     select count(*)::int from orders purchase
@@ -895,6 +1088,91 @@ function financialEvidenceSql(manifest: FixtureProbeManifest): string {
       'commerce.financial-source', 'commerce.financial-payout',
       'commerce.financial-scan', 'commerce.financial-classification'
     ) and (status <> 'succeeded' or completed_at is null or last_error is not null)
+  ),
+  'administratorCommandSucceeded', (
+    select count(*) = 1
+    from financial_admin_commands command
+    join jobs job on job.id = command.job_id
+    where command.kind = 'refund_draft_save'
+      and command.status = 'succeeded'
+      and command.safe_result_code = 'draft_saved'
+      and command.completed_at is not null
+      and command.private_input ->> 'kind' = 'refund_draft_save'
+      and command.private_input ->> 'refundId' = '${administratorRefundId}'
+      and command.private_input = jsonb_build_object(
+        'kind', 'refund_draft_save',
+        'refundId', '${administratorRefundId}',
+        'expectedVersion', null,
+        'items', jsonb_build_array(
+          ${administratorPrivateItems}
+        )
+      )
+      and command.safe_result ->> 'refundId' = command.private_input ->> 'refundId'
+      and command.safe_result ->> 'draftVersion' = '1'
+      and command.safe_result ->> 'changed' = 'true'
+      and job.type = 'commerce.financial-admin-command'
+      and job.status = 'succeeded' and job.attempts = 1
+      and job.completed_at is not null and job.last_error is null
+      and exists (
+        select 1 from refund_allocation_drafts draft
+        where draft.refund_id = '${administratorRefundId}'::uuid
+          and draft.refund_id::text = command.safe_result ->> 'refundId'
+          and draft.state = 'active' and draft.version = 1
+          and not exists (
+            (select item.order_item_id, item.proposed_total_presentment_minor
+              from refund_allocation_draft_items item where item.draft_id = draft.id)
+            except all
+            (values
+              ${administratorDraftTuples}
+            )
+          )
+          and not exists (
+            (values
+              ${administratorDraftTuples}
+            )
+            except all
+            (select item.order_item_id, item.proposed_total_presentment_minor
+              from refund_allocation_draft_items item where item.draft_id = draft.id)
+          )
+      )
+  ),
+  'administratorWorkerClaimObserved', (
+    select count(*) = 1
+    from financial_admin_job_claims claim
+    join financial_admin_commands command on command.job_id = claim.job_id
+    join jobs job on job.id = claim.job_id
+    where command.kind = 'refund_draft_save' and command.status = 'succeeded'
+      and job.status = 'succeeded' and job.attempts = 1
+      and claim.attempt = job.attempts and claim.state = 'invalidated'
+      and claim.invalidated_at is not null
+  ),
+  'administratorAuditReflectionObserved', (
+    select count(*) = 1
+    from audit_events event
+    join refund_allocation_drafts draft
+      on event.resource_id = draft.id::text
+    join financial_admin_commands command
+      on command.safe_result ->> 'refundId' = draft.refund_id::text
+    where command.kind = 'refund_draft_save' and command.status = 'succeeded'
+      and event.action = 'financial.refund_draft.created'
+      and event.outcome = 'succeeded'
+      and event.resource_type = 'refund_allocation_draft'
+      and event.correlation_id = command.correlation_id
+  ),
+  'administratorSalesReflectionObserved', (
+    select count(*) >= 1
+    from audit_events event
+    join financial_admin_commands command
+      on command.safe_result ->> 'refundId' = event.resource_id
+    where command.kind = 'refund_draft_save' and command.status = 'succeeded'
+      and event.action = 'financial.refund_review.view'
+      and event.outcome = 'succeeded' and event.resource_type = 'refund'
+  ),
+  'webPrivateInputDenied', not pg_catalog.has_column_privilege(
+    'pale_orbit_fixture_web', 'financial_admin_commands', 'private_input', 'SELECT'
+  ),
+  'webDraftMutationDenied', not pg_catalog.has_table_privilege(
+    'pale_orbit_fixture_web', 'refund_allocation_drafts', 'INSERT, UPDATE, DELETE, TRUNCATE'
   )
 )::text`;
 }
@@ -938,10 +1216,104 @@ function validateLeasedImageEvidence(
   );
   assert(
     labels['com.paleorbit.plan6b-smoke.run'] === lease.productionRunId &&
-      labels['com.paleorbit.plan6b-smoke.owner'] === lease.productionOwnershipToken,
+      labels['com.paleorbit.plan6b-smoke.owner'] === lease.productionOwnershipToken &&
+      labels['com.paleorbit.plan6b-smoke.stage'] === lease.stage,
     `${description} ownership is invalid`
   );
 }
+
+function booleanEvidence(value: Record<string, unknown>, key: string): boolean {
+  const candidate = value[key];
+  assert(typeof candidate === 'boolean', 'fixture database evidence is invalid');
+  return candidate;
+}
+
+const ADMINISTRATOR_HTTP_CLIENT = `const fs=require('node:fs');
+const mode=process.argv[1];
+const internalOrigin='http://127.0.0.1:3000';
+const sessionFile=${JSON.stringify(ADMINISTRATOR_SESSION_FILE)};
+const fail=()=>process.exit(1);
+const uuid=/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
+const exact=(value,keys)=>value&&typeof value==='object'&&!Array.isArray(value)&&
+  Reflect.ownKeys(value).length===keys.length&&keys.every((key)=>Object.hasOwn(value,key));
+const boundedText=async(response,limit)=>{const value=await response.text();
+  if(Buffer.byteLength(value,'utf8')>limit)fail();return value;};
+const readInput=async()=>{let value='';process.stdin.setEncoding('utf8');
+  for await(const chunk of process.stdin){value+=chunk;
+    if(Buffer.byteLength(value,'utf8')>${PRIVATE_STANDARD_INPUT_LIMIT_BYTES})fail();}
+  try{return JSON.parse(value)}catch{return fail()}};
+const readSession=()=>{let value;try{value=fs.readFileSync(sessionFile,'utf8')}catch{return fail()}
+  if(value.length<1||Buffer.byteLength(value,'utf8')>8192||/[\\r\\n]/.test(value))fail();return value;};
+const requestHeaders=(origin,cookie)=>({origin,cookie,'sec-fetch-site':'same-origin'});
+(async()=>{
+  const input=await readInput();
+  if(!input||typeof input.origin!=='string'||!/^http:\\/\\/127\\.0\\.0\\.1:[1-9][0-9]{3,4}$/.test(input.origin))fail();
+  if(mode==='submit'){
+    const keys=['origin','email','password','refundId','idempotencyKey','expectedVersion','items'];
+    if(!exact(input,keys)||typeof input.email!=='string'||typeof input.password!=='string'||
+      !uuid.test(input.refundId)||!uuid.test(input.idempotencyKey)||input.expectedVersion!==null||
+      !Array.isArray(input.items)||input.items.length!==2||input.items.some((item)=>
+        !exact(item,['orderItemId','totalPresentmentMinor'])||!uuid.test(item.orderItemId)||
+        !Number.isSafeInteger(item.totalPresentmentMinor)||item.totalPresentmentMinor<0))fail();
+    const login=await fetch(internalOrigin+'/api/auth/sign-in/email',{
+      method:'POST',headers:{'content-type':'application/json',origin:input.origin},
+      body:JSON.stringify({email:input.email,password:input.password,rememberMe:false}),
+      redirect:'manual',signal:AbortSignal.timeout(10000)});
+    await boundedText(login,16384);if(login.status!==200)fail();
+    const getSetCookie=login.headers.getSetCookie;
+    const raw=typeof getSetCookie==='function'?getSetCookie.call(login.headers):[login.headers.get('set-cookie')];
+    const cookie=raw.filter((value)=>typeof value==='string').map((value)=>value.split(';',1)[0]).join('; ');
+    if(cookie.length<1||Buffer.byteLength(cookie,'utf8')>8192||/[\\r\\n]/.test(cookie))fail();
+    try{fs.writeFileSync(sessionFile,cookie,{encoding:'utf8',flag:'wx',mode:0o600})}catch{return fail()}
+    const form=new URLSearchParams();form.append('idempotencyKey',input.idempotencyKey);
+    form.append('expectedVersion','');for(const item of input.items){
+      form.append('orderItemId',item.orderItemId);
+      form.append('totalPresentmentMinor',String(item.totalPresentmentMinor));}
+    const response=await fetch(internalOrigin+'/admin/sales/refunds/'+input.refundId+'?/saveDraft',{
+      method:'POST',headers:{...requestHeaders(input.origin,cookie),accept:'application/json',
+        'content-type':'application/x-www-form-urlencoded','x-sveltekit-action':'true',
+        'x-request-id':'plan6b-fixture-draft-submit'},
+      body:form.toString(),redirect:'manual',signal:AbortSignal.timeout(10000)});
+    const text=await boundedText(response,32768);let body;try{body=JSON.parse(text)}catch{return fail()}
+    if(response.status!==200||!exact(body,['type','status','data'])||
+      body.type!=='success'||body.status!==200)fail();
+    process.stdout.write(JSON.stringify({submitted:true}));return;
+  }
+  if(mode==='status'){
+    if(!exact(input,['origin','commandId','refundId'])||
+      !uuid.test(input.commandId)||!uuid.test(input.refundId))fail();
+    const response=await fetch(internalOrigin+'/admin/sales/commands/'+input.commandId,{
+      headers:{...requestHeaders(input.origin,readSession()),accept:'application/json'},
+      redirect:'manual',signal:AbortSignal.timeout(10000)});
+    const text=await boundedText(response,16384);let body;try{body=JSON.parse(text)}catch{return fail()}
+    const keys=['commandId','createdAt','updatedAt','kind','status','resultCode','result','completedAt'];
+    if(response.status!==200||!exact(body,keys)||body.commandId!==input.commandId||
+      body.kind!=='refund_draft_save'||!['pending','succeeded'].includes(body.status))fail();
+    if(body.status==='pending'){
+      if(body.resultCode!==null||body.result!==null||body.completedAt!==null)fail();
+    }else if(body.resultCode!=='draft_saved'||!exact(body.result,['refundId','draftVersion','changed'])||
+      body.result.refundId!==input.refundId||body.result.draftVersion!==1||body.result.changed!==true||
+      typeof body.completedAt!=='string')fail();
+    process.stdout.write(JSON.stringify({status:body.status,resultCode:body.resultCode}));return;
+  }
+  if(mode==='sales'){
+    if(!exact(input,['origin','refundId'])||!uuid.test(input.refundId))fail();
+    const cookie=readSession();let overview;let detail;
+    try{
+      overview=await fetch(internalOrigin+'/admin/sales?range=all',{
+        headers:requestHeaders(input.origin,cookie),redirect:'manual',signal:AbortSignal.timeout(10000)});
+      detail=await fetch(internalOrigin+'/admin/sales/refunds/'+input.refundId,{
+        headers:requestHeaders(input.origin,cookie),redirect:'manual',signal:AbortSignal.timeout(10000)});
+      const overviewText=await boundedText(overview,262144);
+      const detailText=await boundedText(detail,262144);
+      if(overview.status!==200||detail.status!==200||
+        !overviewText.includes('Sales overview')||!overviewText.includes('item needs review')||
+        !detailText.includes('Shared allocation draft')||!detailText.includes('Version 1'))fail();
+    }finally{try{fs.unlinkSync(sessionFile)}catch{fail()}}
+    process.stdout.write(JSON.stringify({sales:true,detail:true}));return;
+  }
+  fail();
+})().catch(fail);`;
 
 export function createFixtureProbeDockerOperations(
   manifest: FixtureProbeManifest,
@@ -951,6 +1323,44 @@ export function createFixtureProbeDockerOperations(
   const environment = dockerEnvironment(dependencies.environment);
   const compose = composeArguments(manifest);
   let aliasCreated = false;
+
+  const captureAdministratorWeb = async (
+    mode: 'submit' | 'status' | 'sales',
+    input: Readonly<Record<string, unknown>>
+  ): Promise<Record<string, unknown>> => {
+    const standardInput = JSON.stringify(input);
+    assert(
+      Buffer.byteLength(standardInput, 'utf8') <= PRIVATE_STANDARD_INPUT_LIMIT_BYTES,
+      'administrator web input is invalid'
+    );
+    const result = await dependencies.command.capture([
+      ...compose,
+      'exec',
+      '-T',
+      'app',
+      'node',
+      '-e',
+      ADMINISTRATOR_HTTP_CLIENT,
+      mode
+    ], environment, false, standardInput);
+    return parseJsonRecord(result.stdout.trim(), 'administrator web evidence is invalid');
+  };
+
+  const waitForInitialFinancialScan = async (
+    owned: FixtureProbeManifest
+  ): Promise<void> => {
+    for (let attempt = 0; attempt < INSPECTION_ATTEMPTS; attempt += 1) {
+      const snapshot = parseJsonRecord((await dependencies.command.capture(
+        psqlArguments(owned, initialFinancialScanEvidenceSql()),
+        environment
+      )).stdout.trim(), 'fixture initial financial scan evidence is invalid');
+      const count = numericEvidence(snapshot, 'completedFinancialScanCount');
+      assert(count <= 1, 'fixture initial financial scan evidence is invalid');
+      if (count === 1) return;
+      if (attempt + 1 < INSPECTION_ATTEMPTS) await dependencies.wait(INSPECTION_WAIT_MS);
+    }
+    throw fixtureError('fixture initial financial scan timed out');
+  };
   return {
     async acquireImage(owned, lease) {
       validateFixtureProbeManifest(owned);
@@ -1028,6 +1438,17 @@ export function createFixtureProbeDockerOperations(
         'run',
         '--rm',
         'database-role-provision'
+      ], environment);
+    },
+    async bootstrapAdministrator(owned) {
+      validateFixtureProbeManifest(owned);
+      await dependencies.command.run([
+        ...compose,
+        '--profile',
+        'tools',
+        'run',
+        '--rm',
+        'bootstrap-admin'
       ], environment);
     },
     async seedPublishedTitles(owned) {
@@ -1118,6 +1539,96 @@ export function createFixtureProbeDockerOperations(
             .test(hosted.pathname) &&
           hosted.search === '',
         'fixture checkout response is invalid'
+      );
+    },
+    async exerciseAdministratorCommand(owned) {
+      validateFixtureProbeManifest(owned);
+      await waitForInitialFinancialScan(owned);
+      await dependencies.command.run(
+        psqlArguments(owned, seedAdministratorRefundSql(owned)),
+        environment
+      );
+      await dependencies.command.run(
+        psqlArguments(owned, webCommandBoundarySql()),
+        environment
+      );
+
+      const origin = `http://${owned.webHost}:${owned.webPort}`;
+      const refundId = fixtureUuid(owned, 'administrator-refund');
+      const submission = await captureAdministratorWeb('submit', {
+        origin,
+        email: fixtureAdministratorEmail(owned),
+        password: await readFixtureAdministratorPassword(owned),
+        refundId,
+        idempotencyKey: fixtureUuid(owned, 'administrator-command-idempotency'),
+        expectedVersion: null,
+        items: [
+          {
+            orderItemId: fixtureUuid(owned, 'administrator-order-item-one'),
+            totalPresentmentMinor: 600
+          },
+          {
+            orderItemId: fixtureUuid(owned, 'administrator-order-item-two'),
+            totalPresentmentMinor: 400
+          }
+        ]
+      });
+      exactOwnKeys(submission, ['submitted'], 'administrator submission evidence');
+      assert(submission.submitted === true, 'administrator submission evidence is invalid');
+
+      let commandId: string | null = null;
+      for (let attempt = 0; attempt < INSPECTION_ATTEMPTS; attempt += 1) {
+        const discovery = parseJsonRecord((await dependencies.command.capture(
+          psqlArguments(owned, administratorCommandDiscoverySql()),
+          environment
+        )).stdout.trim(), 'administrator command discovery evidence is invalid');
+        exactOwnKeys(
+          discovery,
+          ['administratorCommandCount', 'commandId'],
+          'administrator command discovery evidence'
+        );
+        const count = numericEvidence(discovery, 'administratorCommandCount');
+        assert(count <= 1, 'administrator command discovery evidence is invalid');
+        if (count === 1) {
+          assert(
+            typeof discovery.commandId === 'string' &&
+              /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u
+                .test(discovery.commandId),
+            'administrator command discovery evidence is invalid'
+          );
+          commandId = discovery.commandId;
+          break;
+        }
+        assert(discovery.commandId === null, 'administrator command discovery evidence is invalid');
+        if (attempt + 1 < INSPECTION_ATTEMPTS) await dependencies.wait(INSPECTION_WAIT_MS);
+      }
+      assert(commandId !== null, 'administrator command discovery timed out');
+
+      let succeeded = false;
+      for (let attempt = 0; attempt < INSPECTION_ATTEMPTS; attempt += 1) {
+        const status = await captureAdministratorWeb('status', {
+          origin,
+          commandId,
+          refundId
+        });
+        exactOwnKeys(status, ['status', 'resultCode'], 'administrator status evidence');
+        if (status.status === 'succeeded' && status.resultCode === 'draft_saved') {
+          succeeded = true;
+          break;
+        }
+        assert(
+          status.status === 'pending' && status.resultCode === null,
+          'administrator command did not succeed'
+        );
+        if (attempt + 1 < INSPECTION_ATTEMPTS) await dependencies.wait(INSPECTION_WAIT_MS);
+      }
+      assert(succeeded, 'administrator command status timed out');
+
+      const sales = await captureAdministratorWeb('sales', { origin, refundId });
+      exactOwnKeys(sales, ['sales', 'detail'], 'administrator Sales evidence');
+      assert(
+        sales.sales === true && sales.detail === true,
+        'administrator Sales evidence is invalid'
       );
     },
     async inspect(owned, lease) {
@@ -1220,12 +1731,35 @@ export function createFixtureProbeDockerOperations(
           'completedFinancialScanCount'
         );
         const unsafeFinancialJobCount = numericEvidence(snapshot, 'unsafeFinancialJobCount');
+        const administratorCommandSucceeded = booleanEvidence(
+          snapshot,
+          'administratorCommandSucceeded'
+        );
+        const administratorWorkerClaimObserved = booleanEvidence(
+          snapshot,
+          'administratorWorkerClaimObserved'
+        );
+        const administratorAuditReflectionObserved = booleanEvidence(
+          snapshot,
+          'administratorAuditReflectionObserved'
+        );
+        const administratorSalesReflectionObserved = booleanEvidence(
+          snapshot,
+          'administratorSalesReflectionObserved'
+        );
+        const webPrivateInputDenied = booleanEvidence(snapshot, 'webPrivateInputDenied');
+        const webDraftMutationDenied = booleanEvidence(snapshot, 'webDraftMutationDenied');
         assert(
           acceptedOrderCount === 1 && checkoutSessionCount === 1 &&
             completedFinancialScanCount <= 1,
           'fixture database evidence is invalid'
         );
-        if (completedFinancialScanCount === 1 && unsafeFinancialJobCount === 0) {
+        if (
+          completedFinancialScanCount === 1 && unsafeFinancialJobCount === 0 &&
+          administratorCommandSucceeded && administratorWorkerClaimObserved &&
+          administratorAuditReflectionObserved && administratorSalesReflectionObserved &&
+          webPrivateInputDenied && webDraftMutationDenied
+        ) {
           const stripeAttemptResult = await dependencies.command.capture([
             ...compose,
             'exec',
@@ -1255,7 +1789,13 @@ export function createFixtureProbeDockerOperations(
             completedFinancialScanCount,
             unsafeFinancialJobCount,
             externalStripeRequestCount,
-            workerReady: true
+            workerReady: true,
+            administratorCommandSucceeded,
+            administratorWorkerClaimObserved,
+            administratorSalesReflectionObserved,
+            administratorAuditReflectionObserved,
+            webPrivateInputDenied,
+            webDraftMutationDenied
           } as FixtureProbeEvidence;
           validateEvidence(evidence);
           return evidence;
@@ -1345,7 +1885,10 @@ async function reserveLoopbackPort(): Promise<number> {
   });
 }
 
-export async function createFixtureProbeManifest(): Promise<FixtureProbeManifest> {
+export async function createFixtureProbeManifest(
+  stage: Plan6bSmokeStage
+): Promise<FixtureProbeManifest> {
+  assert(stage === FIXTURE_STAGE, 'fixture stage is invalid');
   for (let attempt = 0; attempt < 8; attempt += 1) {
     const runId = randomBytes(8).toString('hex');
     const tempDirectory = join(resolve(tmpdir()), `${RUN_PREFIX}${runId}`);
@@ -1360,11 +1903,12 @@ export async function createFixtureProbeManifest(): Promise<FixtureProbeManifest
       let databasePort = await reserveLoopbackPort();
       while (databasePort === webPort) databasePort = await reserveLoopbackPort();
       const manifest: FixtureProbeManifest = {
-        version: 1,
+        version: 2,
+        stage,
         runId,
         ownershipToken: randomBytes(16).toString('hex'),
         project: `${RUN_PREFIX}${runId}`,
-        imageTag: `pale-orbit:plan6b-i-fixture-${runId}`,
+        imageTag: `pale-orbit:plan6b-${stage}-fixture-${runId}`,
         tempDirectory,
         overrideFile: join(tempDirectory, 'compose.override.yaml'),
         manifestFile: join(tempDirectory, 'owned-run.json'),
@@ -1374,7 +1918,13 @@ export async function createFixtureProbeManifest(): Promise<FixtureProbeManifest
         databasePort
       };
       validateFixtureProbeManifest(manifest);
+      const administratorPassword = `P6b!${randomBytes(32).toString('base64url')}Aa1`;
       await Promise.all([
+        writeFile(
+          fixtureAdministratorPasswordFile(manifest),
+          administratorPassword,
+          { encoding: 'utf8', flag: 'wx', mode: 0o600 }
+        ),
         writeFile(manifest.overrideFile, renderFixtureProbeOverride(manifest), {
           encoding: 'utf8',
           flag: 'wx'
@@ -1422,6 +1972,17 @@ function validateEvidence(evidence: FixtureProbeEvidence): void {
   assert(evidence.unsafeFinancialJobCount === 0, 'fixture runtime created unsafe financial work');
   assert(evidence.externalStripeRequestCount === 0, 'fixture runtime attempted external Stripe work');
   assert(evidence.workerReady, 'fixture runtime worker is not ready');
+  assert(
+    evidence.administratorCommandSucceeded &&
+      evidence.administratorWorkerClaimObserved &&
+      evidence.administratorSalesReflectionObserved &&
+      evidence.administratorAuditReflectionObserved,
+    'fixture administrator command evidence is invalid'
+  );
+  assert(
+    evidence.webPrivateInputDenied && evidence.webDraftMutationDenied,
+    'fixture web command boundary evidence is invalid'
+  );
 }
 
 export async function executeFixtureRuntimeProbe(
@@ -1431,6 +1992,7 @@ export async function executeFixtureRuntimeProbe(
 ): Promise<FixtureProbeEvidence> {
   validateFixtureProbeManifest(manifest);
   validateVerifiedProductionImageLease(lease);
+  assert(manifest.stage === lease.stage, 'fixture and production image stages do not match');
   let evidence: FixtureProbeEvidence | undefined;
   let failed = false;
   try {
@@ -1439,9 +2001,11 @@ export async function executeFixtureRuntimeProbe(
     await operations.startDependencies(manifest);
     await operations.migrate(manifest);
     await operations.provisionRoles(manifest);
+    await operations.bootstrapAdministrator(manifest);
     await operations.seedPublishedTitles(manifest);
     await operations.startRuntime(manifest);
     await operations.exerciseQuoteAndCheckout(manifest);
+    await operations.exerciseAdministratorCommand(manifest);
     evidence = await operations.inspect(manifest, lease);
     validateEvidence(evidence);
   } catch {
@@ -1461,14 +2025,22 @@ export function createFixtureProbeCommandRuntime(): FixtureProbeCommandRuntime {
   const capture = async (
     argumentsToCapture: readonly string[],
     environment: NodeJS.ProcessEnv,
-    allowFailure = false
+    allowFailure = false,
+    standardInput?: string
   ): Promise<FixtureProbeCommandResult> => {
+    assert(
+      standardInput === undefined ||
+        (typeof standardInput === 'string' &&
+          Buffer.byteLength(standardInput, 'utf8') <= PRIVATE_STANDARD_INPUT_LIMIT_BYTES),
+      'Docker standard input is invalid'
+    );
     const result = spawnSync('docker', [...argumentsToCapture], {
       cwd: resolve('.'),
       env: environment,
       encoding: 'utf8',
       shell: false,
       windowsHide: true,
+      input: standardInput,
       timeout: 30 * 60 * 1000,
       maxBuffer: 16 * 1024 * 1024
     });
@@ -1569,11 +2141,15 @@ const defaultRunDependencies: FixtureProbeRunDependencies = {
 };
 
 export async function runFixtureRuntimeProbe(
+  stage: Plan6bSmokeStage,
   lease: VerifiedProductionImageLease,
   dependencies: FixtureProbeRunDependencies = defaultRunDependencies
 ): Promise<FixtureProbeEvidence> {
+  assert(stage === FIXTURE_STAGE, 'fixture stage is invalid');
   validateVerifiedProductionImageLease(lease);
-  const manifest = await dependencies.createManifest();
+  assert(lease.stage === stage, 'production image lease stage is invalid');
+  const manifest = await dependencies.createManifest(stage);
+  assert(manifest.stage === stage, 'owned-run manifest stage is invalid');
   let operations: FixtureProbeOperations;
   try {
     operations = dependencies.createOperations(manifest);
@@ -1601,16 +2177,19 @@ export async function runFixtureRuntimeProbe(
 }
 
 const defaultCliDependencies: FixtureProbeCliDependencies = {
-  runProduction: (consumeImage) => runProductionSmoke(consumeImage),
-  runFixture: (lease) => runFixtureRuntimeProbe(lease)
+  runProduction: (stage, consumeImage) => runProductionSmoke(stage, consumeImage),
+  runFixture: (stage, lease) => runFixtureRuntimeProbe(stage, lease)
 };
 
 export async function runFixtureRuntimeProbeCli(
+  argumentsToParse: readonly string[],
   dependencies: FixtureProbeCliDependencies = defaultCliDependencies
 ): Promise<void> {
-  await dependencies.runProduction(async (lease) => {
+  const stage = parsePlan6bSmokeStage(argumentsToParse);
+  await dependencies.runProduction(stage, async (lease) => {
     validateVerifiedProductionImageLease(lease);
-    await dependencies.runFixture(lease);
+    assert(lease.stage === stage, 'production image lease stage is invalid');
+    await dependencies.runFixture(stage, lease);
   });
 }
 
@@ -1618,7 +2197,7 @@ const isMain = process.argv[1]
   ? import.meta.url === pathToFileURL(resolve(process.argv[1])).href
   : false;
 if (isMain) {
-  runFixtureRuntimeProbeCli().catch(() => {
+  runFixtureRuntimeProbeCli(process.argv.slice(2)).catch(() => {
     console.error('[plan6b-fixture] failed');
     process.exitCode = 1;
   });

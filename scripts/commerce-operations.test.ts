@@ -893,6 +893,52 @@ describe('commerce operations contract', () => {
     }
   });
 
+  it('publishes one exact stage-aware Plan 6B release command and migration identity boundary', async () => {
+    const [packageText, smokeSource, fixtureSource, { DEPLOYMENT_BACKUP_ARTIFACTS }] =
+      await Promise.all([
+        source('package.json'),
+        source('scripts/plan6b-production-smoke.ts'),
+        source('scripts/plan6b-fixture-runtime-probe.ts'),
+        import('./deployment-backup-bundle')
+      ]);
+    const packageManifest = JSON.parse(packageText) as { scripts: Record<string, string> };
+    const production = await composeConfiguration('compose.prod.yaml');
+    const migrationIdentityNames = [
+      'DATABASE_MIGRATION_WEB_USER',
+      'DATABASE_MIGRATION_WORKER_USER',
+      'DATABASE_MIGRATION_STORAGE_CLEANUP_USER'
+    ] as const;
+
+    expect(packageManifest.scripts['smoke:plan6b'])
+      .toBe('node --import tsx scripts/plan6b-production-smoke.ts');
+    expect(packageManifest.scripts['smoke:plan6b-fixture'])
+      .toBe('node --import tsx scripts/plan6b-fixture-runtime-probe.ts');
+    expect(Object.hasOwn(packageManifest.scripts, 'smoke:plan6b-i')).toBe(false);
+    expect(Object.keys(packageManifest.scripts)
+      .filter((key) => key.startsWith('smoke:plan6b'))
+      .sort()).toEqual(['smoke:plan6b', 'smoke:plan6b-fixture']);
+
+    expect(smokeSource).toContain("export type Plan6bSmokeStage = '6b-ii'");
+    expect(fixtureSource).toContain("const FIXTURE_STAGE = '6b-ii'");
+    expect(smokeSource).not.toMatch(/plan6b-i-(?:smoke|fixture)-/u);
+    expect(fixtureSource).not.toMatch(/plan6b-i-(?:smoke|fixture)-/u);
+
+    expect(production.services.migrate?.environment).toMatchObject({
+      DATABASE_MIGRATION_WEB_USER: 'validation_web',
+      DATABASE_MIGRATION_WORKER_USER: 'validation_worker',
+      DATABASE_MIGRATION_STORAGE_CLEANUP_USER: 'validation_storage_cleanup'
+    });
+    expect(production.services.migrate?.environment).not.toHaveProperty('DATABASE_PASSWORD');
+    for (const [name, service] of Object.entries(production.services)) {
+      if (name === 'migrate') continue;
+      for (const identityName of migrationIdentityNames) {
+        expect(service.environment, name).not.toHaveProperty(identityName);
+      }
+    }
+
+    expect(DEPLOYMENT_BACKUP_ARTIFACTS).toHaveLength(14);
+  });
+
   it('scopes Stripe API and webhook secrets to their exact app and worker consumers', async () => {
     const baseline = await composeConfiguration('compose.prod.yaml');
     const merged = await composeConfiguration('compose.prod.yaml', 'compose.stripe.yaml');

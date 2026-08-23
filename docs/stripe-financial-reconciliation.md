@@ -1,8 +1,10 @@
 # Stripe financial reconciliation operations
 
-Status: **6B-I complete; 6B-II pending**
+**Status:** Plan 6B candidate — independent review pending
 
-This guide covers the minimized Stripe ledger, deterministic financial allocations, payout association, recovery scans, and restore checks delivered by checkpoint 6B-I. The administrator Sales navigation, report routes, refund-review mutations, reporting corrections, CSV export, and recovery-grant controls remain disabled until 6B-II. Production remains closed in `APPLICATION_MODE=maintenance`.
+This guide covers the minimized Stripe ledger, deterministic financial allocations, payout association, recovery scans, and restore checks now joined with administrator report routes, refund review/finalization, reporting corrections, CSV export, payout views, and narrowly scoped recovery grants in one Plan 6B candidate. The direct Sales routes are available only to authorized candidate review; global navigation remains `Sales — Upcoming` with no live link. Production remains closed in `APPLICATION_MODE=maintenance` with Stripe disabled. For surface semantics and safe operator actions, see [financial reconciliation and reporting](financial-reconciliation-and-reporting.md).
+
+The committed migration chain ends at `0013`. Migration `0012` retains its historical eight callable public boundary routines and `0013` adds only the ninth correction-resolution routine. The exact pairwise-distinct principals are `DATABASE_OWNER_USER`, `DATABASE_USER`, `DATABASE_WORKER_USER`, and `DATABASE_STORAGE_CLEANUP_USER`. The web principal submits commands, reads owner-scoped status, and records route-authorized audit evidence; only the financial worker executes protected mutations. Candidate release evidence must run in this order: migrate → provision → checkpoint capture → distinct-engine rehearsal → smoke. Plan 7 remains the production-activation and operability phase.
 
 ## Provider boundary and webhook configuration
 
@@ -34,7 +36,7 @@ Every provider retrieve or list call runs outside an active database transaction
 4. A short ordered transaction re-reads local purchase facts, appends deterministic gross and fee allocation sets, recomputes issues, and advances payout-independent evidence to `fee_reconciled` only when complete.
 5. Current `payout_reconciled` is derived at read time from authoritative membership and the payout's current canonical state. It is never stored on a payment, refund, or dispute.
 
-Out-of-order and duplicate events converge because workers reduce complete canonical objects, not event deltas. An ambiguous succeeded multi-title refund remains `needs_review + pending` with `allocation_incomplete`; 6B-I never invents title attribution or enables its administrative finalization UI.
+Out-of-order and duplicate events converge because workers reduce complete canonical objects, not event deltas. Ingestion never invents title attribution: an ambiguous succeeded multi-title refund remains `needs_review + pending` with `allocation_incomplete` until an authorized reviewer uses the named refund workflow through the controlled candidate surface. Direct SQL mutation remains forbidden.
 
 ### Payout flow and exact association
 
@@ -68,7 +70,7 @@ Job attempt ceilings are 12 for source jobs, 12 for payout jobs, 8 for scan jobs
 - a payout lifecycle or publication change uses a new payout-generation key; and
 - an unsupported classification waits for a new deployed classifier/allocation version rather than looping hourly.
 
-An active-entity guard prevents parallel event/hour/generation jobs from mutating the same source. Permanent evidence conflicts remain exceptions until changed canonical evidence or a specifically authorized 6B-II workflow proves the invariant. There is no manual sync, arbitrary retry, or SQL status-reset procedure in 6B-I; Plan 7 owns general failed-job controls.
+An active-entity guard prevents parallel event/hour/generation jobs from mutating the same source. Permanent evidence conflicts remain exceptions until changed canonical evidence or a specifically authorized named Plan 6B workflow proves the invariant. There is no manual sync, arbitrary retry, or SQL status-reset procedure; Plan 7 owns general failed-job controls.
 
 "Financial data through" means the completion time of the last successful relevant local discovery scan. It does not mean live Stripe state, guarantee that every child job succeeded, or erase open/pending issues. Interpret it together with source state, incomplete import runs, open issues, and failed financial jobs. Safe aggregate inspection is:
 
@@ -108,15 +110,15 @@ Never add unlike currencies or treat one domain as a converted equivalent of the
 
 ## Reconciliation issues and safe inspection
 
-`financial_reconciliation_issues` contains internal resource IDs, bounded codes, `open | resolved` state, `pending | exception | informational` impact, timestamps, occurrence count, and a correlation ID. The complete 6B-I issue vocabulary is:
+`financial_reconciliation_issues` contains internal resource IDs, bounded codes, `open | resolved` state, `pending | exception | informational` impact, timestamps, occurrence count, and a correlation ID. The complete Plan 6B issue vocabulary is:
 
 | Code | Meaning and operator disposition |
 | --- | --- |
 | `allocation_fork` | More than one allocation-chain tip is visible. Keep read-only and investigate replay/version history. |
-| `allocation_incomplete` | Expected attribution is not finalized, commonly an ambiguous refund. Wait for the named 6B-II refund workflow. |
+| `allocation_incomplete` | Expected attribution is not finalized, commonly an ambiguous refund. Authorized reviewers use only the named refund workflow; ingestion and direct SQL never guess attribution. |
 | `allocation_mismatch` | Signed totals, capacities, or persisted allocation shape do not conserve. Treat as an exception. |
 | `classification_fork` | Multiple global allocation tips exist for a Balance Transaction, or an exact replay target contradicts immutable classification evidence on its selected allocation set. Treat as an exception. |
-| `correction_rebase_required` | A preserved reporting correction is incompatible with an exact replacement allocation set. Wait for the named correction workflow. |
+| `correction_rebase_required` | A preserved reporting correction is incompatible with an exact replacement allocation set. Use only the named correction workflow after reviewing compatible canonical evidence. |
 | `currency_mismatch` | Currency domains or linked rows disagree. Do not convert or rewrite values. |
 | `generation_exhausted` | A payout reached the bounded generation ceiling. Keep closed and escalate as a software/data incident. |
 | `immutable_mismatch` | Canonical evidence collides with an existing immutable fact. Compare minimized lineage; never overwrite it. |
@@ -4532,7 +4534,7 @@ Starting a worker belongs only to a separately approved production replacement a
 
 ## Final gate evidence (2026-08-15)
 
-This is evidence from clean post-review implementation HEAD `c02ef2cb86dd83d4f0c398a810114d3187d8ec3d`. Every accepted candidate-review finding was resolved in bounded commits, and the complete dependency, schema, automated-test, upgrade, build, and smoke gate was rerun before recording **6B-I complete; 6B-II pending**. Five final read-only reviewers inspect the evidence-only commit that follows this implementation HEAD before handoff.
+This section preserves historical checkpoint-I evidence from clean post-review implementation HEAD `c02ef2cb86dd83d4f0c398a810114d3187d8ec3d`. Every accepted checkpoint-I finding was resolved in bounded commits, and the complete dependency, schema, automated-test, upgrade, build, and smoke gate was rerun before its then-current handoff. That evidence does not establish the later unified Plan 6B candidate.
 
 - The clean dependency and generated-schema gate ran on Node 26.7.0 with npm 11.19.0. `npm ci` installed 284 packages from the lockfile; exact Better Auth schema generation left `src/lib/server/db/schema/auth.ts` content-identical; `npm run db:check` reported no schema drift; and `npm ls --depth=0` reported no missing or invalid direct dependency. The production-tree audit reported three low and four moderate paths, the full-tree audit reported four low and four moderate paths, and neither reported a high or critical finding. The accepted paths and every dated `npm outdated` defer are recorded in [Dependency decisions](dependency-decisions.md).
 - `npm run check`, `npm run lint`, and both production builds passed. The unit gate passed 1,651 tests across 175 files; the PostgreSQL integration gate passed 514 tests across 50 files; and all 12 Chromium journeys passed. The four release-contract suites passed 139 tests across four files, including production-smoke ownership, privacy, operations, and fixture-runtime contracts.
@@ -4549,6 +4551,6 @@ The base `compose.prod.yaml` fixes `APPLICATION_MODE=maintenance`, `STRIPE_ENABL
 
 The explicit `compose.stripe.yaml` overlay is opt-in test-mode/future-launch infrastructure. App and worker receive `STRIPE_SECRET_KEY_FILE`; only app receives `STRIPE_WEBHOOK_SECRET_FILE`. Migrate, bootstrap, cleanup, Caddy, and PostgreSQL receive neither. Export protected values from the deployment secret system, render Compose, then run `npm run stripe:preflight` before any overlay command that can create a container. Preflight reports presence only and must never print a value. The overlay does not change maintenance mode and is not authorization to launch.
 
-Logs, audits, support output, issue rows, job errors, and future route/CSV DTOs must never contain raw Stripe objects or webhook bodies, provider descriptions/messages/metadata, customer identity, email, card/payment-method/billing/address data, receipt/action URLs, or secrets. A full logical backup necessarily retains application PII and minimized provider linkage, so treat its encrypted archive, checksums, manifests, and restore workspace as sensitive access-controlled artifacts; never copy their contents into logs or support output. Provider object IDs remain confined to minimized server-only linkage/ledger rows, bounded internal job routing, canonical test fixtures, and protected backups; operational output should prefer internal UUIDs and aggregates.
+Logs, audits, support output, issue rows, job errors, and route/CSV DTOs must never contain raw Stripe objects or webhook bodies, provider descriptions/messages/metadata, customer identity, email, card/payment-method/billing/address data, receipt/action URLs, or secrets. A full logical backup necessarily retains application PII and minimized provider linkage, so treat its encrypted archive, checksums, manifests, and restore workspace as sensitive access-controlled artifacts; never copy their contents into logs or support output. Provider object IDs remain confined to minimized server-only linkage/ledger rows, bounded internal job routing, canonical test fixtures, and protected backups; operational output should prefer internal UUIDs and aggregates.
 
-Plan 7 owns production launch, monitoring and alerts, general retry administration, automated off-host backup scheduling, deployment hardening, final capacity/pool tuning, and the read-only-root-filesystem review. Checkpoint 6B-I does not open commerce; full Plan 6B remains incomplete until 6B-II and its independent review are complete.
+Plan 7 owns production launch, monitoring and alerts, general retry administration, automated off-host backup scheduling, deployment hardening, final capacity/pool tuning, and the read-only-root-filesystem review. The Plan 6B candidate does not open commerce before its independent review.

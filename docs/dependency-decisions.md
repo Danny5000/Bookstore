@@ -2,6 +2,10 @@
 
 Checked against the npm registry on 2026-08-15.
 
+**Status:** Plan 6B candidate — independent review pending
+
+Plan 6B-I and 6B-II now form one review candidate and add no production runtime dependency beyond the decisions below. Its committed database chain ends at `0013`: `0012` retains the historical eight callable public boundary routines and `0013` adds the final ninth. The exact pairwise-distinct principals remain `DATABASE_OWNER_USER`, `DATABASE_USER`, `DATABASE_WORKER_USER`, and `DATABASE_STORAGE_CLEANUP_USER`; web submit/status/audit authority is separate from worker mutation authority. Release evidence remains ordered migrate → provision → checkpoint capture → distinct-engine rehearsal → smoke. Production stays in maintenance mode with Stripe disabled, and Plan 7 owns activation and operability. See [financial reconciliation and reporting](financial-reconciliation-and-reporting.md).
+
 | Package | Selected line | Decision |
 | --- | --- | --- |
 | Node.js | 26.7.x | Local tooling and the future production image use the same Node 26 runtime line. |

@@ -6,25 +6,29 @@ import {
   executeProductionSmoke,
   createProductionSmokeManifest,
   createProductionSmokeDockerOperations,
+  parsePlan6bSmokeStage,
   renderProductionSmokeOverride,
   runProductionSmoke,
   validateProductionSmokeManifest,
+  validateVerifiedProductionImageLease,
   type DisabledRuntimeEvidence,
   type ProductionSmokeRunDependencies,
   type ProductionSmokeManifest,
   type ProductionSmokeOperations,
-  type ProductionSmokeCommandRuntime
+  type ProductionSmokeCommandRuntime,
+  type VerifiedProductionImageLease
 } from './plan6b-production-smoke';
 
 function manifest(): ProductionSmokeManifest {
   const runId = '0123456789abcdef';
-  const tempDirectory = join(tmpdir(), `pale-orbit-plan6b-smoke-${runId}`);
+  const tempDirectory = join(tmpdir(), `pale-orbit-plan6b-6b-ii-smoke-${runId}`);
   return {
-    version: 1,
+    version: 2,
+    stage: '6b-ii',
     runId,
     ownershipToken: 'f'.repeat(32),
-    project: `pale-orbit-plan6b-smoke-${runId}`,
-    imageTag: `pale-orbit:plan6b-i-smoke-${runId}`,
+    project: `pale-orbit-plan6b-6b-ii-smoke-${runId}`,
+    imageTag: `pale-orbit:plan6b-6b-ii-smoke-${runId}`,
     tempDirectory,
     overrideFile: join(tempDirectory, 'compose.override.yaml'),
     manifestFile: join(tempDirectory, 'owned-run.json'),
@@ -112,14 +116,35 @@ function operations(trace: string[], failAt: string | null = null): ProductionSm
 }
 
 describe('Plan 6B production smoke ownership', () => {
+  it('requires exactly one explicit supported Plan 6B stage', () => {
+    expect(parsePlan6bSmokeStage(['--stage', '6b-ii'])).toBe('6b-ii');
+    for (const argumentsToReject of [
+      [],
+      ['--stage'],
+      ['--stage', '6b-i'],
+      ['--stage', '6b-iii'],
+      ['--stage=6b-ii'],
+      ['--stage', '6b-ii', '--stage', '6b-ii'],
+      ['--stage', '6b-ii', 'unexpected']
+    ]) {
+      expect(() => parsePlan6bSmokeStage(argumentsToReject)).toThrow(
+        '[plan6b-smoke] stage arguments are invalid'
+      );
+    }
+  });
+
   it('publishes only the two explicit Plan 6B smoke entry points', async () => {
     const packageManifest = JSON.parse(
       await readFile(new URL('../package.json', import.meta.url), 'utf8')
     ) as { scripts?: Record<string, string> };
     expect(packageManifest.scripts).toMatchObject({
-      'smoke:plan6b-i': 'node --import tsx scripts/plan6b-production-smoke.ts',
+      'smoke:plan6b': 'node --import tsx scripts/plan6b-production-smoke.ts',
       'smoke:plan6b-fixture': 'node --import tsx scripts/plan6b-fixture-runtime-probe.ts'
     });
+    expect(Object.keys(packageManifest.scripts ?? {})
+      .filter((key) => key.startsWith('smoke:plan6b'))
+      .sort()).toEqual(['smoke:plan6b', 'smoke:plan6b-fixture']);
+    expect(Object.hasOwn(packageManifest.scripts ?? {}, 'smoke:plan6b-i')).toBe(false);
   });
 
   it('accepts only the exact owned project, tag, paths, loopback hosts, and ephemeral ports', () => {
@@ -127,6 +152,8 @@ describe('Plan 6B production smoke ownership', () => {
     for (const mutate of [
       (value: ProductionSmokeManifest) => ({ ...value, project: 'default' }),
       (value: ProductionSmokeManifest) => ({ ...value, imageTag: 'pale-orbit:latest' }),
+      (value: ProductionSmokeManifest) => ({ ...value, stage: '6b-i' as '6b-ii' }),
+      (value: ProductionSmokeManifest) => ({ ...value, version: 1 as 2 }),
       (value: ProductionSmokeManifest) => ({ ...value, tempDirectory: tmpdir() }),
       (value: ProductionSmokeManifest) => ({ ...value, overrideFile: join(tmpdir(), 'foreign.yaml') }),
       (value: ProductionSmokeManifest) => ({ ...value, httpHost: '0.0.0.0' as '127.0.0.1' }),
@@ -140,7 +167,8 @@ describe('Plan 6B production smoke ownership', () => {
     expect(source).toContain('127.0.0.1:49152:80');
     expect(source).toContain('127.0.0.1:49153:443');
     expect(source).toContain('127.0.0.1:49153:443/udp');
-    expect(source).toContain('pale-orbit:plan6b-i-smoke-0123456789abcdef');
+    expect(source).toContain('pale-orbit:plan6b-6b-ii-smoke-0123456789abcdef');
+    expect(source).toContain('com.paleorbit.plan6b-smoke.stage: 6b-ii');
     expect(source).toContain('com.paleorbit.plan6b-smoke.run: 0123456789abcdef');
     expect(source).toContain(`com.paleorbit.plan6b-smoke.owner: ${'f'.repeat(32)}`);
     expect(source).not.toContain('0.0.0.0:80');
@@ -167,7 +195,8 @@ describe('Plan 6B production smoke ownership', () => {
       async (lease) => {
         trace.push('consume-image');
         expect(lease).toEqual({
-          version: 1,
+          version: 2,
+          stage: '6b-ii',
           sourceTag: manifest().imageTag,
           productionRunId: manifest().runId,
           productionOwnershipToken: manifest().ownershipToken,
@@ -179,6 +208,57 @@ describe('Plan 6B production smoke ownership', () => {
 
     expect(result.image.digest).toBe(`sha256:${'a'.repeat(64)}`);
     expect(trace.slice(-3)).toEqual(['inspect-image', 'consume-image', 'cleanup']);
+  });
+
+  it('rejects stale checkpoint-I manifests and production image leases', () => {
+    const owned = manifest();
+    const currentLease: VerifiedProductionImageLease = {
+      version: 2,
+      stage: '6b-ii',
+      sourceTag: owned.imageTag,
+      productionRunId: owned.runId,
+      productionOwnershipToken: owned.ownershipToken,
+      digest: `sha256:${'a'.repeat(64)}`,
+      sizeBytes: 42
+    };
+    expect(() => validateVerifiedProductionImageLease(currentLease)).not.toThrow();
+
+    const staleManifest = {
+      ...owned,
+      version: 1,
+      project: `pale-orbit-plan6b-smoke-${owned.runId}`,
+      imageTag: `pale-orbit:plan6b-i-smoke-${owned.runId}`
+    };
+    delete (staleManifest as Partial<ProductionSmokeManifest>).stage;
+    expect(() => validateProductionSmokeManifest(
+      staleManifest as unknown as ProductionSmokeManifest
+    )).toThrow();
+    expect(() => validateProductionSmokeManifest({
+      ...owned,
+      imageTag: `pale-orbit:plan6b-i-smoke-${owned.runId}`
+    })).toThrow();
+    expect(() => validateProductionSmokeManifest({
+      ...owned,
+      project: `pale-orbit-plan6b-smoke-${owned.runId}`
+    })).toThrow();
+
+    const legacyLease = {
+      version: 1,
+      sourceTag: `pale-orbit:plan6b-i-smoke-${owned.runId}`,
+      productionRunId: owned.runId,
+      productionOwnershipToken: owned.ownershipToken,
+      digest: currentLease.digest,
+      sizeBytes: currentLease.sizeBytes
+    };
+    for (const staleLease of [
+      legacyLease,
+      { ...currentLease, stage: '6b-i' },
+      { ...currentLease, sourceTag: `pale-orbit:plan6b-i-smoke-${owned.runId}` }
+    ]) {
+      expect(() => validateVerifiedProductionImageLease(
+        staleLease as unknown as VerifiedProductionImageLease
+      )).toThrow();
+    }
   });
 
   it('cleans the production source image when its lease consumer fails', async () => {
@@ -198,7 +278,10 @@ describe('Plan 6B production smoke ownership', () => {
     const owned = manifest();
     const cleanupSetupFailure = vi.fn(async () => undefined);
     const dependencies: ProductionSmokeRunDependencies = {
-      createManifest: vi.fn(async () => owned),
+      createManifest: vi.fn(async (stage) => {
+        expect(stage).toBe('6b-ii');
+        return owned;
+      }),
       createOperations: vi.fn(async () => {
         throw new Error('private-secret-read-failure');
       }),
@@ -206,11 +289,29 @@ describe('Plan 6B production smoke ownership', () => {
       report: vi.fn()
     };
 
-    await expect(runProductionSmoke(undefined, dependencies)).rejects.toThrow(
+    await expect(runProductionSmoke('6b-ii', undefined, dependencies)).rejects.toThrow(
       '[plan6b-smoke] smoke verification failed'
     );
     expect(cleanupSetupFailure).toHaveBeenCalledExactlyOnceWith(owned);
     expect(dependencies.report).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unsupported programmatic stage before allocating a manifest', async () => {
+    const dependencies: ProductionSmokeRunDependencies = {
+      createManifest: vi.fn(async () => manifest()),
+      createOperations: vi.fn(async () => operations([])),
+      cleanupSetupFailure: vi.fn(async () => undefined),
+      report: vi.fn()
+    };
+
+    await expect(runProductionSmoke(
+      '6b-i' as '6b-ii',
+      undefined,
+      dependencies
+    )).rejects.toThrow('[plan6b-smoke] stage is invalid');
+    expect(dependencies.createManifest).not.toHaveBeenCalled();
+    expect(dependencies.createOperations).not.toHaveBeenCalled();
+    expect(dependencies.cleanupSetupFailure).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -370,9 +471,10 @@ describe('Plan 6B production smoke ownership', () => {
 
     expect(calls.find((call) => call.kind === 'run')?.args).toEqual([
       'build', '--target', 'production', '--label',
+      'com.paleorbit.plan6b-smoke.stage=6b-ii', '--label',
       'com.paleorbit.plan6b-smoke.run=0123456789abcdef', '--label',
       `com.paleorbit.plan6b-smoke.owner=${'f'.repeat(32)}`, '--tag',
-      'pale-orbit:plan6b-i-smoke-0123456789abcdef', '.'
+      'pale-orbit:plan6b-6b-ii-smoke-0123456789abcdef', '.'
     ]);
     expect(JSON.stringify(calls)).not.toContain('sk_test_private_canary');
     expect(JSON.stringify(calls)).not.toContain('whsec_private_canary');
@@ -411,7 +513,7 @@ describe('Plan 6B production smoke ownership', () => {
   });
 
   it('materializes a private cleanup database secret with the owned smoke manifest', async () => {
-    const owned = await createProductionSmokeManifest();
+    const owned = await createProductionSmokeManifest('6b-ii');
     try {
       await expect(readFile(
         join(owned.secretDirectory, 'database_storage_cleanup_password'),
@@ -538,7 +640,7 @@ describe('Plan 6B production smoke ownership', () => {
   });
 
   it('never removes a pre-existing image tag after refusing its collision', async () => {
-    const owned = await createProductionSmokeManifest();
+    const owned = await createProductionSmokeManifest('6b-ii');
     const calls: string[][] = [];
     const imageId = `sha256:${'a'.repeat(64)}`;
     const command: ProductionSmokeCommandRuntime = {
@@ -555,6 +657,7 @@ describe('Plan 6B production smoke ownership', () => {
               Size: 42,
               Config: { Labels: {
                 'com.paleorbit.plan6b-smoke.run': owned.runId,
+                'com.paleorbit.plan6b-smoke.stage': owned.stage,
                 'com.paleorbit.plan6b-smoke.owner': owned.ownershipToken
               } }
             })
@@ -809,7 +912,7 @@ describe('Plan 6B production smoke ownership', () => {
   });
 
   it('removes and verifies only the exact owned production image tag', async () => {
-    const owned = await createProductionSmokeManifest();
+    const owned = await createProductionSmokeManifest('6b-ii');
     let imagePresent = false;
     const imageInventories: string[][] = [];
     const command: ProductionSmokeCommandRuntime = {
@@ -830,6 +933,7 @@ describe('Plan 6B production smoke ownership', () => {
               Size: 42,
               Config: { Labels: {
                 'com.paleorbit.plan6b-smoke.run': owned.runId,
+                'com.paleorbit.plan6b-smoke.stage': owned.stage,
                 'com.paleorbit.plan6b-smoke.owner': owned.ownershipToken
               } }
             })
@@ -858,11 +962,12 @@ describe('Plan 6B production smoke ownership', () => {
   });
 
   it('fails cleanup when Compose down succeeds but an owned volume remains', async () => {
-    const owned = await createProductionSmokeManifest();
+    const owned = await createProductionSmokeManifest('6b-ii');
     const volumeId = 'plan6b-owned-volume';
     let downCalled = false;
     const labels = {
       'com.docker.compose.project': owned.project,
+      'com.paleorbit.plan6b-smoke.stage': owned.stage,
       'com.paleorbit.plan6b-smoke.run': owned.runId,
       'com.paleorbit.plan6b-smoke.owner': owned.ownershipToken
     };
@@ -897,8 +1002,8 @@ describe('Plan 6B production smoke ownership', () => {
     }
   });
 
-  it('refuses cleanup before Compose down when an exact-name volume has foreign labels', async () => {
-    const owned = await createProductionSmokeManifest();
+  it('refuses cleanup before Compose down when an exact-name volume has a foreign stage', async () => {
+    const owned = await createProductionSmokeManifest('6b-ii');
     const exactVolumeName = `${owned.project}_postgres_data`;
     let downCalled = false;
     const command: ProductionSmokeCommandRuntime = {
@@ -911,7 +1016,15 @@ describe('Plan 6B production smoke ownership', () => {
           return { status: 0, stdout: `${exactVolumeName}\n` };
         }
         if (args[0] === 'volume' && args[1] === 'inspect') {
-          return { status: 0, stdout: JSON.stringify({}) };
+          return {
+            status: 0,
+            stdout: JSON.stringify({
+              'com.docker.compose.project': owned.project,
+              'com.paleorbit.plan6b-smoke.stage': '6b-i',
+              'com.paleorbit.plan6b-smoke.run': owned.runId,
+              'com.paleorbit.plan6b-smoke.owner': owned.ownershipToken
+            })
+          };
         }
         return { status: 0, stdout: '' };
       })

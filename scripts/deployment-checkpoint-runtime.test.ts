@@ -581,6 +581,17 @@ describe('deployment checkpoint injected lifecycle runtime', () => {
     expect(runtime.calls.some((args) =>
       args.includes('pg_restore') && args.includes('--no-owner') && !args.includes('--no-acl')
     )).toBe(true);
+    const migrateCalls = runtime.calls
+      .map((args, index) => ({ args, index }))
+      .filter(({ args }) => args.includes('run') && args.includes('migrate'));
+    const restoreCall = callIndex(runtime, (args) => args.includes('pg_restore'));
+    const provisionCall = callIndex(runtime, (args) =>
+      args.includes('run') && args.includes('database-role-provision')
+    );
+    expect(migrateCalls).toHaveLength(2);
+    expect(migrateCalls[0]?.index).toBeLessThan(restoreCall);
+    expect(migrateCalls[1]?.index).toBeGreaterThan(restoreCall);
+    expect(provisionCall).toBeGreaterThan(migrateCalls[1]?.index ?? Number.MAX_SAFE_INTEGER);
     expect(runtime.calls.some((args) =>
       args.includes('run') && args.includes('storage-cleanup')
     )).toBe(true);

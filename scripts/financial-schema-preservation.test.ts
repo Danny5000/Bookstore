@@ -88,6 +88,66 @@ const ADMIN_COMMAND_MIGRATION = '../drizzle/0012_plan6bii_admin_command_authorit
 const REPORTING_CORRECTION_AUTHORITY_MIGRATION =
   '../drizzle/0013_plan6bii_reporting_correction_authority.sql';
 
+const PLAN6BII_0012_CALLABLE_ROUTINES = [
+  ['submit_financial_admin_command(uuid,text,text,text,text,jsonb)', 'pale_orbit_runtime'],
+  ['financial_admin_command_status(uuid,uuid)', 'pale_orbit_runtime'],
+  ['append_financial_issue_view_audit(uuid,uuid,text,text,text)', 'pale_orbit_runtime'],
+  ['append_financial_refund_review_view_audit(uuid,uuid,text,text,text)', 'pale_orbit_runtime'],
+  ['append_financial_payout_view_audit(uuid,uuid,text,text,text)', 'pale_orbit_runtime'],
+  [
+    'append_financial_sales_export_audit(uuid,text,text,integer,integer,integer,text,text)',
+    'pale_orbit_runtime'
+  ],
+  ['resolve_financial_issue_after_admin_command(uuid,uuid)', 'pale_orbit_financial_worker'],
+  [
+    'transition_administrative_recovery_grant_after_admin_command(uuid)',
+    'pale_orbit_financial_worker'
+  ]
+] as const;
+
+const PLAN6BII_0012_PRIVATE_ROUTINES = [
+  'plan6bii_assert_financial_admin_job_lease(uuid)',
+  'plan6bii_guard_financial_admin_job_lease()',
+  'plan6bii_guard_financial_admin_command_update()',
+  'plan6bii_guard_financial_admin_command_delete()',
+  'plan6bii_guard_administrative_grant_transition()',
+  'plan6bii_sync_failed_financial_admin_command()'
+] as const;
+
+const PLAN6BII_0012_ROUTINES_IN_MIGRATION_ORDER = [
+  PLAN6BII_0012_PRIVATE_ROUTINES[0],
+  PLAN6BII_0012_PRIVATE_ROUTINES[1],
+  ...PLAN6BII_0012_CALLABLE_ROUTINES.slice(0, 6).map(([signature]) => signature),
+  PLAN6BII_0012_PRIVATE_ROUTINES[2],
+  PLAN6BII_0012_PRIVATE_ROUTINES[3],
+  PLAN6BII_0012_CALLABLE_ROUTINES[6][0],
+  PLAN6BII_0012_PRIVATE_ROUTINES[5],
+  PLAN6BII_0012_PRIVATE_ROUTINES[4],
+  PLAN6BII_0012_CALLABLE_ROUTINES[7][0]
+] as const;
+
+const PLAN6BII_0013_ROUTINE =
+  'resolve_financial_issue_after_reporting_correction_command(uuid,uuid)';
+
+function createdRoutineSignatures(migration: string, includeReplacements = false): string[] {
+  const expression = includeReplacements
+    ? /^CREATE(?: OR REPLACE)? FUNCTION "public"\."([a-z0-9_]+)"\(([^)]*)\)/gmu
+    : /^CREATE FUNCTION "public"\."([a-z0-9_]+)"\(([^)]*)\)/gmu;
+  return Array.from(
+    migration.matchAll(expression),
+    (match) => `${match[1]}(${match[2]})`
+  );
+}
+
+function routineName(signature: string): string {
+  return signature.slice(0, signature.indexOf('('));
+}
+
+function quotedRoutineSignature(signature: string): string {
+  const argumentStart = signature.indexOf('(');
+  return `"${signature.slice(0, argumentStart)}"${signature.slice(argumentStart)}`;
+}
+
 function renderedProjectionHeads(): string {
   return getViewConfig(currentFinancialProjectionHeads).query.toQuery({
     casing: {} as never,
@@ -148,6 +208,71 @@ describe('Plan 6B financial schema preservation', () => {
     expect(migration).toContain(
       'GRANT EXECUTE ON FUNCTION "public"."resolve_financial_issue_after_reporting_correction_command"(uuid,uuid) TO "pale_orbit_financial_worker"'
     );
+  });
+
+  it('freezes the historical eight-routine 0012 boundary and final nine-routine 0013 head', () => {
+    const integration = source('../tests/integration/financial-migration.test.ts');
+    const adminCommandMigration = source(ADMIN_COMMAND_MIGRATION);
+    const reportingCorrectionMigration = source(REPORTING_CORRECTION_AUTHORITY_MIGRATION);
+    const journal = JSON.parse(source('../drizzle/meta/_journal.json')) as {
+      entries: Array<{ idx: number; tag: string }>;
+    };
+    const historicalRoutineBlock = integration.match(
+      /const PLAN6BII_ROUTINES = \[([\s\S]*?)\] as const;/u
+    )?.[1] ?? '';
+    const historicalRoutines = Array.from(
+      historicalRoutineBlock.matchAll(/'([a-z0-9_]+)'/gu),
+      (match) => match[1]
+    );
+    const callableRoutineNames = PLAN6BII_0012_CALLABLE_ROUTINES.map(
+      ([signature]) => routineName(signature)
+    );
+    const privateRoutineNames = PLAN6BII_0012_PRIVATE_ROUTINES.map(routineName);
+
+    expect(historicalRoutines).toHaveLength(14);
+    expect(historicalRoutines).toEqual([...callableRoutineNames, ...privateRoutineNames]);
+    expect(historicalRoutines).not.toContain(
+      'resolve_financial_issue_after_reporting_correction_command'
+    );
+
+    expect(createdRoutineSignatures(adminCommandMigration)).toEqual(
+      PLAN6BII_0012_ROUTINES_IN_MIGRATION_ORDER
+    );
+    const adminCommandExecuteGrants = Array.from(
+      adminCommandMigration.matchAll(
+        /^GRANT EXECUTE ON FUNCTION "public"\."([a-z0-9_]+)"\(([^)]*)\) TO "([a-z0-9_]+)";/gmu
+      ),
+      (match) => [`${match[1]}(${match[2]})`, match[3]]
+    );
+    expect(adminCommandExecuteGrants).toEqual(PLAN6BII_0012_CALLABLE_ROUTINES);
+    expect(adminCommandMigration).not.toMatch(
+      /^GRANT EXECUTE ON FUNCTION .* TO PUBLIC;/mu
+    );
+    for (const signature of PLAN6BII_0012_ROUTINES_IN_MIGRATION_ORDER) {
+      expect(adminCommandMigration).toContain(
+        `REVOKE ALL ON FUNCTION "public".${quotedRoutineSignature(signature)} FROM PUBLIC, "pale_orbit_runtime", "pale_orbit_financial_worker", "pale_orbit_storage_cleanup";`
+      );
+    }
+
+    expect(createdRoutineSignatures(reportingCorrectionMigration, true)).toEqual([
+      PLAN6BII_0013_ROUTINE
+    ]);
+    expect(reportingCorrectionMigration).toContain(
+      `REVOKE ALL ON FUNCTION "public".${quotedRoutineSignature(PLAN6BII_0013_ROUTINE)} FROM PUBLIC, "pale_orbit_runtime", "pale_orbit_financial_worker", "pale_orbit_storage_cleanup";`
+    );
+    expect(reportingCorrectionMigration).toContain(
+      `GRANT EXECUTE ON FUNCTION "public".${quotedRoutineSignature(PLAN6BII_0013_ROUTINE)} TO "pale_orbit_financial_worker";`
+    );
+    expect(reportingCorrectionMigration).not.toMatch(
+      /^GRANT EXECUTE ON FUNCTION .* TO (?:PUBLIC|"pale_orbit_runtime"|"pale_orbit_storage_cleanup");/mu
+    );
+    expect(journal.entries.map(({ idx }) => idx)).toEqual(
+      Array.from({ length: 14 }, (_value, idx) => idx)
+    );
+    expect(journal.entries.at(-1)).toEqual(expect.objectContaining({
+      idx: 13,
+      tag: '0013_plan6bii_reporting_correction_authority'
+    }));
   });
 
   it('pins issue-independent correction compatibility and exact command provenance', () => {

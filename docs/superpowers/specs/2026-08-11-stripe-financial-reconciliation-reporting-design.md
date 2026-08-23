@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-11
 
-**Status:** 6B-I complete; 6B-II pending
+**Status:** Plan 6B candidate — independent review pending
 
 **Depends on:** Plans 1-6A, `2026-08-08-bookstore-full-stack-design.md`, and `2026-08-10-stripe-commerce-guest-claims-design.md`
 
@@ -16,9 +16,11 @@ The established purchase model remains unchanged: a cart can contain multiple ti
 
 Production remains in maintenance mode through Plan 6B. Plan 7 still owns launch readiness, general failed-job administration, monitoring and alerting, backup automation, deployment hardening, and the Hetzner production launch.
 
+The implementation candidate is migrated through `0013`: migration `0012` retains its historical eight callable public boundary routines and `0013` adds the ninth. Its exact pairwise-distinct principals are `DATABASE_OWNER_USER`, `DATABASE_USER`, `DATABASE_WORKER_USER`, and `DATABASE_STORAGE_CLEANUP_USER`. The web principal may submit a command, read its owner-scoped status, and record the route-authorized audit boundary; only the financial worker may execute the protected mutation. Candidate release evidence remains ordered migrate → provision → checkpoint capture → distinct-engine rehearsal → smoke. See the [financial reconciliation and reporting operator guide](../../financial-reconciliation-and-reporting.md).
+
 ## 2. Goals
 
-Plan 6B will provide:
+The Plan 6B candidate provides:
 
 - A normalized, minimized local ledger of Stripe balance transactions and payouts.
 - Separate customer-presentment and Stripe-settlement currency domains.
@@ -93,14 +95,14 @@ Webhook delivery is the fast path. Durable local and payout scans are the recove
 
 ### 4.3 Delivery checkpoints
 
-Plan 6B is one design with two implementation checkpoints:
+Plan 6B is one design delivered through two implementation checkpoints:
 
 - **6B-I — Financial ingestion and reconciliation:** schema, canonical provider DTOs, payout webhooks, recurring scans, ledger imports, allocations, issues, migration, backfill, and focused verification.
 - **6B-II — Admin resolution and reporting:** capabilities, sales overview, refund review, payout views, reporting corrections, CSV, audit, accessibility, documentation, and full release gates.
 
-Each checkpoint receives an independent code review. The second checkpoint cannot treat the first as complete until ledger replay, concurrency, migration, and currency invariants have passed their focused gates.
+Checkpoint I passed its bounded independent review before checkpoint II began. They now form one candidate phase, and neither checkpoint is a separately released product surface.
 
-Checkpoint I implements the ingestion/reconciliation half above and has completed its independent review gate. Sales navigation, administrator resolution/reporting routes, payout views, corrections, recovery grants, and CSV remain disabled until 6B-II. Production remains in maintenance mode and Plan 7 retains launch ownership. See the [Stripe financial reconciliation operations guide](../../stripe-financial-reconciliation.md) for its runtime and recovery boundary.
+The candidate combines checkpoint I’s ingestion/reconciliation work with checkpoint II’s administrator resolution/reporting routes, payout views, corrections, recovery grants, and CSV. Direct routes are available only for controlled review; the global item remains `Sales — Upcoming` without a live link until final independent clearance. Production remains in maintenance mode with Stripe disabled, and Plan 7 retains activation and operability ownership. See the [Stripe financial reconciliation operations guide](../../stripe-financial-reconciliation.md) for its runtime and recovery boundary.
 
 ## 5. Financial authority and currency model
 
@@ -831,7 +833,7 @@ Plan 6B updates:
 - Backup/restore documentation with ledger, payout, allocation, issue, draft, correction, and checkpoint invariants.
 - The admin guide with signed metric definitions, UTC boundaries, currency domains, draft/finalization consequences, reporting-only corrections, administrative access recovery, CSV privacy, and audit behavior.
 - Dependency decisions and final gate evidence with current versions and actual test/image results.
-- The full-stack roadmap to mark Plan 6B implemented only after both checkpoints and final review are complete.
+- The full-stack roadmap to mark the unified Plan 6B candidate complete only after final independent review is complete.
 
 Operational diagnostics use safe SQL examples that select counts, states, timestamps, currencies, and internal IDs only. Runbooks never select provider messages, identity columns, raw payloads, or secrets. Direct database edits are not a supported resolution path.
 

@@ -705,6 +705,12 @@ describe('production database authority split', () => {
     expect(worker).not.toContain('DATABASE_STORAGE_CLEANUP_');
     expect(migrate).toContain('DATABASE_OWNER_USER: ${DATABASE_OWNER_USER:');
     expect(migrate).toContain('DATABASE_OWNER_PASSWORD_FILE: /run/secrets/database_owner_password');
+    expect(migrate).toContain('DATABASE_MIGRATION_WEB_USER: ${DATABASE_USER:');
+    expect(migrate).toContain('DATABASE_MIGRATION_WORKER_USER: ${DATABASE_WORKER_USER:');
+    expect(migrate).toContain(
+      'DATABASE_MIGRATION_STORAGE_CLEANUP_USER: ${DATABASE_STORAGE_CLEANUP_USER:'
+    );
+    expect(migrate).not.toMatch(/^\s+DATABASE_PASSWORD(?:_FILE)?:/mu);
     expect(postgres).toContain('POSTGRES_USER: ${DATABASE_OWNER_USER:');
     expect(postgres).toContain('POSTGRES_PASSWORD_FILE: /run/secrets/database_owner_password');
     expect(cleanup).toContain('DATABASE_STORAGE_CLEANUP_USER: ${DATABASE_STORAGE_CLEANUP_USER:');
@@ -720,6 +726,9 @@ describe('production database authority split', () => {
     expect(provision).toContain('/run/secrets/database_storage_cleanup_password');
     for (const block of [app, worker, migrate, bootstrap, postgres]) {
       expect(block).not.toContain('/run/secrets/database_storage_cleanup_password');
+    }
+    for (const block of [app, worker, provision, bootstrap, cleanup, postgres]) {
+      expect(block).not.toContain('DATABASE_MIGRATION_');
     }
     expect(compose).toMatch(
       /database_storage_cleanup_password:\r?\n {4}environment: DATABASE_STORAGE_CLEANUP_PASSWORD/u
@@ -746,11 +755,32 @@ describe('production database authority split', () => {
       "databaseEnvironmentForRole(process.env, 'owner')"
     );
     expect(workerEntrypoint).toContain(
-      "databaseEnvironmentForRole(process.env, 'worker')"
+      "databaseEnvironmentForRole(rawWorkerEnvironment, 'worker')"
     );
     expect(source('src/cleanup-storage.ts')).toContain(
       "databaseEnvironmentForRole(process.env, 'storage-cleanup')"
     );
+  });
+
+  it('keeps smoke, fixture, and checkpoint migration identity transport on migration only', () => {
+    const smoke = source('scripts/plan6b-production-smoke.ts');
+    const fixture = source('scripts/plan6b-fixture-runtime-probe.ts');
+    const checkpoint = source('scripts/deployment-checkpoint.ts');
+    const fixtureMigration = serviceBlock(fixture, 'migrate');
+
+    expect(smoke).toContain("resolve('compose.prod.yaml')");
+    expect(checkpoint).toContain("const composeFile = resolve('compose.prod.yaml')");
+    for (const [name, value] of [
+      ['DATABASE_MIGRATION_WEB_USER', 'pale_orbit_fixture_web'],
+      ['DATABASE_MIGRATION_WORKER_USER', 'pale_orbit_fixture_worker'],
+      ['DATABASE_MIGRATION_STORAGE_CLEANUP_USER', 'pale_orbit_fixture_storage_cleanup']
+    ] as const) {
+      expect(fixtureMigration).toContain(`${name}: ${value}`);
+    }
+    expect(fixtureMigration).not.toMatch(/^\s+DATABASE_PASSWORD(?:_FILE)?:/mu);
+    for (const name of ['app', 'worker', 'database-role-provision']) {
+      expect(serviceBlock(fixture, name), name).not.toContain('DATABASE_MIGRATION_');
+    }
   });
 
   it('masks the shared env file and removes unrelated credentials from long-running development services', () => {

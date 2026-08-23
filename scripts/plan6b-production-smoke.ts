@@ -6,8 +6,11 @@ import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+export type Plan6bSmokeStage = '6b-ii';
+
 export interface ProductionSmokeManifest {
-  readonly version: 1;
+  readonly version: 2;
+  readonly stage: Plan6bSmokeStage;
   readonly runId: string;
   readonly ownershipToken: string;
   readonly project: string;
@@ -56,7 +59,8 @@ export interface ProductionImageEvidence {
 }
 
 export interface VerifiedProductionImageLease {
-  readonly version: 1;
+  readonly version: 2;
+  readonly stage: Plan6bSmokeStage;
   readonly sourceTag: string;
   readonly productionRunId: string;
   readonly productionOwnershipToken: string;
@@ -103,7 +107,7 @@ export interface ProductionSmokeDockerDependencies {
 }
 
 export interface ProductionSmokeRunDependencies {
-  readonly createManifest: () => Promise<ProductionSmokeManifest>;
+  readonly createManifest: (stage: Plan6bSmokeStage) => Promise<ProductionSmokeManifest>;
   readonly createOperations: (
     manifest: ProductionSmokeManifest
   ) => Promise<ProductionSmokeOperations>;
@@ -118,10 +122,13 @@ export interface ProductionSmokeRunDependencies {
   ) => void;
 }
 
-const RUN_PREFIX = 'pale-orbit-plan6b-smoke-';
+const PLAN6B_SMOKE_STAGE: Plan6bSmokeStage = '6b-ii';
+const RUN_PREFIX = `pale-orbit-plan6b-${PLAN6B_SMOKE_STAGE}-smoke-`;
+const IMAGE_TAG_PREFIX = `pale-orbit:plan6b-${PLAN6B_SMOKE_STAGE}-smoke-`;
 const TEMP_PREFIX = join(resolve(tmpdir()), RUN_PREFIX);
 const MANIFEST_KEYS = [
   'version',
+  'stage',
   'runId',
   'ownershipToken',
   'project',
@@ -148,6 +155,7 @@ const MIGRATION_EVIDENCE_KEYS = [
 ] as const;
 const IMAGE_LEASE_KEYS = [
   'version',
+  'stage',
   'sourceTag',
   'productionRunId',
   'productionOwnershipToken',
@@ -161,6 +169,22 @@ function smokeError(message: string): Error {
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw smokeError(message);
+}
+
+export function parsePlan6bSmokeStage(
+  argumentsToParse: readonly string[]
+): Plan6bSmokeStage {
+  assert(
+    argumentsToParse.length === 2 &&
+      argumentsToParse[0] === '--stage' &&
+      argumentsToParse[1] === PLAN6B_SMOKE_STAGE,
+    'stage arguments are invalid'
+  );
+  return PLAN6B_SMOKE_STAGE;
+}
+
+function validatePlan6bSmokeStage(stage: unknown): asserts stage is Plan6bSmokeStage {
+  assert(stage === PLAN6B_SMOKE_STAGE, 'stage is invalid');
 }
 
 function exactOwnKeys(value: object, expected: readonly string[]): void {
@@ -184,7 +208,8 @@ function safePort(value: number): boolean {
 export function validateProductionSmokeManifest(manifest: ProductionSmokeManifest): void {
   assert(typeof manifest === 'object' && manifest !== null, 'owned-run manifest is invalid');
   exactOwnKeys(manifest, MANIFEST_KEYS);
-  assert(manifest.version === 1, 'owned-run manifest version is invalid');
+  assert(manifest.version === 2, 'owned-run manifest version is invalid');
+  validatePlan6bSmokeStage(manifest.stage);
   assert(/^[a-f0-9]{16}$/u.test(manifest.runId), 'owned-run manifest run ID is invalid');
   assert(
     /^[a-f0-9]{32}$/u.test(manifest.ownershipToken),
@@ -195,7 +220,7 @@ export function validateProductionSmokeManifest(manifest: ProductionSmokeManifes
     'owned-run manifest project is invalid'
   );
   assert(
-    manifest.imageTag === `pale-orbit:plan6b-i-smoke-${manifest.runId}`,
+    manifest.imageTag === `${IMAGE_TAG_PREFIX}${manifest.runId}`,
     'owned-run manifest image tag is invalid'
   );
   assert(manifest.httpHost === '127.0.0.1', 'HTTP endpoint is not loopback');
@@ -217,7 +242,8 @@ export function validateProductionSmokeManifest(manifest: ProductionSmokeManifes
 
 export function renderProductionSmokeOverride(manifest: ProductionSmokeManifest): string {
   validateProductionSmokeManifest(manifest);
-  const labels = `com.paleorbit.plan6b-smoke.run: ${manifest.runId}
+  const labels = `com.paleorbit.plan6b-smoke.stage: ${manifest.stage}
+      com.paleorbit.plan6b-smoke.run: ${manifest.runId}
       com.paleorbit.plan6b-smoke.owner: ${manifest.ownershipToken}`;
   return `services:
   app:
@@ -374,6 +400,10 @@ function exactOwnershipLabels(
   assert(
     labels['com.docker.compose.project'] === manifest.project,
     'observed resource project label is foreign'
+  );
+  assert(
+    labels['com.paleorbit.plan6b-smoke.stage'] === manifest.stage,
+    'observed resource stage label is foreign'
   );
   assert(
     labels['com.paleorbit.plan6b-smoke.run'] === manifest.runId,
@@ -694,6 +724,8 @@ export function createProductionSmokeDockerOperations(
           '--target',
           'production',
           '--label',
+          `com.paleorbit.plan6b-smoke.stage=${owned.stage}`,
+          '--label',
           `com.paleorbit.plan6b-smoke.run=${owned.runId}`,
           '--label',
           `com.paleorbit.plan6b-smoke.owner=${owned.ownershipToken}`,
@@ -1000,7 +1032,8 @@ export function createProductionSmokeDockerOperations(
         : null;
       assert(labels && typeof labels === 'object' && !Array.isArray(labels), 'image labels are invalid');
       assert(
-        (labels as Record<string, unknown>)['com.paleorbit.plan6b-smoke.run'] === owned.runId &&
+        (labels as Record<string, unknown>)['com.paleorbit.plan6b-smoke.stage'] === owned.stage &&
+          (labels as Record<string, unknown>)['com.paleorbit.plan6b-smoke.run'] === owned.runId &&
           (labels as Record<string, unknown>)['com.paleorbit.plan6b-smoke.owner'] ===
             owned.ownershipToken,
         'image ownership is invalid'
@@ -1037,7 +1070,10 @@ export function createProductionSmokeDockerOperations(
           assert(labels && typeof labels === 'object', 'cleanup image labels are invalid');
           assert(
             inspected.Id === imageIds[0] &&
-            (labels as Record<string, unknown>)['com.paleorbit.plan6b-smoke.run'] === owned.runId &&
+              (labels as Record<string, unknown>)['com.paleorbit.plan6b-smoke.stage'] ===
+                owned.stage &&
+              (labels as Record<string, unknown>)['com.paleorbit.plan6b-smoke.run'] ===
+                owned.runId &&
               (labels as Record<string, unknown>)['com.paleorbit.plan6b-smoke.owner'] ===
                 owned.ownershipToken,
             'cleanup image ownership is invalid'
@@ -1123,10 +1159,11 @@ export function validateVerifiedProductionImageLease(
       keys.every((key) => typeof key === 'string' && IMAGE_LEASE_KEYS.includes(key)),
     'production image lease shape is invalid'
   );
-  assert(lease.version === 1, 'production image lease version is invalid');
+  assert(lease.version === 2, 'production image lease version is invalid');
+  validatePlan6bSmokeStage(lease.stage);
   assert(
     /^[a-f0-9]{16}$/u.test(lease.productionRunId) &&
-      lease.sourceTag === `pale-orbit:plan6b-i-smoke-${lease.productionRunId}`,
+      lease.sourceTag === `${IMAGE_TAG_PREFIX}${lease.productionRunId}`,
     'production image lease source is invalid'
   );
   assert(
@@ -1141,7 +1178,8 @@ function verifiedProductionImageLease(
   image: ProductionImageEvidence
 ): VerifiedProductionImageLease {
   const lease: VerifiedProductionImageLease = {
-    version: 1,
+    version: 2,
+    stage: manifest.stage,
     sourceTag: manifest.imageTag,
     productionRunId: manifest.runId,
     productionOwnershipToken: manifest.ownershipToken,
@@ -1226,7 +1264,10 @@ export async function assertLoopbackPortAvailable(
   });
 }
 
-export async function createProductionSmokeManifest(): Promise<ProductionSmokeManifest> {
+export async function createProductionSmokeManifest(
+  stage: Plan6bSmokeStage
+): Promise<ProductionSmokeManifest> {
+  validatePlan6bSmokeStage(stage);
   for (let attempt = 0; attempt < 8; attempt += 1) {
     const runId = randomBytes(8).toString('hex');
     const tempDirectory = join(resolve(tmpdir()), `${RUN_PREFIX}${runId}`);
@@ -1243,11 +1284,12 @@ export async function createProductionSmokeManifest(): Promise<ProductionSmokeMa
       let httpsPort = await reserveLoopbackPort();
       while (httpsPort === httpPort) httpsPort = await reserveLoopbackPort();
       const manifest: ProductionSmokeManifest = {
-        version: 1,
+        version: 2,
+        stage,
         runId,
         ownershipToken: randomBytes(16).toString('hex'),
         project: `${RUN_PREFIX}${runId}`,
-        imageTag: `pale-orbit:plan6b-i-smoke-${runId}`,
+        imageTag: `${IMAGE_TAG_PREFIX}${runId}`,
         tempDirectory,
         overrideFile: join(tempDirectory, 'compose.override.yaml'),
         manifestFile: join(tempDirectory, 'owned-run.json'),
@@ -1390,13 +1432,17 @@ const defaultRunDependencies: ProductionSmokeRunDependencies = {
 };
 
 export async function runProductionSmoke(
+  stage: Plan6bSmokeStage,
   consumeImage?: ProductionImageLeaseConsumer,
   dependencies: ProductionSmokeRunDependencies = defaultRunDependencies
 ): Promise<{
   readonly migrationState: string;
   readonly image: ProductionImageEvidence;
 }> {
-  const manifest = await dependencies.createManifest();
+  validatePlan6bSmokeStage(stage);
+  const manifest = await dependencies.createManifest(stage);
+  validateProductionSmokeManifest(manifest);
+  assert(manifest.stage === stage, 'owned-run manifest stage changed');
   let operations: ProductionSmokeOperations;
   try {
     operations = await dependencies.createOperations(manifest);
@@ -1421,8 +1467,11 @@ const isMain = process.argv[1]
   ? import.meta.url === pathToFileURL(resolve(process.argv[1])).href
   : false;
 if (isMain) {
-  runProductionSmoke().catch(() => {
-    console.error('[plan6b-smoke] failed');
-    process.exitCode = 1;
-  });
+  Promise.resolve()
+    .then(() => parsePlan6bSmokeStage(process.argv.slice(2)))
+    .then((stage) => runProductionSmoke(stage))
+    .catch(() => {
+      console.error('[plan6b-smoke] failed');
+      process.exitCode = 1;
+    });
 }

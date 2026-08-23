@@ -1,9 +1,12 @@
+import { createHash } from 'node:crypto';
 import { readFile, rm, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import { Script } from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
 import {
   createFixtureProbeManifest,
+  createFixtureProbeCommandRuntime,
   createFixtureProbeDockerOperations,
   createFixtureProbeInternalHttpClient,
   executeFixtureRuntimeProbe,
@@ -20,13 +23,14 @@ import type { VerifiedProductionImageLease } from './plan6b-production-smoke';
 
 function manifest(): FixtureProbeManifest {
   const runId = '1234567890abcdef';
-  const tempDirectory = join(tmpdir(), `pale-orbit-plan6b-fixture-${runId}`);
+  const tempDirectory = join(tmpdir(), `pale-orbit-plan6b-6b-ii-fixture-${runId}`);
   return {
-    version: 1,
+    version: 2,
+    stage: '6b-ii',
     runId,
     ownershipToken: 'e'.repeat(32),
-    project: `pale-orbit-plan6b-fixture-${runId}`,
-    imageTag: `pale-orbit:plan6b-i-fixture-${runId}`,
+    project: `pale-orbit-plan6b-6b-ii-fixture-${runId}`,
+    imageTag: `pale-orbit:plan6b-6b-ii-fixture-${runId}`,
     tempDirectory,
     overrideFile: join(tempDirectory, 'compose.override.yaml'),
     manifestFile: join(tempDirectory, 'owned-run.json'),
@@ -37,12 +41,27 @@ function manifest(): FixtureProbeManifest {
   };
 }
 
+function expectedFixtureUuid(runId: string, purpose: string): string {
+  const characters = createHash('sha256')
+    .update(runId)
+    .update('\0')
+    .update(purpose)
+    .digest('hex')
+    .slice(0, 32)
+    .split('');
+  characters[12] = '4';
+  characters[16] = '8';
+  const value = characters.join('');
+  return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`;
+}
+
 function lease(
   overrides: Partial<VerifiedProductionImageLease> = {}
 ): VerifiedProductionImageLease {
   return {
-    version: 1,
-    sourceTag: 'pale-orbit:plan6b-i-smoke-0123456789abcdef',
+    version: 2,
+    stage: '6b-ii',
+    sourceTag: 'pale-orbit:plan6b-6b-ii-smoke-0123456789abcdef',
     productionRunId: '0123456789abcdef',
     productionOwnershipToken: 'f'.repeat(32),
     digest: `sha256:${'a'.repeat(64)}`,
@@ -66,7 +85,13 @@ const safeEvidence = (): FixtureProbeEvidence => ({
   completedFinancialScanCount: 1,
   unsafeFinancialJobCount: 0,
   externalStripeRequestCount: 0,
-  workerReady: true
+  workerReady: true,
+  administratorCommandSucceeded: true,
+  administratorWorkerClaimObserved: true,
+  administratorSalesReflectionObserved: true,
+  administratorAuditReflectionObserved: true,
+  webPrivateInputDenied: true,
+  webDraftMutationDenied: true
 });
 
 function operations(trace: string[], failAt: string | null = null): FixtureProbeOperations {
@@ -81,15 +106,43 @@ function operations(trace: string[], failAt: string | null = null): FixtureProbe
     startDependencies: vi.fn(() => step('dependencies', undefined)),
     migrate: vi.fn(() => step('migrate', undefined)),
     provisionRoles: vi.fn(() => step('provision', undefined)),
+    bootstrapAdministrator: vi.fn(() => step('bootstrap', undefined)),
     seedPublishedTitles: vi.fn(() => step('seed', undefined)),
     startRuntime: vi.fn(() => step('runtime', undefined)),
     exerciseQuoteAndCheckout: vi.fn(() => step('checkout', undefined)),
+    exerciseAdministratorCommand: vi.fn(() => step('administrator-command', undefined)),
     inspect: vi.fn(() => step('inspect', safeEvidence())),
     cleanup: vi.fn(() => step('cleanup', undefined))
   };
 }
 
 describe('Plan 6B fixture runtime probe ownership', () => {
+  it('accepts only a version-two fixture identity bound to the exact 6b-ii stage', () => {
+    const runId = manifest().runId;
+    const tempDirectory = join(tmpdir(), `pale-orbit-plan6b-6b-ii-fixture-${runId}`);
+    const staged = {
+      ...manifest(),
+      version: 2,
+      stage: '6b-ii',
+      project: `pale-orbit-plan6b-6b-ii-fixture-${runId}`,
+      imageTag: `pale-orbit:plan6b-6b-ii-fixture-${runId}`,
+      tempDirectory,
+      overrideFile: join(tempDirectory, 'compose.override.yaml'),
+      manifestFile: join(tempDirectory, 'owned-run.json')
+    } as unknown as FixtureProbeManifest;
+
+    expect(() => validateFixtureProbeManifest(staged)).not.toThrow();
+    for (const invalid of [
+      { ...manifest(), version: 1 },
+      { ...staged, stage: 'plan6b-i' },
+      { ...staged, stage: '6b-i' },
+      { ...staged, project: `pale-orbit-plan6b-fixture-${runId}` },
+      { ...staged, imageTag: `pale-orbit:plan6b-i-fixture-${runId}` }
+    ]) {
+      expect(() => validateFixtureProbeManifest(invalid as FixtureProbeManifest)).toThrow();
+    }
+  });
+
   it('accepts only the exact fixture project, image, paths, and distinct loopback ports', () => {
     expect(() => validateFixtureProbeManifest(manifest())).not.toThrow();
     for (const invalid of [
@@ -103,7 +156,8 @@ describe('Plan 6B fixture runtime probe ownership', () => {
   it('renders a no-egress fixture runtime using the same unique image for app and worker', () => {
     const source = renderFixtureProbeOverride(manifest());
     expect(source).toContain('internal: true');
-    expect(source.match(/pale-orbit:plan6b-i-fixture-1234567890abcdef/gu)).toHaveLength(5);
+    expect(source.match(/pale-orbit:plan6b-6b-ii-fixture-1234567890abcdef/gu)).toHaveLength(6);
+    expect(source).toContain('com.paleorbit.plan6b-fixture.stage: 6b-ii');
     expect(source).toContain('APP_ENV: test');
     expect(source).toContain('APPLICATION_MODE: prototype');
     expect(source).toContain('STRIPE_ENABLED: "false"');
@@ -147,10 +201,12 @@ describe('Plan 6B fixture runtime probe ownership', () => {
     expect(worker).toContain('DATABASE_STORAGE_CLEANUP_PASSWORD: ""');
     expect(migrate).toContain('DATABASE_OWNER_USER: pale_orbit_test');
     expect(migrate).toContain('DATABASE_OWNER_PASSWORD: plan6b_fixture_owner_password_0000000000');
-    expect(migrate).toContain('DATABASE_USER: ""');
-    expect(migrate).toContain('DATABASE_WORKER_USER: ""');
-    expect(migrate).toContain('DATABASE_STORAGE_CLEANUP_USER: ""');
-    expect(migrate).toContain('DATABASE_STORAGE_CLEANUP_PASSWORD: ""');
+    expect(migrate).not.toContain('DATABASE_USER:');
+    expect(migrate).not.toContain('DATABASE_PASSWORD:');
+    expect(migrate).not.toContain('DATABASE_WORKER_USER:');
+    expect(migrate).not.toContain('DATABASE_WORKER_PASSWORD:');
+    expect(migrate).not.toContain('DATABASE_STORAGE_CLEANUP_USER:');
+    expect(migrate).not.toContain('DATABASE_STORAGE_CLEANUP_PASSWORD:');
     expect(provision).toContain('DATABASE_OWNER_USER: pale_orbit_test');
     expect(provision).toContain('DATABASE_USER: pale_orbit_fixture_web');
     expect(provision).toContain('DATABASE_WORKER_USER: pale_orbit_fixture_worker');
@@ -169,9 +225,44 @@ describe('Plan 6B fixture runtime probe ownership', () => {
     expect(source).toContain('127.0.0.1:49161:5432');
     expect(source).toContain('mailpit:');
     expect(source).not.toMatch(/-\s+"?0\.0\.0\.0:/u);
-    expect(source).not.toContain('\nsecrets:');
+    expect(source.match(/^secrets:$/gmu)).toHaveLength(1);
     expect(source).not.toContain('STRIPE_SECRET_KEY');
     expect(source).not.toContain('STRIPE_WEBHOOK_SECRET');
+    const bootstrapStart = source.indexOf('  bootstrap-admin:');
+    const bootstrapEnd = source.indexOf('  migrate:');
+    const bootstrap = source.slice(bootstrapStart, bootstrapEnd);
+    expect(bootstrapStart).toBeGreaterThan(source.indexOf('  worker:'));
+    expect(bootstrap).toContain('command: [node, build/services/bootstrap-admin.js]');
+    expect(bootstrap).toContain('BOOTSTRAP_ADMIN_PASSWORD_FILE: /run/secrets/bootstrap_admin_password');
+    expect(bootstrap).not.toContain('BOOTSTRAP_ADMIN_PASSWORD:');
+    expect(bootstrap).not.toContain('DATABASE_MIGRATION_WEB_USER');
+    expect(source).toContain('bootstrap_admin_password:');
+  });
+
+  it('transports exact role names only through the migration service', () => {
+    const source = renderFixtureProbeOverride(manifest());
+    const migrateStart = source.indexOf('  migrate:');
+    const provisionStart = source.indexOf('  database-role-provision:');
+    const migrate = source.slice(migrateStart, provisionStart);
+    const nonMigration = `${source.slice(0, migrateStart)}${source.slice(provisionStart)}`;
+    const expected = [
+      'DATABASE_MIGRATION_WEB_USER: pale_orbit_fixture_web',
+      'DATABASE_MIGRATION_WORKER_USER: pale_orbit_fixture_worker',
+      'DATABASE_MIGRATION_STORAGE_CLEANUP_USER: pale_orbit_fixture_storage_cleanup'
+    ];
+
+    for (const entry of expected) {
+      expect(migrate).toContain(entry);
+      expect(nonMigration).not.toContain(entry.split(':')[0]);
+    }
+    for (const applicationCredential of [
+      'DATABASE_USER:',
+      'DATABASE_PASSWORD:',
+      'DATABASE_WORKER_USER:',
+      'DATABASE_WORKER_PASSWORD:',
+      'DATABASE_STORAGE_CLEANUP_USER:',
+      'DATABASE_STORAGE_CLEANUP_PASSWORD:'
+    ]) expect(migrate).not.toContain(applicationCredential);
   });
 
   it('renders an isolated least-privilege Stripe API connection canary with an owned counter', () => {
@@ -181,7 +272,7 @@ describe('Plan 6B fixture runtime probe ownership', () => {
       source.indexOf('  app:')
     );
 
-    expect(canary).toContain('image: pale-orbit:plan6b-i-fixture-1234567890abcdef');
+    expect(canary).toContain('image: pale-orbit:plan6b-6b-ii-fixture-1234567890abcdef');
     expect(canary).toContain('user: "0:0"');
     expect(canary).toContain('read_only: true');
     expect(canary).toContain('cap_drop:');
@@ -202,13 +293,14 @@ describe('Plan 6B fixture runtime probe ownership', () => {
       safeEvidence()
     );
     expect(trace).toEqual([
-      'image', 'ports', 'dependencies', 'migrate', 'provision', 'seed', 'runtime', 'checkout', 'inspect',
-      'cleanup'
+      'image', 'ports', 'dependencies', 'migrate', 'provision', 'bootstrap', 'seed', 'runtime',
+      'checkout', 'administrator-command', 'inspect', 'cleanup'
     ]);
   });
 
   it.each([
-    'image', 'ports', 'dependencies', 'migrate', 'provision', 'seed', 'runtime', 'checkout', 'inspect'
+    'image', 'ports', 'dependencies', 'migrate', 'provision', 'bootstrap', 'seed', 'runtime',
+    'checkout', 'administrator-command', 'inspect'
   ])(
     'cleans the exact fixture run when %s fails',
     async (failAt) => {
@@ -221,7 +313,7 @@ describe('Plan 6B fixture runtime probe ownership', () => {
   );
 
   it('does not remove a pre-existing fixture image when acquisition detects a collision', async () => {
-    const owned = await createFixtureProbeManifest();
+    const owned = await createFixtureProbeManifest('6b-ii');
     const command: FixtureProbeCommandRuntime = {
       run: vi.fn(async () => undefined),
       capture: vi.fn(async (args) => {
@@ -267,7 +359,7 @@ describe('Plan 6B fixture runtime probe ownership', () => {
   });
 
   it('fails closed when fixture image inspection and absence verification both fail', async () => {
-    const owned = await createFixtureProbeManifest();
+    const owned = await createFixtureProbeManifest('6b-ii');
     const command: FixtureProbeCommandRuntime = {
       run: vi.fn(async () => undefined),
       capture: vi.fn(async (args) => {
@@ -305,7 +397,7 @@ describe('Plan 6B fixture runtime probe ownership', () => {
   });
 
   it('fails closed when a created alias cannot be inspected during cleanup', async () => {
-    const owned = await createFixtureProbeManifest();
+    const owned = await createFixtureProbeManifest('6b-ii');
     let aliasCreated = false;
     let cleanupStarted = false;
     const leasedImage = JSON.stringify({
@@ -313,7 +405,8 @@ describe('Plan 6B fixture runtime probe ownership', () => {
       Size: lease().sizeBytes,
       Config: { Labels: {
         'com.paleorbit.plan6b-smoke.run': lease().productionRunId,
-        'com.paleorbit.plan6b-smoke.owner': lease().productionOwnershipToken
+        'com.paleorbit.plan6b-smoke.owner': lease().productionOwnershipToken,
+        'com.paleorbit.plan6b-smoke.stage': lease().stage
       } }
     });
     const command: FixtureProbeCommandRuntime = {
@@ -373,7 +466,7 @@ describe('Plan 6B fixture runtime probe ownership', () => {
   });
 
   it('fails cleanup when the exact alias still exists after image removal reports success', async () => {
-    const owned = await createFixtureProbeManifest();
+    const owned = await createFixtureProbeManifest('6b-ii');
     let aliasCreated = false;
     let removalAttempted = false;
     const leasedImage = JSON.stringify({
@@ -381,7 +474,8 @@ describe('Plan 6B fixture runtime probe ownership', () => {
       Size: lease().sizeBytes,
       Config: { Labels: {
         'com.paleorbit.plan6b-smoke.run': lease().productionRunId,
-        'com.paleorbit.plan6b-smoke.owner': lease().productionOwnershipToken
+        'com.paleorbit.plan6b-smoke.owner': lease().productionOwnershipToken,
+        'com.paleorbit.plan6b-smoke.stage': lease().stage
       } }
     });
     const command: FixtureProbeCommandRuntime = {
@@ -436,7 +530,12 @@ describe('Plan 6B fixture runtime probe ownership', () => {
       { appEnvironment: 'production' }, { workerFixtureMode: false }, { appStripeEnabled: true },
       { appHasStripeSecret: true }, { networkInternal: false }, { acceptedOrderCount: 2 },
       { checkoutSessionCount: 0 }, { completedFinancialScanCount: 0 },
-      { unsafeFinancialJobCount: 1 }, { externalStripeRequestCount: 1 }, { workerReady: false }
+      { unsafeFinancialJobCount: 1 }, { externalStripeRequestCount: 1 }, { workerReady: false },
+      { administratorCommandSucceeded: false },
+      { administratorWorkerClaimObserved: false },
+      { administratorSalesReflectionObserved: false },
+      { administratorAuditReflectionObserved: false },
+      { webPrivateInputDenied: false }, { webDraftMutationDenied: false }
     ]) {
       const trace: string[] = [];
       const runtime = operations(trace);
@@ -490,7 +589,8 @@ describe('Plan 6B fixture runtime probe ownership', () => {
               Config: {
                 Labels: {
                   'com.paleorbit.plan6b-smoke.run': lease().productionRunId,
-                  'com.paleorbit.plan6b-smoke.owner': lease().productionOwnershipToken
+                  'com.paleorbit.plan6b-smoke.owner': lease().productionOwnershipToken,
+                  'com.paleorbit.plan6b-smoke.stage': lease().stage
                 }
               }
             })
@@ -516,7 +616,7 @@ describe('Plan 6B fixture runtime probe ownership', () => {
 
     expect(calls.find((call) => call.kind === 'run')?.args).toEqual([
       'image', 'tag', lease().sourceTag,
-      'pale-orbit:plan6b-i-fixture-1234567890abcdef'
+      'pale-orbit:plan6b-6b-ii-fixture-1234567890abcdef'
     ]);
     expect(JSON.stringify(calls)).not.toContain('"build"');
     expect(JSON.stringify(calls)).not.toContain('sk_test_private_canary');
@@ -640,7 +740,8 @@ describe('Plan 6B fixture runtime probe ownership', () => {
                 Size: image.Size,
                 Config: { Labels: {
                   'com.paleorbit.plan6b-smoke.run': image.run,
-                  'com.paleorbit.plan6b-smoke.owner': image.owner
+                  'com.paleorbit.plan6b-smoke.owner': image.owner,
+                  'com.paleorbit.plan6b-smoke.stage': lease().stage
                 } }
               })
             };
@@ -677,7 +778,8 @@ describe('Plan 6B fixture runtime probe ownership', () => {
               Size: lease().sizeBytes,
               Config: { Labels: {
                 'com.paleorbit.plan6b-smoke.run': lease().productionRunId,
-                'com.paleorbit.plan6b-smoke.owner': lease().productionOwnershipToken
+                'com.paleorbit.plan6b-smoke.owner': lease().productionOwnershipToken,
+                'com.paleorbit.plan6b-smoke.stage': lease().stage
               } }
             })
           };
@@ -702,7 +804,7 @@ describe('Plan 6B fixture runtime probe ownership', () => {
   });
 
   it('refuses to remove a created alias that no longer matches the production lease', async () => {
-    const owned = await createFixtureProbeManifest();
+    const owned = await createFixtureProbeManifest('6b-ii');
     let aliasCreated = false;
     const calls: readonly string[][] = [];
     const mutableCalls = calls as string[][];
@@ -711,7 +813,8 @@ describe('Plan 6B fixture runtime probe ownership', () => {
       Size: lease().sizeBytes,
       Config: { Labels: {
         'com.paleorbit.plan6b-smoke.run': lease().productionRunId,
-        'com.paleorbit.plan6b-smoke.owner': lease().productionOwnershipToken
+        'com.paleorbit.plan6b-smoke.owner': lease().productionOwnershipToken,
+        'com.paleorbit.plan6b-smoke.stage': lease().stage
       } }
     });
     const command: FixtureProbeCommandRuntime = {
@@ -758,7 +861,7 @@ describe('Plan 6B fixture runtime probe ownership', () => {
   });
 
   it('cleans an alias materialized before the tag command reports failure', async () => {
-    const owned = await createFixtureProbeManifest();
+    const owned = await createFixtureProbeManifest('6b-ii');
     let aliasCreated = false;
     const calls: string[][] = [];
     const image = JSON.stringify({
@@ -766,7 +869,8 @@ describe('Plan 6B fixture runtime probe ownership', () => {
       Size: lease().sizeBytes,
       Config: { Labels: {
         'com.paleorbit.plan6b-smoke.run': lease().productionRunId,
-        'com.paleorbit.plan6b-smoke.owner': lease().productionOwnershipToken
+        'com.paleorbit.plan6b-smoke.owner': lease().productionOwnershipToken,
+        'com.paleorbit.plan6b-smoke.stage': lease().stage
       } }
     });
     const command: FixtureProbeCommandRuntime = {
@@ -813,8 +917,8 @@ describe('Plan 6B fixture runtime probe ownership', () => {
   });
 
   it('materializes unique random owned manifests and overrides in exact temp directories', async () => {
-    const first = await createFixtureProbeManifest();
-    const second = await createFixtureProbeManifest();
+    const first = await createFixtureProbeManifest('6b-ii');
+    const second = await createFixtureProbeManifest('6b-ii');
     try {
       validateFixtureProbeManifest(first);
       validateFixtureProbeManifest(second);
@@ -825,6 +929,31 @@ describe('Plan 6B fixture runtime probe ownership', () => {
       expect(first.webPort).not.toBe(first.databasePort);
       expect(JSON.parse(await readFile(first.manifestFile, 'utf8'))).toEqual(first);
       expect(await readFile(first.overrideFile, 'utf8')).toBe(renderFixtureProbeOverride(first));
+      const firstPassword = await readFile(
+        join(first.tempDirectory, 'bootstrap-admin-password'),
+        'utf8'
+      );
+      const secondPassword = await readFile(
+        join(second.tempDirectory, 'bootstrap-admin-password'),
+        'utf8'
+      );
+      expect(/^P6b![A-Za-z0-9_-]{43}Aa1$/u.test(firstPassword)).toBe(true);
+      expect(firstPassword === secondPassword).toBe(false);
+      expect(firstPassword === first.ownershipToken).toBe(false);
+      expect(firstPassword.includes(first.ownershipToken)).toBe(false);
+      expect((await readFile(first.overrideFile, 'utf8')).includes(firstPassword)).toBe(false);
+      expect((await readFile(first.manifestFile, 'utf8')).includes(firstPassword)).toBe(false);
+      const source = await readFile(
+        new URL('./plan6b-fixture-runtime-probe.ts', import.meta.url),
+        'utf8'
+      );
+      const credentialCreation = source.slice(
+        source.indexOf('const administratorPassword ='),
+        source.indexOf('writeFile(manifest.overrideFile')
+      );
+      expect(credentialCreation).toContain('randomBytes(32)');
+      expect(credentialCreation).toContain('mode: 0o600');
+      expect(credentialCreation).not.toContain('ownershipToken');
     } finally {
       await Promise.all([
         rm(first.tempDirectory, { recursive: true, force: false }),
@@ -939,6 +1068,141 @@ describe('Plan 6B fixture runtime probe ownership', () => {
     });
   });
 
+  it('submits and safely polls one private refund draft command through the real web boundary', async () => {
+    const owned = await createFixtureProbeManifest('6b-ii');
+    const commandId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const runCalls: readonly string[][] = [];
+    const mutableRunCalls = runCalls as string[][];
+    let statusReads = 0;
+    const command: FixtureProbeCommandRuntime = {
+      run: vi.fn(async (args) => {
+        mutableRunCalls.push([...args]);
+      }),
+      capture: vi.fn(async (args) => {
+        if (args.includes('psql')) {
+          const query = String(args.at(-1));
+          if (query.includes("root_key = 'commerce.financial-scan:initial:v1'")) {
+            return { status: 0, stdout: JSON.stringify({ completedFinancialScanCount: 1 }) };
+          }
+          if (query.includes("'administratorCommandCount'")) {
+            return {
+              status: 0,
+              stdout: JSON.stringify({ administratorCommandCount: 1, commandId })
+            };
+          }
+        }
+        if (args.at(-1) === 'submit') {
+          return { status: 0, stdout: JSON.stringify({ submitted: true }) };
+        }
+        if (args.at(-1) === 'status') {
+          statusReads += 1;
+          return {
+            status: 0,
+            stdout: JSON.stringify({
+              status: statusReads === 1 ? 'pending' : 'succeeded',
+              resultCode: statusReads === 1 ? null : 'draft_saved'
+            })
+          };
+        }
+        if (args.at(-1) === 'sales') {
+          return { status: 0, stdout: JSON.stringify({ sales: true, detail: true }) };
+        }
+        throw new Error(`unexpected command: ${JSON.stringify(args)}`);
+      })
+    };
+    const wait = vi.fn(async () => undefined);
+    const docker = createFixtureProbeDockerOperations(owned, {
+      command,
+      environment: { PATH: 'safe-path' },
+      assertPortAvailable: vi.fn(async () => undefined),
+      postJson: vi.fn(),
+      wait
+    });
+
+    try {
+      await docker.bootstrapAdministrator(owned);
+      await docker.exerciseAdministratorCommand(owned);
+
+      const compose = [
+        'compose', '--project-name', owned.project,
+        '--file', resolve('compose.test.yaml'), '--file', owned.overrideFile
+      ];
+      expect(mutableRunCalls[0]).toEqual([
+        ...compose, '--profile', 'tools', 'run', '--rm', 'bootstrap-admin'
+      ]);
+      const sql = mutableRunCalls
+        .filter((args) => args.includes('psql'))
+        .map((args) => String(args.at(-1)));
+      expect(sql.some((query) => query.includes('insert into refunds'))).toBe(true);
+      const boundary = sql.find((query) => query.includes('web-private-input-boundary-failed'));
+      expect(boundary).toContain('set local role pale_orbit_fixture_web');
+      expect(boundary).toContain('perform private_input from financial_admin_commands');
+      expect(boundary).toContain('update refund_allocation_drafts set version = version where false');
+
+      const webCalls = vi.mocked(command.capture).mock.calls.filter(([args]) =>
+        args.includes('app') && args.includes('node')
+      );
+      expect(webCalls.map(([args]) => args.at(-1))).toEqual([
+        'submit', 'status', 'status', 'sales'
+      ]);
+      const clientSource = String(webCalls[0]?.[0].at(-2));
+      expect(() => new Script(clientSource)).not.toThrow();
+      expect(clientSource).toContain("const internalOrigin='http://127.0.0.1:3000'");
+      expect(clientSource).not.toContain('fetch(input.origin');
+      expect(clientSource).toContain("'x-sveltekit-action':'true'");
+      expect(webCalls.every(([args]) => args.at(-2) === clientSource)).toBe(true);
+      const submissionInput = JSON.parse(String(webCalls[0]?.[3])) as Record<string, unknown>;
+      const administratorPassword = await readFile(
+        join(owned.tempDirectory, 'bootstrap-admin-password'),
+        'utf8'
+      );
+      expect(submissionInput).toMatchObject({
+        expectedVersion: null,
+        items: [
+          { totalPresentmentMinor: 600 },
+          { totalPresentmentMinor: 400 }
+        ]
+      });
+      expect(submissionInput.password === administratorPassword).toBe(true);
+      expect(administratorPassword.includes(owned.ownershipToken)).toBe(false);
+      expect(renderFixtureProbeOverride(owned).includes(administratorPassword)).toBe(false);
+      const privateValues = [
+        submissionInput.email,
+        submissionInput.password,
+        submissionInput.refundId,
+        submissionInput.idempotencyKey,
+        ...(submissionInput.items as Array<Record<string, unknown>>)
+          .map((item) => item.orderItemId)
+      ];
+      const commandArguments = JSON.stringify(webCalls.map(([args]) => args));
+      expect(commandArguments.includes(`127.0.0.1:${owned.webPort}`)).toBe(false);
+      for (const privateValue of privateValues) {
+        expect(typeof privateValue).toBe('string');
+        expect(commandArguments.includes(String(privateValue))).toBe(false);
+      }
+      expect(wait).toHaveBeenCalledWith(500);
+    } finally {
+      await rm(owned.tempDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it('bounds private Docker standard input and forwards it only through spawn input', async () => {
+    const source = await readFile(
+      new URL('./plan6b-fixture-runtime-probe.ts', import.meta.url),
+      'utf8'
+    );
+    expect(source).toContain('input: standardInput');
+    expect(source).not.toContain('argumentsToCapture.push(standardInput)');
+
+    const runtime = createFixtureProbeCommandRuntime();
+    await expect(runtime.capture(
+      [],
+      { PATH: 'safe-path' },
+      false,
+      'x'.repeat((16 * 1024) + 1)
+    )).rejects.toThrow('[plan6b-fixture] Docker standard input is invalid');
+  });
+
   it('executes fixture HTTP requests inside the isolated app container', async () => {
     const owned = manifest();
     const command: FixtureProbeCommandRuntime = {
@@ -983,7 +1247,8 @@ describe('Plan 6B fixture runtime probe ownership', () => {
     const labels = {
       'com.docker.compose.project': owned.project,
       'com.paleorbit.plan6b-fixture.run': owned.runId,
-      'com.paleorbit.plan6b-fixture.owner': owned.ownershipToken
+      'com.paleorbit.plan6b-fixture.owner': owned.ownershipToken,
+      'com.paleorbit.plan6b-fixture.stage': owned.stage
     };
     const environment = JSON.stringify([
       'APP_ENV=test',
@@ -1042,7 +1307,13 @@ describe('Plan 6B fixture runtime probe ownership', () => {
               acceptedOrderCount: 1,
               checkoutSessionCount: 1,
               completedFinancialScanCount: databaseSnapshots === 1 ? 0 : 1,
-              unsafeFinancialJobCount: databaseSnapshots === 1 ? 1 : 0
+              unsafeFinancialJobCount: databaseSnapshots === 1 ? 1 : 0,
+              administratorCommandSucceeded: true,
+              administratorWorkerClaimObserved: true,
+              administratorSalesReflectionObserved: true,
+              administratorAuditReflectionObserved: true,
+              webPrivateInputDenied: true,
+              webDraftMutationDenied: true
             })
           };
         }
@@ -1067,6 +1338,27 @@ describe('Plan 6B fixture runtime probe ownership', () => {
     expect(databaseQueries[0]).toContain(
       "stripe_checkout_session_id = 'cs_test_' || replace(purchase.id::text, '-', '')"
     );
+    const financialQuery = databaseQueries.at(-1)!;
+    const administratorRefundId = expectedFixtureUuid(owned.runId, 'administrator-refund');
+    const administratorItemOneId = expectedFixtureUuid(
+      owned.runId,
+      'administrator-order-item-one'
+    );
+    const administratorItemTwoId = expectedFixtureUuid(
+      owned.runId,
+      'administrator-order-item-two'
+    );
+    expect(financialQuery).toContain(
+      `command.private_input ->> 'refundId' = '${administratorRefundId}'`
+    );
+    expect(financialQuery).toContain(`draft.refund_id = '${administratorRefundId}'::uuid`);
+    expect(financialQuery).toContain(`('${administratorItemOneId}'::uuid, 600)`);
+    expect(financialQuery).toContain(`('${administratorItemTwoId}'::uuid, 400)`);
+    expect(financialQuery.match(/except all/gu)).toHaveLength(2);
+    expect(financialQuery).toContain(
+      'select item.order_item_id, item.proposed_total_presentment_minor'
+    );
+    expect(financialQuery).toContain("command.private_input = jsonb_build_object(");
     const psqlCall = vi.mocked(command.capture).mock.calls.find(([args]) =>
       args[0] === 'compose' && args.includes('psql')
     );
@@ -1091,7 +1383,8 @@ describe('Plan 6B fixture runtime probe ownership', () => {
     const labels = {
       'com.docker.compose.project': owned.project,
       'com.paleorbit.plan6b-fixture.run': owned.runId,
-      'com.paleorbit.plan6b-fixture.owner': owned.ownershipToken
+      'com.paleorbit.plan6b-fixture.owner': owned.ownershipToken,
+      'com.paleorbit.plan6b-fixture.stage': owned.stage
     };
     const environment = JSON.stringify([
       'APP_ENV=test',
@@ -1141,7 +1434,13 @@ describe('Plan 6B fixture runtime probe ownership', () => {
               acceptedOrderCount: 1,
               checkoutSessionCount: 1,
               completedFinancialScanCount: 1,
-              unsafeFinancialJobCount: 0
+              unsafeFinancialJobCount: 0,
+              administratorCommandSucceeded: true,
+              administratorWorkerClaimObserved: true,
+              administratorSalesReflectionObserved: true,
+              administratorAuditReflectionObserved: true,
+              webPrivateInputDenied: true,
+              webDraftMutationDenied: true
             })
           };
         }
@@ -1163,13 +1462,14 @@ describe('Plan 6B fixture runtime probe ownership', () => {
   });
 
   it('removes only resources and the image matching the stored owned-run manifest', async () => {
-    const owned = await createFixtureProbeManifest();
+    const owned = await createFixtureProbeManifest('6b-ii');
     let aliasCreated = false;
     let resourcesPresent = false;
     const labels = {
       'com.docker.compose.project': owned.project,
       'com.paleorbit.plan6b-fixture.run': owned.runId,
-      'com.paleorbit.plan6b-fixture.owner': owned.ownershipToken
+      'com.paleorbit.plan6b-fixture.owner': owned.ownershipToken,
+      'com.paleorbit.plan6b-fixture.stage': owned.stage
     };
     const command: FixtureProbeCommandRuntime = {
       run: vi.fn(async (args) => {
@@ -1209,7 +1509,8 @@ describe('Plan 6B fixture runtime probe ownership', () => {
               Config: {
                 Labels: {
                   'com.paleorbit.plan6b-smoke.run': lease().productionRunId,
-                  'com.paleorbit.plan6b-smoke.owner': lease().productionOwnershipToken
+                  'com.paleorbit.plan6b-smoke.owner': lease().productionOwnershipToken,
+                  'com.paleorbit.plan6b-smoke.stage': lease().stage
                 }
               }
             })
@@ -1248,13 +1549,14 @@ describe('Plan 6B fixture runtime probe ownership', () => {
   });
 
   it('fails cleanup when Compose down succeeds but an owned volume remains', async () => {
-    const owned = await createFixtureProbeManifest();
+    const owned = await createFixtureProbeManifest('6b-ii');
     const volumeId = 'plan6b-owned-volume';
     let downCalled = false;
     const labels = {
       'com.docker.compose.project': owned.project,
       'com.paleorbit.plan6b-fixture.run': owned.runId,
-      'com.paleorbit.plan6b-fixture.owner': owned.ownershipToken
+      'com.paleorbit.plan6b-fixture.owner': owned.ownershipToken,
+      'com.paleorbit.plan6b-fixture.stage': owned.stage
     };
     const command: FixtureProbeCommandRuntime = {
       run: vi.fn(async (args) => {
@@ -1288,7 +1590,7 @@ describe('Plan 6B fixture runtime probe ownership', () => {
   });
 
   it('refuses cleanup before Compose down when an exact-name volume has foreign labels', async () => {
-    const owned = await createFixtureProbeManifest();
+    const owned = await createFixtureProbeManifest('6b-ii');
     const exactVolumeName = `${owned.project}_stripe_attempts`;
     let downCalled = false;
     const command: FixtureProbeCommandRuntime = {
@@ -1324,7 +1626,7 @@ describe('Plan 6B fixture runtime probe ownership', () => {
   });
 
   it('refuses cleanup when an observed resource has foreign ownership labels', async () => {
-    const owned = await createFixtureProbeManifest();
+    const owned = await createFixtureProbeManifest('6b-ii');
     const command: FixtureProbeCommandRuntime = {
       run: vi.fn(async () => undefined),
       capture: vi.fn(async (args) => {
@@ -1338,7 +1640,8 @@ describe('Plan 6B fixture runtime probe ownership', () => {
             stdout: JSON.stringify({
               'com.docker.compose.project': owned.project,
               'com.paleorbit.plan6b-fixture.run': owned.runId,
-              'com.paleorbit.plan6b-fixture.owner': '0'.repeat(32)
+              'com.paleorbit.plan6b-fixture.owner': '0'.repeat(32),
+              'com.paleorbit.plan6b-fixture.stage': owned.stage
             })
           };
         }
@@ -1362,7 +1665,7 @@ describe('Plan 6B fixture runtime probe ownership', () => {
   });
 
   it('fails closed before cleanup when Docker inventory cannot be captured', async () => {
-    const owned = await createFixtureProbeManifest();
+    const owned = await createFixtureProbeManifest('6b-ii');
     const command: FixtureProbeCommandRuntime = {
       run: vi.fn(async () => undefined),
       capture: vi.fn(async () => ({ status: 1, stdout: '' }))
@@ -1389,7 +1692,7 @@ describe('Plan 6B fixture runtime probe ownership', () => {
     const trace: string[] = [];
     const report = vi.fn();
 
-    await expect(runFixtureRuntimeProbe(lease(), {
+    await expect(runFixtureRuntimeProbe('6b-ii', lease(), {
       createManifest: vi.fn(async () => owned),
       createOperations: vi.fn(() => operations(trace)),
       report
@@ -1408,9 +1711,9 @@ describe('Plan 6B fixture runtime probe ownership', () => {
   });
 
   it('removes the exact unstarted manifest when operation setup fails', async () => {
-    const owned = await createFixtureProbeManifest();
+    const owned = await createFixtureProbeManifest('6b-ii');
     try {
-      await expect(runFixtureRuntimeProbe(lease(), {
+      await expect(runFixtureRuntimeProbe('6b-ii', lease(), {
         createManifest: vi.fn(async () => owned),
         createOperations: vi.fn(() => {
           throw new Error('private-setup-failure');
@@ -1423,10 +1726,10 @@ describe('Plan 6B fixture runtime probe ownership', () => {
     }
   });
 
-  it('nests the fixture CLI probe inside the in-memory production image lease', async () => {
+  it('requires one exact stage and nests the fixture inside its matching image lease', async () => {
     const verifiedLease = lease();
     const runFixture = vi.fn(async () => safeEvidence());
-    const runProduction = vi.fn(async (consume) => {
+    const runProduction = vi.fn(async (_stage, consume) => {
       await consume?.(verifiedLease);
       return {
         migrationState: '{}',
@@ -1434,9 +1737,25 @@ describe('Plan 6B fixture runtime probe ownership', () => {
       };
     });
 
-    await runFixtureRuntimeProbeCli({ runProduction, runFixture });
+    await runFixtureRuntimeProbeCli(['--stage', '6b-ii'], { runProduction, runFixture });
 
-    expect(runProduction).toHaveBeenCalledOnce();
-    expect(runFixture).toHaveBeenCalledExactlyOnceWith(verifiedLease);
+    expect(runProduction).toHaveBeenCalledExactlyOnceWith('6b-ii', expect.any(Function));
+    expect(runFixture).toHaveBeenCalledExactlyOnceWith('6b-ii', verifiedLease);
+
+    for (const invalid of [
+      [],
+      ['--stage'],
+      ['--stage', '6b-i'],
+      ['--stage', 'plan6b-i'],
+      ['--stage', '6b-ii', '--stage', '6b-ii'],
+      ['6b-ii']
+    ]) {
+      const invalidProduction = vi.fn();
+      await expect(runFixtureRuntimeProbeCli(invalid, {
+        runProduction: invalidProduction,
+        runFixture: vi.fn()
+      })).rejects.toThrow(/stage arguments are invalid/u);
+      expect(invalidProduction).not.toHaveBeenCalled();
+    }
   });
 });

@@ -2,15 +2,19 @@
 
 **Date:** 2026-08-20
 
-**Status:** Approved implementation architecture; superseding implementation plan written
+**Architecture status:** Approved implementation architecture
+
+**Implementation status:** Plan 6B candidate — independent review pending
 
 ## 1. Purpose
 
-Refresh the unimplemented Plan 6B-II administrator financial reporting and resolution work so it can be built safely on the current hardened database-authority, worker, migration, restore, and deployment foundations.
+This design refreshed the then-unimplemented Plan 6B-II administrator financial reporting and resolution work so it could be built safely on the hardened database-authority, worker, migration, restore, and deployment foundations.
 
 The approved product behavior in [Plan 6B: Stripe Financial Reconciliation and Reporting](2026-08-11-stripe-financial-reconciliation-reporting-design.md) remains authoritative. This document changes the implementation architecture and delivery structure only where later Plan 6B-I authority work invalidated the original assumptions.
 
 The August 11 implementation plan assumed that an authorized web request could perform financial writes and append `financial.*` audit events in its own database transaction. Current `main` deliberately forbids both. The refreshed design preserves the web/worker credential split instead of weakening it.
+
+The resulting unified Plan 6B candidate is migrated through `0013`: `0012` retains its historical eight callable public boundary routines and `0013` adds the final ninth. Its exact pairwise-distinct principals are `DATABASE_OWNER_USER`, `DATABASE_USER`, `DATABASE_WORKER_USER`, and `DATABASE_STORAGE_CLEANUP_USER`. The web principal owns command submission, owner-scoped status, and route-authorized audit boundaries; only the financial-worker principal owns protected mutation. Candidate evidence remains ordered migrate → provision → checkpoint capture → distinct-engine rehearsal → smoke. Production remains in maintenance mode with Stripe disabled, and Plan 7 owns activation and operability. See the [financial reconciliation and reporting operator guide](../../financial-reconciliation-and-reporting.md).
 
 ## 2. Source of truth and document strategy
 
@@ -41,7 +45,7 @@ Plan 6B-II delivers:
 6. Shared refund drafts, finalization, reporting corrections, and administrative recovery activation/deactivation.
 7. Database-role, migration, restore-catalog, lock-order, privacy, browser, smoke, and release evidence for the completed phase.
 
-Sales navigation remains disabled until the complete phase passes its final review. Intermediate milestones are implementation checkpoints, not separately released product surfaces.
+Sales navigation remains `Sales — Upcoming` without a live link until the unified candidate passes final review. Direct routes exist only for controlled candidate evidence. Intermediate milestones are implementation checkpoints, not separately released product surfaces.
 
 ## 4. Non-goals
 
@@ -81,7 +85,7 @@ Full financial mutations are not implemented in PL/pgSQL. Doing so would duplica
 
 ### 5.2 Forward migration
 
-Plan 6B-II owns the next append-only migration after the current journal. It must not edit migrations `0007` through `0011`.
+Plan 6B-II took the next append-only migration as `0012`; the later correction-authority boundary added append-only `0013`. Neither migration edits `0007` through `0011`.
 
 The migration adds the command schema, routines, triggers, job guard changes, exact worker privileges, runtime revocations, and audit/administrative-grant provenance rules required by this design. It also enters the existing exact catalog, ACL, owner, trigger, routine, upgrade, and restore-verification contracts.
 
@@ -441,13 +445,13 @@ Checkpoint, backup-bundle, restore SQL, catalog, and row-count contracts are upd
 
 ## 15. Delivery structure
 
-The superseding implementation plan will use three milestones on one unreleased phase:
+The superseding implementation plan used three milestones on one unreleased phase:
 
 1. **Authority and contracts:** capabilities, strict contracts, command schema/job, worker authorization, synchronous audit bridge, migration/ACL/restore foundations.
 2. **Read-only reporting:** overview, operational Needs Review, safe issue/refund/payout details, filters, pagination, signed metrics, and bounded CSV.
 3. **Resolution and release:** drafts, finalization, corrections, recovery, access/email effects, browser journeys, documentation, smoke, release evidence, and final clearance.
 
-Sales navigation is enabled only in the last milestone after every surface exists and the full phase is green.
+Sales navigation remains disabled on the candidate even after every surface is green; enabling it requires the final independent clearance rather than serving as pre-clearance evidence.
 
 ## 16. Review discipline
 
@@ -484,4 +488,4 @@ Plan 6B-II is complete when:
 
 ## 18. Supersession and next step
 
-The reviewed executable plan is [Backend Plan 6B-II: Admin Resolution and Reporting Refresh](../plans/2026-08-20-backend-plan-6b-ii-admin-resolution-reporting-refresh.md). It supersedes, without silently rewriting, `2026-08-11-backend-plan-6b-ii-admin-resolution-reporting.md` and contains the exact file paths, RED/GREEN commands, migration and role-boundary steps, release gates, and commit boundaries. The next phase is task-by-task execution of that plan from its recorded approved base.
+The reviewed executable plan is [Backend Plan 6B-II: Admin Resolution and Reporting Refresh](../plans/2026-08-20-backend-plan-6b-ii-admin-resolution-reporting-refresh.md). It supersedes, without silently rewriting, `2026-08-11-backend-plan-6b-ii-admin-resolution-reporting.md` and contains the exact file paths, RED/GREEN commands, migration and role-boundary steps, release gates, and commit boundaries. Its implementation now forms the unified Plan 6B candidate and awaits the prescribed independent review loop; no candidate status is production clearance.

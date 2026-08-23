@@ -2,7 +2,13 @@
 
 ## Release state and authority
 
-Plan 6A implements the multi-title cart, Stripe-hosted Checkout, signed asynchronous fulfillment, guest purchase claiming, purchase-backed entitlement grants, and refund/dispute access changes. The financial checkpoint status is **6B-I complete; 6B-II pending**. Checkpoint I adds local financial ingestion and reconciliation, but no Sales route or administrator reporting workflow is enabled. Development and production remain credential-free and Stripe-disabled by default. Production is still fixed to `APPLICATION_MODE=maintenance`; neither checkpoint publishes the Hetzner storefront, which remains Plan 7 work.
+Plan 6A implements the multi-title cart, Stripe-hosted Checkout, signed asynchronous fulfillment, guest purchase claiming, purchase-backed entitlement grants, and refund/dispute access changes.
+
+**Status:** Plan 6B candidate — independent review pending
+
+The unified Plan 6B candidate adds local financial ingestion/reconciliation and direct administrator review, finalization, correction, recovery, payout, reporting, and CSV routes. The global navigation still shows `Sales — Upcoming` without a live link until review accepts the candidate. Development and production remain credential-free and Stripe-disabled by default, and production remains fixed to `APPLICATION_MODE=maintenance`. See the [financial reconciliation and reporting operator guide](financial-reconciliation-and-reporting.md).
+
+The committed migration chain ends at `0013`; `0012` retains its historical eight callable public boundary routines and `0013` adds the final ninth routine. The four pairwise-distinct principals are `DATABASE_OWNER_USER`, `DATABASE_USER`, `DATABASE_WORKER_USER`, and `DATABASE_STORAGE_CLEANUP_USER`. The web principal submits and reads owner-scoped financial command status and records the route audit boundary; only the worker executes protected mutations. Deployment preserves migrate → role provision → checkpoint capture → distinct-engine rehearsal → smoke. Plan 7 still owns launch and production operability.
 
 PostgreSQL is authoritative. Browser cart data contains title IDs and a client attempt UUID only. The server re-quotes current public titles, ownership, currency, and prices before creating immutable `orders` and `order_items`. A successful browser redirect never grants access. Only a signature-verified Stripe event followed by canonical Checkout Session and Payment retrieval can make an order paid and create an `entitlement_grants` row. The `entitlements` table is the effective user/title projection used by the library, reader, and download routes.
 
@@ -170,13 +176,13 @@ For receipt/claim delivery, inspect only outbox topic/status/deduplication key a
 
 Initiate refunds and respond to disputes in Stripe Dashboard. Signed events cause the application to retrieve canonical Refund, Dispute, and Payment state before changing access.
 
-A full refund that maps exactly to one item permanently revokes that purchase grant. Complete cumulative refunds can revoke all funded grants. For a partial multi-title refund with no stored provider allocation, the Plan 6A event remains an access-safe exception and keeps access rather than guessing. The Plan 6B-I financial projection records the orthogonal state as `needs_review` plus `pending` and opens an `allocation_incomplete` issue. Plan 6B-II will add the administrator draft/finalization workflow; direct SQL allocation is unsupported.
+A full refund that maps exactly to one item permanently revokes that purchase grant. Complete cumulative refunds can revoke all funded grants. For a partial multi-title refund with no stored provider allocation, the Plan 6A event remains an access-safe exception and keeps access rather than guessing. The Plan 6B financial projection records the orthogonal state as `needs_review` plus `pending` and opens an `allocation_incomplete` issue. The candidate’s authorized draft/finalization route is the only administrative allocation path; direct SQL allocation remains unsupported.
 
 An open dispute suspends otherwise-active purchase grants funded by the payment. A won dispute restores only grants that are not fully refunded or permanently revoked. A lost dispute permanently revokes them. Another active purchase grant or preserved administrative grant keeps effective access, because `entitlements` is recomputed from all grants rather than toggled from one event.
 
 ## Financial ingestion and recovery boundary
 
-Plan 6B-I keeps financial consumers and operational inspection on local durable facts; it never makes a live Stripe call from a report. `commerce.financial-source` imports canonical payment, refund, and dispute balance transactions and fee details, verifies provider linkage, appends versioned classifications, and writes exactly conserving allocation sets. Amount and net values are signed minor-unit integers, fees are nonnegative, and every balance transaction satisfies `net = amount - fee`. Customer-presentment currency and Stripe-settlement currency remain separate; the application performs no conversion and never invents a mixed-currency total.
+Plan 6B keeps financial consumers and operational inspection on local durable facts; it never makes a live Stripe call from a report. `commerce.financial-source` imports canonical payment, refund, and dispute balance transactions and fee details, verifies provider linkage, appends versioned classifications, and writes exactly conserving allocation sets. Amount and net values are signed minor-unit integers, fees are nonnegative, and every balance transaction satisfies `net = amount - fee`. Customer-presentment currency and Stripe-settlement currency remain separate; the application performs no conversion and never invents a mixed-currency total.
 
 When runtime mode is fixture or Stripe, each worker polling loop ensures an initial provider root and one UTC-hour-keyed recovery root. The initial payout range begins seven days before the earliest local paid order, or seven days before the current hour when none exists. Hourly payout discovery overlaps the prior 72 hours. Every local batch or provider page is limited to 100 resources, commits its cursor/checkpoint, and enqueues a bounded continuation. A completed scan means only that its bounded local/provider pages committed; it does not prove that Stripe has no newer activity or that every source is report-complete.
 
@@ -226,6 +232,8 @@ Neither preflight prints credential values. Container creation is the first Comp
 
 The overlay does not alter `APPLICATION_MODE=maintenance`, `STRIPE_LIVE_MODE=false`, database/auth/SMTP secrets, or the migration/bootstrap tools. Do not use it as a production-launch switch. Plan 7 owns the deployment launch gate and Hetzner hardening.
 
-## Checkpoint status and deferred reporting
+## Candidate status and remaining launch work
 
-Status: **6B-I complete; 6B-II pending**. Checkpoint I supplies the local ingestion, allocation, issue, payout, scheduler, and replay boundaries described above. Plan 6B-II still owns administrator refund resolution, per-title copies/gross/fees/estimated-payout reporting, payout views, reporting corrections, access-recovery controls, and aggregate CSV. Sales navigation remains disabled until that checkpoint is implemented and reviewed. Production remains in maintenance mode, and Plan 7 owns launch.
+**Status:** Plan 6B candidate — independent review pending
+
+The candidate combines ingestion, allocation, issues, payouts, scheduling, and replay with administrator refund resolution, per-title copies/gross/fees/estimated-payout reporting, payout views, reporting corrections, access recovery, and aggregate CSV. The direct routes remain review-only and the global Sales link remains disabled. Production remains in maintenance mode with Stripe disabled. Plan 7 owns launch, monitoring and alerts, general retry administration, automated off-host backup scheduling, deployment hardening, and final capacity work.

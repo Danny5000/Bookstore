@@ -318,6 +318,34 @@ describe('commerce privacy evidence helper', () => {
     })).not.toThrow();
   });
 
+  it('keeps fixture administrator-command evidence boolean-only and free of private state', async () => {
+    const fixture = await readFile(
+      new URL('./plan6b-fixture-runtime-probe.ts', import.meta.url),
+      'utf8'
+    );
+    const evidenceInterface = fixture.match(
+      /export interface FixtureProbeEvidence \{([\s\S]*?)\n\}/u
+    )?.[1] ?? '';
+    const safeAdministratorEvidence = [
+      'administratorCommandSucceeded',
+      'administratorWorkerClaimObserved',
+      'administratorSalesReflectionObserved',
+      'administratorAuditReflectionObserved',
+      'webPrivateInputDenied',
+      'webDraftMutationDenied'
+    ] as const;
+
+    for (const key of safeAdministratorEvidence) {
+      expect(evidenceInterface).toContain(`readonly ${key}: boolean;`);
+    }
+    for (const key of financialSensitiveKeys) {
+      expect(evidenceInterface).not.toMatch(new RegExp(`\\b${key}\\b`, 'u'));
+    }
+    expect(evidenceInterface).not.toMatch(
+      /(?:actor|customer|email|reason|commandId|jobId|refundId|draftId|auditId)\s*:/iu
+    );
+  });
+
   it('allows canonical provider identifiers only on the existing server-side database surface', () => {
     expect(() => assertCommercePrivacy('lifecycle database', {
       stripePaymentIntentId: 'pi_serverOnlyEvidence',

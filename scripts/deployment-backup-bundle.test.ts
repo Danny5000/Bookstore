@@ -41,6 +41,7 @@ describe('atomic deployment backup bundle', () => {
   it('seals database plus all three archives and inventories in one exclusive final manifest', async () => {
     const manifest = await sealDeploymentBackupBundle(root, backupId);
 
+    expect(DEPLOYMENT_BACKUP_ARTIFACTS).toHaveLength(14);
     expect(Object.keys(manifest.artifacts).sort()).toEqual([...DEPLOYMENT_BACKUP_ARTIFACTS].sort());
     expect(await verifyDeploymentBackupBundle(root, backupId)).toEqual(manifest);
     expect((await readdir(root)).sort()).toEqual([

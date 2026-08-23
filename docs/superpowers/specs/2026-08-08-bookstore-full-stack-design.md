@@ -2,7 +2,9 @@
 
 **Date:** 2026-08-08
 
-**Status:** Approved conversational design; awaiting review of this written specification
+**Design status:** Approved conversational design
+
+**Implementation status:** Plan 6B candidate — independent review pending
 
 ## 1. Purpose
 
@@ -492,17 +494,17 @@ Connect the existing storefront and reader to server data, implement public prev
 
 Implement the multi-title cart, hosted checkout, signed idempotent webhooks, orders, payment fulfillment, purchase grants, guest purchase claiming, and refund/dispute-driven entitlement changes.
 
-Plan 6A is implemented and verified with mocked Stripe adapter responses, signed webhook fixtures, PostgreSQL integration tests, browser journeys, production Compose validation, and an isolated production-image smoke test. Stripe stays disabled in the base production Compose definition; enabling the provider requires the explicit Stripe overlay and process-supplied secrets. Plan 6B status is **6B-I complete; 6B-II pending**, and the final production launch remains Plan 7 work.
+Plan 6A is implemented and verified with mocked Stripe adapter responses, signed webhook fixtures, PostgreSQL integration tests, browser journeys, production Compose validation, and an isolated production-image smoke test. Stripe stays disabled in the base production Compose definition; enabling the provider requires the explicit Stripe overlay and process-supplied secrets. Plan 6B is one independent-review candidate, and the final production launch remains Plan 7 work.
 
 ### Plan 6B: Stripe financial reconciliation and reporting
 
 Import balance transactions and payouts, allocate processing and dispute fees, resolve ambiguous refund allocations, reconcile settlement state, and provide the administrator sales and estimated-payout dashboard.
 
-Status: **6B-I complete; 6B-II pending**.
+**Status:** Plan 6B candidate — independent review pending
 
-Checkpoint I implements minimized canonical balance-transaction and payout adapters, signed ledger/allocation invariants, durable issues, automatic-standard payout membership, bounded hourly recovery, and versioned classifier replay. The six payout webhook events use the pinned Stripe API version `2026-07-29.dahlia`. Administrator refund resolution, Sales routes, payout/reporting views, reporting corrections, recovery grants, and aggregate CSV remain checkpoint-II work; the disabled Sales navigation does not expose a partial interface.
+The unified candidate combines minimized canonical balance-transaction and payout adapters, signed ledger/allocation invariants, durable issues, automatic-standard payout membership, bounded recovery, and versioned classifier replay with administrator refund resolution, direct Sales/reporting and payout views, reporting corrections, recovery grants, and aggregate CSV. The six payout webhook events use the pinned Stripe API version `2026-07-29.dahlia`. Global navigation remains `Sales — Upcoming` without a live link until independent review accepts the complete candidate.
 
-The approved detailed design is [Plan 6B: Stripe Financial Reconciliation and Reporting](2026-08-11-stripe-financial-reconciliation-reporting-design.md). See the [Stripe financial reconciliation operations guide](../../stripe-financial-reconciliation.md) for the checkpoint-I runtime boundary. Production remains in maintenance mode and Plan 7 owns launch.
+The migration chain ends at `0013`; `0012` retains its historical eight callable public boundary routines and `0013` adds the final ninth. The exact pairwise-distinct principals are `DATABASE_OWNER_USER`, `DATABASE_USER`, `DATABASE_WORKER_USER`, and `DATABASE_STORAGE_CLEANUP_USER`. The web principal owns command submission, owner-scoped status, and route-authorized audit boundaries; the worker owns protected mutation. Release evidence stays ordered migrate → provision → checkpoint capture → distinct-engine rehearsal → smoke. The approved detailed design is [Plan 6B: Stripe Financial Reconciliation and Reporting](2026-08-11-stripe-financial-reconciliation-reporting-design.md). See the [financial reconciliation and reporting operator guide](../../financial-reconciliation-and-reporting.md) and [Stripe reconciliation runbook](../../stripe-financial-reconciliation.md). Production remains in maintenance mode with Stripe disabled, and Plan 7 owns production activation and operability.
 
 ### Plan 7: Production hardening and Hetzner operations
 

@@ -2,7 +2,11 @@
 
 ## Scope
 
-The repository supplies a development environment and a production infrastructure baseline. Authentication, administration, PostgreSQL catalog data, private publication storage, ingestion, Stripe commerce, guest claims, entitlement grants, customer libraries, reader state, entitled original downloads, and local financial reconciliation are durable. Stripe is disabled by default. The financial checkpoint status is **6B-I complete; 6B-II pending**. Production intentionally remains in maintenance mode, Sales remains disabled, and Plan 7 owns the launch gate.
+The repository supplies a development environment and a production infrastructure baseline. Authentication, administration, PostgreSQL catalog data, private publication storage, ingestion, Stripe commerce, guest claims, entitlement grants, customer libraries, reader state, entitled original downloads, and local financial reconciliation are durable. Stripe is disabled by default.
+
+**Status:** Plan 6B candidate — independent review pending
+
+The unified candidate includes ingestion/reconciliation and the direct administrator Sales, review, payout, correction, recovery, and CSV surfaces. The global navigation remains `Sales — Upcoming` without a live link. Production intentionally remains in maintenance mode and Plan 7 owns activation and operability. The migration chain ends at `0013`: `0012` retains the historical eight callable public boundary routines and `0013` adds the final ninth. See [financial reconciliation and reporting](financial-reconciliation-and-reporting.md).
 
 ## Required toolchain
 
@@ -104,6 +108,8 @@ Every required value also supports a mutually exclusive `<NAME>_FILE` form. Prod
 
 ## Production baseline
 
+Keep the Plan 6B evidence order exact: migrate through `0013`, provision and attest the four pairwise-distinct owner/web/financial-worker/storage-cleanup principals, capture the checkpoint, rehearse it on a distinct database engine, then run the production-image smoke. The web principal submits commands, reads its owner-scoped status, and records route-authorized audit evidence; only the financial-worker principal executes protected financial mutations.
+
 Production does not use an environment file. The deployment process exports the image/origin/database values, a generated `AUTH_SECRET`, provider SMTP values, and the first-administrator values. See [authentication and email operations](authentication-and-email.md) for that contract, [commerce and guest-claim operations](commerce-and-guest-claims.md) for Stripe Checkout/webhooks, and [Stripe financial reconciliation](stripe-financial-reconciliation.md) for ledger and worker recovery. Base production requires no Stripe credentials and keeps `STRIPE_ENABLED=false`. Then run:
 
 ```powershell
@@ -123,7 +129,7 @@ npm run storage:migrate-volumes -- --project <exact-project> --report <restricte
 
 Skip that migration command for an already-split deployment only when its current three-volume layout and prior migration report were verified. A brand-new installation may also skip only after the exact legacy `book_storage` volume is verified absent and the freshly initialized database is verified to contain no storage-referencing application data; establish this before bootstrap, uploads, or publication. An empty new volume or a readiness sentinel is not migration evidence. You must not run `storage-cleanup`, bootstrap, or either long-running process until the legacy migration report succeeds or one of those two verified exceptions is established.
 
-After that gate, provision/verify the sentinel through the cleanup dry-run and create the required current-v2 atomic checkpoint before bootstrap or startup. Follow the exact [deployment checkpoint procedure](storage-ingestion-and-publication.md#current-atomic-split-volume-backup-and-restore); a failed capture keeps production stopped:
+After that gate, provision/verify the sentinel through the cleanup dry-run and create the required current-v3 atomic checkpoint before bootstrap or startup. Follow the exact [deployment checkpoint procedure](storage-ingestion-and-publication.md#current-atomic-split-volume-backup-and-restore); a failed capture keeps production stopped:
 
 ```powershell
 docker compose --file compose.prod.yaml --profile tools run --rm storage-cleanup
@@ -136,7 +142,7 @@ docker compose --file compose.prod.yaml up --detach --wait
 
 The production topology contains the app, worker, PostgreSQL, and Caddy. `APP_IMAGE` must identify the already-built immutable application image. Quiesce any old cleanup process first. Migration must succeed before role provisioning creates or rotates the constrained web, worker, and cleanup logins; exercise cleanup in dry-run mode before bootstrap or either long-running process starts. The first dedicated-cleanup rollout must supply a fresh web password to role provisioning because the retired cleanup command held the previous web credential. Caddy is the only service with published ports. PostgreSQL persists in `postgres_data`; private books persist in `book_staging`, `book_publication`, and `book_covers`. Publication is read-only in the app and read-write in the worker and cleanup tool; staging and covers are read-write in all three. Caddy, migration, and bootstrap receive no storage mount. Database, auth, SMTP, bootstrap, and Stripe secrets are mounted only into the processes that need them. None is stored in a production `.env` file. Follow the split-volume upgrade and atomic backup/restore procedures in [storage, ingestion, publication, and recovery](storage-ingestion-and-publication.md); legacy `book_storage` is never an implicit current-runtime fallback.
 
-Plan 6B financial relations are read-only to the web. The worker role has only the relation-specific `INSERT` and `UPDATE` actions used by financial processing, while both roles lack financial `DELETE`. Stripe webhook intake is a column-limited append, and only the worker updates event completion. SELECT-only default privileges apply to future public tables; every new worker mutation therefore requires an explicit migration and provisioner allowlist update.
+Plan 6B financial relations are read-only to the web. Exact public routines allow the web role to submit an authorized command, read only its owner-scoped status, and append the route audit boundary without gaining mutation authority. The worker role has only the routine and relation-specific `INSERT` and `UPDATE` actions used by financial processing, while both roles lack financial `DELETE`. Stripe webhook intake is a column-limited append, and only the worker updates event completion. SELECT-only default privileges apply to future public tables; every new worker mutation therefore requires an explicit migration and provisioner allowlist update.
 
 For a deliberate future test-mode checkpoint, supply both Stripe values from protected process memory and add the explicit overlay:
 
@@ -150,7 +156,7 @@ docker compose --file compose.prod.yaml --file compose.stripe.yaml up --detach -
 
 `compose.stripe.yaml` mounts the API secret into app and worker, but mounts the webhook-verification secret only into app, against the pinned `2026-07-29.dahlia` API version. The app owns Checkout and webhook acceptance; the worker owns canonical source/payout retrieval and hourly recovery and cannot verify inbound webhooks. The overlay adds no service, port, Redis dependency, or credential to migration/bootstrap/storage-cleanup/Caddy/PostgreSQL. Provider calls finish outside financial database transactions. It does not alter `APPLICATION_MODE=maintenance`, live mode, or the existing database/auth/SMTP secret mounts, and it is not a storefront launch switch.
 
-With the base runtime disabled, provider scan roots are not scheduled and the disabled gateway cannot perform source or payout retrieval. The worker may still ensure the version-keyed classifier/allocation replay root because that work uses durable local evidence only. In fixture or Stripe mode it additionally ensures an initial recovery root and one root per UTC hour; each local batch or provider page is capped at 100, initial payout discovery looks back seven days before the earliest local paid order, and hourly discovery overlaps 72 hours. These are convergence boundaries, not a promise that an administrator report is fresh; Sales remains unavailable until Plan 6B-II.
+With the base runtime disabled, provider scan roots are not scheduled and the disabled gateway cannot perform source or payout retrieval. The worker may still ensure the version-keyed classifier/allocation replay root because that work uses durable local evidence only. In fixture or Stripe mode it additionally ensures an initial recovery root and one root per UTC hour; each local batch or provider page is capped at 100, initial payout discovery looks back seven days before the earliest local paid order, and hourly discovery overlaps 72 hours. These are convergence boundaries, not a promise that an administrator report is fresh. Direct Sales candidate routes are available only to controlled review; global navigation remains disabled until acceptance.
 
 Caddy's internal port 2015 health endpoint is container-only and avoids coupling container health to the configured public hostname or TLS redirect behavior.
 
@@ -190,5 +196,5 @@ After the attested apply succeeds, start the app and worker with the ordinary pr
 - Plan 4 supplies private storage, bounded ingestion, revision publication, cleanup, and the current backup/restore procedure.
 - Plan 5 supplies server-owned customer libraries, full entitled reading, optimistic reader state, exact revision migration, and authenticated original downloads. See [customer library, reader state, and original downloads](customer-library-and-reader.md).
 - Plan 6A supplies Stripe Checkout/event reconciliation, guest claiming, purchase grants, and refund/dispute access changes.
-- Plan 6B status is **6B-I complete; 6B-II pending**. Checkpoint I supplies local processing-fee, balance-transaction, payout, allocation, issue, scheduler, and replay boundaries; checkpoint II still owns administrator resolution and sales/estimated-payout reporting.
-- Plan 7 adds deployment automation, off-host backup scheduling, monitoring/alert delivery, final capacity tuning, and the read-only-rootfs review.
+- The Plan 6B candidate combines processing-fee, balance-transaction, payout, allocation, issue, scheduler, and replay boundaries with administrator resolution and sales/estimated-payout reporting while independent review remains pending.
+- Plan 7 adds production activation, deployment automation, off-host backup scheduling, monitoring/alert delivery, general retry administration, final capacity tuning, and the read-only-rootfs review.
