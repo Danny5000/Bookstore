@@ -254,4 +254,31 @@ describe('storage process isolation deployment', () => {
     expect(runbook).toMatch(/archive[^.]*live volume[^.]*equality/iu);
     expect(runbook).toMatch(/restored volume[^.]*manifest[^.]*equality/iu);
   });
+
+  it('composes all six financial administrator executors only in the worker root', () => {
+    const worker = source('src/worker.ts');
+    const web = source('src/hooks.server.ts');
+
+    for (const expected of [
+      'createFinancialAdminCommandExecutors',
+      'createFinancialAdminCommandHandler',
+      'FINANCIAL_ADMIN_COMMAND_JOB',
+      'executeRefundDraftSave',
+      'executeRefundDraftDiscard',
+      'executeRefundAllocationFinalize',
+      'executeReportingCorrectionCreate',
+      'executeAdministrativeRecoveryActivate',
+      'executeAdministrativeRecoveryDeactivate'
+    ]) {
+      expect(worker).toContain(expected);
+      expect(web).not.toContain(expected);
+    }
+
+    expect(worker.match(/createFinancialAdminCommandExecutors\s*\(/gu)).toHaveLength(1);
+    expect(worker.match(/createFinancialAdminCommandHandler\s*\(/gu)).toHaveLength(1);
+    expect(worker).toMatch(
+      /\[FINANCIAL_ADMIN_COMMAND_JOB,\s*financialAdminCommandHandler\]/u
+    );
+    expect(web).not.toMatch(/financial-admin-command|DATABASE_WORKER|financial_worker/iu);
+  });
 });

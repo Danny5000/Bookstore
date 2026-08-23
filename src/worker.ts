@@ -35,6 +35,12 @@ import { STRIPE_EVENT_JOB } from '$lib/server/commerce/job';
 import { fulfillDisputeEvent } from '$lib/server/commerce/disputes';
 import { fulfillRefundEvent } from '$lib/server/commerce/refunds';
 import { createStripeWorkerRuntime } from '$lib/server/commerce/stripe/runtime-core';
+import { createFinancialAdminCommandExecutors } from '$lib/server/commerce/financial/admin-commands/executors';
+import {
+  createFinancialAdminCommandHandler,
+  FINANCIAL_ADMIN_COMMAND_JOB,
+  type FinancialAdminCommandExecutor
+} from '$lib/server/commerce/financial/admin-commands/handler';
 import {
   FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
   FINANCIAL_CLASSIFIER_VERSION
@@ -54,6 +60,20 @@ import {
 import {
   createFinancialScheduleEnsurer
 } from '$lib/server/commerce/financial/scans/scheduler';
+import {
+  executeReportingCorrectionCreate
+} from '$lib/server/commerce/financial/refund-review/corrections';
+import {
+  executeRefundDraftDiscard,
+  executeRefundDraftSave
+} from '$lib/server/commerce/financial/refund-review/drafts';
+import {
+  executeRefundAllocationFinalize
+} from '$lib/server/commerce/financial/refund-review/finalize';
+import {
+  executeAdministrativeRecoveryActivate,
+  executeAdministrativeRecoveryDeactivate
+} from '$lib/server/commerce/financial/refund-review/recovery';
 import { createDatabaseClient } from '$lib/server/db/client';
 import { databaseEnvironmentForRole } from '$lib/server/db/database-role-provision';
 import { probeDatabase } from '$lib/server/db/health';
@@ -147,6 +167,23 @@ const financialClassificationHandler = createFinancialClassificationHandler({
   targetClassifierVersion: FINANCIAL_CLASSIFIER_VERSION,
   targetAllocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
 });
+const financialAdminCommandExecutors = createFinancialAdminCommandExecutors({
+  refundDraftSave: executeRefundDraftSave as FinancialAdminCommandExecutor,
+  refundDraftDiscard: executeRefundDraftDiscard as FinancialAdminCommandExecutor,
+  refundAllocationFinalize:
+    executeRefundAllocationFinalize as FinancialAdminCommandExecutor,
+  refundReportingCorrectionCreate:
+    executeReportingCorrectionCreate as FinancialAdminCommandExecutor,
+  administrativeRecoveryActivate:
+    executeAdministrativeRecoveryActivate as FinancialAdminCommandExecutor,
+  administrativeRecoveryDeactivate:
+    executeAdministrativeRecoveryDeactivate as FinancialAdminCommandExecutor
+});
+const financialAdminCommandHandler = createFinancialAdminCommandHandler({
+  database: databaseClient.db,
+  executors: financialAdminCommandExecutors,
+  accessMessages: commerceMessages
+});
 const handlers = new Map<string, JobHandler>([
   [OUTBOX_DISPATCH_JOB, createOutboxDispatchHandler(databaseClient.db, topicHandlers)],
   [
@@ -172,6 +209,7 @@ const handlers = new Map<string, JobHandler>([
   [FINANCIAL_PAYOUT_JOB, financialPayoutHandler],
   [FINANCIAL_SCAN_JOB, financialScanHandler],
   [FINANCIAL_CLASSIFICATION_JOB, financialClassificationHandler],
+  [FINANCIAL_ADMIN_COMMAND_JOB, financialAdminCommandHandler],
   [
     INGEST_REVISION_JOB,
     createRevisionIngestionHandler(
