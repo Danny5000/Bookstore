@@ -341,6 +341,22 @@ describe('commerce privacy evidence helper', () => {
     }
   });
 
+  it('does not mistake a canonical public UUID segment for test-card evidence', () => {
+    for (const titleId of [
+      'aaaaaaaa-4242-4aaa-8aaa-aaaaaaaaaaaa',
+      'bbbbbbbb-bbbb-4242-8bbb-bbbbbbbbbbbb'
+    ]) {
+      expect(() => assertCommercePrivacy('sales csv', {
+        body: `Public title,${titleId},prose`
+      })).not.toThrow();
+    }
+
+    for (const cardEvidence of ['4242', 'Card ending in 4242', '4242 4242 4242 4242']) {
+      expect(() => assertCommercePrivacy('sales csv', { body: cardEvidence }))
+        .toThrow('Sensitive commerce data detected on sales csv');
+    }
+  });
+
   it.each([
     'pi_plan6biiPrivate',
     'ch_plan6biiPrivate',

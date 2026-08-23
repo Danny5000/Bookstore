@@ -10,17 +10,24 @@ import {
   stripeEvents,
   type OrderItemRow,
   type OrderRow,
-  type PaymentRow
+  type PaymentRow,
+  type RefundRow
 } from '$lib/server/db/schema';
 import { fulfillDisputeEvent } from '$lib/server/commerce/disputes';
 import { createCommerceMessageEnqueuer } from '$lib/server/commerce/email/enqueue';
-import { fulfillCheckoutEvent, recordFulfillmentException } from '$lib/server/commerce/fulfillment';
+import {
+  fulfillCheckoutEvent,
+  recordFulfillmentException
+} from '$lib/server/commerce/fulfillment';
 import {
   createStripeEventHandler,
   defaultLoadStripeEvent,
   fulfillPayoutEvent
 } from '$lib/server/commerce/handler';
-import { STRIPE_EVENT_JOB, createStripeEventJobPayload } from '$lib/server/commerce/job';
+import {
+  STRIPE_EVENT_JOB,
+  createStripeEventJobPayload
+} from '$lib/server/commerce/job';
 import { fulfillRefundEvent } from '$lib/server/commerce/refunds';
 import { createFixtureStripeGateway } from '$lib/server/commerce/stripe/fixture-gateway';
 import type {
@@ -46,6 +53,7 @@ interface RefundOptions {
   amountMinor?: number;
   providerRefundId?: string;
   providerCreatedAt?: Date;
+  eventId?: string;
 }
 
 interface DisputeOptions {
@@ -53,11 +61,28 @@ interface DisputeOptions {
   providerDisputeId?: string;
   providerCreatedAt?: Date;
   reason?: string | null;
+  eventId?: string;
 }
 
 export interface DisputeReference {
   providerDisputeId: string;
   providerCreatedAt: Date;
+}
+
+export interface CommerceHarnessOptions {
+  /**
+   * Prevent this in-process fixture gateway from handing provider-backed financial work to the
+   * separately spawned E2E worker. Financial E2E fixtures publish their worker-owned facts later.
+   */
+  readonly financialE2EMode?: true;
+}
+
+export interface RefundReviewReference {
+  readonly order: OrderRow;
+  readonly items: readonly OrderItemRow[];
+  readonly payment: PaymentRow;
+  readonly refund: RefundRow;
+  readonly privateProviderValues: readonly string[];
 }
 
 function compact(value: string): string {
@@ -80,28 +105,55 @@ function eventJob(stripeEventId: string): JobRecord {
   };
 }
 
-export function createCommerceHarness(database: E2EDatabase, applicationOrigin: string) {
+export function createCommerceHarness(
+  database: E2EDatabase,
+  applicationOrigin: string,
+  options: CommerceHarnessOptions = {}
+) {
   const fixture = createFixtureStripeGateway();
-  const registeredEvents = new Map<string, {
-    type: VerifiedStripeEvent['type'];
-    objectId: string;
-    rawBody: Uint8Array;
-    signature: string;
-    event: VerifiedStripeEvent;
-  }>();
+  const suppressFinancialHandoff = options.financialE2EMode === true;
+  const registeredEvents = new Map<
+    string,
+    {
+      type: VerifiedStripeEvent['type'];
+      objectId: string;
+      rawBody: Uint8Array;
+      signature: string;
+      event: VerifiedStripeEvent;
+    }
+  >();
   const messages = createCommerceMessageEnqueuer(applicationOrigin);
   const handler = createStripeEventHandler(database.workerDb, fixture.gateway, {
     loadStripeEvent: defaultLoadStripeEvent,
-    fulfillCheckout: (selectedDatabase, input) => fulfillCheckoutEvent(selectedDatabase, input, {
-      purchaseMessages: messages
-    }),
-    fulfillRefund: (selectedDatabase, input) => fulfillRefundEvent(selectedDatabase, input, {
-      messages
-    }),
-    fulfillDispute: (selectedDatabase, input) => fulfillDisputeEvent(selectedDatabase, input, {
-      messages
-    }),
-    fulfillPayout: fulfillPayoutEvent,
+    fulfillCheckout: (selectedDatabase, input) =>
+      fulfillCheckoutEvent(selectedDatabase, input, {
+        purchaseMessages: messages,
+        ...(suppressFinancialHandoff
+          ? { queueFinancialSourceFromEvent: async () => undefined }
+          : {})
+      }),
+    fulfillRefund: (selectedDatabase, input) =>
+      fulfillRefundEvent(selectedDatabase, input, {
+        messages,
+        ...(suppressFinancialHandoff
+          ? { queueFinancialSource: async () => undefined }
+          : {})
+      }),
+    fulfillDispute: (selectedDatabase, input) =>
+      fulfillDisputeEvent(selectedDatabase, input, {
+        messages,
+        ...(suppressFinancialHandoff
+          ? { queueFinancialSource: async () => undefined }
+          : {})
+      }),
+    fulfillPayout: (selectedDatabase, input) =>
+      fulfillPayoutEvent(
+        selectedDatabase,
+        input,
+        suppressFinancialHandoff
+          ? { queueFinancialPayout: async () => undefined }
+          : {}
+      ),
     recordException: (selectedDatabase, input) =>
       recordFulfillmentException(selectedDatabase, input)
   });
@@ -141,7 +193,8 @@ export function createCommerceHarness(database: E2EDatabase, applicationOrigin: 
       !payment.stripeLatestChargeId ||
       !payment.paidAt ||
       !payment.paymentMethodCategory
-    ) throw new Error('E2E payment is not canonically paid');
+    )
+      throw new Error('E2E payment is not canonically paid');
     return {
       paymentIntentId: payment.stripePaymentIntentId,
       metadataVersion: '1',
@@ -163,12 +216,15 @@ export function createCommerceHarness(database: E2EDatabase, applicationOrigin: 
   ): Promise<string> {
     const eventId = requestedEventId ?? providerId('evt', randomUUID());
     const registered = registeredEvents.get(eventId);
-    if (registered && (registered.type !== type || registered.objectId !== objectId)) {
+    if (
+      registered &&
+      (registered.type !== type || registered.objectId !== objectId)
+    ) {
       throw new Error('E2E event ID was reused for different immutable facts');
     }
-    const rawBody = registered?.rawBody ?? new TextEncoder().encode(
-      JSON.stringify({ id: eventId, type, objectId })
-    );
+    const rawBody =
+      registered?.rawBody ??
+      new TextEncoder().encode(JSON.stringify({ id: eventId, type, objectId }));
     const signature = registered?.signature ?? `fixture-signature-${eventId}`;
     const event: VerifiedStripeEvent = registered?.event ?? {
       providerEventId: eventId,
@@ -180,7 +236,13 @@ export function createCommerceHarness(database: E2EDatabase, applicationOrigin: 
       rawBodySha256: createHash('sha256').update(rawBody).digest('hex')
     };
     if (!registered) {
-      registeredEvents.set(eventId, { type, objectId, rawBody, signature, event });
+      registeredEvents.set(eventId, {
+        type,
+        objectId,
+        rawBody,
+        signature,
+        event
+      });
     }
     fixture.harness.setWebhook(rawBody, signature, event);
     const verified = fixture.gateway.verifyWebhook(rawBody, signature);
@@ -188,7 +250,10 @@ export function createCommerceHarness(database: E2EDatabase, applicationOrigin: 
       enqueueJob: async () => undefined as never
     });
     if (accepted.status === 'conflict') throw new Error('E2E event conflicted');
-    await handler(eventJob(accepted.stripeEventId), new AbortController().signal);
+    await handler(
+      eventJob(accepted.stripeEventId),
+      new AbortController().signal
+    );
     return accepted.stripeEventId;
   }
 
@@ -204,11 +269,12 @@ export function createCommerceHarness(database: E2EDatabase, applicationOrigin: 
     const chargeId = providerId('ch', order.id);
     const isPaid = options.state === 'paid';
     const isExpired = options.state === 'expired';
-    const paymentState = options.state === 'pending'
-      ? 'pending'
-      : options.state === 'failed'
-        ? 'failed'
-        : 'succeeded';
+    const paymentState =
+      options.state === 'pending'
+        ? 'pending'
+        : options.state === 'failed'
+          ? 'failed'
+          : 'succeeded';
     const session: CheckoutSnapshot = {
       providerSessionId: order.stripeCheckoutSessionId,
       clientReferenceId: order.id,
@@ -251,20 +317,25 @@ export function createCommerceHarness(database: E2EDatabase, applicationOrigin: 
         paymentMethodCategory: 'card'
       } satisfies PaymentSnapshot);
     }
-    const eventType = options.state === 'paid' && order.status === 'payment_pending'
-      ? 'checkout.session.async_payment_succeeded'
-      : options.state === 'failed'
-        ? 'checkout.session.async_payment_failed'
-        : options.state === 'expired'
-          ? 'checkout.session.expired'
-          : 'checkout.session.completed';
+    const eventType =
+      options.state === 'paid' && order.status === 'payment_pending'
+        ? 'checkout.session.async_payment_succeeded'
+        : options.state === 'failed'
+          ? 'checkout.session.async_payment_failed'
+          : options.state === 'expired'
+            ? 'checkout.session.expired'
+            : 'checkout.session.completed';
     await processEvent(eventType, session.providerSessionId, options.eventId);
   }
 
-  async function fulfillRefund(orderId: string, options: RefundOptions = {}): Promise<string> {
+  async function fulfillRefund(
+    orderId: string,
+    options: RefundOptions = {}
+  ): Promise<string> {
     const payment = await paymentFact(orderId);
     const canonical = canonicalPayment(payment);
-    const providerRefundId = options.providerRefundId ?? providerId('re', randomUUID());
+    const providerRefundId =
+      options.providerRefundId ?? providerId('re', randomUUID());
     const refund: RefundSnapshot = {
       providerRefundId,
       paymentIntentId: payment.stripePaymentIntentId,
@@ -279,8 +350,39 @@ export function createCommerceHarness(database: E2EDatabase, applicationOrigin: 
     };
     fixture.harness.setPayment(canonical);
     fixture.harness.setRefund(refund);
-    await processEvent('refund.updated', providerRefundId);
+    await processEvent('refund.updated', providerRefundId, options.eventId);
     return providerRefundId;
+  }
+
+  async function refundReviewReference(
+    orderId: string,
+    providerRefundId: string
+  ): Promise<RefundReviewReference> {
+    const { order, items } = await orderFacts(orderId);
+    const payment = await paymentFact(orderId);
+    const [refund] = await database.db
+      .select()
+      .from(refunds)
+      .where(eq(refunds.stripeRefundId, providerRefundId))
+      .limit(1);
+    if (!refund || refund.paymentId !== payment.id) {
+      throw new Error(
+        'E2E refund review reference did not match the requested order'
+      );
+    }
+    return {
+      order,
+      items,
+      payment,
+      refund,
+      privateProviderValues: [
+        order.stripeCheckoutSessionId,
+        payment.stripePaymentIntentId,
+        payment.stripeLatestChargeId,
+        refund.stripeRefundId,
+        ...items.map((item) => item.stripeLineItemId)
+      ].filter((value): value is string => value !== null)
+    };
   }
 
   async function fulfillDispute(
@@ -289,7 +391,8 @@ export function createCommerceHarness(database: E2EDatabase, applicationOrigin: 
   ): Promise<DisputeReference> {
     const payment = await paymentFact(orderId);
     const canonical = canonicalPayment(payment);
-    const providerDisputeId = options.providerDisputeId ?? providerId('dp', randomUUID());
+    const providerDisputeId =
+      options.providerDisputeId ?? providerId('dp', randomUUID());
     const providerCreatedAt = options.providerCreatedAt ?? new Date();
     const dispute: DisputeSnapshot = {
       providerDisputeId,
@@ -306,8 +409,11 @@ export function createCommerceHarness(database: E2EDatabase, applicationOrigin: 
     fixture.harness.setPayment(canonical);
     fixture.harness.setDispute(dispute);
     await processEvent(
-      options.state === 'open' ? 'charge.dispute.created' : 'charge.dispute.closed',
-      providerDisputeId
+      options.state === 'open'
+        ? 'charge.dispute.created'
+        : 'charge.dispute.closed',
+      providerDisputeId,
+      options.eventId
     );
     return { providerDisputeId, providerCreatedAt };
   }
@@ -316,6 +422,7 @@ export function createCommerceHarness(database: E2EDatabase, applicationOrigin: 
     fulfillCheckout,
     fulfillRefund,
     fulfillDispute,
+    refundReviewReference,
     async orderSnapshot(orderId: string) {
       const { order, items } = await orderFacts(orderId);
       return {
@@ -332,7 +439,8 @@ export function createCommerceHarness(database: E2EDatabase, applicationOrigin: 
       };
     },
     async privacySnapshot(orderIds: readonly string[]) {
-      if (orderIds.length === 0) throw new Error('E2E privacy snapshot requires an order');
+      if (orderIds.length === 0)
+        throw new Error('E2E privacy snapshot requires an order');
       const selectedOrders = await database.db
         .select({
           id: orders.id,
@@ -345,23 +453,34 @@ export function createCommerceHarness(database: E2EDatabase, applicationOrigin: 
         .from(payments)
         .where(inArray(payments.orderId, [...orderIds]));
       const paymentIds = selectedPayments.map((payment) => payment.id);
-      const selectedRefunds = paymentIds.length === 0
-        ? []
-        : await database.db.select().from(refunds).where(inArray(refunds.paymentId, paymentIds));
-      const selectedDisputes = paymentIds.length === 0
-        ? []
-        : await database.db.select().from(disputes).where(inArray(disputes.paymentId, paymentIds));
+      const selectedRefunds =
+        paymentIds.length === 0
+          ? []
+          : await database.db
+              .select()
+              .from(refunds)
+              .where(inArray(refunds.paymentId, paymentIds));
+      const selectedDisputes =
+        paymentIds.length === 0
+          ? []
+          : await database.db
+              .select()
+              .from(disputes)
+              .where(inArray(disputes.paymentId, paymentIds));
       const providerObjectIds = [
-        ...selectedOrders.flatMap((order) => order.stripeCheckoutSessionId ?? []),
+        ...selectedOrders.flatMap(
+          (order) => order.stripeCheckoutSessionId ?? []
+        ),
         ...selectedRefunds.map((refund) => refund.stripeRefundId),
         ...selectedDisputes.map((dispute) => dispute.stripeDisputeId)
       ];
-      const selectedEvents = providerObjectIds.length === 0
-        ? []
-        : await database.db
-            .select()
-            .from(stripeEvents)
-            .where(inArray(stripeEvents.objectId, providerObjectIds));
+      const selectedEvents =
+        providerObjectIds.length === 0
+          ? []
+          : await database.db
+              .select()
+              .from(stripeEvents)
+              .where(inArray(stripeEvents.objectId, providerObjectIds));
       const selectedAudits = await database.db
         .select()
         .from(auditEvents)

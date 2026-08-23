@@ -409,10 +409,14 @@ function trackedRefundActionEvent(actor: Actor, action: RefundActionName) {
   return { event, accesses, body };
 }
 
-function trackedRefundLoadEvent(actor: Actor) {
+function trackedRefundLoadEvent(
+  actor: Actor,
+  search = `?reviewCursor=${REVIEW_CURSOR}`,
+  method: 'GET' | 'POST' = 'GET'
+) {
   const request = new Request(
-    `https://books.example.test/admin/sales/refunds/${REFUND_ID}?reviewCursor=${REVIEW_CURSOR}`,
-    { headers: { 'x-request-id': 'task-15-refund-loader' } }
+    `https://books.example.test/admin/sales/refunds/${REFUND_ID}${search}`,
+    { method, headers: { 'x-request-id': 'task-15-refund-loader' } }
   );
   const values = {
     params: { refundId: REFUND_ID },
@@ -694,6 +698,61 @@ describe('refund review loader and async command routes', () => {
       result.recoveryActivationIdempotencyKey,
       result.recoveryDeactivationIdempotencyKey
     ]).size).toBe(6);
+  });
+
+  it.each(Object.keys(refundActionInputs) as RefundActionName[])(
+    'loads the post-%s page with its empty named-action marker and review cursor',
+    async (action) => {
+      const { event } = trackedRefundLoadEvent(
+        ADMIN,
+        `?reviewCursor=${REVIEW_CURSOR}&/${action}`,
+        'POST'
+      );
+
+      const result = await refundRoute.load(event as never);
+
+      expect(result).toMatchObject({ detail, reviewCursor: REVIEW_CURSOR });
+      expect(routeMocks.getDetail).toHaveBeenCalledWith(
+        routeMocks.database,
+        ADMIN,
+        REFUND_ID,
+        {
+          correlationId: 'task-15-refund-loader',
+          requestMetadata: {
+            method: 'GET',
+            routeId: '/admin/sales/refunds/[refundId]'
+          }
+        }
+      );
+    }
+  );
+
+  it.each([
+    {
+      label: 'an unknown query key',
+      search: `?reviewCursor=${REVIEW_CURSOR}&returnTo=private`
+    },
+    {
+      label: 'an unknown slash-prefixed action marker',
+      search: `?reviewCursor=${REVIEW_CURSOR}&/unknownAction`
+    },
+    {
+      label: 'duplicate named-action marker values',
+      search: `?reviewCursor=${REVIEW_CURSOR}&/saveDraft&/saveDraft`
+    },
+    {
+      label: 'a non-empty named-action marker value',
+      search: `?reviewCursor=${REVIEW_CURSOR}&/saveDraft=private`
+    },
+    {
+      label: 'multiple named-action markers',
+      search: `?reviewCursor=${REVIEW_CURSOR}&/saveDraft&/discardDraft`
+    }
+  ])('rejects $label during the post-action loader lifecycle', async ({ search }) => {
+    const { event } = trackedRefundLoadEvent(ADMIN, search);
+
+    await expect(refundRoute.load(event as never)).rejects.toMatchObject({ status: 400 });
+    expect(routeMocks.getDetail).not.toHaveBeenCalled();
   });
 
   it.each(['prepareFinalize', 'confirmFinalize'] as const)(

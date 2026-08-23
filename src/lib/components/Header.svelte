@@ -264,8 +264,8 @@
       display: none;
     }
     header {
-      padding: 0 16px;
-      gap: 14px;
+      padding: 0 8px;
+      gap: 4px;
     }
     .wordmark {
       font-size: 18px;
@@ -274,8 +274,12 @@
       display: none;
     }
     .account {
-      padding: 7px 12px;
+      padding: 7px 8px;
       max-width: 40vw;
+    }
+    .themes {
+      gap: 4px;
+      padding: 2px;
     }
   }
 </style>

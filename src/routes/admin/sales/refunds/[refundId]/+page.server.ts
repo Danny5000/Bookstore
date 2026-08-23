@@ -60,7 +60,8 @@ function canManageRefund(actor: AdministratorActor): boolean {
     requireCapability(actor, 'reconciliation.manage');
     return true;
   } catch (cause: unknown) {
-    if (cause instanceof AuthorizationError && cause.code === 'forbidden') return false;
+    if (cause instanceof AuthorizationError && cause.code === 'forbidden')
+      return false;
     throw cause;
   }
 }
@@ -70,17 +71,20 @@ function failLoadSafely(cause: unknown): never {
   error(failure.status, failure.code);
 }
 
-type RefundAction =
-  | 'saveDraft'
-  | 'discardDraft'
-  | 'prepareFinalize'
-  | 'confirmFinalize'
-  | 'prepareCorrection'
-  | 'confirmCorrection'
-  | 'prepareRecoveryActivation'
-  | 'confirmRecoveryActivation'
-  | 'prepareRecoveryDeactivation'
-  | 'confirmRecoveryDeactivation';
+const REFUND_ACTIONS = [
+  'saveDraft',
+  'discardDraft',
+  'prepareFinalize',
+  'confirmFinalize',
+  'prepareCorrection',
+  'confirmCorrection',
+  'prepareRecoveryActivation',
+  'confirmRecoveryActivation',
+  'prepareRecoveryDeactivation',
+  'confirmRecoveryDeactivation'
+] as const;
+
+type RefundAction = (typeof REFUND_ACTIONS)[number];
 
 type RetrySubmission =
   | {
@@ -138,18 +142,36 @@ type RetrySubmission =
       readonly confirmation: 'deactivate_persistent_recovery';
     };
 
-function actionReturnContext(url: URL, action: RefundAction) {
+function actionReturnContext(url: URL, action?: RefundAction) {
   const normalized = new URL(url);
-  const marker = `/${action}`;
-  const markerValues = normalized.searchParams.getAll(marker);
-  if (
-    markerValues.length > 1 ||
-    (markerValues.length === 1 && markerValues[0] !== '')
-  ) {
-    throw new FinancialRouteInputError();
+  const recognizedActions = action === undefined ? REFUND_ACTIONS : [action];
+  let markerCount = 0;
+  for (const recognizedAction of recognizedActions) {
+    const marker = `/${recognizedAction}`;
+    const markerValues = normalized.searchParams.getAll(marker);
+    if (
+      markerValues.length > 1 ||
+      (markerValues.length === 1 && markerValues[0] !== '')
+    ) {
+      throw new FinancialRouteInputError();
+    }
+    markerCount += markerValues.length;
+    normalized.searchParams.delete(marker);
   }
-  normalized.searchParams.delete(marker);
+  if (markerCount > 1) throw new FinancialRouteInputError();
   return parseRefundReviewReturnContext(normalized);
+}
+
+function createRefundReadContext(
+  request: Request,
+  routeId: string | null
+): ReturnType<typeof createFinancialRequestContext> {
+  const context = createFinancialRequestContext(request, routeId);
+  if (context.requestMetadata === undefined) return context;
+  return {
+    ...context,
+    requestMetadata: { ...context.requestMetadata, method: 'GET' }
+  };
 }
 
 export const load: PageServerLoad = async (event) => {
@@ -157,8 +179,8 @@ export const load: PageServerLoad = async (event) => {
     const actor = requireRefundRead(event.locals.actor);
     const canManageReconciliation = canManageRefund(actor);
     const refundId = requireFinancialRouteUuid(event.params.refundId);
-    const returnContext = parseRefundReviewReturnContext(event.url);
-    const context = createFinancialRequestContext(event.request, event.route.id);
+    const returnContext = actionReturnContext(event.url);
+    const context = createRefundReadContext(event.request, event.route.id);
     const database = getDatabaseClient().db;
     const detail = await getRefundReviewDetail(
       database,
@@ -183,8 +205,12 @@ export const load: PageServerLoad = async (event) => {
       discardDraftIdempotencyKey: canManageReconciliation ? randomUUID() : null,
       finalizeIdempotencyKey: canManageReconciliation ? randomUUID() : null,
       correctionIdempotencyKey: canManageReconciliation ? randomUUID() : null,
-      recoveryActivationIdempotencyKey: canManageReconciliation ? randomUUID() : null,
-      recoveryDeactivationIdempotencyKey: canManageReconciliation ? randomUUID() : null
+      recoveryActivationIdempotencyKey: canManageReconciliation
+        ? randomUUID()
+        : null,
+      recoveryDeactivationIdempotencyKey: canManageReconciliation
+        ? randomUUID()
+        : null
     };
   } catch (cause: unknown) {
     failLoadSafely(cause);
@@ -201,21 +227,24 @@ async function submitDraft(
     assertSameOrigin(event.request);
     const refundId = requireFinancialRouteUuid(event.params.refundId);
     const returnContext = actionReturnContext(event.url, action);
-    const submission = action === 'saveDraft'
-      ? await parseRefundDraftSaveRequest(event.request, refundId)
-      : await parseRefundDraftDiscardRequest(event.request, refundId);
-    retrySubmission = submission.command.kind === 'refund_draft_save'
-      ? {
-          action: 'saveDraft',
-          idempotencyKey: submission.idempotencyKey,
-          expectedVersion: submission.command.expectedVersion,
-          items: submission.command.items
-        }
-      : {
-          action: 'discardDraft',
-          idempotencyKey: submission.idempotencyKey,
-          expectedActiveDraftVersion: submission.command.expectedActiveDraftVersion
-        };
+    const submission =
+      action === 'saveDraft'
+        ? await parseRefundDraftSaveRequest(event.request, refundId)
+        : await parseRefundDraftDiscardRequest(event.request, refundId);
+    retrySubmission =
+      submission.command.kind === 'refund_draft_save'
+        ? {
+            action: 'saveDraft',
+            idempotencyKey: submission.idempotencyKey,
+            expectedVersion: submission.command.expectedVersion,
+            items: submission.command.items
+          }
+        : {
+            action: 'discardDraft',
+            idempotencyKey: submission.idempotencyKey,
+            expectedActiveDraftVersion:
+              submission.command.expectedActiveDraftVersion
+          };
     const command = await submitFinancialAdminCommand(getDatabaseClient().db, {
       actor,
       idempotencyKey: submission.idempotencyKey,
@@ -225,35 +254,35 @@ async function submitDraft(
     return { command, reviewCursor: returnContext.reviewCursor };
   } catch (cause: unknown) {
     const failure = financialActionFailure(cause);
-    const itemField = cause instanceof RefundReviewInputError
-      ? cause.fieldKey
-      : null;
+    const itemField =
+      cause instanceof RefundReviewInputError ? cause.fieldKey : null;
     return fail(failure.status, {
       code: failure.code,
-      fieldErrors: failure.code === 'invalid_request'
-        ? itemField === null
-          ? { form: 'Check each refund amount and try again.' }
-          : {
-              form: 'Check the highlighted refund amount and try again.',
-              [itemField]: 'Enter a whole amount from 0 through 99,999,999.'
-            }
-        : {},
-      retrySubmission: failure.code === 'temporarily_unavailable'
-        ? retrySubmission
-        : null
+      fieldErrors:
+        failure.code === 'invalid_request'
+          ? itemField === null
+            ? { form: 'Check each refund amount and try again.' }
+            : {
+                form: 'Check the highlighted refund amount and try again.',
+                [itemField]: 'Enter a whole amount from 0 through 99,999,999.'
+              }
+          : {},
+      retrySubmission:
+        failure.code === 'temporarily_unavailable' ? retrySubmission : null
     });
   }
 }
 
-async function prepareFinalization(
-  event: Parameters<Actions['saveDraft']>[0]
-) {
+async function prepareFinalization(event: Parameters<Actions['saveDraft']>[0]) {
   try {
     const actor = requireRefundManagement(event.locals.actor);
     assertSameOrigin(event.request);
     const refundId = requireFinancialRouteUuid(event.params.refundId);
     const returnContext = actionReturnContext(event.url, 'prepareFinalize');
-    const input = await parseRefundFinalizationPrepareRequest(event.request, refundId);
+    const input = await parseRefundFinalizationPrepareRequest(
+      event.request,
+      refundId
+    );
     const finalizationPreview = await previewRefundFinalization(
       getDatabaseClient().db,
       actor,
@@ -269,24 +298,31 @@ async function prepareFinalization(
     );
     return fail(failure.status, {
       code: failure.code,
-      fieldErrors: failure.code === 'invalid_request'
-        ? { form: 'Reload current refund facts and prepare finalization again.' }
-        : {},
+      fieldErrors:
+        failure.code === 'invalid_request'
+          ? {
+              form: 'Reload current refund facts and prepare finalization again.'
+            }
+          : {},
       retrySubmission: null
     });
   }
 }
 
-async function confirmFinalization(
-  event: Parameters<Actions['saveDraft']>[0]
-) {
-  let retrySubmission: Extract<RetrySubmission, { action: 'confirmFinalize' }> | null = null;
+async function confirmFinalization(event: Parameters<Actions['saveDraft']>[0]) {
+  let retrySubmission: Extract<
+    RetrySubmission,
+    { action: 'confirmFinalize' }
+  > | null = null;
   try {
     const actor = requireRefundManagement(event.locals.actor);
     assertSameOrigin(event.request);
     const refundId = requireFinancialRouteUuid(event.params.refundId);
     const returnContext = actionReturnContext(event.url, 'confirmFinalize');
-    const submission = await parseRefundFinalizationConfirmRequest(event.request, refundId);
+    const submission = await parseRefundFinalizationConfirmRequest(
+      event.request,
+      refundId
+    );
     retrySubmission = {
       action: 'confirmFinalize',
       idempotencyKey: submission.idempotencyKey,
@@ -305,19 +341,19 @@ async function confirmFinalization(
     const failure = financialActionFailure(cause);
     return fail(failure.status, {
       code: failure.code,
-      fieldErrors: failure.code === 'invalid_request'
-        ? { form: 'Reload current refund facts and prepare finalization again.' }
-        : {},
-      retrySubmission: failure.code === 'temporarily_unavailable'
-        ? retrySubmission
-        : null
+      fieldErrors:
+        failure.code === 'invalid_request'
+          ? {
+              form: 'Reload current refund facts and prepare finalization again.'
+            }
+          : {},
+      retrySubmission:
+        failure.code === 'temporarily_unavailable' ? retrySubmission : null
     });
   }
 }
 
-async function prepareCorrection(
-  event: Parameters<Actions['saveDraft']>[0]
-) {
+async function prepareCorrection(event: Parameters<Actions['saveDraft']>[0]) {
   try {
     const actor = requireRefundManagement(event.locals.actor);
     assertSameOrigin(event.request);
@@ -343,28 +379,29 @@ async function prepareCorrection(
         ? new FinancialRouteError('stale_state')
         : cause
     );
-    const itemField = cause instanceof RefundReviewInputError
-      ? cause.fieldKey
-      : null;
+    const itemField =
+      cause instanceof RefundReviewInputError ? cause.fieldKey : null;
     return fail(failure.status, {
       code: failure.code,
-      fieldErrors: failure.code === 'invalid_request'
-        ? itemField === null
-          ? { form: 'Check each reporting attribution and prepare again.' }
-          : {
-              form: 'Check the highlighted reporting attribution and prepare again.',
-              [itemField]: 'Enter a whole amount from 0 through 99,999,999.'
-            }
-        : {},
+      fieldErrors:
+        failure.code === 'invalid_request'
+          ? itemField === null
+            ? { form: 'Check each reporting attribution and prepare again.' }
+            : {
+                form: 'Check the highlighted reporting attribution and prepare again.',
+                [itemField]: 'Enter a whole amount from 0 through 99,999,999.'
+              }
+          : {},
       retrySubmission: null
     });
   }
 }
 
-async function confirmCorrection(
-  event: Parameters<Actions['saveDraft']>[0]
-) {
-  let retrySubmission: Extract<RetrySubmission, { action: 'confirmCorrection' }> | null = null;
+async function confirmCorrection(event: Parameters<Actions['saveDraft']>[0]) {
+  let retrySubmission: Extract<
+    RetrySubmission,
+    { action: 'confirmCorrection' }
+  > | null = null;
   try {
     const actor = requireRefundManagement(event.locals.actor);
     assertSameOrigin(event.request);
@@ -378,8 +415,10 @@ async function confirmCorrection(
       action: 'confirmCorrection',
       idempotencyKey: submission.idempotencyKey,
       reason: submission.command.reason,
-      expectedNextCorrectionVersion: submission.command.expectedNextCorrectionVersion,
-      expectedBaseAllocationSetId: submission.command.expectedBaseAllocationSetId,
+      expectedNextCorrectionVersion:
+        submission.command.expectedNextCorrectionVersion,
+      expectedBaseAllocationSetId:
+        submission.command.expectedBaseAllocationSetId,
       expectedSourceFingerprint: submission.command.expectedSourceFingerprint,
       items: submission.command.items,
       previewFingerprint: submission.command.previewFingerprint,
@@ -394,22 +433,23 @@ async function confirmCorrection(
     return { command, reviewCursor: returnContext.reviewCursor };
   } catch (cause: unknown) {
     const failure = financialActionFailure(cause);
-    const itemField = cause instanceof RefundReviewInputError
-      ? cause.fieldKey
-      : null;
+    const itemField =
+      cause instanceof RefundReviewInputError ? cause.fieldKey : null;
     return fail(failure.status, {
       code: failure.code,
-      fieldErrors: failure.code === 'invalid_request'
-        ? itemField === null
-          ? { form: 'Reload current reporting facts and prepare the correction again.' }
-          : {
-              form: 'Check the highlighted reporting attribution and prepare again.',
-              [itemField]: 'Enter a whole amount from 0 through 99,999,999.'
-            }
-        : {},
-      retrySubmission: failure.code === 'temporarily_unavailable'
-        ? retrySubmission
-        : null
+      fieldErrors:
+        failure.code === 'invalid_request'
+          ? itemField === null
+            ? {
+                form: 'Reload current reporting facts and prepare the correction again.'
+              }
+            : {
+                form: 'Check the highlighted reporting attribution and prepare again.',
+                [itemField]: 'Enter a whole amount from 0 through 99,999,999.'
+              }
+          : {},
+      retrySubmission:
+        failure.code === 'temporarily_unavailable' ? retrySubmission : null
     });
   }
 }
@@ -421,17 +461,21 @@ async function prepareRecoveryActivation(
     const actor = requireRefundManagement(event.locals.actor);
     assertSameOrigin(event.request);
     const refundId = requireFinancialRouteUuid(event.params.refundId);
-    const returnContext = actionReturnContext(event.url, 'prepareRecoveryActivation');
+    const returnContext = actionReturnContext(
+      event.url,
+      'prepareRecoveryActivation'
+    );
     const input = await parseAdministrativeRecoveryActivatePrepareRequest(
       event.request,
       refundId
     );
-    const administrativeRecoveryActivationPreview = await previewAdministrativeRecovery(
-      getDatabaseClient().db,
-      actor,
-      input,
-      createFinancialRequestContext(event.request, event.route.id)
-    );
+    const administrativeRecoveryActivationPreview =
+      await previewAdministrativeRecovery(
+        getDatabaseClient().db,
+        actor,
+        input,
+        createFinancialRequestContext(event.request, event.route.id)
+      );
     return {
       administrativeRecoveryActivationPreview,
       reviewCursor: returnContext.reviewCursor
@@ -444,9 +488,12 @@ async function prepareRecoveryActivation(
     );
     return fail(failure.status, {
       code: failure.code,
-      fieldErrors: failure.code === 'invalid_request'
-        ? { form: 'Reload current recovery facts and prepare activation again.' }
-        : {},
+      fieldErrors:
+        failure.code === 'invalid_request'
+          ? {
+              form: 'Reload current recovery facts and prepare activation again.'
+            }
+          : {},
       retrySubmission: null
     });
   }
@@ -463,7 +510,10 @@ async function confirmRecoveryActivation(
     const actor = requireRefundManagement(event.locals.actor);
     assertSameOrigin(event.request);
     const refundId = requireFinancialRouteUuid(event.params.refundId);
-    const returnContext = actionReturnContext(event.url, 'confirmRecoveryActivation');
+    const returnContext = actionReturnContext(
+      event.url,
+      'confirmRecoveryActivation'
+    );
     const submission = await parseAdministrativeRecoveryActivateConfirmRequest(
       event.request,
       refundId
@@ -490,12 +540,14 @@ async function confirmRecoveryActivation(
     const failure = financialActionFailure(cause);
     return fail(failure.status, {
       code: failure.code,
-      fieldErrors: failure.code === 'invalid_request'
-        ? { form: 'Reload current recovery facts and prepare activation again.' }
-        : {},
-      retrySubmission: failure.code === 'temporarily_unavailable'
-        ? retrySubmission
-        : null
+      fieldErrors:
+        failure.code === 'invalid_request'
+          ? {
+              form: 'Reload current recovery facts and prepare activation again.'
+            }
+          : {},
+      retrySubmission:
+        failure.code === 'temporarily_unavailable' ? retrySubmission : null
     });
   }
 }
@@ -507,7 +559,10 @@ async function prepareRecoveryDeactivation(
     const actor = requireRefundManagement(event.locals.actor);
     assertSameOrigin(event.request);
     const refundId = requireFinancialRouteUuid(event.params.refundId);
-    const returnContext = actionReturnContext(event.url, 'prepareRecoveryDeactivation');
+    const returnContext = actionReturnContext(
+      event.url,
+      'prepareRecoveryDeactivation'
+    );
     const input = await parseAdministrativeRecoveryDeactivatePrepareRequest(
       event.request,
       refundId
@@ -531,9 +586,12 @@ async function prepareRecoveryDeactivation(
     );
     return fail(failure.status, {
       code: failure.code,
-      fieldErrors: failure.code === 'invalid_request'
-        ? { form: 'Reload current recovery facts and prepare deactivation again.' }
-        : {},
+      fieldErrors:
+        failure.code === 'invalid_request'
+          ? {
+              form: 'Reload current recovery facts and prepare deactivation again.'
+            }
+          : {},
       retrySubmission: null
     });
   }
@@ -550,10 +608,12 @@ async function confirmRecoveryDeactivation(
     const actor = requireRefundManagement(event.locals.actor);
     assertSameOrigin(event.request);
     requireFinancialRouteUuid(event.params.refundId);
-    const returnContext = actionReturnContext(event.url, 'confirmRecoveryDeactivation');
-    const submission = await parseAdministrativeRecoveryDeactivateConfirmRequest(
-      event.request
+    const returnContext = actionReturnContext(
+      event.url,
+      'confirmRecoveryDeactivation'
     );
+    const submission =
+      await parseAdministrativeRecoveryDeactivateConfirmRequest(event.request);
     retrySubmission = {
       action: 'confirmRecoveryDeactivation',
       idempotencyKey: submission.idempotencyKey,
@@ -573,12 +633,14 @@ async function confirmRecoveryDeactivation(
     const failure = financialActionFailure(cause);
     return fail(failure.status, {
       code: failure.code,
-      fieldErrors: failure.code === 'invalid_request'
-        ? { form: 'Reload current recovery facts and prepare deactivation again.' }
-        : {},
-      retrySubmission: failure.code === 'temporarily_unavailable'
-        ? retrySubmission
-        : null
+      fieldErrors:
+        failure.code === 'invalid_request'
+          ? {
+              form: 'Reload current recovery facts and prepare deactivation again.'
+            }
+          : {},
+      retrySubmission:
+        failure.code === 'temporarily_unavailable' ? retrySubmission : null
     });
   }
 }

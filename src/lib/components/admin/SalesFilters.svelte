@@ -43,7 +43,7 @@
 
   const exportHref = $derived(exportUrl(filters));
 
-  function omitEmptyOptionalFields(event: SubmitEvent): void {
+  function omitEmptyOptionalFields(event: FormDataEvent): void {
     const form = event.currentTarget;
     if (!(form instanceof HTMLFormElement)) return;
     for (const element of form.elements) {
@@ -52,7 +52,7 @@
         element.dataset.optional === 'true' &&
         element.value === ''
       ) {
-        element.disabled = true;
+        event.formData.delete(element.name);
       }
     }
   }
@@ -62,7 +62,7 @@
   method="GET"
   action={resolve('/admin/sales')}
   class="sales-filters"
-  onsubmit={omitEmptyOptionalFields}
+  onformdata={omitEmptyOptionalFields}
 >
   <label>
     <span>Range</span>
@@ -158,7 +158,7 @@
     {#if canExport}
       <!-- Generated only from the strict normalized noncursor DTO. -->
       <!-- eslint-disable-next-line svelte/no-navigation-without-resolve -->
-      <a href={exportHref}>Export filtered CSV</a>
+      <a href={exportHref} data-sveltekit-reload>Export filtered CSV</a>
     {/if}
   </div>
 </form>

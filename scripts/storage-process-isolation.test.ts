@@ -388,8 +388,8 @@ describe('storage process isolation deployment', () => {
     expect(testServices).not.toMatch(/^ {2}(?:app|worker|storage-cleanup):/mu);
     expect(exampleEnvironment).toContain('APP_ENV=development');
     expect(exampleEnvironment).not.toContain('PALE_ORBIT_TEST_PROJECT');
-    expect(playwright).toContain(
-      "command: 'npm run dev -- --host 127.0.0.1 --port 4173'"
+    expect(playwright).toMatch(
+      /\bcommand:\s*'npm run build:web && npm run preview -- --host 127\.0\.0\.1 --port 4173 --strictPort'/u
     );
     expect(playwright).not.toContain('src/worker.ts');
     expect(playwright).not.toContain('$lib/server/jobs/test-worker-control');

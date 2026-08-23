@@ -475,6 +475,14 @@ describe('Sales Overview page', () => {
     expect(body).not.toContain('autofocus');
   });
 
+  it('omits empty optional GET entries without disabling controls reused after navigation', () => {
+    const source = readFileSync(new URL('./SalesFilters.svelte', import.meta.url), 'utf8');
+
+    expect(source).toMatch(/onformdata=\{omitEmptyOptionalFields\}/u);
+    expect(source).toMatch(/event\.formData\.delete\(element\.name\)/u);
+    expect(source).not.toMatch(/(?:\.disabled\s*=|setAttribute\(\s*['"]disabled)/u);
+  });
+
   it('shows a canonical cursor-free export link only when canExport is true', () => {
     componentMocks.url =
       'https://books.example.test/admin/sales?private=ignored&cursor=page_cursor';
@@ -497,6 +505,7 @@ describe('Sales Overview page', () => {
     }).body;
     const href = decodedHref(visible, 'Export filtered CSV');
 
+    expect(visible).toMatch(/<a[^>]*data-sveltekit-reload[^>]*>Export filtered CSV<\/a>/u);
     expect(href).toBe(
       `/admin/sales/export.csv?range=custom&from=2026-08-01&to=2026-08-10&titleId=${titleId}&format=comic&presentmentCurrency=USD&settlementCurrency=EUR&state=fee_reconciled&sort=title_asc`
     );

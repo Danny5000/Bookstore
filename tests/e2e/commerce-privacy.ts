@@ -78,7 +78,9 @@ const financialArtifactForbiddenKeys = new Set([
 ]);
 
 const textKeyPattern = /(?:^|[\s,{])(?:["']|\\")?([a-z][a-z0-9_-]*)(?:["']|\\")?\s*:/giu;
-const providerSecret = /(?:sk|rk)_(?:test|live)_[a-z0-9_-]+|whsec_[a-z0-9_-]+|BEGIN PRIVATE KEY|\b4242\b/iu;
+const providerSecret = /(?:sk|rk)_(?:test|live)_[a-z0-9_-]+|whsec_[a-z0-9_-]+|BEGIN PRIVATE KEY/iu;
+const canonicalUuid = /\b[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/giu;
+const testCardEvidence = /\b4242\b|\b4242(?:[ -]?4242){3}\b/iu;
 const providerObjectId = /\b(?:pi|ch|re|dp|po|txn|evt|cus|pm)_[a-z0-9][a-z0-9_-]{3,}\b/iu;
 const rawEmail = /\b[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+\b/iu;
 const networkIdentity = /\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b|\bMozilla\/[0-9]/iu;
@@ -128,6 +130,10 @@ function hasForbiddenTextKey(value: string, financialArtifact: boolean): boolean
         (financialArtifact && financialArtifactForbiddenKeys.has(key));
     }
   );
+}
+
+function hasTestCardEvidence(value: string): boolean {
+  return testCardEvidence.test(value.replaceAll(canonicalUuid, ''));
 }
 
 function hasSensitiveErrorData(
@@ -189,8 +195,9 @@ function hasSensitiveEvidence(
 ): boolean {
   if (typeof value === 'string') {
     const normalized = value.toLowerCase();
-    return hasForbiddenTextKey(value, financialArtifact) ||
+      return hasForbiddenTextKey(value, financialArtifact) ||
       providerSecret.test(value) ||
+      hasTestCardEvidence(value) ||
       (financialArtifact && providerObjectId.test(value)) ||
       rawEmail.test(value) ||
       networkIdentity.test(value) ||

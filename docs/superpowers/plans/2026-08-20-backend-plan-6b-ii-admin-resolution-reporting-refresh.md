@@ -53,12 +53,12 @@ The only administrator command kinds in this plan are:
 
 ```ts
 export const FINANCIAL_ADMIN_COMMAND_KINDS = [
-  'refund_draft_save',
-  'refund_draft_discard',
-  'refund_allocation_finalize',
-  'refund_reporting_correction_create',
-  'administrative_recovery_activate',
-  'administrative_recovery_deactivate'
+  "refund_draft_save",
+  "refund_draft_discard",
+  "refund_allocation_finalize",
+  "refund_reporting_correction_create",
+  "administrative_recovery_activate",
+  "administrative_recovery_deactivate",
 ] as const;
 ```
 
@@ -66,11 +66,11 @@ The only browser-visible command statuses are:
 
 ```ts
 export const FINANCIAL_ADMIN_COMMAND_STATUSES = [
-  'pending',
-  'succeeded',
-  'denied',
-  'conflict',
-  'failed'
+  "pending",
+  "succeeded",
+  "denied",
+  "conflict",
+  "failed",
 ] as const;
 ```
 
@@ -164,6 +164,7 @@ Expected: all commands exit zero. Stop on a failure; do not start Plan 6B-II by 
 ### Task 2: Add independent capabilities, strict filters, safe DTOs, and command contracts
 
 **Files:**
+
 - Modify: `src/lib/server/auth/admin-policy.ts`
 - Modify: `src/lib/server/auth/admin-policy.test.ts`
 - Create: `src/lib/types/financial-reporting.ts`
@@ -183,31 +184,37 @@ Require this exact policy shape:
 
 ```ts
 export type AdminCapability =
-  | 'admin.access'
-  | 'catalog.manage'
-  | 'roles.manage'
-  | 'audit.read'
-  | 'jobs.retry'
-  | 'sales.read'
-  | 'sales.export'
-  | 'reconciliation.manage';
+  | "admin.access"
+  | "catalog.manage"
+  | "roles.manage"
+  | "audit.read"
+  | "jobs.retry"
+  | "sales.read"
+  | "sales.export"
+  | "reconciliation.manage";
 
 export const CAPABILITIES_BY_ROLE: Readonly<
   Record<ApplicationRole, ReadonlySet<AdminCapability>>
 > = {
   customer: new Set(),
   admin: new Set([
-    'admin.access', 'catalog.manage', 'roles.manage', 'audit.read', 'jobs.retry',
-    'sales.read', 'sales.export', 'reconciliation.manage'
-  ])
+    "admin.access",
+    "catalog.manage",
+    "roles.manage",
+    "audit.read",
+    "jobs.retry",
+    "sales.read",
+    "sales.export",
+    "reconciliation.manage",
+  ]),
 };
 
 export function capabilitiesForRoles(
-  roles: readonly ApplicationRole[]
+  roles: readonly ApplicationRole[],
 ): ReadonlySet<AdminCapability>;
 
 export type CapabilityResolver = (
-  roles: readonly ApplicationRole[]
+  roles: readonly ApplicationRole[],
 ) => ReadonlySet<AdminCapability>;
 
 export interface FinancialAuthorizationDependencies {
@@ -215,14 +222,16 @@ export interface FinancialAuthorizationDependencies {
 }
 
 export const FINANCIAL_ADMIN_COMMAND_CAPABILITIES: Readonly<
-  Record<FinancialAdminCommandKind,
-    readonly ['sales.read', 'reconciliation.manage']>
+  Record<
+    FinancialAdminCommandKind,
+    readonly ["sales.read", "reconciliation.manage"]
+  >
 >;
 
 export function requireCapability(
   actor: Actor,
   capability: AdminCapability,
-  capabilityResolver?: CapabilityResolver
+  capabilityResolver?: CapabilityResolver,
 ): asserts actor is AdministratorActor;
 ```
 
@@ -233,11 +242,14 @@ export function requireCapability(
 Require:
 
 ```ts
-export function parseSalesOverviewFilters(url: URL, now: Date): SalesOverviewFilters;
+export function parseSalesOverviewFilters(
+  url: URL,
+  now: Date,
+): SalesOverviewFilters;
 export function encodeSalesCursor(cursor: SalesCursor): string;
 export function decodeSalesCursor(
   value: string,
-  expectedFilterFingerprint: string
+  expectedFilterFingerprint: string,
 ): SalesCursor;
 export function fingerprintSalesFilters(filters: SalesOverviewFilters): string;
 export const SALES_CURSOR_MAX_ENCODED_LENGTH = 2_674;
@@ -264,25 +276,50 @@ export type FinancialAdminCommandStatus =
   (typeof FINANCIAL_ADMIN_COMMAND_STATUSES)[number];
 
 export type FinancialAdminCommandResultCode =
-  | 'draft_saved'
-  | 'draft_discarded'
-  | 'allocation_finalized'
-  | 'correction_created'
-  | 'recovery_activated'
-  | 'recovery_deactivated'
-  | 'capability_revoked'
-  | 'not_eligible'
-  | 'stale_state'
-  | 'invalid_command'
-  | 'command_failed';
+  | "draft_saved"
+  | "draft_discarded"
+  | "allocation_finalized"
+  | "correction_created"
+  | "recovery_activated"
+  | "recovery_deactivated"
+  | "capability_revoked"
+  | "not_eligible"
+  | "stale_state"
+  | "invalid_command"
+  | "command_failed";
 
 export interface FinancialAdminCommandSafeResultByCode {
-  readonly draft_saved: { readonly refundId: string; readonly draftVersion: number; readonly changed: boolean };
-  readonly draft_discarded: { readonly refundId: string; readonly draftVersion: number; readonly changed: boolean };
-  readonly allocation_finalized: { readonly refundId: string; readonly finalizedDraftVersion: number; readonly accessChanged: boolean; readonly emailQueued: boolean };
-  readonly correction_created: { readonly refundId: string; readonly correctionSetId: string; readonly correctionVersion: number };
-  readonly recovery_activated: { readonly recoveryGrantId: string; readonly accessChanged: boolean; readonly emailQueued: boolean };
-  readonly recovery_deactivated: { readonly recoveryGrantId: string; readonly accessChanged: boolean; readonly emailQueued: boolean };
+  readonly draft_saved: {
+    readonly refundId: string;
+    readonly draftVersion: number;
+    readonly changed: boolean;
+  };
+  readonly draft_discarded: {
+    readonly refundId: string;
+    readonly draftVersion: number;
+    readonly changed: boolean;
+  };
+  readonly allocation_finalized: {
+    readonly refundId: string;
+    readonly finalizedDraftVersion: number;
+    readonly accessChanged: boolean;
+    readonly emailQueued: boolean;
+  };
+  readonly correction_created: {
+    readonly refundId: string;
+    readonly correctionSetId: string;
+    readonly correctionVersion: number;
+  };
+  readonly recovery_activated: {
+    readonly recoveryGrantId: string;
+    readonly accessChanged: boolean;
+    readonly emailQueued: boolean;
+  };
+  readonly recovery_deactivated: {
+    readonly recoveryGrantId: string;
+    readonly accessChanged: boolean;
+    readonly emailQueued: boolean;
+  };
   readonly capability_revoked: null;
   readonly not_eligible: null;
   readonly stale_state: null;
@@ -303,7 +340,7 @@ export interface FinancialAdminCommandReferenceDto {
 }
 
 interface FinancialAdminCommandStatusBaseDto<
-  Kind extends FinancialAdminCommandKind = FinancialAdminCommandKind
+  Kind extends FinancialAdminCommandKind = FinancialAdminCommandKind,
 > {
   readonly commandId: string;
   readonly kind: Kind;
@@ -312,49 +349,48 @@ interface FinancialAdminCommandStatusBaseDto<
 }
 
 export interface FinancialAdminSuccessCodeByKind {
-  readonly refund_draft_save: 'draft_saved';
-  readonly refund_draft_discard: 'draft_discarded';
-  readonly refund_allocation_finalize: 'allocation_finalized';
-  readonly refund_reporting_correction_create: 'correction_created';
-  readonly administrative_recovery_activate: 'recovery_activated';
-  readonly administrative_recovery_deactivate: 'recovery_deactivated';
+  readonly refund_draft_save: "draft_saved";
+  readonly refund_draft_discard: "draft_discarded";
+  readonly refund_allocation_finalize: "allocation_finalized";
+  readonly refund_reporting_correction_create: "correction_created";
+  readonly administrative_recovery_activate: "recovery_activated";
+  readonly administrative_recovery_deactivate: "recovery_deactivated";
 }
 
 type FinancialAdminSucceededStatusDto = {
-  [Kind in FinancialAdminCommandKind]:
-      FinancialAdminCommandStatusBaseDto<Kind> & {
-        readonly status: 'succeeded';
-        readonly resultCode: FinancialAdminSuccessCodeByKind[Kind];
-        readonly result: FinancialAdminCommandSafeResultByCode[
-          FinancialAdminSuccessCodeByKind[Kind]
-        ];
-        readonly completedAt: string;
-      }
+  [
+    Kind in FinancialAdminCommandKind
+  ]: FinancialAdminCommandStatusBaseDto<Kind> & {
+    readonly status: "succeeded";
+    readonly resultCode: FinancialAdminSuccessCodeByKind[Kind];
+    readonly result: FinancialAdminCommandSafeResultByCode[FinancialAdminSuccessCodeByKind[Kind]];
+    readonly completedAt: string;
+  };
 }[FinancialAdminCommandKind];
 
 export type FinancialAdminCommandStatusDto =
   | (FinancialAdminCommandStatusBaseDto & {
-      readonly status: 'pending';
+      readonly status: "pending";
       readonly resultCode: null;
       readonly result: null;
       readonly completedAt: null;
     })
   | FinancialAdminSucceededStatusDto
   | (FinancialAdminCommandStatusBaseDto & {
-      readonly status: 'denied';
-      readonly resultCode: 'capability_revoked';
+      readonly status: "denied";
+      readonly resultCode: "capability_revoked";
       readonly result: null;
       readonly completedAt: string;
     })
   | (FinancialAdminCommandStatusBaseDto & {
-      readonly status: 'conflict';
-      readonly resultCode: 'stale_state' | 'not_eligible';
+      readonly status: "conflict";
+      readonly resultCode: "stale_state" | "not_eligible";
       readonly result: null;
       readonly completedAt: string;
     })
   | (FinancialAdminCommandStatusBaseDto & {
-      readonly status: 'failed';
-      readonly resultCode: 'invalid_command' | 'command_failed';
+      readonly status: "failed";
+      readonly resultCode: "invalid_command" | "command_failed";
       readonly result: null;
       readonly completedAt: string;
     });
@@ -378,12 +414,12 @@ Expected: FAIL because the new capabilities, DTOs, command envelopes, filters, r
 
 ```ts
 export type FinancialRouteFailure =
-  | { readonly status: 400; readonly code: 'invalid_request' }
-  | { readonly status: 401; readonly code: 'unauthenticated' }
-  | { readonly status: 403; readonly code: 'forbidden' }
-  | { readonly status: 404; readonly code: 'not_found' }
-  | { readonly status: 409; readonly code: 'stale_state' }
-  | { readonly status: 503; readonly code: 'temporarily_unavailable' };
+  | { readonly status: 400; readonly code: "invalid_request" }
+  | { readonly status: 401; readonly code: "unauthenticated" }
+  | { readonly status: 403; readonly code: "forbidden" }
+  | { readonly status: 404; readonly code: "not_found" }
+  | { readonly status: 409; readonly code: "stale_state" }
+  | { readonly status: 503; readonly code: "temporarily_unavailable" };
 ```
 
 It may create a bounded correlation ID and safe audit metadata after authorization. It must not import Drizzle rows, Stripe types, provider services, cookies, sessions, credentials, or raw `Request` into reusable reporting/domain contracts.
@@ -410,6 +446,7 @@ git commit -m "feat: add Plan 6B-II reporting contracts"
 ### Task 3: Add the protected administrator-command schema, lease capability, and authority migration
 
 **Files:**
+
 - Create: `src/lib/server/db/schema/financial-admin.ts`
 - Create: `src/lib/server/db/schema/financial-admin.test.ts`
 - Modify: `src/lib/server/db/schema/index.ts`
@@ -468,70 +505,106 @@ The RED must prove missing/invalid/duplicate identities abort before migration; 
 Require these enums and table shape:
 
 ```ts
-export const financialAdminCommandKind = pgEnum('financial_admin_command_kind', [
-  'refund_draft_save',
-  'refund_draft_discard',
-  'refund_allocation_finalize',
-  'refund_reporting_correction_create',
-  'administrative_recovery_activate',
-  'administrative_recovery_deactivate'
-]);
+export const financialAdminCommandKind = pgEnum(
+  "financial_admin_command_kind",
+  [
+    "refund_draft_save",
+    "refund_draft_discard",
+    "refund_allocation_finalize",
+    "refund_reporting_correction_create",
+    "administrative_recovery_activate",
+    "administrative_recovery_deactivate",
+  ],
+);
 
-export const financialAdminCommandStatus = pgEnum('financial_admin_command_status', [
-  'pending', 'succeeded', 'denied', 'conflict', 'failed'
-]);
+export const financialAdminCommandStatus = pgEnum(
+  "financial_admin_command_status",
+  ["pending", "succeeded", "denied", "conflict", "failed"],
+);
 
-export const financialAdminCommands = pgTable('financial_admin_commands', {
-  id: uuid('id').defaultRandom().primaryKey(),
-  kind: financialAdminCommandKind('kind').notNull(),
-  actorUserId: uuid('actor_user_id').notNull().references(() => user.id, {
-    onDelete: 'restrict'
-  }),
-  correlationId: varchar('correlation_id', { length: 100 }).notNull(),
-  idempotencyKeySha256: varchar('idempotency_key_sha256', { length: 64 }).notNull(),
-  inputFingerprintSha256: varchar('input_fingerprint_sha256', { length: 64 }).notNull(),
-  privateInput: jsonb('private_input').$type<JsonObject>().notNull(),
-  jobId: uuid('job_id').notNull(),
-  status: financialAdminCommandStatus('status').default('pending').notNull(),
-  safeResultCode: varchar('safe_result_code', { length: 100 }),
-  safeResult: jsonb('safe_result').$type<JsonObject>(),
-  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
-  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
-  completedAt: timestamp('completed_at', { withTimezone: true })
-}, (table) => [
-  uniqueIndex('financial_admin_commands_actor_idempotency_unique').on(
-    table.actorUserId, table.idempotencyKeySha256
-  ),
-  uniqueIndex('financial_admin_commands_job_unique').on(table.jobId),
-  index('financial_admin_commands_status_created_idx').on(
-    table.status, table.createdAt, table.id
-  )
-]);
+export const financialAdminCommands = pgTable(
+  "financial_admin_commands",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    kind: financialAdminCommandKind("kind").notNull(),
+    actorUserId: uuid("actor_user_id")
+      .notNull()
+      .references(() => user.id, {
+        onDelete: "restrict",
+      }),
+    correlationId: varchar("correlation_id", { length: 100 }).notNull(),
+    idempotencyKeySha256: varchar("idempotency_key_sha256", {
+      length: 64,
+    }).notNull(),
+    inputFingerprintSha256: varchar("input_fingerprint_sha256", {
+      length: 64,
+    }).notNull(),
+    privateInput: jsonb("private_input").$type<JsonObject>().notNull(),
+    jobId: uuid("job_id").notNull(),
+    status: financialAdminCommandStatus("status").default("pending").notNull(),
+    safeResultCode: varchar("safe_result_code", { length: 100 }),
+    safeResult: jsonb("safe_result").$type<JsonObject>(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+  },
+  (table) => [
+    uniqueIndex("financial_admin_commands_actor_idempotency_unique").on(
+      table.actorUserId,
+      table.idempotencyKeySha256,
+    ),
+    uniqueIndex("financial_admin_commands_job_unique").on(table.jobId),
+    index("financial_admin_commands_status_created_idx").on(
+      table.status,
+      table.createdAt,
+      table.id,
+    ),
+  ],
+);
 
-export const financialAdminJobClaims = pgTable('financial_admin_job_claims', {
-  jobId: uuid('job_id').primaryKey().references(() => jobs.id, {
-    onUpdate: 'restrict',
-    onDelete: 'restrict'
-  }),
-  generation: integer('generation').notNull(),
-  attempt: integer('attempt').notNull(),
-  capabilitySha256: text('capability_sha256').notNull(),
-  leaseDurationMs: integer('lease_duration_ms').notNull(),
-  state: varchar('state', { length: 16 }).notNull(),
-  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
-  issuedAt: timestamp('issued_at', { withTimezone: true }).notNull(),
-  renewedAt: timestamp('renewed_at', { withTimezone: true }),
-  invalidatedAt: timestamp('invalidated_at', { withTimezone: true })
-}, (table) => [
-  check('financial_admin_job_claims_generation_positive',
-    sql`(${table.generation} between 1 and 2147483647) is true`),
-  check('financial_admin_job_claims_attempt_positive',
-    sql`(${table.attempt} between 1 and 2147483647) is true`),
-  check('financial_admin_job_claims_capability_sha256_valid',
-    sql`(${table.capabilitySha256} ~ '^[a-f0-9]{64}$') is true`),
-  check('financial_admin_job_claims_lease_duration_bounded',
-    sql`(${table.leaseDurationMs} between 1 and 86400000) is true`),
-  check('financial_admin_job_claims_lifecycle_consistent', sql`(
+export const financialAdminJobClaims = pgTable(
+  "financial_admin_job_claims",
+  {
+    jobId: uuid("job_id")
+      .primaryKey()
+      .references(() => jobs.id, {
+        onUpdate: "restrict",
+        onDelete: "restrict",
+      }),
+    generation: integer("generation").notNull(),
+    attempt: integer("attempt").notNull(),
+    capabilitySha256: text("capability_sha256").notNull(),
+    leaseDurationMs: integer("lease_duration_ms").notNull(),
+    state: varchar("state", { length: 16 }).notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    issuedAt: timestamp("issued_at", { withTimezone: true }).notNull(),
+    renewedAt: timestamp("renewed_at", { withTimezone: true }),
+    invalidatedAt: timestamp("invalidated_at", { withTimezone: true }),
+  },
+  (table) => [
+    check(
+      "financial_admin_job_claims_generation_positive",
+      sql`(${table.generation} between 1 and 2147483647) is true`,
+    ),
+    check(
+      "financial_admin_job_claims_attempt_positive",
+      sql`(${table.attempt} between 1 and 2147483647) is true`,
+    ),
+    check(
+      "financial_admin_job_claims_capability_sha256_valid",
+      sql`(${table.capabilitySha256} ~ '^[a-f0-9]{64}$') is true`,
+    ),
+    check(
+      "financial_admin_job_claims_lease_duration_bounded",
+      sql`(${table.leaseDurationMs} between 1 and 86400000) is true`,
+    ),
+    check(
+      "financial_admin_job_claims_lifecycle_consistent",
+      sql`(
     (${table.state} = 'active' and ${table.invalidatedAt} is null and
       (${table.renewedAt} is null or ${table.renewedAt} >= ${table.issuedAt}) and
       ${table.expiresAt} > coalesce(${table.renewedAt}, ${table.issuedAt}))
@@ -539,8 +612,10 @@ export const financialAdminJobClaims = pgTable('financial_admin_job_claims', {
     (${table.state} = 'invalidated' and ${table.invalidatedAt} is not null and
       (${table.renewedAt} is null or ${table.renewedAt} >= ${table.issuedAt}) and
       ${table.invalidatedAt} >= coalesce(${table.renewedAt}, ${table.issuedAt}))
-  ) is true`)
-]);
+  ) is true`,
+    ),
+  ],
+);
 ```
 
 Add `integer` and `text` imports and import `jobs` from the existing operations schema; keep this private table in `financial-admin.ts`. Static tests must require SHA-256 lowercase hex, bounded canonical correlation IDs, JSON object input/result with `pg_column_size(private_input) <= 8192` and `pg_column_size(safe_result) <= 4096`, immutable identity/input/job fields, terminal immutability, no delete path, and a deferred restrictive `job_id -> jobs.id` foreign key. The command lifecycle constraint is exact: pending means code/result/completion are null; succeeded means a kind-matched success code, exact safe-result object, and completion are present; denied/conflict/failed mean their fixed failure code and completion are present while result is null. All SQL JSON/key/type/lifecycle predicates are total and NULL-safe: required keys are explicitly present, extra keys are absent, JSON `null` is rejected, guarded casts use `pg_input_is_valid`, and the complete accepted predicate must be `IS TRUE` so SQL UNKNOWN cannot satisfy a `CHECK`. Every JSON version later stored or compared to a PostgreSQL `integer` is `1..2147483647`, not merely a JavaScript safe integer.
@@ -568,19 +643,19 @@ export interface JobRepository {
   renewLease(
     jobId: string,
     workerId: string,
-    financialAdminLeaseCapability?: string
+    financialAdminLeaseCapability?: string,
   ): Promise<boolean>;
   complete(
     jobId: string,
     workerId: string,
-    financialAdminLeaseCapability?: string
+    financialAdminLeaseCapability?: string,
   ): Promise<boolean>;
   fail(
     jobId: string,
     workerId: string,
     safeError: string,
     retryable: boolean,
-    financialAdminLeaseCapability?: string
+    financialAdminLeaseCapability?: string,
   ): Promise<boolean>;
 }
 ```
@@ -728,7 +803,7 @@ Extend `plan6b_guard_audit_insert()` with exact owner-routine provenance for the
 Implement the repository/runner side in the same RED/GREEN tranche. One `claimNext` invocation opens one transaction, selects and locks at most one candidate through `FOR UPDATE SKIP LOCKED LIMIT 1`, and processes only that row. The candidate ordering includes normally pending jobs, expired running retry/takeover jobs, and expired running final-attempt cleanup jobs, but there is no bulk exhausted-job update CTE. After the one locked candidate is revalidated and only if it is a financial-admin job requiring a generation rotation, generate exactly once:
 
 ```ts
-const financialAdminLeaseCapability = randomBytes(32).toString('base64url');
+const financialAdminLeaseCapability = randomBytes(32).toString("base64url");
 ```
 
 The transaction sets that one value with `set_config('pale_orbit.plan6bii_financial_admin_job_capability', value, true)` and the canonical decimal lease duration with `set_config('pale_orbit.plan6bii_financial_admin_job_lease_duration_ms', value, true)`, acquires the locked job's exclusive advisory transaction lock, and performs exactly one guarded claim/takeover rotation. Return the clear value only as `JobRecord.financialAdminLeaseCapability` for a nonterminal claimed command; discard the short-lived value after an exhausted cleanup. A no-row or nonfinancial outcome generates no financial-admin capability. Never reuse one value for a second job, loop over multiple exhausted rows inside the transaction, or calculate/compare expiry with injected `now()`; SQL and the guard use `clock_timestamp()`.
@@ -794,6 +869,7 @@ Expected: the diff is clean. Do not stage or commit it until Task 5 has advanced
 ### Task 4 (execute after Task 5): Build command submission, status polling, worker execution, and audit clients
 
 **Files:**
+
 - Create: `src/lib/server/commerce/financial/admin-commands/contracts.ts`
 - Create: `src/lib/server/commerce/financial/admin-commands/contracts.test.ts`
 - Create: `src/lib/server/commerce/financial/admin-commands/repository.ts`
@@ -815,7 +891,7 @@ Export one `z.discriminatedUnion('kind', ...)` parser whose six variants have ex
 ```ts
 export type FinancialAdminPrivateCommand =
   | {
-      readonly kind: 'refund_draft_save';
+      readonly kind: "refund_draft_save";
       readonly refundId: string;
       readonly expectedVersion: number | null;
       readonly items: readonly {
@@ -824,21 +900,21 @@ export type FinancialAdminPrivateCommand =
       }[];
     }
   | {
-      readonly kind: 'refund_draft_discard';
+      readonly kind: "refund_draft_discard";
       readonly refundId: string;
       readonly expectedActiveDraftVersion: number;
     }
   | {
-      readonly kind: 'refund_allocation_finalize';
+      readonly kind: "refund_allocation_finalize";
       readonly refundId: string;
       readonly expectedActiveDraftVersion: number;
       readonly previewFingerprint: string;
-      readonly confirmation: 'finalize_refund_allocation';
+      readonly confirmation: "finalize_refund_allocation";
     }
   | {
-      readonly kind: 'refund_reporting_correction_create';
+      readonly kind: "refund_reporting_correction_create";
       readonly refundId: string;
-      readonly reason: 'allocation_attribution_correction';
+      readonly reason: "allocation_attribution_correction";
       readonly expectedNextCorrectionVersion: number;
       readonly expectedBaseAllocationSetId: string;
       readonly expectedSourceFingerprint: string;
@@ -847,10 +923,10 @@ export type FinancialAdminPrivateCommand =
         readonly totalPresentmentMinor: number;
       }[];
       readonly previewFingerprint: string;
-      readonly confirmation: 'create_reporting_correction';
+      readonly confirmation: "create_reporting_correction";
     }
   | {
-      readonly kind: 'administrative_recovery_activate';
+      readonly kind: "administrative_recovery_activate";
       readonly refundId: string;
       readonly finalizationEffectId: string;
       readonly orderItemId: string;
@@ -858,14 +934,14 @@ export type FinancialAdminPrivateCommand =
       readonly expectedCorrectionVersion: number;
       readonly expectedSourceFingerprint: string;
       readonly previewFingerprint: string;
-      readonly confirmation: 'activate_persistent_recovery';
+      readonly confirmation: "activate_persistent_recovery";
     }
   | {
-      readonly kind: 'administrative_recovery_deactivate';
+      readonly kind: "administrative_recovery_deactivate";
       readonly recoveryGrantId: string;
       readonly recoveryReferenceId: string;
       readonly expectedStateChangedAt: string;
-      readonly confirmation: 'deactivate_persistent_recovery';
+      readonly confirmation: "deactivate_persistent_recovery";
     };
 ```
 
@@ -886,31 +962,31 @@ export interface SubmitFinancialAdminCommandInput {
 export async function submitFinancialAdminCommand(
   database: Database,
   input: SubmitFinancialAdminCommandInput,
-  dependencies?: FinancialAuthorizationDependencies
+  dependencies?: FinancialAuthorizationDependencies,
 ): Promise<FinancialAdminCommandReferenceDto>;
 
 export async function getFinancialAdminCommandStatus(
   database: Database,
   actor: Actor,
   commandId: string,
-  dependencies?: FinancialAuthorizationDependencies
+  dependencies?: FinancialAuthorizationDependencies,
 ): Promise<FinancialAdminCommandStatusDto | null>;
 
 export function auditFinancialIssueDetailRead(
   tx: DatabaseTransaction,
-  input: FinancialIssueReadAuditInput
+  input: FinancialIssueReadAuditInput,
 ): Promise<void>;
 export function auditFinancialRefundDetailRead(
   tx: DatabaseTransaction,
-  input: FinancialRefundReadAuditInput
+  input: FinancialRefundReadAuditInput,
 ): Promise<void>;
 export function auditFinancialPayoutDetailRead(
   tx: DatabaseTransaction,
-  input: FinancialPayoutReadAuditInput
+  input: FinancialPayoutReadAuditInput,
 ): Promise<void>;
 export function auditFinancialExportCompleted(
   tx: DatabaseTransaction,
-  input: FinancialExportAuditInput
+  input: FinancialExportAuditInput,
 ): Promise<void>;
 ```
 
@@ -922,7 +998,7 @@ Require:
 
 ```ts
 export const FINANCIAL_ADMIN_COMMAND_JOB =
-  'commerce.financial-admin-command' as const;
+  "commerce.financial-admin-command" as const;
 
 export interface FinancialAdminCommandExecutorContext {
   readonly transaction: DatabaseTransaction;
@@ -934,12 +1010,15 @@ export interface FinancialAdminCommandExecutorContext {
 
 export type FinancialAdminCommandExecutor = (
   context: FinancialAdminCommandExecutorContext,
-  command: FinancialAdminPrivateCommand
+  command: FinancialAdminPrivateCommand,
 ) => Promise<FinancialAdminCommandSafeResultDto>;
 
 export function createFinancialAdminCommandHandler(input: {
   readonly database: Database;
-  readonly executors: ReadonlyMap<FinancialAdminCommandKind, FinancialAdminCommandExecutor>;
+  readonly executors: ReadonlyMap<
+    FinancialAdminCommandKind,
+    FinancialAdminCommandExecutor
+  >;
   readonly capabilityResolver?: CapabilityResolver;
 }): JobHandler;
 
@@ -1049,6 +1128,7 @@ Expected: Task 5's authority/catalog commit is already HEAD, the transport commi
 ### Task 5 (execute immediately after Task 3): Extend exact restore, upgrade, and checkpoint contracts through 0012
 
 **Files:**
+
 - Modify: `scripts/verify-financial-restore.sql`
 - Modify: `scripts/execute-financial-restore-verifier.ts`
 - Modify: `scripts/commerce-operations.test.ts`
@@ -1192,6 +1272,7 @@ Expected: migration 0012, provisioner parity, upgrade fixtures, and exact restor
 ### Task 6: Build signed metrics and the Sales overview read model
 
 **Files:**
+
 - Create: `src/lib/server/commerce/reporting/metrics.ts`
 - Create: `src/lib/server/commerce/reporting/metrics.test.ts`
 - Create: `src/lib/server/commerce/reporting/review-authority.ts`
@@ -1208,11 +1289,11 @@ Require:
 
 ```ts
 export function toSalesTitleMetricDto(
-  input: SalesTitleMetricInput
+  input: SalesTitleMetricInput,
 ): SalesTitleMetricDto;
 
 export function summarizeCurrencyPairs(
-  rows: readonly SalesTitleMetricDto[]
+  rows: readonly SalesTitleMetricDto[],
 ): readonly SalesCurrencySummaryDto[];
 ```
 
@@ -1243,7 +1324,7 @@ export async function listSalesOverview(
   database: Database,
   actor: Actor,
   filters: SalesOverviewFilters,
-  dependencies?: SalesOverviewDependencies
+  dependencies?: SalesOverviewDependencies,
 ): Promise<SalesOverviewDto>;
 ```
 
@@ -1286,6 +1367,7 @@ Expected: all commands exit zero; summary and page formulas agree and privacy ke
 ### Task 7: Add the Sales route shell and accessible overview UI without enabling navigation
 
 **Files:**
+
 - Create: `src/routes/admin/sales/+layout.svelte`
 - Create: `src/routes/admin/sales/+layout.server.ts`
 - Create: `src/routes/admin/sales/sales.css`
@@ -1332,7 +1414,7 @@ Expected: FAIL because the route shell and components do not exist.
 The loader must be equivalent to:
 
 ```ts
-requireCapability(event.locals.actor, 'sales.read');
+requireCapability(event.locals.actor, "sales.read");
 const filters = parseSalesOverviewFilters(event.url, new Date());
 return listSalesOverview(getDatabaseClient().db, event.locals.actor, filters);
 ```
@@ -1358,6 +1440,7 @@ Expected: all commands exit zero and existing admin/catalog/audit navigation rem
 ### Task 8: Add operational Needs Review and audited safe issue detail
 
 **Files:**
+
 - Create: `src/lib/server/commerce/reporting/review.ts`
 - Create: `src/lib/server/commerce/reporting/review.test.ts`
 - Create: `tests/integration/financial-review.test.ts`
@@ -1379,7 +1462,7 @@ export async function listFinancialIssues(
   database: Database,
   actor: Actor,
   input: FinancialIssueListInput,
-  dependencies?: FinancialAuthorizationDependencies
+  dependencies?: FinancialAuthorizationDependencies,
 ): Promise<FinancialIssueListDto>;
 
 export async function getFinancialIssueDetail(
@@ -1387,7 +1470,7 @@ export async function getFinancialIssueDetail(
   actor: Actor,
   issueId: string,
   context: FinancialRequestContext,
-  dependencies?: FinancialAuthorizationDependencies
+  dependencies?: FinancialAuthorizationDependencies,
 ): Promise<FinancialIssueDetailDto | null>;
 ```
 
@@ -1435,6 +1518,7 @@ git commit -m "feat: add operational financial review"
 ### Task 9: Add local-only payout list and audited detail
 
 **Files:**
+
 - Create: `src/lib/server/commerce/reporting/payouts.ts`
 - Create: `src/lib/server/commerce/reporting/payouts.test.ts`
 - Create: `tests/integration/financial-payout-reporting.test.ts`
@@ -1455,7 +1539,7 @@ export async function listPayouts(
   database: Database,
   actor: Actor,
   input: PayoutListInput,
-  dependencies?: FinancialAuthorizationDependencies
+  dependencies?: FinancialAuthorizationDependencies,
 ): Promise<PayoutListDto>;
 
 export async function getPayoutDetail(
@@ -1463,7 +1547,7 @@ export async function getPayoutDetail(
   actor: Actor,
   payoutId: string,
   context: FinancialRequestContext,
-  dependencies?: FinancialAuthorizationDependencies
+  dependencies?: FinancialAuthorizationDependencies,
 ): Promise<PayoutDetailDto | null>;
 ```
 
@@ -1513,6 +1597,7 @@ git commit -m "feat: add financial payout reporting"
 ### Task 10: Export the full filtered aggregate as bounded audited CSV
 
 **Files:**
+
 - Create: `src/lib/server/commerce/reporting/csv.ts`
 - Create: `src/lib/server/commerce/reporting/csv.test.ts`
 - Modify: `src/lib/server/commerce/reporting/overview.ts`
@@ -1550,8 +1635,12 @@ export async function exportSalesCsv(
   actor: Actor,
   filters: SalesOverviewFilters,
   context: FinancialRequestContext,
-  dependencies?: FinancialAuthorizationDependencies
-): Promise<{ readonly bytes: Uint8Array; readonly filename: string; readonly rowCount: number }>;
+  dependencies?: FinancialAuthorizationDependencies,
+): Promise<{
+  readonly bytes: Uint8Array;
+  readonly filename: string;
+  readonly rowCount: number;
+}>;
 ```
 
 Both route and service require `sales.read` plus `sales.export` before parsing/querying. Inside the bounded web transaction, acquire the global administrator-role lock, reload roles, and reauthorize both capabilities before querying. Remove the Overview cursor and export the complete normalized filter cohort in the same deterministic order/formulas. The SQL itself requests at most `SALES_CSV_MAX_ROWS + 1`; the sentinel row rejects an oversized cohort before serialization. Set a transaction-local `statement_timeout` from the remaining deadline and recheck the monotonic deadline between phases. Build all bytes inside the authorized transaction, then call `auditFinancialExportCompleted` with only filter fingerprint, row/byte/currency-pair counts, and correlation/request metadata. A row, byte, deadline, query, serialization, or audit failure returns no partial bytes and no successful audit.
@@ -1604,6 +1693,7 @@ Expected: CSV and Overview match for rows/totals/order, negative numeric cells r
 ### Task 11: Add audited refund detail and worker-executed shared draft commands
 
 **Files:**
+
 - Create: `src/lib/server/commerce/financial/refund-review/inputs.ts`
 - Create: `src/lib/server/commerce/financial/refund-review/inputs.test.ts`
 - Create: `src/lib/server/commerce/financial/refund-review/query.ts`
@@ -1636,18 +1726,21 @@ export async function getRefundReviewDetail(
   actor: Actor,
   refundId: string,
   context: FinancialRequestContext,
-  dependencies?: FinancialAuthorizationDependencies
+  dependencies?: FinancialAuthorizationDependencies,
 ): Promise<RefundReviewDetailDto | null>;
 
 export async function executeRefundDraftSave(
   context: FinancialAdminCommandExecutorContext,
-  command: Extract<FinancialAdminPrivateCommand, { kind: 'refund_draft_save' }>
-): Promise<FinancialAdminCommandSafeResultByCode['draft_saved']>;
+  command: Extract<FinancialAdminPrivateCommand, { kind: "refund_draft_save" }>,
+): Promise<FinancialAdminCommandSafeResultByCode["draft_saved"]>;
 
 export async function executeRefundDraftDiscard(
   context: FinancialAdminCommandExecutorContext,
-  command: Extract<FinancialAdminPrivateCommand, { kind: 'refund_draft_discard' }>
-): Promise<FinancialAdminCommandSafeResultByCode['draft_discarded']>;
+  command: Extract<
+    FinancialAdminPrivateCommand,
+    { kind: "refund_draft_discard" }
+  >,
+): Promise<FinancialAdminCommandSafeResultByCode["draft_discarded"]>;
 ```
 
 Detail begins a web transaction, acquires the global administrator-role lock, reloads current roles, and reauthorizes `sales.read` before any domain query. It returns refund total/currency, sold-as item facts, paid subtotal/tax/total, finalized allocations/components, remaining capacities, shared draft/version, safe last-editor display label/timestamps, financial completeness, and preview inputs. It exposes no customer/user/email/provider ID, raw administrator ID, or request correlation ID. Complete DTO generation precedes `auditFinancialRefundDetailRead` and commit in that same transaction.
@@ -1710,6 +1803,7 @@ Expected: all commands pass; web submission and worker mutation authority remain
 ### Task 12: Finalize ambiguous refunds with canonical projection and access effects
 
 **Files:**
+
 - Create: `src/lib/server/commerce/refund-access.ts`
 - Create: `src/lib/server/commerce/refund-access.test.ts`
 - Create: `src/lib/server/commerce/refund-allocation-components.ts`
@@ -1747,15 +1841,21 @@ Require:
 export async function previewRefundFinalization(
   database: Database,
   actor: Actor,
-  input: { readonly refundId: string; readonly expectedActiveDraftVersion: number },
+  input: {
+    readonly refundId: string;
+    readonly expectedActiveDraftVersion: number;
+  },
   context: FinancialRequestContext,
-  dependencies?: FinancialAuthorizationDependencies
+  dependencies?: FinancialAuthorizationDependencies,
 ): Promise<RefundFinalizationPreviewDto>;
 
 export async function executeRefundAllocationFinalize(
   context: FinancialAdminCommandExecutorContext,
-  command: Extract<FinancialAdminPrivateCommand, { kind: 'refund_allocation_finalize' }>
-): Promise<FinancialAdminCommandSafeResultByCode['allocation_finalized']>;
+  command: Extract<
+    FinancialAdminPrivateCommand,
+    { kind: "refund_allocation_finalize" }
+  >,
+): Promise<FinancialAdminCommandSafeResultByCode["allocation_finalized"]>;
 ```
 
 Add one required, transaction-bound access-message capability to the executor context. `createFinancialAdminCommandHandler` receives an `accessMessages` dependency beside `database` and `executors`, exposes only `enqueueAccessChange(input)` to executors, and binds the current command transaction internally. Do not inject the full commerce message enqueuer, make the dependency optional, add a seventh executor-builder function, create an enqueuer in the domain module, or open a second transaction. Task 12 uses the existing refund access-change message; Task 14 extends the same narrow input union for recovery and supplies the existing production enqueuer when it registers all six executors.
@@ -1778,7 +1878,7 @@ recomputeLockedRefundFinancialProjectionForAdminCommand(
   transaction,
   lockedInput,
   lockedAndRevalidatedOrdinarySelectedSetIds,
-  commandId
+  commandId,
 );
 ```
 
@@ -1839,7 +1939,7 @@ recomputeLockedRefundFinancialProjectionForAdminCommand(
   transaction,
   lockedInputWithNewAllocations,
   lockedAndRevalidatedOrdinarySelectedSetIds,
-  commandId
+  commandId,
 );
 ```
 
@@ -1888,6 +1988,7 @@ git commit -m "feat: finalize ambiguous refund allocations"
 ### Task 13: Add append-only reporting corrections and classifier-rebase safety
 
 **Files:**
+
 - Create: `drizzle/0013_plan6bii_reporting_correction_authority.sql`
 - Create: `drizzle/meta/0013_snapshot.json`
 - Modify: `drizzle/meta/_journal.json`
@@ -1965,7 +2066,7 @@ In `issues.ts`, keep `resolveFinancialIssueAfterAdminCommand` unchanged and add:
 ```ts
 export async function resolveFinancialIssueAfterReportingCorrectionCommand(
   tx: DatabaseTransaction,
-  input: ResolveFinancialIssueAfterAdminCommandInput
+  input: ResolveFinancialIssueAfterAdminCommandInput,
 ): Promise<FinancialIssueRow | null>;
 ```
 
@@ -2012,35 +2113,41 @@ export interface RefundReportingCorrectionSeedItemDto {
 
 export interface RefundReportingCorrectionSeedDto {
   readonly refundId: string;
-  readonly reason: 'allocation_attribution_correction';
+  readonly reason: "allocation_attribution_correction";
   readonly expectedNextCorrectionVersion: number | null;
   readonly expectedBaseAllocationSetId: string | null;
   readonly expectedSourceFingerprint: string | null;
   readonly rawPredecessorCorrectionSetId: string | null;
   readonly compatibleCorrectionSetId: string | null;
-  readonly baselineKind: 'immutable_base' | 'compatible_correction' | null;
+  readonly baselineKind: "immutable_base" | "compatible_correction" | null;
   readonly currentReportingComplete: boolean;
   readonly currency: string | null;
   readonly settlementCurrency: string | null;
   readonly baselineTotalMinor: number | null;
   readonly eligible: boolean;
   readonly ineligibleReason:
-    | 'provider_evidence_pending'
-    | 'immutable_conflict'
-    | 'not_finalized'
-    | null;
+    "provider_evidence_pending" | "immutable_conflict" | "not_finalized" | null;
   readonly items: readonly RefundReportingCorrectionSeedItemDto[];
 }
 
 export const REFUND_CORRECTION_ITEM_PREVIEW_DTO_KEYS = [
-  'orderItemId', 'titleId', 'soldAsTitle',
-  'baselineTotalMinor', 'baselineSubtotalMinor', 'baselineTaxMinor',
-  'proposedTotalMinor', 'proposedSubtotalMinor', 'proposedTaxMinor',
-  'subtotalDisplayDeltaMinor', 'taxDisplayDeltaMinor',
-  'baselineSettlementGrossMinor', 'proposedSettlementGrossMinor',
-  'settlementGrossDisplayDeltaMinor',
-  'baselineRefundFeeImpactMinor', 'proposedRefundFeeImpactMinor',
-  'refundFeeImpactDisplayDeltaMinor'
+  "orderItemId",
+  "titleId",
+  "soldAsTitle",
+  "baselineTotalMinor",
+  "baselineSubtotalMinor",
+  "baselineTaxMinor",
+  "proposedTotalMinor",
+  "proposedSubtotalMinor",
+  "proposedTaxMinor",
+  "subtotalDisplayDeltaMinor",
+  "taxDisplayDeltaMinor",
+  "baselineSettlementGrossMinor",
+  "proposedSettlementGrossMinor",
+  "settlementGrossDisplayDeltaMinor",
+  "baselineRefundFeeImpactMinor",
+  "proposedRefundFeeImpactMinor",
+  "refundFeeImpactDisplayDeltaMinor",
 ] as const;
 
 export interface RefundCorrectionItemPreviewDto {
@@ -2064,13 +2171,24 @@ export interface RefundCorrectionItemPreviewDto {
 }
 
 export const REFUND_REPORTING_CORRECTION_PREVIEW_DTO_KEYS = [
-  'refundId', 'expectedBaseAllocationSetId',
-  'rawPredecessorCorrectionSetId', 'compatibleCorrectionSetId',
-  'expectedNextCorrectionVersion', 'expectedSourceFingerprint',
-  'previewFingerprint', 'baselineKind', 'currentReportingComplete',
-  'proposedReportingComplete', 'compatibilityRepair', 'currency',
-  'settlementCurrency', 'baselineTotalMinor', 'proposedTotalMinor',
-  'eligible', 'ineligibleReason', 'items'
+  "refundId",
+  "expectedBaseAllocationSetId",
+  "rawPredecessorCorrectionSetId",
+  "compatibleCorrectionSetId",
+  "expectedNextCorrectionVersion",
+  "expectedSourceFingerprint",
+  "previewFingerprint",
+  "baselineKind",
+  "currentReportingComplete",
+  "proposedReportingComplete",
+  "compatibilityRepair",
+  "currency",
+  "settlementCurrency",
+  "baselineTotalMinor",
+  "proposedTotalMinor",
+  "eligible",
+  "ineligibleReason",
+  "items",
 ] as const;
 
 export interface RefundReportingCorrectionPreviewDto {
@@ -2081,7 +2199,7 @@ export interface RefundReportingCorrectionPreviewDto {
   readonly expectedNextCorrectionVersion: number;
   readonly expectedSourceFingerprint: string;
   readonly previewFingerprint: string | null;
-  readonly baselineKind: 'immutable_base' | 'compatible_correction';
+  readonly baselineKind: "immutable_base" | "compatible_correction";
   readonly currentReportingComplete: boolean;
   readonly proposedReportingComplete: boolean;
   readonly compatibilityRepair: boolean;
@@ -2091,10 +2209,10 @@ export interface RefundReportingCorrectionPreviewDto {
   readonly proposedTotalMinor: number;
   readonly eligible: boolean;
   readonly ineligibleReason:
-    | 'provider_evidence_pending'
-    | 'immutable_conflict'
-    | 'not_finalized'
-    | 'no_change'
+    | "provider_evidence_pending"
+    | "immutable_conflict"
+    | "not_finalized"
+    | "no_change"
     | null;
   readonly items: readonly RefundCorrectionItemPreviewDto[];
 }
@@ -2104,14 +2222,17 @@ export async function getReportingCorrectionSeed(
   actor: Actor,
   refundId: string,
   context: FinancialRequestContext,
-  dependencies?: FinancialAuthorizationDependencies
+  dependencies?: FinancialAuthorizationDependencies,
 ): Promise<RefundReportingCorrectionSeedDto | null>;
 
 export type ReportingCorrectionPrepareInput = Omit<
-  Extract<FinancialAdminPrivateCommand, {
-    kind: 'refund_reporting_correction_create'
-  }>,
-  'kind' | 'previewFingerprint' | 'confirmation'
+  Extract<
+    FinancialAdminPrivateCommand,
+    {
+      kind: "refund_reporting_correction_create";
+    }
+  >,
+  "kind" | "previewFingerprint" | "confirmation"
 >;
 
 export async function previewReportingCorrection(
@@ -2119,15 +2240,18 @@ export async function previewReportingCorrection(
   actor: Actor,
   input: ReportingCorrectionPrepareInput,
   context: FinancialRequestContext,
-  dependencies?: FinancialAuthorizationDependencies
+  dependencies?: FinancialAuthorizationDependencies,
 ): Promise<RefundReportingCorrectionPreviewDto>;
 
 export async function executeReportingCorrectionCreate(
   context: FinancialAdminCommandExecutorContext,
-  command: Extract<FinancialAdminPrivateCommand, {
-    kind: 'refund_reporting_correction_create'
-  }>
-): Promise<FinancialAdminCommandSafeResultByCode['correction_created']>;
+  command: Extract<
+    FinancialAdminPrivateCommand,
+    {
+      kind: "refund_reporting_correction_create";
+    }
+  >,
+): Promise<FinancialAdminCommandSafeResultByCode["correction_created"]>;
 ```
 
 The planner contract is exact and database-free:
@@ -2189,10 +2313,10 @@ export interface RefundReportingCorrectionPlanInput {
 }
 
 export interface RefundReportingCorrectionPersistableItem {
-  readonly domain: 'presentment' | 'settlement';
+  readonly domain: "presentment" | "settlement";
   readonly sourceAllocationSetId: string | null;
   readonly orderItemId: string;
-  readonly component: 'refund_subtotal' | 'refund_tax' | 'refund_fee';
+  readonly component: "refund_subtotal" | "refund_tax" | "refund_fee";
   readonly currency: string;
   readonly approvedAbsoluteMinor: number;
   readonly deltaMinor: number;
@@ -2200,9 +2324,9 @@ export interface RefundReportingCorrectionPersistableItem {
 }
 
 export interface RefundReportingCorrectionFingerprintDocument {
-  readonly version: 'refund-reporting-correction-preview-v1';
+  readonly version: "refund-reporting-correction-preview-v1";
   readonly refundId: string;
-  readonly reason: 'allocation_attribution_correction';
+  readonly reason: "allocation_attribution_correction";
   readonly activeProjection: {
     readonly classifierVersion: number;
     readonly allocationAlgorithmVersion: number;
@@ -2213,7 +2337,7 @@ export interface RefundReportingCorrectionFingerprintDocument {
   readonly compatibleCorrectionSetId: string | null;
   readonly expectedNextCorrectionVersion: number;
   readonly expectedSourceFingerprint: string;
-  readonly baselineKind: 'immutable_base' | 'compatible_correction';
+  readonly baselineKind: "immutable_base" | "compatible_correction";
   readonly currentReportingComplete: boolean;
   readonly proposedReportingComplete: boolean;
   readonly compatibilityRepair: boolean;
@@ -2227,20 +2351,20 @@ export interface RefundReportingCorrectionFingerprintDocument {
 
 export type RefundReportingCorrectionPlanResult =
   | {
-      readonly kind: 'ineligible';
+      readonly kind: "ineligible";
       readonly preview: RefundReportingCorrectionPreviewDto;
       readonly fingerprintDocument: null;
       readonly persistableItems: readonly [];
     }
   | {
-      readonly kind: 'ready';
+      readonly kind: "ready";
       readonly preview: RefundReportingCorrectionPreviewDto;
       readonly fingerprintDocument: RefundReportingCorrectionFingerprintDocument;
       readonly persistableItems: readonly RefundReportingCorrectionPersistableItem[];
     };
 
 export function planRefundReportingCorrection(
-  input: RefundReportingCorrectionPlanInput
+  input: RefundReportingCorrectionPlanInput,
 ): RefundReportingCorrectionPlanResult;
 ```
 
@@ -2310,7 +2434,7 @@ export async function recomputeLockedRefundFinancialProjectionForReportingCorrec
   transaction: DatabaseTransaction,
   input: LockedRefundProjectionInput,
   lockedAndRevalidatedOrdinarySelectedSetIds: readonly string[],
-  commandId: string
+  commandId: string,
 ): Promise<RefundFinancialRecomputeResult>;
 ```
 
@@ -2382,6 +2506,7 @@ Expected: Task 13 ends with two reviewable commits, no uncommitted authority/beh
 ### Task 14: Add causally proven persistent administrative recovery
 
 **Files:**
+
 - Modify: `docs/superpowers/specs/2026-08-20-plan-6b-ii-implementation-refresh-design.md`
 - Modify: `docs/superpowers/plans/2026-08-20-backend-plan-6b-ii-admin-resolution-reporting-refresh.md`
 - Modify: `src/lib/types/financial-reporting.ts`
@@ -2443,10 +2568,8 @@ export interface AdministrativeRecoveryDeactivationCandidateDto {
 
 export interface AdministrativeRecoverySeedDto {
   readonly refundId: string;
-  readonly activationCandidates:
-    readonly AdministrativeRecoveryActivationCandidateDto[];
-  readonly deactivationCandidates:
-    readonly AdministrativeRecoveryDeactivationCandidateDto[];
+  readonly activationCandidates: readonly AdministrativeRecoveryActivationCandidateDto[];
+  readonly deactivationCandidates: readonly AdministrativeRecoveryDeactivationCandidateDto[];
 }
 ```
 
@@ -2465,7 +2588,7 @@ export interface AdministrativeRecoveryDeactivationPreviewDto {
   readonly titleId: string;
   readonly soldAsTitle: string;
   readonly eligible: boolean;
-  readonly ineligibleReason: 'already_in_requested_state' | null;
+  readonly ineligibleReason: "already_in_requested_state" | null;
   readonly effectiveAccessBefore: boolean;
   readonly effectiveAccessAfter: boolean;
   readonly accessChanged: boolean;
@@ -2530,19 +2653,25 @@ Require:
 
 ```ts
 export type AdministrativeRecoveryPrepareInput = Omit<
-  Extract<FinancialAdminPrivateCommand, {
-    kind: 'administrative_recovery_activate'
-  }>,
-  'kind' | 'previewFingerprint' | 'confirmation'
+  Extract<
+    FinancialAdminPrivateCommand,
+    {
+      kind: "administrative_recovery_activate";
+    }
+  >,
+  "kind" | "previewFingerprint" | "confirmation"
 >;
 
 export type AdministrativeRecoveryDeactivationPrepareInput = {
   readonly refundId: string;
 } & Omit<
-  Extract<FinancialAdminPrivateCommand, {
-    kind: 'administrative_recovery_deactivate'
-  }>,
-  'kind' | 'confirmation'
+  Extract<
+    FinancialAdminPrivateCommand,
+    {
+      kind: "administrative_recovery_deactivate";
+    }
+  >,
+  "kind" | "confirmation"
 >;
 
 export async function getAdministrativeRecoverySeed(
@@ -2550,7 +2679,7 @@ export async function getAdministrativeRecoverySeed(
   actor: Actor,
   refundId: string,
   context: FinancialRequestContext,
-  dependencies?: FinancialAuthorizationDependencies
+  dependencies?: FinancialAuthorizationDependencies,
 ): Promise<AdministrativeRecoverySeedDto | null>;
 
 export async function previewAdministrativeRecovery(
@@ -2558,7 +2687,7 @@ export async function previewAdministrativeRecovery(
   actor: Actor,
   input: AdministrativeRecoveryPrepareInput,
   context: FinancialRequestContext,
-  dependencies?: FinancialAuthorizationDependencies
+  dependencies?: FinancialAuthorizationDependencies,
 ): Promise<AdministrativeRecoveryPreviewDto>;
 
 export async function previewAdministrativeRecoveryDeactivation(
@@ -2566,22 +2695,28 @@ export async function previewAdministrativeRecoveryDeactivation(
   actor: Actor,
   input: AdministrativeRecoveryDeactivationPrepareInput,
   context: FinancialRequestContext,
-  dependencies?: FinancialAuthorizationDependencies
+  dependencies?: FinancialAuthorizationDependencies,
 ): Promise<AdministrativeRecoveryDeactivationPreviewDto>;
 
 export async function executeAdministrativeRecoveryActivate(
   context: FinancialAdminCommandExecutorContext,
-  command: Extract<FinancialAdminPrivateCommand, {
-    kind: 'administrative_recovery_activate'
-  }>
-): Promise<FinancialAdminCommandSafeResultByCode['recovery_activated']>;
+  command: Extract<
+    FinancialAdminPrivateCommand,
+    {
+      kind: "administrative_recovery_activate";
+    }
+  >,
+): Promise<FinancialAdminCommandSafeResultByCode["recovery_activated"]>;
 
 export async function executeAdministrativeRecoveryDeactivate(
   context: FinancialAdminCommandExecutorContext,
-  command: Extract<FinancialAdminPrivateCommand, {
-    kind: 'administrative_recovery_deactivate'
-  }>
-): Promise<FinancialAdminCommandSafeResultByCode['recovery_deactivated']>;
+  command: Extract<
+    FinancialAdminPrivateCommand,
+    {
+      kind: "administrative_recovery_deactivate";
+    }
+  >,
+): Promise<FinancialAdminCommandSafeResultByCode["recovery_deactivated"]>;
 ```
 
 The prepare input never contains `previewFingerprint` or confirmation. The server returns the fingerprint only after deriving and locking the safe eligibility preview; confirm adds that exact fingerprint and the fixed `activate_persistent_recovery` literal to form the private command.
@@ -2704,6 +2839,7 @@ Expected after implementation: both tests pass, all six and only six kinds are r
 ### Task 15: Harden authorization, audit atomicity, privacy, and lock ordering across every surface
 
 **Files:**
+
 - Modify: `docs/superpowers/plans/2026-08-20-backend-plan-6b-ii-admin-resolution-reporting-refresh.md`
 - Create: `tests/integration/financial-authorization-audit.test.ts`
 - Create: `tests/integration/financial-admin-command-races.test.ts`
@@ -2733,11 +2869,11 @@ Expected after implementation: both tests pass, all six and only six kinds are r
 
 For every loader, endpoint, and action added in Tasks 7–14, test anonymous, customer, administrator missing the required capability, and fully authorized administrator. Assert authorization occurs before parsing path IDs, query strings, form bodies, command payloads, or CSV filters. The expected policy is:
 
-| Surface | Required capability |
-|---|---|
-| Sales overview, issue/refund/payout list and detail, command status | `sales.read` |
-| CSV export | `sales.read` + `sales.export` |
-| Draft, finalization, correction, recovery submit/preview | `sales.read` + `reconciliation.manage` |
+| Surface                                                             | Required capability                    |
+| ------------------------------------------------------------------- | -------------------------------------- |
+| Sales overview, issue/refund/payout list and detail, command status | `sales.read`                           |
+| CSV export                                                          | `sales.read` + `sales.export`          |
+| Draft, finalization, correction, recovery submit/preview            | `sales.read` + `reconciliation.manage` |
 
 Use the injectable capability resolver from Task 2 to exercise a real administrator missing one capability. Do not weaken this to an `admin`-role-only assertion.
 
@@ -2881,6 +3017,7 @@ Expected: all focused tests pass and the commit contains tests plus only the nar
 ### Task 16: Prove the administrator journeys in a provider-neutral browser harness
 
 **Files:**
+
 - Create: `tests/e2e/financial-harness.ts`
 - Create: `tests/e2e/sales-reporting.spec.ts`
 - Create: `tests/e2e/refund-review.spec.ts`
@@ -2892,8 +3029,21 @@ Expected: all focused tests pass and the commit contains tests plus only the nar
 - Modify: `tests/e2e/commerce-privacy.ts`
 - Modify: `src/worker.ts`
 - Modify: `playwright.config.ts`
+- Modify: `svelte.config.js`
+- Modify: `vite.config.ts`
 - Modify: `scripts/playwright-commerce-config.test.ts`
+- Modify: `scripts/commerce-privacy.test.ts`
 - Modify: `scripts/storage-process-isolation.test.ts`
+- Modify: `src/lib/components/admin/SalesFilters.svelte`
+- Modify: `src/lib/components/admin/SalesOverview.test.ts`
+- Modify: `src/lib/components/Header.svelte`
+- Modify: `src/routes/admin/sales/refunds/[refundId]/+page.server.ts`
+- Modify: `src/routes/admin/sales/refunds/refund-routes.test.ts`
+- Modify: `src/routes/+layout.server.ts`
+- Create: `src/routes/layout-server.test.ts`
+- Modify: `src/hooks.server.ts`
+- Create: `src/lib/server/http/canonical-redirect.ts`
+- Create: `src/lib/server/http/canonical-redirect.test.ts`
 
 - [ ] **Step 1: Write failing harness-fidelity tests**
 
@@ -3003,13 +3153,543 @@ git commit -m "test: add deterministic financial worker control"
 
 Implement the harness/config support against the committed control protocol. Run its service-free contract first:
 
+Reviewed browser-RED amendment (2026-08-23): the Sales reporting journey proved that
+submit-time disabling of empty optional GET controls persists across SvelteKit enhanced
+navigation, leaving visible filters unusable during the final 320 CSS pixel / 200% reflow
+check. Modify only `src/lib/components/admin/SalesFilters.svelte` and
+`src/lib/components/admin/SalesOverview.test.ts`. Replace control disabling with deletion
+of empty optional entries from the native `formdata` event; do not disable or otherwise
+mutate rendered controls. The reviewed focused evidence is:
+
 ```powershell
+npx vitest run src/lib/components/admin/SalesOverview.test.ts
+# RED before the production change: 25 passed, 1 intended failure.
+npx vitest run src/lib/components/admin/SalesOverview.test.ts
+# GREEN: 26 passed.
+npm run check
+npx eslint src/lib/components/admin/SalesFilters.svelte src/lib/components/admin/SalesOverview.test.ts
+git diff --check -- src/lib/components/admin/SalesFilters.svelte src/lib/components/admin/SalesOverview.test.ts
+```
+
+Reviewed browser-RED amendment (2026-08-23): the real native refund-command POST
+proved that request parsing and command insertion succeed, but the subsequent page load
+independently rejects SvelteKit's own empty `?/saveDraft` named-action marker. This is
+one of two distinct post-action loader rejections exposed by the journey. Modify only
+`src/routes/admin/sales/refunds/[refundId]/+page.server.ts` and
+`src/routes/admin/sales/refunds/refund-routes.test.ts`. Define the exact ten existing
+refund actions once; let the loader remove zero or one recognized, single-valued empty
+action marker before applying the unchanged strict `reviewCursor` parser; and keep each
+action handler constrained to its individually expected marker. Unknown query keys,
+unknown slash markers, duplicate or non-empty marker values, and multiple action markers
+must remain safe 400 failures. The reviewed intermediate evidence is:
+
+```powershell
+npx vitest run src/routes/admin/sales/refunds/refund-routes.test.ts
+# Initial RED before marker normalization: 133 passed, 10 intended failures.
+npx vitest run src/routes/admin/sales/refunds/refund-routes.test.ts
+# Intermediate RED after marker normalization: 133 passed, 10 intended failures,
+# now at the independent POST-metadata read boundary described below.
+```
+
+Reviewed browser-RED amendment (2026-08-23): after accepting the exact named-action
+marker, the same post-action load still passes SvelteKit's original POST `Request` to
+audited refund-read routines. Those routines correctly reject non-GET read metadata, so
+the successfully inserted command reference is replaced with a safe `400 invalid_request`
+page. In the same two files, create a refund-loader read context that preserves the
+correlation ID and bounded route metadata while setting only the read context's semantic
+method to `GET`. Every action continues to construct and retain its original POST context.
+Add focused tests proving both halves of that boundary. The reviewed focused evidence is:
+
+```powershell
+npx vitest run src/routes/admin/sales/refunds/refund-routes.test.ts
+# Intermediate RED before the semantic read-context change: 133 passed,
+# 10 intended failures.
+npx vitest run src/routes/admin/sales/refunds/refund-routes.test.ts
+# GREEN: 143 passed.
+npm run check
+npx eslint "src/routes/admin/sales/refunds/[refundId]/+page.server.ts" src/routes/admin/sales/refunds/refund-routes.test.ts
+git diff --check -- ':(literal)src/routes/admin/sales/refunds/[refundId]/+page.server.ts' src/routes/admin/sales/refunds/refund-routes.test.ts
+```
+
+Reviewed post-GREEN browser-evidence amendment (2026-08-23): independent review proved
+that the earlier nominal GREEN did not establish the stronger capture, privacy, and
+ordering contract below. Retain that run only as evidence for its earlier assertions and
+rerun both literal browser gates after these corrections.
+
+For every submitted administrator command, retain the first exact same-origin,
+query-free, successful browser status response, parse its body with the production DTO
+parser, and require its command ID and actual `pending` status before any callback,
+demotion, or worker release. A request count, HTTP 200, DOM label, or pre-seeded status is
+not evidence of the initial pending DTO. Command and status interception must use exact
+same-origin predicates and `route.fallback()`/`route.fallback({ headers })`, never
+`route.continue()`, so the earlier-installed fail-closed network capture remains in the
+route chain. Every captured browser context blocks service workers. Administrator role
+controls also fail closed: the target row must expose exactly one mutually exclusive
+grant/revoke control, and every promotion, demotion, and restoration must complete through
+that UI state transition.
+
+Install and await the network guard before navigation. The one exact approved Google Fonts
+CSS request shape is recorded only as a fixed safe classification and is still aborted
+before network; every other non-application HTTP(S) request is aborted and records only
+the fixed `unexpected-external-request-blocked` failure category, never a raw URL, path,
+query, or body. Capture teardown removes the route/listeners and awaits every pending
+capture task before its context may close.
+
+Treat the claim bridge and verification redirect as one exact one-use chain. Accept only
+the query-free same-origin document `GET /claim/authorize` 200 bridge and its document
+`POST /claim/authorize` 303 whose four single-valued magic-link parameters have the exact
+callback semantics. Hold that token only in private harness memory; the next same-page
+verification must be the matching same-origin document
+`GET /api/auth/magic-link/verify`, with the same token byte-for-byte, status 302, and an
+exact same-origin, query-free, fragment-free `/claim/complete` destination. Missing,
+duplicate, mismatched, or unconsumed verification fails capture. Evidence retains only
+fixed paths, statuses, and transport classifications, never a token-bearing URL, raw
+`Location`, cookie, or header.
+
+For each captured initial financial HTML document, read the body once and require exactly
+one `<main>` plus exactly one nonempty hydration `node_ids`/`data` pair with equal nonzero
+cardinality and a non-null final leaf; retain only `<main>` and that leaf. Enhanced Svelte
+data capture likewise requires the exact nonempty `type: 'data'` envelope and a non-null
+final node. Missing, ambiguous, malformed, or unreadable evidence fails closed. Correlate
+each accepted browser download with exactly one same-origin successful
+`/admin/sales/export.csv?range=all&sort=title_asc` attachment and its exact Sales filename
+grammar. Bound both stream opening and reading, cancel/destroy on timeout or overflow,
+retain no more than 10 MiB, decode UTF-8 fatally, and capture the body under the distinct
+download surface. An unexpected, unreadable, unmatched, oversized, or non-UTF-8 download
+fails the journey.
+
+Use surface-specific browser-private canaries so DOM/main, initial hydration, later
+Svelte/action/status data, download content, and console output each prove their own
+observability before the complete captured surface is scanned for every actual value that
+is private on that surface. Do not let one aggregate canary make an empty surface pass, and
+do not classify intentionally public order references as private. The exact committed
+demotion denial audit remains the transaction barrier and must be the only non-submission
+terminal command audit for that command: exact actor, correlation, command kind,
+`financial.admin_command.denied`, `denied`, and `capability_revoked`, with no sibling
+terminal command audit. Only then may the harness restore through the UI, release the held
+second status request, and read the safe terminal DTO; primary and recovery paths share the
+same bounded finish callback and exact teardown.
+
+Keep populated Sales, pagination, payout, export, and reflow evidence on stable
+`range=all`; the custom-date witness uses fixed UTC bounds rather than a rolling default.
+
+Reviewed browser-RED amendment (2026-08-23): Chromium proved that CSS root zoom is not a
+valid layout-viewport surrogate for browser zoom: a 640-CSS-pixel viewport with root zoom
+`2` still reports `document.documentElement.clientWidth === 640` and
+`scrollWidth === 764`. Replace that recipe with an actual 320-CSS-pixel Playwright
+viewport, apply no CSS `zoom`, and require
+`document.documentElement.clientWidth === 320` plus root `scrollWidth <= clientWidth + 1`
+before keyboard and reflow assertions.
+
+The focused `tests/e2e/admin.spec.ts` RED at that exact geometry reports
+`clientWidth === 320`, `scrollWidth === 382`, and exactly one overflow offender:
+`button.signout`. Modify only `src/lib/components/Header.svelte`, and only its responsive
+CSS, to remove that root overflow. Preserve visible authenticated sign-out access, the
+theme/cart/account accessible names, and ordinary-width behavior. Capture the focused RED,
+prove its GREEN, and then rerun the complete Sales/admin browser gate:
+
+```powershell
+npm run test:e2e -- tests/e2e/admin.spec.ts
+# RED: 320px root overflow is 382px and the sole offender is button.signout.
+npm run test:e2e -- tests/e2e/admin.spec.ts
+# GREEN: the 320px root has at most one pixel of overflow and all header controls remain usable.
+npm run check
+npx eslint src/lib/components/Header.svelte tests/e2e/admin.spec.ts
+git diff --check -- src/lib/components/Header.svelte tests/e2e/admin.spec.ts
+npm run test:e2e -- tests/e2e/sales-reporting.spec.ts tests/e2e/admin.spec.ts
+```
+
+Reviewed browser-RED amendment (2026-08-23): the customer Sales denial proved that the
+root layout serializes `locals.user`, including its email and internal identifiers, before
+the administrator child loader returns its safe 403; the anonymous redirect remains
+bodyless. Modify only `src/routes/+layout.server.ts` and create only
+`src/routes/layout-server.test.ts`. For the exact `/admin` path or a path beneath
+`/admin/`, retain the root `user` only when `requireCapability(actor, 'admin.access')`
+succeeds. Catch only `AuthorizationError` to return `{ user: null }`; propagate every other
+error. Preserve the child route's existing anonymous 303 and customer 403 behavior,
+ordinary signed-in root data on public routes, and full authorized-administrator root data.
+
+Add focused tests for anonymous and customer admin-path redaction, authorized-admin
+retention, and ordinary signed-in public-route retention. Capture the focused RED before
+the production change, then prove the focused GREEN and rerun the complete Sales browser
+gate:
+
+```powershell
+npx vitest run src/routes/layout-server.test.ts
+# RED: the signed-in customer admin-path case exposes the root user.
+npx vitest run src/routes/layout-server.test.ts
+# GREEN: all four root-loader authorization cases pass.
+npm run check
+npx eslint src/routes/+layout.server.ts src/routes/layout-server.test.ts
+git diff --check -- src/routes/+layout.server.ts src/routes/layout-server.test.ts
+npm run test:e2e -- tests/e2e/sales-reporting.spec.ts tests/e2e/admin.spec.ts
+```
+
+Reviewed Sales-denial evidence amendment (2026-08-23): the earlier page-denial check
+scanned only the response body, so a bodyless anonymous 303 could false-green with a
+private value in `Location`. In the already-listed `tests/e2e/sales-reporting.spec.ts`,
+project every normal and sentinel page/export denial to exactly `status`, `location`,
+`contentType`, `disposition`, and `body`; scan each bounded projection and the complete
+projection collection against both fixture-private values and the denial canary, then
+require the normal and sentinel page projections to be exactly equal. Preserve all existing
+status, exact JSON, no-attachment, and body-absence assertions. Add a focused in-file
+witness proving that a bodyless 303 whose private canary appears only in `Location` is
+rejected, capture its RED before changing the projection, prove GREEN, and rerun the full
+Sales/admin browser gate:
+
+```powershell
+npx tsx scripts/with-test-database.ts npm run test:e2e:raw -- tests/e2e/sales-reporting.spec.ts --grep "bodyless 303 Sales denial"
+# RED: the promise resolves because the page-denial evidence omits Location.
+npx tsx scripts/with-test-database.ts npm run test:e2e:raw -- tests/e2e/sales-reporting.spec.ts --grep "bodyless 303 Sales denial"
+# GREEN: the selected-header projection rejects the Location-only canary.
+npm run test:e2e -- tests/e2e/sales-reporting.spec.ts tests/e2e/admin.spec.ts
+```
+
+Reviewed browser-RED amendment (2026-08-23): a seeded Sales CSV intermittently fails the
+generic privacy scanner because a public canonical title UUID containing the segment
+`-4242-` matches the bare `\b4242\b` card sentinel. Across 52 random UUIDs this false
+positive has approximately 1.34% probability; inspection proved that no fixture-private
+canary leaked. Modify only `tests/e2e/commerce-privacy.ts` and
+`scripts/commerce-privacy.test.ts`. Narrow only the card-number sentinel's context so a
+canonical UUID containing `4242` remains valid public evidence. Continue rejecting
+standalone `4242`, formatted or complete 4242 test-card evidence, provider secrets,
+provider object IDs, and every existing forbidden key/value pattern.
+
+Add a focused regression for the accepted canonical UUID and the complete retained
+negative matrix. Capture its RED, prove its GREEN, and then rerun the Sales/admin browser
+gate:
+
+```powershell
+npx vitest run scripts/commerce-privacy.test.ts
+# RED: a canonical public UUID containing -4242- is rejected as card evidence.
+npx vitest run scripts/commerce-privacy.test.ts
+# GREEN: the UUID is accepted while standalone/formatted card and existing secret/provider evidence remain rejected.
+npm run check
+npx eslint tests/e2e/commerce-privacy.ts scripts/commerce-privacy.test.ts
+git diff --check -- tests/e2e/commerce-privacy.ts scripts/commerce-privacy.test.ts
+npm run test:e2e -- tests/e2e/sales-reporting.spec.ts tests/e2e/admin.spec.ts
+```
+
+Reviewed post-GREEN browser-evidence amendment (2026-08-23): final capture and effective
+server-configuration review proved that the earlier GREEN did not establish the following
+additional boundaries. Amend only the already-listed Task 16 harness, route, component,
+configuration, and focused-test files plus newly listed `svelte.config.js` and
+`vite.config.ts`; do not reopen the frozen worker control or any financial product logic.
+
+A native refund-command document POST can place its action result only in SvelteKit's
+initial hydration `form`, outside `<main>` and the leaf page data. Extend the import-safe
+financial harness parser to return the page leaf and action result from the same unique
+hydration object. Require exact adjacent `node_ids`, `data`, `form`, and `error` properties,
+balanced bounded expressions, equal nonzero node/data cardinality, and a non-null final
+page leaf. A GET requires `form: null`; a captured document POST requires a non-null form
+and records it as distinct action evidence. Missing, multiple, reordered, malformed, or
+unreadable hydration fails closed; never evaluate the serialized JavaScript or fall back
+to another layout node. Pin this parser and capture contract in the existing
+`scripts/playwright-commerce-config.test.ts` gate and rerun the Refund journey through the
+real worker. Capture settlement must track every relevant same-origin financial request
+from `request` until exactly one `requestfinished` or `requestfailed` event, cross one
+browser task and two consecutive `requestAnimationFrame` callbacks as a quiescence
+barrier, and require both the in-flight request count and response-body task count to remain
+zero across that barrier. A newly observed request resets settlement; rollback and close
+must keep every listener and route installed while `PageCapture.close()` runs the same
+bounded two-barrier request/body-task settlement. If the page is already closed or either
+settlement/drain cannot complete, record only a fixed failure category and then perform the
+exact listener/route teardown. Add an import-safe static model witness for request
+start/finish/failure races, body-task lag, reset-on-new-work, quiescent completion,
+close-time two-barrier settlement, already-closed/failing drains, and exact teardown.
+After command listeners and worker pause are installed, settle existing page captures
+before submitting the native document POST. Likewise, settle the claim page immediately
+before consuming its one-use sensitive navigation and again after the completion page is
+stable. These boundaries prevent a later document navigation from evicting an unread
+successful Svelte data response; an unreadable response still fails closed and is never
+retried after navigation.
+Before installing capture routes and listeners, attach one page-scoped Chromium session
+and enable durable network messages with an exact 16 MiB aggregate buffer plus the 2 MiB
+per-resource protocol hint. Chromium durable storage does not enforce that per-resource
+hint, so after every successful relevant response-text read, independently enforce both
+the 2 MiB character and UTF-8 byte bounds before parsing, projecting, or retaining any
+body; overflow adds one fixed failure category and retains no projection. Durable storage
+keeps a completed response body available after renderer navigation without retrying the
+request, while aggregate overflow or an unreadable body still fails closed. Bound session
+creation, durable enablement, and detachment to one second each because Playwright gives
+those protocol operations no default timeout. A late-created session is detached through
+the same bounded helper, and every late rejection is consumed without logging its value.
+Retain the session through request/body-task settlement, detach it only after those tasks
+drain, and report close-time timeout/failure with one fixed category; context teardown owns
+any session that cannot detach in time. Setup rollback must drain first and then attempt
+the bounded detach without including the rejected value in a diagnostic. The
+command-correlation route uses one stable exact-origin/exact-refund-path
+URL predicate so Svelte named-action queries remain eligible while descendant data URLs
+do not; it additionally requires an exact main-frame document POST and is removed
+immediately after its single correlated submission.
+When the harness validates recovery deactivation through raw PostgreSQL execution, select
+`revoked_at is not null` as a driver-stable Boolean and compare it exactly with the
+expected active/revoked state. Do not use a JavaScript `Date` instance check for a raw
+timestamp result whose driver representation may be a string.
+
+The persistent-recovery journey intentionally publishes a later refund after the guest
+claim. That later refund removes effective access from the separately attributable title
+while the administrative grant preserves the recovered title. Retain and compare the
+exact three-message multiset: one ordinary `commerce.refund-access-changed` message for
+one affected title plus the recovered title's active and revoked
+`commerce.administrative-recovery-access-changed` messages. The delivery poll must wait
+for all three before projecting or asserting privacy; it may not stop after only the two
+administrative messages.
+
+In the terminal-policy journey, follow the displayed `Reload current refund facts` link
+after execution-time demotion. This is the journey's real hydrated Svelte data-navigation
+witness and proves the prescribed recovery action. Keep the audit safe summary as exact
+administrator coverage while the bounded raw-audit validator consumes and validates every
+selected detail-read row. Do not manufacture a data request or make Svelte-data evidence
+optional for this journey.
+
+Root administrator identity redaction must classify the request by `event.route.id`, not
+the raw or encoded URL pathname. Extend `src/routes/layout-server.test.ts` with an encoded
+admin-URL witness whose canonical route identity is in the `/admin` subtree and prove the
+root still returns `user: null` for a non-administrator. Preserve the previously reviewed
+exact `AuthorizationError` catch, authorized-administrator retention, and ordinary
+signed-in public-route retention.
+
+Sensitive financial E2E configuration must set trace, screenshot, and video retention all
+to `off`; the static configuration gate asserts all three. Console privacy capture must
+not rely on `ConsoleMessage.text()`: capture every console argument with explicit depth,
+node, collection, string, and deadline bounds. For every `Error`, inspect all own data
+properties, including non-enumerable and symbol-keyed fields, `cause`, and
+`AggregateError.errors`. Encode own properties with a null-prototype or equivalently
+collision-free ordered representation: preserve a literal `__proto__` data key and keep
+distinct symbols distinct even when their descriptions are identical. Add focused
+witnesses for both cases and for nested AggregateError/cause/custom fields. An accessor,
+cycle, key collision, bound breach, handle failure, or timeout is a fixed-category capture
+failure. Dispose every `ConsoleMessage.args()` handle exactly once in `finally`, including
+handles involved in a bound failure, timeout, rejected read, or late completion. Register
+`pageerror` before navigation and capture it through the same bounded Error path. Never
+include a raw rejected value in a diagnostic, and do not allow capture close to succeed
+while console/page-error work or handle disposal remains pending.
+
+`readAuditEvidence` must retain a bounded raw projection of every audit row selected by
+the journey's resource IDs or correlations before producing its safe correctness view.
+That projection includes actor/action/outcome/resource/correlation plus the actual
+`requestMetadata`, `before`, and `after` payloads. Scan the complete raw projection with
+`assertCommercePrivacy('financial audit', ...)` before mapping or discarding any field;
+row-count, value-size, or serialization bounds fail closed without printing the payload.
+Every selected command/domain/detail action must be classified explicitly, and an unknown
+or otherwise unconsumed relevant row fails the journey rather than disappearing from the
+safe projection. Prior integration privacy coverage does not replace this browser-journey
+audit-payload evidence.
+
+The administrator responsive witnesses use the approved rounding tolerance
+`scrollWidth <= clientWidth + 1` while still requiring exact
+`document.documentElement.clientWidth === 320`. They must also report zero true overflow
+offenders; the one-pixel allowance may not hide an element whose box extends beyond the
+320-pixel root. The Sales witness may exempt only an ancestor whose computed `overflow-x`
+is `auto` or `scroll` and whose `scrollWidth > clientWidth`, preferably the already-asserted
+Sales results region; `hidden` or `clip` must never suppress an offender. At the exact
+320-pixel viewport, the existing mobile table rules intentionally reflow the Sales table
+into block cards and remove its desktop minimum width. Therefore the named,
+keyboard-focusable results region must retain `auto`/`scroll` configuration, positive
+dimensions, exact root containment, and `scrollWidth <= clientWidth + 1`; do not require
+the reflowed content to manufacture horizontal overflow. The earlier whole-document
+offender scan remains authoritative and may use the region exemption only if genuine
+overflow is present.
+
+The real main worktree contains ignored `.env` data, and Vite and SvelteKit can reload
+those files independently after Playwright has tombstoned the inherited child environment.
+Under the exact E2E-only `PALE_ORBIT_E2E_ENV_ISOLATION=1` flag, pass one absolute
+`PALE_ORBIT_E2E_EMPTY_ENV_DIR` beneath the owned disposable test root; require both Vite's
+`envDir` and SvelteKit's `kit.env.dir` to resolve to that same known-empty directory. With
+the flag absent, preserve normal development and production environment discovery. The
+static gate creates distinct sentinel `.env` and `.env.local` values only in an owned
+fixture root, resolves the effective Vite/SvelteKit server configuration without starting
+a database or listener, and proves neither sentinel reaches the effective server
+environment. It also proves a missing, relative, nonempty, mismatched, or out-of-owned-root
+E2E directory fails closed and is cleaned exactly without reading or rewriting the user's
+ignored files.
+
+Reviewed production-preview RED (2026-08-23): Vite's development client emitted a
+`console.debug` while a native Refund document navigation destroyed its argument realm.
+The narrower `server.hmr: false` plus exact `/@vite/client` replacement was rejected by the
+real browser because application hydration failed and `pageerror` was observed. Remove
+that attempted replacement completely; do not filter console levels, ignore the message,
+or weaken failed-handle semantics.
+
+Run the Task 16 Playwright web server as the exact foreground command
+`npm run build:web && npm run preview -- --host 127.0.0.1 --port 4173 --strictPort`, with
+`timeout: 240_000`, `reuseExistingServer: false`, and the unchanged exact readiness URL.
+The existing tombstoned `webServer.env` must cover both build and preview so each evaluates
+the same validated empty Vite/SvelteKit `envDir`; normal development, build, and preview
+configuration stays unchanged without the E2E flag. The `&&` is the freshness guard: a
+failed isolated build may not start preview or reuse prior output. Do not background or
+detach either process. Extend the static gate to pin the exact command, strict loopback
+port, timeout, readiness URL, inherited environment, and unchanged normal configuration.
+The existing post-command resource/temp baseline must prove that the preview process tree
+and port 4173 are gone after each browser gate. Real Refund and Sales browser GREEN must
+retain the flat and structured console canaries and prove production-built hydration.
+
+Reviewed exact-audit RED (2026-08-23): the production-preview Refund journey reached the
+audit proof and exposed that its permissive action classifier could not prove exact
+command ownership, multiplicity, or the fixture issue lifecycle. Do not add a global
+action allowlist or keep raw offender arrays that Vitest can print. `readAuditEvidence`
+must first bounded-clone every selected scalar and
+`requestMetadata`/`before`/`after` value as JSON-only data: enforce shared row, depth, node,
+key, string, collection, and UTF-8 serialized-byte bounds; reject accessors, symbols,
+cycles, sparse arrays, exotic prototypes, non-finite numbers, and unsupported values with
+one fixed diagnostic. It must then call
+`assertCommercePrivacy('financial audit', boundedRaw, input.privateValues)` before any
+classification, projection, or discard. Return only safe summaries and counts; remove
+public `rawRows` and `unclassifiedRows` evidence.
+
+Retain an exact collision-free structural audit-signature multiset for every completed
+command, binding action, outcome, resource type/id, correlation, actor type/id, command
+kind, and terminal status. Validate the command-correlated scalar rows against the
+command's exact allowed semantic family before retaining them. During
+`readAuditEvidence`, consume exactly those retained command signatures plus the exact four
+initial fixture signatures produced by fresh provider balance-transaction staging under
+setup correlation `e2e-refund-source-${refundId}`. All four use actor `system` /
+`financial-worker` and outcome `succeeded`: two
+`financial.classification.appended` rows for the independently retained balance-transaction
+and fee-detail classification IDs, one `financial.balance_transaction.imported` row for
+the independently retained internal balance-transaction ID, and one
+`financial.issue.opened` row for the independently retained seeded issue ID. The
+classification payloads must be exact for `balance_transaction` / `refund` and
+`fee_detail` / `refund_fee` at the active classifier version. The import payload must be
+exact for the inserted fixture balance transaction, including status, signed amount, fee,
+net, currency, and fee-detail count. The issue payload must bind the exact fixture refund
+ID with safe code `allocation_incomplete`, impact `pending`, state `open`, and occurrence
+count 1. The setup correlation must produce zero
+`financial.refund_reconciled` rows because fixture reconciliation intentionally returns
+through that issue-recording path before the reconciliation append point.
+
+Require exactly one `financial.refund_reconciled` row for the successful finalization
+command. A successful reporting-correction command has exact cardinality zero or one:
+immediately after terminal completion, query that command correlation and action, reject
+duplicates or any present row whose actor/outcome/refund resource tuple is not exact, and
+retain the reconciliation signature only when the production recompute emitted it because
+financial source state changed. Every present row must use actor `system` /
+`financial-worker`, outcome `succeeded`, resource `refund` / the exact fixture refund ID,
+and that command's retained `financial-e2e-*` correlation; its safe payload must bind the
+exact fixture refund and order IDs. Continue requiring the separate
+administrator-authored finalization or correction domain row under the same command
+correlation and submitting actor. Any expected `financial.issue.resolved` row must bind
+the retained seeded issue ID and the exact successful command correlation. No draft,
+conflict, denial, failed, navigation-only, or setup operation may satisfy or emit a
+reconciliation expectation. Unknown, duplicate, wrong-resource, wrong-actor,
+wrong-correlation, overlapping, unconsumed, or missing expected rows fail with fixed
+diagnostics only. Detail reads remain separately bounded but every row must have the exact
+refund resource and a retained administrator; the safe summary must prove every selected
+command actor is covered. Refund specs compare the returned
+domain/issue/terminal/reconciliation safe-summary multisets exactly, never with
+`arrayContaining`, and never assert against a raw row.
+
+Reviewed final capture/privacy sweep (2026-08-23): document hydration must consume the
+bounded `error` expression through the enclosing object delimiter and accept only exact
+`error: null`; an empty, malformed, unbalanced, accessor-like, or non-null error value
+fails with the fixed document-capture category. Bind the action expression symmetrically
+to the exact request method: GET requires `form: null`, POST requires a non-null bounded
+form expression, and another method is invalid. Do not discard a validly shaped field
+merely because that transport is not expected to use it.
+
+Every captured relevant 3xx except 304 owns a settled bodyless-framing task. The installed
+Playwright transport deliberately refuses redirect-body reads and its encoded body size
+can report zero when framing is absent, so size alone is not proof. Require the bounded raw
+header array to contain exactly one canonical `Content-Length: 0` and no
+`Transfer-Encoding`, `Content-Encoding`, or `Trailer`; reject missing, duplicate,
+conflicting, nonzero, malformed, oversized, or ambiguous framing. Independently require
+the exact bounded Playwright size object and a zero response-body size only as
+corroboration. This stronger application/transport invariant applies to the exact
+magic-link 302, claim-authorization 303, and every other relevant redirect; no redirect
+body is accepted, discarded, or inferred from size alone. Keep 204, 205, and 304 as
+semantic no-body responses. Redirect-framing work participates in the same close-time
+task settlement and reports only a fixed failure category. At the final server hook
+boundary, canonicalize only a redirect whose Fetch `Response.body` is exactly null: clone
+its `Headers` without flattening repeated `Set-Cookie` values, preserve status, status
+text, `Location`, cookies, and security headers, remove transfer/content encoding and
+trailers, and set exactly `Content-Length: 0`. Reject a redirect with any non-null body
+stream using a fixed invariant failure, even if it claims length zero, and cancel that
+rejected stream without retaining or logging a cancellation error; pass 304 and every
+non-redirect response through by identity. Unit-test the 302/303 framing, preservation,
+and rejected-stream ownership contract, then prove both the claim 303 and Better Auth 302
+through production preview.
+
+Register every generated non-public fixture value before its relevant privacy assertion.
+Refund raw-audit privacy includes purchaser/guest identity IDs and the payment ID;
+browser privacy additionally acquires the canonical claimed-account ID exactly once when
+the guest claim commits. Refund checkout-attempt, quote-fingerprint, and status-token
+digest canaries belong to both retained fixture surfaces. Keep the intentionally safe
+Refund order/refund/title/item IDs out of that private set. Sales purchase and export-bound
+fixtures retain their buyer/order/payment/checkout/item backing IDs, distinct quote/status
+digests, provider IDs, allocation identities and set IDs, tie keys, source/fee fingerprints,
+payout-import run IDs, failure/dummy evidence, and dispute-presentment identities; public
+title and payout IDs remain exempt. Both Sales and Refund must positively observe the flat
+and structured console canaries before scanning them.
+
+The raw-audit preflight explicitly character-bounds and UTF-8-byte-bounds every selected
+scalar, including enum-backed `actorType` and `outcome`, and includes each scalar byte
+count in the per-row and aggregate limits before selecting payloads. PostgreSQL enum
+bounds do not replace this literal evidence contract.
+
+Administrator API-request witnesses that emulate a SvelteKit form action send the exact
+same-origin `Origin` and JSON `Accept` headers. A deliberately cross-site form remains a
+framework-level HTTP 403 with the exact safe JSON message. Same-origin authorization and
+last-administrator policy failures retain SvelteKit's HTTP 200 action transport and prove
+the nested action failure status/code (403 or 409) exactly; do not misclassify that
+framework envelope as a route-level HTTP failure.
+
+Reviewed native-download RED (2026-08-23): SvelteKit enhanced navigation intercepted the
+strict Sales CSV link, so Playwright observed no native `download` event and the bounded
+download evidence could not run. Add only `data-sveltekit-reload` to the authorized,
+cursor-free export link in `SalesFilters.svelte`; preserve its normalized href, capability
+gate, labels, and ordinary filter behavior. Pin the attribute in `SalesOverview.test.ts`,
+then prove the browser receives and fully captures the exact native CSV attachment.
+
+Capture the focused REDs before their respective corrections, prove the focused GREEN,
+and rerun both financial browser gates:
+
+```powershell
+npx vitest run scripts/playwright-commerce-config.test.ts src/routes/layout-server.test.ts src/lib/server/http/canonical-redirect.test.ts
+# RED: POST hydration, request/body settlement, route identity, collision-safe console/handle disposal, artifact retention, or effective env isolation evidence is absent.
+npx vitest run scripts/playwright-commerce-config.test.ts src/routes/layout-server.test.ts src/lib/server/http/canonical-redirect.test.ts
+# GREEN: every strengthened harness/configuration/root-loader contract passes.
+npx vitest run src/lib/components/admin/SalesOverview.test.ts
+# RED: the strict export link lacks data-sveltekit-reload.
+npx vitest run src/lib/components/admin/SalesOverview.test.ts
+# GREEN: the native-download marker is present without changing the normalized export href.
+npm run check
+npx eslint tests/e2e/financial-harness.ts scripts/playwright-commerce-config.test.ts src/routes/+layout.server.ts src/routes/layout-server.test.ts src/lib/server/http/canonical-redirect.ts src/lib/server/http/canonical-redirect.test.ts src/hooks.server.ts src/lib/components/admin/SalesFilters.svelte src/lib/components/admin/SalesOverview.test.ts playwright.config.ts svelte.config.js vite.config.ts
+git diff --check -- tests/e2e/financial-harness.ts scripts/playwright-commerce-config.test.ts src/routes/+layout.server.ts src/routes/layout-server.test.ts src/lib/server/http/canonical-redirect.ts src/lib/server/http/canonical-redirect.test.ts src/hooks.server.ts src/lib/components/admin/SalesFilters.svelte src/lib/components/admin/SalesOverview.test.ts playwright.config.ts svelte.config.js vite.config.ts
+npm run test:e2e -- tests/e2e/refund-review.spec.ts tests/e2e/admin.spec.ts
+npm run test:e2e -- tests/e2e/sales-reporting.spec.ts tests/e2e/admin.spec.ts
+```
+
+Reviewed frozen-static-guard RED (2026-08-23): after the approved production-preview
+change, the final Task 16 service-free gate passes 453 of 454 assertions; its sole failure
+is the Step 5 `scripts/storage-process-isolation.test.ts` web-composition witness still
+requiring the superseded Playwright development command. This is not a worker-control
+defect. Permit exactly one substitution in that file: replace the old
+`npm run dev -- --host 127.0.0.1 --port 4173` literal with a property-bound regular
+expression for the already-approved exact
+`npm run build:web && npm run preview -- --host 127.0.0.1 --port 4173 --strictPort`
+command. Preserve every other assertion and byte in that test, and keep
+`test-worker-control.ts`, its unit test, and `src/worker.ts` byte-identical to Step 5.
+A decoy source comment or unused string is forbidden.
+
+```powershell
+npx vitest run scripts/storage-process-isolation.test.ts -t "keeps every web, cleanup, production, and non-test composition unable to enable control"
+# RED: only the superseded development-command literal fails.
+npx vitest run scripts/storage-process-isolation.test.ts -t "keeps every web, cleanup, production, and non-test composition unable to enable control"
+# GREEN: the exact production-preview command and every non-activation check pass.
 npx vitest run src/lib/server/jobs/test-worker-control.test.ts scripts/playwright-commerce-config.test.ts scripts/storage-process-isolation.test.ts
 npm run check
 npm run lint
 git diff --check
-git diff --exit-code -- src/lib/server/jobs/test-worker-control.ts src/lib/server/jobs/test-worker-control.test.ts src/worker.ts scripts/storage-process-isolation.test.ts
+git diff --exit-code e69953aa6269863c924b4e3fc66fa68d22a27a16 -- src/lib/server/jobs/test-worker-control.ts src/lib/server/jobs/test-worker-control.test.ts src/worker.ts
+git diff --numstat e69953aa6269863c924b4e3fc66fa68d22a27a16 -- scripts/storage-process-isolation.test.ts
+git diff --unified=0 e69953aa6269863c924b4e3fc66fa68d22a27a16 -- scripts/storage-process-isolation.test.ts
 ```
+
+The latter two commands must show exactly one expectation-only hunk comprising the
+matcher-and-command substitution, with zero surrounding assertion changes. Do not require
+an impossible one-line numstat: the property-bound regular expression intentionally changes
+both the matcher line and its argument line.
 
 Then record the resource/temp baseline before each browser command and prove exact teardown afterward:
 
@@ -3020,12 +3700,21 @@ npm run test:e2e -- tests/e2e/refund-review.spec.ts tests/e2e/admin.spec.ts
 
 Expected: both commands exit zero with one owned disposable harness at a time; the real web and worker processes exercise the same command/status path used in production, and each harness self-cleans.
 
-The control module, its test, `src/worker.ts`, and `scripts/storage-process-isolation.test.ts` must remain byte-unchanged from the Step 5 commit throughout this browser tranche. If browser GREEN instead proves a control defect, stop: capture a focused controller RED, apply the minimal correction, rerun the full Step 5 controller/isolation gate, make a separate reviewed controller commit, then restart Step 6. If either browser RED proves any other product defect outside the listed Task 16 files, amend this task through review with that exact path, focused RED/GREEN command, and literal staging command. Do not hide product or controller changes in the browser-evidence commit.
+The control module, its test, and `src/worker.ts` must remain byte-unchanged from the Step 5 commit throughout this browser tranche; the reviewed one-command-witness substitution above is the only permitted `scripts/storage-process-isolation.test.ts` difference. If browser GREEN instead proves a control defect, stop: capture a focused controller RED, apply the minimal correction, rerun the full Step 5 controller/isolation gate, make a separate reviewed controller commit, then restart Step 6. If either browser RED proves any other product defect outside the listed Task 16 files, amend this task through review with that exact path, focused RED/GREEN command, and literal staging command. Do not hide product or controller changes in the browser-evidence commit.
 
 - [ ] **Step 7: Commit browser evidence**
 
 ```powershell
 git add tests/e2e/financial-harness.ts tests/e2e/sales-reporting.spec.ts tests/e2e/refund-review.spec.ts tests/e2e/database.ts tests/e2e/commerce-harness.ts tests/e2e/admin.spec.ts tests/e2e/commerce-privacy.ts playwright.config.ts scripts/playwright-commerce-config.test.ts
+git add docs/superpowers/plans/2026-08-20-backend-plan-6b-ii-admin-resolution-reporting-refresh.md src/lib/components/admin/SalesFilters.svelte src/lib/components/admin/SalesOverview.test.ts
+git add src/routes/admin/sales/refunds/refund-routes.test.ts
+git add -- ':(literal)src/routes/admin/sales/refunds/[refundId]/+page.server.ts'
+git add src/routes/+layout.server.ts src/routes/layout-server.test.ts
+git add src/hooks.server.ts src/lib/server/http/canonical-redirect.ts src/lib/server/http/canonical-redirect.test.ts
+git add src/lib/components/Header.svelte
+git add scripts/commerce-privacy.test.ts
+git add svelte.config.js vite.config.ts
+git add scripts/storage-process-isolation.test.ts
 # Run every additional literal git add command introduced by a reviewed Task 16 amendment.
 git diff --cached --check
 git commit -m "test: cover financial administrator journeys"
@@ -3034,6 +3723,7 @@ git commit -m "test: cover financial administrator journeys"
 ### Task 17: Generalize Plan 6B operations, enable Sales, and close the release evidence
 
 **Files:**
+
 - Modify: `package.json`
 - Modify: `scripts/plan6b-production-smoke.ts`
 - Modify: `scripts/plan6b-production-smoke.test.ts`
@@ -3217,22 +3907,22 @@ Expected: all reviewers report no unresolved Critical/Important/Minor findings, 
 
 ## Acceptance traceability
 
-| Approved behavior | Implemented/proven in |
-|---|---|
-| Independent capabilities and authorize-before-parse | Tasks 2, 7–16 |
-| Strict safe DTO/filter/cursor/money contracts | Tasks 2, 6–10 |
-| Durable private command with web/worker authority split | Tasks 3–5, 11–15 |
-| Stale-generation financial-admin lease capability, takeover, and secret isolation | Tasks 3–5, 14–15 |
-| Execution-time role reauthorization and replay safety | Tasks 4, 15–16 |
-| Exact migration/ACL/restore/upgrade/checkpoint parity | Tasks 3, 5, 13, 17 |
-| Signed per-title reporting and aggregate CSV | Tasks 6–7, 10, 16 |
-| Operational Needs Review and local payout detail | Tasks 8–9, 16 |
-| Audited detail/export before response | Tasks 4, 8–10, 15 |
-| Shared draft, one-way finalization, append-only correction | Tasks 11–13, 15–16 |
-| Causally proven persistent recovery and explicit deactivation | Tasks 14–16 |
-| Accessibility, responsive layout, polling cancellation, privacy | Tasks 7–16 |
-| Stage-aware smoke, final navigation, docs, independent review | Task 17 |
-| Production activation remains out of scope | Scope boundary and Task 17 |
+| Approved behavior                                                                 | Implemented/proven in      |
+| --------------------------------------------------------------------------------- | -------------------------- |
+| Independent capabilities and authorize-before-parse                               | Tasks 2, 7–16              |
+| Strict safe DTO/filter/cursor/money contracts                                     | Tasks 2, 6–10              |
+| Durable private command with web/worker authority split                           | Tasks 3–5, 11–15           |
+| Stale-generation financial-admin lease capability, takeover, and secret isolation | Tasks 3–5, 14–15           |
+| Execution-time role reauthorization and replay safety                             | Tasks 4, 15–16             |
+| Exact migration/ACL/restore/upgrade/checkpoint parity                             | Tasks 3, 5, 13, 17         |
+| Signed per-title reporting and aggregate CSV                                      | Tasks 6–7, 10, 16          |
+| Operational Needs Review and local payout detail                                  | Tasks 8–9, 16              |
+| Audited detail/export before response                                             | Tasks 4, 8–10, 15          |
+| Shared draft, one-way finalization, append-only correction                        | Tasks 11–13, 15–16         |
+| Causally proven persistent recovery and explicit deactivation                     | Tasks 14–16                |
+| Accessibility, responsive layout, polling cancellation, privacy                   | Tasks 7–16                 |
+| Stage-aware smoke, final navigation, docs, independent review                     | Task 17                    |
+| Production activation remains out of scope                                        | Scope boundary and Task 17 |
 
 ## Executor handoff
 
