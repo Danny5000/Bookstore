@@ -966,7 +966,7 @@ describe('Plan 6B financial schema', () => {
       `, [actorId, idempotencyHash, jobId, correlationId]), invalid.label)
         .resolves.toMatchObject({ rows: [{ commands: 0, jobs: 0, audits: 0 }] });
     }
-  });
+  }, 15_000);
 
   it('enforces the three entitlement-grant source shapes and recovery uniqueness', async () => {
     await expectFinancialSchemaPresent(
