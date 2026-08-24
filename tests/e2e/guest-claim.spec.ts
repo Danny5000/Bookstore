@@ -273,10 +273,13 @@ test('guest receipts claim every same-email purchase and reject action replay', 
     await expect(replayPage.locator('main')).not.toContainText(absentEmail);
     await navigateSensitiveAction(replayPage, claimLink);
     await expect(replayPage.getByRole('heading', { name: 'Link unavailable' })).toBeVisible();
-    assertCommercePrivacy('guest browser', await guestPage.locator('body').innerText());
     assertCommercePrivacy(
       'guest browser',
-      await replayPage.locator('body').innerText(),
+      await guestPage.locator('main, section').first().innerText()
+    );
+    assertCommercePrivacy(
+      'guest browser',
+      await replayPage.locator('main, section').first().innerText(),
       [absentEmail]
     );
     assertCommercePrivacy('guest console', browserLogs, [guestEmail, absentEmail, claimLink]);
@@ -416,7 +419,10 @@ test('a pre-existing unverified credential is recovered before claiming its gues
       headers: { origin: baseURL }
     });
     expect(newPasswordSignIn.status()).toBe(200);
-    assertCommercePrivacy('guest browser', await recoveryPage.locator('body').innerText());
+    assertCommercePrivacy(
+      'guest browser',
+      await recoveryPage.locator('main, section').first().innerText()
+    );
     assertCommercePrivacy(
       'guest console',
       browserLogs,

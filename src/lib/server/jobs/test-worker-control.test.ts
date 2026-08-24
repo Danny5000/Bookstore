@@ -1243,6 +1243,117 @@ describe('test worker control integration with the real runner', () => {
     expect(() => control.throwIfFailed()).toThrow();
   });
 
+  it('holds an acknowledged pause beyond the transition deadline until exact release', async () => {
+    const fixture = await activeFixture();
+    const workerAbort = new AbortController();
+    const heldBeyondTransitionDeadline = deferred<void>();
+    const continueReleaseWait = deferred<void>();
+    let nowValue = 0;
+    let releasedWait = false;
+    const wait = vi.fn(async (_milliseconds: number, signal: AbortSignal) => {
+      if (signal.aborted) {
+        throw signal.reason ?? new DOMException('Aborted', 'AbortError');
+      }
+      nowValue += 1_000;
+      if (nowValue > TEST_WORKER_CONTROL_DEADLINE_MS && !releasedWait) {
+        heldBeyondTransitionDeadline.resolve();
+        await continueReleaseWait.promise;
+        releasedWait = true;
+      }
+      await new Promise<void>((resolveValue) => setImmediate(resolveValue));
+    });
+    const repository = repositoryWithNoJobs(() => workerAbort.abort());
+    const control = createTestWorkerControl({
+      environment: fixture.environment,
+      concurrency: 1,
+      abortWorker: (reason) => workerAbort.abort(reason),
+      now: () => nowValue,
+      wait
+    });
+    const harness = createTestWorkerControlHarness({
+      environment: fixture.environment,
+      randomBytes: randomBytesFor(NONCE_A)
+    });
+    const harnessSignal = new AbortController();
+    const pausing = harness.pause(harnessSignal.signal);
+    await waitForContents(fixture.requestFile, PAUSE_A);
+    const running = runWorker({
+      repository,
+      handlers: new Map(),
+      workerId: 'test-durable-pause-worker',
+      concurrency: 1,
+      pollIntervalMs: 1,
+      heartbeatIntervalMs: 1,
+      signal: workerAbort.signal,
+      beforePoll: ({ signal }) => prepareTestWorkerPoll({
+        control,
+        signal,
+        maintenance: vi.fn().mockResolvedValue(undefined)
+      }),
+      sleep: async () => undefined
+    });
+    const session = await within(pausing, 'acknowledging the durable pause');
+
+    await within(
+      heldBeyondTransitionDeadline.promise,
+      'holding beyond the transition deadline'
+    );
+    expect(nowValue).toBeGreaterThan(TEST_WORKER_CONTROL_DEADLINE_MS);
+    expect(workerAbort.signal.aborted).toBe(false);
+    expect(repository.claimNext).not.toHaveBeenCalled();
+
+    const cleanup = session.cleanup(harnessSignal.signal);
+    continueReleaseWait.resolve();
+    await within(
+      Promise.all([running, cleanup]).then(() => undefined),
+      'releasing the durable pause'
+    );
+
+    expect(repository.claimNext).toHaveBeenCalledOnce();
+    expect(workerAbort.signal.aborted).toBe(true);
+    expect(() => control.throwIfFailed()).not.toThrow();
+  });
+
+  it('abandons an acknowledged pause promptly when the worker lifecycle aborts', async () => {
+    const fixture = await activeFixture();
+    const workerAbort = new AbortController();
+    const repository = repositoryWithNoJobs();
+    const control = createTestWorkerControl({
+      environment: fixture.environment,
+      concurrency: 1,
+      abortWorker: (reason) => workerAbort.abort(reason)
+    });
+    const harness = createTestWorkerControlHarness({
+      environment: fixture.environment,
+      randomBytes: randomBytesFor(NONCE_A)
+    });
+    const harnessSignal = new AbortController();
+    const pausing = harness.pause(harnessSignal.signal);
+    await waitForContents(fixture.requestFile, PAUSE_A);
+    const running = runWorker({
+      repository,
+      handlers: new Map(),
+      workerId: 'test-abortable-pause-worker',
+      concurrency: 1,
+      pollIntervalMs: 1,
+      heartbeatIntervalMs: 1,
+      signal: workerAbort.signal,
+      beforePoll: ({ signal }) => prepareTestWorkerPoll({
+        control,
+        signal,
+        maintenance: vi.fn().mockResolvedValue(undefined)
+      }),
+      sleep: async () => undefined
+    });
+    await within(pausing, 'acknowledging the abortable pause');
+
+    workerAbort.abort(new DOMException('Worker teardown', 'AbortError'));
+    await within(running, 'aborting the acknowledged pause');
+
+    expect(repository.claimNext).not.toHaveBeenCalled();
+    expect(() => control.throwIfFailed()).not.toThrow();
+  });
+
   it('holds a pause arriving during maintenance until exact release and acknowledges before claim', async () => {
     const fixture = await activeFixture();
     const workerAbort = new AbortController();

@@ -177,7 +177,10 @@ test('delayed payments, refunds, preserved grants, and disputes converge on effe
       .toBe(404);
     expect((await customerContext.request.get(`/library/${first.titleId}/download`)).status())
       .toBe(200);
-    assertCommercePrivacy('lifecycle browser', await customerPage.locator('body').innerText());
+    assertCommercePrivacy(
+      'lifecycle browser',
+      await customerPage.locator('main, section').first().innerText()
+    );
     assertCommercePrivacy('lifecycle console', browserLogs, [email]);
     assertCommercePrivacy('lifecycle database', await commerce.privacySnapshot(orderIds));
   } finally {

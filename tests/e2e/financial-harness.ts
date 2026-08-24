@@ -273,6 +273,9 @@ export interface FinancialHarness {
       expectedCommandKind: FinancialAdminCommandStatusDto["kind"];
     }>;
   }): Promise<FinancialCommandRun>;
+  withWorkerClaimBarrier<Result>(
+    action: () => Promise<Result>,
+  ): Promise<Result>;
   seedSalesReportingMatrix(): Promise<SalesReportingFixture>;
   seedSalesExportBound(
     kind: "rows" | "bytes" | "deadline",
@@ -709,6 +712,10 @@ interface SalesReportingFixture {
   readonly firstPageRowCount: number;
   readonly overviewRowCount: number;
   readonly privateValues: readonly string[];
+  readonly publicCohort: Readonly<{
+    suffix: string;
+    titles: readonly string[];
+  }>;
   readonly titles: Readonly<{
     archived: Readonly<{
       id: string;
@@ -739,7 +746,7 @@ interface SalesReportingFixture {
     resourceId: string;
     safeCode: string;
     safeReason: string;
-    excludedSafeCodes: readonly string[];
+    excludedIssueIds: readonly string[];
   }>;
   readonly payouts: Readonly<{
     pending: PayoutFixture;
@@ -4820,6 +4827,34 @@ export function createFinancialHarness(
     return count as number;
   }
 
+  async function withWorkerClaimBarrier<Result>(
+    action: () => Promise<Result>,
+  ): Promise<Result> {
+    const session = await workerControl.pause(deadlineSignal(10_000));
+    const actionResult = await Promise.resolve()
+      .then(action)
+      .then(
+        (value) => ({ status: "fulfilled", value }) as const,
+        (reason: unknown) => ({ status: "rejected", reason }) as const,
+      );
+    const cleanupResult = await session.cleanup(deadlineSignal(10_000)).then(
+      () => ({ status: "fulfilled" }) as const,
+      (reason: unknown) => ({ status: "rejected", reason }) as const,
+    );
+    if (
+      actionResult.status === "rejected" &&
+      cleanupResult.status === "rejected"
+    ) {
+      throw new AggregateError(
+        [actionResult.reason, cleanupResult.reason],
+        "Financial worker pause and cleanup failed",
+      );
+    }
+    if (actionResult.status === "rejected") throw actionResult.reason;
+    if (cleanupResult.status === "rejected") throw cleanupResult.reason;
+    return actionResult.value;
+  }
+
   async function purchaserUserId(
     fixture: FinancialRefundFixture,
   ): Promise<string | null> {
@@ -6330,6 +6365,9 @@ export function createFinancialHarness(
     return inSalesOwnerTransaction(async () => {
       const client = database.ownerFixtureClient;
       const privateValues: string[] = [];
+      const publicCohortSuffix = `E2E-${compactUuid()}`;
+      const cohortTitle = (title: string): string =>
+        `${title} [${publicCohortSuffix}]`;
       const rememberPurchase = (purchase: SalesPurchaseSeed): void => {
         privateValues.push(...purchase.privateValues);
       };
@@ -6342,35 +6380,35 @@ export function createFinancialHarness(
       };
 
       const archivedTitle = await createSalesTitle("archived-atlas", {
-        currentTitle: "Archived Atlas",
+        currentTitle: cohortTitle("Archived Atlas"),
         format: "prose",
         visibility: "archived",
       });
       const fxTitle = await createSalesTitle("euro-window", {
-        currentTitle: "Euro Window",
+        currentTitle: cohortTitle("Euro Window"),
       });
       const knownZeroTitle = await createSalesTitle("known-zero", {
-        currentTitle: "Known Zero",
+        currentTitle: cohortTitle("Known Zero"),
       });
       const incompleteTitle = await createSalesTitle("incomplete-evidence", {
-        currentTitle: "Incomplete Evidence",
+        currentTitle: cohortTitle("Incomplete Evidence"),
       });
       const settlementPendingTitle = await createSalesTitle(
         "settlement-pending",
-        { currentTitle: "Settlement Pending" },
+        { currentTitle: cohortTitle("Settlement Pending") },
       );
       const exceptionTitle = await createSalesTitle("exception-ledger", {
-        currentTitle: "Exception Ledger",
+        currentTitle: cohortTitle("Exception Ledger"),
       });
       const payoutTitle = await createSalesTitle("payout-reconciled", {
-        currentTitle: "Payout Reconciled",
+        currentTitle: cohortTitle("Payout Reconciled"),
       });
       const fillerTitles: SalesTitleSeed[] = [];
       for (let index = 0; index < 45; index += 1) {
         const suffix = String(index).padStart(2, "0");
         fillerTitles.push(
           await createSalesTitle(`filler-${suffix}`, {
-            currentTitle: `Filler ${suffix}`,
+            currentTitle: cohortTitle(`Filler ${suffix}`),
           }),
         );
       }
@@ -7066,6 +7104,8 @@ export function createFinancialHarness(
       const excludedClassificationCorrelationId = privateProviderId(
         "sales_excluded_classification_issue",
       );
+      const excludedAllocationIssueId = randomUUID();
+      const excludedClassificationIssueId = randomUUID();
       privateValues.push(
         dummyBalanceTransactionId,
         dummyBalanceProviderId,
@@ -7125,12 +7165,16 @@ export function createFinancialHarness(
       );
       await client.query(
         `insert into financial_reconciliation_issues
-           (resource_type, resource_id, safe_code, state, impact,
+           (id, resource_type, resource_id, safe_code, state, impact,
             first_observed_at, last_observed_at, occurrence_count, correlation_id)
-         values ('allocation_set', $1, 'allocation_mismatch', 'open', 'exception',
+         values ($1, 'allocation_set', $2, 'allocation_mismatch', 'open', 'exception',
                  '2026-08-11T03:00:00.000Z', '2026-08-11T03:00:00.000Z',
-                 1, $2)`,
-        [supersededAllocationId, excludedAllocationCorrelationId],
+                 1, $3)`,
+        [
+          excludedAllocationIssueId,
+          supersededAllocationId,
+          excludedAllocationCorrelationId,
+        ],
       );
       await client.query(
         `insert into financial_classification_versions
@@ -7141,12 +7185,16 @@ export function createFinancialHarness(
       );
       await client.query(
         `insert into financial_reconciliation_issues
-           (resource_type, resource_id, safe_code, state, impact,
+           (id, resource_type, resource_id, safe_code, state, impact,
             first_observed_at, last_observed_at, occurrence_count, correlation_id)
-         values ('financial_classification', $1, 'unsupported_category',
+         values ($1, 'financial_classification', $2, 'unsupported_category',
                  'open', 'exception', '2026-08-11T04:00:00.000Z',
-                 '2026-08-11T04:00:00.000Z', 1, $2)`,
-        [inactiveClassificationId, excludedClassificationCorrelationId],
+                 '2026-08-11T04:00:00.000Z', 1, $3)`,
+        [
+          excludedClassificationIssueId,
+          inactiveClassificationId,
+          excludedClassificationCorrelationId,
+        ],
       );
 
       const sourceFreshnessRootKey = privateProviderId(
@@ -7192,10 +7240,24 @@ export function createFinancialHarness(
       const fillerTitlesByDescendingGross = [...fillerTitles]
         .reverse()
         .map((title) => title.currentTitle);
+      const publicCohortTitles = [
+        archivedTitle,
+        fxTitle,
+        knownZeroTitle,
+        incompleteTitle,
+        settlementPendingTitle,
+        exceptionTitle,
+        payoutTitle,
+        ...fillerTitles,
+      ].map((title) => title.currentTitle);
       return {
         firstPageRowCount: 50,
         overviewRowCount: 52,
         privateValues: [...new Set(privateValues)],
+        publicCohort: {
+          suffix: publicCohortSuffix,
+          titles: publicCohortTitles,
+        },
         titles: {
           archived: {
             id: archivedTitle.id,
@@ -7241,7 +7303,10 @@ export function createFinancialHarness(
           safeCode: "immutable_mismatch",
           safeReason:
             "Stored financial evidence conflicts with its immutable record.",
-          excludedSafeCodes: ["allocation_mismatch", "unsupported_category"],
+          excludedIssueIds: [
+            excludedAllocationIssueId,
+            excludedClassificationIssueId,
+          ],
         },
         payouts: {
           pending: { id: pendingPayoutId },
@@ -7612,6 +7677,7 @@ export function createFinancialHarness(
     promoteAdministrators,
     createRefundFixture,
     runCommand,
+    withWorkerClaimBarrier,
     seedSalesReportingMatrix,
     seedSalesExportBound,
     auditCount,

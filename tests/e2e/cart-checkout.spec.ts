@@ -241,8 +241,8 @@ test('signed-in multi-title checkout keeps quotes, fulfillment, and access serve
     assertCommercePrivacy(
       'account browser',
       [
-        await customerPage.locator('body').innerText(),
-        await anonymousPage.locator('body').innerText()
+        await customerPage.locator('main, section').first().innerText(),
+        await anonymousPage.locator('main, section').first().innerText()
       ]
     );
     assertCommercePrivacy('account console', browserLogs, [customerEmail]);

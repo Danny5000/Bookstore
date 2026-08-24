@@ -908,45 +908,47 @@ export function createTestWorkerControl(input: {
     signal: AbortSignal
   ): Promise<void> => {
     if (!active || paths === null) return;
-    const release = await waitForCondition({
-      signal,
-      dependencies,
-      description: 'release request',
-      inspect: async (deadlineAt) => {
-        await waitForWriter(
-          paths.requestTemp,
-          signal,
-          dependencies,
-          deadlineAt
-        );
-        const requestRaw = await readOptionalFile(
-          dependencies.fileSystem,
-          paths.request
-        );
-        const acknowledgementRaw = await readOptionalFile(
-          dependencies.fileSystem,
-          paths.acknowledgement
-        );
-        if (acknowledgementRaw === null) {
-          throw new Error('Test worker control paused acknowledgement is missing');
-        }
-        const currentAcknowledgement =
-          decodeTestWorkerControlAcknowledgement(acknowledgementRaw);
-        if (currentAcknowledgement.nonce !== pause.nonce ||
-          currentAcknowledgement.phase !== 'paused') {
-          throw new Error('Test worker control paused acknowledgement changed');
-        }
-        if (requestRaw === null) return { done: false } as const;
+    let release: Extract<TestWorkerControlRequest, { readonly phase: 'release' }>;
+    while (true) {
+      throwIfAborted(signal);
+      await waitForWriter(
+        paths.requestTemp,
+        signal,
+        dependencies,
+        dependencies.now() + TEST_WORKER_CONTROL_DEADLINE_MS
+      );
+      const requestRaw = await readOptionalFile(
+        dependencies.fileSystem,
+        paths.request
+      );
+      const acknowledgementRaw = await readOptionalFile(
+        dependencies.fileSystem,
+        paths.acknowledgement
+      );
+      if (acknowledgementRaw === null) {
+        throw new Error('Test worker control paused acknowledgement is missing');
+      }
+      const currentAcknowledgement =
+        decodeTestWorkerControlAcknowledgement(acknowledgementRaw);
+      if (currentAcknowledgement.nonce !== pause.nonce ||
+        currentAcknowledgement.phase !== 'paused') {
+        throw new Error('Test worker control paused acknowledgement changed');
+      }
+      if (requestRaw !== null) {
         const currentRequest = decodeTestWorkerControlRequest(requestRaw);
         if (currentRequest.nonce !== pause.nonce) {
           throw new Error('Test worker control nonce changed concurrently');
         }
-        if (currentRequest.phase === 'pause') {
-          return { done: false } as const;
+        if (currentRequest.phase === 'release') {
+          release = currentRequest;
+          break;
         }
-        return { done: true, value: currentRequest } as const;
       }
-    });
+      // An acknowledged pause is a job-claim barrier, not a filesystem
+      // transition. The worker lifecycle signal bounds the hold; each file
+      // transition above and below retains the strict five-second deadline.
+      await dependencies.wait(CONTROL_POLL_INTERVAL_MS, signal);
+    }
 
     const releaseRaw = encodeTestWorkerControlRequest(release);
     await acquireExclusiveTemp({

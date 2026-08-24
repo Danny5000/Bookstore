@@ -130,6 +130,8 @@ type FilterValues = Readonly<{
   sort?: "gross_desc" | "title_asc";
 }>;
 
+const MAX_REPORTING_PAGE_COUNT = 20;
+
 function salesRegion(page: Page): Locator {
   return page.getByRole("region", { name: "Sales results by title" });
 }
@@ -183,52 +185,36 @@ function payoutDetailValue(page: Page, label: string): Locator {
 }
 
 async function applyFilters(page: Page, values: FilterValues): Promise<void> {
-  await page.goto("/admin/sales");
-  await page.waitForLoadState("networkidle");
-  if (values.range !== undefined)
-    await page.getByLabel("Range").selectOption(values.range);
-  if (values.from !== undefined)
-    await page.getByLabel("From date").fill(values.from);
-  if (values.to !== undefined) await page.getByLabel("To date").fill(values.to);
-  if (values.titleId !== undefined)
-    await page.getByLabel("Title ID").fill(values.titleId);
-  if (values.format !== undefined)
-    await page.getByLabel("Format").selectOption(values.format);
-  if (values.presentmentCurrency !== undefined) {
-    await page
-      .getByLabel("Presentment currency")
-      .fill(values.presentmentCurrency);
-  }
-  if (values.settlementCurrency !== undefined) {
-    await page
-      .getByLabel("Settlement currency")
-      .fill(values.settlementCurrency);
-  }
-  if (values.state !== undefined) {
-    await page.getByLabel("Financial state").selectOption(values.state);
-  }
-  if (values.sort !== undefined)
-    await page.getByLabel("Sort").selectOption(values.sort);
+  await page.getByLabel("Range").selectOption(values.range ?? "30");
+  await page.getByLabel("From date").fill(values.from ?? "");
+  await page.getByLabel("To date").fill(values.to ?? "");
+  await page.getByLabel("Title ID").fill(values.titleId ?? "");
+  await page.getByLabel("Format").selectOption(values.format ?? "");
+  await page
+    .getByLabel("Presentment currency")
+    .fill(values.presentmentCurrency ?? "");
+  await page
+    .getByLabel("Settlement currency")
+    .fill(values.settlementCurrency ?? "");
+  await page.getByLabel("Financial state").selectOption(values.state ?? "");
+  await page.getByLabel("Sort").selectOption(values.sort ?? "gross_desc");
 
   const previousResults = await salesRegion(page).innerHTML();
-  const navigationResponsePromise = page.waitForResponse((response) => {
-    const url = new URL(response.url());
-    return (
-      url.origin === new URL(baseURL).origin &&
-      (url.pathname === "/admin/sales" ||
-        url.pathname === "/admin/sales/__data.json") &&
-      ["document", "fetch"].includes(response.request().resourceType())
-    );
-  });
-  await Promise.all([
-    page.waitForURL(
-      (url) => url.pathname === "/admin/sales" && url.search.length > 0,
-    ),
+  const previousUrl = page.url();
+  const [navigationResponse] = await Promise.all([
+    page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return (
+        url.origin === new URL(baseURL).origin &&
+        (url.pathname === "/admin/sales" ||
+          url.pathname === "/admin/sales/__data.json") &&
+        ["document", "fetch"].includes(response.request().resourceType())
+      );
+    }),
+    page.waitForURL((url) => url.href !== previousUrl),
     page.getByRole("button", { name: "Apply filters" }).click(),
   ]);
-  const navigationResponse = await navigationResponsePromise;
   expect(navigationResponse.status()).toBe(200);
-  await navigationResponse.finished();
   await page.waitForLoadState("networkidle");
   const filterNavigation = `filter navigation ${page.url()}`;
   const url = new URL(page.url());
@@ -268,6 +254,126 @@ async function visibleSalesTitles(page: Page): Promise<readonly string[]> {
   return salesRegion(page)
     .locator('tbody th[scope="row"] > strong')
     .allTextContents();
+}
+
+type SalesTitlePageCollection = Readonly<{
+  pages: readonly (readonly string[])[];
+  titles: readonly string[];
+}>;
+
+async function collectSalesTitlePages(
+  page: Page,
+): Promise<SalesTitlePageCollection> {
+  const pages: string[][] = [];
+  const seenUrls = new Set<string>();
+  for (
+    let pageIndex = 0;
+    pageIndex < MAX_REPORTING_PAGE_COUNT;
+    pageIndex += 1
+  ) {
+    await expect(
+      page.getByRole("heading", { name: "Sales overview" }),
+    ).toBeVisible();
+    const currentUrl = page.url();
+    if (seenUrls.has(currentUrl)) {
+      throw new Error(`Sales pagination repeated ${currentUrl}`);
+    }
+    seenUrls.add(currentUrl);
+    pages.push([...(await visibleSalesTitles(page))]);
+    const nextPage = page.getByRole("link", { name: "Next page →" });
+    if ((await nextPage.count()) === 0) {
+      return { pages, titles: pages.flat() };
+    }
+    const nextHref = await nextPage.getAttribute("href");
+    if (nextHref === null) throw new Error("Sales next-page link had no URL");
+    const expectedUrl = new URL(nextHref, currentUrl).href;
+    await Promise.all([
+      page.waitForURL((url) => url.href === expectedUrl),
+      nextPage.click(),
+    ]);
+  }
+  throw new Error(
+    `Sales pagination exceeded ${MAX_REPORTING_PAGE_COUNT} pages`,
+  );
+}
+
+function projectPublicCohort(
+  titles: readonly string[],
+  publicCohortTitles: readonly string[],
+): readonly string[] {
+  const publicCohort = new Set(publicCohortTitles);
+  return titles.filter((title) => publicCohort.has(title));
+}
+
+async function expectPublicCohortTitles(
+  page: Page,
+  publicCohortTitles: readonly string[],
+  expectedTitles: readonly string[],
+): Promise<void> {
+  const collection = await collectSalesTitlePages(page);
+  expect(projectPublicCohort(collection.titles, publicCohortTitles)).toEqual(
+    expectedTitles,
+  );
+}
+
+async function readNeedsReviewCount(page: Page): Promise<number> {
+  const link = page.getByRole("link", { name: /items? needs? review/u });
+  if ((await link.count()) === 0) return 0;
+  const rawCount = (await link.locator("strong").innerText()).trim();
+  if (!/^\d+$/u.test(rawCount)) {
+    throw new Error(`Needs-review count was not canonical: ${rawCount}`);
+  }
+  return Number.parseInt(rawCount, 10);
+}
+
+type ReviewQueueCollection = Readonly<{
+  issueIds: readonly string[];
+  pageByIssueId: ReadonlyMap<string, string>;
+}>;
+
+async function collectReviewQueuePages(
+  page: Page,
+): Promise<ReviewQueueCollection> {
+  const issueIds: string[] = [];
+  const pageByIssueId = new Map<string, string>();
+  const seenUrls = new Set<string>();
+  for (
+    let pageIndex = 0;
+    pageIndex < MAX_REPORTING_PAGE_COUNT;
+    pageIndex += 1
+  ) {
+    await expect(
+      page.getByRole("heading", { name: "Needs review" }),
+    ).toBeVisible();
+    const currentUrl = page.url();
+    if (seenUrls.has(currentUrl)) {
+      throw new Error(`Needs-review pagination repeated ${currentUrl}`);
+    }
+    seenUrls.add(currentUrl);
+    const pageIssueIds = await page
+      .getByRole("region", { name: "Financial issues needing review" })
+      .locator('tbody th[scope="row"] > span:last-child')
+      .allTextContents();
+    for (const rawIssueId of pageIssueIds) {
+      const issueId = rawIssueId.trim();
+      issueIds.push(issueId);
+      pageByIssueId.set(issueId, currentUrl);
+    }
+    const nextPage = page.getByRole("link", { name: "Next page →" });
+    if ((await nextPage.count()) === 0) return { issueIds, pageByIssueId };
+    const nextHref = await nextPage.getAttribute("href");
+    if (nextHref === null) {
+      throw new Error("Needs-review next-page link had no URL");
+    }
+    const expectedUrl = new URL(nextHref, currentUrl).href;
+    await Promise.all([
+      page.waitForURL((url) => url.href === expectedUrl),
+      nextPage.click(),
+    ]);
+  }
+  throw new Error(
+    `Needs-review pagination exceeded ${MAX_REPORTING_PAGE_COUNT} pages`,
+  );
 }
 
 async function readDownload(download: Download): Promise<string> {
@@ -562,7 +668,10 @@ test.describe("provider-neutral Sales reporting journey", () => {
         .poll(() => financial.auditCount(SALES_EXPORT_ACTION))
         .toBe(deniedExportAuditBefore);
 
-      await adminPage.goto("/admin/sales");
+      const emptyTitleId = randomUUID();
+      await adminPage.goto(
+        `/admin/sales?range=all&titleId=${emptyTitleId}&sort=gross_desc`,
+      );
       await expect(
         adminPage.getByRole("heading", { name: "Sales overview" }),
       ).toBeVisible();
@@ -574,7 +683,9 @@ test.describe("provider-neutral Sales reporting journey", () => {
         globalNavigation.getByRole("link", { name: /Sales/u }),
       ).toHaveCount(0);
       await expect(
-        adminPage.getByRole("heading", { name: "No sales data yet" }),
+        adminPage.getByRole("heading", {
+          name: "No sales match these filters",
+        }),
       ).toBeVisible();
       await expect(adminPage.getByRole("status")).toHaveText(
         "0 matching sales rows.",
@@ -604,8 +715,27 @@ test.describe("provider-neutral Sales reporting journey", () => {
         }
       }
 
+      await adminPage.goto("/admin/sales?range=all&sort=title_asc");
+      await expect(
+        adminPage.getByRole("heading", { name: "Sales overview" }),
+      ).toBeVisible();
+      const baselineNeedsReviewCount = await readNeedsReviewCount(adminPage);
+      const baselineSales = await collectSalesTitlePages(adminPage);
+      const baselineRowCount = baselineSales.titles.length;
+      await adminPage.goto("/admin/sales/review");
+      const baselineReviewQueue = await collectReviewQueuePages(adminPage);
+      expect(baselineNeedsReviewCount).toBe(
+        baselineReviewQueue.issueIds.length,
+      );
+
       const fixture = await financial.seedSalesReportingMatrix();
-      await adminPage.goto("/admin/sales?range=all");
+      expect(fixture.publicCohort.titles).toHaveLength(
+        fixture.overviewRowCount,
+      );
+      expect(new Set(fixture.publicCohort.titles).size).toBe(
+        fixture.overviewRowCount,
+      );
+      await adminPage.goto("/admin/sales?range=all&sort=gross_desc");
       await expect(
         adminPage.getByRole("heading", { name: "Sales overview" }),
       ).toBeVisible();
@@ -613,7 +743,13 @@ test.describe("provider-neutral Sales reporting journey", () => {
         `${fixture.firstPageRowCount} matching sales rows.`,
       );
       await expect(adminPage.getByText("Financial data through")).toBeVisible();
+      expect(await readNeedsReviewCount(adminPage)).toBe(
+        baselineNeedsReviewCount + 1,
+      );
 
+      await adminPage.goto(
+        `/admin/sales?range=all&titleId=${fixture.titles.archived.id}&sort=gross_desc`,
+      );
       const archived = salesRow(
         adminPage,
         fixture.titles.archived.currentTitle,
@@ -641,23 +777,6 @@ test.describe("provider-neutral Sales reporting journey", () => {
         fixture.titles.archived.soldAsCreator,
       );
       await expect(archived).toContainText("Comic");
-
-      await applyFilters(adminPage, {
-        range: "custom",
-        from: fixture.filterWindow.from,
-        to: fixture.filterWindow.to,
-      });
-      expect(await visibleSalesTitles(adminPage)).toEqual(
-        fixture.filterWindow.expectedTitles,
-      );
-
-      await applyFilters(adminPage, {
-        range: "all",
-        titleId: fixture.titles.archived.id,
-      });
-      expect(await visibleSalesTitles(adminPage)).toEqual([
-        fixture.titles.archived.currentTitle,
-      ]);
       const archivedSummary = summaryCard(adminPage, "USD → USD");
       await expect(archivedSummary).toContainText("Fee reconciled");
       await expectMetric(
@@ -672,8 +791,21 @@ test.describe("provider-neutral Sales reporting journey", () => {
         /\+USD\s+16\.10/u,
       );
 
+      await applyFilters(adminPage, {
+        range: "custom",
+        from: fixture.filterWindow.from,
+        to: fixture.filterWindow.to,
+      });
+      await expectPublicCohortTitles(
+        adminPage,
+        fixture.publicCohort.titles,
+        fixture.filterWindow.expectedTitles,
+      );
+
       await applyFilters(adminPage, { range: "all", format: "comic" });
-      expect(await visibleSalesTitles(adminPage)).toEqual(
+      await expectPublicCohortTitles(
+        adminPage,
+        fixture.publicCohort.titles,
         fixture.expectedFilterTitles.comic,
       );
 
@@ -682,13 +814,16 @@ test.describe("provider-neutral Sales reporting journey", () => {
         presentmentCurrency: "EUR",
         settlementCurrency: "USD",
       });
-      expect(await visibleSalesTitles(adminPage)).toEqual([
+      await expectPublicCohortTitles(adminPage, fixture.publicCohort.titles, [
         fixture.titles.fx.currentTitle,
       ]);
       const fx = salesRow(adminPage, fixture.titles.fx.currentTitle);
       await expectMetric(fx, "Gross presentment", /\+EUR\s+15\.00/u);
       await expectMetric(fx, "Gross settlement", /\+USD\s+16\.50/u);
       await expectMetric(fx, "Estimated payout", /\+USD\s+15\.90/u);
+      await adminPage.goto(
+        `/admin/sales?range=all&titleId=${fixture.titles.fx.id}&sort=gross_desc`,
+      );
       const fxSummary = summaryCard(adminPage, "EUR → USD");
       await expectMetric(fxSummary, "Gross presentment", /\+EUR\s+15\.00/u);
       await expectMetric(fxSummary, "Gross settlement", /\+USD\s+16\.50/u);
@@ -700,14 +835,20 @@ test.describe("provider-neutral Sales reporting journey", () => {
         ["exception", fixture.expectedFilterTitles.exception],
       ] as const) {
         await applyFilters(adminPage, { range: "all", state });
-        expect(await visibleSalesTitles(adminPage)).toEqual(expectedTitles);
+        await expectPublicCohortTitles(
+          adminPage,
+          fixture.publicCohort.titles,
+          expectedTitles,
+        );
       }
 
       await applyFilters(adminPage, {
         range: "all",
         settlementCurrency: "pending",
       });
-      expect(await visibleSalesTitles(adminPage)).toEqual(
+      await expectPublicCohortTitles(
+        adminPage,
+        fixture.publicCohort.titles,
         fixture.expectedFilterTitles.settlementPending,
       );
 
@@ -782,47 +923,72 @@ test.describe("provider-neutral Sales reporting journey", () => {
       }
 
       await applyFilters(adminPage, { range: "all", sort: "title_asc" });
-      const firstPageTitles = await visibleSalesTitles(adminPage);
+      const allTimeSales = await collectSalesTitlePages(adminPage);
+      const firstPageTitles = allTimeSales.pages[0] ?? [];
       expect(firstPageTitles).toHaveLength(50);
-      const nextPage = adminPage.getByRole("link", { name: "Next page →" });
-      await expect(nextPage).toBeVisible();
-      await nextPage.click();
+      expect(allTimeSales.pages.length).toBeGreaterThanOrEqual(2);
+      expect(allTimeSales.titles).toHaveLength(
+        baselineRowCount + fixture.overviewRowCount,
+      );
+      const currentCohortTitles = projectPublicCohort(
+        allTimeSales.titles,
+        fixture.publicCohort.titles,
+      );
+      expect(currentCohortTitles).toHaveLength(fixture.overviewRowCount);
+      expect(new Set(currentCohortTitles)).toEqual(
+        new Set(fixture.publicCohort.titles),
+      );
+      expect(firstPageTitles).not.toContain(
+        fixture.pagination.secondPageMarker,
+      );
+      expect(allTimeSales.pages.slice(1).flat()).toContain(
+        fixture.pagination.secondPageMarker,
+      );
       await expect(
         adminPage.getByRole("link", { name: "First page" }),
       ).toBeVisible();
-      const secondPageTitles = await visibleSalesTitles(adminPage);
-      const allPagedTitles = [...firstPageTitles, ...secondPageTitles];
-      expect(allPagedTitles).toHaveLength(fixture.overviewRowCount);
-      expect(new Set(allPagedTitles).size).toBe(fixture.overviewRowCount);
-      expect(secondPageTitles).toContain(fixture.pagination.secondPageMarker);
       await adminPage.getByRole("link", { name: "First page" }).click();
       await expect
         .poll(() => visibleSalesTitles(adminPage))
         .toEqual(firstPageTitles);
 
       await adminPage.goto("/admin/sales");
-      await expect(
-        adminPage.getByRole("link", { name: /item needs review/u }),
-      ).toContainText("1");
+      expect(await readNeedsReviewCount(adminPage)).toBe(
+        baselineNeedsReviewCount + 1,
+      );
       await adminPage.goto("/admin/sales/review");
-      await expect(
-        adminPage.getByRole("heading", { name: "Needs review" }),
-      ).toBeVisible();
+      const reviewQueue = await collectReviewQueuePages(adminPage);
+      expect(reviewQueue.issueIds).toHaveLength(baselineNeedsReviewCount + 1);
+      expect([...reviewQueue.issueIds].sort()).toEqual(
+        [...baselineReviewQueue.issueIds, fixture.issue.id].sort(),
+      );
+      expect(
+        reviewQueue.issueIds.filter((issueId) => issueId === fixture.issue.id),
+      ).toHaveLength(1);
+      for (const excludedIssueId of fixture.issue.excludedIssueIds) {
+        expect(reviewQueue.issueIds).not.toContain(excludedIssueId);
+      }
+      const fixtureIssuePage = reviewQueue.pageByIssueId.get(fixture.issue.id);
+      if (fixtureIssuePage === undefined) {
+        throw new Error("Seeded Sales issue was absent from the review queue");
+      }
+      await adminPage.goto(fixtureIssuePage);
       await expect(adminPage.getByRole("status")).toHaveText(
-        "1 current issue on this page.",
+        /^\d+ current issues? on this page\.$/u,
       );
       const reviewRegion = adminPage.getByRole("region", {
         name: "Financial issues needing review",
       });
-      await expect(reviewRegion).toContainText(fixture.issue.safeCode);
-      for (const excludedCode of fixture.issue.excludedSafeCodes) {
-        await expect(reviewRegion).not.toContainText(excludedCode);
-      }
+      const issueRow = reviewRegion
+        .getByRole("row")
+        .filter({ hasText: fixture.issue.id });
+      await expect(issueRow).toHaveCount(1);
+      await expect(issueRow).toContainText(fixture.issue.safeCode);
       const issueAuditBefore = await financial.auditCount(
         ISSUE_VIEW_ACTION,
         fixture.issue.id,
       );
-      await reviewRegion.getByRole("link", { name: "View issue" }).click();
+      await issueRow.getByRole("link", { name: "View issue" }).click();
       await expect(
         adminPage.getByRole("heading", { name: "Financial issue" }),
       ).toBeVisible();
@@ -1008,7 +1174,7 @@ test.describe("provider-neutral Sales reporting journey", () => {
         );
       }
 
-      await applyFilters(adminPage, { range: "all", sort: "title_asc" });
+      await adminPage.goto("/admin/sales?range=all&sort=title_asc");
       const exportLink = adminPage.getByRole("link", {
         name: "Export filtered CSV",
       });
@@ -1019,52 +1185,62 @@ test.describe("provider-neutral Sales reporting journey", () => {
       expect(exportPath).not.toContain("cursor=");
 
       const exportAuditBefore = await financial.auditCount(SALES_EXPORT_ACTION);
-      const downloadPromise = adminPage.waitForEvent("download");
-      await exportLink.click();
-      const download = await downloadPromise;
-      const csv = await readDownload(download);
+      const stableExports = await financial.withWorkerClaimBarrier(async () => {
+        const stableAllTimeSales = await collectSalesTitlePages(adminPage);
+        const downloadPromise = adminPage.waitForEvent("download");
+        await exportLink.click();
+        const download = await downloadPromise;
+        const csv = await readDownload(download);
+        const directResponse = await adminContext.request.get(exportPath);
+        const directCsv = await directResponse.text();
+        expect(directCsv).toBe(csv);
+        return {
+          rowCount: stableAllTimeSales.titles.length,
+          browser: {
+            suggestedFilename: download.suggestedFilename(),
+            body: csv,
+          },
+          direct: {
+            status: directResponse.status(),
+            contentType: directResponse.headers()["content-type"],
+            disposition: directResponse.headers()["content-disposition"],
+            body: directCsv,
+          },
+        };
+      });
       assertSalesPrivacy(
         "sales csv",
-        { suggestedFilename: download.suggestedFilename(), body: csv },
+        stableExports.browser,
         fixture.privateValues,
       );
-      expect(download.suggestedFilename()).toBe(
+      expect(stableExports.browser.suggestedFilename).toBe(
         "pale-orbit-sales-all-time.csv",
       );
-      const csvLines = csv.trimEnd().split("\r\n");
-      expect(csvLines).toHaveLength(fixture.overviewRowCount + 1);
-      expect(csv).toContain(fixture.pagination.secondPageMarker);
-      expect(csv).toContain(",-460,");
-      expect(csv).toContain(",1610,true,0,fee_reconciled,");
-      await expect
-        .poll(() => financial.auditCount(SALES_EXPORT_ACTION))
-        .toBe(exportAuditBefore + 1);
-
-      const directResponse = await adminContext.request.get(exportPath);
-      const directCsv = await directResponse.text();
+      const csvLines = stableExports.browser.body.trimEnd().split("\r\n");
+      expect(csvLines).toHaveLength(stableExports.rowCount + 1);
+      expect(stableExports.browser.body).toContain(
+        fixture.pagination.secondPageMarker,
+      );
+      expect(stableExports.browser.body).toContain(fixture.publicCohort.suffix);
+      expect(stableExports.browser.body).toContain(",-460,");
+      expect(stableExports.browser.body).toContain(
+        ",1610,true,0,fee_reconciled,",
+      );
       assertSalesPrivacy(
         "sales csv",
-        {
-          status: directResponse.status(),
-          contentType: directResponse.headers()["content-type"],
-          disposition: directResponse.headers()["content-disposition"],
-          body: directCsv,
-        },
+        stableExports.direct,
         fixture.privateValues,
       );
-      expect(directResponse.status()).toBe(200);
-      expect(directResponse.headers()["content-type"]).toBe(
-        "text/csv; charset=utf-8",
-      );
-      expect(directResponse.headers()["content-disposition"]).toContain(
+      expect(stableExports.direct.status).toBe(200);
+      expect(stableExports.direct.contentType).toBe("text/csv; charset=utf-8");
+      expect(stableExports.direct.disposition).toContain(
         "pale-orbit-sales-all-time.csv",
       );
-      expect(directCsv).toBe(csv);
+      expect(stableExports.direct.body).toBe(stableExports.browser.body);
       await expect
         .poll(() => financial.auditCount(SALES_EXPORT_ACTION))
         .toBe(exportAuditBefore + 2);
 
-      await applyFilters(adminPage, { range: "all", sort: "title_asc" });
       await adminPage.setViewportSize({ width: 320, height: 900 });
       await waitForSettledLayout(adminPage);
       for (const name of [
