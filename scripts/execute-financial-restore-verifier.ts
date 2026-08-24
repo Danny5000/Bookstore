@@ -61,16 +61,21 @@ const adminCommandAuthorityMigrationPath = fileURLToPath(
 const reportingCorrectionAuthorityMigrationPath = fileURLToPath(
   new URL('../drizzle/0013_plan6bii_reporting_correction_authority.sql', import.meta.url)
 );
+const issueTransitionFailClosedMigrationPath = fileURLToPath(
+  new URL('../drizzle/0014_plan6bii_issue_transition_fail_closed.sql', import.meta.url)
+);
 const [
   verifier,
   workerAuthorityMigration,
   adminCommandAuthorityMigration,
-  reportingCorrectionAuthorityMigration
+  reportingCorrectionAuthorityMigration,
+  issueTransitionFailClosedMigration
 ] = await Promise.all([
   readFile(verifierPath, 'utf8'),
   readFile(workerAuthorityMigrationPath, 'utf8'),
   readFile(adminCommandAuthorityMigrationPath, 'utf8'),
-  readFile(reportingCorrectionAuthorityMigrationPath, 'utf8')
+  readFile(reportingCorrectionAuthorityMigrationPath, 'utf8'),
+  readFile(issueTransitionFailClosedMigrationPath, 'utf8')
 ]);
 const verifierLines = verifier.split(/\r?\n/u);
 const allowedMetaCommands = ['\\set ON_ERROR_STOP on', '\\set QUIET on'];
@@ -189,6 +194,33 @@ function requiredReportingCorrectionAuthorityStatement(
   }
   const statement = reportingCorrectionAuthorityMigration.slice(start, end);
   if (!statement.startsWith(prefix) || statement.includes('\0')) {
+    throw new Error(`[restore-verifier] unsafe canonical ${witnessName} statement`);
+  }
+  return statement;
+}
+
+function requiredIssueTransitionFailClosedStatement(
+  witnessName: string,
+  prefix: string
+): string {
+  const start = issueTransitionFailClosedMigration.indexOf(prefix);
+  const endMarker = ';--> statement-breakpoint';
+  const end = issueTransitionFailClosedMigration.indexOf(endMarker, start);
+  if (
+    start < 0 ||
+    end < 0 ||
+    issueTransitionFailClosedMigration.indexOf(prefix, start + prefix.length) >= 0
+  ) {
+    throw new Error(`[restore-verifier] expected one canonical ${witnessName} statement`);
+  }
+  const statement = issueTransitionFailClosedMigration.slice(start, end);
+  const functionBodyDelimiter = '$plan6bii_issue_transition_fail_closed$';
+  if (
+    !statement.startsWith(prefix) ||
+    statement.includes('\0') ||
+    statement.split(functionBodyDelimiter).length !== 3 ||
+    !statement.trimEnd().endsWith(functionBodyDelimiter)
+  ) {
     throw new Error(`[restore-verifier] unsafe canonical ${witnessName} statement`);
   }
   return statement;
@@ -349,6 +381,39 @@ const reportingCorrectionResolveGrantStatement =
     'reporting-correction resolver grant',
     'GRANT EXECUTE ON FUNCTION "public"."resolve_financial_issue_after_reporting_correction_command"(uuid,uuid)'
   );
+const vulnerableFinancialIssueTransitionStatement =
+  requiredAdminCommandAuthorityStatement(
+    'vulnerable financial issue transition predecessor',
+    'CREATE OR REPLACE FUNCTION "public"."plan6b_validate_issue_transition"()'
+  );
+const failClosedFinancialIssueTransitionStatement =
+  requiredIssueTransitionFailClosedStatement(
+    'fail-closed financial issue transition',
+    'CREATE OR REPLACE FUNCTION "public"."plan6b_validate_issue_transition"()'
+  );
+const failClosedFinancialIssueTransitionSettingPredicates = [
+  /COALESCE\(\s*pg_catalog\.current_setting\(\s*'pale_orbit\.financial_worker_issue_resolution',\s*true\s*\)\s*=\s*OLD\.id::text,\s*false\s*\)/u,
+  /COALESCE\(\s*pg_catalog\.current_setting\(\s*'pale_orbit\.plan6bii_financial_admin_issue_resolution_issue_id',\s*true\s*\)\s*=\s*OLD\.id::text,\s*false\s*\)/u,
+  /COALESCE\(\s*pg_catalog\.current_setting\(\s*'pale_orbit\.plan6bii_financial_admin_issue_resolution_command_id',\s*true\s*\)\s*~\s*'\^\[0-9a-f-\]\{36\}\$',\s*false\s*\)/u,
+  /COALESCE\(\s*pg_catalog\.current_setting\(\s*'pale_orbit\.plan6bii_financial_admin_issue_resolution_actor_id',\s*true\s*\)\s*=\s*NEW\.resolved_by_admin_id::text,\s*false\s*\)/u
+] as const;
+if (
+  !vulnerableFinancialIssueTransitionStatement.includes(
+    'IF NOT (worker_resolution OR admin_resolution) THEN'
+  ) ||
+  failClosedFinancialIssueTransitionSettingPredicates.some(
+    (predicate) => !predicate.test(failClosedFinancialIssueTransitionStatement)
+  ) ||
+  !failClosedFinancialIssueTransitionStatement.includes(
+    'IF NOT COALESCE(worker_resolution OR admin_resolution, false) THEN'
+  ) ||
+  vulnerableFinancialIssueTransitionStatement ===
+    failClosedFinancialIssueTransitionStatement
+) {
+  throw new Error(
+    '[restore-verifier] financial issue transition predecessor/fix contract is invalid'
+  );
+}
 const financialJobsRuntimeSelectRevokeStatement = requiredAdminCommandAuthorityStatement(
   'financial jobs runtime select revoke',
   'REVOKE SELECT ON TABLE "public"."jobs" FROM "pale_orbit_runtime"'
@@ -569,8 +634,34 @@ function financialCatalogContractSql(): string {
 )`;
 }
 
+function financialCatalogCalibrationContractSql(): string {
+  const contract = financialCatalogContractSql();
+  const expectedCatalogDetails = Array.from(
+    contract.matchAll(/\$catalog\$[\s\S]*?\$catalog\$::jsonb/gu)
+  );
+  const catalogDelimiterCount = contract.split('$catalog$').length - 1;
+  if (
+    expectedCatalogDetails.length === 0 ||
+    catalogDelimiterCount !== expectedCatalogDetails.length * 2
+  ) {
+    throw new Error(
+      '[restore-verifier] exact catalog expected-details boundaries are invalid'
+    );
+  }
+  const calibrationContract = contract.replace(
+    /\$catalog\$[\s\S]*?\$catalog\$::jsonb/gu,
+    () => 'null::jsonb'
+  );
+  if (calibrationContract.includes('$catalog$')) {
+    throw new Error(
+      '[restore-verifier] exact catalog calibration retained an expected-details delimiter'
+    );
+  }
+  return calibrationContract;
+}
+
 function financialCatalogCalibrationSql(): string {
-  return `${financialCatalogContractSql()}
+  return `${financialCatalogCalibrationContractSql()}
 select required.object_kind, required.schema_name, required.parent_name,
   required.object_name, required.identity_arguments,
   actual.actual_catalog::text as actual_catalog_json
@@ -613,6 +704,19 @@ async function printCatalogContractCalibration(): Promise<void> {
     seenKeys.add(key);
     if (typeof row.actual_catalog_json !== 'string') {
       throw new Error(`[restore-verifier] missing calibrated catalog object ${key}`);
+    }
+    let actualCatalogDetails: unknown;
+    try {
+      actualCatalogDetails = JSON.parse(row.actual_catalog_json);
+    } catch {
+      throw new Error(`[restore-verifier] invalid calibrated catalog JSON ${key}`);
+    }
+    if (
+      actualCatalogDetails === null ||
+      typeof actualCatalogDetails !== 'object' ||
+      Array.isArray(actualCatalogDetails)
+    ) {
+      throw new Error(`[restore-verifier] invalid calibrated catalog details ${key}`);
     }
     if (row.actual_catalog_json.includes('$catalog$')) {
       throw new Error(`[restore-verifier] unsafe catalog delimiter in ${key}`);
@@ -2261,6 +2365,14 @@ async function exerciseInvariantWitnesses(): Promise<void> {
   );
   await pool.query(rejectHistoryFunctionDefinition);
   await expectPass('required function definition repair', true);
+
+  await pool.query(vulnerableFinancialIssueTransitionStatement);
+  await expectRejection(
+    'fail-open financial issue transition predecessor',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(failClosedFinancialIssueTransitionStatement);
+  await expectPass('fail-closed financial issue transition repair', true);
 
   await pool.query(`
     create function public.plan6b_reject_history_mutation(value integer)

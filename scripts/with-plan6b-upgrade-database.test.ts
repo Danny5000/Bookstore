@@ -168,7 +168,7 @@ function partialStartupDocker(owned: OwnedRunManifest, state: FakeDockerState): 
 }
 
 describe('Plan 6B disposable upgrade database ownership', () => {
-  it('keeps historical rollback proofs while repaired and valid flows reach 0013 once', async () => {
+  it('keeps historical rollback proofs while repaired and valid flows reach 0014 once', async () => {
     const [journalText, fixture, packageText] = await Promise.all([
       readFile('drizzle/meta/_journal.json', 'utf8'),
       readFile('tests/integration/financial-migration.test.ts', 'utf8'),
@@ -186,11 +186,11 @@ describe('Plan 6B disposable upgrade database ownership', () => {
     };
 
     expect(journal.entries.map(({ idx }) => idx)).toEqual(
-      Array.from({ length: 14 }, (_value, idx) => idx)
+      Array.from({ length: 15 }, (_value, idx) => idx)
     );
     expect(journal.entries.at(-1)).toEqual(expect.objectContaining({
-      idx: 13,
-      tag: '0013_plan6bii_reporting_correction_authority'
+      idx: 14,
+      tag: '0014_plan6bii_issue_transition_fail_closed'
     }));
     const packageManifest = JSON.parse(packageText) as { scripts: Record<string, string> };
     expect(packageManifest.scripts['test:plan6b-upgrade']).toBe(
@@ -200,7 +200,7 @@ describe('Plan 6B disposable upgrade database ownership', () => {
       .toBe('node --import tsx scripts/plan6b-production-smoke.ts');
     expect(Object.hasOwn(packageManifest.scripts, 'smoke:plan6b-i')).toBe(false);
     expect(fixture).toContain(
-      'maxMigrationIndex: 8 | 9 | 10 | 11 | 12 | 13'
+      'maxMigrationIndex: 8 | 9 | 10 | 11 | 12 | 13 | 14'
     );
 
     const repairedHeadCall = 'await runRepairedFixtureThroughPlan6biiHead(pool';
@@ -237,11 +237,12 @@ describe('Plan 6B disposable upgrade database ownership', () => {
       'async function runRepairedFixtureThroughPlan6biiHead(',
       'const REPORTING_CORRECTION_RESOLVER ='
     );
-    expect(headHelper).toContain('createMigrationFolderThrough(13)');
-    expect(headHelper).toContain("equal(await migrationCount(pool), 14");
-    expect(headHelper.match(/runCommittedPlan6biiAttestedMigration\(/gu)).toHaveLength(4);
+    expect(headHelper).toContain('createMigrationFolderThrough(14)');
+    expect(headHelper).toContain("equal(await migrationCount(pool), 15");
+    expect(headHelper.match(/runCommittedPlan6biiAttestedMigration\(/gu)).toHaveLength(6);
     expect(headHelper).toContain('second 0012 migration pass is a no-op');
     expect(headHelper).toContain('second 0013 migration pass is a no-op');
+    expect(headHelper).toContain('second 0014 migration pass is a no-op');
 
     const correctionAuthorityHelper = block(
       'const REPORTING_CORRECTION_RESOLVER =',

@@ -218,7 +218,7 @@ function databasePool(): Pool {
 }
 
 async function createMigrationFolderThrough(
-  maxMigrationIndex: 8 | 9 | 10 | 11 | 12 | 13
+  maxMigrationIndex: 8 | 9 | 10 | 11 | 12 | 13 | 14
 ): Promise<string> {
   const runId = process.env.PLAN6B_UPGRADE_RUN_ID;
   assert(runId && /^[a-f0-9]{16}$/u.test(runId), 'owned run ID is missing or invalid');
@@ -915,7 +915,7 @@ async function seedInvalidLegacyFixture(
   }
 }
 
-async function migrationCount(pool: Pool): Promise<number> {
+async function migrationCount(pool: Pool | PoolClient): Promise<number> {
   const row = await one<{ count: string }>(
     pool,
     `select count(*)::text as count from drizzle.__drizzle_migrations`
@@ -2971,6 +2971,7 @@ async function runRepairedFixtureThroughPlan6biiHead(
   equal(await migrationCount(pool), 12, `${fixture} reaches historical prerequisite 0011`);
   const migrationsThrough12 = await createMigrationFolderThrough(12);
   const migrationsThrough13 = await createMigrationFolderThrough(13);
+  const migrationsThrough14 = await createMigrationFolderThrough(14);
   try {
     await createPlan6biiAttestedRoles(pool, 0b111);
     await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough12);
@@ -2988,6 +2989,14 @@ async function runRepairedFixtureThroughPlan6biiHead(
       await migrationCount(pool),
       14,
       `${fixture} second 0013 migration pass is a no-op`
+    );
+    await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough14);
+    equal(await migrationCount(pool), 15, `${fixture} reaches migration 0014 exactly once`);
+    await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough14);
+    equal(
+      await migrationCount(pool),
+      15,
+      `${fixture} second 0014 migration pass is a no-op`
     );
   } finally {
     await dropPlan6biiAttestedRoles(pool);
@@ -3193,6 +3202,1582 @@ async function assertReportingCorrectionAuthorityUpgrade(pool: Pool): Promise<vo
   }, '0013 installs one exact database-owner correction resolver with worker-only EXECUTE');
   await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough13);
   equal(await migrationCount(pool), 14, 'a second 0013 migrator pass is a no-op');
+}
+
+const ISSUE_TRANSITION_ROUTINE = 'public.plan6b_validate_issue_transition()';
+const PLAN6BII_VULNERABLE_ISSUE_TRANSITION_SHA256 =
+  '33a6441df520bf0c6ed486f7c3b8585ad719683dfe73835eb62176d5bbf898c8';
+const PLAN6BII_FIXED_ISSUE_TRANSITION_SHA256 =
+  'a921aec3b466cdcdc47b6583065d171179d816159d25ec634c57521a7e0f2c81';
+const PLAN6BII_REPORTING_CORRECTION_RESOLVER_SHA256 =
+  'c6e086b30db8e85c5bc38107ceab36f4b41ad5c5a152e75b5e862c607c3a60e8';
+const PLAN6BII_AUDIT_INSERT_GUARD_SHA256 =
+  'f0373a347c369035f1c8b68d6eb4238a33612b0fa6e82e2ecfaa0ebf10e0696b';
+
+interface IssueTransitionRoutineState {
+  routine_definition: string;
+  definition_sha256: string;
+  owner_name: string;
+  database_owner_name: string;
+  acl_entries: string[];
+}
+
+interface RoutineDefinitionState {
+  routine_definition: string;
+  definition_sha256: string;
+}
+
+interface RoutineMetadataState {
+  owner_name: string;
+  language_name: string;
+  result_type: string;
+  argument_types: string;
+  routine_kind: string;
+  volatility: string;
+  parallel_safety: string;
+  security_definer: boolean;
+  leakproof: boolean;
+  strict: boolean;
+  returns_set: boolean;
+  routine_config: string[] | null;
+  acl_entries: string[];
+}
+
+interface IssueTransitionTriggerState {
+  trigger_oid: string;
+  relation_oid: string;
+  routine_oid: string;
+  trigger_name: string;
+  enabled: string;
+  trigger_type: number;
+  argument_count: number;
+  arguments_hex: string;
+  attribute_numbers: string;
+  when_expression: string | null;
+  trigger_definition: string;
+}
+
+async function issueTransitionRoutineState(
+  pool: Pool | PoolClient
+): Promise<IssueTransitionRoutineState> {
+  return one<IssueTransitionRoutineState>(
+    pool,
+    `select
+       pg_catalog.pg_get_functiondef(routine.oid) as routine_definition,
+       pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
+         pg_catalog.replace(pg_catalog.replace(
+           pg_catalog.pg_get_functiondef(routine.oid), E'\\r\\n', E'\\n'
+         ), E'\\r', E'\\n'), 'UTF8'
+       )), 'hex') as definition_sha256,
+       pg_catalog.pg_get_userbyid(routine.proowner) as owner_name,
+       pg_catalog.pg_get_userbyid(database_row.datdba) as database_owner_name,
+       array(
+         select pg_catalog.concat_ws(':',
+           case when privilege.grantee = routine.proowner
+             then 'DATABASE_OWNER' else grantee.rolname::text end,
+           case when privilege.grantor = routine.proowner
+             then 'DATABASE_OWNER' else grantor.rolname::text end,
+           privilege.privilege_type::text,
+           privilege.is_grantable::text
+         )
+         from pg_catalog.aclexplode(coalesce(
+           routine.proacl, pg_catalog.acldefault('f', routine.proowner)
+         )) privilege
+         join pg_catalog.pg_roles grantor on grantor.oid = privilege.grantor
+         left join pg_catalog.pg_roles grantee on grantee.oid = privilege.grantee
+         order by 1
+       ) as acl_entries
+     from pg_catalog.pg_proc routine
+     cross join pg_catalog.pg_database database_row
+     where routine.oid = pg_catalog.to_regprocedure($1)
+       and database_row.datname = pg_catalog.current_database()`,
+    [ISSUE_TRANSITION_ROUTINE]
+  );
+}
+
+async function routineDefinitionState(
+  pool: Pool,
+  signature: string
+): Promise<RoutineDefinitionState> {
+  return one<RoutineDefinitionState>(
+    pool,
+    `select
+       pg_catalog.pg_get_functiondef(routine.oid) as routine_definition,
+       pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
+         pg_catalog.replace(pg_catalog.replace(
+           pg_catalog.pg_get_functiondef(routine.oid), E'\\r\\n', E'\\n'
+         ), E'\\r', E'\\n'), 'UTF8'
+       )), 'hex') as definition_sha256
+     from pg_catalog.pg_proc routine
+     where routine.oid = pg_catalog.to_regprocedure($1)`,
+    [signature]
+  );
+}
+
+async function routineMetadataState(
+  pool: Pool,
+  signature: string
+): Promise<RoutineMetadataState> {
+  return one<RoutineMetadataState>(
+    pool,
+    `select
+       pg_catalog.pg_get_userbyid(routine.proowner) as owner_name,
+       language_row.lanname::text as language_name,
+       pg_catalog.pg_get_function_result(routine.oid) as result_type,
+       pg_catalog.pg_get_function_arguments(routine.oid) as argument_types,
+       routine.prokind::text as routine_kind,
+       routine.provolatile::text as volatility,
+       routine.proparallel::text as parallel_safety,
+       routine.prosecdef as security_definer,
+       routine.proleakproof as leakproof,
+       routine.proisstrict as strict,
+       routine.proretset as returns_set,
+       routine.proconfig as routine_config,
+       array(
+         select pg_catalog.concat_ws(':',
+           case when privilege.grantee = routine.proowner
+             then 'ROUTINE_OWNER' else grantee.rolname::text end,
+           case when privilege.grantor = routine.proowner
+             then 'ROUTINE_OWNER' else grantor.rolname::text end,
+           privilege.privilege_type::text,
+           privilege.is_grantable::text
+         )
+         from pg_catalog.aclexplode(coalesce(
+           routine.proacl, pg_catalog.acldefault('f', routine.proowner)
+         )) privilege
+         join pg_catalog.pg_roles grantor on grantor.oid = privilege.grantor
+         left join pg_catalog.pg_roles grantee on grantee.oid = privilege.grantee
+         order by 1
+       ) as acl_entries
+     from pg_catalog.pg_proc routine
+     join pg_catalog.pg_language language_row on language_row.oid = routine.prolang
+     where routine.oid = pg_catalog.to_regprocedure($1)`,
+    [signature]
+  );
+}
+
+async function issueTransitionTriggerState(
+  pool: Pool | PoolClient
+): Promise<IssueTransitionTriggerState> {
+  return one<IssueTransitionTriggerState>(
+    pool,
+    `select
+       trigger_row.oid::text as trigger_oid,
+       trigger_row.tgrelid::text as relation_oid,
+       trigger_row.tgfoid::text as routine_oid,
+       trigger_row.tgname::text as trigger_name,
+       trigger_row.tgenabled::text as enabled,
+       trigger_row.tgtype::integer as trigger_type,
+       trigger_row.tgnargs::integer as argument_count,
+       pg_catalog.encode(trigger_row.tgargs, 'hex') as arguments_hex,
+       trigger_row.tgattr::text as attribute_numbers,
+       pg_catalog.pg_get_expr(trigger_row.tgqual, trigger_row.tgrelid)
+         as when_expression,
+       pg_catalog.pg_get_triggerdef(trigger_row.oid, false) as trigger_definition
+     from pg_catalog.pg_trigger trigger_row
+     where trigger_row.tgrelid =
+         'public.financial_reconciliation_issues'::pg_catalog.regclass
+       and trigger_row.tgname = 'financial_reconciliation_issues_narrow_update'
+       and not trigger_row.tgisinternal`
+  );
+}
+
+async function expectIssueTransitionRepairPreflightFailure(
+  pool: Pool,
+  migrationsThrough14: string,
+  driftedState: IssueTransitionRoutineState
+): Promise<void> {
+  let rejected = false;
+  try {
+    await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough14);
+  } catch (error) {
+    rejected = true;
+    const postgresError = unwrapPostgresError(error);
+    assert(postgresError !== null, '0014 definition drift must expose its PostgreSQL error');
+    equal(postgresError.code, '42501', '0014 definition drift must use insufficient privilege');
+    assert(
+      /issue-transition repair predecessor definition is not canonical/iu.test(
+        postgresError.message
+      ),
+      '0014 definition drift must identify its exact predecessor-definition preflight'
+    );
+  }
+  assert(rejected, '0014 definition drift unexpectedly migrated');
+  equal(await migrationCount(pool), 14, '0014 definition drift rollback leaves the journal at 0013');
+  equal(
+    await issueTransitionRoutineState(pool),
+    driftedState,
+    '0014 definition drift rollback leaves the pre-existing routine unchanged'
+  );
+}
+
+async function expectResolverDefinitionRepairPreflightFailure(
+  pool: Pool,
+  migrationsThrough14: string,
+  driftedDefinition: RoutineDefinitionState,
+  unchangedMetadata: RoutineMetadataState
+): Promise<void> {
+  let rejected = false;
+  try {
+    await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough14);
+  } catch (error) {
+    rejected = true;
+    const postgresError = unwrapPostgresError(error);
+    assert(postgresError !== null, '0014 resolver definition drift must expose its PostgreSQL error');
+    equal(
+      postgresError.code,
+      '42501',
+      '0014 resolver definition drift must use insufficient privilege'
+    );
+    assert(
+      /issue-transition repair resolver authority is not canonical/iu.test(
+        postgresError.message
+      ),
+      '0014 resolver definition drift must identify the resolver-authority preflight'
+    );
+  }
+  assert(rejected, '0014 resolver definition drift unexpectedly migrated');
+  equal(
+    await migrationCount(pool),
+    14,
+    '0014 resolver definition drift rollback leaves the journal at 0013'
+  );
+  equal(
+    await routineDefinitionState(pool, REPORTING_CORRECTION_RESOLVER),
+    driftedDefinition,
+    '0014 resolver definition drift rollback leaves the pre-existing body unchanged'
+  );
+  equal(
+    await routineMetadataState(pool, REPORTING_CORRECTION_RESOLVER),
+    unchangedMetadata,
+    '0014 resolver definition drift rollback leaves all resolver metadata unchanged'
+  );
+}
+
+async function expectAuditGuardDefinitionRepairPreflightFailure(
+  pool: Pool,
+  migrationsThrough14: string,
+  predecessor: IssueTransitionRoutineState,
+  triggerBefore: IssueTransitionTriggerState
+): Promise<void> {
+  const signature = 'public.plan6b_guard_audit_insert()';
+  const cleanDefinition = await routineDefinitionState(pool, signature);
+  const cleanMetadata = await routineMetadataState(pool, signature);
+  equal(
+    cleanDefinition.definition_sha256,
+    PLAN6BII_AUDIT_INSERT_GUARD_SHA256,
+    '0013 retains the exact normalized audit-insert guard definition'
+  );
+  await pool.query(`
+    create or replace function public.plan6b_guard_audit_insert()
+    returns trigger language plpgsql
+    set search_path = 'pg_catalog'
+    as $plan6bii_0014_audit_guard_definition_drift$
+    begin
+      return null;
+    end;
+    $plan6bii_0014_audit_guard_definition_drift$
+  `);
+  const driftedDefinition = await routineDefinitionState(pool, signature);
+  assert(
+    driftedDefinition.definition_sha256 !== cleanDefinition.definition_sha256,
+    '0014 audit-guard fixture must change the body definition'
+  );
+  equal(
+    await routineMetadataState(pool, signature),
+    cleanMetadata,
+    '0014 audit-guard fixture changes the body without metadata drift'
+  );
+  try {
+    let rejected = false;
+    try {
+      await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough14);
+    } catch (error) {
+      rejected = true;
+      const postgresError = unwrapPostgresError(error);
+      assert(postgresError !== null, '0014 audit-guard drift must expose PostgreSQL');
+      equal(postgresError.code, '42501', '0014 audit-guard drift must use insufficient privilege');
+      assert(
+        /issue-transition repair guard authority is not canonical/iu.test(
+          postgresError.message
+        ),
+        '0014 audit-guard drift must identify the guard-authority preflight'
+      );
+    }
+    assert(rejected, '0014 audit-guard drift unexpectedly migrated');
+    equal(
+      await migrationCount(pool),
+      14,
+      '0014 audit-guard drift rollback leaves the journal at 0013'
+    );
+    equal(
+      await issueTransitionRoutineState(pool),
+      predecessor,
+      '0014 audit-guard drift rollback occurs before transition-function mutation'
+    );
+    equal(
+      await issueTransitionTriggerState(pool),
+      triggerBefore,
+      '0014 audit-guard drift rollback leaves the transition trigger unchanged'
+    );
+    equal(
+      await routineDefinitionState(pool, signature),
+      driftedDefinition,
+      '0014 audit-guard drift rollback preserves the changed body until cleanup'
+    );
+  } finally {
+    await pool.query(cleanDefinition.routine_definition);
+  }
+  equal(
+    await routineDefinitionState(pool, signature),
+    cleanDefinition,
+    '0014 audit-guard fixture restores the exact normalized 0013 definition'
+  );
+  equal(
+    await routineMetadataState(pool, signature),
+    cleanMetadata,
+    '0014 audit-guard fixture restores exact clean metadata before continuing'
+  );
+}
+
+interface ResolutionProvenanceState {
+  issue: Record<string, unknown> | null;
+  resolution_audits: Array<Record<string, unknown>>;
+}
+
+interface RelationIdentityState {
+  relation_oid: string;
+  namespace_name: string;
+  owner_name: string;
+  relation_kind: string;
+  persistence: string;
+  is_partition: boolean;
+  row_security: boolean;
+  force_row_security: boolean;
+}
+
+async function relationIdentityState(
+  pool: Pool,
+  relationName: string
+): Promise<RelationIdentityState> {
+  return one<RelationIdentityState>(
+    pool,
+    `select
+       relation_row.oid::text as relation_oid,
+       namespace_row.nspname::text as namespace_name,
+       pg_catalog.pg_get_userbyid(relation_row.relowner) as owner_name,
+       relation_row.relkind::text as relation_kind,
+       relation_row.relpersistence::text as persistence,
+       relation_row.relispartition as is_partition,
+       relation_row.relrowsecurity as row_security,
+       relation_row.relforcerowsecurity as force_row_security
+     from pg_catalog.pg_class relation_row
+     join pg_catalog.pg_namespace namespace_row
+       on namespace_row.oid = relation_row.relnamespace
+     where relation_row.oid = pg_catalog.to_regclass($1)`,
+    [relationName]
+  );
+}
+
+async function expectRelationIdentityRepairPreflightFailure(
+  pool: Pool,
+  migrationsThrough14: string,
+  predecessor: IssueTransitionRoutineState,
+  triggerBefore: IssueTransitionTriggerState
+): Promise<void> {
+  const relationName = 'public.audit_events';
+  const cleanRelation = await relationIdentityState(pool, relationName);
+  equal(cleanRelation.namespace_name, 'public', '0014 relation fixture begins in public');
+  equal(cleanRelation.relation_kind, 'r', '0014 relation fixture begins as an ordinary table');
+  equal(cleanRelation.persistence, 'p', '0014 relation fixture begins as a permanent table');
+  equal(cleanRelation.is_partition, false, '0014 relation fixture begins as a non-partition');
+  equal(cleanRelation.row_security, false, '0014 relation fixture begins without row security');
+  equal(
+    cleanRelation.force_row_security,
+    false,
+    '0014 relation fixture begins without forced row security'
+  );
+  for (const fixture of [
+    {
+      label: 'ENABLE-only RLS',
+      apply: 'alter table public.audit_events enable row level security',
+      cleanup: 'alter table public.audit_events disable row level security',
+      expectedRowSecurity: true,
+      expectedForceRowSecurity: false
+    },
+    {
+      label: 'FORCE-only RLS',
+      apply: 'alter table public.audit_events force row level security',
+      cleanup: 'alter table public.audit_events no force row level security',
+      expectedRowSecurity: false,
+      expectedForceRowSecurity: true
+    }
+  ] as const) {
+    await pool.query(fixture.apply);
+    const driftedRelation = await relationIdentityState(pool, relationName);
+    equal(
+      driftedRelation.row_security,
+      fixture.expectedRowSecurity,
+      `0014 ${fixture.label} fixture has the exact row-security bit`
+    );
+    equal(
+      driftedRelation.force_row_security,
+      fixture.expectedForceRowSecurity,
+      `0014 ${fixture.label} fixture has the exact force-row-security bit`
+    );
+    try {
+      let rejected = false;
+      try {
+        await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough14);
+      } catch (error) {
+        rejected = true;
+        const postgresError = unwrapPostgresError(error);
+        assert(postgresError !== null, `0014 ${fixture.label} drift must expose PostgreSQL`);
+        equal(
+          postgresError.code,
+          '42501',
+          `0014 ${fixture.label} drift must use insufficient privilege`
+        );
+        assert(
+          /issue-transition repair prerequisite authority is not canonical/iu.test(
+            postgresError.message
+          ),
+          `0014 ${fixture.label} drift must identify the prerequisite-authority preflight`
+        );
+      }
+      assert(rejected, `0014 ${fixture.label} drift unexpectedly migrated`);
+      equal(
+        await migrationCount(pool),
+        14,
+        `0014 ${fixture.label} rollback leaves the journal at 0013`
+      );
+      equal(
+        await issueTransitionRoutineState(pool),
+        predecessor,
+        `0014 ${fixture.label} rollback occurs before transition-function mutation`
+      );
+      equal(
+        await issueTransitionTriggerState(pool),
+        triggerBefore,
+        `0014 ${fixture.label} rollback leaves the transition trigger unchanged`
+      );
+      equal(
+        await relationIdentityState(pool, relationName),
+        driftedRelation,
+        `0014 ${fixture.label} rollback preserves the pre-existing metadata drift`
+      );
+    } finally {
+      await pool.query(fixture.cleanup);
+    }
+    equal(
+      await relationIdentityState(pool, relationName),
+      cleanRelation,
+      `0014 ${fixture.label} fixture restores exact clean table metadata`
+    );
+  }
+}
+
+interface ProtectedCatalogExtensionState {
+  trigger_definitions: string[];
+  rule_definitions: string[];
+  inheritance_edges: string[];
+  worker_resolver_signatures: string[];
+  fixture_routine_definitions: string[];
+}
+
+async function protectedCatalogExtensionState(pool: Pool): Promise<ProtectedCatalogExtensionState> {
+  return one<ProtectedCatalogExtensionState>(
+    pool,
+    `select
+       array(
+         select pg_catalog.pg_get_triggerdef(trigger_row.oid, false)
+         from pg_catalog.pg_trigger trigger_row
+         where trigger_row.tgrelid in (
+           'public.financial_admin_commands'::pg_catalog.regclass,
+           'public.audit_events'::pg_catalog.regclass,
+           'public.financial_reconciliation_issues'::pg_catalog.regclass
+         ) and not trigger_row.tgisinternal
+         order by trigger_row.tgrelid, trigger_row.tgname
+       ) as trigger_definitions,
+       array(
+         select pg_catalog.pg_get_ruledef(rule_row.oid, false)
+         from pg_catalog.pg_rewrite rule_row
+         where rule_row.ev_class in (
+           'public.financial_admin_commands'::pg_catalog.regclass,
+           'public.financial_allocation_sets'::pg_catalog.regclass,
+           'public.audit_events'::pg_catalog.regclass,
+           'public.financial_reconciliation_issues'::pg_catalog.regclass
+         )
+         order by rule_row.ev_class, rule_row.rulename
+       ) as rule_definitions,
+       array(
+         select pg_catalog.concat_ws('>',
+           inheritance_row.inhrelid::pg_catalog.regclass::text,
+           inheritance_row.inhparent::pg_catalog.regclass::text,
+           inheritance_row.inhseqno::text,
+           inheritance_row.inhdetachpending::text
+         )
+         from pg_catalog.pg_inherits inheritance_row
+         where inheritance_row.inhparent in (
+           'public.financial_admin_commands'::pg_catalog.regclass,
+           'public.financial_allocation_sets'::pg_catalog.regclass,
+           'public.audit_events'::pg_catalog.regclass,
+           'public.financial_reconciliation_issues'::pg_catalog.regclass
+         ) or inheritance_row.inhrelid in (
+           'public.financial_admin_commands'::pg_catalog.regclass,
+           'public.financial_allocation_sets'::pg_catalog.regclass,
+           'public.audit_events'::pg_catalog.regclass,
+           'public.financial_reconciliation_issues'::pg_catalog.regclass
+         )
+         order by inheritance_row.inhrelid, inheritance_row.inhparent,
+           inheritance_row.inhseqno
+       ) as inheritance_edges,
+       array(
+         select routine.oid::pg_catalog.regprocedure::text
+         from pg_catalog.pg_proc routine
+         join pg_catalog.pg_namespace namespace_row
+           on namespace_row.oid = routine.pronamespace
+         where namespace_row.nspname = 'public'
+           and routine.proname = 'resolve_financial_issue_after_worker_recompute'
+         order by routine.oid::pg_catalog.regprocedure::text
+       ) as worker_resolver_signatures,
+       array(
+         select pg_catalog.pg_get_functiondef(routine.oid)
+         from pg_catalog.pg_proc routine
+         join pg_catalog.pg_namespace namespace_row
+           on namespace_row.oid = routine.pronamespace
+         where namespace_row.nspname = 'public'
+           and routine.proname like 'plan6bii_0014_%_fixture'
+         order by routine.proname, routine.oid
+       ) as fixture_routine_definitions`
+  );
+}
+
+async function expectProtectedCatalogExtensionFailures(
+  pool: Pool,
+  migrationsThrough14: string,
+  predecessor: IssueTransitionRoutineState,
+  triggerBefore: IssueTransitionTriggerState
+): Promise<void> {
+  const cases = [
+    {
+      label: 'later issue-update trigger',
+      applySql: `
+        create function public.plan6bii_0014_issue_shadow_fixture()
+        returns trigger language plpgsql
+        as $plan6bii_0014_issue_shadow_fixture$
+        begin
+          return new;
+        end;
+        $plan6bii_0014_issue_shadow_fixture$;
+        create trigger zz_plan6bii_0014_issue_shadow
+        before update on public.financial_reconciliation_issues
+        for each row execute function public.plan6bii_0014_issue_shadow_fixture()
+      `,
+      cleanupSql: `
+        drop trigger zz_plan6bii_0014_issue_shadow
+          on public.financial_reconciliation_issues;
+        drop function public.plan6bii_0014_issue_shadow_fixture()
+      `,
+      reason: /issue-transition repair trigger authority is not canonical/iu
+    },
+    {
+      label: 'audit INSERT suppressor rule',
+      applySql: `
+        create rule zz_plan6bii_0014_audit_suppressor as
+        on insert to public.audit_events do instead nothing
+      `,
+      cleanupSql: `
+        drop rule zz_plan6bii_0014_audit_suppressor on public.audit_events
+      `,
+      reason: /issue-transition repair trigger authority is not canonical/iu
+    },
+    {
+      label: 'audit INSERT suppressor trigger',
+      applySql: `
+        create function public.plan6bii_0014_audit_suppressor_fixture()
+        returns trigger language plpgsql
+        as $plan6bii_0014_audit_suppressor_fixture$
+        begin
+          return null;
+        end;
+        $plan6bii_0014_audit_suppressor_fixture$;
+        create trigger zz_plan6bii_0014_audit_suppressor
+        before insert on public.audit_events
+        for each row execute function public.plan6bii_0014_audit_suppressor_fixture()
+      `,
+      cleanupSql: `
+        drop trigger zz_plan6bii_0014_audit_suppressor on public.audit_events;
+        drop function public.plan6bii_0014_audit_suppressor_fixture()
+      `,
+      reason: /issue-transition repair trigger authority is not canonical/iu
+    },
+    {
+      label: 'later command-update shadow trigger',
+      applySql: `
+        create trigger zz_plan6bii_0014_command_shadow
+        before update on public.financial_admin_commands
+        for each row execute function
+          public.plan6bii_guard_financial_admin_command_update()
+      `,
+      cleanupSql: `
+        drop trigger zz_plan6bii_0014_command_shadow
+          on public.financial_admin_commands
+      `,
+      reason: /issue-transition repair trigger authority is not canonical/iu
+    },
+    {
+      label: 'worker-resolver overload',
+      applySql: `
+        create function public.resolve_financial_issue_after_worker_recompute(text,text)
+        returns void language plpgsql as $plan6bii_0014_resolver_overload$
+        begin
+          return;
+        end;
+        $plan6bii_0014_resolver_overload$
+      `,
+      cleanupSql: `
+        drop function public.resolve_financial_issue_after_worker_recompute(text,text)
+      `,
+      reason: /issue-transition repair resolver authority is not canonical/iu
+    },
+    {
+      label: 'traditional issue-table inheritance child',
+      applySql: `
+        create table public.plan6bii_0014_issue_inheritance_child ()
+        inherits (public.financial_reconciliation_issues)
+      `,
+      cleanupSql: `drop table public.plan6bii_0014_issue_inheritance_child`,
+      reason: /issue-transition repair trigger authority is not canonical/iu
+    }
+  ] as const;
+  for (const fixture of cases) {
+    const cleanCatalog = await protectedCatalogExtensionState(pool);
+    await pool.query(fixture.applySql);
+    const driftedCatalog = await protectedCatalogExtensionState(pool);
+    assert(
+      JSON.stringify(driftedCatalog) !== JSON.stringify(cleanCatalog),
+      `0014 ${fixture.label} fixture must change the protected catalog`
+    );
+    try {
+      let rejected = false;
+      try {
+        await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough14);
+      } catch (error) {
+        rejected = true;
+        const postgresError = unwrapPostgresError(error);
+        assert(postgresError !== null, `0014 ${fixture.label} must expose PostgreSQL`);
+        equal(
+          postgresError.code,
+          '42501',
+          `0014 ${fixture.label} must use insufficient privilege`
+        );
+        assert(
+          fixture.reason.test(postgresError.message),
+          `0014 ${fixture.label} must identify its authority preflight`
+        );
+      }
+      assert(rejected, `0014 ${fixture.label} unexpectedly migrated`);
+      equal(
+        await migrationCount(pool),
+        14,
+        `0014 ${fixture.label} rollback leaves the journal at 0013`
+      );
+      equal(
+        await issueTransitionRoutineState(pool),
+        predecessor,
+        `0014 ${fixture.label} rollback occurs before transition-function mutation`
+      );
+      equal(
+        await issueTransitionTriggerState(pool),
+        triggerBefore,
+        `0014 ${fixture.label} rollback leaves the transition trigger unchanged`
+      );
+      equal(
+        await protectedCatalogExtensionState(pool),
+        driftedCatalog,
+        `0014 ${fixture.label} rollback preserves the catalog drift until cleanup`
+      );
+    } finally {
+      await pool.query(fixture.cleanupSql);
+    }
+    equal(
+      await protectedCatalogExtensionState(pool),
+      cleanCatalog,
+      `0014 ${fixture.label} fixture restores the exact clean catalog`
+    );
+  }
+}
+
+async function sessionReplicationParameterAclState(pool: Pool): Promise<string[]> {
+  const state = await one<{ acl_entries: string[] }>(
+    pool,
+    `select array(
+       select pg_catalog.concat_ws(':',
+         grantee.rolname::text,
+         grantor.rolname::text,
+         privilege.privilege_type::text,
+         privilege.is_grantable::text
+       )
+       from pg_catalog.pg_parameter_acl parameter_acl
+       cross join lateral pg_catalog.aclexplode(parameter_acl.paracl) privilege
+       join pg_catalog.pg_roles grantor on grantor.oid = privilege.grantor
+       left join pg_catalog.pg_roles grantee on grantee.oid = privilege.grantee
+       where parameter_acl.parname = 'session_replication_role'
+       order by 1
+     ) as acl_entries`
+  );
+  return state.acl_entries;
+}
+
+async function expectSessionReplicationParameterAclFailure(
+  pool: Pool,
+  migrationsThrough14: string,
+  predecessor: IssueTransitionRoutineState,
+  triggerBefore: IssueTransitionTriggerState
+): Promise<void> {
+  const cleanAcl = await sessionReplicationParameterAclState(pool);
+  await pool.query(`
+    grant set on parameter session_replication_role
+    to pale_orbit_financial_worker
+  `);
+  const driftedAcl = await sessionReplicationParameterAclState(pool);
+  assert(
+    JSON.stringify(driftedAcl) !== JSON.stringify(cleanAcl),
+    '0014 parameter-ACL fixture must grant protected SET authority'
+  );
+  try {
+    let rejected = false;
+    try {
+      await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough14);
+    } catch (error) {
+      rejected = true;
+      const postgresError = unwrapPostgresError(error);
+      assert(postgresError !== null, '0014 parameter-ACL fixture must expose PostgreSQL');
+      equal(postgresError.code, '42501', '0014 parameter-ACL fixture must use insufficient privilege');
+      assert(
+        /issue-transition repair parameter ACL is not canonical/iu.test(
+          postgresError.message
+        ),
+        '0014 parameter-ACL fixture must identify its protected-parameter preflight'
+      );
+    }
+    assert(rejected, '0014 parameter-ACL fixture unexpectedly migrated');
+    equal(
+      await migrationCount(pool),
+      14,
+      '0014 parameter-ACL rollback leaves the journal at 0013'
+    );
+    equal(
+      await issueTransitionRoutineState(pool),
+      predecessor,
+      '0014 parameter-ACL rollback occurs before transition-function mutation'
+    );
+    equal(
+      await issueTransitionTriggerState(pool),
+      triggerBefore,
+      '0014 parameter-ACL rollback leaves the transition trigger unchanged'
+    );
+    equal(
+      await sessionReplicationParameterAclState(pool),
+      driftedAcl,
+      '0014 parameter-ACL rollback preserves the unsafe grant until cleanup'
+    );
+  } finally {
+    await pool.query(`
+      revoke set on parameter session_replication_role
+      from pale_orbit_financial_worker
+    `);
+  }
+  equal(
+    await sessionReplicationParameterAclState(pool),
+    cleanAcl,
+    '0014 parameter-ACL fixture restores the exact clean parameter ACL'
+  );
+}
+
+interface SessionReplicationSettingDefaultState {
+  setting_rows: Array<{
+    roleName: string;
+    databaseName: string;
+    settings: string[];
+  }>;
+}
+
+async function sessionReplicationSettingDefaultState(
+  client: Pool | PoolClient
+): Promise<SessionReplicationSettingDefaultState> {
+  return one<SessionReplicationSettingDefaultState>(
+    client,
+    `select coalesce(pg_catalog.jsonb_agg(
+       pg_catalog.jsonb_build_object(
+         'roleName', case when setting_row.setrole = 0 then 'ALL'
+           else pg_catalog.pg_get_userbyid(setting_row.setrole)::text end,
+         'databaseName', case when setting_row.setdatabase = 0 then 'ALL'
+           else database_row.datname::text end,
+         'settings', setting_row.setconfig
+       ) order by setting_row.setrole, setting_row.setdatabase
+     ), '[]'::jsonb) as setting_rows
+     from pg_catalog.pg_db_role_setting setting_row
+     left join pg_catalog.pg_database database_row
+       on database_row.oid = setting_row.setdatabase
+     where exists (
+       select 1
+       from pg_catalog.unnest(setting_row.setconfig) configured(value)
+       where pg_catalog.split_part(configured.value, '=', 1) =
+         'session_replication_role'
+     )`
+  );
+}
+
+async function expectSessionReplicationSettingDefaultFailures(
+  pool: Pool,
+  migrationsThrough14: string,
+  predecessor: IssueTransitionRoutineState,
+  triggerBefore: IssueTransitionTriggerState
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    const identity = await one<{ owner_name: string; database_name: string }>(
+      client,
+      `select current_user::text as owner_name,
+         pg_catalog.current_database()::text as database_name`
+    );
+    const databaseSet = (await one<{ statement: string }>(
+      client,
+      `select pg_catalog.format(
+         'alter database %I set session_replication_role = replica',
+         pg_catalog.current_database()
+       ) as statement`
+    )).statement;
+    const databaseReset = (await one<{ statement: string }>(
+      client,
+      `select pg_catalog.format(
+         'alter database %I reset session_replication_role',
+         pg_catalog.current_database()
+       ) as statement`
+    )).statement;
+    for (const fixture of [
+      {
+        label: 'database/global replica default',
+        apply: databaseSet,
+        cleanup: databaseReset,
+        expectedRole: 'ALL',
+        expectedDatabase: identity.database_name
+      },
+      {
+        label: 'database-owner/global replica default',
+        apply: 'alter role current_user set session_replication_role = replica',
+        cleanup: 'alter role current_user reset session_replication_role',
+        expectedRole: identity.owner_name,
+        expectedDatabase: 'ALL'
+      }
+    ] as const) {
+      const cleanDefaults = await sessionReplicationSettingDefaultState(client);
+      await client.query(fixture.apply);
+      const driftedDefaults = await sessionReplicationSettingDefaultState(client);
+      assert(
+        driftedDefaults.setting_rows.some((row) =>
+          row.roleName === fixture.expectedRole &&
+          row.databaseName === fixture.expectedDatabase &&
+          row.settings.includes('session_replication_role=replica')
+        ),
+        `0014 ${fixture.label} fixture must persist the exact replica default scope`
+      );
+      equal(
+        (await one<{ replication_role: string }>(
+          client,
+          `select pg_catalog.current_setting(
+             'session_replication_role'
+           ) as replication_role`
+        )).replication_role,
+        'origin',
+        `0014 ${fixture.label} fixture keeps the pinned migration session at origin`
+      );
+      try {
+        let rejected = false;
+        try {
+          await migrateDatabase(
+            drizzle(client),
+            PLAN6BII_ATTESTED_IDENTITIES,
+            migrationsThrough14
+          );
+        } catch (error) {
+          rejected = true;
+          const postgresError = unwrapPostgresError(error);
+          assert(postgresError !== null, `0014 ${fixture.label} must expose PostgreSQL`);
+          equal(
+            postgresError.code,
+            '42501',
+            `0014 ${fixture.label} must use insufficient privilege`
+          );
+          equal(
+            postgresError.message,
+            'Plan 6B-II issue-transition repair session-replication default is not canonical',
+            `0014 ${fixture.label} must expose the exact setting-default preflight message`
+          );
+        }
+        assert(rejected, `0014 ${fixture.label} unexpectedly migrated`);
+        await assertPlan6biiMigrationSettingsCleared(client);
+        equal(
+          await migrationCount(client),
+          14,
+          `0014 ${fixture.label} rollback leaves the journal at 0013`
+        );
+        equal(
+          await issueTransitionRoutineState(client),
+          predecessor,
+          `0014 ${fixture.label} rollback occurs before transition-function mutation`
+        );
+        equal(
+          await issueTransitionTriggerState(client),
+          triggerBefore,
+          `0014 ${fixture.label} rollback leaves the transition trigger unchanged`
+        );
+        equal(
+          await sessionReplicationSettingDefaultState(client),
+          driftedDefaults,
+          `0014 ${fixture.label} rollback preserves the unsafe default until cleanup`
+        );
+      } finally {
+        await client.query(fixture.cleanup);
+      }
+      equal(
+        await sessionReplicationSettingDefaultState(client),
+        cleanDefaults,
+        `0014 ${fixture.label} fixture restores the exact clean setting defaults`
+      );
+    }
+  } finally {
+    client.release();
+  }
+}
+
+async function resolutionProvenanceState(
+  pool: Pool,
+  issueId: string
+): Promise<ResolutionProvenanceState> {
+  return one<ResolutionProvenanceState>(
+    pool,
+    `select
+       (select pg_catalog.to_jsonb(issue)
+        from public.financial_reconciliation_issues issue
+        where issue.id = $1) as issue,
+       coalesce((
+         select pg_catalog.jsonb_agg(pg_catalog.to_jsonb(audit) order by audit.id)
+         from public.audit_events audit
+         where audit.action = 'financial.issue.resolved'
+           and audit.resource_type = 'financial_issue'
+           and audit.resource_id = $1::text
+       ), '[]'::jsonb) as resolution_audits`,
+    [issueId]
+  );
+}
+
+async function runReplicaTransaction(
+  pool: Pool,
+  callback: (client: PoolClient) => Promise<void>
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    await client.query('set local session_replication_role = replica');
+    await callback(client);
+    await client.query('commit');
+  } catch (error) {
+    await client.query('rollback');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function runReplicaIssueMutation(
+  pool: Pool,
+  statement: string,
+  values: unknown[]
+): Promise<void> {
+  await runReplicaTransaction(pool, async (client) => {
+    await client.query(statement, values);
+  });
+}
+
+async function expectMissingResolutionAuditRepairPreflightFailure(
+  pool: Pool,
+  migrationsThrough14: string,
+  predecessor: IssueTransitionRoutineState,
+  triggerBefore: IssueTransitionTriggerState
+): Promise<void> {
+  const issueId = randomUUID();
+  await runReplicaIssueMutation(
+    pool,
+    `insert into public.financial_reconciliation_issues
+       (id, resource_type, resource_id, safe_code, state, impact,
+        occurrence_count, correlation_id, resolved_at)
+     values ($1, 'payment', $2, 'missing_source', 'resolved', 'pending',
+       1, 'migration-0014-missing-resolution-audit', pg_catalog.clock_timestamp())`,
+    [issueId, randomUUID()]
+  );
+  const provenanceBefore = await resolutionProvenanceState(pool, issueId);
+  assert(
+    provenanceBefore.issue !== null,
+    '0014 missing-audit fixture must seed one resolved financial issue'
+  );
+  equal(
+    provenanceBefore.resolution_audits,
+    [],
+    '0014 missing-audit fixture begins without a resolution audit'
+  );
+  try {
+    let rejected = false;
+    try {
+      await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough14);
+    } catch (error) {
+      rejected = true;
+      const postgresError = unwrapPostgresError(error);
+      assert(postgresError !== null, '0014 missing-audit fixture must expose its PostgreSQL error');
+      equal(
+        postgresError.code,
+        '23514',
+        '0014 missing-audit fixture must use check violation'
+      );
+      assert(
+        /issue-transition repair found invalid resolution audit provenance/iu.test(
+          postgresError.message
+        ),
+        '0014 missing-audit fixture must identify its resolution-provenance preflight'
+      );
+    }
+    assert(rejected, '0014 missing-audit fixture unexpectedly migrated');
+    equal(
+      await migrationCount(pool),
+      14,
+      '0014 missing-audit rollback leaves the journal at 0013'
+    );
+    equal(
+      await issueTransitionRoutineState(pool),
+      predecessor,
+      '0014 missing-audit rollback occurs before issue-transition function mutation'
+    );
+    equal(
+      await issueTransitionTriggerState(pool),
+      triggerBefore,
+      '0014 missing-audit rollback leaves the issue-transition trigger unchanged'
+    );
+    equal(
+      await resolutionProvenanceState(pool, issueId),
+      provenanceBefore,
+      '0014 missing-audit rollback leaves the invalid resolved-issue state unchanged'
+    );
+  } finally {
+    await runReplicaIssueMutation(
+      pool,
+      'delete from public.financial_reconciliation_issues where id = $1',
+      [issueId]
+    );
+  }
+  equal(
+    await resolutionProvenanceState(pool, issueId),
+    { issue: null, resolution_audits: [] },
+    '0014 missing-audit fixture removes its replica-seeded issue before continuing'
+  );
+}
+
+interface InvalidAdminResolutionFixture {
+  issueId: string;
+  auditId: string;
+  commandId: string;
+}
+
+interface AdminResolutionProvenanceState {
+  issue: Record<string, unknown> | null;
+  resolution_audits: Array<Record<string, unknown>>;
+  command: Record<string, unknown> | null;
+}
+
+async function adminResolutionProvenanceState(
+  pool: Pool,
+  fixture: InvalidAdminResolutionFixture
+): Promise<AdminResolutionProvenanceState> {
+  return one<AdminResolutionProvenanceState>(
+    pool,
+    `select
+       (select pg_catalog.to_jsonb(issue)
+        from public.financial_reconciliation_issues issue
+        where issue.id = $1) as issue,
+       coalesce((
+         select pg_catalog.jsonb_agg(pg_catalog.to_jsonb(audit) order by audit.id)
+         from public.audit_events audit
+         where audit.action = 'financial.issue.resolved'
+           and audit.resource_type = 'financial_issue'
+           and audit.resource_id = $1::text
+       ), '[]'::jsonb) as resolution_audits,
+       (select pg_catalog.to_jsonb(command)
+        from public.financial_admin_commands command
+        where command.id = $2) as command`,
+    [fixture.issueId, fixture.commandId]
+  );
+}
+
+async function seedInvalidAdminResolutionProvenance(
+  pool: Pool
+): Promise<InvalidAdminResolutionFixture> {
+  const fixture = {
+    issueId: randomUUID(),
+    auditId: randomUUID(),
+    commandId: randomUUID()
+  };
+  const actorId = randomUUID();
+  const issueRefundId = randomUUID();
+  const commandRefundId = randomUUID();
+  assert(
+    commandRefundId !== issueRefundId,
+    '0014 wrong-scope command fixture requires distinct refund identities'
+  );
+  const jobId = randomUUID();
+  const correlationId = 'migration-0014-wrong-refund-scope';
+  await runReplicaTransaction(pool, async (client) => {
+    await client.query(
+      `insert into public.financial_admin_commands
+         (id, kind, actor_user_id, correlation_id, idempotency_key_sha256,
+          input_fingerprint_sha256, private_input, job_id, status,
+          safe_result_code, safe_result, completed_at)
+       values ($1, 'refund_allocation_finalize', $2, $3,
+         pg_catalog.repeat('a', 64), pg_catalog.repeat('b', 64),
+         pg_catalog.jsonb_build_object(
+           'kind', 'refund_allocation_finalize',
+           'refundId', $4::text,
+           'expectedActiveDraftVersion', 1,
+           'previewFingerprint', pg_catalog.repeat('c', 64),
+           'confirmation', 'finalize_refund_allocation'
+         ), $5, 'succeeded', 'allocation_finalized',
+         pg_catalog.jsonb_build_object(
+           'refundId', $4::text,
+           'finalizedDraftVersion', 1,
+           'accessChanged', false,
+           'emailQueued', false
+         ), pg_catalog.now())`,
+      [fixture.commandId, actorId, correlationId, commandRefundId, jobId]
+    );
+    await client.query(
+      `insert into public.financial_reconciliation_issues
+         (id, resource_type, resource_id, safe_code, state, impact,
+          occurrence_count, correlation_id, resolved_by_admin_id, resolved_at)
+       values ($1, 'refund', $2, 'missing_source', 'resolved', 'pending',
+         1, $3, $4, pg_catalog.now())`,
+      [fixture.issueId, issueRefundId, correlationId, actorId]
+    );
+    await client.query(
+      `insert into public.audit_events
+         (id, actor_type, actor_id, action, outcome, resource_type,
+          resource_id, correlation_id, before, after, request_metadata)
+       values ($1, 'user', $2::text, 'financial.issue.resolved', 'succeeded',
+         'financial_issue', $3::text, $4, null,
+         pg_catalog.jsonb_build_object(
+           'resourceType', 'refund',
+           'resourceId', $5::text,
+           'safeCode', 'missing_source',
+           'impact', 'pending',
+           'state', 'resolved',
+           'occurrenceCount', 1
+         ) || pg_catalog.jsonb_build_object('commandId', $6::text),
+         null)`,
+      [
+        fixture.auditId,
+        actorId,
+        fixture.issueId,
+        correlationId,
+        issueRefundId,
+        fixture.commandId
+      ]
+    );
+  });
+  return fixture;
+}
+
+async function cleanupInvalidAdminResolutionProvenance(
+  pool: Pool,
+  fixture: InvalidAdminResolutionFixture
+): Promise<void> {
+  await runReplicaTransaction(pool, async (client) => {
+    await client.query('delete from public.audit_events where id = $1', [fixture.auditId]);
+    await client.query(
+      'delete from public.financial_reconciliation_issues where id = $1',
+      [fixture.issueId]
+    );
+    await client.query('delete from public.financial_admin_commands where id = $1', [
+      fixture.commandId
+    ]);
+  });
+}
+
+async function expectInvalidAdminResolutionProvenanceFailures(
+  pool: Pool,
+  migrationsThrough14: string,
+  predecessor: IssueTransitionRoutineState,
+  triggerBefore: IssueTransitionTriggerState
+): Promise<void> {
+  for (const kind of ['wrong-refund-scope'] as const) {
+    const fixture = await seedInvalidAdminResolutionProvenance(pool);
+    const provenanceBefore = await adminResolutionProvenanceState(pool, fixture);
+    assert(provenanceBefore.issue !== null, `0014 ${kind} fixture must seed an issue`);
+    equal(
+      provenanceBefore.resolution_audits.length,
+      1,
+      `0014 ${kind} fixture must seed one exact-looking resolution audit`
+    );
+    equal(
+      provenanceBefore.command !== null,
+      kind === 'wrong-refund-scope',
+      `0014 ${kind} fixture has the intended command presence`
+    );
+    try {
+      let rejected = false;
+      try {
+        await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough14);
+      } catch (error) {
+        rejected = true;
+        const postgresError = unwrapPostgresError(error);
+        assert(postgresError !== null, `0014 ${kind} fixture must expose PostgreSQL`);
+        equal(postgresError.code, '23514', `0014 ${kind} fixture must use check violation`);
+        assert(
+          /issue-transition repair found invalid resolution audit provenance/iu.test(
+            postgresError.message
+          ),
+          `0014 ${kind} fixture must identify invalid resolution provenance`
+        );
+      }
+      assert(rejected, `0014 ${kind} fixture unexpectedly migrated`);
+      equal(
+        await migrationCount(pool),
+        14,
+        `0014 ${kind} rollback leaves the journal at 0013`
+      );
+      equal(
+        await issueTransitionRoutineState(pool),
+        predecessor,
+        `0014 ${kind} rollback occurs before transition-function mutation`
+      );
+      equal(
+        await issueTransitionTriggerState(pool),
+        triggerBefore,
+        `0014 ${kind} rollback leaves the transition trigger unchanged`
+      );
+      equal(
+        await adminResolutionProvenanceState(pool, fixture),
+        provenanceBefore,
+        `0014 ${kind} rollback preserves the historical rows exactly`
+      );
+    } finally {
+      await cleanupInvalidAdminResolutionProvenance(pool, fixture);
+    }
+    equal(
+      await adminResolutionProvenanceState(pool, fixture),
+      { issue: null, resolution_audits: [], command: null },
+      `0014 ${kind} fixture removes every replica-seeded row before continuing`
+    );
+  }
+}
+
+async function assertDirectOwnerMissingGucResolutionRejected(pool: Pool): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    const context = await one<{
+      current_user_name: string;
+      database_owner_name: string;
+      worker_issue_id: string | null;
+      admin_issue_id: string | null;
+      admin_command_id: string | null;
+      admin_actor_id: string | null;
+    }>(
+      client,
+      `select
+         current_user::text as current_user_name,
+         pg_catalog.pg_get_userbyid(database_row.datdba) as database_owner_name,
+         pg_catalog.current_setting(
+           'pale_orbit.financial_worker_issue_resolution', true
+         ) as worker_issue_id,
+         pg_catalog.current_setting(
+           'pale_orbit.plan6bii_financial_admin_issue_resolution_issue_id', true
+         ) as admin_issue_id,
+         pg_catalog.current_setting(
+           'pale_orbit.plan6bii_financial_admin_issue_resolution_command_id', true
+         ) as admin_command_id,
+         pg_catalog.current_setting(
+           'pale_orbit.plan6bii_financial_admin_issue_resolution_actor_id', true
+         ) as admin_actor_id
+       from pg_catalog.pg_database database_row
+       where database_row.datname = pg_catalog.current_database()`
+    );
+    equal(
+      context.current_user_name,
+      context.database_owner_name,
+      '0014 bypass regression runs as the direct database owner'
+    );
+    for (const setting of [
+      context.worker_issue_id,
+      context.admin_issue_id,
+      context.admin_command_id,
+      context.admin_actor_id
+    ]) {
+      assert(
+        setting === null || setting === '',
+        '0014 bypass regression requires all resolver GUCs to be absent'
+      );
+    }
+    const subject = await insertUserAndTitles(client, 1);
+    const payment = await insertOrderGraph(client, subject.userId, subject.titleIds, {
+      key: 'migration-0014-owner-bypass',
+      paymentSchemaPhase: 'plan6b'
+    });
+    const issueId = randomUUID();
+    await client.query(
+      `insert into public.financial_reconciliation_issues
+         (id, resource_type, resource_id, safe_code, impact, correlation_id)
+       values ($1, 'payment', $2, 'missing_source', 'pending', $3)`,
+      [issueId, payment.paymentId, 'migration-0014-owner-bypass']
+    );
+    await expectSqlStateRejected(
+      client,
+      `update public.financial_reconciliation_issues
+       set state = 'resolved', resolved_at = pg_catalog.clock_timestamp()
+       where id = $1`,
+      [issueId],
+      '55000',
+      'direct database-owner resolution without resolver GUCs'
+    );
+  } finally {
+    await client.query('rollback');
+    client.release();
+  }
+}
+
+async function assertIssueTransitionFailClosedUpgrade(pool: Pool): Promise<void> {
+  equal(await migrationCount(pool), 14, '0014 fixture begins at migration 0013');
+  const migrationsThrough14 = await createMigrationFolderThrough(14);
+  const predecessor = await issueTransitionRoutineState(pool);
+  equal(
+    predecessor.definition_sha256,
+    PLAN6BII_VULNERABLE_ISSUE_TRANSITION_SHA256,
+    '0013 retains the exact historical vulnerable issue-transition definition'
+  );
+  const triggerBefore = await issueTransitionTriggerState(pool);
+  await expectRelationIdentityRepairPreflightFailure(
+    pool,
+    migrationsThrough14,
+    predecessor,
+    triggerBefore
+  );
+  await expectProtectedCatalogExtensionFailures(
+    pool,
+    migrationsThrough14,
+    predecessor,
+    triggerBefore
+  );
+  await expectAuditGuardDefinitionRepairPreflightFailure(
+    pool,
+    migrationsThrough14,
+    predecessor,
+    triggerBefore
+  );
+  await expectSessionReplicationParameterAclFailure(
+    pool,
+    migrationsThrough14,
+    predecessor,
+    triggerBefore
+  );
+  await expectSessionReplicationSettingDefaultFailures(
+    pool,
+    migrationsThrough14,
+    predecessor,
+    triggerBefore
+  );
+  await expectMissingResolutionAuditRepairPreflightFailure(
+    pool,
+    migrationsThrough14,
+    predecessor,
+    triggerBefore
+  );
+  await expectInvalidAdminResolutionProvenanceFailures(
+    pool,
+    migrationsThrough14,
+    predecessor,
+    triggerBefore
+  );
+
+  const resolverPredecessor = await routineDefinitionState(
+    pool,
+    REPORTING_CORRECTION_RESOLVER
+  );
+  equal(
+    resolverPredecessor.definition_sha256,
+    PLAN6BII_REPORTING_CORRECTION_RESOLVER_SHA256,
+    '0013 retains the exact normalized reporting-correction resolver definition'
+  );
+  const resolverMetadata = await routineMetadataState(
+    pool,
+    REPORTING_CORRECTION_RESOLVER
+  );
+  await pool.query(`
+    create or replace function
+      public.resolve_financial_issue_after_reporting_correction_command(uuid,uuid)
+    returns setof public.financial_reconciliation_issues
+    language plpgsql
+    security definer
+    set search_path = 'pg_catalog'
+    as $plan6bii_reporting_correction_definition_drift_fixture$
+    begin
+      return;
+    end;
+    $plan6bii_reporting_correction_definition_drift_fixture$
+  `);
+  const driftedResolver = await routineDefinitionState(
+    pool,
+    REPORTING_CORRECTION_RESOLVER
+  );
+  assert(
+    driftedResolver.definition_sha256 !== resolverPredecessor.definition_sha256,
+    '0014 resolver-definition fixture must change the reporting-correction body'
+  );
+  equal(
+    await routineMetadataState(pool, REPORTING_CORRECTION_RESOLVER),
+    resolverMetadata,
+    '0014 resolver-definition fixture changes the body without changing metadata'
+  );
+  await expectResolverDefinitionRepairPreflightFailure(
+    pool,
+    migrationsThrough14,
+    driftedResolver,
+    resolverMetadata
+  );
+  await pool.query(resolverPredecessor.routine_definition);
+  equal(
+    await routineDefinitionState(pool, REPORTING_CORRECTION_RESOLVER),
+    resolverPredecessor,
+    '0014 fixture restores the exact historical 0013 reporting-correction definition'
+  );
+  equal(
+    await routineMetadataState(pool, REPORTING_CORRECTION_RESOLVER),
+    resolverMetadata,
+    '0014 fixture restores the reporting-correction resolver without metadata drift'
+  );
+
+  await pool.query(`
+    create or replace function public.plan6b_validate_issue_transition()
+    returns trigger language plpgsql as $plan6bii_issue_transition_drift_fixture$
+    begin
+      return new;
+    end;
+    $plan6bii_issue_transition_drift_fixture$
+  `);
+  const drifted = await issueTransitionRoutineState(pool);
+  assert(
+    drifted.definition_sha256 !== predecessor.definition_sha256,
+    '0014 definition-drift fixture must change the predecessor definition'
+  );
+  await expectIssueTransitionRepairPreflightFailure(pool, migrationsThrough14, drifted);
+  equal(
+    await issueTransitionTriggerState(pool),
+    triggerBefore,
+    '0014 definition-drift preflight does not mutate the issue trigger'
+  );
+
+  await pool.query(predecessor.routine_definition);
+  equal(
+    await issueTransitionRoutineState(pool),
+    predecessor,
+    '0014 fixture restores the exact historical 0013 predecessor before repair'
+  );
+
+  await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough14);
+  equal(await migrationCount(pool), 15, 'clean migration 0013 applies 0014 exactly once');
+  const installed = await issueTransitionRoutineState(pool);
+  equal(
+    installed.definition_sha256,
+    PLAN6BII_FIXED_ISSUE_TRANSITION_SHA256,
+    '0014 installs the exact fail-closed issue-transition definition'
+  );
+  for (const [predicate, label] of [
+    [
+      /COALESCE\(\s*pg_catalog\.current_setting\(\s*'pale_orbit\.financial_worker_issue_resolution',\s*true\s*\)\s*=\s*OLD\.id::text,\s*false\s*\)/u,
+      'worker issue identity'
+    ],
+    [
+      /COALESCE\(\s*pg_catalog\.current_setting\(\s*'pale_orbit\.plan6bii_financial_admin_issue_resolution_issue_id',\s*true\s*\)\s*=\s*OLD\.id::text,\s*false\s*\)/u,
+      'administrator issue identity'
+    ],
+    [
+      /COALESCE\(\s*pg_catalog\.current_setting\(\s*'pale_orbit\.plan6bii_financial_admin_issue_resolution_command_id',\s*true\s*\)\s*~\s*'\^\[0-9a-f-\]\{36\}\$',\s*false\s*\)/u,
+      'administrator command identity'
+    ],
+    [
+      /COALESCE\(\s*pg_catalog\.current_setting\(\s*'pale_orbit\.plan6bii_financial_admin_issue_resolution_actor_id',\s*true\s*\)\s*=\s*NEW\.resolved_by_admin_id::text,\s*false\s*\)/u,
+      'administrator actor identity'
+    ]
+  ] as const) {
+    assert(
+      predicate.test(installed.routine_definition),
+      `0014 fail-closed definition COALESCEs the nullable ${label} predicate`
+    );
+  }
+  assert(
+    /IF NOT COALESCE\(worker_resolution OR admin_resolution, false\) THEN/u.test(
+      installed.routine_definition
+    ),
+    '0014 fail-closed definition rejects a nullable combined resolver decision'
+  );
+  equal(
+    installed.owner_name,
+    installed.database_owner_name,
+    '0014 keeps the issue-transition routine owned by the database owner'
+  );
+  equal(
+    installed.acl_entries,
+    ['DATABASE_OWNER:DATABASE_OWNER:EXECUTE:false'],
+    '0014 leaves the issue-transition routine with owner-only EXECUTE'
+  );
+  equal(
+    await issueTransitionTriggerState(pool),
+    triggerBefore,
+    '0014 replaces only the issue-transition routine and leaves its trigger unchanged'
+  );
+  await assertDirectOwnerMissingGucResolutionRejected(pool);
+
+  await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough14);
+  equal(await migrationCount(pool), 15, 'a second 0014 migrator pass is a no-op');
+  equal(
+    await issueTransitionRoutineState(pool),
+    installed,
+    'a second 0014 migrator pass leaves the fixed routine unchanged'
+  );
+  equal(
+    await issueTransitionTriggerState(pool),
+    triggerBefore,
+    'a second 0014 migrator pass leaves the issue trigger unchanged'
+  );
+}
+
+async function runPlan6biiIssueTransitionFailClosedFixture(pool: Pool): Promise<void> {
+  equal(await migrationCount(pool), 7, '0014 fixture begins at migration 0006');
+  await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(11) });
+  equal(await migrationCount(pool), 12, '0014 fixture applies through historical migration 0011');
+  try {
+    await createPlan6biiAttestedRoles(pool, 0b111);
+    await runCommittedPlan6biiAttestedMigration(
+      pool,
+      await createMigrationFolderThrough(12)
+    );
+    equal(await migrationCount(pool), 13, '0014 fixture applies historical migration 0012');
+    await runCommittedPlan6biiAttestedMigration(
+      pool,
+      await createMigrationFolderThrough(13)
+    );
+    equal(await migrationCount(pool), 14, '0014 fixture applies historical migration 0013');
+    await assertIssueTransitionFailClosedUpgrade(pool);
+  } finally {
+    await dropPlan6biiAttestedRoles(pool);
+  }
 }
 
 type Plan6biiIdentityPrepare = (context: {
@@ -4676,7 +6261,8 @@ async function main(): Promise<void> {
       'legacy-claimed-identity-authority',
       'legacy-entitlement-projection',
       'storage-cleanup-authority-preflight',
-      'plan6bii-admin-command-authority'
+      'plan6bii-admin-command-authority',
+      'plan6bii-issue-transition-fail-closed'
     ] as const) {
       const result = spawnSync(
         process.execPath,
@@ -4724,7 +6310,8 @@ async function main(): Promise<void> {
       rawFixture === 'legacy-claimed-identity-authority' ||
       rawFixture === 'legacy-entitlement-projection' ||
       rawFixture === 'storage-cleanup-authority-preflight' ||
-      rawFixture === 'plan6bii-admin-command-authority',
+      rawFixture === 'plan6bii-admin-command-authority' ||
+      rawFixture === 'plan6bii-issue-transition-fail-closed',
     `unknown fixture ${rawFixture ?? '<missing>'}`
   );
   if (rawFixture === 'plan6bii-admin-command-authority') {
@@ -4755,6 +6342,8 @@ async function main(): Promise<void> {
       await runEntitlementProjectionInvalidFixture(pool);
     } else if (rawFixture === 'storage-cleanup-authority-preflight') {
       await runStorageCleanupAuthorityPreflightFixture(pool);
+    } else if (rawFixture === 'plan6bii-issue-transition-fail-closed') {
+      await runPlan6biiIssueTransitionFailClosedFixture(pool);
     } else await runInvalidFixture(pool, rawFixture);
     console.info(`[financial-migration-test] ${rawFixture} fixture passed`);
   } finally {

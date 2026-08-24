@@ -30,7 +30,7 @@ import {
 } from '$lib/server/db/schema';
 import { queueAuthEmail } from '$lib/server/email/enqueue';
 import { authEmailPayloadSchema, type AuthEmailPayload } from '$lib/server/email/payload';
-import { databaseClient, ownerDatabaseClient } from './database';
+import { databaseClient, ownerDatabaseClient, workerDatabaseClient } from './database';
 
 const config = loadApplicationConfig(process.env);
 const password = 'A-secure-test-password-2026';
@@ -196,7 +196,7 @@ describe('Better Auth server', () => {
       expect.objectContaining({ status: 'pending' })
     ]);
     expect(await databaseClient.db.select().from(verification)).toHaveLength(1);
-    expect(await databaseClient.db.select().from(jobs)).toEqual([
+    expect(await workerDatabaseClient.db.select().from(jobs)).toEqual([
       expect.objectContaining({ status: 'pending', type: 'outbox.dispatch' })
     ]);
 

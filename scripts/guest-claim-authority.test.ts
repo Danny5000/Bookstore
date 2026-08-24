@@ -390,10 +390,10 @@ describe('database-enforced guest-claim authority', () => {
     );
   });
 
-  it('carries the valid 0006 upgrade through 0013 while isolating claim preflights at 0010', () => {
+  it('carries the valid 0006 upgrade through 0014 while isolating claim preflights at 0010', () => {
     const upgrade = source('../tests/integration/financial-migration.test.ts');
 
-    expect(upgrade).toContain('maxMigrationIndex: 8 | 9 | 10 | 11 | 12 | 13');
+    expect(upgrade).toContain('maxMigrationIndex: 8 | 9 | 10 | 11 | 12 | 13 | 14');
     const validFixture = upgrade.slice(
       upgrade.indexOf('async function runValidFixture'),
       upgrade.indexOf('async function runInvalidFixture')
@@ -403,7 +403,7 @@ describe('database-enforced guest-claim authority', () => {
     );
     expect(validFixture).toContain('assertStorageCleanupAuthorityUpgrade(pool)');
     expect(validFixture).toContain('await runRepairedFixtureThroughPlan6biiHead(pool');
-    expect(upgrade).toContain('createMigrationFolderThrough(13)');
+    expect(upgrade).toContain('createMigrationFolderThrough(14)');
     expect(upgrade).toMatch(
       /createMigrationFolderThrough\(10\)[\s\S]+migrationCount\(pool\), 11/u
     );

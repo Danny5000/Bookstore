@@ -39,7 +39,7 @@ describe('transactional outbox', () => {
       })
     );
 
-    const [jobCount] = await databaseClient.db.select({ value: count() }).from(jobs);
+    const [jobCount] = await workerDatabaseClient.db.select({ value: count() }).from(jobs);
     expect(jobCount?.value).toBe(1);
     expect(message.dispatchJobId).toBeDefined();
   });
@@ -58,7 +58,7 @@ describe('transactional outbox', () => {
     const [messageCount] = await ownerDatabaseClient.db
       .select({ value: count() })
       .from(outboxMessages);
-    const [jobCount] = await databaseClient.db.select({ value: count() }).from(jobs);
+    const [jobCount] = await workerDatabaseClient.db.select({ value: count() }).from(jobs);
     expect(messageCount?.value).toBe(0);
     expect(jobCount?.value).toBe(0);
   });
@@ -84,7 +84,7 @@ describe('transactional outbox', () => {
     const [messageCount] = await ownerDatabaseClient.db
       .select({ value: count() })
       .from(outboxMessages);
-    const [jobCount] = await databaseClient.db.select({ value: count() }).from(jobs);
+    const [jobCount] = await workerDatabaseClient.db.select({ value: count() }).from(jobs);
     expect(messageCount?.value).toBe(1);
     expect(jobCount?.value).toBe(1);
 
@@ -169,13 +169,13 @@ describe('transactional outbox', () => {
     const dispatchKey = `outbox-key:${createHash('sha256')
       .update(deduplicationKey)
       .digest('hex')}`;
-    const [storedJob] = await databaseClient.db
+    const [storedJob] = await workerDatabaseClient.db
       .select({ payload: jobs.payload })
       .from(jobs)
       .where(eq(jobs.deduplicationKey, dispatchKey));
     expect(storedJob?.payload).toEqual({ outboxId: canonical.id });
     expect(await ownerDatabaseClient.db.select().from(outboxMessages)).toHaveLength(1);
-    expect(await databaseClient.db.select().from(jobs)).toHaveLength(1);
+    expect(await workerDatabaseClient.db.select().from(jobs)).toHaveLength(1);
   });
 
   it('keeps different stable outbox keys distinct', async () => {

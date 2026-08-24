@@ -6,7 +6,7 @@ The repository supplies a development environment and a production infrastructur
 
 **Status:** Plan 6B candidate — independent review pending
 
-The unified candidate includes ingestion/reconciliation and the direct administrator Sales, review, payout, correction, recovery, and CSV surfaces. The global navigation remains `Sales — Upcoming` without a live link. Production intentionally remains in maintenance mode and Plan 7 owns activation and operability. The migration chain ends at `0013`: `0012` retains the historical eight callable public boundary routines and `0013` adds the final ninth. See [financial reconciliation and reporting](financial-reconciliation-and-reporting.md).
+The unified candidate includes ingestion/reconciliation and the direct administrator Sales, review, payout, correction, recovery, and CSV surfaces. The global navigation remains `Sales — Upcoming` without a live link. Production intentionally remains in maintenance mode and Plan 7 owns activation and operability. The migration chain ends at `0014`: `0012` retains the historical eight callable public boundary routines, `0013` adds the final ninth, and `0014` changes no callable surface while replacing the nullable issue-transition trigger guard with a fail-closed definition. See [financial reconciliation and reporting](financial-reconciliation-and-reporting.md).
 
 ## Required toolchain
 
@@ -108,7 +108,7 @@ Every required value also supports a mutually exclusive `<NAME>_FILE` form. Prod
 
 ## Production baseline
 
-Keep the Plan 6B evidence order exact: migrate through `0013`, provision and attest the four pairwise-distinct owner/web/financial-worker/storage-cleanup principals, capture the checkpoint, rehearse it on a distinct database engine, then run the production-image smoke. The web principal submits commands, reads its owner-scoped status, and records route-authorized audit evidence; only the financial-worker principal executes protected financial mutations.
+Keep the Plan 6B evidence order exact: migrate through `0014`, provision and attest the four pairwise-distinct owner/web/financial-worker/storage-cleanup principals, capture the checkpoint, rehearse it on a distinct database engine, then run the production-image smoke. The web principal submits commands, reads its owner-scoped status, and records route-authorized audit evidence; only the financial-worker principal executes protected financial mutations.
 
 Production does not use an environment file. The deployment process exports the image/origin/database values, a generated `AUTH_SECRET`, provider SMTP values, and the first-administrator values. See [authentication and email operations](authentication-and-email.md) for that contract, [commerce and guest-claim operations](commerce-and-guest-claims.md) for Stripe Checkout/webhooks, and [Stripe financial reconciliation](stripe-financial-reconciliation.md) for ledger and worker recovery. Base production requires no Stripe credentials and keeps `STRIPE_ENABLED=false`. Then run:
 

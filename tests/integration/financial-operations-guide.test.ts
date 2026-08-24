@@ -2,7 +2,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { sql } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
-import { databaseClient, ownerDatabaseClient } from './database';
+import { FINANCIAL_ALLOCATION_ALGORITHM_VERSION } from
+  '$lib/server/commerce/financial/constants';
+import { databaseClient, ownerDatabaseClient, workerDatabaseClient } from './database';
 
 const guideUrl = new URL('../../docs/stripe-financial-reconciliation.md', import.meta.url);
 const restoreVerifierFragmentPrefix =
@@ -46,9 +48,9 @@ describe('financial reconciliation operations guide', () => {
   it('classifies restore fragments and keeps standalone SQL read-only and executable', async () => {
     const { all, restoreVerifierFragments, standaloneDiagnostics } =
       await documentedSqlBlocks();
-    expect(all).toHaveLength(11);
+    expect(all).toHaveLength(12);
     expect(standaloneDiagnostics).toHaveLength(7);
-    expect(restoreVerifierFragments).toHaveLength(4);
+    expect(restoreVerifierFragments).toHaveLength(5);
 
     for (const block of restoreVerifierFragments) {
       expect(executableSql(block)).toMatch(
@@ -58,7 +60,7 @@ describe('financial reconciliation operations guide', () => {
     for (const block of standaloneDiagnostics) {
       expect(executableSql(block)).toMatch(/^(select|with)\b/iu);
       expect(block).not.toMatch(/\b(insert|update|delete|truncate|alter|drop|create)\b/iu);
-      await expect(databaseClient.db.execute(sql.raw(block))).resolves.toBeDefined();
+      await expect(workerDatabaseClient.db.execute(sql.raw(block))).resolves.toBeDefined();
     }
   });
 
@@ -113,7 +115,7 @@ describe('financial reconciliation operations guide', () => {
           'running', 1, 8, now(), 'restore-test')
     `);
 
-    const result = await databaseClient.db.execute<{
+    const result = await workerDatabaseClient.db.execute<{
       check_name: string;
       violation_count: number | string;
     }>(sql.raw(blocks[6]!));
@@ -142,7 +144,7 @@ describe('financial reconciliation operations guide', () => {
       )
     `);
 
-    const result = await databaseClient.db.execute<{
+    const result = await workerDatabaseClient.db.execute<{
       check_name: string;
       violation_count: number | string;
     }>(sql.raw(blocks[6]!));
@@ -179,10 +181,10 @@ describe('financial reconciliation operations guide', () => {
       ) values
         (${`adjustment:${balanceTransactionId}:restore-tip-a`}, ${balanceTransactionId},
           'adjustment', ${balanceTransactionId}, 'gross_amount', 'account', 100, 'USD',
-          1, 1, ${'a'.repeat(64)}),
+          ${FINANCIAL_ALLOCATION_ALGORITHM_VERSION}, 1, ${'a'.repeat(64)}),
         (${`adjustment:${balanceTransactionId}:restore-tip-b`}, ${balanceTransactionId},
           'adjustment', ${balanceTransactionId}, 'gross_amount', 'account', 100, 'USD',
-          1, 1, ${'b'.repeat(64)})
+          ${FINANCIAL_ALLOCATION_ALGORITHM_VERSION}, 1, ${'b'.repeat(64)})
     `);
 
     const result = await databaseClient.db.execute<{
@@ -293,10 +295,12 @@ describe('financial reconciliation operations guide', () => {
         ) values
           (${activeSetId}, ${`adjustment:${balanceTransactionId}:operator-active`},
             ${balanceTransactionId}, 'adjustment', ${balanceTransactionId}, 'gross_amount',
-            'account', 1, 'USD', 1, 1, ${fingerprint}, null),
+            'account', 1, 'USD', ${FINANCIAL_ALLOCATION_ALGORITHM_VERSION}, 1,
+            ${fingerprint}, null),
           (${inactiveSetId}, ${`adjustment:${balanceTransactionId}:operator-inactive`},
             ${balanceTransactionId}, 'adjustment', ${balanceTransactionId}, 'gross_amount',
-            'account', 1, 'USD', 1, 2, ${fingerprint}, ${activeSetId})
+            'account', 1, 'USD', ${FINANCIAL_ALLOCATION_ALGORITHM_VERSION}, 2,
+            ${fingerprint}, ${activeSetId})
       `);
       await tx.execute(sql`
         insert into financial_reconciliation_issues (
@@ -334,7 +338,7 @@ describe('financial reconciliation operations guide', () => {
       )
     `);
 
-    const result = await databaseClient.db.execute<{
+    const result = await workerDatabaseClient.db.execute<{
       check_name: string;
       violation_count: number | string;
     }>(sql.raw(blocks[6]!));
@@ -355,7 +359,7 @@ describe('financial reconciliation operations guide', () => {
       where singleton = true
     `);
 
-    const result = await databaseClient.db.execute<{
+    const result = await workerDatabaseClient.db.execute<{
       check_name: string;
       violation_count: number | string;
     }>(sql.raw(blocks[6]!));

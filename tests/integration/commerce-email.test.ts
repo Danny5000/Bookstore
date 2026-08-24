@@ -215,8 +215,8 @@ describe('commerce email persistence', () => {
       orderNumber: fixture.orderId,
       to: 'reader@example.com'
     });
-    expect(await databaseClient.db.select().from(jobs)).toHaveLength(1);
-    expect(JSON.stringify(await databaseClient.db.select().from(jobs))).not.toContain('@example.com');
+    expect(await workerDatabaseClient.db.select().from(jobs)).toHaveLength(1);
+    expect(JSON.stringify(await workerDatabaseClient.db.select().from(jobs))).not.toContain('@example.com');
 
     await ownerDatabaseClient.db.update(orderItems)
       .set({ titleSnapshot: 'Changed immutable title' })
@@ -225,7 +225,7 @@ describe('commerce email persistence', () => {
       enqueuer.enqueueAccountReceipt(transaction, fixture.orderId)
     )).rejects.toBeInstanceOf(OutboxDeduplicationInvariantError);
     expect(await ownerDatabaseClient.db.select().from(outboxMessages)).toHaveLength(1);
-    expect(await databaseClient.db.select().from(jobs)).toHaveLength(1);
+    expect(await workerDatabaseClient.db.select().from(jobs)).toHaveLength(1);
   });
 
   it('deduplicates the strict guest claim-preparation job without an email-derived key', async () => {
@@ -237,7 +237,7 @@ describe('commerce email persistence', () => {
       );
     }
 
-    const storedJobs = await databaseClient.db.select().from(jobs);
+    const storedJobs = await workerDatabaseClient.db.select().from(jobs);
     expect(storedJobs).toHaveLength(1);
     expect(storedJobs[0]).toMatchObject({
       type: COMMERCE_CLAIM_EMAIL_JOB,
@@ -891,7 +891,7 @@ describe('commerce email persistence', () => {
     ));
     expect(response.status).toBe(200);
     expect(await ownerDatabaseClient.db.select().from(outboxMessages)).toHaveLength(0);
-    expect(JSON.stringify(await databaseClient.db.select().from(jobs)))
+    expect(JSON.stringify(await workerDatabaseClient.db.select().from(jobs)))
       .not.toContain(victim.orderId);
   });
 

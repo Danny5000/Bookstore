@@ -3934,3 +3934,33 @@ Expected: all reviewers report no unresolved Critical/Important/Minor findings, 
 - Task 4 builds the handler and fixed registry interface but must not make an incomplete executor map reachable in production. Register the production job handler only when the first complete six-kind composition exists; until then, keep the factory test-only and fail closed on any unknown/missing executor.
 - Run database-backed commands only under the serialized resource protocol. Never launch a duplicate command because output is quiet; poll the same process/session to its final exit.
 - If any requirement is ambiguous, stop at the nearest task boundary and compare both approved design documents before changing code or authority.
+
+## Security correction erratum: append-only migration 0014
+
+During the full candidate integration gate, the historical `plan6b_validate_issue_transition()` definition from migration `0012` was found to authorize a protected issue transition through SQL `NULL` semantics when its transaction-local resolution context was missing or partial. Its nullable `current_setting(..., true)` predicates could produce a null combined authorization result, and the original rejection branch did not explicitly coalesce that result to false.
+
+Migrations `0012` and `0013` are now historical and must remain byte-identical. Append-only migration `0014_plan6bii_issue_transition_fail_closed` replaces only that trigger-function definition with fail-closed setting comparisons and an explicit false default for any incomplete authorization result. It adds or removes no callable routine, table, type, trigger, job kind, or application capability; the public boundary remains exactly the eight routines introduced by `0012` plus the correction-only ninth routine introduced by `0013`.
+
+For current execution and release evidence, `0014` supersedes the earlier current-head statements in this historical plan. Upgrade, restore, checkpoint, bundle, source-parity, and corruption-repair contracts must therefore end at migration `0014` and the calibrated `plan6b-financial-catalog-v4` contract. The earlier task instructions remain an audit record of the approved implementation sequence and are not rewritten retroactively.
+
+The bounded correction file set is:
+
+- `drizzle/0014_plan6bii_issue_transition_fail_closed.sql`, `drizzle/meta/0014_snapshot.json`, and `drizzle/meta/_journal.json`;
+- `scripts/execute-financial-restore-verifier.ts`, `scripts/verify-financial-restore.sql`, `scripts/commerce-operations.test.ts`, `scripts/financial-schema-preservation.test.ts`, `scripts/guest-claim-authority.test.ts`, `scripts/with-plan6b-upgrade-database.test.ts`, `scripts/deployment-backup-bundle.test.ts`, `scripts/deployment-checkpoint.test.ts`, and `scripts/deployment-checkpoint-runtime.test.ts`;
+- `tests/integration/auth.test.ts`, `tests/integration/commerce-email.test.ts`, `tests/integration/commerce-fulfillment.test.ts`, `tests/integration/commerce-webhooks.test.ts`, `tests/integration/email-queue.test.ts`, `tests/integration/email.test.ts`, `tests/integration/financial-ledger.test.ts`, `tests/integration/financial-migration.test.ts`, `tests/integration/financial-operations-guide.test.ts`, `tests/integration/financial-schema.test.ts`, `tests/integration/outbox.test.ts`, `tests/integration/publication.test.ts`, and `tests/integration/storage-ingestion.test.ts`; and
+- `README.md`, `docs/authentication-and-email.md`, `docs/commerce-and-guest-claims.md`, `docs/customer-library-and-reader.md`, `docs/database-and-workers.md`, `docs/dependency-decisions.md`, `docs/financial-reconciliation-and-reporting.md`, `docs/runtime-environments.md`, `docs/storage-ingestion-and-publication.md`, and `docs/stripe-financial-reconciliation.md`.
+
+Capture the focused nullable-authority RED and GREEN with:
+
+```powershell
+npx vitest run scripts/financial-schema-preservation.test.ts -t "appends an exact fail-closed repair for nullable issue-resolution authority" --reporter=verbose
+npm run test:plan6b-upgrade
+```
+
+Then run the complete candidate gates from Task 17 Steps 7–8. Stage only the bounded correction with:
+
+```powershell
+git add README.md docs/authentication-and-email.md docs/commerce-and-guest-claims.md docs/customer-library-and-reader.md docs/database-and-workers.md docs/dependency-decisions.md docs/financial-reconciliation-and-reporting.md docs/runtime-environments.md docs/storage-ingestion-and-publication.md docs/stripe-financial-reconciliation.md docs/superpowers/plans/2026-08-20-backend-plan-6b-ii-admin-resolution-reporting-refresh.md drizzle/0014_plan6bii_issue_transition_fail_closed.sql drizzle/meta/0014_snapshot.json drizzle/meta/_journal.json scripts/commerce-operations.test.ts scripts/deployment-backup-bundle.test.ts scripts/deployment-checkpoint-runtime.test.ts scripts/deployment-checkpoint.test.ts scripts/execute-financial-restore-verifier.ts scripts/financial-schema-preservation.test.ts scripts/guest-claim-authority.test.ts scripts/verify-financial-restore.sql scripts/with-plan6b-upgrade-database.test.ts tests/integration/auth.test.ts tests/integration/commerce-email.test.ts tests/integration/commerce-fulfillment.test.ts tests/integration/commerce-webhooks.test.ts tests/integration/email-queue.test.ts tests/integration/email.test.ts tests/integration/financial-ledger.test.ts tests/integration/financial-migration.test.ts tests/integration/financial-operations-guide.test.ts tests/integration/financial-schema.test.ts tests/integration/outbox.test.ts tests/integration/publication.test.ts tests/integration/storage-ingestion.test.ts
+git diff --cached --check
+git commit -m "fix: address Plan 6B candidate review"
+```

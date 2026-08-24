@@ -98,7 +98,7 @@ async function stageAcceptedRevision(
       stagingByteSize: bytes.byteLength
     }
   });
-  const [queued] = await databaseClient.db
+  const [queued] = await workerDatabaseClient.db
     .select()
     .from(jobs)
     .where(eq(jobs.deduplicationKey, `catalog.ingest:${revision.id}:0`));
@@ -143,7 +143,7 @@ describe('revision upload acceptance', () => {
       stagingChecksumSha256: checksum,
       stagingByteSize: 123
     });
-    const [job] = await databaseClient.db
+    const [job] = await workerDatabaseClient.db
       .select()
       .from(jobs)
       .where(eq(jobs.type, INGEST_REVISION_JOB));
@@ -246,7 +246,7 @@ describe('revision upload acceptance', () => {
       const [revisionCount] = await databaseClient.db
         .select({ value: count() })
         .from(titleRevisions);
-      const [jobCount] = await databaseClient.db.select({ value: count() }).from(jobs);
+      const [jobCount] = await workerDatabaseClient.db.select({ value: count() }).from(jobs);
       const [uploadAuditCount] = await databaseClient.db
         .select({ value: count() })
         .from(auditEvents)

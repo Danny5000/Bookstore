@@ -1818,7 +1818,8 @@ describe('commerce operations contract', () => {
       '0010_plan6b_guest_claim_authority.sql',
       '0011_plan6b_storage_cleanup_authority.sql',
       '0012_plan6bii_admin_command_authority.sql',
-      '0013_plan6bii_reporting_correction_authority.sql'
+      '0013_plan6bii_reporting_correction_authority.sql',
+      '0014_plan6bii_issue_transition_fail_closed.sql'
     ]);
     const plan6bSchemaMigrations = (
       await Promise.all(
@@ -1885,12 +1886,19 @@ describe('commerce operations contract', () => {
   });
 
   it('pins one versioned exact catalog contract for every protected financial object kind', async () => {
-    const [financialVerifier, financialRunbook, verifierWitness, contractTestSource] =
+    const [
+      financialVerifier,
+      financialRunbook,
+      verifierWitness,
+      contractTestSource,
+      issueTransitionFailClosedMigration
+    ] =
       await Promise.all([
         source('scripts/verify-financial-restore.sql'),
         source('docs/stripe-financial-reconciliation.md'),
         source('scripts/execute-financial-restore-verifier.ts'),
-        source('scripts/commerce-operations.test.ts')
+        source('scripts/commerce-operations.test.ts'),
+        source('drizzle/0014_plan6bii_issue_transition_fail_closed.sql')
       ]);
     const financialSchemaManifest = financialVerifier.match(
       /-- BEGIN financial_schema_object_manifest\r?\n(?<sql>[\s\S]*?)\r?\n-- END financial_schema_object_manifest/u
@@ -1963,6 +1971,7 @@ describe('commerce operations contract', () => {
         (match) => match.groups?.name ?? ''
       ).filter((name) => name && name !== 'resolve_financial_reconciliation_issue')
     );
+    requiredFunctionNames.add('reject_audit_event_mutation');
     const requiredTriggerKeys = new Set(
       Array.from(
         plan6bMigrations.matchAll(
@@ -1979,7 +1988,7 @@ describe('commerce operations contract', () => {
 
     expect(documentedManifest).toBe(financialSchemaManifest);
     expect(financialSchemaManifest).toMatch(
-      /catalog_contract_version\s*\(\s*contract_version\s*\)\s+as\s*\(\s*values\s*\(\s*'plan6b-financial-catalog-v3'\s*\)/iu
+      /catalog_contract_version\s*\(\s*contract_version\s*\)\s+as\s*\(\s*values\s*\(\s*'plan6b-financial-catalog-v4'\s*\)/iu
     );
     expect(financialSchemaManifest).toMatch(
       /required_catalog_objects\s*\(\s*object_kind\s*,\s*schema_name\s*,\s*parent_name\s*,\s*object_name\s*,\s*identity_arguments\s*,\s*expected_fingerprint_sha256\s*,\s*expected_catalog\s*\)/iu
@@ -2064,6 +2073,9 @@ describe('commerce operations contract', () => {
     ]) {
       expect(financialSchemaManifest, catalogField).toContain(catalogField);
     }
+    expect(financialSchemaManifest).toMatch(
+      /'definition',\s*pg_catalog\.replace\(pg_catalog\.replace\(\s*pg_catalog\.pg_get_functiondef\(routine\.oid\),\s*E'\\r\\n',\s*E'\\n'\s*\),\s*E'\\r',\s*E'\\n'\)/u
+    );
 
     const catalogRows = Array.from(
       financialSchemaManifest.matchAll(
@@ -2079,7 +2091,7 @@ describe('commerce operations contract', () => {
       })
     );
     expect(catalogRows.length).toBeGreaterThan(100);
-    expect(catalogRows).toHaveLength(274);
+    expect(catalogRows).toHaveLength(275);
     expect(new Set(catalogRows.map((row) =>
       `${row.kind}:${row.parent}:${row.name}:${row.arguments}`
     )).size).toBe(catalogRows.length);
@@ -2089,6 +2101,70 @@ describe('commerce operations contract', () => {
     expect(catalogRows.every((row) =>
       createHash('sha256').update(row.catalog, 'utf8').digest('hex') === row.fingerprint
     )).toBe(true);
+    const issueTransitionRows = catalogRows.filter((row) =>
+      row.kind === 'function' &&
+      row.parent === 'null' &&
+      row.name === 'plan6b_validate_issue_transition' &&
+      row.arguments === "''"
+    );
+    expect(issueTransitionRows).toHaveLength(1);
+    const issueTransitionCatalog = JSON.parse(
+      issueTransitionRows[0]!.catalog
+    ) as Record<string, unknown>;
+    expect(Object.keys(issueTransitionCatalog).sort()).toEqual([
+      'acl',
+      'config',
+      'definition',
+      'identity_arguments',
+      'kind',
+      'language',
+      'leakproof',
+      'owner',
+      'parallel',
+      'result',
+      'security_definer',
+      'strict',
+      'volatility'
+    ]);
+    expect(issueTransitionCatalog).toMatchObject({
+      identity_arguments: '',
+      kind: 'f',
+      language: 'plpgsql',
+      leakproof: false,
+      owner: 'DATABASE_OWNER',
+      parallel: 'u',
+      result: 'trigger',
+      security_definer: false,
+      strict: false,
+      volatility: 'v'
+    });
+    const rawIssueTransitionDefinition = issueTransitionCatalog.definition;
+    expect(typeof rawIssueTransitionDefinition).toBe('string');
+    const issueTransitionDefinition = typeof rawIssueTransitionDefinition === 'string'
+      ? rawIssueTransitionDefinition
+      : '';
+    const migrationFunctionBody = issueTransitionFailClosedMigration.match(
+      /CREATE OR REPLACE FUNCTION "public"\."plan6b_validate_issue_transition"\(\) RETURNS trigger\r?\nLANGUAGE plpgsql AS \$plan6bii_issue_transition_fail_closed\$\r?\n(?<body>[\s\S]*?)\r?\n\$plan6bii_issue_transition_fail_closed\$;--> statement-breakpoint/u
+    )?.groups?.body;
+    const catalogFunctionBody = issueTransitionDefinition.match(
+      /AS \$function\$\n(?<body>[\s\S]*?)\n\$function\$\n$/u
+    )?.groups?.body;
+    expect(migrationFunctionBody).toBeDefined();
+    expect(catalogFunctionBody).toBe(migrationFunctionBody);
+    expect(issueTransitionDefinition).toContain(
+      ") ~ '^[0-9a-f-]{36}$',\n        false\n      ) AND COALESCE("
+    );
+    expect(issueTransitionDefinition).not.toContain(
+      `{36}, "volatility": "v"`
+    );
+    for (const settingName of [
+      'pale_orbit.financial_worker_issue_resolution',
+      'pale_orbit.plan6bii_financial_admin_issue_resolution_issue_id',
+      'pale_orbit.plan6bii_financial_admin_issue_resolution_command_id',
+      'pale_orbit.plan6bii_financial_admin_issue_resolution_actor_id'
+    ]) {
+      expect(issueTransitionDefinition.split(settingName), settingName).toHaveLength(2);
+    }
     for (const relationRow of catalogRows.filter((row) =>
       row.kind === 'table' || row.kind === 'view'
     )) {
@@ -2184,7 +2260,7 @@ describe('commerce operations contract', () => {
       sensitive_relation_state: 4
     });
     expect(requiredTableNames.size).toBe(23);
-    expect(requiredFunctionNames.size).toBe(45);
+    expect(requiredFunctionNames.size).toBe(46);
     expect(requiredTriggerKeys.size).toBe(39);
     expect(requiredLegacyColumnKeys.size).toBe(7);
     expect(requiredEnumLabels.size).toBe(25);
@@ -2629,6 +2705,23 @@ describe('commerce operations contract', () => {
       expect(financialSchemaManifest, authorityPrimitive).toContain(authorityPrimitive);
     }
     expect(verifierWitness).toContain('--print-financial-catalog-contract');
+    const catalogCalibrationExtraction = verifierWitness.match(
+      /function financialCatalogCalibrationContractSql[\s\S]*?function financialCatalogCalibrationSql/u
+    )?.[0] ?? '';
+    expect(catalogCalibrationExtraction).not.toBe('');
+    expect(catalogCalibrationExtraction).toContain(
+      "() => 'null::jsonb'"
+    );
+    expect(catalogCalibrationExtraction).toMatch(
+      /contract\.replace\([\s\S]*?\(\) => 'null::jsonb'[\s\S]*?\)/u
+    );
+    expect(catalogCalibrationExtraction).toContain(
+      "calibrationContract.includes('$catalog$')"
+    );
+    expect(catalogCalibrationExtraction).not.toMatch(
+      /replace\([^\n]+,\s*'null::jsonb'\)/u
+    );
+    expect(verifierWitness).toContain('JSON.parse(row.actual_catalog_json)');
     expect(verifierWitness).toContain(
       'alter table public.entitlement_grants disable trigger all'
     );
@@ -2866,6 +2959,8 @@ describe('commerce operations contract', () => {
       'required view definition repair',
       'required function definition mismatch',
       'required function definition repair',
+      'fail-open financial issue transition predecessor',
+      'fail-closed financial issue transition repair',
       'unexpected protected function overload',
       'unexpected protected function overload repair',
       'required trigger definition mismatch',
@@ -3438,6 +3533,9 @@ describe('commerce operations contract', () => {
       ['inherited application EXECUTE on private lease helper', [
         'financial_schema_object_manifest=1'
       ]],
+      ['fail-open financial issue transition predecessor', [
+        'financial_schema_object_manifest=1'
+      ]],
       ['claim function direct ACL mismatch', [
         'financial_schema_object_manifest=1',
         'storage_cleanup_effective_authority=1'
@@ -3609,6 +3707,40 @@ describe('commerce operations contract', () => {
     }
     expect(verifierWitness).toMatch(
       /fresh financial schema-object manifest[\s\S]{0,200}?exerciseFinancialAdminClaimMatrix/u
+    );
+    expect(verifierWitness).toContain(
+      "../drizzle/0014_plan6bii_issue_transition_fail_closed.sql"
+    );
+    expect(verifierWitness).toMatch(
+      /const vulnerableFinancialIssueTransitionStatement\s*=\s*requiredAdminCommandAuthorityStatement\([\s\S]{0,300}?'CREATE OR REPLACE FUNCTION "public"\."plan6b_validate_issue_transition"\(\)'/u
+    );
+    expect(verifierWitness).toMatch(
+      /const failClosedFinancialIssueTransitionStatement\s*=\s*requiredIssueTransitionFailClosedStatement\([\s\S]{0,300}?'CREATE OR REPLACE FUNCTION "public"\."plan6b_validate_issue_transition"\(\)'/u
+    );
+    const issueTransitionStartupGuard = verifierWitness.match(
+      /const failClosedFinancialIssueTransitionSettingPredicates[\s\S]*?\[restore-verifier\] financial issue transition predecessor\/fix contract is invalid/u
+    )?.[0] ?? '';
+    expect(issueTransitionStartupGuard).not.toBe('');
+    expect(issueTransitionStartupGuard.match(/current_setting/gu) ?? []).toHaveLength(4);
+    for (const settingName of [
+      'pale_orbit.financial_worker_issue_resolution',
+      'pale_orbit.plan6bii_financial_admin_issue_resolution_issue_id',
+      'pale_orbit.plan6bii_financial_admin_issue_resolution_command_id',
+      'pale_orbit.plan6bii_financial_admin_issue_resolution_actor_id'
+    ]) {
+      expect(issueTransitionStartupGuard, settingName).toContain(settingName);
+    }
+    expect(issueTransitionStartupGuard).toContain(
+      'failClosedFinancialIssueTransitionSettingPredicates.some'
+    );
+    expect(issueTransitionStartupGuard).toContain(
+      'IF NOT COALESCE(worker_resolution OR admin_resolution, false) THEN'
+    );
+    expect(issueTransitionStartupGuard).not.toContain(
+      'IF (worker_resolution OR admin_resolution) IS NOT TRUE THEN'
+    );
+    expect(verifierWitness).toMatch(
+      /pool\.query\(vulnerableFinancialIssueTransitionStatement\)[\s\S]{0,300}?fail-open financial issue transition predecessor[\s\S]{0,200}?financial_schema_object_manifest=1[\s\S]{0,300}?pool\.query\(failClosedFinancialIssueTransitionStatement\)[\s\S]{0,300}?fail-closed financial issue transition repair/u
     );
     for (const [witnessName, expectedCount] of [
       ['missing financial transition trigger', 2],

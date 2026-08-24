@@ -87,6 +87,8 @@ const NARROW_UPDATE_GUARD_TABLES = [
 const ADMIN_COMMAND_MIGRATION = '../drizzle/0012_plan6bii_admin_command_authority.sql';
 const REPORTING_CORRECTION_AUTHORITY_MIGRATION =
   '../drizzle/0013_plan6bii_reporting_correction_authority.sql';
+const ISSUE_TRANSITION_FAIL_CLOSED_MIGRATION =
+  '../drizzle/0014_plan6bii_issue_transition_fail_closed.sql';
 
 const PLAN6BII_0012_CALLABLE_ROUTINES = [
   ['submit_financial_admin_command(uuid,text,text,text,text,jsonb)', 'pale_orbit_runtime'],
@@ -210,7 +212,7 @@ describe('Plan 6B financial schema preservation', () => {
     );
   });
 
-  it('freezes the historical eight-routine 0012 boundary and final nine-routine 0013 head', () => {
+  it('freezes the historical eight-routine 0012 boundary and current nine-routine 0014 head', () => {
     const integration = source('../tests/integration/financial-migration.test.ts');
     const adminCommandMigration = source(ADMIN_COMMAND_MIGRATION);
     const reportingCorrectionMigration = source(REPORTING_CORRECTION_AUTHORITY_MIGRATION);
@@ -267,12 +269,120 @@ describe('Plan 6B financial schema preservation', () => {
       /^GRANT EXECUTE ON FUNCTION .* TO (?:PUBLIC|"pale_orbit_runtime"|"pale_orbit_storage_cleanup");/mu
     );
     expect(journal.entries.map(({ idx }) => idx)).toEqual(
-      Array.from({ length: 14 }, (_value, idx) => idx)
+      Array.from({ length: 15 }, (_value, idx) => idx)
     );
     expect(journal.entries.at(-1)).toEqual(expect.objectContaining({
-      idx: 13,
-      tag: '0013_plan6bii_reporting_correction_authority'
+      idx: 14,
+      tag: '0014_plan6bii_issue_transition_fail_closed'
     }));
+  });
+
+  it('appends an exact fail-closed repair for nullable issue-resolution authority', () => {
+    const historicalAdminAuthority = source(ADMIN_COMMAND_MIGRATION);
+    const reportingCorrectionAuthority = source(REPORTING_CORRECTION_AUTHORITY_MIGRATION);
+    const migration = source(ISSUE_TRANSITION_FAIL_CLOSED_MIGRATION);
+    const preflightEnd = migration.indexOf(
+      '$plan6bii_issue_transition_fail_closed_preflight$;--> statement-breakpoint'
+    );
+    const replacement = migration.indexOf(
+      'CREATE OR REPLACE FUNCTION "public"."plan6b_validate_issue_transition"()'
+    );
+
+    expect(historicalAdminAuthority).toContain(
+      'IF NOT (worker_resolution OR admin_resolution) THEN'
+    );
+    expect(reportingCorrectionAuthority).not.toContain(
+      'CREATE OR REPLACE FUNCTION "public"."plan6b_validate_issue_transition"'
+    );
+    expect(migration.startsWith('DO $plan6bii_issue_transition_fail_closed_preflight$')).toBe(
+      true
+    );
+    expect(preflightEnd).toBeGreaterThan(0);
+    expect(replacement).toBeGreaterThan(preflightEnd);
+    expect(migration).toContain(
+      "'33a6441df520bf0c6ed486f7c3b8585ad719683dfe73835eb62176d5bbf898c8'"
+    );
+    expect(migration).toContain(
+      "'a921aec3b466cdcdc47b6583065d171179d816159d25ec634c57521a7e0f2c81'"
+    );
+    for (const resolverDefinitionHash of [
+      '7a9238d3e448d2b528b252276c55f9b69131e335b8f68865597e85b6afde765e',
+      '87085fe791b4f54ef2f3b950a7163f1bdaa144922e1c681df1d2d683737f90c4',
+      'c6e086b30db8e85c5bc38107ceab36f4b41ad5c5a152e75b5e862c607c3a60e8'
+    ]) expect(migration).toContain(resolverDefinitionHash);
+    for (const guardDefinitionHash of [
+      'f0373a347c369035f1c8b68d6eb4238a33612b0fa6e82e2ecfaa0ebf10e0696b',
+      'bab4c3832060ba371da911deb57c88258a8be93141301552889b03bb9c313634',
+      'f3691d9c661abe6ec369f784e99395a05dc10247f704dd282445457b8346fb96',
+      '1b4835de9ab460e0e55a6a82a42cc5646131bf3c78f59ed37c91e1f2160b1588',
+      '26d19d45231662b9ec352269be5a1db7f61e832876eecffc3fbce50eb5ab23b6'
+    ]) expect(migration).toContain(guardDefinitionHash);
+    expect(migration).toContain(
+      'IF NOT COALESCE(worker_resolution OR admin_resolution, false) THEN'
+    );
+    expect(migration).not.toContain(
+      'IF NOT (worker_resolution OR admin_resolution) THEN'
+    );
+    expect(migration).toContain('pg_catalog.pg_get_functiondef');
+    expect(migration).toContain('pg_catalog.sha256');
+    expect(migration.match(/E'\\r\\n', E'\\n'/gu)).toHaveLength(4);
+    expect(migration.match(/E'\\r', E'\\n'/gu)).toHaveLength(4);
+    expect(migration).toContain('session_replication_role');
+    expect(migration).toContain('unsafe_session_replication_default');
+    expect(migration).toContain("configured_setting.value, '=', 2) IS DISTINCT FROM 'origin'");
+    expect(migration).toContain(
+      'Plan 6B-II issue-transition repair session-replication default is not canonical'
+    );
+    expect(migration).toContain('protected_parameter_principal');
+    expect(migration).toContain('pg_catalog.pg_parameter_acl');
+    expect(migration).toContain(
+      'Plan 6B-II issue-transition repair parameter ACL is not canonical'
+    );
+    expect(migration).toContain('relation_row.relispartition');
+    expect(migration).toContain('relation_row.relrowsecurity');
+    expect(migration).toContain('relation_row.relforcerowsecurity');
+    expect(migration).toContain("'public.financial_admin_commands'");
+    expect(migration).toContain('expected_trigger_inventory');
+    expect(migration).toContain('actual_trigger_inventory');
+    expect(migration).toContain('trigger_inventory_delta');
+    expect(migration).toContain('pg_catalog.pg_rewrite');
+    expect(migration).toContain('pg_catalog.pg_inherits');
+    expect(migration).toMatch(
+      /audit\.actor_id = 'commerce-worker'[\s\S]+?issue\.resource_type = 'dispute'[\s\S]+?issue\.resource_type = 'allocation_set'/u
+    );
+    expect(migration).toContain("audit.after - 'commandId'");
+    expect(migration).toContain('FROM "public"."financial_admin_commands" command');
+    expect(migration).toContain('command.actor_user_id = issue.resolved_by_admin_id');
+    expect(migration).toContain('command.correlation_id = audit.correlation_id');
+    expect(migration).toContain("command.status = 'succeeded'");
+    const commandAuditBranchStart = migration.indexOf("audit.after - 'commandId'");
+    const commandAuditBranch = migration.slice(
+      commandAuditBranchStart,
+      migration.indexOf(') ELSE false END', commandAuditBranchStart)
+    );
+    const commandSafeCodes = commandAuditBranch
+      .match(/issue\.safe_code IN \(([\s\S]*?)\)/u)?.[1]
+      ?.match(/'([^']+)'/gu)
+      ?.map((quotedCode) => quotedCode.slice(1, -1));
+    expect(commandSafeCodes).toEqual([
+      'allocation_fork',
+      'allocation_incomplete',
+      'allocation_mismatch',
+      'classification_fork',
+      'correction_rebase_required',
+      'currency_mismatch',
+      'immutable_mismatch',
+      'missing_source',
+      'source_linkage_mismatch'
+    ]);
+    expect(migration).toContain("command.safe_result ->> 'refundId'");
+    expect(migration).toContain('allocation_set.source_internal_id::text');
+    expect(migration.match(/invalid_overload_inventory/gu)).toHaveLength(4);
+    expect(migration).not.toContain('audit.after @>');
+    expect(migration).toContain(
+      'REVOKE ALL ON FUNCTION "public"."plan6b_validate_issue_transition"() FROM PUBLIC, "pale_orbit_runtime", "pale_orbit_financial_worker", "pale_orbit_storage_cleanup"'
+    );
+    expect(migration).toContain('$plan6bii_issue_transition_fail_closed_postflight$;');
   });
 
   it('pins issue-independent correction compatibility and exact command provenance', () => {

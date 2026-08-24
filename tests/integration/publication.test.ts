@@ -61,7 +61,7 @@ import {
 } from '$lib/server/storage/keys';
 import { storage } from './storage';
 import { onePixelPng } from '../fixtures/publications';
-import { databaseClient, ownerDatabaseClient } from './database';
+import { databaseClient, ownerDatabaseClient, workerDatabaseClient } from './database';
 
 const admin = { type: 'user', id: randomUUID(), roles: ['admin'] } satisfies Actor;
 const customer = { type: 'user', id: randomUUID(), roles: ['customer'] } satisfies Actor;
@@ -994,7 +994,7 @@ describe('failed revision retry', () => {
       processedAt: null
     });
     expect(retried.stagingStorageKey).not.toBe(oldKey);
-    const [job] = await databaseClient.db
+    const [job] = await workerDatabaseClient.db
       .select()
       .from(jobs)
       .where(eq(jobs.deduplicationKey, `catalog.ingest:${failed.id}:1`));

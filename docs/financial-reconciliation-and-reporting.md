@@ -120,13 +120,13 @@ If safe inspection cannot explain the state, stop. Keep maintenance mode enabled
 
 ## Migration, principals, and deployment order
 
-The candidate migration chain ends at `0013`. Migration `0012` retains its historical eight callable public boundary routines; `0013` adds only `resolve_financial_issue_after_reporting_correction_command(uuid, uuid)`, producing the final nine-routine callable surface.
+The candidate migration chain ends at `0014`. Migration `0012` retains its historical eight callable public boundary routines; `0013` adds only `resolve_financial_issue_after_reporting_correction_command(uuid, uuid)`, producing the final nine-routine callable surface; and `0014` changes no callable surface while replacing the nullable issue-transition trigger guard with a fail-closed definition. Missing or partial transaction-local resolution context therefore rejects the protected transition instead of being accepted through SQL `NULL` semantics.
 
 The four pairwise-distinct login principals are exactly `DATABASE_OWNER_USER`, `DATABASE_USER` (web), `DATABASE_WORKER_USER` (financial worker), and `DATABASE_STORAGE_CLEANUP_USER` (storage cleanup). The web principal may submit commands, read its owner-scoped status, and append the route-authorized audit boundary; it cannot mutate protected financial state. Only the worker principal executes the allowlisted mutation routines. Storage cleanup retains only its narrow storage capability, and the owner is used only for ownership and migrations.
 
 For a candidate deployment or rehearsal, preserve this order:
 
-1. migrate through `0013` as the owner;
+1. migrate through `0014` as the owner;
 2. provision and attest the four-role boundary;
 3. capture the versioned checkpoint artifacts;
 4. rehearse restore on a distinct database engine with app and general worker stopped; and

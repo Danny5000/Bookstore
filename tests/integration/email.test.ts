@@ -129,7 +129,7 @@ describe('SMTP outbox delivery', () => {
       true
     );
 
-    const [storedJob] = await databaseClient.db
+    const [storedJob] = await workerDatabaseClient.db
       .select()
       .from(jobs)
       .where(eq(jobs.id, failedJob.id));

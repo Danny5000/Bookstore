@@ -2,7 +2,7 @@
 
 **Status:** Plan 6B candidate — independent review pending
 
-The unified Plan 6B candidate is migrated through `0013`. Migration `0012` retains its historical eight callable public boundary routines; `0013` adds only the correction-resolution routine, for a final surface of nine. Production remains in maintenance mode with Stripe disabled. The direct Sales candidate routes remain unlinked until independent review. See [financial reconciliation and reporting](financial-reconciliation-and-reporting.md) for the operator boundary; Plan 7 owns production activation and operability.
+The unified Plan 6B candidate is migrated through `0014`. Migration `0012` retains its historical eight callable public boundary routines; `0013` adds only the correction-resolution routine, for a final surface of nine; and `0014` changes no callable surface while replacing the nullable issue-transition trigger guard with a fail-closed definition. Production remains in maintenance mode with Stripe disabled. The direct Sales candidate routes remain unlinked until independent review. See [financial reconciliation and reporting](financial-reconciliation-and-reporting.md) for the operator boundary; Plan 7 owns production activation and operability.
 
 ## Ownership
 
@@ -94,7 +94,7 @@ npm run test:plan6b-upgrade
 
 ## Production deployment order
 
-The Plan 6B release-evidence order is exact: migrate through `0013`, provision and attest the four principals, capture the versioned checkpoint, rehearse it on a distinct database engine, then run the production-image smoke. A later step cannot substitute for or precede an earlier one.
+The Plan 6B release-evidence order is exact: migrate through `0014`, provision and attest the four principals, capture the versioned checkpoint, rehearse it on a distinct database engine, then run the production-image smoke. A later step cannot substitute for or precede an earlier one.
 
 Production configuration comes from the invoking process environment; no production `.env` file is used. When upgrading an existing PostgreSQL data volume created by the former single-login topology, set `DATABASE_OWNER_USER` to the existing database owner (and use its existing secret); you must not reuse that owner name for `DATABASE_USER`, `DATABASE_WORKER_USER`, or `DATABASE_STORAGE_CLEANUP_USER`. Choose three new login names and secrets for web, worker, and cleanup. An already-split owner/web/worker deployment preserves those pairs and adds the fourth cleanup pair. Role provisioning deliberately rejects a proposed runtime login that owns the database or public application objects, or that inherits unexpected roles, instead of silently weakening the boundary.
 

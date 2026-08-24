@@ -10,12 +10,16 @@ import { PermanentFinancialError } from '$lib/server/commerce/financial/errors';
 import { appendClassificationDecisionLocked } from '$lib/server/commerce/financial/classification';
 import { observeFinancialIssue, resolveFinancialIssueAfterRecompute } from '$lib/server/commerce/financial/issues';
 import type { BalanceTransactionSnapshot } from '$lib/server/commerce/stripe/financial-types';
+import { loadApplicationConfig } from '$lib/server/config/load';
+import { createDatabaseClient } from '$lib/server/db/client';
+import { databaseEnvironmentForRole } from '$lib/server/db/database-role-provision';
 import {
   auditEvents,
   financialClassificationVersions,
   financialReconciliationIssues,
   stripeBalanceTransactionFeeDetails,
-  stripeBalanceTransactions
+  stripeBalanceTransactions,
+  user
 } from '$lib/server/db/schema';
 import {
   ownerDatabaseClient,
@@ -69,6 +73,12 @@ function postgresLeaf(error: unknown): unknown {
 
 function systemActor() {
   return { type: 'system' as const, id: 'financial-worker' };
+}
+
+function freshOwnerClient() {
+  return createDatabaseClient(
+    loadApplicationConfig(databaseEnvironmentForRole(process.env, 'owner')).database
+  );
 }
 
 async function installRejectingAuditTrigger(functionName: string, triggerName: string): Promise<void> {
@@ -518,6 +528,181 @@ describe('financial balance-transaction ledger', () => {
     expect(events.filter((entry) => entry.action === 'financial.issue.resolved')).toHaveLength(1);
     expect(events.some((entry) => entry.action === 'financial.balance_transaction.imported')).toBe(true);
     expect(events.some((entry) => entry.action === 'financial.classification.appended')).toBe(true);
+  });
+
+  it('fails closed for missing, partial, empty, mismatched, and replayed resolution context', async () => {
+    const firstStage = await stageBalanceTransaction(databaseClient.db, snapshot(), {
+      correlationId: 'ledger-nullable-resolution-first-stage'
+    });
+    const secondStage = await stageBalanceTransaction(databaseClient.db, snapshot(), {
+      correlationId: 'ledger-nullable-resolution-second-stage'
+    });
+    await databaseClient.db.transaction((tx) => observeFinancialIssue(tx, {
+      resourceType: 'balance_transaction', resourceId: firstStage.balanceTransactionId,
+      safeCode: 'immutable_mismatch', impact: 'exception', actor: systemActor(),
+      correlationId: 'ledger-nullable-resolution-first-open'
+    }));
+    await databaseClient.db.transaction((tx) => observeFinancialIssue(tx, {
+      resourceType: 'balance_transaction', resourceId: secondStage.balanceTransactionId,
+      safeCode: 'classification_fork', impact: 'exception', actor: systemActor(),
+      correlationId: 'ledger-nullable-resolution-second-open'
+    }));
+    const [firstIssue] = await databaseClient.db.select().from(financialReconciliationIssues)
+      .where(eq(financialReconciliationIssues.resourceId, firstStage.balanceTransactionId));
+    const [secondIssue] = await databaseClient.db.select().from(financialReconciliationIssues)
+      .where(eq(financialReconciliationIssues.resourceId, secondStage.balanceTransactionId));
+    const actorId = randomUUID();
+    const commandId = randomUUID();
+    await ownerDatabaseClient.db.insert(user).values({
+      id: actorId,
+      name: 'Nullable Resolution Guard',
+      email: `nullable-resolution-${randomUUID()}@paleorbit.test`,
+      emailVerified: true
+    });
+
+    const workerSetting = 'pale_orbit.financial_worker_issue_resolution';
+    const adminSettings = {
+      issue: 'pale_orbit.plan6bii_financial_admin_issue_resolution_issue_id',
+      command: 'pale_orbit.plan6bii_financial_admin_issue_resolution_command_id',
+      actor: 'pale_orbit.plan6bii_financial_admin_issue_resolution_actor_id'
+    } as const;
+    const allSettingNames = [workerSetting, ...Object.values(adminSettings)];
+    type Attempt = {
+      readonly label: string;
+      readonly targetIssueId: string;
+      readonly resolvedByAdminId: string | null;
+      readonly settings: ReadonlyArray<readonly [string, string]>;
+      readonly expectMissing?: boolean;
+      readonly expectEmpty?: boolean;
+    };
+    const matchingAdminSettings = {
+      issue: [adminSettings.issue, firstIssue!.id] as const,
+      command: [adminSettings.command, commandId] as const,
+      actor: [adminSettings.actor, actorId] as const
+    };
+    const partialAdminSettings = [
+      [matchingAdminSettings.issue],
+      [matchingAdminSettings.command],
+      [matchingAdminSettings.actor],
+      [matchingAdminSettings.issue, matchingAdminSettings.command],
+      [matchingAdminSettings.issue, matchingAdminSettings.actor],
+      [matchingAdminSettings.command, matchingAdminSettings.actor]
+    ] as const;
+    const attempts: Attempt[] = [
+      {
+        label: 'missing worker context', targetIssueId: firstIssue!.id,
+        resolvedByAdminId: null, settings: [], expectMissing: true
+      },
+      {
+        label: 'missing administrator context', targetIssueId: firstIssue!.id,
+        resolvedByAdminId: actorId, settings: [], expectMissing: true
+      },
+      ...partialAdminSettings.map((settings, index) => ({
+        label: `partial administrator context ${index + 1}`,
+        targetIssueId: firstIssue!.id,
+        resolvedByAdminId: actorId,
+        settings
+      })),
+      {
+        label: 'empty worker context', targetIssueId: firstIssue!.id,
+        resolvedByAdminId: null, settings: [[workerSetting, '']], expectEmpty: true
+      },
+      {
+        label: 'empty administrator context', targetIssueId: firstIssue!.id,
+        resolvedByAdminId: actorId,
+        settings: Object.values(adminSettings).map((name) => [name, ''] as const),
+        expectEmpty: true
+      },
+      {
+        label: 'wrong worker issue', targetIssueId: firstIssue!.id,
+        resolvedByAdminId: null, settings: [[workerSetting, randomUUID()]]
+      },
+      {
+        label: 'wrong administrator issue', targetIssueId: firstIssue!.id,
+        resolvedByAdminId: actorId,
+        settings: [
+          [adminSettings.issue, randomUUID()], matchingAdminSettings.command,
+          matchingAdminSettings.actor
+        ]
+      },
+      {
+        label: 'wrong administrator actor', targetIssueId: firstIssue!.id,
+        resolvedByAdminId: actorId,
+        settings: [
+          matchingAdminSettings.issue, matchingAdminSettings.command,
+          [adminSettings.actor, randomUUID()]
+        ]
+      },
+      {
+        label: 'malformed administrator command', targetIssueId: firstIssue!.id,
+        resolvedByAdminId: actorId,
+        settings: [
+          matchingAdminSettings.issue, [adminSettings.command, 'not-a-command-id'],
+          matchingAdminSettings.actor
+        ]
+      },
+      {
+        label: 'administrator context replayed against another issue',
+        targetIssueId: secondIssue!.id,
+        resolvedByAdminId: actorId,
+        settings: Object.values(matchingAdminSettings)
+      }
+    ];
+
+    for (const attempt of attempts) {
+      const freshDatabaseClient = freshOwnerClient();
+      const client = await freshDatabaseClient.pool.connect();
+      try {
+        await client.query('begin');
+        if (attempt.expectMissing) {
+          const missing = await client.query<Record<string, string | null>>(`
+            select
+              current_setting($1, true) as worker,
+              current_setting($2, true) as issue,
+              current_setting($3, true) as command,
+              current_setting($4, true) as actor
+          `, allSettingNames);
+          expect(Object.values(missing.rows[0]!), attempt.label).toEqual([
+            null, null, null, null
+          ]);
+        }
+        for (const [name, value] of attempt.settings) {
+          await client.query('select set_config($1, $2, true)', [name, value]);
+        }
+        if (attempt.expectEmpty) {
+          for (const [name] of attempt.settings) {
+            const empty = await client.query<{ value: string | null }>(
+              'select current_setting($1, true) as value',
+              [name]
+            );
+            expect(empty.rows[0]?.value, `${attempt.label}: ${name}`).toBe('');
+          }
+        }
+        await expect(client.query(
+          `update financial_reconciliation_issues
+           set state = 'resolved', resolved_at = clock_timestamp(),
+             resolved_by_admin_id = $2
+           where id = $1`,
+          [attempt.targetIssueId, attempt.resolvedByAdminId]
+        ), attempt.label).rejects.toMatchObject({ code: '55000' });
+      } finally {
+        await client.query('rollback');
+        client.release();
+        await freshDatabaseClient.close();
+      }
+    }
+
+    expect(await ownerDatabaseClient.db.select().from(financialReconciliationIssues)
+      .where(eq(financialReconciliationIssues.id, firstIssue!.id)))
+      .toEqual([expect.objectContaining({ state: 'open', resolvedByAdminId: null })]);
+    expect(await ownerDatabaseClient.db.select().from(financialReconciliationIssues)
+      .where(eq(financialReconciliationIssues.id, secondIssue!.id)))
+      .toEqual([expect.objectContaining({ state: 'open', resolvedByAdminId: null })]);
+    const resolutionAudits = await ownerDatabaseClient.db.select().from(auditEvents)
+      .where(eq(auditEvents.action, 'financial.issue.resolved'));
+    expect(resolutionAudits.filter((event) =>
+      event.resourceId === firstIssue!.id || event.resourceId === secondIssue!.id
+    )).toEqual([]);
   });
 
   it('makes the worker role the sole audited transition and rejects runtime-role bypasses', async () => {

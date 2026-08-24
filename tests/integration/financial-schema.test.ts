@@ -1,6 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { sql } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
+import {
+  FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+  FINANCIAL_CLASSIFIER_VERSION
+} from '$lib/server/commerce/financial/constants';
 import { ownerDatabaseClient as databaseClient } from './database';
 
 const FINANCIAL_TABLES = [
@@ -238,8 +242,8 @@ function insertAllocationSet(input: AllocationSetInput) {
       input.scope ?? 'title',
       input.expectedEffectMinor,
       input.currency ?? 'USD',
-      input.algorithmVersion ?? 1,
-      input.classifierVersion ?? 1,
+      input.algorithmVersion ?? FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
+      input.classifierVersion ?? FINANCIAL_CLASSIFIER_VERSION,
       input.sourceFingerprintSha256 ?? 'd'.repeat(64),
       input.supersedesSetId ?? null,
       input.reversalOfSetId ?? null

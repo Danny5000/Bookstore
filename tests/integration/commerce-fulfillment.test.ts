@@ -248,7 +248,7 @@ describe('canonical Stripe checkout fulfillment', () => {
     const [storedPayment] = await databaseClient.db.select().from(payments)
       .where(eq(payments.orderId, fixture.orderId));
     expect(storedPayment?.status).toBe(expectedPaymentStatus);
-    expect(await databaseClient.db.select().from(jobs)
+    expect(await workerDatabaseClient.db.select().from(jobs)
       .where(eq(jobs.type, 'commerce.financial-source'))).toEqual([
       expect.objectContaining({
         type: 'commerce.financial-source',
@@ -270,7 +270,7 @@ describe('canonical Stripe checkout fulfillment', () => {
 
     await fulfill(fixture);
 
-    expect(await databaseClient.db.select().from(jobs)
+    expect(await workerDatabaseClient.db.select().from(jobs)
       .where(eq(jobs.type, 'commerce.financial-source'))).toEqual([
       expect.objectContaining({
         deduplicationKey: `stripe:financial-source:event:${fixture.providerEventId}`,
@@ -301,7 +301,7 @@ describe('canonical Stripe checkout fulfillment', () => {
       payment: null
     }, dependencies());
 
-    expect(await databaseClient.db.select().from(jobs)
+    expect(await workerDatabaseClient.db.select().from(jobs)
       .where(eq(jobs.type, 'commerce.financial-source'))).toHaveLength(0);
   });
 
@@ -324,13 +324,13 @@ describe('canonical Stripe checkout fulfillment', () => {
       .where(eq(payments.orderId, fixture.orderId))).toHaveLength(0);
     expect((await databaseClient.db.select().from(stripeEvents)
       .where(eq(stripeEvents.id, fixture.stripeEventId)))[0]?.status).toBe('pending');
-    expect(await databaseClient.db.select().from(jobs)).toHaveLength(0);
+    expect(await workerDatabaseClient.db.select().from(jobs)).toHaveLength(0);
   });
 
   it('keeps a terminal event-keyed financial job unchanged on reducer replay', async () => {
     const fixture = await createFixture();
     await fulfill(fixture);
-    const [queued] = await databaseClient.db.select().from(jobs)
+    const [queued] = await workerDatabaseClient.db.select().from(jobs)
       .where(eq(jobs.deduplicationKey,
         `stripe:financial-source:event:${fixture.providerEventId}`));
     if (!queued) throw new Error('Expected financial source job');
@@ -343,7 +343,7 @@ describe('canonical Stripe checkout fulfillment', () => {
 
     await fulfill(fixture);
 
-    expect(await databaseClient.db.select().from(jobs)
+    expect(await workerDatabaseClient.db.select().from(jobs)
       .where(eq(jobs.deduplicationKey,
         `stripe:financial-source:event:${fixture.providerEventId}`))).toEqual([
       expect.objectContaining({ id: queued.id, status: 'succeeded', completedAt })
