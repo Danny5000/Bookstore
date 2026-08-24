@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-11
 
-**Status:** Plan 6B candidate — independent review pending
+**Status:** Plan 6B implementation complete — protected global Sales link live
 
 **Depends on:** Plans 1-6A, `2026-08-08-bookstore-full-stack-design.md`, and `2026-08-10-stripe-commerce-guest-claims-design.md`
 
@@ -16,11 +16,11 @@ The established purchase model remains unchanged: a cart can contain multiple ti
 
 Production remains in maintenance mode through Plan 6B. Plan 7 still owns launch readiness, general failed-job administration, monitoring and alerting, backup automation, deployment hardening, and the Hetzner production launch.
 
-The implementation candidate is migrated through `0013`: migration `0012` retains its historical eight callable public boundary routines and `0013` adds the ninth. Its exact pairwise-distinct principals are `DATABASE_OWNER_USER`, `DATABASE_USER`, `DATABASE_WORKER_USER`, and `DATABASE_STORAGE_CLEANUP_USER`. The web principal may submit a command, read its owner-scoped status, and record the route-authorized audit boundary; only the financial worker may execute the protected mutation. Candidate release evidence remains ordered migrate → provision → checkpoint capture → distinct-engine rehearsal → smoke. See the [financial reconciliation and reporting operator guide](../../financial-reconciliation-and-reporting.md).
+The completed implementation is migrated through `0014`: migration `0012` retains its historical eight callable public boundary routines, `0013` adds the ninth, and `0014` adds fail-closed runtime-authority and source-parity protection to the financial issue-transition boundary without changing the callable surface. Its exact pairwise-distinct principals are `DATABASE_OWNER_USER`, `DATABASE_USER`, `DATABASE_WORKER_USER`, and `DATABASE_STORAGE_CLEANUP_USER`. The web principal may submit a command, read its owner-scoped status, and record the route-authorized audit boundary; only the financial worker may execute the protected mutation. Release evidence remains ordered migrate → provision → checkpoint capture → distinct-engine rehearsal → smoke. See the [financial reconciliation and reporting operator guide](../../financial-reconciliation-and-reporting.md).
 
 ## 2. Goals
 
-The Plan 6B candidate provides:
+The completed Plan 6B implementation provides:
 
 - A normalized, minimized local ledger of Stripe balance transactions and payouts.
 - Separate customer-presentment and Stripe-settlement currency domains.
@@ -100,9 +100,9 @@ Plan 6B is one design delivered through two implementation checkpoints:
 - **6B-I — Financial ingestion and reconciliation:** schema, canonical provider DTOs, payout webhooks, recurring scans, ledger imports, allocations, issues, migration, backfill, and focused verification.
 - **6B-II — Admin resolution and reporting:** capabilities, sales overview, refund review, payout views, reporting corrections, CSV, audit, accessibility, documentation, and full release gates.
 
-Checkpoint I passed its bounded independent review before checkpoint II began. They now form one candidate phase, and neither checkpoint is a separately released product surface.
+Checkpoint I passed its bounded independent review before checkpoint II began. The checkpoints formed one candidate phase during implementation, and neither checkpoint is a separately released product surface.
 
-The candidate combines checkpoint I’s ingestion/reconciliation work with checkpoint II’s administrator resolution/reporting routes, payout views, corrections, recovery grants, and CSV. Direct routes are available only for controlled review; the global item remains `Sales — Upcoming` without a live link until final independent clearance. Production remains in maintenance mode with Stripe disabled, and Plan 7 retains activation and operability ownership. See the [Stripe financial reconciliation operations guide](../../stripe-financial-reconciliation.md) for its runtime and recovery boundary.
+The completed implementation combines checkpoint I’s ingestion/reconciliation work with checkpoint II’s administrator resolution/reporting routes, payout views, corrections, recovery grants, and CSV. The direct routes remain protected administrator surfaces, and global administrator navigation now exposes the live protected **Sales** link. Production remains in maintenance mode with Stripe disabled, and Plan 7 retains activation and operability ownership. See the [Stripe financial reconciliation operations guide](../../stripe-financial-reconciliation.md) for its runtime and recovery boundary.
 
 ## 5. Financial authority and currency model
 
@@ -833,7 +833,7 @@ Plan 6B updates:
 - Backup/restore documentation with ledger, payout, allocation, issue, draft, correction, and checkpoint invariants.
 - The admin guide with signed metric definitions, UTC boundaries, currency domains, draft/finalization consequences, reporting-only corrections, administrative access recovery, CSV privacy, and audit behavior.
 - Dependency decisions and final gate evidence with current versions and actual test/image results.
-- The full-stack roadmap to mark the unified Plan 6B candidate complete only after final independent review is complete.
+- The full-stack roadmap records Plan 6B implementation completion, the live protected global Sales link, and Plan 7 ownership of production activation.
 
 Operational diagnostics use safe SQL examples that select counts, states, timestamps, currencies, and internal IDs only. Runbooks never select provider messages, identity columns, raw payloads, or secrets. Direct database edits are not a supported resolution path.
 

@@ -4,7 +4,7 @@
 
 **Architecture status:** Approved implementation architecture
 
-**Implementation status:** Plan 6B candidate — independent review pending
+**Implementation status:** Plan 6B implementation complete — protected global Sales link live
 
 ## 1. Purpose
 
@@ -14,7 +14,7 @@ The approved product behavior in [Plan 6B: Stripe Financial Reconciliation and R
 
 The August 11 implementation plan assumed that an authorized web request could perform financial writes and append `financial.*` audit events in its own database transaction. Current `main` deliberately forbids both. The refreshed design preserves the web/worker credential split instead of weakening it.
 
-The resulting unified Plan 6B candidate is migrated through `0013`: `0012` retains its historical eight callable public boundary routines and `0013` adds the final ninth. Its exact pairwise-distinct principals are `DATABASE_OWNER_USER`, `DATABASE_USER`, `DATABASE_WORKER_USER`, and `DATABASE_STORAGE_CLEANUP_USER`. The web principal owns command submission, owner-scoped status, and route-authorized audit boundaries; only the financial-worker principal owns protected mutation. Candidate evidence remains ordered migrate → provision → checkpoint capture → distinct-engine rehearsal → smoke. Production remains in maintenance mode with Stripe disabled, and Plan 7 owns activation and operability. See the [financial reconciliation and reporting operator guide](../../financial-reconciliation-and-reporting.md).
+The resulting unified Plan 6B implementation is complete and migrated through `0014`: `0012` retains its historical eight callable public boundary routines, `0013` adds the final ninth, and `0014` adds fail-closed runtime-authority and source-parity protection to the financial issue-transition boundary without changing the callable surface. Its exact pairwise-distinct principals are `DATABASE_OWNER_USER`, `DATABASE_USER`, `DATABASE_WORKER_USER`, and `DATABASE_STORAGE_CLEANUP_USER`. The web principal owns command submission, owner-scoped status, and route-authorized audit boundaries; only the financial-worker principal owns protected mutation. Release evidence remains ordered migrate → provision → checkpoint capture → distinct-engine rehearsal → smoke. Production remains in maintenance mode with Stripe disabled, and Plan 7 owns activation and operability. See the [financial reconciliation and reporting operator guide](../../financial-reconciliation-and-reporting.md).
 
 ## 2. Source of truth and document strategy
 
@@ -45,7 +45,7 @@ Plan 6B-II delivers:
 6. Shared refund drafts, finalization, reporting corrections, and administrative recovery activation/deactivation.
 7. Database-role, migration, restore-catalog, lock-order, privacy, browser, smoke, and release evidence for the completed phase.
 
-Sales navigation remains `Sales — Upcoming` without a live link until the unified candidate passes final review. Direct routes exist only for controlled candidate evidence. Intermediate milestones are implementation checkpoints, not separately released product surfaces.
+Global administrator navigation now exposes the live protected **Sales** link. Direct routes remain protected by the route, service, and database-authority boundaries defined here. Intermediate milestones are implementation checkpoints, not separately released product surfaces.
 
 ## 4. Non-goals
 
@@ -451,7 +451,7 @@ The superseding implementation plan used three milestones on one unreleased phas
 2. **Read-only reporting:** overview, operational Needs Review, safe issue/refund/payout details, filters, pagination, signed metrics, and bounded CSV.
 3. **Resolution and release:** drafts, finalization, corrections, recovery, access/email effects, browser journeys, documentation, smoke, release evidence, and final clearance.
 
-Sales navigation remains disabled on the candidate even after every surface is green; enabling it requires the final independent clearance rather than serving as pre-clearance evidence.
+The delivery gate required Sales navigation to remain disabled on the candidate even after every surface was green; enabling it was not pre-clearance evidence. At this frozen implementation-complete head, the protected global **Sales** link is live.
 
 ## 16. Review discipline
 
@@ -488,4 +488,4 @@ Plan 6B-II is complete when:
 
 ## 18. Supersession and next step
 
-The reviewed executable plan is [Backend Plan 6B-II: Admin Resolution and Reporting Refresh](../plans/2026-08-20-backend-plan-6b-ii-admin-resolution-reporting-refresh.md). It supersedes, without silently rewriting, `2026-08-11-backend-plan-6b-ii-admin-resolution-reporting.md` and contains the exact file paths, RED/GREEN commands, migration and role-boundary steps, release gates, and commit boundaries. Its implementation now forms the unified Plan 6B candidate and awaits the prescribed independent review loop; no candidate status is production clearance.
+The reviewed executable plan is [Backend Plan 6B-II: Admin Resolution and Reporting Refresh](../plans/2026-08-20-backend-plan-6b-ii-admin-resolution-reporting-refresh.md). It supersedes, without silently rewriting, `2026-08-11-backend-plan-6b-ii-admin-resolution-reporting.md` and contains the exact file paths, RED/GREEN commands, migration and role-boundary steps, release gates, and commit boundaries. Its implementation is complete at this frozen Plan 6B head, and the protected global **Sales** link is live; this implementation status is not production clearance.

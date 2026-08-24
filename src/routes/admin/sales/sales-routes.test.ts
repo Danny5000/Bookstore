@@ -32,14 +32,19 @@ const routeMocks = vi.hoisted(() => ({
   getFinancialAdminCommandStatus: vi.fn()
 }));
 
-describe('Sales candidate navigation boundary', () => {
-  it('keeps the global Sales — Upcoming item disabled while direct candidate routes remain review-only', () => {
+describe('Sales navigation boundary', () => {
+  it('exposes one active-aware global link to the protected Sales surface', () => {
     const adminLayout = readFileSync(new URL('../+layout.svelte', import.meta.url), 'utf8');
     const adminLinks = adminLayout.match(/<a\b[\s\S]*?<\/a>/giu) ?? [];
+    const salesLinks = adminLinks.filter((link) => /\bSales\b/u.test(link));
 
-    expect(adminLayout).toContain('<span>Sales <small>Upcoming</small></span>');
-    expect(adminLinks.some((link) => /\bSales\b/u.test(link))).toBe(false);
-    expect(adminLayout).not.toMatch(/<a\b[^>]*\/admin\/sales/iu);
+    expect(salesLinks).toHaveLength(1);
+    expect(salesLinks[0]).toContain("href={resolve('/admin/sales')}");
+    expect(salesLinks[0]).toContain(
+      "class:active={$page.url.pathname.startsWith('/admin/sales')}"
+    );
+    expect(salesLinks[0]).toMatch(/>\s*Sales\s*<\/a>/u);
+    expect(adminLayout).not.toContain('Upcoming');
   });
 });
 

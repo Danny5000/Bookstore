@@ -2,9 +2,9 @@
 
 Checked against the npm registry on 2026-08-15.
 
-**Status:** Plan 6B candidate — independent review pending
+**Status:** Plan 6B implementation complete
 
-Plan 6B-I and 6B-II now form one review candidate and add no production runtime dependency beyond the decisions below. Its committed database chain ends at `0014`: `0012` retains the historical eight callable public boundary routines, `0013` adds the final ninth, and `0014` changes no callable surface while replacing the nullable issue-transition trigger guard with a fail-closed definition. The exact pairwise-distinct principals remain `DATABASE_OWNER_USER`, `DATABASE_USER`, `DATABASE_WORKER_USER`, and `DATABASE_STORAGE_CLEANUP_USER`; web submit/status/audit authority is separate from worker mutation authority. Release evidence remains ordered migrate → provision → checkpoint capture → distinct-engine rehearsal → smoke. Production stays in maintenance mode with Stripe disabled, and Plan 7 owns activation and operability. See [financial reconciliation and reporting](financial-reconciliation-and-reporting.md).
+Plan 6B-I and 6B-II now form one completed implementation and add no production runtime dependency beyond the decisions below. Its committed database chain ends at `0014`: `0012` retains the historical eight callable public boundary routines, `0013` adds the final ninth, and `0014` changes no callable surface while replacing the nullable issue-transition trigger guard with a fail-closed definition. The exact pairwise-distinct principals remain `DATABASE_OWNER_USER`, `DATABASE_USER`, `DATABASE_WORKER_USER`, and `DATABASE_STORAGE_CLEANUP_USER`; web submit/status/audit authority is separate from worker mutation authority. The required release-evidence order remains migrate → provision → checkpoint capture → distinct-engine rehearsal → smoke. The protected global Sales link is live, but production must remain `APPLICATION_MODE=maintenance` with Stripe-disabled defaults; Plan 7 owns production activation and operability, including general retry administration, monitoring, off-host backup scheduling, and deployment hardening. See [financial reconciliation and reporting](financial-reconciliation-and-reporting.md).
 
 | Package | Selected line | Decision |
 | --- | --- | --- |

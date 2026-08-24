@@ -4,11 +4,11 @@
 
 Plan 6A implements the multi-title cart, Stripe-hosted Checkout, signed asynchronous fulfillment, guest purchase claiming, purchase-backed entitlement grants, and refund/dispute access changes.
 
-**Status:** Plan 6B candidate — independent review pending
+**Status:** Plan 6B implementation complete
 
-The unified Plan 6B candidate adds local financial ingestion/reconciliation and direct administrator review, finalization, correction, recovery, payout, reporting, and CSV routes. The global navigation still shows `Sales — Upcoming` without a live link until review accepts the candidate. Development and production remain credential-free and Stripe-disabled by default, and production remains fixed to `APPLICATION_MODE=maintenance`. See the [financial reconciliation and reporting operator guide](financial-reconciliation-and-reporting.md).
+The completed unified Plan 6B implementation adds local financial ingestion/reconciliation and direct administrator review, finalization, correction, recovery, payout, reporting, and CSV routes. The protected global Sales link is live for authorized administrators. Development and production remain credential-free and Stripe-disabled by default, and production must remain fixed to `APPLICATION_MODE=maintenance`. See the [financial reconciliation and reporting operator guide](financial-reconciliation-and-reporting.md).
 
-The committed migration chain ends at `0014`; `0012` retains its historical eight callable public boundary routines, `0013` adds the final ninth routine, and `0014` changes no callable surface while replacing the nullable issue-transition trigger guard with a fail-closed definition. The four pairwise-distinct principals are `DATABASE_OWNER_USER`, `DATABASE_USER`, `DATABASE_WORKER_USER`, and `DATABASE_STORAGE_CLEANUP_USER`. The web principal submits and reads owner-scoped financial command status and records the route audit boundary; only the worker executes protected mutations. Deployment preserves migrate → role provision → checkpoint capture → distinct-engine rehearsal → smoke. Plan 7 still owns launch and production operability.
+The committed migration chain ends at `0014`; `0012` retains its historical eight callable public boundary routines, `0013` adds the final ninth routine, and `0014` changes no callable surface while replacing the nullable issue-transition trigger guard with a fail-closed definition. The four pairwise-distinct principals are `DATABASE_OWNER_USER`, `DATABASE_USER`, `DATABASE_WORKER_USER`, and `DATABASE_STORAGE_CLEANUP_USER`. The web principal submits and reads owner-scoped financial command status and records the route audit boundary; only the worker executes protected mutations. The required release-evidence order remains migrate → role provision → checkpoint capture → distinct-engine rehearsal → smoke. Plan 7 owns production activation and operability, including general retry administration, monitoring, off-host backup scheduling, and deployment hardening.
 
 PostgreSQL is authoritative. Browser cart data contains title IDs and a client attempt UUID only. The server re-quotes current public titles, ownership, currency, and prices before creating immutable `orders` and `order_items`. A successful browser redirect never grants access. Only a signature-verified Stripe event followed by canonical Checkout Session and Payment retrieval can make an order paid and create an `entitlement_grants` row. The `entitlements` table is the effective user/title projection used by the library, reader, and download routes.
 
@@ -176,7 +176,7 @@ For receipt/claim delivery, inspect only outbox topic/status/deduplication key a
 
 Initiate refunds and respond to disputes in Stripe Dashboard. Signed events cause the application to retrieve canonical Refund, Dispute, and Payment state before changing access.
 
-A full refund that maps exactly to one item permanently revokes that purchase grant. Complete cumulative refunds can revoke all funded grants. For a partial multi-title refund with no stored provider allocation, the Plan 6A event remains an access-safe exception and keeps access rather than guessing. The Plan 6B financial projection records the orthogonal state as `needs_review` plus `pending` and opens an `allocation_incomplete` issue. The candidate’s authorized draft/finalization route is the only administrative allocation path; direct SQL allocation remains unsupported.
+A full refund that maps exactly to one item permanently revokes that purchase grant. Complete cumulative refunds can revoke all funded grants. For a partial multi-title refund with no stored provider allocation, the Plan 6A event remains an access-safe exception and keeps access rather than guessing. The Plan 6B financial projection records the orthogonal state as `needs_review` plus `pending` and opens an `allocation_incomplete` issue. The implementation's authorized draft/finalization route is the only administrative allocation path; direct SQL allocation remains unsupported.
 
 An open dispute suspends otherwise-active purchase grants funded by the payment. A won dispute restores only grants that are not fully refunded or permanently revoked. A lost dispute permanently revokes them. Another active purchase grant or preserved administrative grant keeps effective access, because `entitlements` is recomputed from all grants rather than toggled from one event.
 
@@ -232,8 +232,8 @@ Neither preflight prints credential values. Container creation is the first Comp
 
 The overlay does not alter `APPLICATION_MODE=maintenance`, `STRIPE_LIVE_MODE=false`, database/auth/SMTP secrets, or the migration/bootstrap tools. Do not use it as a production-launch switch. Plan 7 owns the deployment launch gate and Hetzner hardening.
 
-## Candidate status and remaining launch work
+## Completed implementation and remaining launch work
 
-**Status:** Plan 6B candidate — independent review pending
+**Status:** Plan 6B implementation complete
 
-The candidate combines ingestion, allocation, issues, payouts, scheduling, and replay with administrator refund resolution, per-title copies/gross/fees/estimated-payout reporting, payout views, reporting corrections, access recovery, and aggregate CSV. The direct routes remain review-only and the global Sales link remains disabled. Production remains in maintenance mode with Stripe disabled. Plan 7 owns launch, monitoring and alerts, general retry administration, automated off-host backup scheduling, deployment hardening, and final capacity work.
+The completed implementation combines ingestion, allocation, issues, payouts, scheduling, and replay with administrator refund resolution, per-title copies/gross/fees/estimated-payout reporting, payout views, reporting corrections, access recovery, and aggregate CSV. The protected direct routes and global Sales link are live for authorized administrators. Production must remain `APPLICATION_MODE=maintenance` with Stripe-disabled defaults. Plan 7 owns production activation and operability, including monitoring and alerts, general retry administration, automated off-host backup scheduling, deployment hardening, and final capacity work.

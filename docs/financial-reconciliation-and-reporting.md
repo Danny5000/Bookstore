@@ -1,8 +1,8 @@
 # Financial Reconciliation and Reporting
 
-**Status:** Plan 6B candidate — independent review pending
+**Status:** Plan 6B implementation complete — protected Sales navigation live
 
-This is the operator guide for the unified Plan 6B financial-ingestion, reconciliation, administrator-review, reporting, payout, and CSV candidate. Production remains in maintenance mode, Stripe remains disabled, and the global administrator navigation must continue to show `Sales — Upcoming` without a live Sales link until the independent review accepts the candidate. Authorized reviewers may use the direct `/admin/sales` routes in the controlled candidate environment.
+This is the operator guide for the completed Plan 6B financial-ingestion, reconciliation, administrator-review, reporting, payout, and CSV implementation. The global administrator navigation now exposes the protected live `Sales` link to `/admin/sales`; the route and service capability checks described below still govern access. Production remains closed in `APPLICATION_MODE=maintenance`, and the base production defaults remain Stripe-disabled.
 
 Plan 6B reads the durable commerce facts established by Plan 6A. It does not replace checkout, refund, dispute, claim, or entitlement authority, and its reporting corrections never rewrite those facts.
 
@@ -120,11 +120,11 @@ If safe inspection cannot explain the state, stop. Keep maintenance mode enabled
 
 ## Migration, principals, and deployment order
 
-The candidate migration chain ends at `0014`. Migration `0012` retains its historical eight callable public boundary routines; `0013` adds only `resolve_financial_issue_after_reporting_correction_command(uuid, uuid)`, producing the final nine-routine callable surface; and `0014` changes no callable surface while replacing the nullable issue-transition trigger guard with a fail-closed definition. Missing or partial transaction-local resolution context therefore rejects the protected transition instead of being accepted through SQL `NULL` semantics.
+The Plan 6B migration chain ends at `0014`. Migration `0012` retains its historical eight callable public boundary routines; `0013` adds only `resolve_financial_issue_after_reporting_correction_command(uuid, uuid)`, producing the final nine-routine callable surface; and `0014` changes no callable surface while replacing the nullable issue-transition trigger guard with a fail-closed definition. Missing or partial transaction-local resolution context therefore rejects the protected transition instead of being accepted through SQL `NULL` semantics.
 
 The four pairwise-distinct login principals are exactly `DATABASE_OWNER_USER`, `DATABASE_USER` (web), `DATABASE_WORKER_USER` (financial worker), and `DATABASE_STORAGE_CLEANUP_USER` (storage cleanup). The web principal may submit commands, read its owner-scoped status, and append the route-authorized audit boundary; it cannot mutate protected financial state. Only the worker principal executes the allowlisted mutation routines. Storage cleanup retains only its narrow storage capability, and the owner is used only for ownership and migrations.
 
-For a candidate deployment or rehearsal, preserve this order:
+For a Plan 6B release rehearsal, preserve this order:
 
 1. migrate through `0014` as the owner;
 2. provision and attest the four-role boundary;
@@ -132,4 +132,4 @@ For a candidate deployment or rehearsal, preserve this order:
 4. rehearse restore on a distinct database engine with app and general worker stopped; and
 5. run the production-image smoke gate.
 
-Do not reorder these steps or treat a same-engine check as the restore rehearsal. Production remains in maintenance mode and Stripe remains disabled after the candidate gate. Independent review remains the Plan 6B candidate gate. Plan 7 owns launch activation, monitoring and alerts, general retry administration, automated off-host backup scheduling, deployment hardening, capacity/pool tuning, and the final production launch.
+Do not reorder these steps or treat a same-engine check as the restore rehearsal. Production remains closed in `APPLICATION_MODE=maintenance`, and the base production defaults remain Stripe-disabled after Plan 6B implementation completion. The live protected Sales navigation does not activate production. Plan 7 owns launch activation, monitoring and alerts, general retry administration, automated off-host backup scheduling, deployment hardening, capacity/pool tuning, and the final production launch.

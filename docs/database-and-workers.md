@@ -1,8 +1,8 @@
 # Database and workers
 
-**Status:** Plan 6B candidate — independent review pending
+**Status:** Plan 6B implementation complete
 
-The unified Plan 6B candidate is migrated through `0014`. Migration `0012` retains its historical eight callable public boundary routines; `0013` adds only the correction-resolution routine, for a final surface of nine; and `0014` changes no callable surface while replacing the nullable issue-transition trigger guard with a fail-closed definition. Production remains in maintenance mode with Stripe disabled. The direct Sales candidate routes remain unlinked until independent review. See [financial reconciliation and reporting](financial-reconciliation-and-reporting.md) for the operator boundary; Plan 7 owns production activation and operability.
+The completed unified Plan 6B implementation is migrated through `0014`. Migration `0012` retains its historical eight callable public boundary routines; `0013` adds only the correction-resolution routine, for a final surface of nine; and `0014` changes no callable surface while replacing the nullable issue-transition trigger guard with a fail-closed definition. The protected global Sales link and direct routes are live for authorized administrators, but production must remain `APPLICATION_MODE=maintenance` with Stripe-disabled defaults. See [financial reconciliation and reporting](financial-reconciliation-and-reporting.md) for the operator boundary; Plan 7 owns production activation and operability, including general retry administration, monitoring, off-host backup scheduling, and deployment hardening.
 
 ## Ownership
 
@@ -138,7 +138,7 @@ docker compose --file compose.prod.yaml ps
 docker compose --file compose.prod.yaml logs --tail 100 app worker postgres caddy
 ```
 
-`/health/live` proves only the web process responds. `/health/ready` performs bounded PostgreSQL and storage probes. Worker health proves the worker completed its initial dependency probes and entered the polling loop. The unified financial and reporting implementation is a review candidate only. Production storefront and API paths remain in maintenance mode, the global Sales link remains disabled, and Plan 7 owns launch. The base production stack keeps Stripe disabled and requires no Stripe credential.
+`/health/live` proves only the web process responds. `/health/ready` performs bounded PostgreSQL and storage probes. Worker health proves the worker completed its initial dependency probes and entered the polling loop. The unified financial and reporting implementation is complete, and the protected global Sales link is live for authorized administrators. Production storefront and API paths must remain in `APPLICATION_MODE=maintenance`, and Plan 7 owns production activation and operability. The base production stack keeps Stripe disabled and requires no Stripe credential.
 
 ## Job behavior
 
@@ -166,5 +166,5 @@ Safe operations may inspect IDs, types/topics, status, attempts, reconciliation 
 - Plan 4 added storage/ingestion jobs, revision lifecycle transitions, and bounded storage cleanup.
 - Plan 5 added the six entitlement/reader-state tables and semantic fingerprint columns. Reader migration is synchronous under ordered transaction locks; it is not a worker job.
 - Plan 6A added Stripe reconciliation, commerce email/claim jobs, purchase grants, and refund/dispute access reduction.
-- The Plan 6B candidate combines financial ingestion/reconciliation with administrator resolution and reporting while its global navigation remains disabled pending independent review.
-- Plan 7 adds production activation, failed-job administration, structured logging, queue-age monitoring, scheduled off-host backups, and final pool/capacity tuning.
+- Plan 6B combines completed financial ingestion/reconciliation with administrator resolution and reporting, and its protected global Sales link is live.
+- Plan 7 adds production activation and operability, including general failed-job retry administration, structured logging, queue-age monitoring, scheduled off-host backups, deployment hardening, and final pool/capacity tuning.

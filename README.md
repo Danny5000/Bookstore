@@ -59,9 +59,9 @@ npm run verify
 
 Development uses the PostgreSQL catalog, private EPUB/CBZ storage, background ingestion, revision review/publication, public previews, server-owned commerce and entitlement grants, customer libraries and reader state, authenticated original downloads, and an audited admin dashboard. Stripe is disabled by default and production Compose remains fixed to maintenance mode.
 
-**Status:** Plan 6B candidate — independent review pending
+**Status:** Plan 6B implementation complete
 
-The unified candidate includes financial ingestion and reconciliation plus direct administrator review, refund finalization, reporting correction, recovery, payout, Sales reporting, and CSV routes. The global item remains `Sales — Upcoming` with no live link until review accepts the candidate. The migration chain ends at `0014`: `0012` retains its historical eight callable public boundary routines, `0013` adds the ninth, and `0014` changes no callable surface while replacing the nullable issue-transition trigger guard with a fail-closed definition. The four pairwise-distinct login principals are `DATABASE_OWNER_USER`, `DATABASE_USER`, `DATABASE_WORKER_USER`, and `DATABASE_STORAGE_CLEANUP_USER`; the web principal submits commands, reads owner-scoped status, and completes route-authorized detail/export audits while only the financial-worker principal executes protected financial mutations. Candidate deployment order is migrate, role provision, checkpoint capture, distinct-engine rehearsal, then production-image smoke. Plan 7 retains the production launch and operability gate.
+The completed Plan 6B implementation includes financial ingestion and reconciliation plus direct administrator review, refund finalization, reporting correction, recovery, payout, Sales reporting, and CSV routes. The protected global Sales link is live for authorized administrators. The migration chain ends at `0014`: `0012` retains its historical eight callable public boundary routines, `0013` adds the ninth, and `0014` changes no callable surface while replacing the nullable issue-transition trigger guard with a fail-closed definition. The four pairwise-distinct login principals are `DATABASE_OWNER_USER`, `DATABASE_USER`, `DATABASE_WORKER_USER`, and `DATABASE_STORAGE_CLEANUP_USER`; the web principal submits commands, reads owner-scoped status, and completes route-authorized detail/export audits while only the financial-worker principal executes protected financial mutations. The required release-evidence order remains migrate, role provision, checkpoint capture, distinct-engine rehearsal, then production-image smoke. Production must remain in maintenance mode with Stripe-disabled defaults; Plan 7 owns production activation and operability, including general retry administration, monitoring, off-host backup scheduling, and deployment hardening.
 
 ## Routes
 
@@ -76,7 +76,7 @@ The unified candidate includes financial ingestion and reconciliation plus direc
 | `/read/[id]` | Public preview by slug or entitled full reader by title ID |
 | `/library` | Server-owned entitled shelf, resume state, and downloads |
 | `/library/[titleId]/download` | Re-authorized EPUB/CBZ/ZIP original stream |
-| `/admin` | Protected publication, user, and audit dashboard; direct Sales candidate routes remain unlinked pending review |
+| `/admin` | Protected publication, user, audit, and Sales dashboard with a live Sales link for authorized administrators |
 | `/studio` | Redirect to the database-backed admin catalog |
 
 ## Reader
@@ -104,9 +104,9 @@ Public catalog, detail, and preview loaders read only active public revisions wi
 
 Plan 6A provides a bounded quantity-one multi-title cart, server-owned quotes, immutable order snapshots, Stripe-hosted Checkout, signed idempotent webhook processing, account and guest fulfillment, one-use guest claims, and refund/dispute-driven purchase grants. A redirect never creates access: canonical asynchronous Stripe processing is the only purchase fulfillment authority. Prices are tax-exclusive, mixed currencies are rejected, and Stripe remains disabled unless explicit validated test-mode configuration enables it.
 
-Plan 6B's unified candidate adds local canonical balance-transaction and payout ingestion, signed fee/net allocation, reconciliation issues, bounded recovery scans, versioned classification replay, and the direct administrator resolution/reporting surfaces described in the [financial reconciliation and reporting operator guide](docs/financial-reconciliation-and-reporting.md). Exact automatic-standard payout association requires complete membership plus current paid status; manual and instant payouts remain fee-reconciled without invented membership. See also the [commerce operations runbook](docs/commerce-and-guest-claims.md) and the detailed [Stripe financial reconciliation guide](docs/stripe-financial-reconciliation.md).
+Plan 6B adds local canonical balance-transaction and payout ingestion, signed fee/net allocation, reconciliation issues, bounded recovery scans, versioned classification replay, and the direct administrator resolution/reporting surfaces described in the [financial reconciliation and reporting operator guide](docs/financial-reconciliation-and-reporting.md). Exact automatic-standard payout association requires complete membership plus current paid status; manual and instant payouts remain fee-reconciled without invented membership. See also the [commerce operations runbook](docs/commerce-and-guest-claims.md) and the detailed [Stripe financial reconciliation guide](docs/stripe-financial-reconciliation.md).
 
-Production is still `APPLICATION_MODE=maintenance`. Stripe remains disabled in the base stack, the Sales navigation remains unavailable, and Plan 7—not the Stripe overlay—owns storefront launch.
+The protected global Sales link is live, but production must remain `APPLICATION_MODE=maintenance` and the base stack must retain its Stripe-disabled defaults. Plan 7—not the Stripe overlay—owns production activation and operability.
 
 ## Authentication and delivery
 
@@ -116,5 +116,5 @@ Versioned authentication and commerce messages use the PostgreSQL outbox and pro
 
 ## Deferred work
 
-- Plan 6B independent review and Plan 7 production launch, deployment automation, monitoring, general retry administration, and off-host backup scheduling.
+- Plan 7 production activation and operability, including deployment automation and hardening, monitoring, general retry administration, and off-host backup scheduling.
 - Search, series grouping, pre-orders, and reviews.

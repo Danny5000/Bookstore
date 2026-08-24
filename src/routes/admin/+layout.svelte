@@ -22,7 +22,7 @@
       <a href={resolve('/admin/users')} class:active={$page.url.pathname.startsWith('/admin/users')}>Users</a>
       <a href={resolve('/admin/catalog')} class:active={$page.url.pathname.startsWith('/admin/catalog')}>Catalog</a>
       <a href={resolve('/admin/audit')} class:active={$page.url.pathname.startsWith('/admin/audit')}>Audit</a>
-      <span>Sales <small>Upcoming</small></span>
+      <a href={resolve('/admin/sales')} class:active={$page.url.pathname.startsWith('/admin/sales')}>Sales</a>
     </nav>
   </aside>
   <main>{@render children()}</main>
@@ -58,8 +58,7 @@
     gap: 5px;
   }
 
-  nav a,
-  nav span {
+  nav a {
     display: flex;
     justify-content: space-between;
     gap: 8px;
@@ -73,16 +72,6 @@
   nav a.active {
     background: var(--raised);
     color: var(--ink);
-  }
-
-  nav span {
-    opacity: 0.55;
-  }
-
-  small {
-    font-size: 9px;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
   }
 
   main {

@@ -717,10 +717,14 @@ test.describe("provider-neutral Sales reporting journey", () => {
       const globalNavigation = adminPage.getByRole("navigation", {
         name: "Admin sections",
       });
-      await expect(globalNavigation.getByText("Sales Upcoming")).toBeVisible();
-      await expect(
-        globalNavigation.getByRole("link", { name: /Sales/u }),
-      ).toHaveCount(0);
+      const salesLink = globalNavigation.getByRole("link", {
+        name: "Sales",
+        exact: true,
+      });
+      await expect(salesLink).toBeVisible();
+      await expect(salesLink).toHaveAttribute("href", "/admin/sales");
+      await expect(salesLink).toHaveClass(/\bactive\b/u);
+      await expect(globalNavigation.getByText("Upcoming")).toHaveCount(0);
       await expect(
         adminPage.getByRole("heading", {
           name: "No sales match these filters",
