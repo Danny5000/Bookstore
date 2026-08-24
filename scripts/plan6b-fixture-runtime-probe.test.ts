@@ -1138,6 +1138,12 @@ describe('Plan 6B fixture runtime probe ownership', () => {
       expect(boundary).toContain('set local role pale_orbit_fixture_web');
       expect(boundary).toContain('perform private_input from financial_admin_commands');
       expect(boundary).toContain('update refund_allocation_drafts set version = version where false');
+      const discovery = vi.mocked(command.capture).mock.calls
+        .filter(([args]) => args.includes('psql'))
+        .map(([args]) => String(args.at(-1)))
+        .find((query) => query.includes("'administratorCommandCount'"));
+      expect(discovery).toContain('min(id::text)');
+      expect(discovery).not.toContain('min(id)::text');
 
       const webCalls = vi.mocked(command.capture).mock.calls.filter(([args]) =>
         args.includes('app') && args.includes('node')

@@ -842,7 +842,7 @@ rollback;`;
 function administratorCommandDiscoverySql(): string {
   return `select json_build_object(
   'administratorCommandCount', count(*)::int,
-  'commandId', case when count(*) = 1 then min(id)::text else null end
+  'commandId', case when count(*) = 1 then min(id::text) else null end
 )::text from financial_admin_commands`;
 }
 
