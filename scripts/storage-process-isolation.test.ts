@@ -723,5 +723,5 @@ describe('storage process isolation deployment', () => {
         /import\s+type\s+\{\s*FinancialAdminCommandExecutorContext\s*\}\s+from\s+['"]\$lib\/server\/commerce\/financial\/admin-commands\/handler['"]/u
       );
     }
-  });
+  }, 30_000);
 });

@@ -3728,7 +3728,10 @@ describe('commerce operations contract', () => {
       'pale_orbit.plan6bii_financial_admin_issue_resolution_command_id',
       'pale_orbit.plan6bii_financial_admin_issue_resolution_actor_id'
     ]) {
-      expect(issueTransitionStartupGuard, settingName).toContain(settingName);
+      expect(
+        issueTransitionStartupGuard.split(settingName.replaceAll('.', '\\.')),
+        settingName
+      ).toHaveLength(2);
     }
     expect(issueTransitionStartupGuard).toContain(
       'failClosedFinancialIssueTransitionSettingPredicates.some'
