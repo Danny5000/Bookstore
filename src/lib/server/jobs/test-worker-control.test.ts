@@ -22,6 +22,7 @@ import { runWorker } from './runner';
 import type { JobRepository } from './types';
 import {
   TEST_WORKER_CONTROL_ACKNOWLEDGEMENT_BASENAME,
+  TEST_WORKER_CONTROL_ACKNOWLEDGED_HOLD_DEADLINE_MS,
   TEST_WORKER_CONTROL_DEADLINE_MS,
   TEST_WORKER_CONTROL_REQUEST_BASENAME,
   createTestWorkerControl,
@@ -162,6 +163,23 @@ const nodeFileSystem = {
   unlink
 } as unknown as TestWorkerControlFileSystem;
 
+function releaseWitnessFileSystem(requestFile: string) {
+  const published = deferred<void>();
+  const fileSystem: TestWorkerControlFileSystem = {
+    ...nodeFileSystem,
+    async rename(from, to) {
+      await nodeFileSystem.rename(from, to);
+      if (
+        to === requestFile &&
+        await nodeFileSystem.readFile(to, 'utf8') === RELEASE_A
+      ) {
+        published.resolve();
+      }
+    }
+  };
+  return { fileSystem, published: published.promise };
+}
+
 function advancingDeadline() {
   let nowValue = 0;
   const waits: Array<{ milliseconds: number; signal: AbortSignal }> = [];
@@ -225,8 +243,9 @@ describe('test worker control canonical protocol', () => {
       .toEqualTypeOf<TestWorkerControl>();
   });
 
-  it('uses one exact five-second deadline and exact canonical encodings', () => {
+  it('uses exact transition and acknowledged-hold deadlines and canonical encodings', () => {
     expect(TEST_WORKER_CONTROL_DEADLINE_MS).toBe(5_000);
+    expect(TEST_WORKER_CONTROL_ACKNOWLEDGED_HOLD_DEADLINE_MS).toBe(120_000);
     expect(basename(TEST_WORKER_CONTROL_REQUEST_BASENAME))
       .toBe(TEST_WORKER_CONTROL_REQUEST_BASENAME);
     expect(basename(TEST_WORKER_CONTROL_ACKNOWLEDGEMENT_BASENAME))
@@ -1270,8 +1289,10 @@ describe('test worker control integration with the real runner', () => {
       now: () => nowValue,
       wait
     });
+    const releaseWitness = releaseWitnessFileSystem(fixture.requestFile);
     const harness = createTestWorkerControlHarness({
       environment: fixture.environment,
+      fileSystem: releaseWitness.fileSystem,
       randomBytes: randomBytesFor(NONCE_A)
     });
     const harnessSignal = new AbortController();
@@ -1303,6 +1324,7 @@ describe('test worker control integration with the real runner', () => {
     expect(repository.claimNext).not.toHaveBeenCalled();
 
     const cleanup = session.cleanup(harnessSignal.signal);
+    await within(releaseWitness.published, 'publishing the durable-pause release');
     continueReleaseWait.resolve();
     await within(
       Promise.all([running, cleanup]).then(() => undefined),
@@ -1314,14 +1336,229 @@ describe('test worker control integration with the real runner', () => {
     expect(() => control.throwIfFailed()).not.toThrow();
   });
 
-  it('abandons an acknowledged pause promptly when the worker lifecycle aborts', async () => {
+  it('accepts release observed one millisecond before the acknowledged-hold deadline', async () => {
     const fixture = await activeFixture();
     const workerAbort = new AbortController();
+    const releaseWindow = deferred<void>();
+    const continueReleaseWait = deferred<void>();
+    let nowValue = 0;
+    let parked = false;
+    const wait = vi.fn(async (_milliseconds: number, signal: AbortSignal) => {
+      if (signal.aborted) {
+        throw signal.reason ?? new DOMException('Aborted', 'AbortError');
+      }
+      if (!parked) {
+        parked = true;
+        nowValue = TEST_WORKER_CONTROL_ACKNOWLEDGED_HOLD_DEADLINE_MS - 1;
+        releaseWindow.resolve();
+        await continueReleaseWait.promise;
+      }
+      await new Promise<void>((resolveValue) => setImmediate(resolveValue));
+    });
+    const abortWorker = vi.fn((reason?: unknown) => workerAbort.abort(reason));
+    const repository = repositoryWithNoJobs(() => workerAbort.abort());
+    const control = createTestWorkerControl({
+      environment: fixture.environment,
+      concurrency: 1,
+      abortWorker,
+      now: () => nowValue,
+      wait
+    });
+    const releaseWitness = releaseWitnessFileSystem(fixture.requestFile);
+    const harness = createTestWorkerControlHarness({
+      environment: fixture.environment,
+      fileSystem: releaseWitness.fileSystem,
+      randomBytes: randomBytesFor(NONCE_A)
+    });
+    const harnessSignal = new AbortController();
+    const pausing = harness.pause(harnessSignal.signal);
+    await waitForContents(fixture.requestFile, PAUSE_A);
+    const running = runWorker({
+      repository,
+      handlers: new Map(),
+      workerId: 'test-pre-boundary-pause-worker',
+      concurrency: 1,
+      pollIntervalMs: 1,
+      heartbeatIntervalMs: 1,
+      signal: workerAbort.signal,
+      beforePoll: ({ signal }) => prepareTestWorkerPoll({
+        control,
+        signal,
+        maintenance: vi.fn().mockResolvedValue(undefined)
+      }),
+      sleep: async () => undefined
+    });
+    const session = await within(pausing, 'acknowledging the pre-boundary pause');
+    await within(releaseWindow.promise, 'reaching the pre-boundary release window');
+
+    const cleanup = session.cleanup(harnessSignal.signal);
+    await within(releaseWitness.published, 'publishing the pre-boundary release');
+    continueReleaseWait.resolve();
+    await within(
+      Promise.all([running, cleanup]).then(() => undefined),
+      'accepting the pre-boundary release'
+    );
+
+    expect(nowValue).toBe(TEST_WORKER_CONTROL_ACKNOWLEDGED_HOLD_DEADLINE_MS - 1);
+    expect(abortWorker).not.toHaveBeenCalled();
+    expect(repository.claimNext).toHaveBeenCalledOnce();
+    expect(() => control.throwIfFailed()).not.toThrow();
+  });
+
+  it('expires fail closed when release is first observable at the acknowledged-hold boundary', async () => {
+    const fixture = await activeFixture();
+    const workerAbort = new AbortController();
+    const boundaryReached = deferred<void>();
+    const continueBoundaryWait = deferred<void>();
+    let nowValue = 0;
+    let parked = false;
+    const wait = vi.fn(async (_milliseconds: number, signal: AbortSignal) => {
+      if (signal.aborted) {
+        throw signal.reason ?? new DOMException('Aborted', 'AbortError');
+      }
+      if (!parked) {
+        parked = true;
+        nowValue = TEST_WORKER_CONTROL_ACKNOWLEDGED_HOLD_DEADLINE_MS;
+        boundaryReached.resolve();
+        await continueBoundaryWait.promise;
+      }
+      await new Promise<void>((resolveValue) => setImmediate(resolveValue));
+    });
+    const abortWorker = vi.fn((reason?: unknown) => workerAbort.abort(reason));
+    const repository = repositoryWithNoJobs(() => workerAbort.abort());
+    const control = createTestWorkerControl({
+      environment: fixture.environment,
+      concurrency: 1,
+      abortWorker,
+      now: () => nowValue,
+      wait
+    });
+    const releaseWitness = releaseWitnessFileSystem(fixture.requestFile);
+    const harness = createTestWorkerControlHarness({
+      environment: fixture.environment,
+      fileSystem: releaseWitness.fileSystem,
+      randomBytes: randomBytesFor(NONCE_A)
+    });
+    const harnessSignal = new AbortController();
+    const pausing = harness.pause(harnessSignal.signal);
+    await waitForContents(fixture.requestFile, PAUSE_A);
+    const running = runWorker({
+      repository,
+      handlers: new Map(),
+      workerId: 'test-boundary-expiry-worker',
+      concurrency: 1,
+      pollIntervalMs: 1,
+      heartbeatIntervalMs: 1,
+      signal: workerAbort.signal,
+      beforePoll: ({ signal }) => prepareTestWorkerPoll({
+        control,
+        signal,
+        maintenance: vi.fn().mockResolvedValue(undefined)
+      }),
+      sleep: async () => undefined
+    });
+    const session = await within(pausing, 'acknowledging the boundary pause');
+    await within(boundaryReached.promise, 'reaching the acknowledged-hold boundary');
+
+    const cleanup = session.cleanup(harnessSignal.signal);
+    await within(releaseWitness.published, 'publishing the boundary release');
+    continueBoundaryWait.resolve();
+    await within(running, 'failing closed at the acknowledged-hold boundary');
+    harnessSignal.abort(new DOMException('Boundary cleanup', 'AbortError'));
+    await cleanup.catch(() => undefined);
+
+    expect(nowValue).toBe(TEST_WORKER_CONTROL_ACKNOWLEDGED_HOLD_DEADLINE_MS);
+    expect(abortWorker).toHaveBeenCalledOnce();
+    expect(repository.claimNext).not.toHaveBeenCalled();
+    expect(() => control.throwIfFailed()).toThrow(
+      'Test worker control acknowledged pause deadline expired'
+    );
+  });
+
+  it('caps a nested transition wait at the remaining acknowledged-hold time', async () => {
+    const fixture = await activeFixture();
+    const workerAbort = new AbortController();
+    const nearBoundary = deferred<void>();
+    const continueOuterPoll = deferred<void>();
+    const nestedWaitObserved = deferred<number>();
+    let nowValue = 0;
+    let waitCount = 0;
+    const wait = vi.fn(async (milliseconds: number, signal: AbortSignal) => {
+      if (signal.aborted) {
+        throw signal.reason ?? new DOMException('Aborted', 'AbortError');
+      }
+      waitCount += 1;
+      if (waitCount === 1) {
+        nowValue = TEST_WORKER_CONTROL_ACKNOWLEDGED_HOLD_DEADLINE_MS - 1;
+        nearBoundary.resolve();
+        await continueOuterPoll.promise;
+        return;
+      }
+      nestedWaitObserved.resolve(milliseconds);
+      await new Promise<void>((_resolve, reject) => {
+        signal.addEventListener(
+          'abort',
+          () => reject(signal.reason ?? new DOMException('Aborted', 'AbortError')),
+          { once: true }
+        );
+      });
+    });
     const repository = repositoryWithNoJobs();
     const control = createTestWorkerControl({
       environment: fixture.environment,
       concurrency: 1,
-      abortWorker: (reason) => workerAbort.abort(reason)
+      abortWorker: (reason) => workerAbort.abort(reason),
+      now: () => nowValue,
+      wait
+    });
+    const harness = createTestWorkerControlHarness({
+      environment: fixture.environment,
+      randomBytes: randomBytesFor(NONCE_A)
+    });
+    const harnessSignal = new AbortController();
+    const pausing = harness.pause(harnessSignal.signal);
+    await waitForContents(fixture.requestFile, PAUSE_A);
+    const running = runWorker({
+      repository,
+      handlers: new Map(),
+      workerId: 'test-capped-transition-worker',
+      concurrency: 1,
+      pollIntervalMs: 1,
+      heartbeatIntervalMs: 1,
+      signal: workerAbort.signal,
+      beforePoll: ({ signal }) => prepareTestWorkerPoll({
+        control,
+        signal,
+        maintenance: vi.fn().mockResolvedValue(undefined)
+      }),
+      sleep: async () => undefined
+    });
+    await within(pausing, 'acknowledging the capped-transition pause');
+    await within(nearBoundary.promise, 'reaching the capped-transition boundary');
+    await writeFile(join(fixture.root, 'worker.control.tmp'), PAUSE_A, 'utf8');
+    continueOuterPoll.resolve();
+
+    const nestedWait = await within(
+      nestedWaitObserved.promise,
+      'observing the capped nested transition wait'
+    );
+    workerAbort.abort(new DOMException('Test teardown', 'AbortError'));
+    await within(running, 'aborting the capped-transition worker');
+
+    expect(nestedWait).toBe(1);
+    expect(repository.claimNext).not.toHaveBeenCalled();
+    expect(() => control.throwIfFailed()).not.toThrow();
+  });
+
+  it('abandons an acknowledged pause promptly when the worker lifecycle aborts', async () => {
+    const fixture = await activeFixture();
+    const workerAbort = new AbortController();
+    const repository = repositoryWithNoJobs();
+    const abortWorker = vi.fn((reason?: unknown) => workerAbort.abort(reason));
+    const control = createTestWorkerControl({
+      environment: fixture.environment,
+      concurrency: 1,
+      abortWorker
     });
     const harness = createTestWorkerControlHarness({
       environment: fixture.environment,
@@ -1351,6 +1588,7 @@ describe('test worker control integration with the real runner', () => {
     await within(running, 'aborting the acknowledged pause');
 
     expect(repository.claimNext).not.toHaveBeenCalled();
+    expect(abortWorker).not.toHaveBeenCalled();
     expect(() => control.throwIfFailed()).not.toThrow();
   });
 

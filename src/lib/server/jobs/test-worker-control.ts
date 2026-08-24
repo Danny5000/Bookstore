@@ -19,6 +19,7 @@ export const TEST_WORKER_CONTROL_REQUEST_BASENAME = 'worker.control.json';
 export const TEST_WORKER_CONTROL_ACKNOWLEDGEMENT_BASENAME =
   'worker.control.ack.json';
 export const TEST_WORKER_CONTROL_DEADLINE_MS = 5_000;
+export const TEST_WORKER_CONTROL_ACKNOWLEDGED_HOLD_DEADLINE_MS = 120_000;
 
 const REQUEST_TEMP_BASENAME = 'worker.control.tmp';
 const ACKNOWLEDGEMENT_TEMP_BASENAME = 'worker.control.ack.tmp';
@@ -97,6 +98,7 @@ interface ControlDependencies {
 
 interface WorkerPause {
   readonly nonce: string;
+  readonly holdDeadlineAt: number;
 }
 
 interface TestWorkerControlInternal {
@@ -459,9 +461,13 @@ async function acquireExclusiveTemp(input: {
   readonly contents: string;
   readonly signal: AbortSignal;
   readonly dependencies: ControlDependencies;
+  readonly deadlineAt?: number;
 }): Promise<void> {
-  const deadlineAt = input.dependencies.now() +
+  const transitionDeadlineAt = input.dependencies.now() +
     TEST_WORKER_CONTROL_DEADLINE_MS;
+  const deadlineAt = input.deadlineAt === undefined
+    ? transitionDeadlineAt
+    : Math.min(transitionDeadlineAt, input.deadlineAt);
   while (true) {
     throwIfAborted(input.signal);
     try {
@@ -493,7 +499,8 @@ async function acquireExclusiveTemp(input: {
       await releaseExclusiveTemp(
         input.fileSystem,
         input.temp,
-        input.dependencies
+        input.dependencies,
+        input.deadlineAt
       );
     } catch {
       // The validation error remains authoritative and the worker fails closed.
@@ -507,9 +514,13 @@ async function unlinkWithRetry(input: {
   readonly path: string;
   readonly signal: AbortSignal;
   readonly dependencies: ControlDependencies;
+  readonly deadlineAt?: number;
 }): Promise<void> {
-  const deadlineAt = input.dependencies.now() +
+  const transitionDeadlineAt = input.dependencies.now() +
     TEST_WORKER_CONTROL_DEADLINE_MS;
+  const deadlineAt = input.deadlineAt === undefined
+    ? transitionDeadlineAt
+    : Math.min(transitionDeadlineAt, input.deadlineAt);
   while (true) {
     throwIfAborted(input.signal);
     try {
@@ -536,13 +547,15 @@ async function unlinkWithRetry(input: {
 async function releaseExclusiveTemp(
   fileSystem: TestWorkerControlFileSystem,
   temp: string,
-  dependencies: ControlDependencies
+  dependencies: ControlDependencies,
+  deadlineAt?: number
 ): Promise<void> {
   await unlinkWithRetry({
     fileSystem,
     path: temp,
     signal: new AbortController().signal,
-    dependencies
+    dependencies,
+    ...(deadlineAt === undefined ? {} : { deadlineAt })
   });
 }
 
@@ -554,14 +567,16 @@ async function atomicWrite(
   mode: 'create' | 'replace',
   expectedTargetRaw: string | null,
   signal: AbortSignal,
-  dependencies: ControlDependencies
+  dependencies: ControlDependencies,
+  deadlineAt?: number
 ): Promise<void> {
   await acquireExclusiveTemp({
     fileSystem,
     temp,
     contents: raw,
     signal,
-    dependencies
+    dependencies,
+    ...(deadlineAt === undefined ? {} : { deadlineAt })
   });
   let ownsTemp = true;
   let operationFailed = false;
@@ -581,8 +596,11 @@ async function atomicWrite(
         throw new Error('Test worker control predecessor changed');
       }
     }
-    const renameDeadline = dependencies.now() +
+    const transitionDeadlineAt = dependencies.now() +
       TEST_WORKER_CONTROL_DEADLINE_MS;
+    const renameDeadline = deadlineAt === undefined
+      ? transitionDeadlineAt
+      : Math.min(transitionDeadlineAt, deadlineAt);
     while (true) {
       throwIfAborted(signal);
       try {
@@ -611,7 +629,7 @@ async function atomicWrite(
   let cleanupError: unknown;
   if (ownsTemp) {
     try {
-      await releaseExclusiveTemp(fileSystem, temp, dependencies);
+      await releaseExclusiveTemp(fileSystem, temp, dependencies, deadlineAt);
     } catch (error: unknown) {
       cleanupError = error;
     }
@@ -900,7 +918,11 @@ export function createTestWorkerControl(input: {
     if (!await acknowledgePause(requestRaw, existingRequest.nonce, signal)) {
       return null;
     }
-    return { nonce: existingRequest.nonce };
+    return {
+      nonce: existingRequest.nonce,
+      holdDeadlineAt: dependencies.now() +
+        TEST_WORKER_CONTROL_ACKNOWLEDGED_HOLD_DEADLINE_MS
+    };
   };
 
   const completePause = async (
@@ -909,13 +931,26 @@ export function createTestWorkerControl(input: {
   ): Promise<void> => {
     if (!active || paths === null) return;
     let release: Extract<TestWorkerControlRequest, { readonly phase: 'release' }>;
-    while (true) {
+    const remainingHold = (): number => {
       throwIfAborted(signal);
+      const remaining = pause.holdDeadlineAt - dependencies.now();
+      if (remaining <= 0) {
+        throw new Error(
+          'Test worker control acknowledged pause deadline expired'
+        );
+      }
+      return remaining;
+    };
+    while (true) {
+      const remainingBeforeObservation = remainingHold();
       await waitForWriter(
         paths.requestTemp,
         signal,
         dependencies,
-        dependencies.now() + TEST_WORKER_CONTROL_DEADLINE_MS
+        Math.min(
+          dependencies.now() + TEST_WORKER_CONTROL_DEADLINE_MS,
+          pause.holdDeadlineAt
+        )
       );
       const requestRaw = await readOptionalFile(
         dependencies.fileSystem,
@@ -940,14 +975,20 @@ export function createTestWorkerControl(input: {
           throw new Error('Test worker control nonce changed concurrently');
         }
         if (currentRequest.phase === 'release') {
+          remainingHold();
           release = currentRequest;
           break;
         }
       }
-      // An acknowledged pause is a job-claim barrier, not a filesystem
-      // transition. The worker lifecycle signal bounds the hold; each file
-      // transition above and below retains the strict five-second deadline.
-      await dependencies.wait(CONTROL_POLL_INTERVAL_MS, signal);
+      const remainingAfterObservation = remainingHold();
+      await dependencies.wait(
+        Math.min(
+          CONTROL_POLL_INTERVAL_MS,
+          remainingBeforeObservation,
+          remainingAfterObservation
+        ),
+        signal
+      );
     }
 
     const releaseRaw = encodeTestWorkerControlRequest(release);
@@ -956,7 +997,8 @@ export function createTestWorkerControl(input: {
       temp: paths.requestTemp,
       contents: releaseRaw,
       signal,
-      dependencies
+      dependencies,
+      deadlineAt: pause.holdDeadlineAt
     });
     let operationFailed = false;
     let operationError: unknown;
@@ -1001,7 +1043,8 @@ export function createTestWorkerControl(input: {
           acknowledgement(pause.nonce, 'paused')
         ),
         signal,
-        dependencies
+        dependencies,
+        pause.holdDeadlineAt
       );
     } catch (error: unknown) {
       completedNonces.delete(pause.nonce);
@@ -1018,7 +1061,8 @@ export function createTestWorkerControl(input: {
       await releaseExclusiveTemp(
         dependencies.fileSystem,
         paths.requestTemp,
-        dependencies
+        dependencies,
+        pause.holdDeadlineAt
       );
     } catch (error: unknown) {
       releaseLockError = error;

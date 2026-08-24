@@ -3069,13 +3069,13 @@ Use this exact two-phase, one-logical-request state machine:
 
 Reject a different concurrent nonce, a reused completed nonce, a release before its paused acknowledgement, duplicate/multiple/invalid IDs, malformed or noncanonical JSON (including duplicate/unknown/out-of-order keys), symlink or lexical path escape, or a missing/stale/mismatched acknowledgement. Sequential requests are allowed only after the prior targeted command is terminal and nonce-owned cleanup is complete; the harness must arm and receive the next paused acknowledgement before submitting the next target command. Cleanup compares the current nonce before unlinking, so an older `finally` cannot remove a newer request or acknowledgement.
 
-Every control-file wait is condition-polled with an explicit five-second deadline and the appropriate `AbortSignal`: the worker controller signal inside the spawned worker and a harness-owned test signal while awaiting acknowledgements. No fixed sleep establishes correctness. Export one import-safe orchestration seam that performs: fail-closed control preflight -> the injected bounded purge/scheduling callback -> a final same-nonce control re-read/barrier and released acknowledgement as the last action before hook return. A preflight failure records the error, aborts the worker, and skips maintenance. The final barrier observes a pause created during maintenance and holds the hook until its exact release. Any final-barrier failure records the error and aborts. `prepareWorkerPoll` delegates that whole sequence; the existing worker loop observes an aborted signal before `claimNext`. After `runWorker` returns, `src/worker.ts` calls the controller's `throwIfFailed()` so the process exits nonzero.
+Every unacknowledged control-file transition and harness acknowledgement wait is condition-polled with an explicit five-second deadline and the appropriate `AbortSignal`: the worker controller signal inside the spawned worker and a harness-owned test signal while awaiting acknowledgements. After the worker atomically publishes the exact `paused` acknowledgement, the job-claim barrier instead uses one exported internal fixed `120_000` millisecond monotonic deadline beginning when that acknowledgement completes. That deadline never rolls: every poll and nested file-transition wait is capped by the smaller of its five-second transition bound and the time remaining in the acknowledged hold. A release must be observed strictly before the boundary; at exactly `120_000` milliseconds, expiry wins, the final barrier records the protocol failure, aborts the worker exactly once, and the worker reaches no claim. A worker lifecycle abort still ends the hold promptly and is not recorded as a protocol failure. No fixed sleep establishes correctness. Export one import-safe orchestration seam that performs: fail-closed control preflight -> the injected bounded purge/scheduling callback -> a final same-nonce control re-read/barrier and released acknowledgement as the last action before hook return. A preflight failure records the error, aborts the worker, and skips maintenance. The final barrier observes a pause created during maintenance and holds the hook until its exact release. Any final-barrier failure records the error and aborts. `prepareWorkerPoll` delegates that whole sequence; the existing worker loop observes an aborted signal before `claimNext`. After `runWorker` returns, `src/worker.ts` calls the controller's `throwIfFailed()` so the process exits nonzero.
 
 The table-driven unit suite must:
 
 - vary each activation conjunct above one at a time and use filesystem spies to prove zero read/stat/write/unlink calls whenever any conjunct fails;
 - use the real `runWorker` with a fake repository to prove malformed control yields zero `claimNext` calls and a pause arriving during injected maintenance also yields zero claims until exact release;
-- prove the exact canonical pause/release/ack JSON and nonce grammar, both handshake phases, different concurrent and reused-completed nonce rejection, release-before-paused rejection, duplicate/multiple/invalid IDs, malformed/noncanonical/unknown-key JSON, lexical and symlink escape, missing/stale/mismatched acknowledgements, abort/deadline behavior, matching-ID exact-once failure, unrelated-job preservation, and nonce-owned cleanup; and
+- prove the exact canonical pause/release/ack JSON and nonce grammar, both handshake phases, different concurrent and reused-completed nonce rejection, release-before-paused rejection, duplicate/multiple/invalid IDs, malformed/noncanonical/unknown-key JSON, lexical and symlink escape, missing/stale/mismatched acknowledgements, five-second transition bounds, a valid acknowledged hold beyond five seconds, release one millisecond before the fixed hold boundary, fail-closed exact-boundary expiry with one worker abort and zero claims, nested waits capped by the one absolute hold deadline, prompt non-failure lifecycle abort, matching-ID exact-once failure, unrelated-job preservation, and nonce-owned cleanup; and
 - prove one completed request can be followed by a fresh nonce only after its target is terminal and cleanup has completed.
 
 `scripts/storage-process-isolation.test.ts` additionally proves no non-test/production composition can activate the controller. After the harness exists in Step 6, `scripts/playwright-commerce-config.test.ts` separately proves that `financial-harness.ts` cannot import the handler, executor builder, or concrete executors.
@@ -3701,6 +3701,39 @@ npm run test:e2e -- tests/e2e/refund-review.spec.ts tests/e2e/admin.spec.ts
 Expected: both commands exit zero with one owned disposable harness at a time; the real web and worker processes exercise the same command/status path used in production, and each harness self-cleans.
 
 The control module, its test, and `src/worker.ts` must remain byte-unchanged from the Step 5 commit throughout this browser tranche; the reviewed one-command-witness substitution above is the only permitted `scripts/storage-process-isolation.test.ts` difference. If browser GREEN instead proves a control defect, stop: capture a focused controller RED, apply the minimal correction, rerun the full Step 5 controller/isolation gate, make a separate reviewed controller commit, then restart Step 6. If either browser RED proves any other product defect outside the listed Task 16 files, amend this task through review with that exact path, focused RED/GREEN command, and literal staging command. Do not hide product or controller changes in the browser-evidence commit.
+
+Reviewed Step 6 controller-defect exception (2026-08-24): candidate review of
+`2740f2d1a0d53f813e5a03111d04b71aadcd3bb2` found that the acknowledged
+job-claim barrier had become lifecycle-bounded but otherwise unbounded so the Sales
+export browser witness could remain paused beyond the five-second transition bound.
+The approved correction is limited to `src/lib/server/jobs/test-worker-control.ts`,
+its unit test, and this plan amendment: export the fixed `120_000` millisecond hold
+deadline; start one absolute monotonic deadline when the paused acknowledgement
+completes; cap every nested transition and poll wait by the remaining hold; accept a
+release only before the boundary; and preserve prompt, non-failure lifecycle abort.
+
+The focused RED command and observed defect proof were:
+
+```powershell
+npx vitest run src/lib/server/jobs/test-worker-control.test.ts -t "transition deadline|acknowledged-hold|nested transition|lifecycle aborts" --reporter=verbose
+# RED: 2 failed, 3 passed, 87 skipped. Exact-boundary release produced zero
+# controller aborts instead of one, and a nested wait requested 10 ms with only
+# 1 ms left in the absolute hold.
+```
+
+After the minimal correction, rerun the focused test, the complete controller suite,
+and the full Step 5 controller/isolation gate. Review the diff and those fresh results,
+make a separate controller-correction commit, treat that reviewed commit as the new
+frozen controller baseline, and restart Step 6 before relying on any browser evidence:
+
+```powershell
+npx vitest run src/lib/server/jobs/test-worker-control.test.ts -t "transition deadline|acknowledged-hold|nested transition|lifecycle aborts|exact transition" --reporter=verbose
+npx vitest run src/lib/server/jobs/test-worker-control.test.ts
+npx vitest run src/lib/server/jobs/test-worker-control.test.ts scripts/playwright-commerce-config.test.ts scripts/storage-process-isolation.test.ts
+npm run check
+npm run lint
+git diff --check
+```
 
 - [ ] **Step 7: Commit browser evidence**
 
