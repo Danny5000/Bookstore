@@ -17,6 +17,7 @@ import type {
 import { auditFinancialPayoutDetailRead } from './audit';
 import type { FinancialRequestContext } from './context';
 import { SalesReportingInputError } from './filters';
+import { payoutMembershipCertificationCtes } from './payout-membership-authority';
 
 export const PAYOUT_PAGE_SIZE = 50 as const;
 const CURSOR_MAX_ENCODED_LENGTH = 1_024;
@@ -349,44 +350,7 @@ function payoutReportQuery(targetPayoutQuery: SQL, selection: SQL, finalOrder: S
   return sql`
     with target_payouts as (
       ${targetPayoutQuery}
-    ), published_run_candidates as (
-      select
-        run.id,
-        run.payout_id,
-        run.generation,
-        run.candidate_count,
-        run.completed_at,
-        case when
-          exists (
-            select 1
-            from stripe_payout_balance_transactions original_membership
-            where original_membership.published_from_run_id = run.id
-              and original_membership.payout_id = run.payout_id
-          ) or (
-            run.candidate_count = 0 and not exists (
-              select 1
-              from payout_import_runs earlier_published
-              where earlier_published.payout_id = run.payout_id
-                and earlier_published.state = 'published'
-                and earlier_published.generation < run.generation
-            )
-          )
-          then run.generation + 1
-          else run.generation
-        end as certified_generation
-      from payout_import_runs run
-      join target_payouts target_payout on target_payout.id = run.payout_id
-      where run.state = 'published' and run.completed_at is not null
-    ), ranked_certifications as (
-      select candidate.*,
-        row_number() over (
-          partition by candidate.payout_id
-          order by candidate.certified_generation desc, candidate.completed_at desc, candidate.id desc
-        ) as certification_rank
-      from published_run_candidates candidate
-    ), certified_membership as (
-      select * from ranked_certifications where certification_rank = 1
-    ), member_head_health as (
+    ), ${payoutMembershipCertificationCtes()}, member_head_health as (
       select
         membership.payout_id,
         membership.balance_transaction_id,

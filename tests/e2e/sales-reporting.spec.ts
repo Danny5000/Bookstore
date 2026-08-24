@@ -21,7 +21,10 @@ import {
   FINANCIAL_CAPTURE_STRUCTURED_CONSOLE_WITNESS,
   normalizeFinancialConsoleEvidenceForPrivacy,
 } from "./financial-harness";
-import { baseURL, signInAdministrator } from "./publication-admin";
+import {
+  baseURL,
+  signInAdministrator,
+} from "./publication-admin";
 
 const SALES_EXPORT_ACTION = "financial.sales_export";
 const ISSUE_VIEW_ACTION = "financial.issue.view";
@@ -37,6 +40,23 @@ type SalesDenialProjection = Readonly<{
   disposition: string | null;
   body: string;
 }>;
+
+async function waitForSalesFilterHydration(page: Page): Promise<void> {
+  const form = page.locator("form.sales-filters");
+  await expect
+    .poll(() =>
+      form.evaluate((element) => {
+        if (!(element instanceof HTMLFormElement)) return false;
+        const formData = new FormData();
+        formData.set("range", "all");
+        formData.set("from", "2026-08-01");
+        formData.set("to", "2026-08-10");
+        element.dispatchEvent(new FormDataEvent("formdata", { formData }));
+        return !formData.has("from") && !formData.has("to");
+      }),
+    )
+    .toBe(true);
+}
 
 function assertSalesPrivacy(
   surface: SalesPrivacySurface,
@@ -668,6 +688,25 @@ test.describe("provider-neutral Sales reporting journey", () => {
         .poll(() => financial.auditCount(SALES_EXPORT_ACTION))
         .toBe(deniedExportAuditBefore);
 
+      await financial.withIsolatedEmptyDefaultSalesCohort(async () => {
+        const emptyResponse = await adminPage.goto("/admin/sales");
+        expect(emptyResponse?.status()).toBe(200);
+        await expect(adminPage).toHaveURL(`${baseURL}/admin/sales`);
+        await waitForSalesFilterHydration(adminPage);
+        await expect(
+          adminPage.getByRole("heading", { name: "No sales data yet" }),
+        ).toBeVisible();
+        await expect(
+          adminPage.getByRole("heading", {
+            name: "No sales match these filters",
+          }),
+        ).toHaveCount(0);
+        const emptyStatus = adminPage.getByRole("status");
+        await expect(emptyStatus).toHaveAttribute("aria-live", "polite");
+        await expect(emptyStatus).toHaveAttribute("aria-atomic", "true");
+        await expect(emptyStatus).toHaveText("0 matching sales rows.");
+      });
+
       const emptyTitleId = randomUUID();
       await adminPage.goto(
         `/admin/sales?range=all&titleId=${emptyTitleId}&sort=gross_desc`,
@@ -791,11 +830,86 @@ test.describe("provider-neutral Sales reporting journey", () => {
         /\+USD\s+16\.10/u,
       );
 
-      await applyFilters(adminPage, {
+      // BEGIN manual Sales range transition witness.
+      const customToPresetWitness =
+        `/admin/sales?range=custom&from=${fixture.filterWindow.from}` +
+        `&to=${fixture.filterWindow.to}&sort=gross_desc`;
+      await adminPage.goto(customToPresetWitness);
+      await waitForSalesFilterHydration(adminPage);
+      await expect(adminPage.getByLabel("From date")).toHaveValue(
+        fixture.filterWindow.from,
+      );
+      await expect(adminPage.getByLabel("To date")).toHaveValue(
+        fixture.filterWindow.to,
+      );
+      await adminPage.getByLabel("Range").selectOption("all");
+      await expect(adminPage.getByLabel("From date")).toHaveValue(
+        fixture.filterWindow.from,
+      );
+      await expect(adminPage.getByLabel("To date")).toHaveValue(
+        fixture.filterWindow.to,
+      );
+      const customUrl = adminPage.url();
+      const [presetResponse] = await Promise.all([
+        adminPage.waitForResponse((response) => {
+          const url = new URL(response.url());
+          return (
+            url.origin === new URL(baseURL).origin &&
+            (url.pathname === "/admin/sales" ||
+              url.pathname === "/admin/sales/__data.json") &&
+            ["document", "fetch"].includes(response.request().resourceType())
+          );
+        }),
+        adminPage.waitForURL((url) => url.href !== customUrl),
+        adminPage
+          .getByRole("button", { name: "Apply filters" })
+          .click(),
+      ]);
+      expect(presetResponse.status()).toBe(200);
+      await adminPage.waitForLoadState("networkidle");
+      expect(Object.fromEntries(new URL(adminPage.url()).searchParams)).toEqual({
+        range: "all",
+        sort: "gross_desc",
+      });
+      await expect(adminPage.getByLabel("From date")).toHaveValue("");
+      await expect(adminPage.getByLabel("To date")).toHaveValue("");
+
+      await adminPage.getByLabel("Range").selectOption("custom");
+      await adminPage
+        .getByLabel("From date")
+        .fill(fixture.filterWindow.from);
+      await adminPage.getByLabel("To date").fill(fixture.filterWindow.to);
+      const presetUrl = adminPage.url();
+      const [customResponse] = await Promise.all([
+        adminPage.waitForResponse((response) => {
+          const url = new URL(response.url());
+          return (
+            url.origin === new URL(baseURL).origin &&
+            (url.pathname === "/admin/sales" ||
+              url.pathname === "/admin/sales/__data.json") &&
+            ["document", "fetch"].includes(response.request().resourceType())
+          );
+        }),
+        adminPage.waitForURL((url) => url.href !== presetUrl),
+        adminPage
+          .getByRole("button", { name: "Apply filters" })
+          .click(),
+      ]);
+      expect(customResponse.status()).toBe(200);
+      await adminPage.waitForLoadState("networkidle");
+      expect(Object.fromEntries(new URL(adminPage.url()).searchParams)).toEqual({
         range: "custom",
         from: fixture.filterWindow.from,
         to: fixture.filterWindow.to,
+        sort: "gross_desc",
       });
+      await expect(adminPage.getByLabel("From date")).toHaveValue(
+        fixture.filterWindow.from,
+      );
+      await expect(adminPage.getByLabel("To date")).toHaveValue(
+        fixture.filterWindow.to,
+      );
+      // END manual Sales range transition witness.
       await expectPublicCohortTitles(
         adminPage,
         fixture.publicCohort.titles,

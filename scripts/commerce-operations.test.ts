@@ -3170,7 +3170,7 @@ describe('commerce operations contract', () => {
     }
   });
 
-  it('accepts only the bounded legacy commerce-worker resolved-audit provenance', async () => {
+  it('accepts only canonical worker and scoped administrator resolution audits', async () => {
     const [financialVerifier, financialRunbook, verifierWitness] = await Promise.all([
       source('scripts/verify-financial-restore.sql'),
       source('docs/stripe-financial-reconciliation.md'),
@@ -3205,9 +3205,45 @@ describe('commerce operations contract', () => {
 
     expect(legacyCommerceWorkerIssuePairs(verifierAuditSql)).toEqual(expectedLegacyPairs);
     expect(legacyCommerceWorkerIssuePairs(documentedAuditSql)).toEqual(expectedLegacyPairs);
+    expect(documentedAuditSql.trim().replace(/\s+/gu, ' ')).toBe(
+      verifierAuditSql.trim().replace(/\s+/gu, ' ')
+    );
     expect(verifierAuditSql).toContain("audit.actor_id = 'financial-worker'");
     expect(verifierAuditSql).toContain("audit.actor_id = 'commerce-worker'");
+    for (const auditSql of [verifierAuditSql, documentedAuditSql]) {
+      expect(auditSql).toContain('audit.before is null');
+      expect(auditSql).toContain('audit.request_metadata is null');
+      expect(auditSql).toContain("audit.after - 'commandId'");
+      expect(auditSql).toContain(
+        "jsonb_typeof(audit.after -> 'commandId') = 'string'"
+      );
+      expect(auditSql).toContain(
+        "pg_input_is_valid(audit.after ->> 'commandId', 'uuid')"
+      );
+      expect(auditSql).toContain('from financial_admin_commands command');
+      expect(auditSql).toContain(
+        "command.id::text = audit.after ->> 'commandId'"
+      );
+      expect(auditSql).toContain(
+        'command.actor_user_id = issue.resolved_by_admin_id'
+      );
+      expect(auditSql).toContain(
+        'command.correlation_id = audit.correlation_id'
+      );
+      expect(auditSql).toContain("command.status = 'succeeded'");
+      expect(auditSql).toContain("command.kind = 'refund_allocation_finalize'");
+      expect(auditSql).toContain(
+        "command.kind = 'refund_reporting_correction_create'"
+      );
+    }
     for (const witnessLabel of [
+      'administrator command-bound resolution audit',
+      'administrator resolution audit rejects an unrelated command',
+      'administrator resolution audit command repair',
+      'resolution audit rejects a before payload',
+      'resolution audit before payload repair',
+      'resolution audit rejects request metadata',
+      'resolution audit request metadata repair',
       'legacy commerce-worker dispute resolution audit',
       'legacy commerce-worker allocation-set resolution audit',
       'commerce-worker cannot resolve a payout issue',

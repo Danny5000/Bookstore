@@ -4229,6 +4229,8 @@ with legacy_commerce_worker_issue_pairs(resource_type, safe_code) as (values
     and audit.resource_type = 'financial_issue'
     and audit.correlation_id is not null
     and char_length(audit.correlation_id) between 1 and 100
+    and audit.before is null
+    and audit.request_metadata is null
     and (
       (issue.resolved_by_admin_id is null
         and audit.actor_type = 'system'
@@ -4240,18 +4242,79 @@ with legacy_commerce_worker_issue_pairs(resource_type, safe_code) as (values
             where legacy.resource_type = issue.resource_type
               and legacy.safe_code = issue.safe_code
           ))
+        )
+        and audit.after = jsonb_build_object(
+          'resourceType', issue.resource_type,
+          'resourceId', issue.resource_id,
+          'safeCode', issue.safe_code,
+          'impact', issue.impact,
+          'state', issue.state,
+          'occurrenceCount', issue.occurrence_count
         ))
       or (issue.resolved_by_admin_id is not null
         and audit.actor_type = 'user'
-        and audit.actor_id = issue.resolved_by_admin_id::text)
-    )
-    and audit.after = jsonb_build_object(
-      'resourceType', issue.resource_type,
-      'resourceId', issue.resource_id,
-      'safeCode', issue.safe_code,
-      'impact', issue.impact,
-      'state', issue.state,
-      'occurrenceCount', issue.occurrence_count
+        and audit.actor_id = issue.resolved_by_admin_id::text
+        and (
+          audit.after = jsonb_build_object(
+            'resourceType', issue.resource_type,
+            'resourceId', issue.resource_id,
+            'safeCode', issue.safe_code,
+            'impact', issue.impact,
+            'state', issue.state,
+            'occurrenceCount', issue.occurrence_count
+          ) or case when
+            audit.after - 'commandId' = jsonb_build_object(
+              'resourceType', issue.resource_type,
+              'resourceId', issue.resource_id,
+              'safeCode', issue.safe_code,
+              'impact', issue.impact,
+              'state', issue.state,
+              'occurrenceCount', issue.occurrence_count
+            ) and jsonb_typeof(audit.after -> 'commandId') = 'string'
+              and pg_input_is_valid(audit.after ->> 'commandId', 'uuid')
+          then exists (
+            select 1
+            from financial_admin_commands command
+            where command.id::text = audit.after ->> 'commandId'
+              and command.actor_user_id = issue.resolved_by_admin_id
+              and command.correlation_id = audit.correlation_id
+              and command.status = 'succeeded'
+              and issue.safe_code in (
+                'allocation_fork',
+                'allocation_incomplete',
+                'allocation_mismatch',
+                'classification_fork',
+                'correction_rebase_required',
+                'currency_mismatch',
+                'immutable_mismatch',
+                'missing_source',
+                'source_linkage_mismatch'
+              )
+              and command.kind in (
+                'refund_allocation_finalize',
+                'refund_reporting_correction_create'
+              )
+              and (
+                (command.kind = 'refund_allocation_finalize'
+                  and command.safe_result_code = 'allocation_finalized')
+                or (command.kind = 'refund_reporting_correction_create'
+                  and command.safe_result_code = 'correction_created')
+              )
+              and jsonb_typeof(command.safe_result -> 'refundId') = 'string'
+              and (
+                (issue.resource_type = 'refund' and issue.resource_id::text =
+                  command.safe_result ->> 'refundId')
+                or (issue.resource_type = 'allocation_set' and exists (
+                  select 1
+                  from financial_allocation_sets allocation_set
+                  where allocation_set.id = issue.resource_id
+                    and allocation_set.source_kind = 'refund'
+                    and allocation_set.source_internal_id::text =
+                      command.safe_result ->> 'refundId'
+                ))
+              )
+          ) else false end
+        ))
     )
 ), invalid_resolved_issues as (
   select issue.id

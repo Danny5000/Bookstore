@@ -259,6 +259,30 @@ describe('sales overview read model', () => {
     expect(freshness).toContain('financial_payout_discovery_state');
   });
 
+  it('requires the current certified payout generation in every shared aggregate query', async () => {
+    const { database, execute } = successfulDatabase();
+    await listSalesOverview(database, admin, filters, { stripeEnabled: false });
+    const aggregate = databaseWith([[completeRow()]]);
+    await loadSalesAggregateRows(
+      { execute: aggregate.execute } as never,
+      filters,
+      { applyCursor: false, limit: 10_001 }
+    );
+
+    for (const statement of [
+      normalizedSql(execute.mock.calls[0]![0]),
+      normalizedSql(execute.mock.calls[1]![0]),
+      normalizedSql(aggregate.execute.mock.calls[0]![0])
+    ]) {
+      expect(statement).toContain('published_run_candidates');
+      expect(statement).toContain('ranked_certifications');
+      expect(statement).toContain('certified_membership');
+      expect(statement).toMatch(
+        /certification\.certified_generation = payout\.financial_generation/u
+      );
+    }
+  });
+
   it('fails closed for legacy dispute reinstatement while accepting the tax-split v2 shape', async () => {
     const { database, execute } = successfulDatabase();
     await listSalesOverview(database, admin, filters, { stripeEnabled: false });

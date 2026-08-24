@@ -1324,6 +1324,87 @@ describe("Playwright commerce fixture isolation", () => {
     );
   });
 
+  it("keeps Sales range transitions manual and the unfiltered empty witness reversible", async () => {
+    const harnessSource = await readFile(financialHarnessPath, "utf8");
+    const salesSource = await readFile(
+      requiredFinancialE2ESources.salesReportingJourney,
+      "utf8",
+    );
+    const isolatedCohortSource = harnessSource.slice(
+      harnessSource.indexOf("async function withIsolatedEmptyDefaultSalesCohort"),
+      harnessSource.indexOf("async function seedSalesReportingMatrix"),
+    );
+    const rangeTransitionSource = salesSource.slice(
+      salesSource.indexOf("// BEGIN manual Sales range transition witness."),
+      salesSource.indexOf("// END manual Sales range transition witness."),
+    );
+    const mutationTransactionStart = isolatedCohortSource.indexOf(
+      "await inSalesOwnerTransaction(async () => {",
+    );
+    const mutationCommitMarker = "\n      });";
+    const mutationCommitStart = isolatedCohortSource.indexOf(
+      mutationCommitMarker,
+      mutationTransactionStart,
+    );
+    const protectedTryStart = isolatedCohortSource.indexOf(
+      "\n      try {",
+      mutationCommitStart,
+    );
+    const protectedCatchStart = isolatedCohortSource.indexOf(
+      "\n      } catch (reason: unknown) {",
+      protectedTryStart,
+    );
+
+    expect(isolatedCohortSource).toMatch(/withWorkerClaimBarrier/u);
+    expect(isolatedCohortSource).toMatch(/with utc_clock as materialized/u);
+    expect(isolatedCohortSource.match(/clock_timestamp\(\)/gu)).toHaveLength(1);
+    expect(isolatedCohortSource).toMatch(
+      /select distinct orders\.id::text as "orderId",[\s\S]*orders\.paid_at::text as "paidAt"/u,
+    );
+    expect(isolatedCohortSource).toMatch(
+      /set local session_replication_role = replica[\s\S]*update orders[\s\S]*set paid_at/u,
+    );
+    expect(mutationTransactionStart).toBeGreaterThanOrEqual(0);
+    expect(mutationCommitStart).toBeGreaterThan(mutationTransactionStart);
+    expect(protectedTryStart).toBeGreaterThan(mutationCommitStart);
+    expect(protectedCatchStart).toBeGreaterThan(protectedTryStart);
+    expect(
+      isolatedCohortSource.slice(
+        mutationCommitStart + mutationCommitMarker.length,
+        protectedTryStart,
+      ),
+    ).not.toMatch(/\bawait\b/u);
+    expect(
+      isolatedCohortSource.slice(protectedTryStart, protectedCatchStart),
+    ).toMatch(
+      /const remaining = await readDefaultCohort\(\);[\s\S]*Sales default cohort was not isolated[\s\S]*await action\(\)/u,
+    );
+    expect(isolatedCohortSource).toMatch(
+      /catch \(reason: unknown\)[\s\S]*status: "rejected"[\s\S]*\} finally \{[\s\S]*original\."paidAt"/u,
+    );
+    expect(isolatedCohortSource).toMatch(
+      /assertExactSalesCohortRows\([\s\S]*"mutated"[\s\S]*assertExactSalesCohortRows\([\s\S]*"restored"/u,
+    );
+    expect(isolatedCohortSource).not.toMatch(
+      /delete from|truncate|(?:select|returning)[^;]*email/iu,
+    );
+
+    expect(salesSource).toMatch(
+      /withIsolatedEmptyDefaultSalesCohort\(async \(\) => \{[\s\S]*goto\("\/admin\/sales"\)[\s\S]*waitForSalesFilterHydration[\s\S]*No sales data yet[\s\S]*aria-live[\s\S]*0 matching sales rows\./u,
+    );
+    expect(salesSource).toMatch(
+      /function waitForSalesFilterHydration[\s\S]*new FormDataEvent\("formdata"[\s\S]*!formData\.has\("from"\)[\s\S]*!formData\.has\("to"\)/u,
+    );
+    expect(salesSource).toMatch(/No sales match these filters/u);
+    expect(rangeTransitionSource).toMatch(
+      /getByLabel\("Range"\)\.selectOption\("all"\)[\s\S]*getByRole\("button", \{ name: "Apply filters" \}\)\s*\.click\(\)/u,
+    );
+    expect(rangeTransitionSource).toMatch(
+      /getByLabel\("Range"\)\.selectOption\("custom"\)[\s\S]*getByLabel\("From date"\)\s*\.fill[\s\S]*getByLabel\("To date"\)\.fill[\s\S]*getByRole\("button", \{ name: "Apply filters" \}\)\s*\.click\(\)/u,
+    );
+    expect(rangeTransitionSource).not.toMatch(/applyFilters\(/u);
+  });
+
   it("retains every non-public Sales export-bound backing identifier", async () => {
     const harnessSource = await readFile(financialHarnessPath, "utf8");
     const exportBoundSource = harnessSource.slice(

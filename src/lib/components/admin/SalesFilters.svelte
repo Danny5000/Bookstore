@@ -43,9 +43,14 @@
 
   const exportHref = $derived(exportUrl(filters));
 
-  function omitEmptyOptionalFields(event: FormDataEvent): void {
+  function normalizeFilterFormData(event: FormDataEvent): void {
     const form = event.currentTarget;
     if (!(form instanceof HTMLFormElement)) return;
+    const submittedRange = event.formData.get('range');
+    if (submittedRange !== 'custom') {
+      event.formData.delete('from');
+      event.formData.delete('to');
+    }
     for (const element of form.elements) {
       if (
         (element instanceof HTMLInputElement || element instanceof HTMLSelectElement) &&
@@ -62,7 +67,7 @@
   method="GET"
   action={resolve('/admin/sales')}
   class="sales-filters"
-  onformdata={omitEmptyOptionalFields}
+  onformdata={normalizeFilterFormData}
 >
   <label>
     <span>Range</span>

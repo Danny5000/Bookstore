@@ -475,12 +475,37 @@ describe('Sales Overview page', () => {
     expect(body).not.toContain('autofocus');
   });
 
-  it('omits empty optional GET entries without disabling controls reused after navigation', () => {
+  it('normalizes range dates from the submitted value without disabling reusable controls', () => {
     const source = readFileSync(new URL('./SalesFilters.svelte', import.meta.url), 'utf8');
 
-    expect(source).toMatch(/onformdata=\{omitEmptyOptionalFields\}/u);
+    expect(source).toMatch(/onformdata=\{normalizeFilterFormData\}/u);
+    expect(source).toMatch(/event\.formData\.get\('range'\)/u);
+    expect(source).toMatch(
+      /submittedRange !== 'custom'[\s\S]*event\.formData\.delete\('from'\)[\s\S]*event\.formData\.delete\('to'\)/u
+    );
     expect(source).toMatch(/event\.formData\.delete\(element\.name\)/u);
     expect(source).not.toMatch(/(?:\.disabled\s*=|setAttribute\(\s*['"]disabled)/u);
+
+    const custom = render(SalesOverview, {
+      props: {
+        data: overview({
+          filters: {
+            ...overview().filters,
+            range: 'custom',
+            from: '2026-08-01T00:00:00.000Z',
+            to: '2026-08-11T00:00:00.000Z'
+          }
+        }) as never
+      }
+    }).body;
+    const preset = render(SalesOverview, {
+      props: { data: overview() as never }
+    }).body;
+
+    expect(custom).toMatch(/name="from"[^>]*value="2026-08-01"/u);
+    expect(custom).toMatch(/name="to"[^>]*value="2026-08-10"/u);
+    expect(preset).toMatch(/name="from"[^>]*value=""/u);
+    expect(preset).toMatch(/name="to"[^>]*value=""/u);
   });
 
   it('shows a canonical cursor-free export link only when canExport is true', () => {

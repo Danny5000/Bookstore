@@ -276,6 +276,9 @@ export interface FinancialHarness {
   withWorkerClaimBarrier<Result>(
     action: () => Promise<Result>,
   ): Promise<Result>;
+  withIsolatedEmptyDefaultSalesCohort<Result>(
+    action: () => Promise<Result>,
+  ): Promise<Result>;
   seedSalesReportingMatrix(): Promise<SalesReportingFixture>;
   seedSalesExportBound(
     kind: "rows" | "bytes" | "deadline",
@@ -6360,6 +6363,159 @@ export function createFinancialHarness(
     return [runId] as const;
   }
 
+  type SalesCohortTimestampRow = Readonly<{
+    orderId: string;
+    paidAt: string;
+  }>;
+
+  function assertExactSalesCohortRows(
+    expected: readonly SalesCohortTimestampRow[],
+    actual: readonly SalesCohortTimestampRow[],
+    state: "mutated" | "restored",
+  ): void {
+    const expectedById = new Map(
+      expected.map((row) => [
+        assertCanonicalUuid(row.orderId, `Sales ${state} order ID`),
+        row.paidAt,
+      ]),
+    );
+    if (
+      expectedById.size !== expected.length ||
+      actual.length !== expected.length
+    ) {
+      throw new Error(`Sales empty-cohort ${state} row count was invalid`);
+    }
+    for (const row of actual) {
+      const orderId = assertCanonicalUuid(
+        row.orderId,
+        `Sales ${state} order ID`,
+      );
+      if (expectedById.get(orderId) !== row.paidAt) {
+        throw new Error(`Sales empty-cohort ${state} timestamps were invalid`);
+      }
+      expectedById.delete(orderId);
+    }
+    if (expectedById.size !== 0) {
+      throw new Error(`Sales empty-cohort ${state} identities were invalid`);
+    }
+  }
+
+  async function withIsolatedEmptyDefaultSalesCohort<Result>(
+    action: () => Promise<Result>,
+  ): Promise<Result> {
+    return withWorkerClaimBarrier(async () => {
+      const client = database.ownerFixtureClient;
+      const boundaryResult = await client.query<{
+        defaultFrom: string;
+        defaultTo: string;
+      }>(`
+        with utc_clock as materialized (
+          select pg_catalog.date_trunc(
+            'day', pg_catalog.clock_timestamp() at time zone 'UTC'
+          ) at time zone 'UTC' as "defaultTo"
+        )
+        select
+          ("defaultTo" - interval '30 days')::text as "defaultFrom",
+          "defaultTo"::text as "defaultTo"
+        from utc_clock
+      `);
+      const boundary = boundaryResult.rows[0];
+      if (
+        boundaryResult.rows.length !== 1 ||
+        boundary === undefined ||
+        boundary.defaultFrom.length === 0 ||
+        boundary.defaultTo.length === 0
+      ) {
+        throw new Error("Sales empty-cohort UTC boundary was invalid");
+      }
+
+      const readDefaultCohort = async (): Promise<SalesCohortTimestampRow[]> => {
+        const result = await client.query<SalesCohortTimestampRow>(`
+          select distinct orders.id::text as "orderId",
+            orders.paid_at::text as "paidAt"
+          from orders
+          where orders.status = 'paid'
+            and orders.paid_at >= $1::timestamptz
+            and orders.paid_at < $2::timestamptz
+            and exists (
+              select 1
+              from order_items
+              join payments on payments.order_id = order_items.order_id
+                and payments.status = 'succeeded'
+              where order_items.order_id = orders.id
+            )
+          order by orders.id::text
+        `, [boundary.defaultFrom, boundary.defaultTo]);
+        return result.rows;
+      };
+
+      const originals = await readDefaultCohort();
+      const orderIds = originals.map((row) => row.orderId);
+      const originalPaidAt = originals.map((row) => row.paidAt);
+      const mutatedExpected = originals.map((row) => ({
+        orderId: row.orderId,
+        paidAt: boundary.defaultTo,
+      }));
+
+      await inSalesOwnerTransaction(async () => {
+        await client.query("set local session_replication_role = replica");
+        const mutated = await client.query<SalesCohortTimestampRow>(`
+          update orders
+          set paid_at = $2::timestamptz
+          where id = any($1::uuid[])
+          returning id::text as "orderId", paid_at::text as "paidAt"
+        `, [orderIds, boundary.defaultTo]);
+        assertExactSalesCohortRows(mutatedExpected, mutated.rows, "mutated");
+      });
+
+      let actionResult:
+        | Readonly<{ status: "fulfilled"; value: Result }>
+        | Readonly<{ status: "rejected"; reason: unknown }>;
+      let restoreError: unknown;
+      try {
+        const remaining = await readDefaultCohort();
+        if (remaining.length !== 0) {
+          throw new Error("Sales default cohort was not isolated");
+        }
+        actionResult = { status: "fulfilled", value: await action() };
+      } catch (reason: unknown) {
+        actionResult = { status: "rejected", reason };
+      } finally {
+        try {
+          await inSalesOwnerTransaction(async () => {
+            await client.query("set local session_replication_role = replica");
+            const restored = await client.query<SalesCohortTimestampRow>(`
+              update orders
+              set paid_at = original."paidAt"::timestamptz
+              from unnest($1::uuid[], $2::text[]) as original("orderId", "paidAt")
+              where orders.id = original."orderId"
+              returning orders.id::text as "orderId",
+                orders.paid_at::text as "paidAt"
+            `, [orderIds, originalPaidAt]);
+            assertExactSalesCohortRows(originals, restored.rows, "restored");
+          });
+          assertExactSalesCohortRows(
+            originals,
+            await readDefaultCohort(),
+            "restored",
+          );
+        } catch (error: unknown) {
+          restoreError = error;
+        }
+      }
+      if (actionResult.status === "rejected" && restoreError !== undefined) {
+        throw new AggregateError(
+          [actionResult.reason, restoreError],
+          "Sales empty-cohort witness and restoration failed",
+          { cause: actionResult.reason },
+        );
+      }
+      if (actionResult.status === "rejected") throw actionResult.reason;
+      if (restoreError !== undefined) throw restoreError;
+      return actionResult.value;
+    });
+  }
+
   async function seedSalesReportingMatrix(): Promise<SalesReportingFixture> {
     await ensureProjectionAuthority();
     return inSalesOwnerTransaction(async () => {
@@ -7678,6 +7834,7 @@ export function createFinancialHarness(
     createRefundFixture,
     runCommand,
     withWorkerClaimBarrier,
+    withIsolatedEmptyDefaultSalesCohort,
     seedSalesReportingMatrix,
     seedSalesExportBound,
     auditCount,

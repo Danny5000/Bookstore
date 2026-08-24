@@ -2738,6 +2738,91 @@ describe('financial Sales overview reporting', () => {
     ]);
   });
 
+  it('treats paid completed payout membership as historical until its exact generation is recertified', async () => {
+    const title = await createTitle('payout-generation', { title: 'Payout Generation' });
+    const purchase = await createPurchase('payout-generation', {
+      paidAt: new Date('2026-08-01T13:00:00.000Z'),
+      currency: 'USD',
+      financialEvidenceStatus: 'fee_reconciled',
+      items: [{
+        title,
+        titleSnapshot: 'Payout Generation',
+        creatorNameSnapshot: 'Payout Creator',
+        format: 'prose',
+        subtotalMinor: 100,
+        taxMinor: 0
+      }]
+    });
+    const evidence = await createChargeEvidence('payout-generation', purchase, {
+      amountMinor: 100,
+      feeMinor: 0,
+      currency: 'USD',
+      grossItems: [{
+        orderItemId: purchase.items[0]!.id,
+        component: 'sale_subtotal',
+        effectMinor: 100
+      }],
+      feeItems: []
+    });
+    const payoutId = await publishPayoutMembership(
+      'payout-generation',
+      'USD',
+      [evidence.balanceTransactionId]
+    );
+
+    await ownerDatabaseClient.pool.query(
+      `update stripe_payouts
+       set arrival_at = arrival_at + interval '1 day', financial_generation = 2
+       where id = $1`,
+      [payoutId]
+    );
+
+    const historical = await listSalesOverview(
+      databaseClient.db,
+      ADMIN,
+      customDayFilters(),
+      { stripeEnabled: true }
+    );
+    expect(historical.rows).toEqual([
+      expect.objectContaining({
+        titleId: title.id,
+        settlementMetricsComplete: true,
+        estimatedPayoutMinor: 100,
+        state: 'fee_reconciled'
+      })
+    ]);
+
+    const recertification = await ownerDatabaseClient.pool.query<{ id: string }>(
+      `insert into payout_import_runs
+         (payout_id, generation, state, candidate_count, page_count, safe_outcome,
+          completed_at)
+       values ($1, 2, 'published', 1, 1, 'published',
+               '2026-08-04T03:00:00.000Z')
+       returning id`,
+      [payoutId]
+    );
+    await ownerDatabaseClient.pool.query(
+      `insert into payout_import_run_entries (run_id, balance_transaction_id)
+       values ($1, $2)`,
+      [recertification.rows[0]!.id, evidence.balanceTransactionId]
+    );
+
+    const current = await listSalesOverview(
+      databaseClient.db,
+      ADMIN,
+      customDayFilters(),
+      { stripeEnabled: true }
+    );
+    expect(current.rows).toEqual([
+      expect.objectContaining({
+        titleId: title.id,
+        settlementMetricsComplete: true,
+        estimatedPayoutMinor: 100,
+        state: 'payout_reconciled'
+      })
+    ]);
+  });
+
   it('limits a refund payout exception to titles attributed by that refund', async () => {
     const affectedTitle = await createTitle('payout-scope-affected', {
       title: 'Payout Affected'

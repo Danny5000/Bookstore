@@ -4090,6 +4090,12 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     '46000000-0000-4000-8000-000000000013';
   const correctionRefundId = '46000000-0000-4000-8000-000000000014';
   const correctionRefundAllocationId = '46000000-0000-4000-8000-000000000015';
+  const adminResolutionJobId = '49000000-0000-4000-8000-000000000001';
+  const adminResolutionCommandId = '49000000-0000-4000-8000-000000000002';
+  const adminResolutionIssueId = '49000000-0000-4000-8000-000000000003';
+  const adminResolutionAuditId = '49000000-0000-4000-8000-000000000004';
+  const unrelatedAdminResolutionCommandId =
+    '49000000-0000-4000-8000-000000000005';
   const correctionSourceOrderId = '46000000-0000-4000-8000-000000000016';
   const correctionSourceItemId = '46000000-0000-4000-8000-000000000017';
   const correctionPaymentId = '46000000-0000-4000-8000-000000000018';
@@ -4223,6 +4229,126 @@ async function exerciseInvariantWitnesses(): Promise<void> {
     correctionSourceItemId
   ]);
   await expectPass('refund title allocation deterministic baseline', true);
+  await mutateAppendOnlyFixture(`
+    with witness_clock as materialized (
+      select pg_catalog.transaction_timestamp() as terminal_at
+    ), inserted_job as (
+      insert into jobs (
+        id, type, payload, deduplication_key, status, run_at, attempts,
+        max_attempts, completed_at, created_at, updated_at
+      )
+      select $1, 'commerce.financial-admin-command',
+        pg_catalog.jsonb_build_object('commandId', $2::uuid),
+        'commerce:financial-admin-command:' || $2::text || ':v1',
+        'succeeded', terminal_at, 1, 8, terminal_at, terminal_at, terminal_at
+      from witness_clock
+      returning id
+    ), inserted_command as (
+      insert into financial_admin_commands (
+        id, kind, actor_user_id, correlation_id, idempotency_key_sha256,
+        input_fingerprint_sha256, private_input, job_id, status,
+        safe_result_code, safe_result, created_at, updated_at, completed_at
+      )
+      select $2, 'refund_allocation_finalize', $3,
+        'restore-admin-resolution-audit', repeat('1', 64), repeat('2', 64),
+        pg_catalog.jsonb_build_object(
+          'kind', 'refund_allocation_finalize',
+          'refundId', $4::uuid,
+          'expectedActiveDraftVersion', 1,
+          'previewFingerprint', repeat('3', 64),
+          'confirmation', 'finalize_refund_allocation'
+        ), inserted_job.id, 'succeeded', 'allocation_finalized',
+        pg_catalog.jsonb_build_object(
+          'refundId', $4::uuid,
+          'finalizedDraftVersion', 1,
+          'accessChanged', false,
+          'emailQueued', false
+        ), terminal_at, terminal_at, terminal_at
+      from inserted_job cross join witness_clock
+      returning id
+    ), inserted_issue as (
+      insert into financial_reconciliation_issues (
+        id, resource_type, resource_id, safe_code, state, impact,
+        first_observed_at, last_observed_at, occurrence_count, correlation_id,
+        resolved_by_admin_id, resolved_at
+      )
+      select $5, 'refund', $4, 'missing_source', 'resolved', 'pending',
+        terminal_at, terminal_at, 1, 'restore-admin-resolution-audit', $3,
+        terminal_at
+      from witness_clock
+      returning *
+    )
+    insert into audit_events (
+      id, occurred_at, actor_type, actor_id, action, outcome, resource_type,
+      resource_id, correlation_id, request_metadata, before, after
+    )
+    select $6, terminal_at, 'user', $3::text, 'financial.issue.resolved',
+      'succeeded', 'financial_issue', inserted_issue.id::text,
+      'restore-admin-resolution-audit', null, null,
+      pg_catalog.jsonb_build_object(
+        'resourceType', inserted_issue.resource_type,
+        'resourceId', inserted_issue.resource_id,
+        'safeCode', inserted_issue.safe_code,
+        'impact', inserted_issue.impact,
+        'state', inserted_issue.state,
+        'occurrenceCount', inserted_issue.occurrence_count,
+        'commandId', inserted_command.id
+      )
+    from inserted_issue cross join inserted_command cross join witness_clock
+  `, [
+    adminResolutionJobId,
+    adminResolutionCommandId,
+    correctionAdminId,
+    correctionRefundId,
+    adminResolutionIssueId,
+    adminResolutionAuditId
+  ]);
+  await expectPass('administrator command-bound resolution audit', true);
+  await mutateAppendOnlyFixture(`
+    update audit_events
+    set after = pg_catalog.jsonb_set(
+      after, '{commandId}', pg_catalog.to_jsonb($2::text), false
+    )
+    where id = $1
+  `, [adminResolutionAuditId, unrelatedAdminResolutionCommandId]);
+  await expectRejection(
+    'administrator resolution audit rejects an unrelated command',
+    'resolved_issue_audit_provenance=2'
+  );
+  await mutateAppendOnlyFixture(`
+    update audit_events
+    set after = pg_catalog.jsonb_set(
+      after, '{commandId}', pg_catalog.to_jsonb($2::text), false
+    )
+    where id = $1
+  `, [adminResolutionAuditId, adminResolutionCommandId]);
+  await expectPass('administrator resolution audit command repair', true);
+  await mutateAppendOnlyFixture(
+    `update audit_events set before = '{}'::jsonb where id = $1`,
+    [adminResolutionAuditId]
+  );
+  await expectRejection(
+    'resolution audit rejects a before payload',
+    'resolved_issue_audit_provenance=2'
+  );
+  await mutateAppendOnlyFixture(
+    'update audit_events set before = null where id = $1',
+    [adminResolutionAuditId]
+  );
+  await expectPass('resolution audit before payload repair', true);
+  await mutateAppendOnlyFixture(
+    `update audit_events set request_metadata = '{}'::jsonb where id = $1`,
+    [adminResolutionAuditId]
+  );
+  await expectRejection(
+    'resolution audit rejects request metadata',
+    'resolved_issue_audit_provenance=2'
+  );
+  await mutateAppendOnlyFixture(
+    'update audit_events set request_metadata = null where id = $1',
+    [adminResolutionAuditId]
+  );
+  await expectPass('resolution audit request metadata repair', true);
   await mutateAppendOnlyFixture(`
     update financial_item_allocations
     set effect_minor = case id when $1 then -1 else -2 end

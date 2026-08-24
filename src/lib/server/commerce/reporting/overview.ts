@@ -23,6 +23,7 @@ import {
   fingerprintSalesFilters,
   type SalesOverviewFilters
 } from './filters';
+import { payoutMembershipCertificationCtes } from './payout-membership-authority';
 import { currentOperationalFinancialIssuePredicate } from './review-authority';
 
 export interface SalesOverviewDependencies extends FinancialAuthorizationDependencies {
@@ -530,12 +531,18 @@ function salesRowsRelation(filters: SalesOverviewFilters): SQL {
       join (select distinct order_id from cohort_items) cohort on cohort.order_id = payment.order_id
       left join stripe_balance_transactions balance
         on balance.source_family = 'dispute' and balance.source_id = dispute.stripe_dispute_id
-    ), source_payout_authority as (
+    ), target_payouts as (
+      select distinct membership.payout_id as id
+      from source_transactions source
+      join stripe_payout_balance_transactions membership
+        on membership.balance_transaction_id = source.balance_transaction_id
+    ), ${payoutMembershipCertificationCtes()}, source_payout_authority as (
       select source.source_kind, source.source_internal_id, source.balance_transaction_id,
         coalesce(bool_or(
           payout.id is not null and payout.automatic and payout.method = 'standard'
             and payout.status = 'paid' and payout.reconciliation_status = 'completed'
             and payout.reversed_by_provider_payout_id is null
+            and certification.certified_generation = payout.financial_generation
         ), false) as is_payout_reconciled,
         coalesce(bool_or(
           payout.id is not null and (
@@ -558,6 +565,7 @@ function salesRowsRelation(filters: SalesOverviewFilters): SQL {
       left join stripe_payout_balance_transactions membership
         on membership.balance_transaction_id = source.balance_transaction_id
       left join stripe_payouts payout on payout.id = membership.payout_id
+      left join certified_membership certification on certification.payout_id = payout.id
       group by source.source_kind, source.source_internal_id, source.balance_transaction_id
     ), source_health as (
       select source.source_kind, source.source_internal_id, source.order_id,
