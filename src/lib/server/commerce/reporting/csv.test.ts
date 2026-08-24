@@ -113,7 +113,11 @@ function fakeDatabase(order: string[] = []): {
 } {
   const execute = vi.fn(async (statement: SQL) => {
     const rendered = dialect.sqlToQuery(statement);
-    order.push(rendered.sql.includes('set_config') ? 'timeout' : 'role-lock');
+    if (rendered.sql.includes('set_config')) order.push('timeout');
+    else if (rendered.sql.includes('pg_advisory_xact_lock')) order.push('role-advisory-lock');
+    else if (rendered.sql.includes('user_roles') && rendered.sql.includes('for key share')) {
+      order.push('role-row-lock');
+    } else order.push('unexpected-query');
     return { rows: [] };
   });
   const transaction = vi.fn(async (
@@ -237,7 +241,7 @@ describe('bounded audited sales CSV export', () => {
     expect(transaction).not.toHaveBeenCalled();
   });
 
-  it('sets shrinking transaction-local timeouts, locks roles, reloads and reauthorizes before data', async () => {
+  it('locks the current administrator role row after the global role lock and before export data', async () => {
     const order: string[] = [];
     const database = fakeDatabase(order);
     collaborators.listRoles.mockImplementation(async () => {
@@ -264,7 +268,8 @@ describe('bounded audited sales CSV export', () => {
     }, { monotonicNow });
 
     expect(order).toEqual([
-      'timeout', 'role-lock', 'timeout', 'role-reload',
+      'timeout', 'role-advisory-lock', 'timeout', 'role-row-lock',
+      'timeout', 'role-reload',
       'timeout', 'rows', 'timeout', 'freshness', 'timeout', 'audit'
     ]);
     expect(database.transaction).toHaveBeenCalledWith(expect.any(Function), {
@@ -273,7 +278,7 @@ describe('bounded audited sales CSV export', () => {
     const timeoutCalls = database.execute.mock.calls
       .map(([statement]) => dialect.sqlToQuery(statement as SQL))
       .filter((statement) => statement.sql.includes('set_config'));
-    expect(timeoutCalls).toHaveLength(5);
+    expect(timeoutCalls).toHaveLength(6);
     expect(timeoutCalls.every((statement) =>
       statement.sql.includes("pg_catalog.set_config('statement_timeout'") &&
       Number(statement.params[0]) > 0 && Number(statement.params[0]) <= SALES_CSV_DEADLINE_MS
@@ -282,6 +287,38 @@ describe('bounded audited sales CSV export', () => {
     expect(timeoutValues).toEqual([...timeoutValues].sort((left, right) => right - left));
     expect(new Set(timeoutValues).size).toBe(timeoutValues.length);
     expect(collaborators.listRoles).toHaveBeenCalledWith(expect.any(Object), ADMIN_ID);
+    const roleRowLock = database.execute.mock.calls
+      .map(([statement]) => dialect.sqlToQuery(statement as SQL))
+      .find((statement) => statement.sql.includes('for key share'));
+    expect(roleRowLock).toEqual(expect.objectContaining({
+      sql: expect.stringMatching(/from "user_roles".*"user_id" = \$1.*"role" = \$2.*for key share/su),
+      params: [ADMIN_ID, 'admin']
+    }));
+  });
+
+  it('returns no export or audit when the current-role lock raises a serialization failure', async () => {
+    const database = fakeDatabase();
+    const serializationFailure = Object.assign(
+      new Error('could not serialize access due to concurrent update'),
+      { code: '40001' }
+    );
+    database.execute.mockImplementation(async (statement: SQL) => {
+      const rendered = dialect.sqlToQuery(statement);
+      if (rendered.sql.includes('for key share')) throw serializationFailure;
+      return { rows: [] };
+    });
+
+    await expect(exportSalesCsv(
+      database.database,
+      ADMIN,
+      CUSTOM_FILTERS,
+      { correlationId: 'csv-concurrent-demotion' },
+      { monotonicNow: () => 1_000 }
+    )).rejects.toBe(serializationFailure);
+    expect(collaborators.listRoles).not.toHaveBeenCalled();
+    expect(collaborators.loadRows).not.toHaveBeenCalled();
+    expect(collaborators.loadDataThrough).not.toHaveBeenCalled();
+    expect(collaborators.audit).not.toHaveBeenCalled();
   });
 
   it('exports the cursor-free complete cohort, maps safe rows, and audits only bounded counts', async () => {

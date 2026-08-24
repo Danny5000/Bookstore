@@ -3920,10 +3920,19 @@ After every accepted-finding commit, repeat all three review lanes against the n
 
 - [ ] **Step 10: Enable Sales, freeze final evidence, rerun everything, and rereview exact HEAD**
 
-Only after the candidate gates and all three reviews are clear for the current exact HEAD, replace `Sales — Upcoming` in `src/routes/admin/+layout.svelte` with the live Sales link and change the route assertion from disabled to enabled. Make only the evidence/status changes that record exact commands, counts, current commit, and completed Plan 6B-II acceptance. Keep production maintenance mode and Stripe-disabled settings unchanged. Commit them:
+Only after the candidate gates and all three reviews are clear for the current exact HEAD:
+
+- replace `Sales — Upcoming` in `src/routes/admin/+layout.svelte` with the live `/admin/sales` link;
+- change the static route assertion from disabled to enabled;
+- change the real browser assertion in `tests/e2e/sales-reporting.spec.ts` from “Sales Upcoming with zero links” to the visible exact `/admin/sales` link and absence of `Upcoming`;
+- update README, both financial guides, all three current source-of-truth specs, and all seven current runbooks from candidate/review-only/unlinked wording to completed Plan 6B status;
+- advance the three stale current source-of-truth migration statements from `0013` to `0014`, preserving the historical eight-plus-one callable surface and recording that `0014` changes no callable surface; and
+- keep production maintenance mode, Stripe-disabled defaults, and Plan 7 activation/operability ownership unchanged.
+
+Make only the evidence/status changes that record exact commands, counts, current commit, and completed Plan 6B-II acceptance. Commit them:
 
 ```powershell
-git add src/routes/admin/+layout.svelte src/routes/admin/sales/sales-routes.test.ts README.md docs/financial-reconciliation-and-reporting.md docs/stripe-financial-reconciliation.md docs/superpowers/specs/2026-08-08-bookstore-full-stack-design.md docs/superpowers/specs/2026-08-11-stripe-financial-reconciliation-reporting-design.md docs/superpowers/specs/2026-08-20-plan-6b-ii-implementation-refresh-design.md
+git add src/routes/admin/+layout.svelte src/routes/admin/sales/sales-routes.test.ts tests/e2e/sales-reporting.spec.ts README.md docs/financial-reconciliation-and-reporting.md docs/stripe-financial-reconciliation.md docs/authentication-and-email.md docs/commerce-and-guest-claims.md docs/customer-library-and-reader.md docs/database-and-workers.md docs/dependency-decisions.md docs/runtime-environments.md docs/storage-ingestion-and-publication.md docs/superpowers/specs/2026-08-08-bookstore-full-stack-design.md docs/superpowers/specs/2026-08-11-stripe-financial-reconciliation-reporting-design.md docs/superpowers/specs/2026-08-20-plan-6b-ii-implementation-refresh-design.md
 git diff --cached --check
 git commit -m "feat: complete Plan 6B reporting"
 ```
@@ -3997,3 +4006,152 @@ git add README.md docs/authentication-and-email.md docs/commerce-and-guest-claim
 git diff --cached --check
 git commit -m "fix: address Plan 6B candidate review"
 ```
+
+## Candidate review correction: fail closed on concurrent CSV-export demotion
+
+Independent candidate review found a repeatable-read authorization race in
+`exportSalesCsv`. The export transaction establishes its snapshot while setting the
+first transaction-local timeout, then waits for the global administrator-role advisory
+lock. If a concurrent demotion already holds that lock, deletes the actor's
+administrator role, and commits, the export can acquire the lock but continue to
+observe the pre-demotion role through its older repeatable-read snapshot. It can
+therefore generate bytes and commit a successful export audit after the demotion
+committed.
+
+Do not weaken the export to read committed and do not alter migration, ACL,
+audit-function, CSV DTO, filter, formula, privacy, row, byte, or deadline contracts.
+Preserve the one repeatable-read transaction and make the stale snapshot fail closed
+with a locking current-role witness.
+
+The bounded correction file set is exactly:
+
+- `src/lib/server/commerce/reporting/csv.ts`;
+- `src/lib/server/commerce/reporting/csv.test.ts`;
+- `tests/integration/financial-authorization-audit.test.ts`; and
+- `docs/superpowers/plans/2026-08-20-backend-plan-6b-ii-admin-resolution-reporting-refresh.md`.
+
+### RED
+
+Add a unit contract named exactly:
+
+`locks the current administrator role row after the global role lock and before export data`
+
+It must prove this order:
+
+1. transaction-local timeout;
+2. global `pale-orbit:user-roles:admin` transaction advisory lock;
+3. transaction-local timeout;
+4. a parameterized locking read of the submitting actor's exact `user_roles` row with
+   `role = 'admin'` and `FOR KEY SHARE`;
+5. transaction-local timeout;
+6. ordinary persisted-role reload and both capability checks; and
+7. aggregate query, freshness query, serialization, and audit.
+
+The unit contract must also inject a SQLSTATE `40001` failure from the locking role-row
+read and prove that role reload, aggregate loading, freshness loading, audit, and a
+successful export result never occur. It must pin six shrinking timeout calls so the
+fixed 25-second absolute deadline cannot stretch across the new statement and the
+existing role reload.
+
+Add an integration contract named exactly:
+
+`fails closed when administrator demotion commits after the CSV snapshot and before role reauthorization`
+
+Use only explicit barriers, never timing guesses:
+
+1. create the export fixture's administrator and a separate surviving administrator;
+2. pin a runtime connection with a unique session `application_name`, a bounded
+   `lock_timeout`, and its exact backend PID, then wrap that connection with the real
+   Drizzle schema;
+3. acquire a dedicated owner connection, begin a demotion transaction, acquire the
+   exact global administrator-role advisory lock, and delete the exporting actor's
+   administrator-role row without committing;
+4. start `exportSalesCsv` through the pinned runtime connection and attach settlement
+   handling immediately;
+5. poll `pg_stat_activity` and `pg_blocking_pids` boundedly until the exact exporter PID
+   is waiting on the demotion PID's advisory lock, proving that its first real
+   `set_config('statement_timeout', ...)` statement completed and the repeatable-read
+   snapshot exists;
+6. prove the export is still unsettled and the correlation-specific audit count is
+   zero, then commit the demotion and release the advisory lock;
+7. require the export to reject boundedly with SQLSTATE `40001`, return no bytes, and
+   commit zero `financial.sales_export` audits for its unique correlation ID; and
+8. prove the target is demoted before cleanup.
+
+Give the test an explicit 30-second outer timeout, and give every blocking wait and
+promise join a shorter fixed timeout. In cleanup, roll back an open demotion transaction
+before joining a blocked export. If that join times out, destroy the runtime session and
+join it boundedly again before attempting role restoration. Restore the exact deleted
+administrator-role row under the same global advisory lock only after the exporter has
+settled, use a bounded lock timeout, verify the restoration, and destroy/release both
+dedicated connections without deleting immutable audit evidence.
+
+Run:
+
+```powershell
+npx vitest run src/lib/server/commerce/reporting/csv.test.ts -t "locks the current administrator role row after the global role lock and before export data" --reporter=verbose
+npx tsx scripts/with-test-database.ts npx vitest run --config vitest.integration.config.ts tests/integration/financial-authorization-audit.test.ts -t "fails closed when administrator demotion commits after the CSV snapshot and before role reauthorization"
+```
+
+Expected on the reviewed candidate: RED. The unit sequence has no current-role locking
+read, and the real concurrent witness resolves an export and commits one audit from its
+stale snapshot instead of rejecting.
+
+### Minimal correction
+
+Immediately after the export acquires the global administrator-role advisory lock, set
+the remaining transaction-local statement timeout and execute a parameterized locking
+read for the actor's exact `user_roles` administrator row with `FOR KEY SHARE`. Recheck
+the monotonic deadline after it, then set the remaining timeout again before retaining
+the existing ordinary persisted-role reload and both `sales.read`/`sales.export`
+capability checks. Load no report data first.
+
+Under repeatable read, a demotion that deleted the role row after the export snapshot
+began causes this locking read to abort with SQLSTATE `40001`. Do not catch or retry that
+failure: the transaction must roll back, return no bytes, and write no successful export
+audit. If the export obtains the global lock first, its role-row lock and advisory lock
+remain held through byte construction and audit commit, so a later demotion waits and
+the existing valid export ordering remains intact.
+
+Preserve:
+
+- initial authorize-before-filter behavior;
+- strict normalized filters and cursor-free cohort;
+- repeatable-read snapshot consistency;
+- the fixed 25-second absolute monotonic deadline and shrinking statement timeouts;
+- 10,000-row and 10 MiB limits;
+- safe DTO mapping and formula neutralization;
+- minimized audit metadata; and
+- atomic “bytes only after successful audit commit” behavior.
+
+### GREEN and regression gate
+
+Run one command at a time:
+
+```powershell
+npx vitest run src/lib/server/commerce/reporting/csv.test.ts --reporter=verbose
+npx tsx scripts/with-test-database.ts npx vitest run --config vitest.integration.config.ts tests/integration/financial-authorization-audit.test.ts -t "fails closed when administrator demotion commits after the CSV snapshot and before role reauthorization"
+npm run test:integration -- tests/integration/financial-authorization-audit.test.ts
+npm run check
+npm run lint
+git diff --check
+```
+
+Expected: every command exits zero; the concurrent-demotion witness rejects with no
+bytes and zero audit, the ordinary export/audit contracts remain green, and the worktree
+contains only the four bounded paths.
+
+Stage and commit only the reviewed correction:
+
+```powershell
+git add src/lib/server/commerce/reporting/csv.ts src/lib/server/commerce/reporting/csv.test.ts tests/integration/financial-authorization-audit.test.ts docs/superpowers/plans/2026-08-20-backend-plan-6b-ii-admin-resolution-reporting-refresh.md
+git diff --cached --check
+git diff --cached --stat
+git diff --cached
+git commit -m "fix: address Plan 6B candidate review"
+```
+
+After this commit, rerun Task 17 Steps 7 and 8 in full against the new exact immutable
+HEAD, then repeat all three independent review lanes. Candidate navigation remains
+disabled throughout this correction. No dirty or merely staged correction may proceed
+to Step 10.

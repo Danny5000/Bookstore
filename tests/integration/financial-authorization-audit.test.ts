@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
+import { drizzle } from 'drizzle-orm/node-postgres';
+import type { PoolClient } from 'pg';
 import { describe, expect, it, vi } from 'vitest';
 import type {
   Actor,
@@ -45,6 +47,8 @@ import {
   listFinancialIssues
 } from '$lib/server/commerce/reporting/review';
 import { FINANCIAL_ADMIN_COMMAND_KINDS } from '$lib/types/financial-reporting';
+import type { Database } from '$lib/server/db/client';
+import * as schema from '$lib/server/db/schema';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
 import { databaseClient, ownerDatabaseClient } from './database';
 
@@ -569,6 +573,109 @@ async function installRejectingAuditTrigger(correlationId: string): Promise<() =
   };
 }
 
+function postgresCode(error: unknown): string | undefined {
+  let current = error;
+  for (let depth = 0; depth < 6; depth += 1) {
+    if (!current || typeof current !== 'object') return undefined;
+    const record = current as { readonly code?: unknown; readonly cause?: unknown };
+    if (typeof record.code === 'string') return record.code;
+    current = record.cause;
+  }
+  return undefined;
+}
+
+async function within<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  message: string
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  try {
+    return await Promise.race([operation, timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+async function waitForCsvRoleAdvisoryLock(input: {
+  readonly exporterPid: number;
+  readonly exporterApplicationName: string;
+  readonly demotionPid: number;
+}): Promise<void> {
+  for (let attempt = 0; attempt < 300; attempt += 1) {
+    const activity = await ownerDatabaseClient.pool.query<{
+      pid: number;
+      blockers: number[];
+      wait_event_type: string | null;
+      wait_event: string | null;
+      query: string;
+    }>(
+      `select pid, pg_catalog.pg_blocking_pids(pid) as blockers,
+              wait_event_type, wait_event, query
+       from pg_catalog.pg_stat_activity
+       where pid = $1 and application_name = $2`,
+      [input.exporterPid, input.exporterApplicationName]
+    );
+    const exporter = activity.rows[0];
+    if (
+      activity.rows.length === 1 &&
+      exporter?.wait_event_type === 'Lock' &&
+      exporter.wait_event === 'advisory' &&
+      exporter.blockers.length === 1 &&
+      exporter.blockers[0] === input.demotionPid
+    ) {
+      expect(exporter.query).toMatch(/pg_advisory_xact_lock/iu);
+      expect(exporter.blockers).toEqual([input.demotionPid]);
+      return;
+    }
+    await delay(10);
+  }
+  throw new Error('Timed out waiting for CSV export to reach the administrator advisory lock.');
+}
+
+interface DeletedAdministratorRole {
+  readonly user_id: string;
+  readonly role: 'admin';
+  readonly granted_at: string;
+  readonly granted_by_user_id: string | null;
+}
+
+async function restoreAdministratorRole(
+  owner: PoolClient,
+  role: DeletedAdministratorRole
+): Promise<void> {
+  await owner.query('begin');
+  try {
+    await owner.query(
+      `select pg_catalog.set_config('lock_timeout', '5s', true)`
+    );
+    await owner.query(
+      `select pg_catalog.pg_advisory_xact_lock(
+         pg_catalog.hashtext('pale-orbit:user-roles:admin')
+       )`
+    );
+    await owner.query(
+      `insert into user_roles (user_id, role, granted_at, granted_by_user_id)
+       values ($1, $2::application_role, $3::timestamptz, $4)`,
+      [role.user_id, role.role, role.granted_at, role.granted_by_user_id]
+    );
+    await owner.query('commit');
+  } catch (error) {
+    await owner.query('rollback').catch(() => undefined);
+    throw error;
+  }
+
+  const restored = await owner.query<DeletedAdministratorRole>(
+    `select user_id, role::text as role, granted_at::text as granted_at, granted_by_user_id
+     from user_roles where user_id = $1 and role = 'admin'`,
+    [role.user_id]
+  );
+  expect(restored.rows).toEqual([role]);
+}
+
 describe('financial service capability matrix', () => {
   it('authorizes every service before path, filter, preview, or private command parsing', async () => {
     const customer = await createUser('matrix-customer', 'customer');
@@ -612,6 +719,164 @@ describe('financial service capability matrix', () => {
 });
 
 describe('financial detail and export audit visibility', () => {
+  it('fails closed when administrator demotion commits after the CSV snapshot and before role reauthorization', async () => {
+    const fixture = await createFinancialFixture('csv-concurrent-demotion');
+    await createAdministrator('csv-concurrent-demotion-survivor');
+    const correlationId = token('financial_csv_concurrent_demotion');
+    const suffix = randomUUID().replaceAll('-', '');
+    const exporterApplicationName = `test-csv-exporter-${suffix}`;
+    const demoterApplicationName = `test-csv-demoter-${suffix}`;
+    const runtime = await databaseClient.pool.connect();
+    const demoter = await ownerDatabaseClient.pool.connect();
+    let demotionOpen = false;
+    let demotionCommitted = false;
+    let deletedRole: DeletedAdministratorRole | undefined;
+    let exportSettled = false;
+    let exportOutcome: Promise<
+      | { readonly status: 'resolved'; readonly rowCount: number }
+      | { readonly status: 'rejected'; readonly code: string | undefined }
+    > | undefined;
+    let primaryError: unknown;
+    let runtimeReleased = false;
+
+    try {
+      await runtime.query(
+        `select pg_catalog.set_config('application_name', $1, false)`,
+        [exporterApplicationName]
+      );
+      await runtime.query(
+        `select pg_catalog.set_config('lock_timeout', '5s', false)`
+      );
+      const exporterPidResult = await runtime.query<{ pid: number }>(
+        `select pg_catalog.pg_backend_pid() as pid`
+      );
+      const exporterPid = exporterPidResult.rows[0]?.pid;
+      if (typeof exporterPid !== 'number') throw new Error('Expected CSV exporter backend PID.');
+      const pinnedDatabase = drizzle({ client: runtime, schema }) as Database;
+
+      await demoter.query('begin');
+      demotionOpen = true;
+      await demoter.query(
+        `select pg_catalog.set_config('application_name', $1, true)`,
+        [demoterApplicationName]
+      );
+      const demotionPidResult = await demoter.query<{ pid: number }>(
+        `select pg_catalog.pg_backend_pid() as pid`
+      );
+      const demotionPid = demotionPidResult.rows[0]?.pid;
+      if (typeof demotionPid !== 'number') throw new Error('Expected role demotion backend PID.');
+      await demoter.query(
+        `select pg_catalog.pg_advisory_xact_lock(
+           pg_catalog.hashtext('pale-orbit:user-roles:admin')
+         )`
+      );
+      const deleted = await demoter.query<DeletedAdministratorRole>(
+        `delete from user_roles
+         where user_id = $1 and role = 'admin'
+         returning user_id, role::text as role,
+                   granted_at::text as granted_at, granted_by_user_id`,
+        [fixture.actor.id]
+      );
+      expect(deleted.rows).toHaveLength(1);
+      deletedRole = deleted.rows[0];
+
+      exportOutcome = exportSalesCsv(
+        pinnedDatabase,
+        fixture.actor,
+        fixture.filters,
+        { correlationId }
+      ).then(
+        (value) => ({ status: 'resolved' as const, rowCount: value.rowCount }),
+        (error: unknown) => ({ status: 'rejected' as const, code: postgresCode(error) })
+      );
+      void exportOutcome.then(() => { exportSettled = true; });
+
+      await waitForCsvRoleAdvisoryLock({
+        exporterPid,
+        exporterApplicationName,
+        demotionPid
+      });
+      expect(exportSettled).toBe(false);
+      expect(await auditCount(correlationId)).toBe(0);
+
+      await demoter.query('commit');
+      demotionOpen = false;
+      demotionCommitted = true;
+
+      const outcome = await within(
+        exportOutcome,
+        5_000,
+        'Timed out waiting for the CSV export after committing administrator demotion.'
+      );
+      expect.soft(outcome).toEqual({ status: 'rejected', code: '40001' });
+      expect.soft(await auditCount(correlationId)).toBe(0);
+      const persistedRoles = await ownerDatabaseClient.pool.query<{ role: string }>(
+        `select role::text as role from user_roles where user_id = $1 order by role`,
+        [fixture.actor.id]
+      );
+      expect(persistedRoles.rows).toEqual([]);
+    } catch (error) {
+      primaryError = error;
+    }
+
+    const cleanupErrors: unknown[] = [];
+    if (demotionOpen) {
+      try {
+        await demoter.query('rollback');
+        demotionOpen = false;
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    let exportJoined = exportOutcome === undefined;
+    if (exportOutcome !== undefined) {
+      try {
+        await within(
+          exportOutcome,
+          5_000,
+          'Timed out settling CSV export during concurrent-demotion cleanup.'
+        );
+        exportJoined = true;
+      } catch (error) {
+        cleanupErrors.push(error);
+        runtime.release(true);
+        runtimeReleased = true;
+        try {
+          await within(
+            exportOutcome,
+            5_000,
+            'Timed out settling CSV export after destroying its runtime connection.'
+          );
+          exportJoined = true;
+        } catch (settlementError) {
+          cleanupErrors.push(settlementError);
+        }
+      }
+    }
+    if (demotionCommitted && deletedRole !== undefined && exportJoined) {
+      try {
+        await restoreAdministratorRole(demoter, deletedRole);
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    } else if (demotionCommitted && deletedRole !== undefined) {
+      cleanupErrors.push(new Error(
+        'Skipped administrator-role restoration because the CSV exporter did not settle.'
+      ));
+    }
+    if (!runtimeReleased) runtime.release(true);
+    demoter.release(true);
+
+    const failures = [
+      ...(primaryError === undefined ? [] : [primaryError]),
+      ...cleanupErrors
+    ];
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(failures, 'Concurrent CSV-demotion test and cleanup failed.');
+    }
+  }, 30_000);
+
   it('leaves every list/filter/page unaudited and writes exactly one minimized audit per complete detail/export', async () => {
     const fixture = await createFinancialFixture('visibility');
 

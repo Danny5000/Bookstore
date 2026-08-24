@@ -9,6 +9,7 @@ import {
 } from '$lib/server/auth/admin-policy';
 import { listRolesForUser } from '$lib/server/auth/identity';
 import type { Database } from '$lib/server/db/client';
+import { userRoles } from '$lib/server/db/schema';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
 import type { SalesCsvRowDto } from '$lib/types/financial-reporting';
 import { SALES_CSV_ROW_DTO_KEYS } from '$lib/types/financial-reporting';
@@ -305,6 +306,16 @@ export async function exportSalesCsv(
     await transaction.execute(
       sql`select pg_advisory_xact_lock(hashtext('pale-orbit:user-roles:admin'))`
     );
+    assertBeforeDeadline(clock, deadline);
+
+    await setRemainingStatementTimeout(transaction, clock, deadline);
+    await transaction.execute(sql`
+      select ${userRoles.role}
+      from ${userRoles}
+      where ${userRoles.userId} = ${actor.id}
+        and ${userRoles.role} = ${'admin'}
+      for key share
+    `);
     assertBeforeDeadline(clock, deadline);
 
     await setRemainingStatementTimeout(transaction, clock, deadline);
