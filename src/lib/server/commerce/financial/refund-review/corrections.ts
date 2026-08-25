@@ -28,7 +28,7 @@ import {
   lockFinancialProjectionAuthority,
   lockFinancialProjectionEnrollment,
   type FinancialProjectionAuthority
-} from '$lib/server/commerce/financial/rebase';
+} from '$lib/server/commerce/financial/projection-authority';
 import * as refundFinancialProjection from '$lib/server/commerce/financial/sources/refund';
 import type {
   FinancialComponent,

@@ -27,8 +27,10 @@ vi.mock('$lib/server/auth/identity', async (importOriginal) => ({
 }));
 vi.mock('$lib/server/audit/service', () => ({ appendAuditEvent: collaborators.appendAudit }));
 vi.mock('$lib/server/commerce/lock', () => ({ lockOrder: collaborators.lockOrder }));
-vi.mock('$lib/server/commerce/financial/rebase', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('$lib/server/commerce/financial/rebase')>()),
+vi.mock('$lib/server/commerce/financial/projection-authority', async (importOriginal) => ({
+  ...(await importOriginal<
+    typeof import('$lib/server/commerce/financial/projection-authority')
+  >()),
   loadFinancialProjectionAuthority: collaborators.loadAuthority,
   lockFinancialProjectionAuthority: collaborators.lockAuthority,
   lockFinancialProjectionEnrollment: collaborators.lockEnrollment

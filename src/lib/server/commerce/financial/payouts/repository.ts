@@ -19,7 +19,7 @@ import {
 import { lockPayoutImportRows } from '../locks';
 import { observeFinancialIssue, resolveFinancialIssueAfterRecompute } from '../issues';
 import { enqueueCurrentAccountProjectionsForPayout } from '../ledger';
-import { lockFinancialProjectionEnrollment } from '../rebase';
+import { lockFinancialProjectionEnrollment } from '../projection-authority';
 import type { CurrentPayoutEvidence } from '../types';
 
 export interface StartPayoutImportInput {

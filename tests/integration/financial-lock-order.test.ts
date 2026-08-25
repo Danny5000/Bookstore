@@ -34,9 +34,10 @@ import {
   type FinancialProjectionLockInput
 } from '$lib/server/commerce/financial/locks';
 import {
-  lockFinancialProjectionAuthority,
   replayFinancialClassification
 } from '$lib/server/commerce/financial/rebase';
+import { lockFinancialProjectionAuthority } from
+  '$lib/server/commerce/financial/projection-authority';
 import { executeReportingCorrectionCreate } from
   '$lib/server/commerce/financial/refund-review/corrections';
 import {

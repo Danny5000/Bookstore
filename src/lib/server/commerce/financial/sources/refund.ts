@@ -57,7 +57,7 @@ import {
   rearmCurrentProjectionSubjectsForFinancialSources,
   stageBalanceTransaction
 } from '../ledger';
-import { lockFinancialProjectionEnrollment } from '../rebase';
+import { lockFinancialProjectionEnrollment } from '../projection-authority';
 import type {
   FinancialAllocationPlan,
   FinancialIssueCode,

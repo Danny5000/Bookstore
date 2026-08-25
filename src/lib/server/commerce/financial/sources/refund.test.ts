@@ -28,7 +28,7 @@ import {
   rearmCurrentProjectionSubjectsForFinancialSources,
   stageBalanceTransaction
 } from '../ledger';
-import { lockFinancialProjectionEnrollment } from '../rebase';
+import { lockFinancialProjectionEnrollment } from '../projection-authority';
 import { PermanentFinancialError } from '../errors';
 import {
   FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
@@ -53,7 +53,7 @@ vi.mock('../ledger', () => ({
   rearmCurrentProjectionSubjectsForFinancialSources: vi.fn(),
   stageBalanceTransaction: vi.fn()
 }));
-vi.mock('../rebase', () => ({ lockFinancialProjectionEnrollment: vi.fn() }));
+vi.mock('../projection-authority', () => ({ lockFinancialProjectionEnrollment: vi.fn() }));
 vi.mock('./payment', () => ({ lockCanonicalPaymentPurchaseFacts: vi.fn() }));
 vi.mock('$lib/server/commerce/lock', () => ({ lockOrder: vi.fn() }));
 vi.mock('$lib/server/commerce/reconciliation', () => ({ lockPaymentPurchaseFacts: vi.fn() }));

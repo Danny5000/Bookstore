@@ -16,7 +16,7 @@ import {
 import {
   lockFinancialProjectionAuthority,
   lockFinancialProjectionEnrollment
-} from '../rebase';
+} from '../projection-authority';
 import {
   createFinancialCompositeReplayScanJob,
   createFinancialHourlyScanJob,
