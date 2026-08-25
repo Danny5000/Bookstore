@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-24
 
-**Design status:** Written review pending — conversational direction approved
+**Design status:** Approved
 
 **Implementation status:** Not started
 
