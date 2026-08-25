@@ -1,5 +1,6 @@
 import { render } from 'svelte/server';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { PermanentCommerceError } from '$lib/server/commerce/errors';
 
 const dependencies = vi.hoisted(() => ({
   database: {},
@@ -68,6 +69,17 @@ describe('/claim request page', () => {
       await expect(submit(event('reader@example.com') as never))
         .resolves.toEqual({ sent: true });
     }
+  });
+
+  it('returns one bounded unavailable result when commerce rate limiting rejects', async () => {
+    dependencies.requestGuestClaimEmails.mockRejectedValueOnce(new PermanentCommerceError());
+
+    const result = await submit(event('private-reader@example.com') as never);
+
+    expect(result).toMatchObject({ status: 503, data: { unavailable: true } });
+    expect(JSON.stringify(result)).not.toMatch(
+      /private-reader|203\.0\.113\.41|PERMANENT_COMMERCE_FAILURE/iu
+    );
   });
 
   it.each([

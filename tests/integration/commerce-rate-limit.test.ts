@@ -4,13 +4,13 @@ import {
   cleanupExpiredRateLimits,
   consumeRateLimit,
   rateLimitScopeDigest
-} from '$lib/server/commerce/rate-limit';
+} from '$lib/server/security/rate-limit';
 import { applicationRateLimits } from '$lib/server/db/schema';
 import { databaseClient } from './database';
 
 const scope = (value: string): string => value.repeat(64).slice(0, 64);
 
-describe('application commerce rate limits', () => {
+describe('shared application rate limits', () => {
   it('allows the first N attempts, denies N+1 with bounded retry-after, and resets next window', async () => {
     const now = new Date('2026-08-10T12:00:00.000Z');
     const input = {
