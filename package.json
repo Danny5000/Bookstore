@@ -38,8 +38,9 @@
     "smoke:plan6b-fixture": "node --import tsx scripts/plan6b-fixture-runtime-probe.ts",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "lint": "eslint .",
-    "test": "vitest run",
-    "test:unit": "vitest run",
+    "test": "vitest run --config vitest.config.ts",
+    "test:unit": "vitest run --config vitest.config.ts",
+    "test:service": "vitest run --config vitest.service.config.ts",
     "test:integration:raw": "vitest run --config vitest.integration.config.ts",
     "test:integration": "tsx scripts/with-test-database.ts npm run test:integration:raw",
     "test:plan6b-upgrade": "tsx scripts/with-plan6b-upgrade-database.ts --phase-command tsx tests/integration/financial-migration.test.ts",
@@ -48,9 +49,9 @@
     "test:e2e:headed:raw": "playwright test --headed",
     "test:e2e:headed": "tsx scripts/with-test-database.ts --worker --bootstrap-admin npm run test:e2e:headed:raw",
     "test:e2e:install": "playwright install chromium",
-    "test:watch": "vitest",
+    "test:watch": "vitest --config vitest.config.ts",
     "test:database": "npm run test:integration && npm run test:e2e",
-    "verify": "npm run check && npm run lint && npm run test:unit && npm run test:database && npm run build"
+    "verify": "npm run check && npm run lint && npm run test:unit && npm run test:service && npm run test:database && npm run build"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

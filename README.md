@@ -51,6 +51,7 @@ Quality gates:
 npm run check
 npm run lint
 npm run test:unit
+npm run test:service
 npm run test:integration
 npm run test:e2e
 npm run build

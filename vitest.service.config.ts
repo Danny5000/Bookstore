@@ -5,8 +5,9 @@ export default defineConfig({
   plugins: [sveltekit()],
   test: {
     environment: 'node',
-    include: ['src/**/*.test.ts', 'scripts/**/*.test.ts'],
-    exclude: ['tests/service/**/*.test.ts'],
+    include: ['tests/service/financial-restore-witness.test.ts'],
+    fileParallelism: false,
+    maxWorkers: 1,
     clearMocks: true,
     restoreMocks: true
   }

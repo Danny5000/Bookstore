@@ -75,11 +75,13 @@ The long-running app and worker receive only their own database credentials. Com
 
 ## Tests
 
-Unit tests do not require Docker:
+`npm test`, `npm run test:unit`, and `npm run test:watch` are hermetic. They do not start Docker, PostgreSQL, browsers, network services, or the financial restore witness:
 
 ```powershell
 npm run test:unit
 ```
+
+`npm run test:service` runs the single Docker/PostgreSQL financial restore/commerce witness. That lane preserves the bounded supervisor, unique Compose-project and temporary-storage ownership, exact Compose-path and label checks, process-tree termination, and teardown absence proof. On Windows, invoke the service lane through npm because the direct Node supervisor requires the inherited `npm_execpath`.
 
 Integration and Playwright commands start a uniquely named PostgreSQL 18.4 Compose project, ask Docker for a random loopback port, apply committed migrations, run the requested tests, and remove the test containers, network, and tmpfs data:
 
@@ -89,6 +91,8 @@ npm run test:e2e
 npm run test:database
 npm run test:plan6b-upgrade
 ```
+
+`npm run test:database` does not include `npm run test:service`; integration and E2E keep their existing, uniquely disposable environments. The release gate remains `check -> lint -> unit -> service -> integration/E2E -> build`.
 
 `npm run verify` runs integration and browser suites in separate disposable Compose projects. Browser tests additionally start the real worker and bootstrap a test administrator so email delivery, ingestion, role authorization, commerce fulfillment/claims, customer downloads, and revision migration use production-shaped paths. The commerce harness uses a provider-neutral fixture only in `APP_ENV=test`, with provider secrets stripped from child environments; it exposes no application route that marks an order paid. Financial fixture tests exercise the same source, payout, scheduler, and classifier handlers without real Stripe credentials or network access. The harness creates a unique temporary local-storage root and removes only that verified path. Direct preserved-access fixtures reject non-loopback or non-test databases and exist only under `tests/e2e`; they are not production grant controls. The Plan 6B upgrade command uses its own uniquely identified disposable PostgreSQL Compose project to execute every supported prior-schema fixture through the committed migration.
 
