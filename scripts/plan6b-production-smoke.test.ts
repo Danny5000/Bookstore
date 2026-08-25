@@ -1,9 +1,14 @@
+import { createSocket, type Socket as DgramSocket } from 'node:dgram';
+import { randomInt } from 'node:crypto';
+import { once } from 'node:events';
 import { readFile, rm, stat } from 'node:fs/promises';
+import { createConnection, Server as TcpServer, type Socket as TcpSocket } from 'node:net';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import {
   executeProductionSmoke,
+  assertLoopbackPortAvailable,
   createProductionSmokeManifest,
   createProductionSmokeDockerOperations,
   parsePlan6bSmokeStage,
@@ -18,6 +23,51 @@ import {
   type ProductionSmokeCommandRuntime,
   type VerifiedProductionImageLease
 } from './plan6b-production-smoke';
+
+const UDP_TEST_PORT_ATTEMPTS = 16;
+
+function closeTestUdpSocket(socket: DgramSocket): Promise<void> {
+  return new Promise((resolveClosed, reject) => {
+    try {
+      socket.close(resolveClosed);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ERR_SOCKET_DGRAM_NOT_RUNNING') {
+        resolveClosed();
+        return;
+      }
+      reject(error as Error);
+    }
+  });
+}
+
+async function occupyAvailableUdpLoopbackPort(): Promise<{
+  readonly socket: DgramSocket;
+  readonly port: number;
+}> {
+  for (let attempt = 0; attempt < UDP_TEST_PORT_ATTEMPTS; attempt += 1) {
+    const port = randomInt(49_152, 65_536);
+    const socket = createSocket({ type: 'udp4', reuseAddr: false });
+    try {
+      await new Promise<void>((resolveBound, reject) => {
+        socket.once('error', reject);
+        socket.bind({ address: '127.0.0.1', port, exclusive: true }, () => {
+          socket.removeListener('error', reject);
+          resolveBound();
+        });
+      });
+      const address = socket.address();
+      if (typeof address === 'string' || address.port !== port) {
+        await closeTestUdpSocket(socket);
+        continue;
+      }
+      await assertLoopbackPortAvailable('127.0.0.1', port);
+      return { socket, port };
+    } catch {
+      await closeTestUdpSocket(socket);
+    }
+  }
+  throw new Error('could not occupy a safe UDP loopback port for the test');
+}
 
 function manifest(): ProductionSmokeManifest {
   const runId = '0123456789abcdef';
@@ -160,6 +210,103 @@ describe('Plan 6B production smoke ownership', () => {
       (value: ProductionSmokeManifest) => ({ ...value, httpPort: 80 }),
       (value: ProductionSmokeManifest) => ({ ...value, httpsPort: value.httpPort })
     ]) expect(() => validateProductionSmokeManifest(mutate(manifest()))).toThrow();
+  });
+
+  it('requires UDP availability only when explicitly requested', async () => {
+    const occupied = await occupyAvailableUdpLoopbackPort();
+    try {
+      await expect(assertLoopbackPortAvailable('127.0.0.1', occupied.port)).resolves.toBeUndefined();
+      await expect(
+        assertLoopbackPortAvailable('127.0.0.1', occupied.port, true)
+      ).rejects.toThrow('[plan6b-smoke] reserved loopback port is no longer available');
+    } finally {
+      await closeTestUdpSocket(occupied.socket);
+    }
+  });
+
+  it('settles a TCP availability probe after an incidental client connects', async () => {
+    const occupied = await occupyAvailableUdpLoopbackPort();
+    const clients = new Set<TcpSocket>();
+    let resolveClient: ((client: TcpSocket) => void) | undefined;
+    const clientCreated = new Promise<TcpSocket>((resolveCreated) => {
+      resolveClient = resolveCreated;
+    });
+    const originalClose = TcpServer.prototype.close;
+    const closeSpy = vi.spyOn(TcpServer.prototype, 'close').mockImplementation(function (
+      this: TcpServer,
+      callback?: (error?: Error) => void
+    ) {
+      const address = this.address();
+      if (!address || typeof address === 'string') {
+        Reflect.apply(originalClose, this, [callback]);
+        return this;
+      }
+      const client = createConnection({ host: '127.0.0.1', port: address.port });
+      clients.add(client);
+      resolveClient?.(client);
+      let closeStarted = false;
+      const startClose = () => {
+        if (closeStarted) return;
+        closeStarted = true;
+        Reflect.apply(originalClose, this, [callback]);
+      };
+      client.once('connect', startClose);
+      client.once('error', startClose);
+      client.once('close', () => clients.delete(client));
+      return this;
+    });
+    const probe = assertLoopbackPortAvailable('127.0.0.1', occupied.port);
+    onTestFinished(async () => {
+      closeSpy.mockRestore();
+      for (const client of clients) client.destroy();
+      try {
+        await probe;
+      } finally {
+        await closeTestUdpSocket(occupied.socket);
+      }
+    });
+
+    const client = await clientCreated;
+    const connected = once(client, 'connect');
+    const closed = once(client, 'close');
+    await connected;
+    await closed;
+    await probe;
+  }, 2_000);
+
+  it('revalidates HTTP over TCP and HTTPS over both TCP and UDP in order', async () => {
+    const owned = manifest();
+    const assertPortAvailable = vi.fn(async () => undefined);
+    const docker = createProductionSmokeDockerOperations(owned, {
+      command: {
+        run: vi.fn(async () => undefined),
+        capture: vi.fn(async () => ({ status: 0, stdout: '' }))
+      },
+      environment: { PATH: 'safe-path' },
+      assertPortAvailable,
+      requestStatus: vi.fn(async () => 503),
+      wait: vi.fn(async () => undefined)
+    });
+
+    await docker.revalidatePorts(owned);
+
+    expect(assertPortAvailable.mock.calls).toEqual([
+      [owned.httpHost, owned.httpPort, false],
+      [owned.httpsHost, owned.httpsPort, true]
+    ]);
+  });
+
+  it('allocates a manifest HTTPS port available to both TCP and UDP', async () => {
+    const owned = await createProductionSmokeManifest('6b-ii');
+    try {
+      expect(owned.httpsPort).toBeGreaterThanOrEqual(49_152);
+      expect(owned.httpsPort).toBeLessThanOrEqual(65_535);
+      await expect(
+        assertLoopbackPortAvailable(owned.httpsHost, owned.httpsPort, true)
+      ).resolves.toBeUndefined();
+    } finally {
+      await rm(owned.tempDirectory, { recursive: true, force: true });
+    }
   });
 
   it('renders only loopback host publication with the exact unique image and ownership labels', () => {
