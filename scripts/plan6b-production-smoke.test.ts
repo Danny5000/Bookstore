@@ -1,16 +1,13 @@
-import { createSocket, type Socket as DgramSocket } from 'node:dgram';
-import { randomInt } from 'node:crypto';
-import { once } from 'node:events';
 import { readFile, rm, stat } from 'node:fs/promises';
-import { createConnection, Server as TcpServer, type Socket as TcpSocket } from 'node:net';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { describe, expect, it, onTestFinished, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  executeProductionSmoke,
   assertLoopbackPortAvailable,
+  executeProductionSmoke,
   createProductionSmokeManifest,
   createProductionSmokeDockerOperations,
+  createProductionSmokePortOperations,
   parsePlan6bSmokeStage,
   renderProductionSmokeOverride,
   runProductionSmoke,
@@ -21,53 +18,431 @@ import {
   type ProductionSmokeManifest,
   type ProductionSmokeOperations,
   type ProductionSmokeCommandRuntime,
+  type ProductionSmokePortOperations,
+  type ProductionSmokePortRuntime,
   type VerifiedProductionImageLease
 } from './plan6b-production-smoke';
 
-const UDP_TEST_PORT_ATTEMPTS = 16;
+type TcpConnectionHandler = (socket: { destroy(): void }) => void;
+type TcpServerFactory = (handler: TcpConnectionHandler | undefined) => unknown;
+type UdpSocketFactory = (options: unknown) => unknown;
 
-function closeTestUdpSocket(socket: DgramSocket): Promise<void> {
-  return new Promise((resolveClosed, reject) => {
-    try {
-      socket.close(resolveClosed);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ERR_SOCKET_DGRAM_NOT_RUNNING') {
-        resolveClosed();
-        return;
+const socketAdapterTraps = vi.hoisted(() => {
+  const state = {
+    tcpFactory: undefined as TcpServerFactory | undefined,
+    udpFactory: undefined as UdpSocketFactory | undefined,
+    expectedTcpCalls: 0,
+    expectedUdpCalls: 0,
+    unexpectedCalls: [] as string[]
+  };
+  return {
+    state,
+    createServer: vi.fn((handler?: TcpConnectionHandler) => {
+      if (!state.tcpFactory) {
+        state.unexpectedCalls.push('node:net.createServer');
+        throw new Error('unexpected default TCP socket adapter use');
       }
-      reject(error as Error);
-    }
-  });
+      return state.tcpFactory(handler);
+    }),
+    createSocket: vi.fn((options: unknown) => {
+      if (!state.udpFactory) {
+        state.unexpectedCalls.push('node:dgram.createSocket');
+        throw new Error('unexpected default UDP socket adapter use');
+      }
+      return state.udpFactory(options);
+    })
+  };
+});
+
+vi.mock('node:net', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:net')>();
+  const createServer = socketAdapterTraps.createServer as unknown as typeof actual.createServer;
+  return {
+    ...actual,
+    createServer,
+    default: { ...actual.default, createServer }
+  };
+});
+
+vi.mock('node:dgram', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:dgram')>();
+  const createSocket = socketAdapterTraps.createSocket as unknown as typeof actual.createSocket;
+  return {
+    ...actual,
+    createSocket,
+    default: { ...actual.default, createSocket }
+  };
+});
+
+beforeEach(() => {
+  socketAdapterTraps.state.tcpFactory = undefined;
+  socketAdapterTraps.state.udpFactory = undefined;
+  socketAdapterTraps.state.expectedTcpCalls = 0;
+  socketAdapterTraps.state.expectedUdpCalls = 0;
+  socketAdapterTraps.state.unexpectedCalls.length = 0;
+  socketAdapterTraps.createServer.mockClear();
+  socketAdapterTraps.createSocket.mockClear();
+});
+
+afterEach(() => {
+  expect(socketAdapterTraps.state.unexpectedCalls).toEqual([]);
+  expect(socketAdapterTraps.createServer).toHaveBeenCalledTimes(
+    socketAdapterTraps.state.expectedTcpCalls
+  );
+  expect(socketAdapterTraps.createSocket).toHaveBeenCalledTimes(
+    socketAdapterTraps.state.expectedUdpCalls
+  );
+});
+
+type FakePortLeaseOutcome = number | 'conflict';
+
+interface FakePortRuntimeOptions {
+  readonly randomPorts?: readonly number[];
+  readonly tcpOutcomes: readonly FakePortLeaseOutcome[];
+  readonly udpOutcomes?: readonly FakePortLeaseOutcome[];
+  readonly closeFailures?: readonly string[];
 }
 
-async function occupyAvailableUdpLoopbackPort(): Promise<{
-  readonly socket: DgramSocket;
-  readonly port: number;
-}> {
-  for (let attempt = 0; attempt < UDP_TEST_PORT_ATTEMPTS; attempt += 1) {
-    const port = randomInt(49_152, 65_536);
-    const socket = createSocket({ type: 'udp4', reuseAddr: false });
-    try {
-      await new Promise<void>((resolveBound, reject) => {
-        socket.once('error', reject);
-        socket.bind({ address: '127.0.0.1', port, exclusive: true }, () => {
-          socket.removeListener('error', reject);
-          resolveBound();
-        });
-      });
-      const address = socket.address();
-      if (typeof address === 'string' || address.port !== port) {
-        await closeTestUdpSocket(socket);
-        continue;
-      }
-      await assertLoopbackPortAvailable('127.0.0.1', port);
-      return { socket, port };
-    } catch {
-      await closeTestUdpSocket(socket);
+function createFakePortRuntime(options: FakePortRuntimeOptions): {
+  readonly operations: ProductionSmokePortOperations;
+  readonly runtime: ProductionSmokePortRuntime;
+  readonly trace: string[];
+} {
+  const randomPorts = [...(options.randomPorts ?? [])];
+  const tcpOutcomes = [...options.tcpOutcomes];
+  const udpOutcomes = [...(options.udpOutcomes ?? [])];
+  const closeFailures = new Set(options.closeFailures ?? []);
+  const trace: string[] = [];
+
+  const lease = async (
+    protocol: 'tcp' | 'udp',
+    requestedPort: number,
+    outcomes: FakePortLeaseOutcome[]
+  ) => {
+    const outcome = outcomes.shift();
+    if (outcome === undefined) throw new Error(`unexpected ${protocol} lease`);
+    if (outcome === 'conflict') {
+      trace.push(`${protocol}:conflict:${requestedPort}`);
+      throw new Error(`${protocol} conflict`);
     }
+    trace.push(`${protocol}:open:${requestedPort}:${outcome}`);
+    return {
+      port: outcome,
+      async close() {
+        trace.push(`${protocol}:close:${outcome}`);
+        if (closeFailures.has(`${protocol}:${outcome}`)) {
+          throw new Error(`${protocol} close failure`);
+        }
+      }
+    };
+  };
+
+  const runtime: ProductionSmokePortRuntime = {
+    randomInteger: vi.fn((minimum, maximumExclusive) => {
+      const port = randomPorts.shift();
+      if (port === undefined) throw new Error('unexpected random port request');
+      trace.push(`random:${minimum}:${maximumExclusive}:${port}`);
+      return port;
+    }),
+    leaseTcpLoopback: vi.fn((port) => lease('tcp', port, tcpOutcomes)),
+    leaseUdpLoopback: vi.fn((port) => lease('udp', port, udpOutcomes))
+  };
+  return {
+    operations: createProductionSmokePortOperations(runtime),
+    runtime,
+    trace
+  };
+}
+
+function deterministicPortOperations(): ProductionSmokePortOperations {
+  return createFakePortRuntime({
+    randomPorts: [49_153],
+    tcpOutcomes: [49_152, 49_153],
+    udpOutcomes: [49_153]
+  }).operations;
+}
+
+interface AllocationCase {
+  readonly name: string;
+  readonly options: FakePortRuntimeOptions;
+  readonly requireUdp: boolean;
+  readonly excludedPort?: number;
+  readonly expectedPort?: number;
+  readonly expectedError?: string;
+  readonly trace: readonly string[];
+}
+
+const allocationCases = [
+  {
+    name: 'leases TCP only for HTTP success',
+    options: { tcpOutcomes: [49_152] },
+    requireUdp: false,
+    expectedPort: 49_152,
+    trace: ['tcp:open:0:49152', 'tcp:close:49152']
+  },
+  {
+    name: 'leases distinct TCP and UDP identities for HTTPS success',
+    options: {
+      randomPorts: [49_152, 49_153],
+      tcpOutcomes: [49_153],
+      udpOutcomes: [49_153]
+    },
+    requireUdp: true,
+    excludedPort: 49_152,
+    expectedPort: 49_153,
+    trace: [
+      'random:49152:65536:49152',
+      'random:49152:65536:49153',
+      'tcp:open:49153:49153',
+      'udp:open:49153:49153',
+      'udp:close:49153',
+      'tcp:close:49153'
+    ]
+  },
+  {
+    name: 'retries after partial TCP acquisition',
+    options: {
+      randomPorts: [50_001, 50_002],
+      tcpOutcomes: ['conflict', 50_002],
+      udpOutcomes: [50_002]
+    },
+    requireUdp: true,
+    expectedPort: 50_002,
+    trace: [
+      'random:49152:65536:50001',
+      'tcp:conflict:50001',
+      'random:49152:65536:50002',
+      'tcp:open:50002:50002',
+      'udp:open:50002:50002',
+      'udp:close:50002',
+      'tcp:close:50002'
+    ]
+  },
+  {
+    name: 'retries after partial UDP acquisition and closes TCP',
+    options: {
+      randomPorts: [50_003, 50_004],
+      tcpOutcomes: [50_003, 50_004],
+      udpOutcomes: ['conflict', 50_004]
+    },
+    requireUdp: true,
+    expectedPort: 50_004,
+    trace: [
+      'random:49152:65536:50003',
+      'tcp:open:50003:50003',
+      'udp:conflict:50003',
+      'tcp:close:50003',
+      'random:49152:65536:50004',
+      'tcp:open:50004:50004',
+      'udp:open:50004:50004',
+      'udp:close:50004',
+      'tcp:close:50004'
+    ]
+  },
+  {
+    name: 'retries a nonzero TCP lease with a mismatched identity',
+    options: {
+      randomPorts: [50_005, 50_006],
+      tcpOutcomes: [50_007, 50_006],
+      udpOutcomes: [50_006]
+    },
+    requireUdp: true,
+    expectedPort: 50_006,
+    trace: [
+      'random:49152:65536:50005',
+      'tcp:open:50005:50007',
+      'tcp:close:50007',
+      'random:49152:65536:50006',
+      'tcp:open:50006:50006',
+      'udp:open:50006:50006',
+      'udp:close:50006',
+      'tcp:close:50006'
+    ]
+  },
+  {
+    name: 'retries a UDP lease with a mismatched TCP identity',
+    options: {
+      randomPorts: [50_008, 50_009],
+      tcpOutcomes: [50_008, 50_009],
+      udpOutcomes: [50_010, 50_009]
+    },
+    requireUdp: true,
+    expectedPort: 50_009,
+    trace: [
+      'random:49152:65536:50008',
+      'tcp:open:50008:50008',
+      'udp:open:50008:50010',
+      'udp:close:50010',
+      'tcp:close:50008',
+      'random:49152:65536:50009',
+      'tcp:open:50009:50009',
+      'udp:open:50009:50009',
+      'udp:close:50009',
+      'tcp:close:50009'
+    ]
+  },
+  {
+    name: 'retries an unsafe TCP lease identity',
+    options: {
+      randomPorts: [50_011, 50_012],
+      tcpOutcomes: [80, 50_012],
+      udpOutcomes: [50_012]
+    },
+    requireUdp: true,
+    expectedPort: 50_012,
+    trace: [
+      'random:49152:65536:50011',
+      'tcp:open:50011:80',
+      'tcp:close:80',
+      'random:49152:65536:50012',
+      'tcp:open:50012:50012',
+      'udp:open:50012:50012',
+      'udp:close:50012',
+      'tcp:close:50012'
+    ]
+  },
+  {
+    name: 'fails closed on TCP cleanup failure',
+    options: { tcpOutcomes: [52_000], closeFailures: ['tcp:52000'] },
+    requireUdp: false,
+    expectedError: '[plan6b-smoke] loopback TCP socket cleanup failed',
+    trace: ['tcp:open:0:52000', 'tcp:close:52000']
+  },
+  {
+    name: 'fails closed on UDP cleanup failure and still closes TCP',
+    options: {
+      randomPorts: [52_001],
+      tcpOutcomes: [52_001],
+      udpOutcomes: [52_001],
+      closeFailures: ['udp:52001']
+    },
+    requireUdp: true,
+    expectedError: '[plan6b-smoke] loopback UDP socket cleanup failed',
+    trace: [
+      'random:49152:65536:52001',
+      'tcp:open:52001:52001',
+      'udp:open:52001:52001',
+      'udp:close:52001',
+      'tcp:close:52001'
+    ]
   }
-  throw new Error('could not occupy a safe UDP loopback port for the test');
+] satisfies readonly AllocationCase[];
+
+interface ProbeCase {
+  readonly name: string;
+  readonly port: number;
+  readonly requireUdp: boolean;
+  readonly options: FakePortRuntimeOptions;
+  readonly expectedError?: string;
+  readonly trace: readonly string[];
 }
+
+const unavailablePortError = '[plan6b-smoke] reserved loopback port is no longer available';
+const probeCleanupError = '[plan6b-smoke] loopback port check failed';
+const probeCases = [
+  {
+    name: 'accepts an exact TCP-only lease',
+    port: 51_000,
+    requireUdp: false,
+    options: { tcpOutcomes: [51_000] },
+    trace: ['tcp:open:51000:51000', 'tcp:close:51000']
+  },
+  {
+    name: 'accepts exact TCP and UDP leases',
+    port: 51_001,
+    requireUdp: true,
+    options: { tcpOutcomes: [51_001], udpOutcomes: [51_001] },
+    trace: [
+      'tcp:open:51001:51001',
+      'udp:open:51001:51001',
+      'udp:close:51001',
+      'tcp:close:51001'
+    ]
+  },
+  {
+    name: 'rejects partial TCP acquisition',
+    port: 51_002,
+    requireUdp: false,
+    options: { tcpOutcomes: ['conflict'] },
+    expectedError: unavailablePortError,
+    trace: ['tcp:conflict:51002']
+  },
+  {
+    name: 'rejects partial UDP acquisition and closes TCP',
+    port: 51_003,
+    requireUdp: true,
+    options: { tcpOutcomes: [51_003], udpOutcomes: ['conflict'] },
+    expectedError: unavailablePortError,
+    trace: ['tcp:open:51003:51003', 'udp:conflict:51003', 'tcp:close:51003']
+  },
+  {
+    name: 'rejects an unsafe TCP lease identity',
+    port: 51_004,
+    requireUdp: false,
+    options: { tcpOutcomes: [80] },
+    expectedError: unavailablePortError,
+    trace: ['tcp:open:51004:80', 'tcp:close:80']
+  },
+  {
+    name: 'rejects a mismatched TCP lease identity',
+    port: 51_005,
+    requireUdp: false,
+    options: { tcpOutcomes: [51_006] },
+    expectedError: unavailablePortError,
+    trace: ['tcp:open:51005:51006', 'tcp:close:51006']
+  },
+  {
+    name: 'rejects an unsafe UDP lease identity and closes both leases',
+    port: 51_007,
+    requireUdp: true,
+    options: { tcpOutcomes: [51_007], udpOutcomes: [80] },
+    expectedError: unavailablePortError,
+    trace: [
+      'tcp:open:51007:51007',
+      'udp:open:51007:80',
+      'udp:close:80',
+      'tcp:close:51007'
+    ]
+  },
+  {
+    name: 'rejects a mismatched UDP lease identity and closes both leases',
+    port: 51_008,
+    requireUdp: true,
+    options: { tcpOutcomes: [51_008], udpOutcomes: [51_009] },
+    expectedError: unavailablePortError,
+    trace: [
+      'tcp:open:51008:51008',
+      'udp:open:51008:51009',
+      'udp:close:51009',
+      'tcp:close:51008'
+    ]
+  },
+  {
+    name: 'fails closed on TCP probe cleanup failure',
+    port: 51_010,
+    requireUdp: false,
+    options: { tcpOutcomes: [51_010], closeFailures: ['tcp:51010'] },
+    expectedError: probeCleanupError,
+    trace: ['tcp:open:51010:51010', 'tcp:close:51010']
+  },
+  {
+    name: 'fails closed on UDP probe cleanup failure and still closes TCP',
+    port: 51_011,
+    requireUdp: true,
+    options: {
+      tcpOutcomes: [51_011],
+      udpOutcomes: [51_011],
+      closeFailures: ['udp:51011']
+    },
+    expectedError: probeCleanupError,
+    trace: [
+      'tcp:open:51011:51011',
+      'udp:open:51011:51011',
+      'udp:close:51011',
+      'tcp:close:51011'
+    ]
+  }
+] satisfies readonly ProbeCase[];
 
 function manifest(): ProductionSmokeManifest {
   const runId = '0123456789abcdef';
@@ -212,67 +587,79 @@ describe('Plan 6B production smoke ownership', () => {
     ]) expect(() => validateProductionSmokeManifest(mutate(manifest()))).toThrow();
   });
 
-  it('requires UDP availability only when explicitly requested', async () => {
-    const occupied = await occupyAvailableUdpLoopbackPort();
-    try {
-      await expect(assertLoopbackPortAvailable('127.0.0.1', occupied.port)).resolves.toBeUndefined();
-      await expect(
-        assertLoopbackPortAvailable('127.0.0.1', occupied.port, true)
-      ).rejects.toThrow('[plan6b-smoke] reserved loopback port is no longer available');
-    } finally {
-      await closeTestUdpSocket(occupied.socket);
-    }
+  it('destroys accepted TCP connections through the trapped default adapter', async () => {
+    let connectionHandler: TcpConnectionHandler | undefined;
+    const server = {
+      once: vi.fn(() => server),
+      listen: vi.fn((_options: unknown, listening: () => void) => {
+        listening();
+        return server;
+      }),
+      removeListener: vi.fn(() => server),
+      address: vi.fn(() => ({ address: '127.0.0.1', family: 'IPv4', port: 51_500 })),
+      close: vi.fn((closed: (error?: Error) => void) => {
+        closed();
+        return server;
+      })
+    };
+    socketAdapterTraps.state.tcpFactory = (handler) => {
+      connectionHandler = handler;
+      return server;
+    };
+    socketAdapterTraps.state.expectedTcpCalls = 1;
+
+    await expect(
+      assertLoopbackPortAvailable('127.0.0.1', 51_500)
+    ).resolves.toBeUndefined();
+    expect(socketAdapterTraps.createSocket).not.toHaveBeenCalled();
+    expect(connectionHandler).toBeTypeOf('function');
+
+    const acceptedSocket = { destroy: vi.fn() };
+    connectionHandler?.(acceptedSocket);
+    expect(acceptedSocket.destroy).toHaveBeenCalledOnce();
   });
 
-  it('settles a TCP availability probe after an incidental client connects', async () => {
-    const occupied = await occupyAvailableUdpLoopbackPort();
-    const clients = new Set<TcpSocket>();
-    let resolveClient: ((client: TcpSocket) => void) | undefined;
-    const clientCreated = new Promise<TcpSocket>((resolveCreated) => {
-      resolveClient = resolveCreated;
-    });
-    const originalClose = TcpServer.prototype.close;
-    const closeSpy = vi.spyOn(TcpServer.prototype, 'close').mockImplementation(function (
-      this: TcpServer,
-      callback?: (error?: Error) => void
-    ) {
-      const address = this.address();
-      if (!address || typeof address === 'string') {
-        Reflect.apply(originalClose, this, [callback]);
-        return this;
-      }
-      const client = createConnection({ host: '127.0.0.1', port: address.port });
-      clients.add(client);
-      resolveClient?.(client);
-      let closeStarted = false;
-      const startClose = () => {
-        if (closeStarted) return;
-        closeStarted = true;
-        Reflect.apply(originalClose, this, [callback]);
-      };
-      client.once('connect', startClose);
-      client.once('error', startClose);
-      client.once('close', () => clients.delete(client));
-      return this;
-    });
-    const probe = assertLoopbackPortAvailable('127.0.0.1', occupied.port);
-    onTestFinished(async () => {
-      closeSpy.mockRestore();
-      for (const client of clients) client.destroy();
-      try {
-        await probe;
-      } finally {
-        await closeTestUdpSocket(occupied.socket);
-      }
+  it.each(allocationCases)('$name', async ({
+    options, requireUdp, excludedPort, expectedPort, expectedError, trace
+  }) => {
+    const fake = createFakePortRuntime(options);
+    const allocation = fake.operations.allocateLoopbackPort(requireUdp, excludedPort);
+
+    if (expectedError) {
+      await expect(allocation).rejects.toThrow(expectedError);
+    } else {
+      await expect(allocation).resolves.toBe(expectedPort);
+    }
+    expect(fake.trace).toEqual(trace);
+  });
+
+  it.each(probeCases)('$name', async ({
+    port, requireUdp, options, expectedError, trace
+  }) => {
+    const fake = createFakePortRuntime(options);
+    const probe = fake.operations.probeLoopbackPort('127.0.0.1', port, requireUdp);
+
+    if (expectedError) {
+      await expect(probe).rejects.toThrow(expectedError);
+    } else {
+      await expect(probe).resolves.toBeUndefined();
+    }
+    expect(fake.trace).toEqual(trace);
+  });
+
+  it('bounds randomized TCP and UDP allocation attempts', async () => {
+    const fake = createFakePortRuntime({
+      randomPorts: Array.from({ length: 32 }, (_, index) => 53_000 + index),
+      tcpOutcomes: Array.from({ length: 32 }, () => 'conflict' as const)
     });
 
-    const client = await clientCreated;
-    const connected = once(client, 'connect');
-    const closed = once(client, 'close');
-    await connected;
-    await closed;
-    await probe;
-  }, 2_000);
+    await expect(fake.operations.allocateLoopbackPort(true)).rejects.toThrow(
+      '[plan6b-smoke] failed to reserve an ephemeral TCP and UDP loopback port'
+    );
+    expect(fake.runtime.randomInteger).toHaveBeenCalledTimes(32);
+    expect(fake.runtime.leaseTcpLoopback).toHaveBeenCalledTimes(32);
+    expect(fake.runtime.leaseUdpLoopback).not.toHaveBeenCalled();
+  });
 
   it('revalidates HTTP over TCP and HTTPS over both TCP and UDP in order', async () => {
     const owned = manifest();
@@ -296,14 +683,19 @@ describe('Plan 6B production smoke ownership', () => {
     ]);
   });
 
-  it('allocates a manifest HTTPS port available to both TCP and UDP', async () => {
-    const owned = await createProductionSmokeManifest('6b-ii');
+  it('allocates manifest HTTP over TCP and HTTPS over both TCP and UDP', async () => {
+    const fake = createFakePortRuntime({
+      randomPorts: [54_001],
+      tcpOutcomes: [54_000, 54_001],
+      udpOutcomes: [54_001]
+    });
+    const owned = await createProductionSmokeManifest('6b-ii', fake.operations);
     try {
-      expect(owned.httpsPort).toBeGreaterThanOrEqual(49_152);
-      expect(owned.httpsPort).toBeLessThanOrEqual(65_535);
-      await expect(
-        assertLoopbackPortAvailable(owned.httpsHost, owned.httpsPort, true)
-      ).resolves.toBeUndefined();
+      expect({ httpPort: owned.httpPort, httpsPort: owned.httpsPort }).toEqual({
+        httpPort: 54_000,
+        httpsPort: 54_001
+      });
+      expect(fake.runtime.leaseUdpLoopback).toHaveBeenCalledExactlyOnceWith(54_001);
     } finally {
       await rm(owned.tempDirectory, { recursive: true, force: true });
     }
@@ -660,7 +1052,7 @@ describe('Plan 6B production smoke ownership', () => {
   });
 
   it('materializes a private cleanup database secret with the owned smoke manifest', async () => {
-    const owned = await createProductionSmokeManifest('6b-ii');
+    const owned = await createProductionSmokeManifest('6b-ii', deterministicPortOperations());
     try {
       await expect(readFile(
         join(owned.secretDirectory, 'database_storage_cleanup_password'),
@@ -787,7 +1179,7 @@ describe('Plan 6B production smoke ownership', () => {
   });
 
   it('never removes a pre-existing image tag after refusing its collision', async () => {
-    const owned = await createProductionSmokeManifest('6b-ii');
+    const owned = await createProductionSmokeManifest('6b-ii', deterministicPortOperations());
     const calls: string[][] = [];
     const imageId = `sha256:${'a'.repeat(64)}`;
     const command: ProductionSmokeCommandRuntime = {
@@ -1059,7 +1451,7 @@ describe('Plan 6B production smoke ownership', () => {
   });
 
   it('removes and verifies only the exact owned production image tag', async () => {
-    const owned = await createProductionSmokeManifest('6b-ii');
+    const owned = await createProductionSmokeManifest('6b-ii', deterministicPortOperations());
     let imagePresent = false;
     const imageInventories: string[][] = [];
     const command: ProductionSmokeCommandRuntime = {
@@ -1109,7 +1501,7 @@ describe('Plan 6B production smoke ownership', () => {
   });
 
   it('fails cleanup when Compose down succeeds but an owned volume remains', async () => {
-    const owned = await createProductionSmokeManifest('6b-ii');
+    const owned = await createProductionSmokeManifest('6b-ii', deterministicPortOperations());
     const volumeId = 'plan6b-owned-volume';
     let downCalled = false;
     const labels = {
@@ -1150,7 +1542,7 @@ describe('Plan 6B production smoke ownership', () => {
   });
 
   it('refuses cleanup before Compose down when an exact-name volume has a foreign stage', async () => {
-    const owned = await createProductionSmokeManifest('6b-ii');
+    const owned = await createProductionSmokeManifest('6b-ii', deterministicPortOperations());
     const exactVolumeName = `${owned.project}_postgres_data`;
     let downCalled = false;
     const command: ProductionSmokeCommandRuntime = {

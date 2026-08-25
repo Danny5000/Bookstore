@@ -127,6 +127,26 @@ export interface ProductionSmokeRunDependencies {
   ) => void;
 }
 
+export interface ProductionSmokePortLease {
+  readonly port: number;
+  close(): Promise<void>;
+}
+
+export interface ProductionSmokePortRuntime {
+  readonly randomInteger: (minimum: number, maximumExclusive: number) => number;
+  readonly leaseTcpLoopback: (port: number) => Promise<ProductionSmokePortLease>;
+  readonly leaseUdpLoopback: (port: number) => Promise<ProductionSmokePortLease>;
+}
+
+export interface ProductionSmokePortOperations {
+  allocateLoopbackPort(requireUdp?: boolean, excludedPort?: number): Promise<number>;
+  probeLoopbackPort(
+    host: '127.0.0.1',
+    port: number,
+    requireUdp?: boolean
+  ): Promise<void>;
+}
+
 const PLAN6B_SMOKE_STAGE: Plan6bSmokeStage = '6b-ii';
 const RUN_PREFIX = `pale-orbit-plan6b-${PLAN6B_SMOKE_STAGE}-smoke-`;
 const IMAGE_TAG_PREFIX = `pale-orbit:plan6b-${PLAN6B_SMOKE_STAGE}-smoke-`;
@@ -1242,34 +1262,32 @@ const LOOPBACK_PORT_RESERVATION_ATTEMPTS = 32;
 const EPHEMERAL_PORT_MIN = 49_152;
 const EPHEMERAL_PORT_MAX_EXCLUSIVE = 65_536;
 
-function listenExclusiveTcpLoopback(port: number, errorMessage: string): Promise<TcpServer> {
-  return new Promise((resolveServer, reject) => {
+function leaseExclusiveTcpLoopback(port: number): Promise<ProductionSmokePortLease> {
+  return new Promise((resolveLease, reject) => {
     const server = createServer((socket) => socket.destroy());
-    const rejectUnavailable = () => reject(smokeError(errorMessage));
+    const rejectUnavailable = (error: Error) => reject(error);
     server.once('error', rejectUnavailable);
     server.listen({ host: '127.0.0.1', port, exclusive: true }, () => {
       server.removeListener('error', rejectUnavailable);
-      resolveServer(server);
+      const address = server.address();
+      resolveLease({
+        port: address && typeof address !== 'string' ? address.port : 0,
+        close: () => closeTcpServer(server)
+      });
     });
   });
 }
 
-function closeTcpServer(
-  server: TcpServer,
-  errorMessage = 'loopback TCP socket cleanup failed'
-): Promise<void> {
+function closeTcpServer(server: TcpServer): Promise<void> {
   return new Promise((resolveClosed, reject) => {
     server.close((error) => {
-      if (error) return reject(smokeError(errorMessage));
+      if (error) return reject(error);
       resolveClosed();
     });
   });
 }
 
-function closeUdpSocket(
-  socket: DgramSocket,
-  errorMessage = 'loopback UDP socket cleanup failed'
-): Promise<void> {
+function closeUdpSocket(socket: DgramSocket): Promise<void> {
   return new Promise((resolveClosed, reject) => {
     try {
       socket.close(resolveClosed);
@@ -1278,103 +1296,163 @@ function closeUdpSocket(
         resolveClosed();
         return;
       }
-      reject(smokeError(errorMessage));
+      reject(error as Error);
     }
   });
 }
 
-function bindExclusiveUdpLoopback(port: number, errorMessage: string): Promise<DgramSocket> {
+function leaseExclusiveUdpLoopback(port: number): Promise<ProductionSmokePortLease> {
   const socket = createSocket({ type: 'udp4', reuseAddr: false });
-  return new Promise((resolveSocket, reject) => {
-    const rejectUnavailable = () => {
+  return new Promise((resolveLease, reject) => {
+    const rejectUnavailable = (error: Error) => {
       void closeUdpSocket(socket).then(
-        () => reject(smokeError(errorMessage)),
-        () => reject(smokeError(errorMessage))
+        () => reject(error),
+        () => reject(error)
       );
     };
     socket.once('error', rejectUnavailable);
     socket.bind({ address: '127.0.0.1', port, exclusive: true }, () => {
       socket.removeListener('error', rejectUnavailable);
-      resolveSocket(socket);
+      resolveLease({ port, close: () => closeUdpSocket(socket) });
     });
   });
 }
 
-async function reserveLoopbackPort(
-  requireUdp = false,
-  excludedPort?: number
-): Promise<number> {
-  for (let attempt = 0; attempt < LOOPBACK_PORT_RESERVATION_ATTEMPTS; attempt += 1) {
-    let server: TcpServer | undefined;
-    let socket: DgramSocket | undefined;
-    try {
-      const candidatePort = requireUdp
-        ? randomInt(EPHEMERAL_PORT_MIN, EPHEMERAL_PORT_MAX_EXCLUSIVE)
-        : 0;
-      if (candidatePort === excludedPort) continue;
-      server = await listenExclusiveTcpLoopback(
-        candidatePort,
+async function acquirePortLease(
+  acquire: (port: number) => Promise<ProductionSmokePortLease>,
+  port: number,
+  errorMessage: string
+): Promise<ProductionSmokePortLease> {
+  try {
+    return await acquire(port);
+  } catch {
+    throw smokeError(errorMessage);
+  }
+}
+
+async function closePortLease(
+  lease: ProductionSmokePortLease,
+  errorMessage: string
+): Promise<void> {
+  try {
+    await lease.close();
+  } catch {
+    throw smokeError(errorMessage);
+  }
+}
+
+function hasExactPortIdentity(lease: ProductionSmokePortLease, port: number): boolean {
+  return safePort(lease.port) && lease.port === port;
+}
+
+export function createProductionSmokePortOperations(
+  runtime: ProductionSmokePortRuntime
+): ProductionSmokePortOperations {
+  return {
+    async allocateLoopbackPort(requireUdp = false, excludedPort?: number) {
+      for (let attempt = 0; attempt < LOOPBACK_PORT_RESERVATION_ATTEMPTS; attempt += 1) {
+        let tcpLease: ProductionSmokePortLease | undefined;
+        let udpLease: ProductionSmokePortLease | undefined;
+        try {
+          const candidatePort = requireUdp
+            ? runtime.randomInteger(EPHEMERAL_PORT_MIN, EPHEMERAL_PORT_MAX_EXCLUSIVE)
+            : 0;
+          if (candidatePort === excludedPort) continue;
+          tcpLease = await acquirePortLease(
+            runtime.leaseTcpLoopback,
+            candidatePort,
+            requireUdp
+              ? 'ephemeral loopback port is unavailable for TCP'
+              : 'failed to reserve an ephemeral loopback port'
+          );
+          if (!safePort(tcpLease.port) || tcpLease.port === excludedPort ||
+              (candidatePort !== 0 && tcpLease.port !== candidatePort)) {
+            continue;
+          }
+          if (requireUdp) {
+            udpLease = await acquirePortLease(
+              runtime.leaseUdpLoopback,
+              tcpLease.port,
+              'ephemeral loopback port is unavailable for UDP'
+            );
+            if (!hasExactPortIdentity(udpLease, tcpLease.port)) continue;
+          }
+          return tcpLease.port;
+        } catch {
+          // Try another bounded candidate when either required protocol is unavailable.
+        } finally {
+          await Promise.all([
+            udpLease
+              ? closePortLease(udpLease, 'loopback UDP socket cleanup failed')
+              : Promise.resolve(),
+            tcpLease
+              ? closePortLease(tcpLease, 'loopback TCP socket cleanup failed')
+              : Promise.resolve()
+          ]);
+        }
+      }
+      throw smokeError(
         requireUdp
-          ? 'ephemeral loopback port is unavailable for TCP'
+          ? 'failed to reserve an ephemeral TCP and UDP loopback port'
           : 'failed to reserve an ephemeral loopback port'
       );
-      const address = server.address();
-      if (!address || typeof address === 'string' || !safePort(address.port) ||
-          address.port === excludedPort) {
-        continue;
-      }
-      if (requireUdp) {
-        socket = await bindExclusiveUdpLoopback(
-          address.port,
-          'ephemeral loopback port is unavailable for UDP'
+    },
+    async probeLoopbackPort(host, port, requireUdp = false) {
+      assert(host === '127.0.0.1' && safePort(port), 'port check is unsafe');
+      let tcpLease: ProductionSmokePortLease | undefined;
+      let udpLease: ProductionSmokePortLease | undefined;
+      try {
+        tcpLease = await acquirePortLease(
+          runtime.leaseTcpLoopback,
+          port,
+          'reserved loopback port is no longer available'
         );
+        assert(
+          hasExactPortIdentity(tcpLease, port),
+          'reserved loopback port is no longer available'
+        );
+        if (requireUdp) {
+          udpLease = await acquirePortLease(
+            runtime.leaseUdpLoopback,
+            port,
+            'reserved loopback port is no longer available'
+          );
+          assert(
+            hasExactPortIdentity(udpLease, port),
+            'reserved loopback port is no longer available'
+          );
+        }
+      } finally {
+        await Promise.all([
+          udpLease
+            ? closePortLease(udpLease, 'loopback port check failed')
+            : Promise.resolve(),
+          tcpLease
+            ? closePortLease(tcpLease, 'loopback port check failed')
+            : Promise.resolve()
+        ]);
       }
-      return address.port;
-    } catch {
-      // Try another bounded candidate when either required protocol is unavailable.
-    } finally {
-      await Promise.all([
-        socket ? closeUdpSocket(socket) : Promise.resolve(),
-        server ? closeTcpServer(server) : Promise.resolve()
-      ]);
     }
-  }
-  throw smokeError(
-    requireUdp
-      ? 'failed to reserve an ephemeral TCP and UDP loopback port'
-      : 'failed to reserve an ephemeral loopback port'
-  );
+  };
 }
+
+const defaultProductionSmokePortOperations = createProductionSmokePortOperations({
+  randomInteger: (minimum, maximumExclusive) => randomInt(minimum, maximumExclusive),
+  leaseTcpLoopback: leaseExclusiveTcpLoopback,
+  leaseUdpLoopback: leaseExclusiveUdpLoopback
+});
 
 export async function assertLoopbackPortAvailable(
   host: '127.0.0.1',
   port: number,
   requireUdp = false
 ): Promise<void> {
-  assert(host === '127.0.0.1' && safePort(port), 'port check is unsafe');
-  let server: TcpServer | undefined;
-  let socket: DgramSocket | undefined;
-  try {
-    server = await listenExclusiveTcpLoopback(
-      port,
-      'reserved loopback port is no longer available'
-    );
-    if (requireUdp) {
-      socket = await bindExclusiveUdpLoopback(
-        port,
-        'reserved loopback port is no longer available'
-      );
-    }
-  } finally {
-    await Promise.all([
-      socket ? closeUdpSocket(socket, 'loopback port check failed') : Promise.resolve(),
-      server ? closeTcpServer(server, 'loopback port check failed') : Promise.resolve()
-    ]);
-  }
+  await defaultProductionSmokePortOperations.probeLoopbackPort(host, port, requireUdp);
 }
 
 export async function createProductionSmokeManifest(
-  stage: Plan6bSmokeStage
+  stage: Plan6bSmokeStage,
+  portOperations: ProductionSmokePortOperations = defaultProductionSmokePortOperations
 ): Promise<ProductionSmokeManifest> {
   validatePlan6bSmokeStage(stage);
   for (let attempt = 0; attempt < 8; attempt += 1) {
@@ -1389,8 +1467,8 @@ export async function createProductionSmokeManifest(
     const secretDirectory = join(tempDirectory, 'secrets');
     try {
       await mkdir(secretDirectory, { recursive: false });
-      const httpPort = await reserveLoopbackPort();
-      const httpsPort = await reserveLoopbackPort(true, httpPort);
+      const httpPort = await portOperations.allocateLoopbackPort();
+      const httpsPort = await portOperations.allocateLoopbackPort(true, httpPort);
       const manifest: ProductionSmokeManifest = {
         version: 2,
         stage,

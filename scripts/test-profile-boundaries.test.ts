@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import * as ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
@@ -14,6 +15,37 @@ function occurrences(value: string, fragment: string): number {
   return value.split(fragment).length - 1;
 }
 
+function runtimeModuleSpecifiers(path: string, contents: string): readonly string[] {
+  const specifiers = new Set<string>();
+  const syntax = ts.createSourceFile(
+    path,
+    contents,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS
+  );
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isImportDeclaration(node) &&
+      ts.isStringLiteral(node.moduleSpecifier) &&
+      (node.importClause === undefined || !node.importClause.isTypeOnly)
+    ) {
+      specifiers.add(node.moduleSpecifier.text);
+    } else if (
+      ts.isCallExpression(node) &&
+      node.arguments.length === 1 &&
+      ts.isStringLiteralLike(node.arguments[0]) &&
+      (node.expression.kind === ts.SyntaxKind.ImportKeyword ||
+        (ts.isIdentifier(node.expression) && node.expression.text === 'require'))
+    ) {
+      specifiers.add(node.arguments[0].text);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(syntax);
+  return [...specifiers].sort();
+}
+
 const packageManifest = JSON.parse(source('package.json')) as {
   readonly scripts: Readonly<Record<string, string>>;
 };
@@ -22,6 +54,11 @@ const serviceConfigSource = source('vitest.service.config.ts');
 const commerceOperationsTestSource = source('scripts/commerce-operations.test.ts');
 const serviceTestSource = source('tests/service/financial-restore-witness.test.ts');
 const financialWitnessHarnessSource = source('scripts/financial-restore-witness-harness.ts');
+const productionSmokeTestSource = source('scripts/plan6b-production-smoke.test.ts');
+const productionSmokeTestRuntimeModules = runtimeModuleSpecifiers(
+  'scripts/plan6b-production-smoke.test.ts',
+  productionSmokeTestSource
+);
 const readmeSource = source('README.md');
 const databaseAndWorkersSource = source('docs/database-and-workers.md');
 
@@ -86,6 +123,11 @@ describe('test profile boundaries', () => {
     expect(serviceConfigSource).not.toContain('upgrade');
     expect(serviceConfigSource).not.toContain('smoke');
     expect(serviceConfigSource).not.toContain("include: ['tests/service/**/*.test.ts']");
+  });
+
+  it('keeps production smoke tests from directly importing live socket runtimes', () => {
+    expect(productionSmokeTestRuntimeModules).not.toContain('node:net');
+    expect(productionSmokeTestRuntimeModules).not.toContain('node:dgram');
   });
 
   it('places the one active PostgreSQL invocation only in the service test', () => {
