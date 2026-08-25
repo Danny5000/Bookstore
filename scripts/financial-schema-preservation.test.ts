@@ -9,7 +9,9 @@ import {
 
 function source(relativePath: string): string {
   const path = fileURLToPath(new URL(relativePath, import.meta.url));
-  return existsSync(path) ? readFileSync(path, 'utf8') : '';
+  return existsSync(path)
+    ? readFileSync(path, 'utf8').replace(/\r\n?/gu, '\n')
+    : '';
 }
 
 const PROVIDER_TABLES = [
