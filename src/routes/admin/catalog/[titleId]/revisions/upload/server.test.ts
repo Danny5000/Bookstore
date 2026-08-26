@@ -3,6 +3,7 @@ import { Readable } from 'node:stream';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Actor } from '$lib/server/auth/admin-policy';
 import { CatalogDomainError } from '$lib/server/catalog/errors';
+import { runWithDiagnosticContext } from '$lib/server/observability/context';
 import { UploadError } from '$lib/server/uploads/multipart';
 
 const { database, storage, parsePublicationUpload, streamObjectWithSha256, acceptRevisionUpload } =
@@ -131,8 +132,21 @@ describe('publication revision upload endpoint', () => {
     expect(storage.delete).not.toHaveBeenCalled();
   });
 
-  it('replaces an invalid incoming request ID', async () => {
-    await POST(event(admin, 'x'.repeat(201)) as never);
+  it('accepts exactly 100 characters and replaces 101', async () => {
+    const maximum = `a${'x'.repeat(99)}`;
+    await POST(event(admin, maximum) as never);
+    expect(acceptRevisionUpload.mock.calls.at(-1)?.[1].correlationId).toBe(maximum);
+
+    await POST(event(admin, 'x'.repeat(101)) as never);
     expect(acceptRevisionUpload.mock.calls.at(-1)?.[1].correlationId).toMatch(/^[0-9a-f-]{36}$/u);
+  });
+
+  it('prefers ambient diagnostic correlation over a conflicting header', async () => {
+    await runWithDiagnosticContext(
+      { kind: 'web', correlationId: 'ambient-upload' } as never,
+      () => POST(event(admin, 'conflicting-header') as never)
+    );
+
+    expect(acceptRevisionUpload.mock.calls.at(-1)?.[1].correlationId).toBe('ambient-upload');
   });
 });

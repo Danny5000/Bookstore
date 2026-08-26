@@ -1,12 +1,11 @@
-import { randomUUID } from 'node:crypto';
 import { error, fail, isHttpError, isRedirect, type ActionFailure } from '@sveltejs/kit';
 import { z, ZodError } from 'zod';
 import { AuthorizationError, requireCapability, type Actor } from '$lib/server/auth/admin-policy';
 import { safeAuditRequestMetadata } from '$lib/server/audit/request-metadata';
 import { CatalogDomainError } from '$lib/server/catalog/errors';
 import { toAdminTitleDto } from '$lib/server/catalog/titles';
+import { correlationIdForRequest } from '$lib/server/observability/context';
 
-const requestIdSchema = z.string().trim().min(1).max(200);
 const uuidSchema = z.uuid();
 
 export class CatalogRouteInputError extends Error {
@@ -44,9 +43,8 @@ export async function readScalarForm(request: Request): Promise<Record<string, s
 }
 
 export function commandContext(request: Request, routeId: string | null) {
-  const incoming = requestIdSchema.safeParse(request.headers.get('x-request-id'));
   return {
-    correlationId: incoming.success ? incoming.data : randomUUID(),
+    correlationId: correlationIdForRequest(request),
     requestMetadata: safeAuditRequestMetadata(request, routeId)
   };
 }

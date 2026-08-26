@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
+import { runWithDiagnosticContext } from '$lib/server/observability/context';
 
 vi.mock('$lib/server/config', () => ({
   getApplicationConfig: () => ({ origin: 'https://books.example.com' })
@@ -95,17 +96,26 @@ describe('strict JSON HTTP helpers', () => {
     expect(
       correlationIdForRequest(
         new Request('https://books.example.com', {
-          headers: { 'x-request-id': 'request-123' }
+          headers: { 'x-request-id': `a${'x'.repeat(99)}` }
         })
       )
-    ).toBe('request-123');
+    ).toBe(`a${'x'.repeat(99)}`);
     expect(
       correlationIdForRequest(
         new Request('https://books.example.com', {
-          headers: { 'x-request-id': 'x'.repeat(201) }
+          headers: { 'x-request-id': 'x'.repeat(101) }
         })
       )
     ).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(correlationIdForRequest({
+      headers: { get: () => ' padded ' }
+    } as unknown as Request)).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(runWithDiagnosticContext(
+      { kind: 'web', correlationId: 'ambient-request' } as never,
+      () => correlationIdForRequest(new Request('https://books.example.com', {
+        headers: { 'x-request-id': 'conflicting-header' }
+      }))
+    )).toBe('ambient-request');
 
     const json = privateJson({ id: randomUUID() }, 201);
     expect(json.status).toBe(201);

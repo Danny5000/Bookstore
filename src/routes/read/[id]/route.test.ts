@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Actor } from '$lib/server/auth/admin-policy';
+import { runWithDiagnosticContext } from '$lib/server/observability/context';
 
 const { resolvePublicationAccess, getReaderDocumentForAccess, getEntitledInitialReader } = vi.hoisted(
   () => ({
@@ -44,10 +45,13 @@ const initialState = {
   migrationNotice: null
 };
 
-function event(actor: Actor) {
+function event(actor: Actor, requestId = 'reader-request') {
   return {
     params: { id: titleId },
     locals: { actor },
+    request: new Request(`https://books.example.com/read/${titleId}`, {
+      headers: { 'x-request-id': requestId }
+    }),
     url: new URL(`https://books.example.com/read/${titleId}`),
     setHeaders: vi.fn()
   };
@@ -66,7 +70,10 @@ describe('reader page access loader', () => {
     });
     getEntitledInitialReader.mockResolvedValueOnce({ document, initialState });
     const request = event(customer);
-    await expect(load(request as never)).resolves.toMatchObject({
+    await expect(runWithDiagnosticContext(
+      { kind: 'web', correlationId: 'ambient-reader' } as never,
+      () => load(request as never)
+    )).resolves.toMatchObject({
       document,
       initialState,
       persistenceKind: 'server',
@@ -75,7 +82,7 @@ describe('reader page access loader', () => {
     expect(getEntitledInitialReader).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ level: 'entitled', titleId }),
-      expect.objectContaining({ actor: customer })
+      expect.objectContaining({ actor: customer, correlationId: 'ambient-reader' })
     );
     expect(getReaderDocumentForAccess).not.toHaveBeenCalled();
     expect(request.setHeaders).toHaveBeenCalledWith({ 'cache-control': 'private, no-store' });

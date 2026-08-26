@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { error } from '@sveltejs/kit';
 import { z } from 'zod';
 import type { PageServerLoad } from './$types';
@@ -9,6 +8,7 @@ import {
 } from '$lib/server/catalog/reader';
 import { getDatabaseClient } from '$lib/server/db/runtime';
 import { resolvePublicationAccess } from '$lib/server/library/access';
+import { correlationIdForRequest } from '$lib/server/observability/context';
 import { ReaderStateNotFoundError } from '$lib/server/reader-state/errors';
 import type { ReaderInitialStateDto } from '$lib/types/library';
 
@@ -21,7 +21,7 @@ const emptyInitialState: ReaderInitialStateDto = {
   migrationNotice: null
 };
 
-export const load: PageServerLoad = async ({ params, locals, setHeaders }) => {
+export const load: PageServerLoad = async ({ params, locals, request, setHeaders }) => {
   const database = getDatabaseClient().db;
   const parsedTitleId = titleIdSchema.safeParse(params.id);
   if (!parsedTitleId.success) {
@@ -50,7 +50,7 @@ export const load: PageServerLoad = async ({ params, locals, setHeaders }) => {
     try {
       entitled = await getEntitledInitialReader(database, decision, {
         actor: locals.actor,
-        correlationId: randomUUID()
+        correlationId: correlationIdForRequest(request)
       });
     } catch (cause: unknown) {
       if (cause instanceof ReaderStateNotFoundError) error(404, 'Publication not found');

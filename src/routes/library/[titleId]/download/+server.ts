@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { AuthorizationError } from '$lib/server/auth/admin-policy';
 import {
@@ -6,11 +5,11 @@ import {
   streamCustomerOriginalDownload
 } from '$lib/server/catalog/media';
 import { getDatabaseClient } from '$lib/server/db/runtime';
+import { correlationIdForRequest } from '$lib/server/observability/context';
 import { getObjectStorage } from '$lib/server/storage/runtime';
 import type { RequestHandler } from './$types';
 
 const parametersSchema = z.strictObject({ titleId: z.uuid() });
-const requestIdSchema = z.string().trim().min(1).max(200);
 
 const respond: RequestHandler = async ({ locals, params, request }) => {
   const parsed = parametersSchema.safeParse(params);
@@ -22,7 +21,6 @@ const respond: RequestHandler = async ({ locals, params, request }) => {
     return new Response('Not found', { status: 404, headers: { 'cache-control': 'no-store' } });
   }
   const storage = getObjectStorage();
-  const incoming = requestIdSchema.safeParse(request.headers.get('x-request-id'));
   try {
     return await streamCustomerOriginalDownload(
       getDatabaseClient().db,
@@ -30,7 +28,7 @@ const respond: RequestHandler = async ({ locals, params, request }) => {
       locals.actor,
       {
         titleId: parsed.data.titleId,
-        correlationId: incoming.success ? incoming.data : randomUUID(),
+        correlationId: correlationIdForRequest(request),
         method: request.method === 'HEAD' ? 'HEAD' : 'GET',
         rangeHeader: request.headers.get('range')
       }

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import type { Actor } from '$lib/server/auth/admin-policy';
+import { runWithDiagnosticContext } from '$lib/server/observability/context';
 
 const database = {};
 vi.mock('$lib/server/db/runtime', () => ({
@@ -138,14 +139,36 @@ describe('setAdmin action', () => {
     expect(result).toEqual({ users: [] });
   });
 
-  it('replaces invalid request IDs with a UUID', async () => {
+  it('accepts exactly 100 characters and replaces 101', async () => {
     vi.mocked(setAdminRole).mockResolvedValueOnce(['customer']);
     vi.mocked(listUsersWithRoles).mockResolvedValueOnce([]);
+    const maximum = `a${'x'.repeat(99)}`;
     await setAdminAction(
-      actionEvent(admin, { userId: randomUUID(), enabled: 'false' }, 'x'.repeat(201)) as never
+      actionEvent(admin, { userId: randomUUID(), enabled: 'false' }, maximum) as never
+    );
+    expect(vi.mocked(setAdminRole).mock.calls.at(-1)?.[1].correlationId).toBe(maximum);
+
+    await setAdminAction(
+      actionEvent(admin, { userId: randomUUID(), enabled: 'false' }, 'x'.repeat(101)) as never
     );
     expect(vi.mocked(setAdminRole).mock.calls.at(-1)?.[1].correlationId).toMatch(
       /^[0-9a-f-]{36}$/
     );
+  });
+
+  it('prefers ambient diagnostic correlation over a conflicting header', async () => {
+    vi.mocked(setAdminRole).mockResolvedValueOnce(['customer']);
+    vi.mocked(listUsersWithRoles).mockResolvedValueOnce([]);
+
+    await runWithDiagnosticContext(
+      { kind: 'web', correlationId: 'ambient-users' } as never,
+      () => setAdminAction(actionEvent(
+        admin,
+        { userId: randomUUID(), enabled: 'false' },
+        'conflicting-header'
+      ) as never)
+    );
+
+    expect(vi.mocked(setAdminRole).mock.calls.at(-1)?.[1].correlationId).toBe('ambient-users');
   });
 });

@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { ZodError, z } from 'zod';
 import {
   AuthorizationError,
@@ -14,6 +13,7 @@ import { SalesReportingInputError } from '$lib/server/commerce/reporting/filters
 import { FinancialAdminCommandSubmissionConflictError } from '$lib/server/commerce/financial/admin-commands/repository';
 import { RefundReviewInputError } from '$lib/server/commerce/financial/refund-review/inputs';
 import { StrictHttpError } from '$lib/server/http/strict-json';
+import { correlationIdForRequest } from '$lib/server/observability/context';
 
 export type FinancialRouteFailure =
   | { readonly status: 400; readonly code: 'invalid_request' }
@@ -46,12 +46,6 @@ type FinancialDomainRouteFailureCode = Extract<
   'not_found' | 'stale_state' | 'temporarily_unavailable'
 >;
 
-const correlationIdSchema = z
-  .string()
-  .trim()
-  .min(1)
-  .max(100)
-  .regex(/^[A-Za-z0-9._:-]+$/u);
 const canonicalUuidSchema = z.uuid().refine((value) => value === value.toLowerCase());
 
 export class FinancialRouteInputError extends Error {
@@ -88,9 +82,8 @@ export function createFinancialRequestContext(
   request: Request,
   routeId: string | null
 ): FinancialRequestContext {
-  const incoming = correlationIdSchema.safeParse(request.headers.get('x-request-id'));
   return {
-    correlationId: incoming.success ? incoming.data : randomUUID(),
+    correlationId: correlationIdForRequest(request),
     requestMetadata: safeAuditRequestMetadata(request, routeId)
   };
 }

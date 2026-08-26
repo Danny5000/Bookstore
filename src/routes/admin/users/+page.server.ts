@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { fail } from '@sveltejs/kit';
 import { z } from 'zod';
 import { AuthorizationError, requireCapability } from '$lib/server/auth/admin-policy';
@@ -9,13 +8,13 @@ import {
   setAdminRole
 } from '$lib/server/auth/roles';
 import { getDatabaseClient } from '$lib/server/db/runtime';
+import { correlationIdForRequest } from '$lib/server/observability/context';
 import type { Actions, PageServerLoad } from './$types';
 
 const roleInputSchema = z.strictObject({
   userId: z.uuid(),
   enabled: z.enum(['true', 'false'])
 });
-const requestIdSchema = z.string().trim().min(1).max(200);
 
 export const load: PageServerLoad = async ({ locals }) => {
   requireCapability(locals.actor, 'roles.manage');
@@ -36,8 +35,7 @@ export const actions: Actions = {
     const values = Object.fromEntries(await request.formData());
     const parsed = roleInputSchema.safeParse(values);
     if (!parsed.success) return fail(400, { message: 'Invalid role change request' });
-    const incomingRequestId = requestIdSchema.safeParse(request.headers.get('x-request-id'));
-    const correlationId = incomingRequestId.success ? incomingRequestId.data : randomUUID();
+    const correlationId = correlationIdForRequest(request);
     const database = getDatabaseClient().db;
 
     try {

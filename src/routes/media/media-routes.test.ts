@@ -3,6 +3,7 @@ import { Readable } from 'node:stream';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { AuthorizationError, type Actor } from '$lib/server/auth/admin-policy';
 import { MediaNotFoundError } from '$lib/server/catalog/media';
+import { runWithDiagnosticContext } from '$lib/server/observability/context';
 import { parseStorageKey } from '$lib/server/storage/keys';
 
 const {
@@ -187,14 +188,17 @@ describe('publication media routes', () => {
   });
 
   it('streams an audited original as an RFC 5987 attachment', async () => {
-    const response = await getOriginal(
-      event(
-        admin,
-        { titleId, revisionId },
-        `/admin/catalog/${titleId}/revisions/${revisionId}/original`,
-        { 'x-request-id': 'original-request' },
-        '/admin/catalog/[titleId]/revisions/[revisionId]/original'
-      ) as never
+    const response = await runWithDiagnosticContext(
+      { kind: 'web', correlationId: 'ambient-original' } as never,
+      () => getOriginal(
+        event(
+          admin,
+          { titleId, revisionId },
+          `/admin/catalog/${titleId}/revisions/${revisionId}/original`,
+          { 'x-request-id': 'conflicting-header' },
+          '/admin/catalog/[titleId]/revisions/[revisionId]/original'
+        ) as never
+      )
     );
     expect(response.status).toBe(200);
     expect(response.headers.get('content-disposition')).toContain('attachment;');
@@ -203,11 +207,23 @@ describe('publication media routes', () => {
     expect(resolveOriginalDownload).toHaveBeenCalledWith(database, storage, admin, {
       titleId,
       revisionId,
-      correlationId: 'original-request',
+      correlationId: 'ambient-original',
       requestMetadata: {
         method: 'GET',
         routeId: '/admin/catalog/[titleId]/revisions/[revisionId]/original'
       }
     });
+  });
+
+  it('accepts exactly 100 correlation characters and replaces 101 for original downloads', async () => {
+    const maximum = `a${'x'.repeat(99)}`;
+    const routeId = '/admin/catalog/[titleId]/revisions/[revisionId]/original';
+    const path = `/admin/catalog/${titleId}/revisions/${revisionId}/original`;
+
+    await getOriginal(event(admin, { titleId, revisionId }, path, { 'x-request-id': maximum }, routeId) as never);
+    expect(resolveOriginalDownload.mock.calls.at(-1)?.[3].correlationId).toBe(maximum);
+
+    await getOriginal(event(admin, { titleId, revisionId }, path, { 'x-request-id': 'x'.repeat(101) }, routeId) as never);
+    expect(resolveOriginalDownload.mock.calls.at(-1)?.[3].correlationId).toMatch(/^[0-9a-f-]{36}$/u);
   });
 });

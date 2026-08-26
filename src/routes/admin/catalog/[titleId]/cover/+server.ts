@@ -8,6 +8,7 @@ import { getApplicationConfig } from '$lib/server/config';
 import { getDatabaseClient } from '$lib/server/db/runtime';
 import { IngestionError } from '$lib/server/ingestion/errors';
 import { ingestionLimitsFromConfig } from '$lib/server/ingestion/limits';
+import { correlationIdForRequest } from '$lib/server/observability/context';
 import { stagingUploadKey, type StorageKey } from '$lib/server/storage/keys';
 import { getObjectStorage } from '$lib/server/storage/runtime';
 import { parseSingleFileMultipart, UploadError } from '$lib/server/uploads/multipart';
@@ -15,7 +16,6 @@ import { streamObjectWithSha256 } from '$lib/server/uploads/stream-object';
 import type { RequestHandler } from './$types';
 
 const titleIdSchema = z.uuid();
-const requestIdSchema = z.string().trim().min(1).max(200);
 const coverBytes = 25 * 1024 * 1024;
 
 function json(body: unknown, status: number): Response {
@@ -54,14 +54,13 @@ export const POST: RequestHandler = async ({ locals, params, request, route }) =
     stagingKey = stagingUploadKey(randomUUID());
     await streamObjectWithSha256(storage, stagingKey, parsed.file, maximum, request.signal);
     await parsed.completion;
-    const incoming = requestIdSchema.safeParse(request.headers.get('x-request-id'));
     const result = await replaceTitleCover(
       getDatabaseClient().db,
       storage,
       ingestionLimitsFromConfig(getApplicationConfig().ingestion),
       {
         actor: locals.actor,
-        correlationId: incoming.success ? incoming.data : randomUUID(),
+        correlationId: correlationIdForRequest(request),
         requestMetadata: safeAuditRequestMetadata(request, route.id),
         input: { titleId: titleId.data, sourceKey: stagingKey },
         signal: request.signal

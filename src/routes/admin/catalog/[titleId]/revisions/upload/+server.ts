@@ -6,6 +6,7 @@ import { CatalogDomainError } from '$lib/server/catalog/errors';
 import { acceptRevisionUpload } from '$lib/server/catalog/revisions';
 import { getApplicationConfig } from '$lib/server/config';
 import { getDatabaseClient } from '$lib/server/db/runtime';
+import { correlationIdForRequest } from '$lib/server/observability/context';
 import { stagingUploadKey, type StorageKey } from '$lib/server/storage/keys';
 import { getObjectStorage } from '$lib/server/storage/runtime';
 import { parsePublicationUpload, UploadError } from '$lib/server/uploads/multipart';
@@ -13,7 +14,6 @@ import { streamObjectWithSha256 } from '$lib/server/uploads/stream-object';
 import type { RequestHandler } from './$types';
 
 const titleIdSchema = z.uuid();
-const requestIdSchema = z.string().trim().min(1).max(200);
 
 function jsonResponse(body: unknown, status: number): Response {
   return new Response(JSON.stringify(body), {
@@ -73,8 +73,7 @@ export const POST: RequestHandler = async ({ locals, params, request, route }) =
       request.signal
     );
     await parsed.completion;
-    const incomingRequestId = requestIdSchema.safeParse(request.headers.get('x-request-id'));
-    const correlationId = incomingRequestId.success ? incomingRequestId.data : randomUUID();
+    const correlationId = correlationIdForRequest(request);
     const revision = await acceptRevisionUpload(getDatabaseClient().db, {
       actor: locals.actor,
       correlationId,

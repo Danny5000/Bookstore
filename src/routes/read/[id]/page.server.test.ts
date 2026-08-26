@@ -79,6 +79,7 @@ import { load } from './+page.server';
 
 describe('entitled reader page load', () => {
   it('uses one current publication snapshot when replacement retires the access decision revision', async () => {
+    const maximumCorrelationId = `a${'x'.repeat(99)}`;
     mocks.resolvePublicationAccess.mockResolvedValue({
       level: 'entitled',
       titleId,
@@ -96,10 +97,18 @@ describe('entitled reader page load', () => {
     }>)({
       params: { id: titleId },
       locals: { actor: { type: 'user', id: titleId, roles: ['customer'] } },
+      request: new Request(`https://books.example.com/read/${titleId}`, {
+        headers: { 'x-request-id': maximumCorrelationId }
+      }),
       setHeaders: vi.fn()
     });
 
     expect(mocks.getEntitledInitialReader).toHaveBeenCalledOnce();
+    expect(mocks.getEntitledInitialReader).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ correlationId: maximumCorrelationId })
+    );
     expect(result.document.revisionId).toBe(revisionB);
     expect(result.initialState.progress?.revisionId).toBe(result.document.revisionId);
     expect(JSON.stringify(result.document)).not.toContain(revisionA);
@@ -118,6 +127,7 @@ describe('entitled reader page load', () => {
     await expect((load as (event: unknown) => Promise<unknown>)({
       params: { id: titleId },
       locals: { actor: { type: 'user', id: titleId, roles: ['customer'] } },
+      request: new Request(`https://books.example.com/read/${titleId}`),
       setHeaders: vi.fn()
     })).rejects.toMatchObject({ status: 404 });
   });

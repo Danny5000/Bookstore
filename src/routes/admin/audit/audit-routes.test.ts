@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import type { Actor } from '$lib/server/auth/admin-policy';
+import { runWithDiagnosticContext } from '$lib/server/observability/context';
 
 const database = {};
 vi.mock('$lib/server/db/runtime', () => ({ getDatabaseClient: () => ({ db: database }) }));
@@ -69,23 +70,40 @@ describe('audit routes', () => {
     expect(getAuditEventDetail).toHaveBeenCalledTimes(1);
   });
 
-  it('uses a validated correlation ID or generates a UUID', async () => {
+  it('uses an exact bounded correlation ID or generates a UUID', async () => {
     const eventId = randomUUID();
     vi.mocked(getAuditEventDetail).mockResolvedValue({ id: eventId } as never);
+    const maximum = `a${'x'.repeat(99)}`;
     await loadDetail({
       locals: { actor: admin }, params: { eventId },
-      request: new Request(`http://localhost/admin/audit/${eventId}`, { headers: { 'x-request-id': 'request-123' } }),
+      request: new Request(`http://localhost/admin/audit/${eventId}`, { headers: { 'x-request-id': maximum } }),
       route: { id: '/admin/audit/[eventId]' }
     } as never);
     expect(getAuditEventDetail).toHaveBeenLastCalledWith(database, {
-      actor: admin, eventId, correlationId: 'request-123'
+      actor: admin, eventId, correlationId: maximum
     });
 
     await loadDetail({
       locals: { actor: admin }, params: { eventId },
-      request: new Request(`http://localhost/admin/audit/${eventId}`, { headers: { 'x-request-id': 'x'.repeat(201) } }),
+      request: new Request(`http://localhost/admin/audit/${eventId}`, { headers: { 'x-request-id': 'x'.repeat(101) } }),
       route: { id: '/admin/audit/[eventId]' }
     } as never);
     expect(vi.mocked(getAuditEventDetail).mock.calls.at(-1)?.[1].correlationId).toMatch(/^[0-9a-f-]{36}$/u);
+  });
+
+  it('prefers ambient diagnostic correlation over a conflicting header', async () => {
+    const eventId = randomUUID();
+    vi.mocked(getAuditEventDetail).mockResolvedValue({ id: eventId } as never);
+
+    await runWithDiagnosticContext(
+      { kind: 'web', correlationId: 'ambient-audit' } as never,
+      () => loadDetail({
+        locals: { actor: admin }, params: { eventId },
+        request: new Request(`http://localhost/admin/audit/${eventId}`, { headers: { 'x-request-id': 'conflicting-header' } }),
+        route: { id: '/admin/audit/[eventId]' }
+      } as never)
+    );
+
+    expect(vi.mocked(getAuditEventDetail).mock.calls.at(-1)?.[1].correlationId).toBe('ambient-audit');
   });
 });

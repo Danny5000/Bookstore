@@ -4,6 +4,7 @@ import { z } from 'zod';
 import type { Actor } from '$lib/server/auth/admin-policy';
 import { CatalogDomainError } from '$lib/server/catalog/errors';
 import { IngestionError } from '$lib/server/ingestion/errors';
+import { runWithDiagnosticContext } from '$lib/server/observability/context';
 import { UploadError } from '$lib/server/uploads/multipart';
 
 const database = {};
@@ -85,6 +86,7 @@ import {
 } from '$lib/server/catalog/publication';
 import { parseSingleFileMultipart } from '$lib/server/uploads/multipart';
 import { streamObjectWithSha256 } from '$lib/server/uploads/stream-object';
+import { commandContext } from './route-support';
 
 const titleId = randomUUID();
 const revisionId = randomUUID();
@@ -156,6 +158,25 @@ describe('admin catalog authorization', () => {
 });
 
 describe('admin catalog routes', () => {
+  it('uses exact bounded or ambient diagnostic correlation in command contexts', () => {
+    const maximum = `a${'x'.repeat(99)}`;
+    expect(commandContext(new Request('http://localhost/admin/catalog', {
+      method: 'POST', headers: { 'x-request-id': maximum }
+    }), '/admin/catalog').correlationId).toBe(maximum);
+    expect(commandContext(new Request('http://localhost/admin/catalog', {
+      method: 'POST', headers: { 'x-request-id': 'x'.repeat(101) }
+    }), '/admin/catalog').correlationId).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(commandContext({
+      method: 'POST', headers: { get: () => ' padded ' }
+    } as unknown as Request, '/admin/catalog').correlationId).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(runWithDiagnosticContext(
+      { kind: 'web', correlationId: 'ambient-catalog' } as never,
+      () => commandContext(new Request('http://localhost/admin/catalog', {
+        method: 'POST', headers: { 'x-request-id': 'conflicting-header' }
+      }), '/admin/catalog').correlationId
+    )).toBe('ambient-catalog');
+  });
+
   it('derives overview counts from safe catalog queries', async () => {
     vi.mocked(listAdminTitles).mockResolvedValueOnce([
       { id: titleId, visibility: 'private' },
@@ -336,10 +357,19 @@ describe('admin catalog routes', () => {
     });
     vi.mocked(streamObjectWithSha256).mockResolvedValueOnce({ byteSize: 42, checksumSha256: 'b'.repeat(64) });
     vi.mocked(replaceTitleCover).mockResolvedValueOnce({ titleId, checksumSha256: 'c'.repeat(64) });
-    const response = await uploadCover(event(admin, `/admin/catalog/${titleId}/cover`, {}, { titleId }) as never);
+    const response = await runWithDiagnosticContext(
+      { kind: 'web', correlationId: 'ambient-cover' } as never,
+      () => uploadCover(event(admin, `/admin/catalog/${titleId}/cover`, {}, { titleId }) as never)
+    );
     expect(response.status).toBe(202);
     expect(await response.text()).not.toMatch(/storage|path/iu);
     expect(storage.delete).toHaveBeenCalled();
+    expect(replaceTitleCover).toHaveBeenCalledWith(
+      database,
+      storage,
+      expect.anything(),
+      expect.objectContaining({ correlationId: 'ambient-cover' })
+    );
   });
 
   it('maps cover size and decoded media failures to safe responses', async () => {

@@ -1,13 +1,12 @@
-import { randomUUID } from 'node:crypto';
 import { error } from '@sveltejs/kit';
 import { z } from 'zod';
 import type { PageServerLoad } from './$types';
 import { AuthorizationError, requireCapability } from '$lib/server/auth/admin-policy';
 import { getAuditEventDetail } from '$lib/server/audit/query';
 import { getDatabaseClient } from '$lib/server/db/runtime';
+import { correlationIdForRequest } from '$lib/server/observability/context';
 
 const eventIdSchema = z.uuid();
-const requestIdSchema = z.string().trim().min(1).max(200);
 
 export const load: PageServerLoad = async ({ locals, params, request }) => {
   try {
@@ -18,11 +17,10 @@ export const load: PageServerLoad = async ({ locals, params, request }) => {
   }
   const eventId = eventIdSchema.safeParse(params.eventId);
   if (!eventId.success) error(404, 'Audit event not found');
-  const incoming = requestIdSchema.safeParse(request.headers.get('x-request-id'));
   const event = await getAuditEventDetail(getDatabaseClient().db, {
     actor: locals.actor,
     eventId: eventId.data,
-    correlationId: incoming.success ? incoming.data : randomUUID()
+    correlationId: correlationIdForRequest(request)
   });
   if (!event) error(404, 'Audit event not found');
   return { event };

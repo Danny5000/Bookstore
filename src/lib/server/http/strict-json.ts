@@ -1,10 +1,9 @@
-import { randomUUID } from 'node:crypto';
 import { z, ZodError, type ZodType } from 'zod';
 import { getApplicationConfig } from '$lib/server/config';
+export { correlationIdForRequest } from '$lib/server/observability/context';
 
 export const DEFAULT_MAX_JSON_BYTES = 16 * 1024;
 
-const requestIdSchema = z.string().trim().min(1).max(200);
 const jsonContentType = /^application\/json(?:\s*;\s*charset\s*=\s*utf-8)?$/iu;
 
 export class StrictHttpError extends Error {
@@ -97,11 +96,6 @@ export async function readStrictJson<Schema extends ZodType>(
     if (error instanceof ZodError) throw new StrictHttpError(422, 'INVALID_INPUT');
     throw error;
   }
-}
-
-export function correlationIdForRequest(request: Request): string {
-  const parsed = requestIdSchema.safeParse(request.headers.get('x-request-id'));
-  return parsed.success ? parsed.data : randomUUID();
 }
 
 export function privateJson(value: unknown, status = 200): Response {

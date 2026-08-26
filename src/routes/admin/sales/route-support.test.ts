@@ -9,6 +9,7 @@ import {
 import { SalesReportingInputError } from '$lib/server/commerce/reporting/filters';
 import { FinancialAdminCommandSubmissionConflictError } from '$lib/server/commerce/financial/admin-commands/repository';
 import { StrictHttpError } from '$lib/server/http/strict-json';
+import { runWithDiagnosticContext } from '$lib/server/observability/context';
 import {
   FinancialRouteError,
   FinancialRouteInputError,
@@ -118,19 +119,39 @@ describe('financial route input and context contracts', () => {
   });
 
   it.each([
-    ['', true],
-    ['x'.repeat(101), true],
-    ['unsafe request id', true],
-    ['safe.request:id-2', false]
-  ] as const)('bounds or replaces correlation id %j', (incoming, replaced) => {
+    ['', undefined],
+    ['x'.repeat(101), undefined],
+    ['unsafe request id', undefined],
+    [' padded ', undefined],
+    ['safe.request:id-2', 'safe.request:id-2'],
+    [`a${'x'.repeat(99)}`, `a${'x'.repeat(99)}`]
+  ] as const)('bounds or replaces correlation id %j', (incoming, expected) => {
     const context = withFinancialRouteAuthorization(admin, 'sales.read', () =>
-      createFinancialRequestContext(new Request('https://books.example.test/', {
-        headers: { 'x-request-id': incoming }
-      }), null)
+      createFinancialRequestContext(
+        incoming === ' padded '
+          ? { method: 'GET', headers: { get: () => incoming } } as unknown as Request
+          : new Request('https://books.example.test/', { headers: { 'x-request-id': incoming } }),
+        null
+      )
     );
-    expect(context.correlationId).toMatch(replaced
-      ? /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u
-      : /^safe\.request:id-2$/u);
+    if (expected === undefined) {
+      expect(context.correlationId).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u
+      );
+    } else {
+      expect(context.correlationId).toBe(expected);
+    }
+  });
+
+  it('prefers ambient diagnostic correlation over a conflicting header', () => {
+    const context = runWithDiagnosticContext(
+      { kind: 'job', correlationId: 'ambient-job', jobId: randomUUID(), jobKind: 'sales.export', attempt: 1, workerId: 'worker:1', slotId: 0 } as never,
+      () => createFinancialRequestContext(new Request('https://books.example.test/', {
+        headers: { 'x-request-id': 'conflicting-header' }
+      }), '/admin/sales')
+    );
+
+    expect(context.correlationId).toBe('ambient-job');
   });
 });
 
