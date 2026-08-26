@@ -224,10 +224,17 @@ interface LeaseRenewalOptions {
 
 async function renewLease(options: LeaseRenewalOptions): Promise<void> {
   while (!options.signal.aborted) {
-    let renewed: boolean;
     try {
       await options.sleep(options.intervalMs, options.signal);
+    } catch {
       if (options.signal.aborted) return;
+      options.loseLease(LEASE_RENEWAL_FAILED);
+      return;
+    }
+    if (options.signal.aborted) return;
+
+    let renewed: boolean;
+    try {
       renewed = options.financialAdminLeaseCapability === undefined
         ? await options.repository.renewLease(options.jobId, options.leaseOwner)
         : await options.repository.renewLease(
@@ -236,16 +243,27 @@ async function renewLease(options: LeaseRenewalOptions): Promise<void> {
             options.financialAdminLeaseCapability
           );
     } catch {
-      if (options.signal.aborted) return;
       options.loseLease(LEASE_RENEWAL_FAILED);
       return;
     }
-    if (options.signal.aborted) return;
     if (!renewed) {
       options.loseLease(LEASE_RENEWAL_REJECTED);
       return;
     }
     options.renewed();
+  }
+}
+
+function permanentSafeMessage(cause: unknown): string | undefined {
+  try {
+    if (!(cause instanceof PermanentJobError)) return undefined;
+    const descriptor = Object.getOwnPropertyDescriptor(cause, 'safeMessage');
+    return descriptor && Object.hasOwn(descriptor, 'value') &&
+      typeof descriptor.value === 'string'
+      ? descriptor.value
+      : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -380,11 +398,12 @@ async function runRegisteredJob(
 
     if (leaseLost) return;
     if (handlerFailed) {
+      const trustedPermanentMessage = permanentSafeMessage(handlerError);
       const reduced = reduceSafeError(handlerError, {
         operation: 'job.handler',
         correlationId: identity.correlationId,
         matchers: [
-          (cause) => cause instanceof PermanentJobError
+          () => trustedPermanentMessage !== undefined
             ? createSafeDiagnosticError({
                 class: 'job',
                 code: PERMANENT_JOB_FAILURE,
@@ -395,14 +414,14 @@ async function runRegisteredJob(
             : undefined
         ]
       });
-      let safeMessage = handlerError instanceof PermanentJobError
-        ? handlerError.safeMessage
+      let safeMessage = trustedPermanentMessage !== undefined
+        ? trustedPermanentMessage
         : 'Transient job handler failure';
       if (job.financialAdminLeaseCapability !== undefined &&
         safeMessage.includes(job.financialAdminLeaseCapability)) {
         safeMessage = 'Permanent job handler failure';
       }
-      const retryable = !(handlerError instanceof PermanentJobError);
+      const retryable = trustedPermanentMessage === undefined;
       let transition: JobFailureTransition;
       try {
         transition = await failClaimedJob(

@@ -85,6 +85,16 @@ function controlledSleep() {
   };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 describe('runWorker', () => {
   it('models an exhausted transient failure as terminal in the in-memory adapter', async () => {
     const exhausted = { ...job, attempts: job.maxAttempts };
@@ -1059,6 +1069,102 @@ describe('runWorker', () => {
     expect(JSON.stringify(captured.events)).not.toContain('renewal-privacy-canary');
   });
 
+  it.each([
+    {
+      name: 'rejection',
+      settle: (renewal: ReturnType<typeof deferred<boolean>>) => renewal.resolve(false),
+      code: 'lease_renewal_rejected'
+    },
+    {
+      name: 'failure',
+      settle: (renewal: ReturnType<typeof deferred<boolean>>) =>
+        renewal.reject(new Error('in-flight-renewal-privacy-canary')),
+      code: 'lease_renewal_failed'
+    }
+  ] as const)('consumes an in-flight lease renewal $name after handler completion', async ({
+    settle,
+    code
+  }) => {
+    const controller = new AbortController();
+    const repository = repositoryReturning(job);
+    const inFlightRenewal = deferred<boolean>();
+    vi.mocked(repository.renewLease).mockImplementation(() => inFlightRenewal.promise);
+    const captured = captureObservations();
+    const controlledRenewal = controlledSleep();
+    const heldHandler = deferred<void>();
+
+    const running = runWorker({
+      repository,
+      handlers: new Map([[job.type, async () => heldHandler.promise]]),
+      workerId: 'worker-base',
+      concurrency: 1,
+      pollIntervalMs: 1,
+      leaseRenewalIntervalMs: 25,
+      signal: controller.signal,
+      observer: captured.observer,
+      correlationIdSource: () => GENERATED_CORRELATION_ID,
+      leaseRenewalSleep: controlledRenewal.sleep,
+      sleep: async () => controller.abort()
+    });
+    await vi.waitFor(() => expect(controlledRenewal.sleep).toHaveBeenCalledOnce());
+    controlledRenewal.releaseNext();
+    await vi.waitFor(() => expect(repository.renewLease).toHaveBeenCalledOnce());
+    heldHandler.resolve();
+    await Promise.resolve();
+    settle(inFlightRenewal);
+    await running;
+
+    expect(jobEvents(captured.events).map((event) =>
+      event.type === 'job_lease_lost' ? `${event.type}:${event.code}` : event.type
+    )).toEqual(['job_claimed', `job_lease_lost:${code}`]);
+    expect(captured.events.filter((event) => event.type === 'lease_lost')).toEqual([
+      { type: 'lease_lost', slotId: 0 }
+    ]);
+    expect(repository.complete).not.toHaveBeenCalled();
+    expect(repository.failWithDisposition).not.toHaveBeenCalled();
+    expect(captured.events).not.toContainEqual({ type: 'terminal_settled', slotId: 0 });
+    expect(JSON.stringify(captured.events)).not.toContain('in-flight-renewal-privacy-canary');
+  });
+
+  it('records an accepted in-flight renewal after handler completion before completing', async () => {
+    const controller = new AbortController();
+    const repository = repositoryReturning(job);
+    const inFlightRenewal = deferred<boolean>();
+    vi.mocked(repository.renewLease).mockImplementation(() => inFlightRenewal.promise);
+    const captured = captureObservations();
+    const controlledRenewal = controlledSleep();
+    const heldHandler = deferred<void>();
+
+    const running = runWorker({
+      repository,
+      handlers: new Map([[job.type, async () => heldHandler.promise]]),
+      workerId: 'worker-base',
+      concurrency: 1,
+      pollIntervalMs: 1,
+      leaseRenewalIntervalMs: 25,
+      signal: controller.signal,
+      observer: captured.observer,
+      correlationIdSource: () => GENERATED_CORRELATION_ID,
+      leaseRenewalSleep: controlledRenewal.sleep,
+      sleep: async () => controller.abort()
+    });
+    await vi.waitFor(() => expect(controlledRenewal.sleep).toHaveBeenCalledOnce());
+    controlledRenewal.releaseNext();
+    await vi.waitFor(() => expect(repository.renewLease).toHaveBeenCalledOnce());
+    heldHandler.resolve();
+    await Promise.resolve();
+    inFlightRenewal.resolve(true);
+    await running;
+
+    expect(captured.events).toContainEqual({ type: 'lease_renewed', slotId: 0 });
+    expect(repository.complete).toHaveBeenCalledOnce();
+    expect(jobEvents(captured.events).map((event) => event.type)).toEqual([
+      'job_claimed',
+      'job_succeeded'
+    ]);
+    expect(captured.events).toContainEqual({ type: 'terminal_settled', slotId: 0 });
+  });
+
   it('emits succeeded and terminal progress only after completion is applied', async () => {
     const controller = new AbortController();
     const repository = repositoryReturning(job);
@@ -1224,6 +1330,59 @@ describe('runWorker', () => {
     if (error instanceof PermanentJobError) {
       expect(JSON.stringify(captured.events)).not.toContain(error.safeMessage);
     }
+  });
+
+  it.each([
+    {
+      name: 'revoked proxy',
+      error: (() => {
+        const { proxy, revoke } = Proxy.revocable({}, {});
+        revoke();
+        return proxy;
+      })()
+    },
+    {
+      name: 'hostile permanent safeMessage accessor',
+      error: (() => {
+        const error = Object.create(PermanentJobError.prototype) as PermanentJobError;
+        Object.defineProperty(error, 'safeMessage', {
+          enumerable: true,
+          get() { throw new Error('hostile-safe-message-privacy-canary'); }
+        });
+        return error;
+      })()
+    }
+  ])('settles a hostile $name as a transient unexpected failure', async ({ error }) => {
+    const controller = new AbortController();
+    const repository = repositoryReturning(job);
+    const captured = captureObservations();
+
+    await expect(runWorker({
+      repository,
+      handlers: new Map([[job.type, async () => { throw error; }]]),
+      workerId: 'worker-base',
+      concurrency: 1,
+      pollIntervalMs: 1,
+      leaseRenewalIntervalMs: 10_000,
+      signal: controller.signal,
+      observer: captured.observer,
+      correlationIdSource: () => GENERATED_CORRELATION_ID,
+      sleep: async () => controller.abort()
+    })).resolves.toBeUndefined();
+
+    expect(repository.failWithDisposition).toHaveBeenCalledWith(
+      job.id,
+      'worker-base',
+      'Transient job handler failure',
+      true
+    );
+    expect(jobEvents(captured.events)[1]).toMatchObject({
+      type: 'job_failed',
+      code: 'unexpected_failure',
+      retryScheduled: true
+    });
+    expect(captured.events).toContainEqual({ type: 'terminal_settled', slotId: 0 });
+    expect(JSON.stringify(captured.events)).not.toContain('privacy-canary');
   });
 
   it('maps an applied-false handler failure transition to failure_transition_rejected without failed or terminal progress', async () => {
