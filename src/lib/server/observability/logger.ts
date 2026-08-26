@@ -32,21 +32,22 @@ export function createStructuredLogger<S extends StructuredLogService>(options: 
   readonly stdout?: StructuredLogSink;
   readonly stderr?: StructuredLogSink;
 }): StructuredLogger<S> {
-  const now = options.now ?? (() => new Date());
-  const stdout = options.stdout ?? ((value) => { process.stdout.write(value); });
-  const stderr = options.stderr ?? ((value) => { process.stderr.write(value); });
+  const { service, environment, now: injectedNow, stdout: injectedStdout, stderr: injectedStderr } = options;
+  const now = injectedNow ?? (() => new Date());
+  const stdout = injectedStdout ?? ((value) => { process.stdout.write(value); });
+  const stderr = injectedStderr ?? ((value) => { process.stderr.write(value); });
 
   return {
     emit(input) {
       let timestamp = EPOCH;
       try {
         timestamp = currentTimestamp(now);
-        const validated = validateStructuredEvent(options.service, timestamp, input);
+        const validated = validateStructuredEvent(service, timestamp, input);
         (validated.sink === 'stdout' ? stdout : stderr)(line(validated.record));
       } catch (cause) {
-        if (options.environment !== 'production') throw cause;
+        if (environment !== 'production') throw cause;
         try {
-          const failure = validateLoggingFailure(options.service, timestamp);
+          const failure = validateLoggingFailure(service, timestamp);
           stderr(line(failure.record));
         } catch { /* logging must never alter production domain outcomes */ }
       }

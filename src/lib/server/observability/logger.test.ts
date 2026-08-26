@@ -1,15 +1,47 @@
 import { describe, expect, expectTypeOf, test, vi } from 'vitest';
 
-import type { StructuredEventInputFor } from './contracts';
+import type { CorrelationId, SafeCode, StructuredEventInputFor, StructuredLogService } from './contracts';
 import { createStructuredLogger } from './logger';
 
 const timestamp = '2026-08-24T12:34:56.789Z';
 const clock = () => new Date(timestamp);
-const webCompleted = { event: 'http.request.completed', correlationId: 'request-1', method: 'GET', route: '/books', httpStatus: 200, durationMs: 12 } as const;
-const webRejected = { event: 'http.request.rejected', correlationId: 'request-1', method: 'GET', route: '/books', httpStatus: 400, code: 'invalid_request' as never, durationMs: 3 } as const;
-const workerStarted = { event: 'worker.started', workerId: 'worker-1', configuredSlots: 2 } as const;
-const jobFailed = { event: 'job.failed', correlationId: 'request-1', jobId: '01234567-89ab-cdef-0123-456789abcdef', jobKind: 'email', attempt: 1, maxAttempts: 3, workerId: 'worker-1', slotId: 0, code: 'permanent_job_failure' as never, durationMs: 9, retryScheduled: true } as const;
-const smokeStarted = { event: 'smoke.stage.started', profile: 'maintenance_fixture', runId: '0123456789abcdef', candidateId: '01234567-89ab-cdef-0123-456789abcdef', stage: 'preflight' } as const;
+const correlationId = 'request-1' as CorrelationId;
+const code = <C extends string>(value: C) => value as SafeCode<C>;
+const jobId = '01234567-89ab-cdef-0123-456789abcdef';
+const runId = '0123456789abcdef';
+const webCompleted = { event: 'http.request.completed', correlationId, method: 'GET', route: '/books', httpStatus: 200, durationMs: 12 } satisfies StructuredEventInputFor<'web'>;
+const webRejected = { event: 'http.request.rejected', correlationId, method: 'GET', route: '/books', httpStatus: 400, code: code('invalid_request'), durationMs: 3 } satisfies StructuredEventInputFor<'web'>;
+const workerStarted = { event: 'worker.started', workerId: 'worker-1', configuredSlots: 2 } satisfies StructuredEventInputFor<'worker'>;
+const jobFailed = { event: 'job.failed', correlationId, jobId, jobKind: 'email', attempt: 1, maxAttempts: 3, workerId: 'worker-1', slotId: 0, code: code('permanent_job_failure'), durationMs: 9, retryScheduled: true } satisfies StructuredEventInputFor<'worker'>;
+const smokeStarted = { event: 'smoke.stage.started', profile: 'maintenance_fixture', runId, candidateId: jobId, stage: 'preflight' } satisfies StructuredEventInputFor<'plan6b-production-smoke'>;
+
+type SinkFixture =
+  | { readonly service: 'web'; readonly input: StructuredEventInputFor<'web'>; readonly sink: 'stdout' | 'stderr'; readonly severity: string; readonly outcome: string }
+  | { readonly service: 'worker'; readonly input: StructuredEventInputFor<'worker'>; readonly sink: 'stdout' | 'stderr'; readonly severity: string; readonly outcome: string }
+  | { readonly service: 'plan6b-production-smoke'; readonly input: StructuredEventInputFor<'plan6b-production-smoke'>; readonly sink: 'stdout' | 'stderr'; readonly severity: string; readonly outcome: string };
+
+const sinkFixtures: readonly SinkFixture[] = [
+  { service: 'web', input: webCompleted, sink: 'stdout', severity: 'info', outcome: 'succeeded' },
+  { service: 'web', input: webRejected, sink: 'stderr', severity: 'warn', outcome: 'denied' },
+  { service: 'web', input: { event: 'http.request.failed', correlationId, method: 'GET', route: '/books', httpStatus: 500, code: code('http_server_error'), durationMs: 4 }, sink: 'stderr', severity: 'error', outcome: 'failed' },
+  { service: 'worker', input: workerStarted, sink: 'stdout', severity: 'info', outcome: 'started' },
+  { service: 'worker', input: { event: 'worker.ready', workerId: 'worker-1', configuredSlots: 2, durationMs: 1 }, sink: 'stdout', severity: 'info', outcome: 'succeeded' },
+  { service: 'worker', input: { event: 'worker.stopping', workerId: 'worker-1', code: code('signal_sigint') }, sink: 'stdout', severity: 'info', outcome: 'started' },
+  { service: 'worker', input: { event: 'worker.stopped', workerId: 'worker-1', durationMs: 1 }, sink: 'stdout', severity: 'info', outcome: 'succeeded' },
+  { service: 'worker', input: { event: 'worker.failed', workerId: 'worker-1', code: code('configuration_invalid') }, sink: 'stderr', severity: 'error', outcome: 'failed' },
+  { service: 'worker', input: { event: 'job.claimed', correlationId, jobId, jobKind: 'email', attempt: 1, maxAttempts: 3, workerId: 'worker-1', slotId: 0 }, sink: 'stdout', severity: 'debug', outcome: 'started' },
+  { service: 'worker', input: { event: 'job.succeeded', correlationId, jobId, jobKind: 'email', attempt: 1, workerId: 'worker-1', slotId: 0, durationMs: 1 }, sink: 'stdout', severity: 'info', outcome: 'succeeded' },
+  { service: 'worker', input: jobFailed, sink: 'stderr', severity: 'warn', outcome: 'failed' },
+  { service: 'worker', input: { event: 'job.lease_lost', correlationId, jobId, jobKind: 'email', attempt: 1, workerId: 'worker-1', slotId: 0, code: code('lease_renewal_rejected') }, sink: 'stderr', severity: 'warn', outcome: 'failed' },
+  { service: 'worker', input: { event: 'worker.heartbeat_failed', workerId: 'worker-1', code: code('heartbeat_publication_failed') }, sink: 'stderr', severity: 'error', outcome: 'failed' },
+  { service: 'plan6b-production-smoke', input: smokeStarted, sink: 'stdout', severity: 'debug', outcome: 'started' },
+  { service: 'plan6b-production-smoke', input: { event: 'smoke.stage.succeeded', profile: 'maintenance_fixture', runId, candidateId: jobId, stage: 'preflight', durationMs: 1 }, sink: 'stdout', severity: 'info', outcome: 'succeeded' },
+  { service: 'plan6b-production-smoke', input: { event: 'smoke.stage.failed', profile: 'maintenance_fixture', runId, candidateId: jobId, stage: 'preflight', code: code('timeout'), durationMs: 1 }, sink: 'stderr', severity: 'error', outcome: 'failed' },
+  { service: 'plan6b-production-smoke', input: { event: 'smoke.cleanup.succeeded', profile: 'maintenance_fixture', runId, candidateId: jobId, durationMs: 1, containerCount: 0, networkCount: 0, volumeCount: 0, temporaryRootCount: 0 }, sink: 'stdout', severity: 'info', outcome: 'succeeded' },
+  { service: 'plan6b-production-smoke', input: { event: 'smoke.cleanup.failed', profile: 'maintenance_fixture', runId, candidateId: jobId, code: code('cleanup_failed'), durationMs: 1, containerCount: 0, networkCount: 0, volumeCount: 0, temporaryRootCount: 0 }, sink: 'stderr', severity: 'error', outcome: 'failed' },
+  { service: 'plan6b-production-smoke', input: { event: 'smoke.run.succeeded', profile: 'maintenance_fixture', runId, candidateId: jobId, durationMs: 1, evidenceFingerprint: 'a'.repeat(64) }, sink: 'stdout', severity: 'info', outcome: 'succeeded' },
+  { service: 'plan6b-production-smoke', input: { event: 'smoke.run.failed', profile: 'maintenance_fixture', runId, candidateId: jobId, stage: 'cleanup', code: code('cleanup_failed'), durationMs: 1 }, sink: 'stderr', severity: 'error', outcome: 'failed' }
+];
 
 function lines() {
   const stdout: string[] = [];
@@ -29,20 +61,16 @@ describe('strict structured logger', () => {
     expect(Object.keys(JSON.parse(captured.stdout[0]!))).toEqual(['version', 'timestamp', 'severity', 'service', 'event', 'outcome', 'correlationId', 'method', 'route', 'httpStatus', 'durationMs']);
   });
 
-  test.each([
-    ['stdout', webCompleted, 'web'],
-    ['stderr', webRejected, 'web'],
-    ['stdout', workerStarted, 'worker'],
-    ['stderr', jobFailed, 'worker'],
-    ['stdout', smokeStarted, 'plan6b-production-smoke']
-  ] as const)('uses the contract-selected %s sink for %s', (sink, input, service) => {
+  test.each(sinkFixtures)('uses the fixed $sink sink for $input.event', (fixture) => {
     const captured = lines();
-    const logger = createStructuredLogger({ service, environment: 'development', now: clock, ...captured.sinks });
+    const logger = createStructuredLogger({ service: fixture.service, environment: 'development', now: clock, ...captured.sinks });
 
-    logger.emit(input as never);
+    logger.emit(fixture.input);
 
-    expect(sink === 'stdout' ? captured.stdout : captured.stderr).toHaveLength(1);
-    expect(sink === 'stdout' ? captured.stderr : captured.stdout).toEqual([]);
+    const selected = fixture.sink === 'stdout' ? captured.stdout : captured.stderr;
+    expect(selected).toHaveLength(1);
+    expect(fixture.sink === 'stdout' ? captured.stderr : captured.stdout).toEqual([]);
+    expect(JSON.parse(selected[0]!)).toMatchObject({ event: fixture.input.event, severity: fixture.severity, outcome: fixture.outcome });
   });
 
   test('uses canonical RFC 3339 UTC time from the injected clock', () => {
@@ -83,14 +111,14 @@ describe('strict structured logger', () => {
     const web = createStructuredLogger({ service: 'web', environment: 'development', now: clock, ...lines().sinks });
     const smoke = createStructuredLogger({ service: 'plan6b-production-smoke', environment: 'development', now: clock, ...lines().sinks });
 
-    expect(() => web.emit(smokeStarted as never)).toThrow('invalid structured event');
-    expect(() => smoke.emit(workerStarted as never)).toThrow('invalid structured event');
+    expect(() => Reflect.apply(web.emit, web, [smokeStarted])).toThrow('invalid structured event');
+    expect(() => Reflect.apply(smoke.emit, smoke, [workerStarted])).toThrow('invalid structured event');
   });
 
   test.each(['development', 'test'] as const)('throws validation failures to the caller in %s', (environment) => {
     const logger = createStructuredLogger({ service: 'web', environment, now: clock, ...lines().sinks });
 
-    expect(() => logger.emit({ ...webCompleted, route: 'customer@example.test', secret: 'privacy-canary' } as never)).toThrow('invalid structured event');
+    expect(() => Reflect.apply(logger.emit, logger, [{ ...webCompleted, route: 'customer@example.test', secret: 'privacy-canary' }])).toThrow('invalid structured event');
   });
 
   test.each(['development', 'test'] as const)('throws clock failures to the caller in %s', (environment) => {
@@ -117,10 +145,36 @@ describe('strict structured logger', () => {
     const captured = lines();
     const logger = createStructuredLogger({ service: 'web', environment: 'production', now: clock, ...captured.sinks });
 
-    logger.emit({ ...webCompleted, secret: 'customer@example.test privacy-canary' } as never);
+    Reflect.apply(logger.emit, logger, [{ ...webCompleted, secret: 'customer@example.test privacy-canary' }]);
 
     expect(captured.stdout).toEqual([]);
     expect(captured.stderr).toEqual(['{"version":1,"timestamp":"2026-08-24T12:34:56.789Z","severity":"error","service":"web","event":"logging.failure","outcome":"failed"}\n']);
+  });
+
+  test('snapshots factory configuration before a mutable options object changes', () => {
+    const original = lines();
+    const mutated = lines();
+    const options: {
+      service: StructuredLogService;
+      environment: 'development' | 'test' | 'production';
+      now: () => Date;
+      stdout: (line: string) => void;
+      stderr: (line: string) => void;
+    } = { service: 'web', environment: 'production', now: clock, ...original.sinks };
+    const logger = createStructuredLogger(options);
+    options.service = 'worker';
+    options.environment = 'development';
+    options.now = () => new Date('not-a-date');
+    options.stdout = mutated.sinks.stdout;
+    options.stderr = mutated.sinks.stderr;
+
+    Reflect.apply(logger.emit, logger, [webCompleted]);
+    expect(() => Reflect.apply(logger.emit, logger, [{ ...webCompleted, secret: 'privacy-canary' }])).not.toThrow();
+
+    expect(original.stdout).toEqual(['{"version":1,"timestamp":"2026-08-24T12:34:56.789Z","severity":"info","service":"web","event":"http.request.completed","outcome":"succeeded","correlationId":"request-1","method":"GET","route":"/books","httpStatus":200,"durationMs":12}\n']);
+    expect(original.stderr).toEqual(['{"version":1,"timestamp":"2026-08-24T12:34:56.789Z","severity":"error","service":"web","event":"logging.failure","outcome":"failed"}\n']);
+    expect(mutated.stdout).toEqual([]);
+    expect(mutated.stderr).toEqual([]);
   });
 
   test('makes one nonrecursive stderr logging.failure attempt after a production primary-sink failure', () => {
