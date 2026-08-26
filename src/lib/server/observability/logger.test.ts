@@ -180,15 +180,22 @@ describe('strict structured logger', () => {
   test('captures default stream writers before later replacements', () => {
     const stdoutDescriptor = Object.getOwnPropertyDescriptor(process.stdout, 'write');
     const stderrDescriptor = Object.getOwnPropertyDescriptor(process.stderr, 'write');
+    const stdoutWrite = process.stdout.write;
+    const stderrWrite = process.stderr.write;
     const first = lines();
     const second = lines();
+    const receivers: { stdout: NodeJS.WriteStream[]; stderr: NodeJS.WriteStream[] } = { stdout: [], stderr: [] };
+    function firstStdout(this: NodeJS.WriteStream, line: string): boolean { receivers.stdout.push(this); first.stdout.push(line); return true; }
+    function firstStderr(this: NodeJS.WriteStream, line: string): boolean { receivers.stderr.push(this); first.stderr.push(line); return true; }
+    function secondStdout(this: NodeJS.WriteStream, line: string): boolean { second.stdout.push(line); return true; }
+    function secondStderr(this: NodeJS.WriteStream, line: string): boolean { second.stderr.push(line); return true; }
     try {
-      Object.defineProperty(process.stdout, 'write', { configurable: true, writable: true, value: (line: string) => { first.stdout.push(line); return true; } });
-      Object.defineProperty(process.stderr, 'write', { configurable: true, writable: true, value: (line: string) => { first.stderr.push(line); return true; } });
+      Object.defineProperty(process.stdout, 'write', { configurable: true, writable: true, value: firstStdout });
+      Object.defineProperty(process.stderr, 'write', { configurable: true, writable: true, value: firstStderr });
       const valid = createStructuredLogger({ service: 'web', environment: 'development', now: clock });
       const failing = createStructuredLogger({ service: 'web', environment: 'production', now: clock });
-      Object.defineProperty(process.stdout, 'write', { configurable: true, writable: true, value: (line: string) => { second.stdout.push(line); return true; } });
-      Object.defineProperty(process.stderr, 'write', { configurable: true, writable: true, value: (line: string) => { second.stderr.push(line); return true; } });
+      Object.defineProperty(process.stdout, 'write', { configurable: true, writable: true, value: secondStdout });
+      Object.defineProperty(process.stderr, 'write', { configurable: true, writable: true, value: secondStderr });
 
       valid.emit(webCompleted);
       Reflect.apply(failing.emit, failing, [{ ...webCompleted, secret: 'privacy-canary' }]);
@@ -197,11 +204,17 @@ describe('strict structured logger', () => {
       expect(first.stderr).toEqual(['{"version":1,"timestamp":"2026-08-24T12:34:56.789Z","severity":"error","service":"web","event":"logging.failure","outcome":"failed"}\n']);
       expect(second.stdout).toEqual([]);
       expect(second.stderr).toEqual([]);
+      expect(receivers.stdout).toEqual([process.stdout]);
+      expect(receivers.stderr).toEqual([process.stderr]);
     } finally {
       if (stdoutDescriptor) Object.defineProperty(process.stdout, 'write', stdoutDescriptor);
       else Reflect.deleteProperty(process.stdout, 'write');
       if (stderrDescriptor) Object.defineProperty(process.stderr, 'write', stderrDescriptor);
       else Reflect.deleteProperty(process.stderr, 'write');
+      expect(Object.getOwnPropertyDescriptor(process.stdout, 'write')).toEqual(stdoutDescriptor);
+      expect(Object.getOwnPropertyDescriptor(process.stderr, 'write')).toEqual(stderrDescriptor);
+      expect(process.stdout.write).toBe(stdoutWrite);
+      expect(process.stderr.write).toBe(stderrWrite);
     }
   });
 
