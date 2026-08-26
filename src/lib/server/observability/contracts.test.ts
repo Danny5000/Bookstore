@@ -243,4 +243,54 @@ describe('structured event contracts', () => {
     const case_ = cases.find((entry) => Object.hasOwn(entry.input, key))!;
     expect(() => validate(case_, { ...case_.input, [key]: value })).toThrow();
   });
+
+  test('rejects an inherited registry entry for an own unregistered event', () => {
+    const previous = Object.getOwnPropertyDescriptor(Object.prototype, 'evil.event');
+    Object.defineProperty(Object.prototype, 'evil.event', {
+      configurable: true,
+      value: { services: ['web'], fields: [], severity: 'info', outcome: 'succeeded', sink: 'stdout' }
+    });
+    try {
+      expect(() => validateStructuredEvent('web', timestamp, { event: 'evil.event' } as never)).toThrow();
+    } finally {
+      if (previous) Object.defineProperty(Object.prototype, 'evil.event', previous);
+      else delete (Object.prototype as Record<string, unknown>)['evil.event'];
+    }
+  });
+
+  test('does not emit inherited optional worker fields', () => {
+    const inherited = [['workerId', 'inherited-worker'], ['generation', 42]] as const;
+    const previous = inherited.map(([key]) => [key, Object.getOwnPropertyDescriptor(Object.prototype, key)] as const);
+    for (const [key, value] of inherited) Object.defineProperty(Object.prototype, key, { configurable: true, writable: true, value });
+    try {
+      const failed = cases.find((entry) => entry.input.event === 'worker.failed')!;
+      const claimed = cases.find((entry) => entry.input.event === 'job.claimed')!;
+      const withoutWorker = Object.fromEntries(Object.entries(failed.input).filter(([key]) => key !== 'workerId'));
+      const withoutGeneration = Object.fromEntries(Object.entries(claimed.input).filter(([key]) => key !== 'generation'));
+      expect(validate(failed, withoutWorker).record).not.toHaveProperty('workerId');
+      expect(validate(claimed, withoutGeneration).record).not.toHaveProperty('generation');
+      expect(validate(failed, { ...withoutWorker, workerId }).record.workerId).toBe(workerId);
+      expect(validate(claimed, { ...withoutGeneration, generation: 1 }).record.generation).toBe(1);
+    } finally {
+      for (const [key, descriptor] of previous) {
+        if (descriptor) Object.defineProperty(Object.prototype, key, descriptor);
+        else delete (Object.prototype as Record<string, unknown>)[key];
+      }
+    }
+  });
+
+  test('constructs records without invoking inherited setters', () => {
+    const previous = Object.getOwnPropertyDescriptor(Object.prototype, 'durationMs');
+    let assigned: unknown;
+    Object.defineProperty(Object.prototype, 'durationMs', { configurable: true, set: (value) => { assigned = value; } });
+    try {
+      const result = validate(webCompleted);
+      expect(assigned).toBeUndefined();
+      expect(Object.hasOwn(result.record, 'durationMs')).toBe(true);
+      expect(result.record.durationMs).toBe(0);
+    } finally {
+      if (previous) Object.defineProperty(Object.prototype, 'durationMs', previous);
+      else delete (Object.prototype as Record<string, unknown>).durationMs;
+    }
+  });
 });

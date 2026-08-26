@@ -30,6 +30,10 @@ function exact(value: unknown, keys: readonly string[]): Record<string, unknown>
   if (actual.length !== keys.length || actual.some((key) => typeof key !== 'string' || !keys.includes(key))) invalid();
   return record;
 }
+function bag<T extends object>(): T { return Object.create(null) as T; }
+function put(target: object, key: string, value: unknown): void {
+  Object.defineProperty(target, key, { configurable: true, enumerable: true, value, writable: true });
+}
 function publicState(value: unknown): SafePublicState {
   const record = exact(value, ['name', 'value']);
   if (!isSafeToken(record.name)) invalid();
@@ -37,16 +41,55 @@ function publicState(value: unknown): SafePublicState {
   if (typeof state === 'string') { if (state.length > 100) invalid(); }
   else if (typeof state === 'number') { if (!Number.isSafeInteger(state) || state < -2_147_483_648 || state > 2_147_483_647) invalid(); }
   else if (typeof state !== 'boolean') invalid();
-  return { name: record.name, value: state };
+  const result = bag<SafePublicState>();
+  put(result, 'name', record.name); put(result, 'value', state);
+  return result;
 }
 function validated<C extends string>(input: unknown): SafeDiagnosticError<C> {
   const record = ownObject(input); const keys = Reflect.ownKeys(record);
   if (!keys.every((key) => typeof key === 'string' && ['class', 'code', 'operation', 'outcome', 'correlationId', 'publicState'].includes(key)) || !['class', 'code', 'operation', 'outcome'].every((key) => keys.includes(key))) invalid();
   if (!classes.has(record.class as SafeErrorClass) || !operations.has(record.operation as SafeErrorOperation) || (record.outcome !== 'denied' && record.outcome !== 'failed') || typeof record.code !== 'string' || !codes.has(record.code)) invalid();
-  if ('correlationId' in record && !isCorrelationId(record.correlationId)) invalid();
-  const result: { class: SafeErrorClass; code: SafeCode<C>; operation: SafeErrorOperation; outcome: 'denied' | 'failed'; correlationId?: CorrelationId; publicState?: SafePublicState } = { class: record.class as SafeErrorClass, code: record.code as SafeCode<C>, operation: record.operation as SafeErrorOperation, outcome: record.outcome as 'denied' | 'failed' };
-  if ('correlationId' in record) result.correlationId = record.correlationId as CorrelationId;
-  if ('publicState' in record) result.publicState = publicState(record.publicState);
+  if (Object.hasOwn(record, 'correlationId') && !isCorrelationId(record.correlationId)) invalid();
+  const result = bag<{ class: SafeErrorClass; code: SafeCode<C>; operation: SafeErrorOperation; outcome: 'denied' | 'failed'; correlationId?: CorrelationId; publicState?: SafePublicState }>();
+  put(result, 'class', record.class as SafeErrorClass); put(result, 'code', record.code as SafeCode<C>); put(result, 'operation', record.operation as SafeErrorOperation); put(result, 'outcome', record.outcome as 'denied' | 'failed');
+  if (Object.hasOwn(record, 'correlationId')) put(result, 'correlationId', record.correlationId as CorrelationId);
+  if (Object.hasOwn(record, 'publicState')) put(result, 'publicState', publicState(record.publicState));
+  return result;
+}
+
+type ValidatedMatcherArray<C extends string> = { readonly length: number; readonly [index: number]: SafeErrorMatcher<C> };
+
+function matcherArray<C extends string>(value: unknown): ValidatedMatcherArray<C> {
+  try {
+    if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) invalid();
+    const descriptors = Object.getOwnPropertyDescriptors(value) as unknown as Record<PropertyKey, PropertyDescriptor | undefined>;
+    const length = descriptors['length'];
+    if (!length || !('value' in length) || typeof length.value !== 'number' || !Number.isSafeInteger(length.value) || length.value < 0) invalid();
+    for (const key of Reflect.ownKeys(descriptors)) {
+      if (key === 'length') continue;
+      if (typeof key !== 'string' || !/^(?:0|[1-9][0-9]*)$/.test(key)) invalid();
+      const descriptor = descriptors[key];
+      if (!descriptor || !('value' in descriptor) || !descriptor.enumerable || typeof descriptor.value !== 'function') invalid();
+    }
+    const result = bag<ValidatedMatcherArray<C>>();
+    put(result, 'length', length.value);
+    for (let index = 0; index < length.value; index += 1) {
+      const descriptor = descriptors[String(index)];
+      if (!descriptor || !('value' in descriptor)) invalid();
+      put(result, String(index), descriptor.value as SafeErrorMatcher<C>);
+    }
+    return result;
+  } catch { return invalid(); }
+}
+function reducerOptions<C extends string>(value: unknown): { readonly operation: SafeErrorOperation; readonly correlationId?: CorrelationId; readonly matchers?: ValidatedMatcherArray<C> } {
+  const record = ownObject(value); const keys = Reflect.ownKeys(record);
+  if (!keys.every((key) => typeof key === 'string' && ['operation', 'correlationId', 'matchers'].includes(key)) || !Object.hasOwn(record, 'operation') || !operations.has(record.operation as SafeErrorOperation)) invalid();
+  if (Object.hasOwn(record, 'correlationId') && !isCorrelationId(record.correlationId)) invalid();
+  const matchers = Object.hasOwn(record, 'matchers') ? matcherArray<C>(record.matchers) : undefined;
+  const result = bag<{ operation: SafeErrorOperation; correlationId?: CorrelationId; matchers?: ValidatedMatcherArray<C> }>();
+  put(result, 'operation', record.operation as SafeErrorOperation);
+  if (Object.hasOwn(record, 'correlationId')) put(result, 'correlationId', record.correlationId as CorrelationId);
+  if (matchers !== undefined) put(result, 'matchers', matchers);
   return result;
 }
 
@@ -59,14 +102,17 @@ export function defineSafeCode<const C extends string>(value: C): SafeCode<C> {
 export function createSafeDiagnosticError<const C extends string>(input: SafeDiagnosticError<C>): SafeDiagnosticError<C> { return validated<C>(input); }
 
 export function reduceSafeError<const C extends string = never>(cause: unknown, options: { readonly operation: SafeErrorOperation; readonly correlationId?: CorrelationId; readonly matchers?: readonly SafeErrorMatcher<C>[] }): SafeDiagnosticError<C | 'unexpected_failure'> {
-  if (!operations.has(options.operation) || ('correlationId' in options && !isCorrelationId(options.correlationId))) invalid();
-  for (const matcher of options.matchers ?? []) {
-    try {
-      const match = matcher(cause);
-      if (match !== undefined) return validated<C>(match);
-    } catch { /* an untrusted matcher cannot escape the boundary */ }
+  const safeOptions = reducerOptions<C>(options);
+  if (safeOptions.matchers !== undefined) {
+    for (let index = 0; index < safeOptions.matchers.length; index += 1) {
+      try {
+        const match = safeOptions.matchers[index]!(cause);
+        if (match !== undefined) return validated<C>(match);
+      } catch { /* an untrusted matcher cannot escape the boundary */ }
+    }
   }
-  const result: { class: 'unexpected'; code: SafeCode<'unexpected_failure'>; operation: SafeErrorOperation; outcome: 'failed'; correlationId?: CorrelationId } = { class: 'unexpected', code: defineSafeCode('unexpected_failure'), operation: options.operation, outcome: 'failed' };
-  if (options.correlationId !== undefined) result.correlationId = options.correlationId;
+  const result = bag<{ class: 'unexpected'; code: SafeCode<'unexpected_failure'>; operation: SafeErrorOperation; outcome: 'failed'; correlationId?: CorrelationId }>();
+  put(result, 'class', 'unexpected'); put(result, 'code', defineSafeCode('unexpected_failure')); put(result, 'operation', safeOptions.operation); put(result, 'outcome', 'failed');
+  if (Object.hasOwn(safeOptions, 'correlationId')) put(result, 'correlationId', safeOptions.correlationId);
   return result;
 }

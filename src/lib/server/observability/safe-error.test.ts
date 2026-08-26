@@ -99,4 +99,66 @@ describe('safe diagnostic errors', () => {
   test.each(['Uppercase', '1starts_wrong', 'a'.repeat(101)])('defineSafeCode rejects invalid grammar %s', (value) => {
     expect(() => defineSafeCode(value)).toThrow();
   });
+
+  test('does not copy inherited trusted diagnostic optionals', () => {
+    const inherited = [
+      ['correlationId', correlationId],
+      ['publicState', { name: 'http_status', value: 400 }]
+    ] as const;
+    const previous = inherited.map(([key]) => [key, Object.getOwnPropertyDescriptor(Object.prototype, key)] as const);
+    for (const [key, value] of inherited) Object.defineProperty(Object.prototype, key, { configurable: true, writable: true, value });
+    try {
+      const result = createSafeDiagnosticError({ class: 'request', code: defineSafeCode('invalid_request'), operation: 'http.request', outcome: 'denied' });
+      expect(result).not.toHaveProperty('correlationId');
+      expect(result).not.toHaveProperty('publicState');
+    } finally {
+      for (const [key, descriptor] of previous) {
+        if (descriptor) Object.defineProperty(Object.prototype, key, descriptor);
+        else delete (Object.prototype as Record<string, unknown>)[key];
+      }
+    }
+  });
+
+  test('ignores inherited reducer options', () => {
+    const previous = [
+      ['correlationId', Object.getOwnPropertyDescriptor(Object.prototype, 'correlationId')],
+      ['publicState', Object.getOwnPropertyDescriptor(Object.prototype, 'publicState')],
+      ['matchers', Object.getOwnPropertyDescriptor(Object.prototype, 'matchers')]
+    ] as const;
+    let invoked = false;
+    Object.defineProperties(Object.prototype, {
+      correlationId: { configurable: true, writable: true, value: correlationId },
+      publicState: { configurable: true, writable: true, value: { name: 'safe', value: true } },
+      matchers: { configurable: true, writable: true, value: [() => { invoked = true; return valid(); }] }
+    });
+    try {
+      expect(reduceSafeError(new Error(), { operation: 'http.request' })).toEqual({ class: 'unexpected', code: 'unexpected_failure', operation: 'http.request', outcome: 'failed' });
+      expect(invoked).toBe(false);
+    } finally {
+      for (const [key, descriptor] of previous) {
+        if (descriptor) Object.defineProperty(Object.prototype, key, descriptor);
+        else delete (Object.prototype as Record<string, unknown>)[key];
+      }
+    }
+  });
+
+  test.each([
+    { operation: 'http.request', matchers: undefined },
+    { operation: 'http.request', correlationId: undefined },
+    { operation: 'http.request', publicState: { name: 'safe', value: true } },
+    { operation: 'http.request', [Symbol('secret')]: true }
+  ])('rejects non-exact reducer options %#', (options) => {
+    expect(() => reduceSafeError(new Error(), options as never)).toThrow();
+  });
+
+  test('iterates only copied validated matcher functions', () => {
+    const matcher: SafeErrorMatcher<'known_failure'> = () => createSafeDiagnosticError({ class: 'request', code: defineSafeCode('known_failure'), operation: 'http.request', outcome: 'failed' });
+    const matchers = new Proxy([matcher], {
+      get(target, key, receiver) {
+        if (key === Symbol.iterator) throw new Error('unsafe iterator');
+        return Reflect.get(target, key, receiver);
+      }
+    });
+    expect(reduceSafeError(new Error(), { operation: 'http.request', matchers: matchers as never })).toEqual({ class: 'request', code: 'known_failure', operation: 'http.request', outcome: 'failed' });
+  });
 });

@@ -130,7 +130,10 @@ function string(value: unknown, pattern: RegExp): string { return typeof value =
 function integer(value: unknown, min: number, max: number): number { return typeof value === 'number' && Number.isSafeInteger(value) && value >= min && value <= max ? value : invalid(); }
 function positive(value: unknown): number { return isPositiveSignedInt32(value) ? value : invalid(); }
 function timestamp(value: string): string { try { return new Date(value).toISOString() === value ? value : invalid(); } catch { return invalid(); } }
-function put(record: Record<string, string | number | boolean>, key: string, value: string | number | boolean): void { record[key] = value; }
+function bag(): Record<string, string | number | boolean> { return Object.create(null) as Record<string, string | number | boolean>; }
+function put(record: Record<string, string | number | boolean>, key: string, value: string | number | boolean): void {
+  Object.defineProperty(record, key, { configurable: true, enumerable: true, value, writable: true });
+}
 function fieldValue(field: string, value: unknown, metadata: EventMetadata, service: StructuredLogService): string | number | boolean {
   switch (field) {
     case 'correlationId': return string(value, CORRELATION);
@@ -154,22 +157,25 @@ function fieldValue(field: string, value: unknown, metadata: EventMetadata, serv
 }
 function construct(event: EventName, metadata: EventMetadata, service: StructuredLogService, timestamp_: string, values: Readonly<Record<string, string | number | boolean>>): ValidatedStructuredRecord {
   const severity = typeof metadata.severity === 'function' ? metadata.severity(values) : metadata.severity;
-  const record: Record<string, string | number | boolean> = { version: 1, timestamp: timestamp_, severity, service, event, outcome: metadata.outcome };
+  const record = bag();
+  put(record, 'version', 1); put(record, 'timestamp', timestamp_); put(record, 'severity', severity); put(record, 'service', service); put(record, 'event', event); put(record, 'outcome', metadata.outcome);
   for (const field of metadata.fields) put(record, field, values[field]!);
-  if (metadata.optional !== undefined && metadata.optional in values) put(record, metadata.optional, values[metadata.optional]!);
+  if (metadata.optional !== undefined && Object.hasOwn(values, metadata.optional)) put(record, metadata.optional, values[metadata.optional]!);
   return { record, sink: metadata.sink };
 }
 
 export function validateStructuredEvent<S extends StructuredLogService>(service: S, valueTimestamp: string, input: StructuredEventInputFor<S>): ValidatedStructuredRecord {
   if (!isService(service)) return invalid();
-  const raw = object(input); const event = string(raw.event, TOKEN); const metadata = EVENTS[event as EventName];
-  if (!metadata || metadata.internal || !metadata.services.includes(service)) return invalid();
+  const raw = object(input); const event = string(raw.event, TOKEN);
+  if (!Object.hasOwn(EVENTS, event)) return invalid();
+  const metadata = EVENTS[event as EventName]!;
+  if (metadata.internal || !metadata.services.includes(service)) return invalid();
   const keys = ['event', ...metadata.fields, ...(metadata.optional === undefined ? [] : [metadata.optional])];
   const hasOptional = metadata.optional !== undefined && Object.hasOwn(raw, metadata.optional);
   const keyed = exact(raw, hasOptional ? keys : keys.filter((key) => key !== metadata.optional));
-  const values: Record<string, string | number | boolean> = {};
-  for (const field of metadata.fields) values[field] = fieldValue(field, keyed[field], metadata, service);
-  if (metadata.optional !== undefined && hasOptional) values[metadata.optional] = fieldValue(metadata.optional, keyed[metadata.optional], metadata, service);
+  const values = bag();
+  for (const field of metadata.fields) put(values, field, fieldValue(field, keyed[field], metadata, service));
+  if (metadata.optional !== undefined && hasOptional) put(values, metadata.optional, fieldValue(metadata.optional, keyed[metadata.optional], metadata, service));
   return construct(event as PublicEvent, metadata, service, timestamp(valueTimestamp), values);
 }
 
