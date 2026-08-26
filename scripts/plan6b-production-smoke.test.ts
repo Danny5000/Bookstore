@@ -6,6 +6,7 @@ import {
   assertLoopbackPortAvailable,
   executeProductionSmoke,
   createProductionSmokeManifest,
+  createProductionSmokeCommandRuntime,
   createProductionSmokeDockerOperations as createProductionSmokeDockerOperationsWithClock,
   createProductionSmokePortOperations,
   parsePlan6bSmokeStage,
@@ -18,6 +19,7 @@ import {
   type ProductionSmokeManifest,
   type ProductionSmokeOperations,
   type ProductionSmokeCommandRuntime,
+  type ProductionSmokeCommandResult,
   type ProductionSmokeDockerDependencies,
   type ProductionSmokePortOperations,
   type ProductionSmokePortRuntime,
@@ -69,6 +71,16 @@ const socketAdapterTraps = vi.hoisted(() => {
   };
 });
 
+const commandAdapterTraps = vi.hoisted(() => ({
+  spawnSync: vi.fn()
+}));
+
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  const spawnSync = commandAdapterTraps.spawnSync as unknown as typeof actual.spawnSync;
+  return { ...actual, spawnSync };
+});
+
 vi.mock('node:net', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:net')>();
   const createServer = socketAdapterTraps.createServer as unknown as typeof actual.createServer;
@@ -97,6 +109,7 @@ beforeEach(() => {
   socketAdapterTraps.state.unexpectedCalls.length = 0;
   socketAdapterTraps.createServer.mockClear();
   socketAdapterTraps.createSocket.mockClear();
+  commandAdapterTraps.spawnSync.mockReset();
 });
 
 afterEach(() => {
@@ -507,6 +520,55 @@ const safeRuntime = (): DisabledRuntimeEvidence => ({
   activeAllocationAlgorithmVersion: 2,
   providerLedgerSubjectCount: 0
 });
+
+type CapturedCommandResult = ProductionSmokeCommandResult & {
+  readonly stderr?: string;
+};
+
+function runtimeInspectionCommand(
+  workerHealthRehearsal: (readyFileOverride: string) => CapturedCommandResult
+): ProductionSmokeCommandRuntime {
+  const appId = 'a'.repeat(64);
+  const workerId = 'b'.repeat(64);
+  const postgresId = 'c'.repeat(64);
+  return {
+    run: vi.fn(async () => undefined),
+    capture: vi.fn(async (args) => {
+      if (args.includes('ps') && args.includes('--quiet')) {
+        const service = args.at(-1);
+        return {
+          status: 0,
+          stdout: `${service === 'app' ? appId : service === 'worker' ? workerId : postgresId}\n`
+        };
+      }
+      if (args[0] === 'inspect' && args.includes('{{json .Config.Env}}')) {
+        return {
+          status: 0,
+          stdout: args.at(-1) === workerId
+            ? JSON.stringify([
+                'WORKER_CONCURRENCY=1',
+                'WORKER_HEARTBEAT_MAX_AGE_MS=20000'
+              ])
+            : '[]'
+        };
+      }
+      if (args[0] === 'inspect' && args.includes('{{json .Mounts}}')) {
+        return { status: 0, stdout: '[]' };
+      }
+      if (args[0] === 'port') return { status: 0, stdout: '' };
+      if (args.includes('build/services/worker-health.js')) {
+        const overrideIndex = args.indexOf('--env');
+        return overrideIndex === -1
+          ? { status: 0, stdout: '' }
+          : workerHealthRehearsal(String(args[overrideIndex + 1]));
+      }
+      if (args.includes('psql')) {
+        return { status: 0, stdout: JSON.stringify(safeRuntime()) };
+      }
+      return { status: 0, stdout: '' };
+    })
+  };
+}
 
 const migrationState = (
   overrides: Partial<Record<
@@ -989,6 +1051,42 @@ describe('Plan 6B production smoke ownership', () => {
     expect(Object.hasOwn(error as object, 'cause')).toBe(false);
   });
 
+  it('command runtime retains fixed stderr for a successfully spawned allowed failure', async () => {
+    commandAdapterTraps.spawnSync.mockReturnValueOnce({
+      status: 1,
+      stdout: '',
+      stderr: '[worker-health] unhealthy\n',
+      error: undefined,
+      signal: null
+    });
+
+    await expect(createProductionSmokeCommandRuntime().capture(
+      ['compose', 'exec', '-T', 'worker', 'node', 'build/services/worker-health.js'],
+      { PATH: 'safe-path' },
+      true
+    )).resolves.toEqual({
+      status: 1,
+      stdout: '',
+      stderr: '[worker-health] unhealthy\n'
+    });
+  });
+
+  it('command runtime rejects a spawn error even when command failure is allowed', async () => {
+    commandAdapterTraps.spawnSync.mockReturnValueOnce({
+      status: null,
+      stdout: '',
+      stderr: '',
+      error: Object.assign(new Error('spawn docker ENOENT'), { code: 'ENOENT' }),
+      signal: null
+    });
+
+    await expect(createProductionSmokeCommandRuntime().capture(
+      ['compose', 'exec', '-T', 'worker', 'node', 'build/services/worker-health.js'],
+      { PATH: '' },
+      true
+    )).rejects.toThrow('[plan6b-smoke] Docker command failed');
+  });
+
   it('refuses an unsafe manifest before invoking cleanup or another operation', async () => {
     const trace: string[] = [];
     await expect(executeProductionSmoke(
@@ -1271,6 +1369,46 @@ describe('Plan 6B production smoke ownership', () => {
     expect(queries[0]).toContain("'activeAllocationAlgorithmVersion'");
   });
 
+  it('rejects transport exit 125 during the stale worker-health rehearsal', async () => {
+    const owned = manifest();
+    const docker = createProductionSmokeDockerOperations(owned, {
+      command: runtimeInspectionCommand(() => ({
+        status: 125,
+        stdout: '',
+        stderr: '[worker-health] unhealthy\n'
+      })),
+      environment: { PATH: 'safe-path' },
+      assertPortAvailable: vi.fn(async () => undefined),
+      requestStatus: vi.fn(async () => 503),
+      wait: vi.fn(async () => undefined)
+    });
+
+    await expect(docker.inspectDisabledRuntime(owned)).rejects.toThrow(
+      /stale worker health rehearsal/u
+    );
+  });
+
+  it('rejects exit one without validator stderr during the missing-slot rehearsal', async () => {
+    const owned = manifest();
+    const docker = createProductionSmokeDockerOperations(owned, {
+      command: runtimeInspectionCommand((readyFileOverride) => ({
+        status: 1,
+        stdout: '',
+        stderr: readyFileOverride.includes('stale-')
+          ? '[worker-health] unhealthy\n'
+          : ''
+      })),
+      environment: { PATH: 'safe-path' },
+      assertPortAvailable: vi.fn(async () => undefined),
+      requestStatus: vi.fn(async () => 503),
+      wait: vi.fn(async () => undefined)
+    });
+
+    await expect(docker.inspectDisabledRuntime(owned)).rejects.toThrow(
+      /missing-slot worker health rehearsal/u
+    );
+  });
+
   it('inspects app and worker mounts plus /run/secrets instead of trusting environment alone', async () => {
     const runs: readonly string[][] = [];
     const mutableRuns = runs as string[][];
@@ -1317,7 +1455,9 @@ describe('Plan 6B production smoke ownership', () => {
         }
         if (args[0] === 'port') return { status: 0, stdout: '' };
         if (args.includes('build/services/worker-health.js')) {
-          return { status: args.includes('--env') ? 1 : 0, stdout: '' };
+          return args.includes('--env')
+            ? { status: 1, stdout: '', stderr: '[worker-health] unhealthy\n' }
+            : { status: 0, stdout: '' };
         }
         if (args.includes('psql')) {
           queries.push(String(args.at(-1)));
@@ -1455,7 +1595,9 @@ describe('Plan 6B production smoke ownership', () => {
         }
         if (args[0] === 'port') return { status: 0, stdout: '' };
         if (args.includes('build/services/worker-health.js')) {
-          return { status: args.includes('--env') ? 1 : 0, stdout: '' };
+          return args.includes('--env')
+            ? { status: 1, stdout: '', stderr: '[worker-health] unhealthy\n' }
+            : { status: 0, stdout: '' };
         }
         if (args.includes('psql')) {
           return {
@@ -1589,7 +1731,9 @@ describe('Plan 6B production smoke ownership', () => {
         }
         if (args[0] === 'port') return { status: 0, stdout: '' };
         if (args.includes('build/services/worker-health.js')) {
-          return { status: args.includes('--env') ? 1 : 0, stdout: '' };
+          return args.includes('--env')
+            ? { status: 1, stdout: '', stderr: '[worker-health] unhealthy\n' }
+            : { status: 0, stdout: '' };
         }
         if (args.includes('psql')) {
           jobSnapshot += 1;

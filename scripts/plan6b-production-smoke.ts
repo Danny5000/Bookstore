@@ -88,6 +88,7 @@ export interface ProductionSmokeOperations {
 export interface ProductionSmokeCommandResult {
   readonly status: number;
   readonly stdout: string;
+  readonly stderr?: string;
 }
 
 export interface ProductionSmokeCommandRuntime {
@@ -417,6 +418,7 @@ const root='/run/secrets';
 const names=fs.existsSync(root)?fs.readdirSync(root):[];
 if(names.some((name)=>/stripe/i.test(name)))process.exit(1);`;
 const WORKER_HEALTH_ARTIFACT = 'build/services/worker-health.js';
+const WORKER_HEALTH_UNHEALTHY_STDERR = '[worker-health] unhealthy\n';
 const WRITE_WORKER_HEARTBEAT_REHEARSAL = `const fs=require('node:fs');
 const [path,encoded]=process.argv.slice(1);
 if(!path||!encoded)process.exit(1);
@@ -874,7 +876,10 @@ export function createProductionSmokeDockerOperations(
         environment,
         true
       );
-      assert(stale.status !== 0, 'stale worker health rehearsal was accepted');
+      assert(
+        stale.status === 1 && stale.stderr === WORKER_HEALTH_UNHEALTHY_STDERR,
+        'stale worker health rehearsal did not prove validator rejection'
+      );
 
       let missingSlotCreated = false;
       try {
@@ -885,7 +890,10 @@ export function createProductionSmokeDockerOperations(
           environment,
           true
         );
-        assert(missingSlot.status !== 0, 'missing-slot worker health rehearsal was accepted');
+        assert(
+          missingSlot.status === 1 && missingSlot.stderr === WORKER_HEALTH_UNHEALTHY_STDERR,
+          'missing-slot worker health rehearsal did not prove validator rejection'
+        );
       } finally {
         if (missingSlotCreated) await removeWorkerHeartbeat(missingSlotPath);
       }
@@ -1692,11 +1700,15 @@ export function createProductionSmokeCommandRuntime(): ProductionSmokeCommandRun
       timeout: 30 * 60 * 1000,
       maxBuffer: 16 * 1024 * 1024
     });
-    const status = result.status ?? 1;
-    if ((result.error || status !== 0) && !allowFailure) {
+    if (result.error || result.status === null) {
       throw smokeError('Docker command failed');
     }
-    return { status, stdout: result.stdout ?? '' };
+    if (result.status !== 0 && !allowFailure) throw smokeError('Docker command failed');
+    return {
+      status: result.status,
+      stdout: result.stdout ?? '',
+      stderr: result.stderr ?? ''
+    };
   };
   return {
     async run(argumentsToRun, environment) {
