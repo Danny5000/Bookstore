@@ -140,14 +140,28 @@ export function loadWorkerApplicationConfig(
   source: EnvironmentValues,
   readSecretFile?: SecretFileReader
 ): WorkerApplicationConfig {
+  const application = loadScopedApplicationConfig(
+    source,
+    'worker',
+    OPTIONAL_SETTINGS.filter((name) => name !== 'STRIPE_WEBHOOK_SECRET'),
+    readSecretFile
+  );
+  const workerSource: EnvironmentValues = {
+    WORKER_READY_FILE: source.WORKER_READY_FILE,
+    WORKER_READY_FILE_FILE: source.WORKER_READY_FILE_FILE,
+    WORKER_CONCURRENCY: source.WORKER_CONCURRENCY,
+    WORKER_CONCURRENCY_FILE: source.WORKER_CONCURRENCY_FILE,
+    WORKER_HEARTBEAT_INTERVAL_MS: source.WORKER_HEARTBEAT_INTERVAL_MS,
+    WORKER_HEARTBEAT_INTERVAL_MS_FILE: source.WORKER_HEARTBEAT_INTERVAL_MS_FILE,
+    WORKER_HEARTBEAT_MAX_AGE_MS: source.WORKER_HEARTBEAT_MAX_AGE_MS,
+    WORKER_HEARTBEAT_MAX_AGE_MS_FILE: source.WORKER_HEARTBEAT_MAX_AGE_MS_FILE,
+    JOB_POLL_INTERVAL_MS: String(application.jobs.pollIntervalMs),
+    JOB_LEASE_MS: String(application.jobs.leaseMs)
+  };
+
   return {
-    ...loadScopedApplicationConfig(
-      source,
-      'worker',
-      OPTIONAL_SETTINGS.filter((name) => name !== 'STRIPE_WEBHOOK_SECRET'),
-      readSecretFile
-    ),
-    worker: loadWorkerHealthConfig(source, readSecretFile)
+    ...application,
+    worker: loadWorkerHealthConfig(workerSource, readSecretFile)
   };
 }
 

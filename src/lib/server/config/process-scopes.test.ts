@@ -207,6 +207,111 @@ describe('process-scoped configuration loaders', () => {
     expect(readSecretFile).not.toHaveBeenCalled();
   });
 
+  it.each([
+    {
+      label: 'poll interval',
+      setting: 'JOB_POLL_INTERVAL_MS',
+      path: '/run/settings/changing-job-poll',
+      values: ['20000\n', '1000\n'],
+      expectedIssue:
+        'WORKER_HEARTBEAT_MAX_AGE_MS: must be at least JOB_POLL_INTERVAL_MS plus twice WORKER_HEARTBEAT_INTERVAL_MS'
+    },
+    {
+      label: 'lease',
+      setting: 'JOB_LEASE_MS',
+      path: '/run/settings/changing-job-lease',
+      values: ['15000\n', '30000\n'],
+      expectedIssue: 'WORKER_HEARTBEAT_MAX_AGE_MS: must be less than JOB_LEASE_MS'
+    }
+  ] as const)(
+    'validates freshness against the one $label file snapshot returned in jobs',
+    ({ setting, path, values, expectedIssue }) => {
+      let reads = 0;
+      const readSecretFile = vi.fn((actualPath: string) => {
+        expect(actualPath).toBe(path);
+        const value = values[Math.min(reads, values.length - 1)];
+        reads += 1;
+        return value!;
+      });
+      let thrown: unknown;
+      try {
+        scopedLoaders.loadWorkerApplicationConfig(
+          productionEnvironment({
+            [setting]: undefined,
+            [`${setting}_FILE`]: path
+          }),
+          readSecretFile
+        );
+      } catch (cause: unknown) {
+        thrown = cause;
+      }
+
+      expect(thrown).toBeInstanceOf(Error);
+      expect((thrown as Error).message).toContain(expectedIssue);
+      expect(readSecretFile).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it('returns one coherent worker application shape from changing shared files', () => {
+    const values: Readonly<Record<string, readonly string[]>> = {
+      '/run/settings/job-poll': ['1000\n', '2000\n'],
+      '/run/settings/job-lease': ['30000\n', '25000\n']
+    };
+    const reads = new Map<string, number>();
+    const readSecretFile = vi.fn((path: string) => {
+      const candidates = values[path];
+      if (!candidates) throw new Error(`unexpected setting read: ${path}`);
+      const index = reads.get(path) ?? 0;
+      reads.set(path, index + 1);
+      return candidates[Math.min(index, candidates.length - 1)]!;
+    });
+    const config = scopedLoaders.loadWorkerApplicationConfig(
+      productionEnvironment({
+        JOB_POLL_INTERVAL_MS: undefined,
+        JOB_POLL_INTERVAL_MS_FILE: '/run/settings/job-poll',
+        JOB_LEASE_MS: undefined,
+        JOB_LEASE_MS_FILE: '/run/settings/job-lease'
+      }),
+      readSecretFile
+    );
+
+    expect(config.jobs).toEqual({
+      pollIntervalMs: 1000,
+      leaseMs: 30000,
+      retryBaseMs: 1000,
+      retryMaxMs: 300000
+    });
+    expect(config.worker).toEqual({
+      heartbeatFile: '/tmp/worker-ready',
+      concurrency: 1,
+      heartbeatIntervalMs: 5000,
+      heartbeatMaxAgeMs: 20000
+    });
+    expect(readSecretFile.mock.calls.map(([path]) => path)).toEqual([
+      '/run/settings/job-poll',
+      '/run/settings/job-lease'
+    ]);
+  });
+
+  it.each([
+    'WORKER_READY_FILE',
+    'WORKER_CONCURRENCY',
+    'WORKER_HEARTBEAT_INTERVAL_MS',
+    'WORKER_HEARTBEAT_MAX_AGE_MS'
+  ])('preserves composed-loader direct/file ambiguity for %s', (setting) => {
+    const readSecretFile = vi.fn(() => {
+      throw new Error('an ambiguous worker setting must fail before reading its file');
+    });
+
+    expect(() =>
+      scopedLoaders.loadWorkerApplicationConfig(
+        productionEnvironment({ [`${setting}_FILE`]: `/run/settings/${setting}` }),
+        readSecretFile
+      )
+    ).toThrow(new RegExp(`${setting} and ${setting}_FILE cannot both be set`, 'u'));
+    expect(readSecretFile).not.toHaveBeenCalled();
+  });
+
   it('loads worker health from exactly six noncredential settings', () => {
     const allowedValues: Readonly<Record<string, string>> = {
       '/run/settings/worker-ready': '/tmp/worker-ready\n',
