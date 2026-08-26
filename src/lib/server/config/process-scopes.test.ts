@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import * as configLoad from './load';
+import type { WorkerApplicationConfig } from './load';
 import type { EnvironmentValues } from './read-setting';
 import type { ApplicationConfig, DatabaseConfig } from './schema';
+import { loadWorkerHealthConfig } from './worker';
 
 const scopedLoaders = configLoad as typeof configLoad & {
   loadDatabaseConfig(
@@ -15,7 +17,7 @@ const scopedLoaders = configLoad as typeof configLoad & {
   loadWorkerApplicationConfig(
     source: EnvironmentValues,
     readSecretFile?: (path: string) => string
-  ): ApplicationConfig;
+  ): WorkerApplicationConfig;
 };
 
 function productionEnvironment(overrides: EnvironmentValues = {}): EnvironmentValues {
@@ -38,6 +40,8 @@ function productionEnvironment(overrides: EnvironmentValues = {}): EnvironmentVa
     JOB_RETRY_MAX_MS: '300000',
     WORKER_READY_FILE: '/tmp/worker-ready',
     WORKER_CONCURRENCY: '1',
+    WORKER_HEARTBEAT_INTERVAL_MS: '5000',
+    WORKER_HEARTBEAT_MAX_AGE_MS: '20000',
     STORAGE_PROVIDER: 'local',
     STORAGE_STAGING_ROOT: '/var/lib/pale-orbit/staging',
     STORAGE_PUBLICATION_ROOT: '/var/lib/pale-orbit/publication',
@@ -146,6 +150,40 @@ describe('process-scoped configuration loaders', () => {
     expect(readSecretFile).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['full', scopedLoaders.loadApplicationConfig],
+    ['web', scopedLoaders.loadWebApplicationConfig]
+  ] as const)(
+    '%s configuration neither reads nor retains worker-only direct or file settings',
+    (_scope, load) => {
+      const readSecretFile = vi.fn(() => {
+        throw new Error('common application configuration must not read worker-only files');
+      });
+      const config = load(
+        productionEnvironment({
+          WORKER_READY_FILE: '/tmp/ignored-worker-ready',
+          WORKER_READY_FILE_FILE: '/run/settings/ignored-worker-ready',
+          WORKER_CONCURRENCY: 'invalid-and-ignored',
+          WORKER_CONCURRENCY_FILE: '/run/settings/ignored-worker-concurrency',
+          WORKER_HEARTBEAT_INTERVAL_MS: 'invalid-and-ignored',
+          WORKER_HEARTBEAT_INTERVAL_MS_FILE: '/run/settings/ignored-worker-interval',
+          WORKER_HEARTBEAT_MAX_AGE_MS: 'invalid-and-ignored',
+          WORKER_HEARTBEAT_MAX_AGE_MS_FILE: '/run/settings/ignored-worker-max-age'
+        }),
+        readSecretFile
+      );
+
+      expect(config).not.toHaveProperty('worker');
+      expect(config.jobs).toEqual({
+        pollIntervalMs: 1000,
+        leaseMs: 30000,
+        retryBaseMs: 1000,
+        retryMaxMs: 300000
+      });
+      expect(readSecretFile).not.toHaveBeenCalled();
+    }
+  );
+
   it('loads worker configuration without reading or retaining the webhook secret', () => {
     const readSecretFile = vi.fn(() => {
       throw new Error('worker must not read the webhook secret file');
@@ -160,7 +198,67 @@ describe('process-scoped configuration loaders', () => {
       secretKey: 'sk_test_process_scope_only',
       webhookSecret: undefined
     });
+    expect(config.worker).toEqual({
+      heartbeatFile: '/tmp/worker-ready',
+      concurrency: 1,
+      heartbeatIntervalMs: 5000,
+      heartbeatMaxAgeMs: 20000
+    });
     expect(readSecretFile).not.toHaveBeenCalled();
+  });
+
+  it('loads worker health from exactly six noncredential settings', () => {
+    const allowedValues: Readonly<Record<string, string>> = {
+      '/run/settings/worker-ready': '/tmp/worker-ready\n',
+      '/run/settings/worker-concurrency': '2\n',
+      '/run/settings/worker-interval': '5000\n',
+      '/run/settings/worker-max-age': '20000\n',
+      '/run/settings/job-poll': '1000\n',
+      '/run/settings/job-lease': '30000\n'
+    };
+    const readSecretFile = vi.fn((path: string) => {
+      const value = allowedValues[path];
+      if (value === undefined) throw new Error(`unexpected secret read: ${path}`);
+      return value;
+    });
+    const source: EnvironmentValues = {
+      WORKER_READY_FILE_FILE: '/run/settings/worker-ready',
+      WORKER_CONCURRENCY_FILE: '/run/settings/worker-concurrency',
+      WORKER_HEARTBEAT_INTERVAL_MS_FILE: '/run/settings/worker-interval',
+      WORKER_HEARTBEAT_MAX_AGE_MS_FILE: '/run/settings/worker-max-age',
+      JOB_POLL_INTERVAL_MS_FILE: '/run/settings/job-poll',
+      JOB_LEASE_MS_FILE: '/run/settings/job-lease',
+      DATABASE_PASSWORD_FILE: '/run/secrets/database',
+      DATABASE_OWNER_PASSWORD_FILE: '/run/secrets/database-owner',
+      DATABASE_WORKER_PASSWORD_FILE: '/run/secrets/database-worker',
+      DATABASE_STORAGE_CLEANUP_PASSWORD_FILE: '/run/secrets/database-storage-cleanup',
+      STORAGE_STAGING_ROOT_FILE: '/run/settings/storage',
+      SMTP_USER_FILE: '/run/secrets/smtp-user',
+      SMTP_PASSWORD_FILE: '/run/secrets/smtp-password',
+      AUTH_SECRET_FILE: '/run/secrets/auth',
+      STRIPE_SECRET_KEY_FILE: '/run/secrets/stripe',
+      STRIPE_WEBHOOK_SECRET_FILE: '/run/secrets/webhook',
+      ORIGIN_FILE: '/run/settings/origin',
+      APPLICATION_MODE_FILE: '/run/settings/application-mode',
+      JOB_RETRY_BASE_MS_FILE: '/run/settings/retry-base',
+      JOB_RETRY_MAX_MS_FILE: '/run/settings/retry-max',
+      BOOTSTRAP_ADMIN_PASSWORD_FILE: '/run/secrets/bootstrap'
+    };
+
+    expect(loadWorkerHealthConfig(source, readSecretFile)).toEqual({
+      heartbeatFile: '/tmp/worker-ready',
+      concurrency: 2,
+      heartbeatIntervalMs: 5000,
+      heartbeatMaxAgeMs: 20000
+    });
+    expect(readSecretFile.mock.calls.map(([path]) => path)).toEqual([
+      '/run/settings/worker-ready',
+      '/run/settings/worker-concurrency',
+      '/run/settings/worker-interval',
+      '/run/settings/worker-max-age',
+      '/run/settings/job-poll',
+      '/run/settings/job-lease'
+    ]);
   });
 
   it('fails closed for secrets required by each long-lived process', () => {

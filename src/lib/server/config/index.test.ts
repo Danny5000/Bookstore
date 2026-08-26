@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { loadApplicationConfig } from './index';
+import {
+  loadApplicationConfig,
+  loadWorkerApplicationConfig,
+  type WorkerApplicationConfig,
+  type WorkerProcessConfig
+} from './index';
 import { ConfigurationError, type EnvironmentValues } from './read-setting';
+import { parseApplicationConfig } from './schema';
 
 const VALID_DEVELOPMENT_ENVIRONMENT: EnvironmentValues = {
   APP_ENV: 'development',
@@ -62,6 +68,20 @@ const VALID_DEVELOPMENT_ENVIRONMENT: EnvironmentValues = {
   SMTP_SOCKET_TIMEOUT_MS: '10000'
 };
 
+describe('parseApplicationConfig', () => {
+  it('rejects worker-only keys at the raw common-schema boundary', () => {
+    expect(() =>
+      parseApplicationConfig({
+        ...VALID_DEVELOPMENT_ENVIRONMENT,
+        WORKER_HEARTBEAT_INTERVAL_MS: '5000',
+        WORKER_HEARTBEAT_MAX_AGE_MS: '20000'
+      })
+    ).toThrow(
+      /WORKER_READY_FILE.*WORKER_CONCURRENCY.*WORKER_HEARTBEAT_INTERVAL_MS.*WORKER_HEARTBEAT_MAX_AGE_MS/u
+    );
+  });
+});
+
 describe('loadApplicationConfig', () => {
   it('returns a typed configuration from direct development values', () => {
     expect(loadApplicationConfig(VALID_DEVELOPMENT_ENVIRONMENT)).toEqual({
@@ -83,9 +103,7 @@ describe('loadApplicationConfig', () => {
         pollIntervalMs: 1000,
         leaseMs: 30000,
         retryBaseMs: 1000,
-        retryMaxMs: 300000,
-        workerReadyFile: '.worker-ready',
-        concurrency: 1
+        retryMaxMs: 300000
       },
       storage: {
         provider: 'local',
@@ -149,7 +167,7 @@ describe('loadApplicationConfig', () => {
     });
   });
 
-  it('returns bounded database and worker settings', () => {
+  it('returns bounded database and common job settings', () => {
     const config = loadApplicationConfig(VALID_DEVELOPMENT_ENVIRONMENT);
 
     expect(config.database).toMatchObject({
@@ -162,9 +180,7 @@ describe('loadApplicationConfig', () => {
       pollIntervalMs: 1000,
       leaseMs: 30000,
       retryBaseMs: 1000,
-      retryMaxMs: 300000,
-      workerReadyFile: '.worker-ready',
-      concurrency: 1
+      retryMaxMs: 300000
     });
     expect(config.storage).toEqual({
       provider: 'local',
@@ -183,6 +199,26 @@ describe('loadApplicationConfig', () => {
       maxImagePixels: 100000000,
       maxCompressionRatio: 200,
       timeoutMs: 900000
+    });
+  });
+
+  it('exports and composes worker-only settings only for the worker loader', () => {
+    const config: WorkerApplicationConfig = loadWorkerApplicationConfig(
+      VALID_DEVELOPMENT_ENVIRONMENT
+    );
+    const worker: WorkerProcessConfig = config.worker;
+
+    expect(config.jobs).toEqual({
+      pollIntervalMs: 1000,
+      leaseMs: 30000,
+      retryBaseMs: 1000,
+      retryMaxMs: 300000
+    });
+    expect(worker).toEqual({
+      heartbeatFile: '.worker-ready',
+      concurrency: 1,
+      heartbeatIntervalMs: 5000,
+      heartbeatMaxAgeMs: 20000
     });
   });
 
@@ -354,8 +390,6 @@ describe('loadApplicationConfig', () => {
     ['DATABASE_READINESS_TIMEOUT_MS', 'not-a-number'],
     ['JOB_POLL_INTERVAL_MS', '0'],
     ['JOB_LEASE_MS', '500'],
-    ['WORKER_CONCURRENCY', '0'],
-    ['WORKER_CONCURRENCY', '17'],
     ['UPLOAD_MAX_BYTES', '0'],
     ['INGEST_MAX_ENTRIES', '100001'],
     ['INGEST_MAX_COMPRESSION_RATIO', '0'],

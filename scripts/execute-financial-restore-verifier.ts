@@ -938,9 +938,7 @@ async function exerciseFinancialAdminClaimMatrix(): Promise<FinancialAdminMatrix
         pollIntervalMs: 25,
         leaseMs: 30_000,
         retryBaseMs: 10,
-        retryMaxMs: 1_000,
-        workerReadyFile: 'restore-verifier-financial-worker',
-        concurrency: 1
+        retryMaxMs: 1_000
       },
       () => new Date(),
       'all',

@@ -8,6 +8,7 @@ export {
   loadWebApplicationConfig,
   loadWorkerApplicationConfig
 } from './load';
+export type { WorkerApplicationConfig } from './load';
 export type {
   ApplicationConfig,
   ApplicationMode,
@@ -20,6 +21,7 @@ export type {
   StorageConfig,
   StripeConfig
 } from './schema';
+export type { WorkerProcessConfig } from './worker';
 
 let cachedConfiguration: ApplicationConfig | undefined;
 

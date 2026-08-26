@@ -40,7 +40,7 @@ const rawDatabaseConfigSchema = z.strictObject({
 }));
 
 const rawApplicationConfigSchema = z
-  .object({
+  .strictObject({
     APP_ENV: z.enum(['development', 'test', 'production']),
     APPLICATION_MODE: z.enum(['prototype', 'maintenance']),
     ORIGIN: z.url().refine((value) => {
@@ -60,8 +60,6 @@ const rawApplicationConfigSchema = z
     JOB_LEASE_MS: milliseconds,
     JOB_RETRY_BASE_MS: milliseconds,
     JOB_RETRY_MAX_MS: milliseconds,
-    WORKER_READY_FILE: z.string().trim().min(1),
-    WORKER_CONCURRENCY: integerSetting(1, 16),
     STORAGE_PROVIDER: z.enum(['local', 's3']),
     STORAGE_STAGING_ROOT: z.string().trim().min(1).optional(),
     STORAGE_PUBLICATION_ROOT: z.string().trim().min(1).optional(),
@@ -316,9 +314,7 @@ const rawApplicationConfigSchema = z
       pollIntervalMs: value.JOB_POLL_INTERVAL_MS,
       leaseMs: value.JOB_LEASE_MS,
       retryBaseMs: value.JOB_RETRY_BASE_MS,
-      retryMaxMs: value.JOB_RETRY_MAX_MS,
-      workerReadyFile: value.WORKER_READY_FILE,
-      concurrency: value.WORKER_CONCURRENCY
+      retryMaxMs: value.JOB_RETRY_MAX_MS
     },
     storage: {
       provider: value.STORAGE_PROVIDER,

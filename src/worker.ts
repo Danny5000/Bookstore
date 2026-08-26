@@ -105,7 +105,7 @@ const config = loadWorkerApplicationConfig(
 const controller = new AbortController();
 const testWorkerControl = createTestWorkerControl({
   environment: rawWorkerEnvironment,
-  concurrency: config.jobs.concurrency,
+  concurrency: config.worker.concurrency,
   abortWorker: (reason) => controller.abort(reason)
 });
 const databaseClient = createDatabaseClient(config.database);
@@ -275,13 +275,13 @@ process.once('SIGTERM', requestShutdown);
 try {
   await probeDatabase(databaseClient.pool, config.database.readinessTimeoutMs);
   await probeStorage(storage, 'writer');
-  await writeFile(config.jobs.workerReadyFile, workerId, { encoding: 'utf8' });
+  await writeFile(config.worker.heartbeatFile, workerId, { encoding: 'utf8' });
   console.info('[worker] ready', { workerId });
   await runWorker({
     repository,
     handlers,
     workerId,
-    concurrency: config.jobs.concurrency,
+    concurrency: config.worker.concurrency,
     pollIntervalMs: config.jobs.pollIntervalMs,
     leaseRenewalIntervalMs: Math.max(1, Math.floor(config.jobs.leaseMs / 3)),
     beforePoll: prepareWorkerPoll,
@@ -295,6 +295,6 @@ try {
   process.exitCode = 1;
 } finally {
   emailTransport.close();
-  await rm(config.jobs.workerReadyFile, { force: true });
+  await rm(config.worker.heartbeatFile, { force: true });
   await databaseClient.close();
 }

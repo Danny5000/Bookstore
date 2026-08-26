@@ -441,9 +441,7 @@ describe('job claim policy', () => {
         pollIntervalMs: 1,
         leaseMs: 1_000,
         retryBaseMs: 1,
-        retryMaxMs: 1,
-        workerReadyFile: 'unused',
-        concurrency: 1
+        retryMaxMs: 1
       },
       () => NOW,
       'all',
@@ -529,9 +527,7 @@ describe('job claim policy', () => {
         pollIntervalMs: 1,
         leaseMs: 30_000,
         retryBaseMs: 1,
-        retryMaxMs: 1,
-        workerReadyFile: 'unused',
-        concurrency: 1
+        retryMaxMs: 1
       },
       () => NOW,
       'local-only',
@@ -592,9 +588,7 @@ describe('job claim policy', () => {
         pollIntervalMs: 1,
         leaseMs: 30_000,
         retryBaseMs: 1,
-        retryMaxMs: 1,
-        workerReadyFile: 'unused',
-        concurrency: 1
+        retryMaxMs: 1
       },
       () => NOW,
       'local-only',
@@ -656,9 +650,7 @@ describe('job claim policy', () => {
         pollIntervalMs: 1,
         leaseMs: 30_000,
         retryBaseMs: 1,
-        retryMaxMs: 1,
-        workerReadyFile: 'unused',
-        concurrency: 1
+        retryMaxMs: 1
       },
       () => NOW,
       'local-only',
@@ -731,9 +723,7 @@ describe('job claim policy', () => {
         pollIntervalMs: 1,
         leaseMs: 30_000,
         retryBaseMs: 1,
-        retryMaxMs: 1,
-        workerReadyFile: 'unused',
-        concurrency: 1
+        retryMaxMs: 1
       },
       () => NOW,
       'local-only',
@@ -820,9 +810,7 @@ describe('job claim policy', () => {
         pollIntervalMs: 1,
         leaseMs: 30_000,
         retryBaseMs: 1,
-        retryMaxMs: 1,
-        workerReadyFile: 'unused',
-        concurrency: 1
+        retryMaxMs: 1
       },
       () => NOW,
       'local-only',
@@ -895,9 +883,7 @@ describe('job claim policy', () => {
         pollIntervalMs: 1,
         leaseMs: 30_000,
         retryBaseMs: 1,
-        retryMaxMs: 1,
-        workerReadyFile: 'unused',
-        concurrency: 1
+        retryMaxMs: 1
       });
 
       const result = operation === 'renewLease'
@@ -964,9 +950,7 @@ describe('job claim policy', () => {
       pollIntervalMs: 1,
       leaseMs: 30_000,
       retryBaseMs: 1,
-      retryMaxMs: 1,
-      workerReadyFile: 'unused',
-      concurrency: 1
+      retryMaxMs: 1
     });
 
     await expect(repository.renewLease(running.id, 'financial-admin-worker'))
@@ -1005,9 +989,7 @@ describe('job claim policy', () => {
       pollIntervalMs: 1,
       leaseMs: 30_000,
       retryBaseMs: 1,
-      retryMaxMs: 1,
-      workerReadyFile: 'unused',
-      concurrency: 1
+      retryMaxMs: 1
     });
 
     await expect(repository.fail(
@@ -1077,9 +1059,7 @@ function failureDispositionHarness(input: {
     pollIntervalMs: 1,
     leaseMs: 30_000,
     retryBaseMs: 10,
-    retryMaxMs: 1_000,
-    workerReadyFile: 'unused',
-    concurrency: 1
+    retryMaxMs: 1_000
   });
   return {
     calls,
@@ -1238,9 +1218,7 @@ describe('job failure committed retry disposition', () => {
       pollIntervalMs: 1,
       leaseMs: 30_000,
       retryBaseMs: 10,
-      retryMaxMs: 1_000,
-      workerReadyFile: 'unused',
-      concurrency: 1
+      retryMaxMs: 1_000
     });
 
     await expect(repository.failWithDisposition(

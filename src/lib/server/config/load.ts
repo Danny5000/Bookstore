@@ -11,6 +11,11 @@ import {
   type ApplicationConfigScope,
   type DatabaseConfig
 } from './schema';
+import { loadWorkerHealthConfig, type WorkerProcessConfig } from './worker';
+
+export type WorkerApplicationConfig = ApplicationConfig & {
+  readonly worker: WorkerProcessConfig;
+};
 
 const DATABASE_SETTINGS = [
   'DATABASE_HOST',
@@ -41,8 +46,6 @@ const REQUIRED_SETTINGS = [
   'JOB_LEASE_MS',
   'JOB_RETRY_BASE_MS',
   'JOB_RETRY_MAX_MS',
-  'WORKER_READY_FILE',
-  'WORKER_CONCURRENCY',
   'STORAGE_PROVIDER',
   'UPLOAD_MAX_BYTES',
   'INGEST_MAX_EXPANDED_BYTES',
@@ -136,13 +139,16 @@ export function loadWebApplicationConfig(
 export function loadWorkerApplicationConfig(
   source: EnvironmentValues,
   readSecretFile?: SecretFileReader
-): ApplicationConfig {
-  return loadScopedApplicationConfig(
-    source,
-    'worker',
-    OPTIONAL_SETTINGS.filter((name) => name !== 'STRIPE_WEBHOOK_SECRET'),
-    readSecretFile
-  );
+): WorkerApplicationConfig {
+  return {
+    ...loadScopedApplicationConfig(
+      source,
+      'worker',
+      OPTIONAL_SETTINGS.filter((name) => name !== 'STRIPE_WEBHOOK_SECRET'),
+      readSecretFile
+    ),
+    worker: loadWorkerHealthConfig(source, readSecretFile)
+  };
 }
 
 export function loadDatabaseConfig(

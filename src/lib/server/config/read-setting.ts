@@ -62,6 +62,18 @@ export function readRequiredSetting(
   return value;
 }
 
+export function readDefaultedSetting(
+  source: EnvironmentValues,
+  name: string,
+  defaultValue: string,
+  readSecretFile?: SecretFileReader
+): string {
+  if (source[name] === undefined && source[`${name}_FILE`] === undefined) {
+    return defaultValue;
+  }
+  return readRequiredSetting(source, name, readSecretFile);
+}
+
 export function readOptionalSetting(
   source: EnvironmentValues,
   name: string,
