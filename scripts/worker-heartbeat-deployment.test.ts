@@ -172,7 +172,7 @@ describe('worker heartbeat deployment consumers', () => {
       '`slotId`, `state`, `lastSuccessfulPollAt`, and `lastProgressAt`'
     );
     expect.soft(workers).toContain(
-      '`polling` means a queue claim is in progress, `idle` means the latest successful poll found no job or terminal work has settled, and `handling` means the slot owns a claimed job'
+      '`polling` means the slot is preparing or attempting its next queue claim, including waiting to enter or executing the serialized before-poll hook; `idle` means it owns no claimed job after an empty poll, terminal settlement, or lease loss; and `handling` means it owns a claimed job'
     );
     expect.soft(workers).toContain('Slots are zero-based, and every configured slot appears exactly once');
     expect.soft(workers).toContain('A successful poll, including an empty poll, advances both timestamps');
