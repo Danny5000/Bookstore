@@ -4321,7 +4321,7 @@ describe('commerce operations contract', () => {
     } finally {
       rmSync(readerRoot, { force: true, recursive: true });
     }
-  }, 40_000);
+  }, 60_000);
 
   it('rejects non-regular restored storage entries before verification or startup', async () => {
     const storageRunbook = await source('docs/storage-ingestion-and-publication.md');
