@@ -293,4 +293,49 @@ describe('structured event contracts', () => {
       else delete (Object.prototype as Record<string, unknown>).durationMs;
     }
   });
+
+  test('does not inherit registry optional metadata', () => {
+    const previous = Object.getOwnPropertyDescriptor(Object.prototype, 'optional');
+    let extraRejected = false;
+    let result: ReturnType<typeof validate> | undefined;
+    Object.defineProperty(Object.prototype, 'optional', { configurable: true, value: 'workerId' });
+    try {
+      try { validate(webCompleted, { ...webCompleted.input, workerId }); } catch { extraRejected = true; }
+      result = validate(webCompleted);
+    } finally {
+      if (previous) Object.defineProperty(Object.prototype, 'optional', previous);
+      else delete (Object.prototype as Record<string, unknown>).optional;
+    }
+    expect(extraRejected).toBe(true);
+    expect(result!.record).not.toHaveProperty('workerId');
+  });
+
+  test('does not inherit registry internal metadata', () => {
+    const previous = Object.getOwnPropertyDescriptor(Object.prototype, 'internal');
+    let rejected = false;
+    Object.defineProperty(Object.prototype, 'internal', { configurable: true, value: true });
+    try {
+      try { validate(webCompleted); } catch { rejected = true; }
+    } finally {
+      if (previous) Object.defineProperty(Object.prototype, 'internal', previous);
+      else delete (Object.prototype as Record<string, unknown>).internal;
+    }
+    expect(rejected).toBe(false);
+  });
+
+  test('rejects accessor event fields before their getter executes despite inherited descriptor value', () => {
+    const previous = Object.getOwnPropertyDescriptor(Object.prototype, 'value');
+    let reads = 0;
+    let rejected = false;
+    const input = Object.defineProperty({ ...webCompleted.input }, 'durationMs', { enumerable: true, get: () => { reads += 1; return 0; } });
+    Object.defineProperty(Object.prototype, 'value', { configurable: true, value: 0 });
+    try {
+      try { validate(webCompleted, input); } catch { rejected = true; }
+    } finally {
+      if (previous) Object.defineProperty(Object.prototype, 'value', previous);
+      else delete (Object.prototype as Record<string, unknown>).value;
+    }
+    expect(rejected).toBe(true);
+    expect(reads).toBe(0);
+  });
 });

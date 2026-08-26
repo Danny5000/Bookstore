@@ -161,4 +161,41 @@ describe('safe diagnostic errors', () => {
     });
     expect(reduceSafeError(new Error(), { operation: 'http.request', matchers: matchers as never })).toEqual({ class: 'request', code: 'known_failure', operation: 'http.request', outcome: 'failed' });
   });
+
+  test('rejects accessor safe diagnostic fields before their getter executes despite inherited descriptor value', () => {
+    const previous = Object.getOwnPropertyDescriptor(Object.prototype, 'value');
+    let reads = 0;
+    let rejected = false;
+    const input = Object.defineProperty({ code: defineSafeCode('invalid_request'), operation: 'http.request', outcome: 'denied' }, 'class', { enumerable: true, get: () => { reads += 1; return 'request'; } });
+    Object.defineProperty(Object.prototype, 'value', { configurable: true, value: 'request' });
+    try {
+      try { createSafeDiagnosticError(input as never); } catch { rejected = true; }
+    } finally {
+      if (previous) Object.defineProperty(Object.prototype, 'value', previous);
+      else delete (Object.prototype as Record<string, unknown>).value;
+    }
+    expect(rejected).toBe(true);
+    expect(reads).toBe(0);
+  });
+
+  test('does not source sparse matcher entries from inherited descriptor-map indexes', () => {
+    const previous = Object.getOwnPropertyDescriptor(Object.prototype, '0');
+    let invoked = false;
+    let rejected = false;
+    Object.defineProperty(Object.prototype, '0', { configurable: true, writable: true, value: { enumerable: true, value: () => { invoked = true; return valid(); } } });
+    try {
+      try { reduceSafeError(new Error(), { operation: 'http.request', matchers: new Array(1) as never }); } catch { rejected = true; }
+    } finally {
+      if (previous) Object.defineProperty(Object.prototype, '0', previous);
+      else delete (Object.prototype as Record<string, unknown>)['0'];
+    }
+    expect(rejected).toBe(true);
+    expect(invoked).toBe(false);
+  });
+
+  test('rejects matcher properties outside the dense index range', () => {
+    const matchers: SafeErrorMatcher[] = [];
+    Object.defineProperty(matchers, '4294967295', { configurable: true, enumerable: true, value: () => undefined });
+    expect(() => reduceSafeError(new Error(), { operation: 'http.request', matchers })).toThrow();
+  });
 });

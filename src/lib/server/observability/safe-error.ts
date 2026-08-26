@@ -19,8 +19,9 @@ function ownObject(value: unknown): Record<string, unknown> {
     const descriptors = Object.getOwnPropertyDescriptors(value);
     for (const key of Reflect.ownKeys(descriptors)) {
       if (typeof key !== 'string') invalid();
-      const descriptor = descriptors[key];
-      if (!descriptor || !('value' in descriptor) || !descriptor.enumerable) invalid();
+      const entry = Object.getOwnPropertyDescriptor(descriptors, key);
+      const descriptor = entry && Object.hasOwn(entry, 'value') ? entry.value : undefined;
+      if (descriptor === null || typeof descriptor !== 'object' || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) invalid();
     }
     return value as Record<string, unknown>;
   } catch { return invalid(); }
@@ -62,20 +63,21 @@ type ValidatedMatcherArray<C extends string> = { readonly length: number; readon
 function matcherArray<C extends string>(value: unknown): ValidatedMatcherArray<C> {
   try {
     if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) invalid();
-    const descriptors = Object.getOwnPropertyDescriptors(value) as unknown as Record<PropertyKey, PropertyDescriptor | undefined>;
-    const length = descriptors['length'];
-    if (!length || !('value' in length) || typeof length.value !== 'number' || !Number.isSafeInteger(length.value) || length.value < 0) invalid();
-    for (const key of Reflect.ownKeys(descriptors)) {
+    const length = Object.getOwnPropertyDescriptor(value, 'length');
+    if (!length || !Object.hasOwn(length, 'value') || typeof length.value !== 'number' || !Number.isSafeInteger(length.value) || length.value < 0) invalid();
+    for (const key of Reflect.ownKeys(value)) {
       if (key === 'length') continue;
       if (typeof key !== 'string' || !/^(?:0|[1-9][0-9]*)$/.test(key)) invalid();
-      const descriptor = descriptors[key];
-      if (!descriptor || !('value' in descriptor) || !descriptor.enumerable || typeof descriptor.value !== 'function') invalid();
+      const index = Number(key);
+      if (!Number.isSafeInteger(index) || String(index) !== key || index >= length.value) invalid();
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable || typeof descriptor.value !== 'function') invalid();
     }
     const result = bag<ValidatedMatcherArray<C>>();
     put(result, 'length', length.value);
     for (let index = 0; index < length.value; index += 1) {
-      const descriptor = descriptors[String(index)];
-      if (!descriptor || !('value' in descriptor)) invalid();
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!descriptor || !Object.hasOwn(descriptor, 'value') || typeof descriptor.value !== 'function') invalid();
       put(result, String(index), descriptor.value as SafeErrorMatcher<C>);
     }
     return result;
