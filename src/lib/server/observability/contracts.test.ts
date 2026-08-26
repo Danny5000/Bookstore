@@ -43,6 +43,7 @@ const cases: readonly Case[] = [
   { service: 'plan6b-production-smoke', input: { event: 'smoke.run.succeeded', profile: 'maintenance_fixture', runId: '0123456789abcdef', candidateId, durationMs: 11, evidenceFingerprint: fingerprint }, severity: 'info', outcome: 'succeeded', sink: 'stdout', keys: ['profile', 'runId', 'candidateId', 'durationMs', 'evidenceFingerprint'] },
   { service: 'plan6b-production-smoke', input: { event: 'smoke.run.failed', profile: 'maintenance_fixture', runId: '0123456789abcdef', candidateId, stage: 'cleanup', code: 'cleanup_failed', durationMs: 12 }, severity: 'error', outcome: 'failed', sink: 'stderr', keys: ['profile', 'runId', 'candidateId', 'stage', 'code', 'durationMs'] }
 ];
+const webCompleted = cases[0]!;
 
 function validate(case_: Case, input = case_.input, valueTimestamp = timestamp) {
   return validateStructuredEvent(case_.service, valueTimestamp, input as StructuredEventInputFor<typeof case_.service>);
@@ -93,12 +94,12 @@ describe('structured event contracts', () => {
   });
 
   test.each([null, [], {}, new String('safe'), Number.NaN, Infinity, 1.1, Number.MAX_SAFE_INTEGER + 1])('rejects untrusted primitive shape %p', (value) => {
-    const case_ = cases[0];
+    const case_ = webCompleted;
     expect(() => validate(case_, { ...case_.input, durationMs: value })).toThrow();
   });
 
   test('rejects accessors and hostile reflection proxies', () => {
-    const case_ = cases[0];
+    const case_ = webCompleted;
     const accessor = Object.defineProperty({ ...case_.input }, 'durationMs', { enumerable: true, get: () => 1 });
     const proxy = new Proxy({}, { ownKeys: () => { throw new Error('trap'); } });
     expect(() => validate(case_, accessor)).toThrow();
@@ -115,9 +116,9 @@ describe('structured event contracts', () => {
   });
 
   test('requires canonical finite ISO timestamps and reserves logging.failure', () => {
-    expect(() => validate(cases[0], cases[0].input, '2026-08-24T12:34:56Z')).toThrow();
-    expect(() => validate(cases[0], cases[0].input, 'not-a-date')).toThrow();
-    expect(() => validate(cases[0], { event: 'logging.failure' })).toThrow();
+    expect(() => validate(webCompleted, webCompleted.input, '2026-08-24T12:34:56Z')).toThrow();
+    expect(() => validate(webCompleted, webCompleted.input, 'not-a-date')).toThrow();
+    expect(() => validate(webCompleted, { event: 'logging.failure' })).toThrow();
   });
 
   test('excludes logger-internal events from caller inputs at compile time', () => {
