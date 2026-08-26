@@ -1091,10 +1091,13 @@ describe('runWorker', () => {
     const repository = repositoryReturning(job);
     vi.mocked(repository.complete).mockResolvedValue(false);
     const captured = captureObservations();
+    let handlerSignal: AbortSignal | undefined;
 
     await runWorker({
       repository,
-      handlers: new Map([[job.type, vi.fn().mockResolvedValue(undefined)]]),
+      handlers: new Map([[job.type, vi.fn(async (_record, signal) => {
+        handlerSignal = signal;
+      })]]),
       workerId: 'worker-base',
       concurrency: 1,
       pollIntervalMs: 1,
@@ -1110,6 +1113,8 @@ describe('runWorker', () => {
     )).toEqual(['job_claimed', 'job_lease_lost:completion_rejected']);
     expect(captured.events).toContainEqual({ type: 'lease_lost', slotId: 0 });
     expect(captured.events).not.toContainEqual({ type: 'terminal_settled', slotId: 0 });
+    expect(handlerSignal?.aborted).toBe(true);
+    expect(handlerSignal?.reason).toMatchObject({ name: 'JobLeaseLostError' });
   });
 
   it('maps an ambiguous completion followed by an applied failure to job_completion_failed and committed retry disposition', async () => {
@@ -1226,10 +1231,14 @@ describe('runWorker', () => {
     const repository = repositoryReturning(job);
     vi.mocked(repository.failWithDisposition).mockResolvedValue({ applied: false });
     const captured = captureObservations();
+    let handlerSignal: AbortSignal | undefined;
 
     await runWorker({
       repository,
-      handlers: new Map([[job.type, async () => { throw new Error('private'); }]]),
+      handlers: new Map([[job.type, async (_record, signal) => {
+        handlerSignal = signal;
+        throw new Error('private');
+      }]]),
       workerId: 'worker-base',
       concurrency: 1,
       pollIntervalMs: 1,
@@ -1245,6 +1254,8 @@ describe('runWorker', () => {
     )).toEqual(['job_claimed', 'job_lease_lost:failure_transition_rejected']);
     expect(captured.events).toContainEqual({ type: 'lease_lost', slotId: 0 });
     expect(captured.events).not.toContainEqual({ type: 'terminal_settled', slotId: 0 });
+    expect(handlerSignal?.aborted).toBe(true);
+    expect(handlerSignal?.reason).toMatchObject({ name: 'JobLeaseLostError' });
   });
 
   it('observes an ordinary failure-transition throw and rethrows the identical error', async () => {
@@ -1253,10 +1264,14 @@ describe('runWorker', () => {
     const transitionError = new Error('failure-transition-privacy-canary');
     vi.mocked(repository.failWithDisposition).mockRejectedValue(transitionError);
     const captured = captureObservations();
+    let handlerSignal: AbortSignal | undefined;
 
     await expect(runWorker({
       repository,
-      handlers: new Map([[job.type, async () => { throw new Error('handler-private'); }]]),
+      handlers: new Map([[job.type, async (_record, signal) => {
+        handlerSignal = signal;
+        throw new Error('handler-private');
+      }]]),
       workerId: 'worker-base',
       concurrency: 1,
       pollIntervalMs: 1,
@@ -1271,6 +1286,12 @@ describe('runWorker', () => {
       code: 'failure_transition_failed'
     });
     expect(captured.events).toContainEqual({ type: 'lease_lost', slotId: 0 });
+    expect(jobEvents(captured.events).map((event) =>
+      event.type === 'job_lease_lost' ? `${event.type}:${event.code}` : event.type
+    )).toEqual(['job_claimed', 'job_lease_lost:failure_transition_failed']);
+    expect(captured.events).not.toContainEqual({ type: 'terminal_settled', slotId: 0 });
+    expect(handlerSignal?.aborted).toBe(true);
+    expect(handlerSignal?.reason).toMatchObject({ name: 'JobLeaseLostError' });
     expect(JSON.stringify(captured.events)).not.toContain('failure-transition-privacy-canary');
   });
 

@@ -319,30 +319,27 @@ async function runRegisteredJob(
     const handlerController = new AbortController();
     const renewalController = new AbortController();
     let leaseLost = false;
-    const loseLease = (code: JobLeaseLostLogCode) => {
-      if (leaseLost) return;
-      leaseLost = true;
-      options.observer({
-        type: 'job_lease_lost',
-        identity,
-        code: fixedLeaseLossCode(code, 'job.lease_renewal', identity)
-      });
-      options.observer({ type: 'lease_lost', slotId: options.slotId });
-      handlerController.abort(new JobLeaseLostError());
-      renewalController.abort();
-    };
-    const rejectSettlement = (
+    const loseLease = (
       code: JobLeaseLostLogCode,
-      operation: 'job.completion' | 'job.failure_transition'
+      operation: 'job.completion' | 'job.failure_transition' | 'job.lease_renewal' =
+        'job.lease_renewal'
     ) => {
       if (leaseLost) return;
       leaseLost = true;
+      handlerController.abort(new JobLeaseLostError());
+      renewalController.abort();
       options.observer({
         type: 'job_lease_lost',
         identity,
         code: fixedLeaseLossCode(code, operation, identity)
       });
       options.observer({ type: 'lease_lost', slotId: options.slotId });
+    };
+    const rejectSettlement = (
+      code: JobLeaseLostLogCode,
+      operation: 'job.completion' | 'job.failure_transition'
+    ) => {
+      loseLease(code, operation);
     };
     const forwardShutdown = () => {
       handlerController.abort(options.signal.reason);
