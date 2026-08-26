@@ -11,7 +11,7 @@
   "scripts": {
     "dev": "vite dev",
     "build:web": "vite build",
-    "build:services": "vite build --config vite.services.config.ts",
+    "build:services": "vite build --config vite.services.config.ts && vite build --config vite.services.config.ts --mode worker-health",
     "build": "npm run build:web && npm run build:services",
     "preview": "vite preview",
     "db:generate": "drizzle-kit generate",
@@ -25,6 +25,7 @@
     "admin:bootstrap:raw": "tsx src/bootstrap-admin.ts",
     "admin:bootstrap": "node --env-file-if-exists=.env --import tsx src/bootstrap-admin.ts",
     "worker:dev": "node --env-file-if-exists=.env --import tsx src/worker.ts",
+    "worker:health": "node --env-file-if-exists=.env --import tsx src/worker-health.ts",
     "worker:watch": "node --watch --env-file-if-exists=.env --import tsx src/worker.ts",
     "storage:cleanup:raw": "tsx src/cleanup-storage.ts",
     "storage:cleanup": "node --env-file-if-exists=.env --import tsx src/cleanup-storage.ts",

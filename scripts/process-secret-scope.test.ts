@@ -61,6 +61,34 @@ describe('process secret scope', () => {
     expect(source('src/bootstrap-admin.ts')).toContain('loadDatabaseConfig(process.env)');
   });
 
+  it('keeps the worker-health entrypoint on its six-setting credential-free leaf', () => {
+    const entrypoint = source('src/worker-health.ts');
+    const loader = source('src/lib/server/config/worker.ts');
+    const entrypointImports = [...entrypoint.matchAll(/from\s+['"]([^'"]+)['"]/gu)]
+      .map((match) => match[1]);
+    const loadedSettings = [...loader.matchAll(
+      /(?:readRequiredSetting|readDefaultedSetting)\(\s*source,\s*['"]([A-Z0-9_]+)['"]/gu
+    )].map((match) => match[1]);
+
+    expect(entrypointImports).toEqual([
+      '$lib/server/config/worker',
+      '$lib/server/worker/health-check'
+    ]);
+    expect(loadedSettings).toEqual([
+      'WORKER_READY_FILE',
+      'WORKER_CONCURRENCY',
+      'WORKER_HEARTBEAT_INTERVAL_MS',
+      'WORKER_HEARTBEAT_MAX_AGE_MS',
+      'JOB_POLL_INTERVAL_MS',
+      'JOB_LEASE_MS'
+    ]);
+    expect(loader).not.toMatch(
+      /DATABASE_(?:PASSWORD|OWNER)|SMTP_|STRIPE_|(?:BETTER_)?AUTH_|BOOTSTRAP_|STORAGE_(?:ACCESS|SECRET|CREDENTIAL)/iu
+    );
+    expect(loadedSettings.some((name) => /(?:PASSWORD|SECRET|CREDENTIAL|OWNER)/u.test(name)))
+      .toBe(false);
+  });
+
   it('rejects inherited PGOPTIONS and validates identities before opening a migration connection', () => {
     const migrationEntrypoint = source('src/migrate.ts');
     const pgOptionsGuard = migrationEntrypoint.indexOf('process.env.PGOPTIONS');

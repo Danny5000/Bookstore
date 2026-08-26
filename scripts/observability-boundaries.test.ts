@@ -123,6 +123,26 @@ describe('observability ownership and privacy boundaries', () => {
     }
   });
 
+  it('keeps worker health private, fixed-output, and free of network or public-route behavior', () => {
+    const healthLibrary = source('src/lib/server/worker/health-check.ts');
+    const healthEntrypoint = source('src/worker-health.ts');
+    const healthSources = `${healthLibrary}\n${healthEntrypoint}`;
+    const healthImports = [...healthLibrary.matchAll(/from\s+['"]([^'"]+)['"]/gu)]
+      .map((match) => match[1]);
+    const publicRouteSources = productionSourceFiles('src/routes').map(source).join('\n');
+
+    expect(healthImports).toEqual(['node:fs/promises', './heartbeat-contract']);
+    expect(healthSources.match(/\[worker-health\] unhealthy/gu)).toHaveLength(2);
+    expect(healthSources).not.toMatch(/`[^`]*\[worker-health\] unhealthy|\$\{/u);
+    expect(healthSources).not.toMatch(
+      /\b(?:fetch|listen|createServer|connect|createConnection|WebSocket)\s*\(|from\s+['"]node:(?:http|https|net|tls|dgram)['"]/iu
+    );
+    expect(publicRouteSources).not.toMatch(/worker[-_/ ]health|WORKER_READY_FILE/iu);
+    expect(healthSources).not.toMatch(
+      /createStructuredLogger|emitStructuredLog|console\.(?:debug|info|log|warn)\s*\(/u
+    );
+  });
+
   it('keeps diagnostic context out of authorization locals', () => {
     const appTypes = source('src/app.d.ts');
     const locals = between(appTypes, 'interface Locals {', '}\n  }');

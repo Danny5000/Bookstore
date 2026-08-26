@@ -191,6 +191,64 @@ const storageEnvironment = [
 ] as const;
 
 describe('storage process isolation deployment', () => {
+  it('keeps the stateless worker-health graph out of storage and application clients', () => {
+    const healthLibrary = source('src/lib/server/worker/health-check.ts');
+    const healthImports = runtimeModuleSpecifiers('src/lib/server/worker/health-check.ts');
+    const healthGraph = runtimeValueImportGraph(['src/worker-health.ts']);
+    const relativeGraph = [...healthGraph.files]
+      .map((path) => relative(process.cwd(), path).replaceAll('\\', '/'))
+      .sort();
+
+    expect(healthImports).toEqual(['./heartbeat-contract', 'node:fs/promises']);
+    for (const forbidden of [
+      '/auth/',
+      '/commerce/',
+      '/db/',
+      '/email/',
+      '/jobs/',
+      '/routes/',
+      '/storage/'
+    ]) {
+      expect(relativeGraph.some((path) => path.includes(forbidden)), forbidden).toBe(false);
+    }
+    for (const client of [
+      'createDatabaseClient',
+      'createObjectStorage',
+      'nodemailer',
+      'stripe',
+      'better-auth'
+    ]) {
+      expect(healthLibrary).not.toContain(client);
+    }
+  });
+
+  it('packages worker health as one named service input and one host-only source command', () => {
+    const serviceBuild = source('vite.services.config.ts');
+    const packageManifest = JSON.parse(source('package.json')) as {
+      readonly scripts?: Readonly<Record<string, string>>;
+      readonly dependencies?: Readonly<Record<string, string>>;
+    };
+
+    expect(serviceBuild).toContain(
+      "'worker-health': resolve(import.meta.dirname, 'src/worker-health.ts')"
+    );
+    expect(serviceBuild).toMatch(
+      /defineConfig\(\(\{\s*mode\s*\}\)\s*=>[\s\S]*mode\s*===\s*['"]worker-health['"]/u
+    );
+    expect(serviceBuild).toContain(
+      'input: workerHealthBuild ? workerHealthInput : serviceInputs'
+    );
+    expect(serviceBuild).toContain('emptyOutDir: !workerHealthBuild');
+    expect(serviceBuild).toContain('codeSplitting: !workerHealthBuild');
+    expect(packageManifest.scripts?.['build:services']).toBe(
+      'vite build --config vite.services.config.ts && vite build --config vite.services.config.ts --mode worker-health'
+    );
+    expect(packageManifest.scripts?.['worker:health']).toBe(
+      'node --env-file-if-exists=.env --import tsx src/worker-health.ts'
+    );
+    expect(packageManifest.dependencies).not.toHaveProperty('tsx');
+  });
+
   it('traverses every emitted import/export edge under verbatim module syntax', () => {
     expect(runtimeModuleSpecifiersFromSource('runtime-edge-fixture.ts', `
       import type { DeclarationOnlyImport } from './declaration-import';
@@ -233,7 +291,7 @@ describe('storage process isolation deployment', () => {
       "databaseEnvironmentForRole(rawWorkerEnvironment, 'worker')"
     );
     expect(workerSource).toMatch(
-      /createTestWorkerControl\(\{\s*environment:\s*rawWorkerEnvironment,\s*concurrency:\s*config\.jobs\.concurrency,\s*abortWorker:/u
+      /createTestWorkerControl\(\{\s*environment:\s*rawWorkerEnvironment,\s*concurrency:\s*config\.worker\.concurrency,\s*abortWorker:/u
     );
 
     const productionRuntimeSources = runtimeSourceFiles('src');
