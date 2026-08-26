@@ -877,7 +877,14 @@ describe('job claim policy', () => {
           calls.push(query);
           const statement = rendered(query).sql;
           if (statement.includes('for update')) return { rows: [running] };
-          if (statement.includes('returning')) return { rows: [{ id: running.id }] };
+          if (statement.includes('returning')) {
+            return {
+              rows: [{
+                id: running.id,
+                status: operation === 'retry' ? 'pending' : 'failed'
+              }]
+            };
+          }
           return { rows: [] };
         })
       };
@@ -985,7 +992,9 @@ describe('job claim policy', () => {
         calls.push(query);
         const statement = rendered(query).sql;
         if (statement.includes('for update')) return { rows: [running] };
-        if (statement.includes('returning')) return { rows: [{ id: running.id }] };
+        if (statement.includes('returning')) {
+          return { rows: [{ id: running.id, status: 'failed' }] };
+        }
         return { rows: [] };
       })
     };
@@ -1013,5 +1022,272 @@ describe('job claim policy', () => {
       item.sql.trimStart().startsWith('update jobs'));
     expect(update?.params).not.toContain(`unsafe ${FINANCIAL_ADMIN_LEASE_CAPABILITY}`);
     expect(update?.params).toContain('Financial administrator job failure');
+  });
+});
+
+function runningJob(overrides: Partial<JobRow> = {}): JobRow {
+  return jobRow({
+    type: 'test.failure-disposition',
+    payload: {},
+    deduplicationKey: null,
+    status: 'running',
+    attempts: 1,
+    maxAttempts: 5,
+    lockedAt: NOW,
+    lockedBy: 'failure-worker',
+    ...overrides
+  });
+}
+
+function failureDispositionHarness(input: {
+  readonly job?: JobRow | null;
+  readonly returnedStatus?: unknown;
+  readonly returnRowWithoutStatus?: boolean;
+  readonly authorityFailure?: Error;
+}) {
+  const calls: SQL[] = [];
+  const transaction = {
+    execute: vi.fn(async (query: SQL) => {
+      calls.push(query);
+      const statement = rendered(query).sql;
+      if (statement.includes('for update')) {
+        return { rows: input.job === null ? [] : [input.job ?? runningJob()] };
+      }
+      if (statement.includes('pg_advisory_xact_lock')) {
+        if (input.authorityFailure) throw input.authorityFailure;
+        return { rows: [] };
+      }
+      if (statement.includes('returning id')) {
+        if (input.returnRowWithoutStatus) {
+          return { rows: [{ id: input.job?.id ?? runningJob().id }] };
+        }
+        return input.returnedStatus === undefined
+          ? { rows: [] }
+          : { rows: [{ id: input.job?.id ?? runningJob().id, status: input.returnedStatus }] };
+      }
+      return { rows: [] };
+    })
+  };
+  const database = {
+    transaction: vi.fn(async (work: (tx: unknown) => Promise<unknown>) => work(transaction))
+  };
+  const repository = createPostgresJobRepository(database as never, {
+    pollIntervalMs: 1,
+    leaseMs: 30_000,
+    retryBaseMs: 10,
+    retryMaxMs: 1_000,
+    workerReadyFile: 'unused',
+    concurrency: 1
+  });
+  return {
+    calls,
+    database,
+    repository
+  };
+}
+
+describe('job failure committed retry disposition', () => {
+  it.each([
+    {
+      label: 'an ordinary retry below the attempt limit',
+      job: runningJob({ attempts: 1, maxAttempts: 5 }),
+      retryable: true,
+      returnedStatus: 'pending',
+      expected: { applied: true, retryScheduled: true }
+    },
+    {
+      label: 'an exhausted retry',
+      job: runningJob({ attempts: 5, maxAttempts: 5 }),
+      retryable: true,
+      returnedStatus: 'failed',
+      expected: { applied: true, retryScheduled: false }
+    },
+    {
+      label: 'a nonretryable failure',
+      job: runningJob({ attempts: 1, maxAttempts: 5 }),
+      retryable: false,
+      returnedStatus: 'failed',
+      expected: { applied: true, retryScheduled: false }
+    },
+    {
+      label: 'a rerun requested before a nonretryable settlement',
+      job: runningJob({
+        attempts: 1,
+        maxAttempts: 5,
+        rerunRequestedAt: new Date('2026-08-12T11:59:59.000Z')
+      }),
+      retryable: false,
+      returnedStatus: 'pending',
+      expected: { applied: true, retryScheduled: true }
+    },
+    {
+      label: 'a rerun requested before an exhausted retryable settlement',
+      job: runningJob({
+        attempts: 5,
+        maxAttempts: 5,
+        rerunRequestedAt: new Date('2026-08-12T11:59:59.000Z')
+      }),
+      retryable: true,
+      returnedStatus: 'pending',
+      expected: { applied: true, retryScheduled: true }
+    }
+  ])('returns the committed status for $label', async ({
+    job, retryable, returnedStatus, expected
+  }) => {
+    const harness = failureDispositionHarness({ job, returnedStatus });
+
+    await expect(harness.repository.failWithDisposition(
+      job.id,
+      'failure-worker',
+      'Bounded failure',
+      retryable
+    )).resolves.toEqual(expected);
+
+    expect(harness.database.transaction).toHaveBeenCalledOnce();
+    const update = harness.calls.map(rendered).find((call) =>
+      call.sql.trimStart().startsWith('update jobs'));
+    expect(update?.sql).toContain('returning id, status');
+  });
+
+  it.each([
+    { label: 'a missing or unowned job', job: null, returnedStatus: undefined },
+    { label: 'a stale attempt rejected by the update predicate', job: runningJob(), returnedStatus: undefined }
+  ])('returns not-applied for $label', async ({ job, returnedStatus }) => {
+    const harness = failureDispositionHarness({ job, returnedStatus });
+
+    await expect(harness.repository.failWithDisposition(
+      runningJob().id,
+      'failure-worker',
+      'Bounded failure',
+      true
+    )).resolves.toEqual({ applied: false });
+  });
+
+  it('rejects an invalid financial capability before mutation', async () => {
+    const job = runningJob({
+      id: FINANCIAL_ADMIN_JOB_ID,
+      type: FINANCIAL_ADMIN_JOB,
+      payload: { commandId: FINANCIAL_ADMIN_COMMAND_ID },
+      deduplicationKey:
+        `commerce:financial-admin-command:${FINANCIAL_ADMIN_COMMAND_ID}:v1`
+    });
+    const harness = failureDispositionHarness({ job, returnedStatus: 'failed' });
+
+    await expect(harness.repository.failWithDisposition(
+      job.id,
+      'failure-worker',
+      'Bounded failure',
+      false,
+      'invalid capability'
+    )).resolves.toEqual({ applied: false });
+    expect(harness.calls).toHaveLength(1);
+  });
+
+  it('maps a rejected financial capability to not-applied', async () => {
+    const job = runningJob({
+      id: FINANCIAL_ADMIN_JOB_ID,
+      type: FINANCIAL_ADMIN_JOB,
+      payload: { commandId: FINANCIAL_ADMIN_COMMAND_ID },
+      deduplicationKey:
+        `commerce:financial-admin-command:${FINANCIAL_ADMIN_COMMAND_ID}:v1`
+    });
+    const rejected = Object.assign(new Error('private database authority detail'), {
+      code: '55000'
+    });
+    const harness = failureDispositionHarness({ job, authorityFailure: rejected });
+
+    await expect(harness.repository.failWithDisposition(
+      job.id,
+      'failure-worker',
+      'Bounded failure',
+      false,
+      FINANCIAL_ADMIN_LEASE_CAPABILITY
+    )).resolves.toEqual({ applied: false });
+  });
+
+  it('preserves the fixed financial authority failure mapping', async () => {
+    const job = runningJob({
+      id: FINANCIAL_ADMIN_JOB_ID,
+      type: FINANCIAL_ADMIN_JOB,
+      payload: { commandId: FINANCIAL_ADMIN_COMMAND_ID },
+      deduplicationKey:
+        `commerce:financial-admin-command:${FINANCIAL_ADMIN_COMMAND_ID}:v1`
+    });
+    const harness = failureDispositionHarness({
+      job,
+      authorityFailure: new Error('private database authority detail')
+    });
+
+    await expect(harness.repository.failWithDisposition(
+      job.id,
+      'failure-worker',
+      'Bounded failure',
+      false,
+      FINANCIAL_ADMIN_LEASE_CAPABILITY
+    )).rejects.toThrow('Financial administrator job lease authority failed');
+  });
+
+  it('propagates an ordinary transaction failure', async () => {
+    const failure = new Error('ordinary transaction failed');
+    const database = {
+      transaction: vi.fn(async () => { throw failure; })
+    };
+    const repository = createPostgresJobRepository(database as never, {
+      pollIntervalMs: 1,
+      leaseMs: 30_000,
+      retryBaseMs: 10,
+      retryMaxMs: 1_000,
+      workerReadyFile: 'unused',
+      concurrency: 1
+    });
+
+    await expect(repository.failWithDisposition(
+      runningJob().id,
+      'failure-worker',
+      'Bounded failure',
+      true
+    )).rejects.toBe(failure);
+  });
+
+  it('rejects an impossible committed failure status', async () => {
+    const harness = failureDispositionHarness({ returnedStatus: 'running' });
+
+    await expect(harness.repository.failWithDisposition(
+      runningJob().id,
+      'failure-worker',
+      'Bounded failure',
+      true
+    )).rejects.toThrow('Invalid job failure transition status');
+  });
+
+  it('rejects a returned failure row without its committed status', async () => {
+    const harness = failureDispositionHarness({ returnRowWithoutStatus: true });
+
+    await expect(harness.repository.failWithDisposition(
+      runningJob().id,
+      'failure-worker',
+      'Bounded failure',
+      true
+    )).rejects.toThrow('Invalid job failure transition status');
+  });
+
+  it.each([
+    { returnedStatus: 'pending', expected: true },
+    { returnedStatus: 'failed', expected: true },
+    { returnedStatus: undefined, expected: false }
+  ])('keeps legacy fail as the applied-only adapter for $returnedStatus', async ({
+    returnedStatus, expected
+  }) => {
+    const harness = failureDispositionHarness({ returnedStatus });
+
+    const result = await harness.repository.fail(
+      runningJob().id,
+      'failure-worker',
+      'Bounded failure',
+      returnedStatus === 'pending'
+    );
+
+    expect(result).toBe(expected);
+    expect(typeof result).toBe('boolean');
   });
 });

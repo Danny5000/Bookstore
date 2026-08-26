@@ -1,5 +1,7 @@
 import { eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
+import type { AdministratorActor } from '$lib/server/auth/admin-policy';
+import { submitFinancialAdminCommand } from '$lib/server/commerce/financial/admin-commands/repository';
 import {
   FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
   FINANCIAL_CLASSIFIER_VERSION,
@@ -9,7 +11,12 @@ import { financialProjectionVersions, financialScanRuns, jobs } from '$lib/serve
 import { enqueueJob, createPostgresJobRepository } from '$lib/server/jobs/repository';
 import { processFinancialScanJob } from '$lib/server/commerce/financial/scans/service';
 import type { StripeCommerceGateway } from '$lib/server/commerce/stripe/types';
-import { applicationConfig, workerDatabaseClient as databaseClient } from './database';
+import {
+  applicationConfig,
+  databaseClient as webDatabaseClient,
+  ownerDatabaseClient,
+  workerDatabaseClient as databaseClient
+} from './database';
 
 describe('PostgreSQL jobs', () => {
   it('deduplicates enqueue by key', async () => {
@@ -579,6 +586,194 @@ describe('PostgreSQL jobs', () => {
       attempts: 2,
       lastError: 'safe transient failure'
     });
+  });
+
+  it('returns failure disposition from the exact PostgreSQL transition', async () => {
+    let currentTime = new Date('2026-08-26T12:00:00.000Z');
+    const repository = createPostgresJobRepository(
+      databaseClient.db,
+      applicationConfig.jobs,
+      () => currentTime
+    );
+
+    const retry = await enqueueJob(databaseClient.db, {
+      type: 'test.failure-disposition-retry',
+      payload: {},
+      runAt: currentTime,
+      maxAttempts: 2
+    });
+    await expect(repository.claimNext('disposition-retry-worker')).resolves.toMatchObject({
+      id: retry.id,
+      attempts: 1
+    });
+    await expect(repository.failWithDisposition(
+      retry.id,
+      'disposition-retry-worker',
+      'safe transient failure',
+      true
+    )).resolves.toEqual({ applied: true, retryScheduled: true });
+    await expect(databaseClient.db.select().from(jobs).where(eq(jobs.id, retry.id)))
+      .resolves.toEqual([expect.objectContaining({
+        status: 'pending',
+        attempts: 1,
+        completedAt: null
+      })]);
+    currentTime = new Date(currentTime.getTime() + applicationConfig.jobs.retryMaxMs + 1);
+    await expect(repository.claimNext('disposition-retry-cleanup')).resolves.toMatchObject({
+      id: retry.id
+    });
+    await expect(repository.complete(retry.id, 'disposition-retry-cleanup')).resolves.toBe(true);
+
+    const terminal = await enqueueJob(databaseClient.db, {
+      type: 'test.failure-disposition-terminal',
+      payload: {},
+      runAt: currentTime,
+      maxAttempts: 1
+    });
+    await expect(repository.claimNext('disposition-terminal-worker')).resolves.toMatchObject({
+      id: terminal.id,
+      attempts: 1
+    });
+    await expect(repository.failWithDisposition(
+      terminal.id,
+      'disposition-terminal-worker',
+      'safe permanent failure',
+      true
+    )).resolves.toEqual({ applied: true, retryScheduled: false });
+    await expect(databaseClient.db.select().from(jobs).where(eq(jobs.id, terminal.id)))
+      .resolves.toEqual([expect.objectContaining({
+        status: 'failed',
+        attempts: 1,
+        lastError: 'safe permanent failure'
+      })]);
+
+    const lost = await enqueueJob(databaseClient.db, {
+      type: 'test.failure-disposition-lost',
+      payload: {},
+      runAt: currentTime,
+      maxAttempts: 3
+    });
+    await expect(repository.claimNext('disposition-lost-worker-a')).resolves.toMatchObject({
+      id: lost.id,
+      attempts: 1
+    });
+    currentTime = new Date(currentTime.getTime() + applicationConfig.jobs.leaseMs + 1);
+    await expect(repository.claimNext('disposition-lost-worker-b')).resolves.toMatchObject({
+      id: lost.id,
+      attempts: 2
+    });
+    await expect(repository.failWithDisposition(
+      lost.id,
+      'disposition-lost-worker-a',
+      'stale failure',
+      true
+    )).resolves.toEqual({ applied: false });
+    await expect(databaseClient.db.select().from(jobs).where(eq(jobs.id, lost.id)))
+      .resolves.toEqual([expect.objectContaining({
+        status: 'running',
+        attempts: 2,
+        lockedBy: 'disposition-lost-worker-b'
+      })]);
+    await expect(repository.complete(lost.id, 'disposition-lost-worker-b')).resolves.toBe(true);
+
+    const rerun = await enqueueJob(databaseClient.db, {
+      type: 'test.failure-disposition-rerun',
+      payload: {},
+      runAt: currentTime,
+      maxAttempts: 1
+    });
+    await expect(repository.claimNext('disposition-rerun-worker')).resolves.toMatchObject({
+      id: rerun.id,
+      attempts: 1
+    });
+    await databaseClient.db.update(jobs).set({ rerunRequestedAt: currentTime })
+      .where(eq(jobs.id, rerun.id));
+    await expect(repository.failWithDisposition(
+      rerun.id,
+      'disposition-rerun-worker',
+      'safe permanent failure',
+      false
+    )).resolves.toEqual({ applied: true, retryScheduled: true });
+    await expect(databaseClient.db.select().from(jobs).where(eq(jobs.id, rerun.id)))
+      .resolves.toEqual([expect.objectContaining({
+        status: 'pending',
+        attempts: 0,
+        lastError: null,
+        rerunRequestedAt: null
+      })]);
+    await expect(repository.claimNext('disposition-rerun-cleanup')).resolves.toMatchObject({
+      id: rerun.id
+    });
+    await expect(repository.complete(rerun.id, 'disposition-rerun-cleanup')).resolves.toBe(true);
+
+    const actorId = crypto.randomUUID();
+    await ownerDatabaseClient.pool.query(`
+      insert into "user" (id, name, email, email_verified)
+      values ($1, $2, $3, true)
+    `, [
+      actorId,
+      'Failure disposition administrator',
+      `failure-disposition-${actorId}@example.com`
+    ]);
+    await ownerDatabaseClient.pool.query(
+      `insert into user_roles (user_id, role) values ($1, 'admin')`,
+      [actorId]
+    );
+    const actor: AdministratorActor = { type: 'user', id: actorId, roles: ['admin'] };
+    const command = await submitFinancialAdminCommand(webDatabaseClient.db, {
+      actor,
+      idempotencyKey: crypto.randomUUID(),
+      command: {
+        kind: 'refund_draft_save',
+        refundId: crypto.randomUUID(),
+        expectedVersion: null,
+        items: [{ orderItemId: crypto.randomUUID(), totalPresentmentMinor: 725 }]
+      },
+      context: { correlationId: `failure-disposition-${crypto.randomUUID()}` }
+    });
+    const capability = 'D'.repeat(43);
+    const protectedRepository = createPostgresJobRepository(
+      databaseClient.db,
+      applicationConfig.jobs,
+      undefined,
+      'local-only',
+      {
+        classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+        allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
+      },
+      () => capability
+    );
+    const protectedJob = await protectedRepository.claimNext('disposition-protected-worker');
+    expect(protectedJob).toMatchObject({
+      type: 'commerce.financial-admin-command',
+      payload: { commandId: command.commandId },
+      financialAdminLeaseCapability: capability
+    });
+    await expect(protectedRepository.failWithDisposition(
+      protectedJob!.id,
+      'disposition-protected-worker',
+      'safe transient failure',
+      true,
+      'E'.repeat(43)
+    )).resolves.toEqual({ applied: false });
+    await expect(databaseClient.db.select().from(jobs).where(eq(jobs.id, protectedJob!.id)))
+      .resolves.toEqual([expect.objectContaining({
+        status: 'running',
+        lockedBy: 'disposition-protected-worker'
+      })]);
+    await expect(protectedRepository.failWithDisposition(
+      protectedJob!.id,
+      'disposition-protected-worker',
+      'safe transient failure',
+      true,
+      capability
+    )).resolves.toEqual({ applied: true, retryScheduled: true });
+    await expect(databaseClient.db.select().from(jobs).where(eq(jobs.id, protectedJob!.id)))
+      .resolves.toEqual([expect.objectContaining({
+        status: 'pending',
+        attempts: 1,
+        lastError: 'safe transient failure'
+      })]);
   });
 
   it('reclaims an expired lease and fails it after the final crashed attempt', async () => {

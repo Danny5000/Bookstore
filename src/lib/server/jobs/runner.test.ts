@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { PermanentJobError, runWorker } from './runner';
-import type { JobRecord, JobRepository } from './types';
+import type { JobFailureTransition, JobRecord, JobRepository } from './types';
 
 const job: JobRecord = {
   id: 'f1f46ee7-3170-40ea-bfad-d55a734bf37d',
@@ -24,11 +24,17 @@ const financialAdminJob: JobRecord = {
 };
 
 function repositoryReturning(record: JobRecord): JobRepository {
+  const fail = vi.fn().mockResolvedValue(true);
   return {
     claimNext: vi.fn().mockResolvedValueOnce(record).mockResolvedValue(null),
     renewLease: vi.fn().mockResolvedValue(true),
     complete: vi.fn().mockResolvedValue(true),
-    fail: vi.fn().mockResolvedValue(true)
+    fail,
+    failWithDisposition: vi.fn(async (
+      ...failureArguments: Parameters<JobRepository['fail']>
+    ): Promise<JobFailureTransition> => await fail(...failureArguments)
+      ? { applied: true, retryScheduled: failureArguments[3] }
+      : { applied: false })
   };
 }
 
@@ -236,6 +242,7 @@ describe('runWorker', () => {
     const controller = new AbortController();
     const seenWorkers = new Set<string>();
     const complete = vi.fn().mockResolvedValue(true);
+    const fail = vi.fn().mockResolvedValue(true);
     const repository: JobRepository = {
       claimNext: vi.fn(async (workerId: string) => {
         if (seenWorkers.has(workerId)) return null;
@@ -248,7 +255,12 @@ describe('runWorker', () => {
       }),
       renewLease: vi.fn().mockResolvedValue(true),
       complete,
-      fail: vi.fn().mockResolvedValue(true)
+      fail,
+      failWithDisposition: vi.fn(async (
+        ...failureArguments: Parameters<JobRepository['fail']>
+      ): Promise<JobFailureTransition> => await fail(...failureArguments)
+        ? { applied: true, retryScheduled: failureArguments[3] }
+        : { applied: false })
     };
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });

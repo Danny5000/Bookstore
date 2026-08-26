@@ -13,6 +13,13 @@ export interface JobRecord {
 
 export type JobHandler = (job: JobRecord, signal: AbortSignal) => Promise<void>;
 
+export type JobFailureTransition =
+  | { readonly applied: false }
+  | {
+      readonly applied: true;
+      readonly retryScheduled: boolean;
+    };
+
 export interface JobRepository {
   claimNext(workerId: string): Promise<JobRecord | null>;
   renewLease(
@@ -32,4 +39,11 @@ export interface JobRepository {
     retryable: boolean,
     financialAdminLeaseCapability?: string
   ): Promise<boolean>;
+  failWithDisposition(
+    jobId: string,
+    workerId: string,
+    safeError: string,
+    retryable: boolean,
+    financialAdminLeaseCapability?: string
+  ): Promise<JobFailureTransition>;
 }

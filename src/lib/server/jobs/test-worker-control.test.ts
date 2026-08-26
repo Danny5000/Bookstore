@@ -19,7 +19,7 @@ import {
   type FinancialAdminCommandKind
 } from '$lib/types/financial-reporting';
 import { runWorker } from './runner';
-import type { JobRepository } from './types';
+import type { JobFailureTransition, JobRepository } from './types';
 import {
   TEST_WORKER_CONTROL_ACKNOWLEDGEMENT_BASENAME,
   TEST_WORKER_CONTROL_ACKNOWLEDGED_HOLD_DEADLINE_MS,
@@ -131,6 +131,7 @@ async function waitForContents(path: string, expected: string): Promise<void> {
 }
 
 function repositoryWithNoJobs(onClaim?: () => void | Promise<void>): JobRepository {
+  const fail = vi.fn().mockResolvedValue(true);
   return {
     claimNext: vi.fn(async () => {
       await onClaim?.();
@@ -138,7 +139,12 @@ function repositoryWithNoJobs(onClaim?: () => void | Promise<void>): JobReposito
     }),
     renewLease: vi.fn().mockResolvedValue(true),
     complete: vi.fn().mockResolvedValue(true),
-    fail: vi.fn().mockResolvedValue(true)
+    fail,
+    failWithDisposition: vi.fn(async (
+      ...failureArguments: Parameters<JobRepository['fail']>
+    ): Promise<JobFailureTransition> => await fail(...failureArguments)
+      ? { applied: true, retryScheduled: failureArguments[3] }
+      : { applied: false })
   };
 }
 

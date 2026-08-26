@@ -20,7 +20,7 @@ import {
 } from '$lib/server/commerce/financial/constants';
 import { STRIPE_EVENT_JOB } from '$lib/server/commerce/job';
 import { computeRetryDelayMs } from './backoff';
-import type { JobRecord, JobRepository } from './types';
+import type { JobFailureTransition, JobRecord, JobRepository } from './types';
 
 export interface EnqueueJobInput {
   type: string;
@@ -837,6 +837,108 @@ export function createPostgresJobRepository(
       and (${replayImplementationSupported})
       and (${providerImplementationSupported})
   `;
+  async function settleFailure(
+    jobId: string,
+    workerId: string,
+    safeError: string,
+    retryable: boolean,
+    capability?: string
+  ): Promise<JobFailureTransition> {
+    let financialAdminPath = false;
+    try {
+      return await withTransaction(database, async (transaction) => {
+        const [job] = await queryRows<LockedOwnedJob>(transaction, sql`
+          select id, type, payload,
+            deduplication_key as "deduplicationKey",
+            status, run_at as "runAt", attempts,
+            max_attempts as "maxAttempts", locked_at as "lockedAt",
+            locked_by as "lockedBy", last_error as "lastError",
+            rerun_requested_at as "rerunRequestedAt"
+          from jobs
+          where id = ${jobId}::uuid
+            and status = 'running'
+            and locked_by = ${workerId}
+          for update
+        `);
+        if (!job) return { applied: false };
+        financialAdminPath = job.type === FINANCIAL_ADMIN_COMMAND_JOB;
+        if (financialAdminPath) {
+          if (capability === undefined ||
+            !FINANCIAL_ADMIN_LEASE_CAPABILITY_PATTERN.test(capability)) {
+            return { applied: false };
+          }
+          await setFinancialAdminLeaseContext(transaction, capability);
+          await lockFinancialAdminLease(transaction, job.id, 'exclusive');
+        }
+        const failedAt = now();
+        const timestamp = financialAdminPath
+          ? sql`pg_catalog.clock_timestamp()`
+          : sql`${failedAt}`;
+        let transition: Array<{ id: string; status: unknown }>;
+        if (job.rerunRequestedAt !== null) {
+          transition = await queryRows<{ id: string; status: unknown }>(transaction, sql`
+            update jobs
+            set status = 'pending',
+                run_at = ${timestamp},
+                attempts = 0,
+                locked_at = null,
+                locked_by = null,
+                last_error = null,
+                rerun_requested_at = null,
+                completed_at = null,
+                updated_at = ${timestamp}
+            where id = ${job.id}::uuid
+              and status = 'running'
+              and locked_by = ${workerId}
+              and attempts = ${job.attempts}
+            returning id, status
+          `);
+        } else {
+          const exhausted = !retryable || job.attempts >= job.maxAttempts;
+          const retryDelay = computeRetryDelayMs(
+            job.attempts,
+            config.retryBaseMs,
+            config.retryMaxMs
+          );
+          const boundedSafeError = financialAdminPath && capability !== undefined &&
+            safeError.includes(capability)
+            ? 'Financial administrator job failure'
+            : safeError.slice(0, 1000);
+          const runAt = exhausted
+            ? sql`${job.runAt}`
+            : financialAdminPath
+              ? sql`pg_catalog.clock_timestamp() +
+                  (${retryDelay}::double precision * interval '1 millisecond')`
+              : sql`${new Date(failedAt.getTime() + retryDelay)}`;
+          transition = await queryRows<{ id: string; status: unknown }>(transaction, sql`
+            update jobs
+            set status = ${exhausted ? 'failed' : 'pending'}::job_status,
+                run_at = ${runAt},
+                locked_at = null,
+                locked_by = null,
+                last_error = ${boundedSafeError},
+                completed_at = ${exhausted ? timestamp : sql`null::timestamptz`},
+                updated_at = ${timestamp}
+            where id = ${job.id}::uuid
+              and status = 'running'
+              and locked_by = ${workerId}
+              and attempts = ${job.attempts}
+            returning id, status
+          `);
+        }
+        const settled = transition[0];
+        if (!settled) return { applied: false };
+        const status = settled.status;
+        if (status === 'pending') return { applied: true, retryScheduled: true };
+        if (status === 'failed') return { applied: true, retryScheduled: false };
+        throw new Error('Invalid job failure transition status');
+      });
+    } catch (error: unknown) {
+      if (!financialAdminPath) throw error;
+      if (errorCode(error) === '55000') return { applied: false };
+      throw financialAdminAuthorityFailure();
+    }
+  }
   return {
     async claimNext(workerId): Promise<JobRecord | null> {
       const claimedAt = now();
@@ -1181,92 +1283,18 @@ export function createPostgresJobRepository(
     },
 
     async fail(jobId, workerId, safeError, retryable, capability): Promise<boolean> {
-      let financialAdminPath = false;
-      try {
-        return await withTransaction(database, async (transaction) => {
-          const [job] = await queryRows<LockedOwnedJob>(transaction, sql`
-            select id, type, payload,
-              deduplication_key as "deduplicationKey",
-              status, run_at as "runAt", attempts,
-              max_attempts as "maxAttempts", locked_at as "lockedAt",
-              locked_by as "lockedBy", last_error as "lastError",
-              rerun_requested_at as "rerunRequestedAt"
-            from jobs
-            where id = ${jobId}::uuid
-              and status = 'running'
-              and locked_by = ${workerId}
-            for update
-          `);
-          if (!job) return false;
-          financialAdminPath = job.type === FINANCIAL_ADMIN_COMMAND_JOB;
-          if (financialAdminPath) {
-            if (capability === undefined ||
-              !FINANCIAL_ADMIN_LEASE_CAPABILITY_PATTERN.test(capability)) return false;
-            await setFinancialAdminLeaseContext(transaction, capability);
-            await lockFinancialAdminLease(transaction, job.id, 'exclusive');
-          }
-          const failedAt = now();
-          const timestamp = financialAdminPath
-            ? sql`pg_catalog.clock_timestamp()`
-            : sql`${failedAt}`;
-          if (job.rerunRequestedAt !== null) {
-            const requeued = await queryRows<{ id: string }>(transaction, sql`
-              update jobs
-              set status = 'pending',
-                  run_at = ${timestamp},
-                  attempts = 0,
-                  locked_at = null,
-                  locked_by = null,
-                  last_error = null,
-                  rerun_requested_at = null,
-                  completed_at = null,
-                  updated_at = ${timestamp}
-              where id = ${job.id}::uuid
-                and status = 'running'
-                and locked_by = ${workerId}
-                and attempts = ${job.attempts}
-              returning id
-            `);
-            return requeued.length === 1;
-          }
-          const exhausted = !retryable || job.attempts >= job.maxAttempts;
-          const retryDelay = computeRetryDelayMs(
-            job.attempts,
-            config.retryBaseMs,
-            config.retryMaxMs
-          );
-          const boundedSafeError = financialAdminPath && capability !== undefined &&
-            safeError.includes(capability)
-            ? 'Financial administrator job failure'
-            : safeError.slice(0, 1000);
-          const runAt = exhausted
-            ? sql`${job.runAt}`
-            : financialAdminPath
-              ? sql`pg_catalog.clock_timestamp() +
-                  (${retryDelay}::double precision * interval '1 millisecond')`
-              : sql`${new Date(failedAt.getTime() + retryDelay)}`;
-          const failed = await queryRows<{ id: string }>(transaction, sql`
-            update jobs
-            set status = ${exhausted ? 'failed' : 'pending'}::job_status,
-                run_at = ${runAt},
-                locked_at = null,
-                locked_by = null,
-                last_error = ${boundedSafeError},
-                completed_at = ${exhausted ? timestamp : sql`null::timestamptz`},
-                updated_at = ${timestamp}
-            where id = ${job.id}::uuid
-              and status = 'running'
-              and locked_by = ${workerId}
-              and attempts = ${job.attempts}
-            returning id
-          `);
-          return failed.length === 1;
-        });
-      } catch (error: unknown) {
-        if (!financialAdminPath) throw error;
-        if (errorCode(error) === '55000') return false;
-        throw financialAdminAuthorityFailure();
-      }
+      const result = await settleFailure(jobId, workerId, safeError, retryable, capability);
+      return result.applied;
+    },
+
+    async failWithDisposition(
+      jobId,
+      workerId,
+      safeError,
+      retryable,
+      capability
+    ): Promise<JobFailureTransition> {
+      return settleFailure(jobId, workerId, safeError, retryable, capability);
     }
   };
 }

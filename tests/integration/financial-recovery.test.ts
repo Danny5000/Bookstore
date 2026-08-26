@@ -262,7 +262,8 @@ function disconnectTerminalWrites(repository: JobRepository): JobRepository {
     claimNext: (workerId) => repository.claimNext(workerId),
     renewLease: (jobId, workerId) => repository.renewLease(jobId, workerId),
     complete: disconnected,
-    fail: disconnected
+    fail: disconnected,
+    failWithDisposition: disconnected
   };
 }
 

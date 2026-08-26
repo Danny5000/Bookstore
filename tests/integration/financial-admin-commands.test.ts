@@ -502,6 +502,18 @@ function observeRepository(
       afterFailure?.(current);
       return result;
     },
+    async failWithDisposition(jobId, workerId, safeError, retryable, leaseCapability) {
+      observations.failures += 1;
+      const result = await repository.failWithDisposition(
+        jobId,
+        workerId,
+        safeError,
+        retryable,
+        leaseCapability,
+      );
+      afterFailure?.(current);
+      return result;
+    },
   };
 }
 
