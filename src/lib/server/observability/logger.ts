@@ -25,6 +25,11 @@ function line(record: Readonly<Record<string, string | number | boolean>>): stri
   return `${JSON.stringify(record)}\n`;
 }
 
+function defaultSink(stream: NodeJS.WriteStream): StructuredLogSink {
+  const write = stream.write;
+  return write.bind(stream);
+}
+
 export function createStructuredLogger<S extends StructuredLogService>(options: {
   readonly service: S;
   readonly environment: 'development' | 'test' | 'production';
@@ -34,8 +39,8 @@ export function createStructuredLogger<S extends StructuredLogService>(options: 
 }): StructuredLogger<S> {
   const { service, environment, now: injectedNow, stdout: injectedStdout, stderr: injectedStderr } = options;
   const now = injectedNow ?? (() => new Date());
-  const stdout = injectedStdout ?? ((value) => { process.stdout.write(value); });
-  const stderr = injectedStderr ?? ((value) => { process.stderr.write(value); });
+  const stdout = injectedStdout ?? defaultSink(process.stdout);
+  const stderr = injectedStderr ?? defaultSink(process.stderr);
 
   return {
     emit(input) {

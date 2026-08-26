@@ -177,6 +177,34 @@ describe('strict structured logger', () => {
     expect(mutated.stderr).toEqual([]);
   });
 
+  test('captures default stream writers before later replacements', () => {
+    const stdoutDescriptor = Object.getOwnPropertyDescriptor(process.stdout, 'write');
+    const stderrDescriptor = Object.getOwnPropertyDescriptor(process.stderr, 'write');
+    const first = lines();
+    const second = lines();
+    try {
+      Object.defineProperty(process.stdout, 'write', { configurable: true, writable: true, value: (line: string) => { first.stdout.push(line); return true; } });
+      Object.defineProperty(process.stderr, 'write', { configurable: true, writable: true, value: (line: string) => { first.stderr.push(line); return true; } });
+      const valid = createStructuredLogger({ service: 'web', environment: 'development', now: clock });
+      const failing = createStructuredLogger({ service: 'web', environment: 'production', now: clock });
+      Object.defineProperty(process.stdout, 'write', { configurable: true, writable: true, value: (line: string) => { second.stdout.push(line); return true; } });
+      Object.defineProperty(process.stderr, 'write', { configurable: true, writable: true, value: (line: string) => { second.stderr.push(line); return true; } });
+
+      valid.emit(webCompleted);
+      Reflect.apply(failing.emit, failing, [{ ...webCompleted, secret: 'privacy-canary' }]);
+
+      expect(first.stdout).toEqual(['{"version":1,"timestamp":"2026-08-24T12:34:56.789Z","severity":"info","service":"web","event":"http.request.completed","outcome":"succeeded","correlationId":"request-1","method":"GET","route":"/books","httpStatus":200,"durationMs":12}\n']);
+      expect(first.stderr).toEqual(['{"version":1,"timestamp":"2026-08-24T12:34:56.789Z","severity":"error","service":"web","event":"logging.failure","outcome":"failed"}\n']);
+      expect(second.stdout).toEqual([]);
+      expect(second.stderr).toEqual([]);
+    } finally {
+      if (stdoutDescriptor) Object.defineProperty(process.stdout, 'write', stdoutDescriptor);
+      else Reflect.deleteProperty(process.stdout, 'write');
+      if (stderrDescriptor) Object.defineProperty(process.stderr, 'write', stderrDescriptor);
+      else Reflect.deleteProperty(process.stderr, 'write');
+    }
+  });
+
   test('makes one nonrecursive stderr logging.failure attempt after a production primary-sink failure', () => {
     const calls: Array<{ readonly sink: 'stdout' | 'stderr'; readonly line: string }> = [];
     const logger = createStructuredLogger({
