@@ -1043,6 +1043,7 @@ function failureDispositionHarness(input: {
   readonly job?: JobRow | null;
   readonly returnedStatus?: unknown;
   readonly returnRowWithoutStatus?: boolean;
+  readonly returnedRows?: readonly unknown[];
   readonly authorityFailure?: Error;
 }) {
   const calls: SQL[] = [];
@@ -1058,6 +1059,7 @@ function failureDispositionHarness(input: {
         return { rows: [] };
       }
       if (statement.includes('returning id')) {
+        if (input.returnedRows !== undefined) return { rows: input.returnedRows };
         if (input.returnRowWithoutStatus) {
           return { rows: [{ id: input.job?.id ?? runningJob().id }] };
         }
@@ -1269,6 +1271,42 @@ describe('job failure committed retry disposition', () => {
       'Bounded failure',
       true
     )).rejects.toThrow('Invalid job failure transition status');
+  });
+
+  it.each([
+    {
+      label: 'multiple committed rows',
+      returnedRows: [
+        { id: runningJob().id, status: 'pending' },
+        { id: runningJob().id, status: 'pending' }
+      ]
+    },
+    {
+      label: 'a mismatched committed row identity',
+      returnedRows: [{
+        id: '00000000-0000-4000-8000-000000001699',
+        status: 'pending'
+      }]
+    }
+  ])('rejects $label through both failure APIs', async ({ returnedRows }) => {
+    for (const operation of ['failWithDisposition', 'fail'] as const) {
+      const harness = failureDispositionHarness({ returnedRows });
+      const result = operation === 'failWithDisposition'
+        ? harness.repository.failWithDisposition(
+            runningJob().id,
+            'failure-worker',
+            'Bounded failure',
+            true
+          )
+        : harness.repository.fail(
+            runningJob().id,
+            'failure-worker',
+            'Bounded failure',
+            true
+          );
+
+      await expect(result).rejects.toThrow('Invalid job failure transition status');
+    }
   });
 
   it.each([

@@ -143,7 +143,7 @@ function repositoryWithNoJobs(onClaim?: () => void | Promise<void>): JobReposito
     failWithDisposition: vi.fn(async (
       ...failureArguments: Parameters<JobRepository['fail']>
     ): Promise<JobFailureTransition> => await fail(...failureArguments)
-      ? { applied: true, retryScheduled: failureArguments[3] }
+      ? { applied: true, retryScheduled: false }
       : { applied: false })
   };
 }

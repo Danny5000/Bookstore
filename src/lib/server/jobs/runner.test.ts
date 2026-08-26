@@ -33,7 +33,10 @@ function repositoryReturning(record: JobRecord): JobRepository {
     failWithDisposition: vi.fn(async (
       ...failureArguments: Parameters<JobRepository['fail']>
     ): Promise<JobFailureTransition> => await fail(...failureArguments)
-      ? { applied: true, retryScheduled: failureArguments[3] }
+      ? {
+          applied: true,
+          retryScheduled: failureArguments[3] && record.attempts < record.maxAttempts
+        }
       : { applied: false })
   };
 }
@@ -62,6 +65,18 @@ function controlledSleep() {
 }
 
 describe('runWorker', () => {
+  it('models an exhausted transient failure as terminal in the in-memory adapter', async () => {
+    const exhausted = { ...job, attempts: job.maxAttempts };
+    const repository = repositoryReturning(exhausted);
+
+    await expect(repository.failWithDisposition(
+      exhausted.id,
+      exhausted.lockedBy,
+      'Transient job handler failure',
+      true
+    )).resolves.toEqual({ applied: true, retryScheduled: false });
+  });
+
   it('runs the poll hook before each claim cycle and stops before claiming after abort', async () => {
     const controller = new AbortController();
     const trace: string[] = [];
@@ -259,7 +274,10 @@ describe('runWorker', () => {
       failWithDisposition: vi.fn(async (
         ...failureArguments: Parameters<JobRepository['fail']>
       ): Promise<JobFailureTransition> => await fail(...failureArguments)
-        ? { applied: true, retryScheduled: failureArguments[3] }
+        ? {
+            applied: true,
+            retryScheduled: failureArguments[3] && job.attempts < job.maxAttempts
+          }
         : { applied: false })
     };
     let release!: () => void;

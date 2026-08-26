@@ -926,8 +926,14 @@ export function createPostgresJobRepository(
             returning id, status
           `);
         }
-        const settled = transition[0];
-        if (!settled) return { applied: false };
+        if (transition.length === 0) return { applied: false };
+        if (transition.length !== 1) {
+          throw new Error('Invalid job failure transition status');
+        }
+        const settled = transition[0]!;
+        if (settled.id !== job.id) {
+          throw new Error('Invalid job failure transition status');
+        }
         const status = settled.status;
         if (status === 'pending') return { applied: true, retryScheduled: true };
         if (status === 'failed') return { applied: true, retryScheduled: false };
