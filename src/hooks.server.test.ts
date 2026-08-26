@@ -1,17 +1,15 @@
 import type { Handle, RequestEvent, ResolveOptions } from '@sveltejs/kit';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { StructuredEventInputFor } from '$lib/server/observability/contracts';
+import type { StructuredLogger } from '$lib/server/observability/logger';
 
 const state = vi.hoisted(() => ({
   building: false,
   available: true,
   environment: 'test' as 'development' | 'test' | 'production',
   applicationMode: 'prototype',
-  stdoutLines: [] as string[],
-  stderrLines: [] as string[],
-  stdoutAttempts: [] as string[],
-  stderrAttempts: [] as string[],
-  stdoutFailure: undefined as unknown,
-  stderrFailure: undefined as unknown,
+  emittedEvents: [] as StructuredEventInputFor<'web'>[],
+  emitFailure: undefined as unknown,
   sequence: [] as string[]
 }));
 
@@ -61,30 +59,15 @@ vi.mock('$lib/server/storage/runtime', () => ({
   getObjectStorage: mocks.getObjectStorage
 }));
 
-vi.mock('$lib/server/observability/logger', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('$lib/server/observability/logger')>();
-  return {
-    ...actual,
-    createStructuredLogger: vi.fn((options: Parameters<typeof actual.createStructuredLogger>[0]) =>
-      actual.createStructuredLogger({
-        ...options,
-        now: () => new Date('2026-08-25T12:34:56.789Z'),
-        stdout: (line) => {
-          state.stdoutAttempts.push(line);
-          state.sequence.push('stdout');
-          if (state.stdoutFailure !== undefined) throw state.stdoutFailure;
-          state.stdoutLines.push(line);
-        },
-        stderr: (line) => {
-          state.stderrAttempts.push(line);
-          state.sequence.push('stderr');
-          if (state.stderrFailure !== undefined) throw state.stderrFailure;
-          state.stderrLines.push(line);
-        }
-      })
-    )
-  };
-});
+vi.mock('$lib/server/observability/logger', () => ({
+  createStructuredLogger: vi.fn((): StructuredLogger<'web'> => ({
+    emit(input) {
+      state.emittedEvents.push(input);
+      state.sequence.push('emit');
+      if (state.emitFailure !== undefined) throw state.emitFailure;
+    }
+  }))
+}));
 
 import { commandContext } from './routes/admin/catalog/route-support';
 import { handle, init } from './hooks.server';
@@ -152,8 +135,8 @@ function response(status = 200): Response {
   });
 }
 
-function records(): Array<Record<string, unknown>> {
-  return [...state.stdoutLines, ...state.stderrLines].map((line) => JSON.parse(line));
+function emittedEvents(): readonly StructuredEventInputFor<'web'>[] {
+  return state.emittedEvents;
 }
 
 async function invoke(
@@ -168,12 +151,8 @@ beforeEach(() => {
   state.available = true;
   state.environment = 'test';
   state.applicationMode = 'prototype';
-  state.stdoutLines = [];
-  state.stderrLines = [];
-  state.stdoutAttempts = [];
-  state.stderrAttempts = [];
-  state.stdoutFailure = undefined;
-  state.stderrFailure = undefined;
+  state.emittedEvents = [];
+  state.emitFailure = undefined;
   state.sequence = [];
 
   mocks.getApplicationConfig.mockImplementation(() => ({
@@ -228,7 +207,7 @@ describe('build-mode hook behavior', () => {
     expect(result.headers.get('content-encoding')).toBeNull();
     expect(mocks.getApplicationConfig).not.toHaveBeenCalled();
     expect(createStructuredLogger).not.toHaveBeenCalled();
-    expect(records()).toEqual([]);
+    expect(emittedEvents()).toEqual([]);
   });
 });
 
@@ -269,14 +248,9 @@ describe('top-level HTTP lifecycle', () => {
       'content-type': 'text/plain; charset=utf-8',
       'retry-after': '60'
     });
-    expect(records()).toEqual([
+    expect(emittedEvents()).toEqual([
       {
-        version: 1,
-        timestamp: '2026-08-25T12:34:56.789Z',
-        severity: 'warn',
-        service: 'web',
         event: 'http.request.rejected',
-        outcome: 'denied',
         correlationId: 'Incoming.Request:42',
         method: 'POST',
         route: 'unmatched',
@@ -289,13 +263,13 @@ describe('top-level HTTP lifecycle', () => {
   });
 
   it.each([
-    [200, 'http.request.completed', undefined, 'stdout'],
-    [302, 'http.request.completed', undefined, 'stdout'],
-    [404, 'http.request.rejected', 'not_found', 'stderr'],
-    [500, 'http.request.failed', 'http_server_error', 'stderr']
+    [200, 'http.request.completed', undefined],
+    [302, 'http.request.completed', undefined],
+    [404, 'http.request.rejected', 'not_found'],
+    [500, 'http.request.failed', 'http_server_error']
   ] as const)(
     'emits one terminal event for canonical returned status %i',
-    async (status, eventName, code, sink) => {
+    async (status, eventName, code) => {
       const event = requestEvent({
         method: 'post',
         routeId: '/admin/catalog/[titleId]',
@@ -316,9 +290,8 @@ describe('top-level HTTP lifecycle', () => {
       } else {
         expect(result.headers.get('x-domain-header')).toBe('preserved');
       }
-      expect(records()).toHaveLength(1);
-      expect(records()[0]).toMatchObject({
-        service: 'web',
+      expect(emittedEvents()).toHaveLength(1);
+      expect(emittedEvents()[0]).toMatchObject({
         event: eventName,
         correlationId: 'status-matrix',
         method: 'POST',
@@ -326,8 +299,8 @@ describe('top-level HTTP lifecycle', () => {
         httpStatus: status,
         ...(code === undefined ? {} : { code })
       });
-      expect(Object.hasOwn(records()[0]!, 'code')).toBe(code !== undefined);
-      expect(state.sequence).toEqual(['svelte-kit', 'resolve', sink]);
+      expect(Object.hasOwn(emittedEvents()[0]!, 'code')).toBe(code !== undefined);
+      expect(state.sequence).toEqual(['svelte-kit', 'resolve', 'emit']);
     }
   );
 
@@ -343,19 +316,18 @@ describe('top-level HTTP lifecycle', () => {
 
     await expect(invoke(event)).rejects.toBe(cause);
 
-    expect(records()).toHaveLength(1);
-    expect(records()[0]).toMatchObject({
+    expect(emittedEvents()).toHaveLength(1);
+    expect(emittedEvents()[0]).toMatchObject({
       event: 'http.request.failed',
-      outcome: 'failed',
       correlationId: 'exception-request',
       method: 'DELETE',
       route: '/admin/catalog/[titleId]',
       httpStatus: 500,
       code: 'unexpected_failure'
     });
-    const line = state.stderrLines.join('');
-    expect(line).not.toContain('exception-message-canary');
-    expect(line).not.toContain('stack-canary');
+    const loggerInput = JSON.stringify(emittedEvents());
+    expect(loggerInput).not.toContain('exception-message-canary');
+    expect(loggerInput).not.toContain('stack-canary');
   });
 
   it.each([
@@ -408,7 +380,7 @@ describe('top-level HTTP lifecycle', () => {
     } else {
       expect(seen[0]).toMatch(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/);
     }
-    expect(records()[0]).toMatchObject({ correlationId: seen[0] });
+    expect(emittedEvents()[0]).toMatchObject({ correlationId: seen[0] });
   });
 
   it('constructs the fixed web logger after configuration succeeds', async () => {
@@ -429,46 +401,41 @@ describe('top-level HTTP lifecycle', () => {
     async (environment) => {
       state.environment = environment;
       const loggerFailure = new Error('logger-failure-canary');
-      state.stdoutFailure = loggerFailure;
+      state.emitFailure = loggerFailure;
 
       await expect(invoke(requestEvent({ requestId: 'strict-logger' }))).rejects.toBe(loggerFailure);
 
-      expect(state.stdoutAttempts).toHaveLength(1);
-      expect(state.stderrAttempts).toHaveLength(0);
+      expect(emittedEvents()).toHaveLength(1);
+      expect(emittedEvents()[0]).toMatchObject({ event: 'http.request.completed' });
+      expect(state.sequence.filter((entry) => entry === 'emit')).toHaveLength(1);
     }
   );
 
-  it('keeps a successful production response when the primary logger sink fails', async () => {
+  it('returns a successful production response when the logger honors its nonthrowing contract', async () => {
     state.environment = 'production';
-    state.stdoutFailure = new Error('production-sink-canary');
 
     const result = await invoke(requestEvent({ requestId: 'production-success' }));
 
     expect(result.status).toBe(200);
-    expect(state.stdoutAttempts).toHaveLength(1);
-    expect(state.stderrAttempts).toHaveLength(1);
-    expect(JSON.parse(state.stderrLines[0]!)).toEqual({
-      version: 1,
-      timestamp: '2026-08-25T12:34:56.789Z',
-      severity: 'error',
-      service: 'web',
-      event: 'logging.failure',
-      outcome: 'failed'
-    });
+    expect(emittedEvents()).toHaveLength(1);
+    expect(emittedEvents()[0]).toMatchObject({ event: 'http.request.completed' });
   });
 
-  it('rethrows the identical production domain error when failure logging also fails', async () => {
+  it('rethrows the identical production domain error with a nonthrowing logger contract', async () => {
     state.environment = 'production';
     const cause = new Error('domain-error-canary');
-    state.stderrFailure = new Error('production-stderr-canary');
     mocks.resolve.mockRejectedValue(cause);
 
     await expect(invoke(requestEvent({ requestId: 'production-failure' }))).rejects.toBe(cause);
 
-    expect(state.stderrAttempts).toHaveLength(2);
+    expect(emittedEvents()).toHaveLength(1);
+    expect(emittedEvents()[0]).toMatchObject({
+      event: 'http.request.failed',
+      code: 'unexpected_failure'
+    });
   });
 
-  it('does not serialize request or authentication privacy canaries', async () => {
+  it('does not pass request or authentication privacy canaries to the logger', async () => {
     const event = requestEvent({
       pathname: '/pathname-segment-canary',
       query: '?secret=query-canary',
@@ -492,7 +459,7 @@ describe('top-level HTTP lifecycle', () => {
 
     await invoke(event);
 
-    const line = [...state.stdoutLines, ...state.stderrLines].join('');
+    const loggerInput = JSON.stringify(emittedEvents());
     for (const canary of [
       'pathname-segment-canary',
       'query-canary',
@@ -502,9 +469,9 @@ describe('top-level HTTP lifecycle', () => {
       'auth-email-canary',
       'auth-session-canary'
     ]) {
-      expect(line).not.toContain(canary);
+      expect(loggerInput).not.toContain(canary);
     }
-    expect(records()[0]).toMatchObject({
+    expect(emittedEvents()[0]).toMatchObject({
       correlationId: 'privacy-request',
       route: '/library/[titleId]'
     });
@@ -538,6 +505,6 @@ describe('internal subrequest behavior', () => {
 
     expect(result.status).toBe(200);
     expect(seen).toEqual(['ambient-parent', 'ambient-parent', 'ambient-parent']);
-    expect(records()).toEqual([]);
+    expect(emittedEvents()).toEqual([]);
   });
 });
