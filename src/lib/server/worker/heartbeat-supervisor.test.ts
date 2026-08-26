@@ -943,47 +943,108 @@ describe('worker heartbeat supervisor atomic filesystem and lifecycle', () => {
 		expect(harness.filesystem.files.has('heartbeat.json.tmp')).toBe(false);
 	});
 
-	it.each(['accessor', 'hostile proxy'])(
-		'does not inspect or retry a %s rename code',
-		async (kind) => {
-			let codeInspection = 0;
-			const failure = kind === 'accessor'
-				? Object.defineProperty(new Error('accessor-code'), 'code', {
-					get() {
-						codeInspection += 1;
-						return 'EPERM';
-					}
-				})
-				: new Proxy(new Error('hostile-code'), {
-					getOwnPropertyDescriptor() {
-						codeInspection += 1;
-						throw new Error('hostile descriptor');
-					}
-				});
-			const retryWait = vi.fn().mockResolvedValue(undefined);
-			const harness = createHarness(1, {
-				monotonicNow: () => 0,
-				retryWait
-			});
-			await harness.supervisor.prepare();
-			const controller = new AbortController();
-			const run = harness.supervisor.run(controller.signal);
-			harness.supervisor.reportSlotProgress({
-				type: 'poll_succeeded',
-				slotId: 0,
-				claimed: false
-			});
-			await harness.supervisor.firstHealthyPublication;
-			harness.filesystem.failures.set('rename', failure);
-			await harness.sleeper.waitForCall(1);
-			harness.sleeper.release(0);
+	it('does not invoke or retry an accessor rename code', async () => {
+		let codeInspection = 0;
+		const failure = Object.defineProperty(new Error('accessor-code'), 'code', {
+			get() {
+				codeInspection += 1;
+				return 'EPERM';
+			}
+		});
+		const retryWait = vi.fn().mockResolvedValue(undefined);
+		const harness = createHarness(1, {
+			monotonicNow: () => 0,
+			retryWait
+		});
+		await harness.supervisor.prepare();
+		const controller = new AbortController();
+		const run = harness.supervisor.run(controller.signal);
+		harness.supervisor.reportSlotProgress({
+			type: 'poll_succeeded',
+			slotId: 0,
+			claimed: false
+		});
+		await harness.supervisor.firstHealthyPublication;
+		harness.filesystem.failures.set('rename', failure);
+		await harness.sleeper.waitForCall(1);
+		harness.sleeper.release(0);
 
-			const observed = await capturePublicationFailure(run);
-			expectFixedPublicationFailure(observed, failure);
-			expect(codeInspection).toBe(kind === 'accessor' ? 0 : 1);
-			expect(retryWait).not.toHaveBeenCalled();
-		}
-	);
+		const observed = await capturePublicationFailure(run);
+		expectFixedPublicationFailure(observed, failure);
+		expect(codeInspection).toBe(0);
+		expect(retryWait).not.toHaveBeenCalled();
+	});
+
+	it('does not invoke proxy traps or retry a proxy-reported transient code', async () => {
+		let codeInspection = 0;
+		const failure = new Proxy(new Error('proxy-code'), {
+			getOwnPropertyDescriptor(target, property) {
+				codeInspection += 1;
+				if (property === 'code') {
+					return {
+						configurable: true,
+						enumerable: true,
+						value: 'EPERM',
+						writable: true
+					};
+				}
+				return Reflect.getOwnPropertyDescriptor(target, property);
+			}
+		});
+		let monotonicMilliseconds = 0;
+		const retryWait = vi.fn(async (milliseconds: number) => {
+			monotonicMilliseconds += milliseconds;
+		});
+		const harness = createHarness(1, {
+			intervalMs: 10,
+			monotonicNow: () => monotonicMilliseconds,
+			retryWait
+		});
+		await harness.supervisor.prepare();
+		const controller = new AbortController();
+		const run = harness.supervisor.run(controller.signal);
+		harness.supervisor.reportSlotProgress({
+			type: 'poll_succeeded',
+			slotId: 0,
+			claimed: false
+		});
+		await harness.supervisor.firstHealthyPublication;
+		harness.filesystem.failures.set('rename', failure);
+		await harness.sleeper.waitForCall(1);
+		harness.sleeper.release(0);
+
+		const observed = await capturePublicationFailure(run);
+		expect(observed.cause).toBe(failure);
+		expect(codeInspection).toBe(0);
+		expect(retryWait).not.toHaveBeenCalled();
+	});
+
+	it('treats a revoked proxy rename error as nonretryable', async () => {
+		const revocable = Proxy.revocable(new Error('revoked-proxy'), {});
+		const failure = revocable.proxy;
+		revocable.revoke();
+		const retryWait = vi.fn().mockResolvedValue(undefined);
+		const harness = createHarness(1, {
+			monotonicNow: () => 0,
+			retryWait
+		});
+		await harness.supervisor.prepare();
+		const controller = new AbortController();
+		const run = harness.supervisor.run(controller.signal);
+		harness.supervisor.reportSlotProgress({
+			type: 'poll_succeeded',
+			slotId: 0,
+			claimed: false
+		});
+		await harness.supervisor.firstHealthyPublication;
+		harness.filesystem.failures.set('rename', failure);
+		await harness.sleeper.waitForCall(1);
+		harness.sleeper.release(0);
+
+		const observed = await capturePublicationFailure(run);
+		expect(observed.cause).toBe(failure);
+		expect(retryWait).not.toHaveBeenCalled();
+	});
 
 	it('expires persistent transient rename contention at the exact monotonic deadline', async () => {
 		let monotonicMilliseconds = 0;
@@ -1198,6 +1259,43 @@ describe('worker heartbeat supervisor atomic filesystem and lifecycle', () => {
 			expect(harness.filesystem.files.has('heartbeat.json.tmp')).toBe(false);
 		}
 	);
+
+	it('fails closed when a positive retry wait makes no monotonic progress', async () => {
+		const controller = new AbortController();
+		let waitCalls = 0;
+		const retryWait = vi.fn(async () => {
+			waitCalls += 1;
+			if (waitCalls > 1) controller.abort();
+		});
+		const harness = createHarness(1, {
+			intervalMs: 25,
+			monotonicNow: () => 100,
+			retryWait
+		});
+		await harness.supervisor.prepare();
+		const run = harness.supervisor.run(controller.signal);
+		harness.supervisor.reportSlotProgress({
+			type: 'poll_succeeded',
+			slotId: 0,
+			claimed: false
+		});
+		await harness.supervisor.firstHealthyPublication;
+		const priorTarget = harness.filesystem.files.get('heartbeat.json');
+		harness.filesystem.failures.set('rename', errorWithCode('EBUSY'));
+		await harness.sleeper.waitForCall(1);
+		harness.sleeper.release(0);
+
+		const outcome = await run.then(
+			() => undefined,
+			(error: unknown) => error
+		);
+		expect(outcome).toBeInstanceOf(WorkerHeartbeatPublicationError);
+		expect((outcome as WorkerHeartbeatPublicationError).cause)
+			.toBeInstanceOf(TypeError);
+		expect(retryWait).toHaveBeenCalledOnce();
+		expect(harness.filesystem.files.get('heartbeat.json')).toBe(priorTarget);
+		expect(harness.filesystem.files.has('heartbeat.json.tmp')).toBe(false);
+	});
 
 	it.skipIf(process.platform !== 'win32')(
 		'retries a native Windows replace after a held reader releases without wall sleep',

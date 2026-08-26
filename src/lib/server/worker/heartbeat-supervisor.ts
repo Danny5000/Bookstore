@@ -4,6 +4,7 @@ import {
 	rm as removeFile
 } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
+import { types as utilTypes } from 'node:util';
 
 import { isPositiveSignedInt32, isWorkerId } from '../observability/contracts';
 import type { WorkerSlotProgressEvent } from '../jobs/runner-observer';
@@ -104,6 +105,7 @@ function isTransientRenameContention(error: unknown): boolean {
 	if (error === null || typeof error !== 'object') return false;
 	let descriptor: PropertyDescriptor | undefined;
 	try {
+		if (utilTypes.isProxy(error)) return false;
 		descriptor = Object.getOwnPropertyDescriptor(error, 'code');
 	} catch {
 		return false;
@@ -327,7 +329,10 @@ export function createWorkerHeartbeatSupervisor(options: {
 		});
 	}
 
-	function readMonotonicMilliseconds(previous?: number): number {
+	function readMonotonicMilliseconds(
+		previous?: number,
+		requireForwardProgress = false
+	): number {
 		let milliseconds: number;
 		try {
 			milliseconds = monotonicNow();
@@ -337,7 +342,11 @@ export function createWorkerHeartbeatSupervisor(options: {
 		if (
 			!Number.isFinite(milliseconds) ||
 			milliseconds < 0 ||
-			(previous !== undefined && milliseconds < previous)
+			(previous !== undefined && (
+				requireForwardProgress
+					? milliseconds <= previous
+					: milliseconds < previous
+			))
 		) {
 			throw new TypeError(INVALID_LIFECYCLE);
 		}
@@ -373,7 +382,7 @@ export function createWorkerHeartbeatSupervisor(options: {
 					throw waitError;
 				}
 				if (signal.aborted || sealed) return false;
-				observedAt = readMonotonicMilliseconds(observedAt);
+				observedAt = readMonotonicMilliseconds(observedAt, true);
 				if (observedAt >= deadline) throw error;
 				retrying = true;
 			}
