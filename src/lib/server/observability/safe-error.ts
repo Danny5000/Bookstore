@@ -17,13 +17,17 @@ function ownObject(value: unknown): Record<string, unknown> {
     const prototype = Object.getPrototypeOf(value);
     if (prototype !== Object.prototype && prototype !== null) invalid();
     const descriptors = Object.getOwnPropertyDescriptors(value);
-    for (const descriptor of Object.values(descriptors)) if (!('value' in descriptor) || !descriptor.enumerable) invalid();
+    for (const key of Reflect.ownKeys(descriptors)) {
+      if (typeof key !== 'string') invalid();
+      const descriptor = descriptors[key];
+      if (!descriptor || !('value' in descriptor) || !descriptor.enumerable) invalid();
+    }
     return value as Record<string, unknown>;
   } catch { return invalid(); }
 }
 function exact(value: unknown, keys: readonly string[]): Record<string, unknown> {
-  const record = ownObject(value); const actual = Object.keys(record);
-  if (actual.length !== keys.length || actual.some((key) => !keys.includes(key))) invalid();
+  const record = ownObject(value); const actual = Reflect.ownKeys(record);
+  if (actual.length !== keys.length || actual.some((key) => typeof key !== 'string' || !keys.includes(key))) invalid();
   return record;
 }
 function publicState(value: unknown): SafePublicState {
@@ -36,8 +40,8 @@ function publicState(value: unknown): SafePublicState {
   return { name: record.name, value: state };
 }
 function validated<C extends string>(input: unknown): SafeDiagnosticError<C> {
-  const record = ownObject(input); const keys = Object.keys(record);
-  if (!keys.every((key) => ['class', 'code', 'operation', 'outcome', 'correlationId', 'publicState'].includes(key)) || !['class', 'code', 'operation', 'outcome'].every((key) => keys.includes(key))) invalid();
+  const record = ownObject(input); const keys = Reflect.ownKeys(record);
+  if (!keys.every((key) => typeof key === 'string' && ['class', 'code', 'operation', 'outcome', 'correlationId', 'publicState'].includes(key)) || !['class', 'code', 'operation', 'outcome'].every((key) => keys.includes(key))) invalid();
   if (!classes.has(record.class as SafeErrorClass) || !operations.has(record.operation as SafeErrorOperation) || (record.outcome !== 'denied' && record.outcome !== 'failed') || typeof record.code !== 'string' || !codes.has(record.code)) invalid();
   if ('correlationId' in record && !isCorrelationId(record.correlationId)) invalid();
   const result: { class: SafeErrorClass; code: SafeCode<C>; operation: SafeErrorOperation; outcome: 'denied' | 'failed'; correlationId?: CorrelationId; publicState?: SafePublicState } = { class: record.class as SafeErrorClass, code: record.code as SafeCode<C>, operation: record.operation as SafeErrorOperation, outcome: record.outcome as 'denied' | 'failed' };

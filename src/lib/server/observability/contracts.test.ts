@@ -1,7 +1,9 @@
 import { describe, expect, test } from 'vitest';
 
 import {
+  isPositiveSignedInt32,
   type StructuredEventInputFor,
+  validateLoggingFailure,
   validateStructuredEvent
 } from './contracts';
 
@@ -127,5 +129,104 @@ describe('structured event contracts', () => {
       validateStructuredEvent('worker', timestamp, { event: 'logging.failure' });
     };
     expect(cannotConstruct).toBeTypeOf('function');
+  });
+
+  test.each([
+    ['web', cases.find((entry) => entry.input.event === 'http.request.completed')!],
+    ['worker', cases.find((entry) => entry.input.event === 'worker.started')!],
+    ['plan6b-production-smoke', cases.find((entry) => entry.input.event === 'smoke.stage.started')!],
+    ['plan6b-fixture-runtime-probe', cases.find((entry) => entry.input.event === 'smoke.stage.started')!],
+    ['plan7a-release-candidate', cases.find((entry) => entry.input.event === 'smoke.stage.started')!]
+  ] as const)('accepts only compatible registered service %s', (service, case_) => {
+    const input = service === 'plan7a-release-candidate' ? { ...case_.input, profile: 'release_candidate' } : case_.input;
+    expect(() => validateStructuredEvent(service, timestamp, input as never)).not.toThrow();
+  });
+
+  test.each(['nope', '', new String('web'), null, {}, []])('rejects an unregistered runtime service %#', (service) => {
+    expect(() => validateStructuredEvent(service as never, timestamp, webCompleted.input as never)).toThrow();
+  });
+
+  test('requires the exact smoke service/profile pair', () => {
+    const smoke = cases.find((entry) => entry.input.event === 'smoke.stage.started')!;
+    expect(() => validateStructuredEvent('plan6b-production-smoke', timestamp, { ...smoke.input, profile: 'release_candidate' } as never)).toThrow();
+    expect(() => validateStructuredEvent('plan6b-fixture-runtime-probe', timestamp, { ...smoke.input, profile: 'release_candidate' } as never)).toThrow();
+    expect(() => validateStructuredEvent('plan7a-release-candidate', timestamp, smoke.input as never)).toThrow();
+    expect(() => validateStructuredEvent('web', timestamp, smoke.input as never)).toThrow();
+    expect(() => validateStructuredEvent('worker', timestamp, smoke.input as never)).toThrow();
+  });
+
+  test.each(['web', 'worker', 'plan6b-production-smoke', 'plan6b-fixture-runtime-probe', 'plan7a-release-candidate'] as const)('constructs exact internal logging.failure for %s', (service) => {
+    const result = validateLoggingFailure(service, timestamp);
+    expect(result).toEqual({ record: { version: 1, timestamp, severity: 'error', service, event: 'logging.failure', outcome: 'failed' }, sink: 'stderr' });
+    expect(Object.keys(result.record)).toEqual(['version', 'timestamp', 'severity', 'service', 'event', 'outcome']);
+  });
+
+  test('rejects invalid fallback service and timestamp', () => {
+    expect(() => validateLoggingFailure('nope' as never, timestamp)).toThrow();
+    expect(() => validateLoggingFailure('web', '2026-08-24T12:34:56Z')).toThrow();
+    expect(() => (validateLoggingFailure as (...arguments_: unknown[]) => unknown)('web', timestamp, { event: 'logging.failure' })).toThrow();
+  });
+
+  test('rejects symbol-keyed event extras', () => {
+    const symbol = Symbol('payload');
+    expect(() => validate(webCompleted, { ...webCompleted.input, [symbol]: 'customer@example.test' })).toThrow();
+  });
+
+  test.each([
+    ['jobKind', 'a'], ['jobKind', 'a'.repeat(100)], ['profile', 'maintenance_fixture'], ['stage', 'cleanup'],
+    ['runId', '0'.repeat(16)], ['evidenceFingerprint', 'a'.repeat(64)], ['correlationId', `a${'x'.repeat(99)}`], ['workerId', `a${'x'.repeat(199)}`]
+  ])('accepts named grammar edge %s', (key, value) => {
+    const case_ = cases.find((entry) => Object.hasOwn(entry.input, key))!;
+    expect(() => validate(case_, { ...case_.input, [key]: value })).not.toThrow();
+  });
+
+  test.each([
+    ['jobKind', '1bad'], ['profile', 'not_a_profile'], ['stage', 'not_a_registered_stage'], ['runId', 'a'.repeat(15)],
+    ['runId', 'A'.repeat(16)], ['evidenceFingerprint', 'a'.repeat(63)], ['candidateId', 'a'.repeat(36)],
+    ['correlationId', 'a'.repeat(101)], ['correlationId', ':bad'], ['workerId', ':bad'], ['workerId', 'a'.repeat(201)],
+    ['slotId', 2_147_483_648], ['containerCount', 2_147_483_648], ['attempt', 2_147_483_648],
+    ['maxAttempts', Number.NaN], ['configuredSlots', Infinity], ['generation', Number.MAX_SAFE_INTEGER + 1]
+  ])('rejects named grammar or numeric neighbor %s', (key, value) => {
+    const case_ = cases.find((entry) => Object.hasOwn(entry.input, key))!;
+    expect(() => validate(case_, { ...case_.input, [key]: value })).toThrow();
+  });
+
+  test.each([1, 2_147_483_647])('shares positive signed-int32 rules with heartbeat sequence %s', (sequence) => {
+    expect(isPositiveSignedInt32(sequence)).toBe(true);
+  });
+
+  test.each([0, -1, 2_147_483_648, 1.1, Number.NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])('rejects invalid heartbeat sequence %s', (sequence) => {
+    expect(isPositiveSignedInt32(sequence)).toBe(false);
+  });
+
+  test.each(['slotId', 'containerCount', 'networkCount', 'volumeCount', 'temporaryRootCount'])('accepts nonnegative signed-int32 bounds for %s', (key) => {
+    const case_ = cases.find((entry) => Object.hasOwn(entry.input, key))!;
+    for (const value of [0, 2_147_483_647]) expect(() => validate(case_, { ...case_.input, [key]: value })).not.toThrow();
+  });
+
+  test.each(['slotId', 'containerCount', 'networkCount', 'volumeCount', 'temporaryRootCount'])('rejects invalid nonnegative signed-int32 values for %s', (key) => {
+    const case_ = cases.find((entry) => Object.hasOwn(entry.input, key))!;
+    for (const value of [-1, 2_147_483_648, 1.1, Number.NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) expect(() => validate(case_, { ...case_.input, [key]: value })).toThrow();
+  });
+
+  test.each(['attempt', 'maxAttempts', 'configuredSlots', 'generation'])('accepts positive signed-int32 bounds for %s', (key) => {
+    const case_ = cases.find((entry) => Object.hasOwn(entry.input, key))!;
+    for (const value of [1, 2_147_483_647]) expect(() => validate(case_, { ...case_.input, [key]: value })).not.toThrow();
+  });
+
+  test.each(['attempt', 'maxAttempts', 'configuredSlots', 'generation'])('rejects invalid positive signed-int32 values for %s', (key) => {
+    const case_ = cases.find((entry) => Object.hasOwn(entry.input, key))!;
+    for (const value of [0, 2_147_483_648, 1.1, Number.NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) expect(() => validate(case_, { ...case_.input, [key]: value })).toThrow();
+  });
+
+  test('accepts optional generation and worker.failed workerId omission and presence, but not undefined', () => {
+    const claimed = cases.find((entry) => entry.input.event === 'job.claimed')!;
+    const failed = cases.find((entry) => entry.input.event === 'worker.failed')!;
+    const withoutGeneration = Object.fromEntries(Object.entries(claimed.input).filter(([key]) => key !== 'generation'));
+    const withoutWorker = Object.fromEntries(Object.entries(failed.input).filter(([key]) => key !== 'workerId'));
+    expect(() => validate(claimed, withoutGeneration)).not.toThrow();
+    expect(() => validate(failed, withoutWorker)).not.toThrow();
+    expect(() => validate(claimed, { ...claimed.input, generation: undefined })).toThrow();
+    expect(() => validate(failed, { ...failed.input, workerId: undefined })).toThrow();
   });
 });

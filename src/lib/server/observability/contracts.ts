@@ -78,24 +78,31 @@ const CODES: Readonly<Record<string, ReadonlySet<string>>> = {
 function invalid(): never { throw new TypeError('invalid structured event'); }
 export function isSafeToken(value: unknown): value is string { return typeof value === 'string' && TOKEN.test(value); }
 export function isCorrelationId(value: unknown): value is CorrelationId { return typeof value === 'string' && CORRELATION.test(value); }
+export function isPositiveSignedInt32(value: unknown): value is number { return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 && value <= 2_147_483_647; }
+function isService(value: unknown): value is StructuredLogService { return value === 'web' || value === 'worker' || value === 'plan6b-production-smoke' || value === 'plan6b-fixture-runtime-probe' || value === 'plan7a-release-candidate'; }
 function object(value: unknown): Record<string, unknown> {
   try {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) invalid();
     const prototype = Object.getPrototypeOf(value);
     if (prototype !== Object.prototype && prototype !== null) invalid();
     const descriptors = Object.getOwnPropertyDescriptors(value);
-    for (const descriptor of Object.values(descriptors)) if (!('value' in descriptor) || !descriptor.enumerable) invalid();
+    for (const key of Reflect.ownKeys(descriptors)) {
+      if (typeof key !== 'string') invalid();
+      const descriptor = descriptors[key];
+      if (!descriptor || !('value' in descriptor) || !descriptor.enumerable) invalid();
+    }
     return value as Record<string, unknown>;
   } catch { return invalid(); }
 }
 function exact(value: unknown, keys: readonly string[]): Record<string, unknown> {
   const record = object(value);
-  const actual = Object.keys(record);
-  if (actual.length !== keys.length || actual.some((key) => !keys.includes(key))) invalid();
+  const actual = Reflect.ownKeys(record);
+  if (actual.length !== keys.length || actual.some((key) => typeof key !== 'string' || !keys.includes(key))) invalid();
   return record;
 }
 function string(value: unknown, pattern: RegExp): string { return typeof value === 'string' && pattern.test(value) ? value : invalid(); }
 function integer(value: unknown, min: number, max: number): number { return typeof value === 'number' && Number.isSafeInteger(value) && value >= min && value <= max ? value : invalid(); }
+function positive(value: unknown): number { return isPositiveSignedInt32(value) ? value : invalid(); }
 function bool(value: unknown): boolean { return typeof value === 'boolean' ? value : invalid(); }
 function code(event: string, value: unknown): string { const value_ = string(value, TOKEN); return CODES[event]?.has(value_) ? value_ : invalid(); }
 function timestamp(value: string): string { try { return new Date(value).toISOString() === value ? value : invalid(); } catch { return invalid(); } }
@@ -125,14 +132,14 @@ function worker(value: unknown, event: string, timestamp_: string): ValidatedStr
   const severity = event === 'worker.started' || event === 'worker.ready' || event === 'worker.stopping' || event === 'worker.stopped' || event === 'job.succeeded' ? 'info' : event === 'job.claimed' ? 'debug' : event === 'job.failed' && retry ? 'warn' : event === 'job.lease_lost' ? 'warn' : 'error';
   const outcome = event === 'worker.started' || event === 'worker.stopping' || event === 'job.claimed' ? 'started' : event === 'worker.ready' || event === 'worker.stopped' || event === 'job.succeeded' ? 'succeeded' : 'failed';
   const record: Record<string, string | number | boolean> = { version: 1, timestamp: timestamp_, severity, service: 'worker', event, outcome };
-  if (event.startsWith('job.')) { put(record, 'correlationId', string(keyed.correlationId, CORRELATION)); put(record, 'jobId', string(keyed.jobId, UUID)); put(record, 'jobKind', string(keyed.jobKind, TOKEN)); put(record, 'attempt', integer(keyed.attempt, 1, 2_147_483_647)); if ('maxAttempts' in keyed) put(record, 'maxAttempts', integer(keyed.maxAttempts, 1, 2_147_483_647)); put(record, 'workerId', string(keyed.workerId, WORKER_ID)); put(record, 'slotId', integer(keyed.slotId, 0, 2_147_483_647)); if ('code' in keyed) put(record, 'code', code(event, keyed.code)); if ('durationMs' in keyed) put(record, 'durationMs', integer(keyed.durationMs, 0, 86_400_000)); if ('retryScheduled' in keyed) put(record, 'retryScheduled', retry); if ('generation' in keyed) put(record, 'generation', integer(keyed.generation, 1, 2_147_483_647)); }
+  if (event.startsWith('job.')) { put(record, 'correlationId', string(keyed.correlationId, CORRELATION)); put(record, 'jobId', string(keyed.jobId, UUID)); put(record, 'jobKind', string(keyed.jobKind, TOKEN)); put(record, 'attempt', positive(keyed.attempt)); if ('maxAttempts' in keyed) put(record, 'maxAttempts', positive(keyed.maxAttempts)); put(record, 'workerId', string(keyed.workerId, WORKER_ID)); put(record, 'slotId', integer(keyed.slotId, 0, 2_147_483_647)); if ('code' in keyed) put(record, 'code', code(event, keyed.code)); if ('durationMs' in keyed) put(record, 'durationMs', integer(keyed.durationMs, 0, 86_400_000)); if ('retryScheduled' in keyed) put(record, 'retryScheduled', retry); if ('generation' in keyed) put(record, 'generation', positive(keyed.generation)); }
   else {
     if (event === 'worker.failed') {
       put(record, 'code', code(event, keyed.code));
       if ('workerId' in keyed) put(record, 'workerId', string(keyed.workerId, WORKER_ID));
     } else {
       if ('workerId' in keyed) put(record, 'workerId', string(keyed.workerId, WORKER_ID));
-      if ('configuredSlots' in keyed) put(record, 'configuredSlots', integer(keyed.configuredSlots, 1, 2_147_483_647));
+      if ('configuredSlots' in keyed) put(record, 'configuredSlots', positive(keyed.configuredSlots));
       if ('code' in keyed) put(record, 'code', code(event, keyed.code));
       if ('durationMs' in keyed) put(record, 'durationMs', integer(keyed.durationMs, 0, 86_400_000));
     }
@@ -152,9 +159,21 @@ function smoke(value: unknown, event: string, timestamp_: string, service: Exclu
 }
 
 export function validateStructuredEvent<S extends StructuredLogService>(service: S, valueTimestamp: string, input: StructuredEventInputFor<S>): ValidatedStructuredRecord {
+  if (!isService(service)) return invalid();
   const timestamp_ = timestamp(valueTimestamp); const raw = object(input); const event = string(raw.event, TOKEN);
   if (service === 'web' && ['http.request.completed', 'http.request.rejected', 'http.request.failed'].includes(event)) return http(input, event, timestamp_, service);
   if (service === 'worker' && ['worker.started', 'worker.ready', 'worker.stopping', 'worker.stopped', 'worker.failed', 'job.claimed', 'job.succeeded', 'job.failed', 'job.lease_lost', 'worker.heartbeat_failed'].includes(event)) return worker(input, event, timestamp_);
-  if (service !== 'web' && service !== 'worker' && ['smoke.stage.started', 'smoke.stage.succeeded', 'smoke.stage.failed', 'smoke.cleanup.succeeded', 'smoke.cleanup.failed', 'smoke.run.succeeded', 'smoke.run.failed'].includes(event)) return smoke(input, event, timestamp_, service);
+  if (service !== 'web' && service !== 'worker' && ['smoke.stage.started', 'smoke.stage.succeeded', 'smoke.stage.failed', 'smoke.cleanup.succeeded', 'smoke.cleanup.failed', 'smoke.run.succeeded', 'smoke.run.failed'].includes(event)) {
+    const profile = object(input).profile;
+    if ((service === 'plan7a-release-candidate') !== (profile === 'release_candidate') || (service !== 'plan7a-release-candidate' && profile !== 'maintenance_fixture')) invalid();
+    return smoke(input, event, timestamp_, service);
+  }
   return invalid();
+}
+
+export function validateLoggingFailure(service: StructuredLogService, valueTimestamp: string): ValidatedStructuredRecord {
+  if (arguments.length !== 2) return invalid();
+  if (!isService(service)) return invalid();
+  const timestamp_ = timestamp(valueTimestamp);
+  return { record: { version: 1, timestamp: timestamp_, severity: 'error', service, event: 'logging.failure', outcome: 'failed' }, sink: 'stderr' };
 }

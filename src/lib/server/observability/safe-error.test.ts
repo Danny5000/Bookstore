@@ -1,6 +1,6 @@
-import { describe, expect, test } from 'vitest';
+import { describe, expect, expectTypeOf, test } from 'vitest';
 
-import { type CorrelationId } from './contracts';
+import { type CorrelationId, type SafeCode } from './contracts';
 import {
   createSafeDiagnosticError,
   defineSafeCode,
@@ -62,5 +62,37 @@ describe('safe diagnostic errors', () => {
     const nested = { cause: new Error('secret') };
     const matcher: SafeErrorMatcher<'known_failure'> = () => createSafeDiagnosticError({ class: 'job', code: defineSafeCode('known_failure'), operation: 'job.handler', outcome: 'failed', correlationId: 'different' as CorrelationId });
     expect(reduceSafeError(nested, { operation: 'job.handler', correlationId, matchers: [matcher] })).toEqual({ class: 'job', code: 'known_failure', operation: 'job.handler', outcome: 'failed', correlationId: 'different' });
+  });
+
+  test('rejects symbol-keyed trusted, matcher, and nested publicState extras', () => {
+    const symbol = Symbol('secret');
+    expect(() => createSafeDiagnosticError({ class: 'request', code: defineSafeCode('invalid_request'), operation: 'http.request', outcome: 'denied', [symbol]: 'customer@example.test' } as never)).toThrow();
+    const matcher: SafeErrorMatcher<'known_failure'> = () => ({ class: 'request', code: defineSafeCode('known_failure'), operation: 'http.request', outcome: 'denied', [symbol]: 'customer@example.test' } as never);
+    expect(reduceSafeError(new Error(), { operation: 'http.request', matchers: [matcher] }).code).toBe('unexpected_failure');
+    expect(() => createSafeDiagnosticError({ class: 'request', code: defineSafeCode('invalid_request'), operation: 'http.request', outcome: 'denied', publicState: { name: 'safe', value: true, [symbol]: 'customer@example.test' } } as never)).toThrow();
+  });
+
+  test.each([
+    ['safe', ''], ['a'.repeat(100), 'x'.repeat(100)], ['safe', false], ['safe', -2_147_483_648], ['safe', 2_147_483_647]
+  ])('accepts safe public state bounds %#', (name, value) => {
+    expect(() => createSafeDiagnosticError({ class: 'request', code: defineSafeCode('invalid_request'), operation: 'http.request', outcome: 'denied', publicState: { name, value } as never })).not.toThrow();
+  });
+
+  test.each([
+    ['safe', 'x'.repeat(101)], ['safe', -2_147_483_649], ['safe', 2_147_483_648], ['safe', 1.1], ['safe', Number.NaN], ['safe', Infinity], ['safe', Number.MAX_SAFE_INTEGER + 1]
+  ])('rejects unsafe public state bounds %#', (name, value) => {
+    expect(() => createSafeDiagnosticError({ class: 'request', code: defineSafeCode('invalid_request'), operation: 'http.request', outcome: 'denied', publicState: { name, value } as never })).toThrow();
+  });
+
+  test('accepts optional safe fields when omitted and rejects present undefined', () => {
+    expect(() => createSafeDiagnosticError({ class: 'request', code: defineSafeCode('invalid_request'), operation: 'http.request', outcome: 'denied' })).not.toThrow();
+    expect(() => createSafeDiagnosticError({ class: 'request', code: defineSafeCode('invalid_request'), operation: 'http.request', outcome: 'denied', correlationId: undefined } as never)).toThrow();
+    expect(() => createSafeDiagnosticError({ class: 'request', code: defineSafeCode('invalid_request'), operation: 'http.request', outcome: 'denied', publicState: undefined } as never)).toThrow();
+  });
+
+  test('preserves matcher code literals plus unexpected_failure in the reducer result', () => {
+    const matcher: SafeErrorMatcher<'first' | 'second'> = () => undefined;
+    const reduced = reduceSafeError(new Error(), { operation: 'http.request', matchers: [matcher] });
+    expectTypeOf(reduced.code).toEqualTypeOf<SafeCode<'first' | 'second' | 'unexpected_failure'>>();
   });
 });
