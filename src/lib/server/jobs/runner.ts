@@ -532,7 +532,7 @@ async function runWorkerLoop(options: WorkerLoopOptions): Promise<void> {
       await options.runBeforePoll?.();
       if (options.signal.aborted) return;
       const job = await options.repository.claimNext(options.leaseOwner);
-      if (options.signal.aborted) return;
+      if (job === null && options.signal.aborted) return;
       const claimedAt = job === null ? undefined : options.monotonicNow();
       options.observer({
         type: 'poll_succeeded',

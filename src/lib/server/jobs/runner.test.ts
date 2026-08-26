@@ -399,12 +399,17 @@ describe('runWorker', () => {
     expect(siblingSleep).not.toHaveBeenCalled();
   });
 
-  it('does not start a job returned by a sibling claim after internal abort', async () => {
+  it('settles a sibling claim returned after internal abort without starting another poll', async () => {
     const controller = new AbortController();
     const primaryFailure = new Error('primary claim failure');
     const siblingClaimStarted = deferred<void>();
     const siblingClaimGate = deferred<JobRecord | null>();
-    const handler = vi.fn().mockResolvedValue(undefined);
+    const handlerSideEffect = vi.fn();
+    const handler = vi.fn(async (_job: JobRecord, signal: AbortSignal) => {
+      expect(signal.aborted).toBe(true);
+      if (signal.aborted) throw new Error('shutdown before handler side effect');
+      handlerSideEffect();
+    });
     const { events, observer } = captureObservations();
     const repository: JobRepository = {
       claimNext: vi.fn(async (leaseOwner: string) => {
@@ -420,7 +425,7 @@ describe('runWorker', () => {
       fail: vi.fn().mockResolvedValue(true),
       failWithDisposition: vi.fn().mockResolvedValue({
         applied: true,
-        retryScheduled: false
+        retryScheduled: true
       })
     };
 
@@ -441,15 +446,22 @@ describe('runWorker', () => {
     siblingClaimGate.resolve(job);
     await expect(running).rejects.toBe(primaryFailure);
 
-    expect(handler).not.toHaveBeenCalled();
+    expect(handler).toHaveBeenCalledOnce();
+    expect(handlerSideEffect).not.toHaveBeenCalled();
+    expect(repository.failWithDisposition).toHaveBeenCalledExactlyOnceWith(
+      job.id,
+      'worker-post-abort-claim:1',
+      'Transient job handler failure',
+      true
+    );
     expect(repository.complete).not.toHaveBeenCalled();
     expect(repository.fail).not.toHaveBeenCalled();
-    expect(repository.failWithDisposition).not.toHaveBeenCalled();
-    expect(events).not.toContainEqual(expect.objectContaining({
+    expect(repository.claimNext).toHaveBeenCalledTimes(2);
+    expect(events).toContainEqual(expect.objectContaining({
       type: 'poll_succeeded',
       slotId: 1
     }));
-    expect(events).not.toContainEqual(expect.objectContaining({
+    expect(events).toContainEqual(expect.objectContaining({
       type: 'terminal_settled',
       slotId: 1
     }));
