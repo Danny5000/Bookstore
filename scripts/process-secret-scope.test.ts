@@ -369,6 +369,16 @@ describe('process secret scope', () => {
       'DATABASE_MIGRATION_WORKER_USER',
       'DATABASE_MIGRATION_STORAGE_CLEANUP_USER'
     ];
+    const workerFreshness = [
+      'WORKER_READY_FILE',
+      'WORKER_READY_FILE_FILE',
+      'WORKER_CONCURRENCY',
+      'WORKER_CONCURRENCY_FILE',
+      'WORKER_HEARTBEAT_INTERVAL_MS',
+      'WORKER_HEARTBEAT_INTERVAL_MS_FILE',
+      'WORKER_HEARTBEAT_MAX_AGE_MS',
+      'WORKER_HEARTBEAT_MAX_AGE_MS_FILE'
+    ];
 
     expectedEmpty('app', [...smtpCredentials, ...bootstrap]);
     expectedEmpty('worker', [...stripeWebhook, ...bootstrap]);
@@ -393,6 +403,23 @@ describe('process secret scope', () => {
     expectedEmpty('migrate', [...webDatabase, ...workerDatabase, ...cleanupDatabase]);
     expectedEmpty('bootstrap-admin', [...ownerDatabase, ...workerDatabase, ...cleanupDatabase]);
     expectedEmpty('storage-cleanup', [...ownerDatabase, ...webDatabase, ...workerDatabase]);
+    for (const service of [
+      'app',
+      'migrate',
+      'database-role-provision',
+      'bootstrap-admin',
+      'storage-cleanup'
+    ]) expectedEmpty(service, workerFreshness);
+
+    const worker = serviceBlock(compose, 'worker');
+    expect(worker).toContain('WORKER_READY_FILE: /tmp/worker-ready');
+    expect(worker).toContain('WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-1}');
+    expect(worker).toContain(
+      'WORKER_HEARTBEAT_INTERVAL_MS: ${WORKER_HEARTBEAT_INTERVAL_MS:-5000}'
+    );
+    expect(worker).toContain(
+      'WORKER_HEARTBEAT_MAX_AGE_MS: ${WORKER_HEARTBEAT_MAX_AGE_MS:-20000}'
+    );
 
     const migrate = serviceBlock(compose, 'migrate');
     expect(migrate).toContain('DATABASE_MIGRATION_WEB_USER: ${DATABASE_USER:?DATABASE_USER must be set}');
@@ -434,7 +461,8 @@ describe('process secret scope', () => {
       'BOOTSTRAP_ADMIN_NAME',
       'BOOTSTRAP_ADMIN_NAME_FILE',
       'BOOTSTRAP_ADMIN_PASSWORD',
-      'BOOTSTRAP_ADMIN_PASSWORD_FILE'
+      'BOOTSTRAP_ADMIN_PASSWORD_FILE',
+      ...workerFreshness
     ]);
     expect(secretNames(migrate)).toEqual([]);
     for (const service of [

@@ -167,8 +167,6 @@ export default defineConfig({
       JOB_LEASE_MS: process.env.JOB_LEASE_MS ?? '5000',
       JOB_RETRY_BASE_MS: process.env.JOB_RETRY_BASE_MS ?? '10',
       JOB_RETRY_MAX_MS: process.env.JOB_RETRY_MAX_MS ?? '1000',
-      WORKER_READY_FILE: '.worker-ready-web-process-unused',
-      WORKER_CONCURRENCY: '1',
       STORAGE_PROVIDER: process.env.STORAGE_PROVIDER ?? 'local',
       STORAGE_STAGING_ROOT:
         process.env.STORAGE_STAGING_ROOT ?? '.data/test-e2e-storage-staging',

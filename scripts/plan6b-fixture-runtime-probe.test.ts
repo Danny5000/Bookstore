@@ -180,7 +180,8 @@ describe('Plan 6B fixture runtime probe ownership', () => {
     expect(source).toContain('database-role-provision:');
     expect(source).toContain('command: [node, build/services/provision-database-roles.js]');
     const app = source.slice(source.indexOf('  app:'), source.indexOf('  worker:'));
-    const worker = source.slice(source.indexOf('  worker:'), source.indexOf('  migrate:'));
+    const worker = source.slice(source.indexOf('  worker:'), source.indexOf('  bootstrap-admin:'));
+    const bootstrap = source.slice(source.indexOf('  bootstrap-admin:'), source.indexOf('  migrate:'));
     const migrate = source.slice(
       source.indexOf('  migrate:'),
       source.indexOf('  database-role-provision:')
@@ -219,7 +220,25 @@ describe('Plan 6B fixture runtime probe ownership', () => {
     expect(source).toContain('AUTH_SECRET: plan6b-fixture-auth-secret-0000000000000000');
     expect(source).toContain('SMTP_HOST: mailpit');
     expect(source).toContain('SMTP_PORT: "1025"');
-    expect(source).toContain('WORKER_READY_FILE: /tmp/worker-ready');
+    const sharedEnvironment = source.slice(0, source.indexOf('\nservices:'));
+    for (const setting of [
+      'WORKER_READY_FILE',
+      'WORKER_CONCURRENCY',
+      'WORKER_HEARTBEAT_INTERVAL_MS',
+      'WORKER_HEARTBEAT_MAX_AGE_MS'
+    ]) {
+      expect(sharedEnvironment, setting).not.toContain(setting);
+      expect(app, `app:${setting}`).not.toContain(setting);
+      expect(bootstrap, `bootstrap:${setting}`).not.toContain(setting);
+      expect(migrate, `migrate:${setting}`).not.toContain(setting);
+      expect(provision, `provision:${setting}`).not.toContain(setting);
+    }
+    expect(worker).toContain('WORKER_READY_FILE: /tmp/worker-ready');
+    expect(worker).toContain('WORKER_CONCURRENCY: "1"');
+    expect(worker).toContain('WORKER_HEARTBEAT_INTERVAL_MS: "5000"');
+    expect(worker).toContain('WORKER_HEARTBEAT_MAX_AGE_MS: "20000"');
+    expect(worker).toContain('test: [CMD, node, build/services/worker-health.js]');
+    expect(source).not.toMatch(/statSync\([^\n]*worker-ready/u);
     expect(source.match(/ports: !override/gu)).toHaveLength(2);
     expect(source).toContain('127.0.0.1:49160:3000');
     expect(source).toContain('127.0.0.1:49161:5432');
@@ -229,8 +248,6 @@ describe('Plan 6B fixture runtime probe ownership', () => {
     expect(source).not.toContain('STRIPE_SECRET_KEY');
     expect(source).not.toContain('STRIPE_WEBHOOK_SECRET');
     const bootstrapStart = source.indexOf('  bootstrap-admin:');
-    const bootstrapEnd = source.indexOf('  migrate:');
-    const bootstrap = source.slice(bootstrapStart, bootstrapEnd);
     expect(bootstrapStart).toBeGreaterThan(source.indexOf('  worker:'));
     expect(bootstrap).toContain('command: [node, build/services/bootstrap-admin.js]');
     expect(bootstrap).toContain('BOOTSTRAP_ADMIN_PASSWORD_FILE: /run/secrets/bootstrap_admin_password');
@@ -1372,7 +1389,9 @@ describe('Plan 6B fixture runtime probe ownership', () => {
     expect(wait).toHaveBeenCalledOnce();
     expect(wait).toHaveBeenCalledWith(500);
     expect(command.run).toHaveBeenCalledWith(
-      expect.arrayContaining(['exec', '-T', 'worker', 'node', '-e']),
+      expect.arrayContaining([
+        'exec', '-T', 'worker', 'node', 'build/services/worker-health.js'
+      ]),
       expect.not.objectContaining({ STRIPE_SECRET_KEY: expect.anything() })
     );
     expect(command.capture).toHaveBeenCalledWith(

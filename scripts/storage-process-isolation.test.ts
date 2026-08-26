@@ -522,6 +522,8 @@ describe('storage process isolation deployment', () => {
       "DATABASE_WORKER_USER: 'pale_orbit_test_worker'",
       "WORKER_CONCURRENCY: '1'",
       'WORKER_READY_FILE: workerReadyFile',
+      "WORKER_HEARTBEAT_INTERVAL_MS: '1000'",
+      "WORKER_HEARTBEAT_MAX_AGE_MS: '4000'",
       "const workerEnvironment = databaseEnvironmentForRole(webEnvironment, 'worker');",
       "spawn(process.execPath, ['--import', 'tsx', 'src/worker.ts']",
       'if (withWorker) worker = await startWorker(workerEnvironment);',
@@ -556,6 +558,13 @@ describe('storage process isolation deployment', () => {
     expect(harness).not.toMatch(
       /\b(?:TEST_)?WORKER_(?:CONTROL|REQUEST|PAUSE|RELEASE|ACK(?:NOWLEDGEMENT)?)_FILE\b/u
     );
+    expect(harness).toContain(
+      "import { runWorkerHealthCheck } from '../src/lib/server/worker/health-check';"
+    );
+    expect(harness).toMatch(
+      /runWorkerHealthCheck\(\{\s*heartbeatFile: readyFile,\s*configuredSlots: 1,\s*maxAgeMs: 4_000,/u
+    );
+    expect(harness).not.toContain('existsSync(readyFile)');
   });
 
   it('keeps every web, cleanup, production, and non-test composition unable to enable control', () => {

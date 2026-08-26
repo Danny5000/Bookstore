@@ -102,6 +102,7 @@ export interface ProductionSmokeCommandRuntime {
 export interface ProductionSmokeDockerDependencies {
   readonly command: ProductionSmokeCommandRuntime;
   readonly environment: NodeJS.ProcessEnv;
+  readonly now: () => Date;
   readonly assertPortAvailable: (
     host: '127.0.0.1',
     port: number,
@@ -415,8 +416,81 @@ const STRIPE_FILE_ASSERTION = `const fs=require('node:fs');
 const root='/run/secrets';
 const names=fs.existsSync(root)?fs.readdirSync(root):[];
 if(names.some((name)=>/stripe/i.test(name)))process.exit(1);`;
+const WORKER_HEALTH_ARTIFACT = 'build/services/worker-health.js';
+const WRITE_WORKER_HEARTBEAT_REHEARSAL = `const fs=require('node:fs');
+const [path,encoded]=process.argv.slice(1);
+if(!path||!encoded)process.exit(1);
+fs.writeFileSync(path,Buffer.from(encoded,'base64url').toString('utf8'),{
+  encoding:'utf8',flag:'wx',mode:0o600
+});`;
+const REMOVE_WORKER_HEARTBEAT_REHEARSAL = `const fs=require('node:fs');
+const [path]=process.argv.slice(1);
+if(!path)process.exit(1);
+fs.rmSync(path,{force:true});`;
 const RUNTIME_INSPECTION_ATTEMPTS = 120;
 const RUNTIME_INSPECTION_WAIT_MS = 500;
+
+function positiveWorkerSetting(
+  environment: Record<string, string>,
+  name: 'WORKER_CONCURRENCY' | 'WORKER_HEARTBEAT_MAX_AGE_MS'
+): number {
+  const raw = environment[name];
+  const value = raw === undefined ? Number.NaN : Number(raw);
+  assert(
+    raw !== undefined && /^\d+$/u.test(raw) && Number.isSafeInteger(value) && value > 0,
+    'worker health configuration evidence is invalid'
+  );
+  return value;
+}
+
+function heartbeatSlot(slotId: number, timestamp: string): Record<string, unknown> {
+  return {
+    slotId,
+    state: 'idle',
+    lastSuccessfulPollAt: timestamp,
+    lastProgressAt: timestamp
+  };
+}
+
+function workerHeartbeatRehearsals(
+  now: Date,
+  configuredSlots: number,
+  maxAgeMs: number
+): { readonly stale: string; readonly missingSlot: string } {
+  const nowMilliseconds = Date.prototype.getTime.call(now) as number;
+  assert(Number.isFinite(nowMilliseconds), 'worker health rehearsal clock is invalid');
+  const currentTimestamp = new Date(nowMilliseconds).toISOString();
+  const staleTimestamp = new Date(nowMilliseconds - maxAgeMs - 1).toISOString();
+  const record = (
+    workerId: string,
+    timestamp: string,
+    slots: readonly Record<string, unknown>[]
+  ): string => JSON.stringify({
+    version: 1,
+    workerId,
+    processStartedAt: timestamp,
+    publishedAt: timestamp,
+    sequence: 1,
+    configuredSlots,
+    slots
+  });
+  return {
+    stale: record(
+      'worker:plan6b-smoke-stale',
+      staleTimestamp,
+      Array.from({ length: configuredSlots }, (_, slotId) =>
+        heartbeatSlot(slotId, staleTimestamp)
+      )
+    ),
+    missingSlot: record(
+      'worker:plan6b-smoke-missing-slot',
+      currentTimestamp,
+      Array.from({ length: configuredSlots - 1 }, (_, index) =>
+        heartbeatSlot(index + 1, currentTimestamp)
+      )
+    )
+  };
+}
 
 function exactOwnershipLabels(
   manifest: ProductionSmokeManifest,
@@ -738,6 +812,87 @@ export function createProductionSmokeDockerOperations(
     );
     return result.stdout.trim();
   };
+  const workerHealthArguments = (heartbeatFile?: string): string[] => [
+    ...compose,
+    'exec',
+    '-T',
+    ...(heartbeatFile === undefined
+      ? []
+      : ['--env', `WORKER_READY_FILE=${heartbeatFile}`]),
+    'worker',
+    'node',
+    WORKER_HEALTH_ARTIFACT
+  ];
+  const materializeWorkerHeartbeat = async (path: string, raw: string): Promise<void> => {
+    await dependencies.command.run([
+      ...compose,
+      'exec',
+      '-T',
+      'worker',
+      'node',
+      '-e',
+      WRITE_WORKER_HEARTBEAT_REHEARSAL,
+      path,
+      Buffer.from(raw, 'utf8').toString('base64url')
+    ], environment);
+  };
+  const removeWorkerHeartbeat = async (path: string): Promise<void> => {
+    await dependencies.command.run([
+      ...compose,
+      'exec',
+      '-T',
+      'worker',
+      'node',
+      '-e',
+      REMOVE_WORKER_HEARTBEAT_REHEARSAL,
+      path
+    ], environment);
+  };
+  const rehearseWorkerHealthFailures = async (
+    owned: ProductionSmokeManifest,
+    workerEnvironment: Record<string, string>
+  ): Promise<void> => {
+    const configuredSlots = positiveWorkerSetting(workerEnvironment, 'WORKER_CONCURRENCY');
+    const maxAgeMs = positiveWorkerSetting(
+      workerEnvironment,
+      'WORKER_HEARTBEAT_MAX_AGE_MS'
+    );
+    const rehearsals = workerHeartbeatRehearsals(
+      dependencies.now(),
+      configuredSlots,
+      maxAgeMs
+    );
+    const stalePath = `/tmp/worker-heartbeat-stale-${owned.runId}.json`;
+    const missingSlotPath = `/tmp/worker-heartbeat-missing-slot-${owned.runId}.json`;
+    let staleCreated = false;
+
+    try {
+      await materializeWorkerHeartbeat(stalePath, rehearsals.stale);
+      staleCreated = true;
+      const stale = await dependencies.command.capture(
+        workerHealthArguments(stalePath),
+        environment,
+        true
+      );
+      assert(stale.status !== 0, 'stale worker health rehearsal was accepted');
+
+      let missingSlotCreated = false;
+      try {
+        await materializeWorkerHeartbeat(missingSlotPath, rehearsals.missingSlot);
+        missingSlotCreated = true;
+        const missingSlot = await dependencies.command.capture(
+          workerHealthArguments(missingSlotPath),
+          environment,
+          true
+        );
+        assert(missingSlot.status !== 0, 'missing-slot worker health rehearsal was accepted');
+      } finally {
+        if (missingSlotCreated) await removeWorkerHeartbeat(missingSlotPath);
+      }
+    } finally {
+      if (staleCreated) await removeWorkerHeartbeat(stalePath);
+    }
+  };
   return {
     async build(owned) {
       validateProductionSmokeManifest(owned);
@@ -841,11 +996,13 @@ export function createProductionSmokeDockerOperations(
         [...compose, 'exec', '-T', service, 'node', '-e', STRIPE_FILE_ASSERTION],
         environment
       )));
-      await dependencies.command.run(
-        [...compose, 'exec', '-T', 'worker', 'node', '-e',
-          "require('node:fs').statSync('/tmp/worker-ready').size > 0 || process.exit(1)"],
-        environment
+      const liveWorkerHealth = await dependencies.command.capture(
+        workerHealthArguments(),
+        environment,
+        true
       );
+      const workerReady = liveWorkerHealth.status === 0;
+      assert(workerReady, 'runtime worker is not ready');
       const postgresPorts = await dependencies.command.capture(
         ['port', postgresId],
         environment
@@ -1008,6 +1165,7 @@ export function createProductionSmokeDockerOperations(
         }
       }
       assert(jobs, 'disabled financial replay timed out');
+      await rehearseWorkerHealthFailures(owned, worker.environment);
       const numeric = (key: string): number => Number(jobs[key]);
       return {
         storefrontStatus: await dependencies.requestStatus(
@@ -1029,7 +1187,7 @@ export function createProductionSmokeDockerOperations(
         appHasStripeSecret: hasStripeSecret(app.environment) || app.hasStripeMount,
         workerHasStripeSecret: hasStripeSecret(worker.environment) || worker.hasStripeMount,
         postgresHostPublished: postgresPorts.stdout.trim().length > 0,
-        workerReady: true,
+        workerReady,
         providerBackedJobCount: numeric('providerBackedJobCount'),
         classificationRootCount: numeric('classificationRootCount'),
         classificationRootCompletedCount: numeric('classificationRootCompletedCount'),
@@ -1577,6 +1735,7 @@ async function createDefaultProductionSmokeOperations(
       BOOTSTRAP_ADMIN_NAME: 'Plan 6B Smoke Admin'
     },
     assertPortAvailable: assertLoopbackPortAvailable,
+    now: () => new Date(),
     async requestStatus(url) {
       const response = await fetch(url, { redirect: 'manual', signal: AbortSignal.timeout(10_000) });
       return response.status;
@@ -1601,6 +1760,7 @@ function createSetupCleanupOperations(
       BOOTSTRAP_ADMIN_PASSWORD: 'plan6b-smoke-setup-cleanup'
     },
     assertPortAvailable: assertLoopbackPortAvailable,
+    now: () => new Date(),
     async requestStatus() {
       throw smokeError('runtime request is unavailable during setup cleanup');
     },

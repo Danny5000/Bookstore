@@ -1,11 +1,11 @@
 import { randomBytes } from 'node:crypto';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { existsSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { databaseEnvironmentForRole } from '../src/lib/server/db/database-role-provision';
+import { runWorkerHealthCheck } from '../src/lib/server/worker/health-check';
 import { withoutTestProcessSecrets } from './test-environment';
 
 const runId = randomBytes(8).toString('hex');
@@ -150,7 +150,6 @@ function publishedPort(service: string, containerPort: string): string {
 async function startWorker(environment: NodeJS.ProcessEnv): Promise<ChildProcess> {
   const readyFile = environment.WORKER_READY_FILE;
   if (!readyFile) throw new Error('WORKER_READY_FILE is required');
-  if (existsSync(readyFile)) throw new Error('Worker readiness file already exists');
   const worker = spawn(process.execPath, ['--import', 'tsx', 'src/worker.ts'], {
     env: environment,
     stdio: 'inherit'
@@ -161,16 +160,29 @@ async function startWorker(environment: NodeJS.ProcessEnv): Promise<ChildProcess
   });
   try {
     const deadline = Date.now() + 30_000;
-    while (!existsSync(readyFile)) {
+    while (true) {
       if (exit) {
         throw new Error(
           `Worker exited before readiness with ${exit.code ?? exit.signal ?? 'unknown'}`
         );
       }
+      const healthy = await runWorkerHealthCheck({
+        heartbeatFile: readyFile,
+        configuredSlots: 1,
+        maxAgeMs: 4_000,
+        stderr: () => undefined
+      });
+      if (healthy === 0) {
+        if (exit) {
+          throw new Error(
+            `Worker exited before readiness with ${exit.code ?? exit.signal ?? 'unknown'}`
+          );
+        }
+        return worker;
+      }
       if (Date.now() >= deadline) throw new Error('Timed out waiting for worker readiness');
       await delay(50);
     }
-    return worker;
   } catch (cause: unknown) {
     await stopWorker(worker);
     throw cause;
@@ -229,6 +241,8 @@ try {
     JOB_RETRY_MAX_MS: '1000',
     WORKER_READY_FILE: workerReadyFile,
     WORKER_CONCURRENCY: '1',
+    WORKER_HEARTBEAT_INTERVAL_MS: '1000',
+    WORKER_HEARTBEAT_MAX_AGE_MS: '4000',
     STORAGE_PROVIDER: 'local',
     STORAGE_STAGING_ROOT: join(testStorageRoot, 'staging'),
     STORAGE_PUBLICATION_ROOT: join(testStorageRoot, 'publication'),

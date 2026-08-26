@@ -74,6 +74,13 @@ const isolatedEnvironment = {
   STRIPE_WEBHOOK_SECRET: "whsec_private",
   STRIPE_WEBHOOK_SECRET_FILE: "/run/secrets/stripe-webhook",
   WORKER_READY_FILE: join(isolatedTestStorageRoot, "worker.ready"),
+  WORKER_READY_FILE_FILE: "/run/secrets/worker-ready-file",
+  WORKER_CONCURRENCY: "1",
+  WORKER_CONCURRENCY_FILE: "/run/secrets/worker-concurrency",
+  WORKER_HEARTBEAT_INTERVAL_MS: "1000",
+  WORKER_HEARTBEAT_INTERVAL_MS_FILE: "/run/secrets/worker-heartbeat-interval",
+  WORKER_HEARTBEAT_MAX_AGE_MS: "4000",
+  WORKER_HEARTBEAT_MAX_AGE_MS_FILE: "/run/secrets/worker-heartbeat-max-age",
   PGPASSWORD: "private-postgres-password",
   PGPASSFILE: "/run/secrets/pgpass",
   POSTGRES_PASSWORD: "private-container-password",
@@ -327,10 +334,6 @@ describe("Playwright commerce fixture isolation", () => {
     expect(webEnvironment.AUTH_SECRET).not.toBe(
       isolatedEnvironment.AUTH_SECRET,
     );
-    expect(webEnvironment.WORKER_READY_FILE).not.toBe(
-      isolatedEnvironment.WORKER_READY_FILE,
-    );
-
     for (const name of [
       "PALE_ORBIT_TEST_PROJECT",
       "DATABASE_URL",
@@ -366,6 +369,14 @@ describe("Playwright commerce fixture isolation", () => {
       "STRIPE_SECRET_KEY_FILE",
       "STRIPE_WEBHOOK_SECRET",
       "STRIPE_WEBHOOK_SECRET_FILE",
+      "WORKER_READY_FILE",
+      "WORKER_READY_FILE_FILE",
+      "WORKER_CONCURRENCY",
+      "WORKER_CONCURRENCY_FILE",
+      "WORKER_HEARTBEAT_INTERVAL_MS",
+      "WORKER_HEARTBEAT_INTERVAL_MS_FILE",
+      "WORKER_HEARTBEAT_MAX_AGE_MS",
+      "WORKER_HEARTBEAT_MAX_AGE_MS_FILE",
       "PGPASSWORD",
       "PGPASSFILE",
       "POSTGRES_PASSWORD",

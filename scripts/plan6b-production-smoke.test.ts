@@ -6,7 +6,7 @@ import {
   assertLoopbackPortAvailable,
   executeProductionSmoke,
   createProductionSmokeManifest,
-  createProductionSmokeDockerOperations,
+  createProductionSmokeDockerOperations as createProductionSmokeDockerOperationsWithClock,
   createProductionSmokePortOperations,
   parsePlan6bSmokeStage,
   renderProductionSmokeOverride,
@@ -18,10 +18,25 @@ import {
   type ProductionSmokeManifest,
   type ProductionSmokeOperations,
   type ProductionSmokeCommandRuntime,
+  type ProductionSmokeDockerDependencies,
   type ProductionSmokePortOperations,
   type ProductionSmokePortRuntime,
   type VerifiedProductionImageLease
 } from './plan6b-production-smoke';
+
+const DETERMINISTIC_SMOKE_NOW = '2026-08-26T12:00:00.000Z';
+
+function createProductionSmokeDockerOperations(
+  owned: ProductionSmokeManifest,
+  dependencies: Omit<ProductionSmokeDockerDependencies, 'now'> & {
+    readonly now?: () => Date;
+  }
+): ProductionSmokeOperations {
+  return createProductionSmokeDockerOperationsWithClock(owned, {
+    ...dependencies,
+    now: dependencies.now ?? (() => new Date(DETERMINISTIC_SMOKE_NOW))
+  });
+}
 
 type TcpConnectionHandler = (socket: { destroy(): void }) => void;
 type TcpServerFactory = (handler: TcpConnectionHandler | undefined) => unknown;
@@ -1259,6 +1274,10 @@ describe('Plan 6B production smoke ownership', () => {
   it('inspects app and worker mounts plus /run/secrets instead of trusting environment alone', async () => {
     const runs: readonly string[][] = [];
     const mutableRuns = runs as string[][];
+    const captures: Array<{
+      readonly args: readonly string[];
+      readonly allowFailure: boolean | undefined;
+    }> = [];
     const queries: string[] = [];
     const appId = 'a'.repeat(64);
     const workerId = 'b'.repeat(64);
@@ -1267,7 +1286,8 @@ describe('Plan 6B production smoke ownership', () => {
       run: vi.fn(async (args) => {
         mutableRuns.push([...args]);
       }),
-      capture: vi.fn(async (args) => {
+      capture: vi.fn(async (args, _environment, allowFailure) => {
+        captures.push({ args: [...args], allowFailure });
         if (args.includes('ps') && args.includes('--quiet')) {
           const service = args.at(-1);
           return {
@@ -1276,7 +1296,16 @@ describe('Plan 6B production smoke ownership', () => {
           };
         }
         if (args[0] === 'inspect' && args.includes('{{json .Config.Env}}')) {
-          return { status: 0, stdout: '[]' };
+          return {
+            status: 0,
+            stdout: args.at(-1) === workerId
+              ? JSON.stringify([
+                  'WORKER_CONCURRENCY=2',
+                  'WORKER_HEARTBEAT_INTERVAL_MS=5000',
+                  'WORKER_HEARTBEAT_MAX_AGE_MS=20000'
+                ])
+              : '[]'
+          };
         }
         if (args[0] === 'inspect' && args.includes('{{json .Mounts}}')) {
           return {
@@ -1287,6 +1316,9 @@ describe('Plan 6B production smoke ownership', () => {
           };
         }
         if (args[0] === 'port') return { status: 0, stdout: '' };
+        if (args.includes('build/services/worker-health.js')) {
+          return { status: args.includes('--env') ? 1 : 0, stdout: '' };
+        }
         if (args.includes('psql')) {
           queries.push(String(args.at(-1)));
           return {
@@ -1316,7 +1348,8 @@ describe('Plan 6B production smoke ownership', () => {
       command, environment: { PATH: 'safe-path' },
       assertPortAvailable: vi.fn(async () => undefined),
       requestStatus: vi.fn(async () => 503),
-      wait: vi.fn(async () => undefined)
+      wait: vi.fn(async () => undefined),
+      now: () => new Date('2026-08-26T12:00:00.000Z')
     });
 
     await expect(docker.inspectDisabledRuntime(owned)).resolves.toMatchObject({
@@ -1330,6 +1363,137 @@ describe('Plan 6B production smoke ownership', () => {
         args.includes('exec') && args.includes(service) && args.some((arg) => arg.includes('/run/secrets'))
       )).toBe(true);
     }
+
+    const healthCaptures = captures.filter(({ args }) =>
+      args.includes('build/services/worker-health.js')
+    );
+    expect(healthCaptures).toHaveLength(3);
+    expect(healthCaptures[0]?.args).toEqual(expect.arrayContaining([
+      'exec', '-T', 'worker', 'node', 'build/services/worker-health.js'
+    ]));
+    expect(healthCaptures[0]?.args).not.toContain('--env');
+    expect(healthCaptures.every(({ allowFailure }) => allowFailure === true)).toBe(true);
+
+    const stalePath = `/tmp/worker-heartbeat-stale-${owned.runId}.json`;
+    const missingSlotPath = `/tmp/worker-heartbeat-missing-slot-${owned.runId}.json`;
+    expect(healthCaptures[1]?.args).toEqual(expect.arrayContaining([
+      '--env', `WORKER_READY_FILE=${stalePath}`, 'worker', 'node',
+      'build/services/worker-health.js'
+    ]));
+    expect(healthCaptures[2]?.args).toEqual(expect.arrayContaining([
+      '--env', `WORKER_READY_FILE=${missingSlotPath}`, 'worker', 'node',
+      'build/services/worker-health.js'
+    ]));
+
+    const writtenRecord = (path: string): string => {
+      const call = runs.find((args) => args.includes(path) && args.at(-1) !== path);
+      expect(call, path).toBeDefined();
+      return Buffer.from(call!.at(-1)!, 'base64url').toString('utf8');
+    };
+    const staleRaw = writtenRecord(stalePath);
+    const missingSlotRaw = writtenRecord(missingSlotPath);
+    expect(staleRaw).toBe(
+      '{"version":1,"workerId":"worker:plan6b-smoke-stale",' +
+      '"processStartedAt":"2026-08-26T11:59:39.999Z",' +
+      '"publishedAt":"2026-08-26T11:59:39.999Z","sequence":1,' +
+      '"configuredSlots":2,"slots":[' +
+      '{"slotId":0,"state":"idle","lastSuccessfulPollAt":"2026-08-26T11:59:39.999Z",' +
+      '"lastProgressAt":"2026-08-26T11:59:39.999Z"},' +
+      '{"slotId":1,"state":"idle","lastSuccessfulPollAt":"2026-08-26T11:59:39.999Z",' +
+      '"lastProgressAt":"2026-08-26T11:59:39.999Z"}]}'
+    );
+    expect(missingSlotRaw).toBe(
+      '{"version":1,"workerId":"worker:plan6b-smoke-missing-slot",' +
+      '"processStartedAt":"2026-08-26T12:00:00.000Z",' +
+      '"publishedAt":"2026-08-26T12:00:00.000Z","sequence":1,' +
+      '"configuredSlots":2,"slots":[' +
+      '{"slotId":1,"state":"idle","lastSuccessfulPollAt":"2026-08-26T12:00:00.000Z",' +
+      '"lastProgressAt":"2026-08-26T12:00:00.000Z"}]}'
+    );
+    for (const path of [stalePath, missingSlotPath]) {
+      expect(runs.filter((args) => args.includes(path))).toHaveLength(2);
+    }
+    expect(runs.some((args) => args.includes('/tmp/worker-ready'))).toBe(false);
+  });
+
+  it('does not remove a synthetic heartbeat path when exclusive creation collides', async () => {
+    const owned = manifest();
+    const stalePath = `/tmp/worker-heartbeat-stale-${owned.runId}.json`;
+    const missingSlotPath = `/tmp/worker-heartbeat-missing-slot-${owned.runId}.json`;
+    const appId = 'a'.repeat(64);
+    const workerId = 'b'.repeat(64);
+    const postgresId = 'c'.repeat(64);
+    const runs: string[][] = [];
+    const command: ProductionSmokeCommandRuntime = {
+      run: vi.fn(async (args) => {
+        runs.push([...args]);
+        if (args.includes(stalePath) && args.at(-1) !== stalePath) {
+          throw new Error('exclusive synthetic path collision');
+        }
+      }),
+      capture: vi.fn(async (args) => {
+        if (args.includes('ps') && args.includes('--quiet')) {
+          const service = args.at(-1);
+          return {
+            status: 0,
+            stdout: `${service === 'app' ? appId : service === 'worker' ? workerId : postgresId}\n`
+          };
+        }
+        if (args[0] === 'inspect' && args.includes('{{json .Config.Env}}')) {
+          return {
+            status: 0,
+            stdout: args.at(-1) === workerId
+              ? JSON.stringify([
+                  'WORKER_CONCURRENCY=1',
+                  'WORKER_HEARTBEAT_MAX_AGE_MS=20000'
+                ])
+              : '[]'
+          };
+        }
+        if (args[0] === 'inspect' && args.includes('{{json .Mounts}}')) {
+          return { status: 0, stdout: '[]' };
+        }
+        if (args[0] === 'port') return { status: 0, stdout: '' };
+        if (args.includes('build/services/worker-health.js')) {
+          return { status: args.includes('--env') ? 1 : 0, stdout: '' };
+        }
+        if (args.includes('psql')) {
+          return {
+            status: 0,
+            stdout: JSON.stringify({
+              providerBackedJobCount: 0,
+              classificationRootCount: 1,
+              classificationRootCompletedCount: 1,
+              classificationRootUnsafeCount: 0,
+              classificationContinuationCount: 1,
+              classificationContinuationCompletedCount: 1,
+              classificationContinuationUnsafeCount: 0,
+              classificationRunCount: 1,
+              classificationRunCompletedCount: 1,
+              pendingProjectionVersionCount: 0,
+              activeClassifierVersion: 1,
+              activeAllocationAlgorithmVersion: 2,
+              providerLedgerSubjectCount: 0
+            })
+          };
+        }
+        return { status: 0, stdout: '' };
+      })
+    };
+    const docker = createProductionSmokeDockerOperations(owned, {
+      command,
+      environment: { PATH: 'safe-path' },
+      assertPortAvailable: vi.fn(async () => undefined),
+      requestStatus: vi.fn(async () => 503),
+      wait: vi.fn(async () => undefined)
+    });
+
+    await expect(docker.inspectDisabledRuntime(owned)).rejects.toThrow(
+      'exclusive synthetic path collision'
+    );
+    expect(runs.filter((args) => args.includes(stalePath))).toHaveLength(1);
+    expect(runs.some((args) => args.at(-1) === stalePath)).toBe(false);
+    expect(runs.some((args) => args.includes(missingSlotPath))).toBe(false);
   });
 
   it('fails closed when PostgreSQL host-port inspection cannot be read', async () => {
@@ -1347,7 +1511,15 @@ describe('Plan 6B production smoke ownership', () => {
           };
         }
         if (args[0] === 'inspect' && args.includes('{{json .Config.Env}}')) {
-          return { status: 0, stdout: '[]' };
+          return {
+            status: 0,
+            stdout: args.at(-1) === workerId
+              ? JSON.stringify([
+                  'WORKER_CONCURRENCY=1',
+                  'WORKER_HEARTBEAT_MAX_AGE_MS=20000'
+                ])
+              : '[]'
+          };
         }
         if (args[0] === 'inspect' && args.includes('{{json .Mounts}}')) {
           return { status: 0, stdout: '[]' };
@@ -1402,12 +1574,23 @@ describe('Plan 6B production smoke ownership', () => {
           };
         }
         if (args[0] === 'inspect' && args.includes('{{json .Config.Env}}')) {
-          return { status: 0, stdout: '[]' };
+          return {
+            status: 0,
+            stdout: args.at(-1) === workerId
+              ? JSON.stringify([
+                  'WORKER_CONCURRENCY=1',
+                  'WORKER_HEARTBEAT_MAX_AGE_MS=20000'
+                ])
+              : '[]'
+          };
         }
         if (args[0] === 'inspect' && args.includes('{{json .Mounts}}')) {
           return { status: 0, stdout: '[]' };
         }
         if (args[0] === 'port') return { status: 0, stdout: '' };
+        if (args.includes('build/services/worker-health.js')) {
+          return { status: args.includes('--env') ? 1 : 0, stdout: '' };
+        }
         if (args.includes('psql')) {
           jobSnapshot += 1;
           return {

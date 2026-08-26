@@ -290,8 +290,6 @@ export function renderFixtureProbeOverride(manifest: FixtureProbeManifest): stri
   JOB_LEASE_MS: "30000"
   JOB_RETRY_BASE_MS: "1000"
   JOB_RETRY_MAX_MS: "300000"
-  WORKER_READY_FILE: /tmp/worker-ready
-  WORKER_CONCURRENCY: "1"
   STORAGE_PROVIDER: local
   STORAGE_STAGING_ROOT: /var/lib/pale-orbit/staging
   STORAGE_PUBLICATION_ROOT: /var/lib/pale-orbit/publication
@@ -415,6 +413,10 @@ services:
       DATABASE_PASSWORD: ""
       DATABASE_STORAGE_CLEANUP_USER: ""
       DATABASE_STORAGE_CLEANUP_PASSWORD: ""
+      WORKER_READY_FILE: /tmp/worker-ready
+      WORKER_CONCURRENCY: "1"
+      WORKER_HEARTBEAT_INTERVAL_MS: "5000"
+      WORKER_HEARTBEAT_MAX_AGE_MS: "20000"
     labels:
       ${labels}
     volumes:
@@ -429,7 +431,7 @@ services:
       stripe_api_canary:
         condition: service_healthy
     healthcheck:
-      test: [CMD, node, -e, "require('node:fs').statSync('/tmp/worker-ready').size > 0 || process.exit(1)"]
+      test: [CMD, node, build/services/worker-health.js]
       interval: 2s
       timeout: 3s
       retries: 60
@@ -1680,8 +1682,7 @@ export function createFixtureProbeDockerOperations(
         '-T',
         'worker',
         'node',
-        '-e',
-        "require('node:fs').statSync('/tmp/worker-ready').size > 0 || process.exit(1)"
+        'build/services/worker-health.js'
       ], environment);
 
       const networkIds = await captureIdentifiers(dependencies, environment, [

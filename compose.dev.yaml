@@ -39,7 +39,14 @@ services:
       STORAGE_PUBLICATION_ROOT: /var/lib/pale-orbit/publication
       STORAGE_COVERS_ROOT: /var/lib/pale-orbit/covers
       STORAGE_SCRATCH_ROOT: /tmp/pale-orbit-verified
-      WORKER_READY_FILE: /tmp/worker-ready
+      WORKER_READY_FILE: ""
+      WORKER_READY_FILE_FILE: ""
+      WORKER_CONCURRENCY: ""
+      WORKER_CONCURRENCY_FILE: ""
+      WORKER_HEARTBEAT_INTERVAL_MS: ""
+      WORKER_HEARTBEAT_INTERVAL_MS_FILE: ""
+      WORKER_HEARTBEAT_MAX_AGE_MS: ""
+      WORKER_HEARTBEAT_MAX_AGE_MS_FILE: ""
     volumes:
       - .:/app
       - ./deploy/container.env:/app/.env:ro
@@ -105,6 +112,9 @@ services:
       STORAGE_COVERS_ROOT: /var/lib/pale-orbit/covers
       STORAGE_SCRATCH_ROOT: /tmp/pale-orbit-verified
       WORKER_READY_FILE: /tmp/worker-ready
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-1}
+      WORKER_HEARTBEAT_INTERVAL_MS: ${WORKER_HEARTBEAT_INTERVAL_MS:-5000}
+      WORKER_HEARTBEAT_MAX_AGE_MS: ${WORKER_HEARTBEAT_MAX_AGE_MS:-20000}
     volumes:
       - .:/app
       - ./deploy/container.env:/app/.env:ro
@@ -120,7 +130,7 @@ services:
       mailpit:
         condition: service_healthy
     healthcheck:
-      test: [CMD, node, -e, "require('node:fs').statSync('/tmp/worker-ready').size > 0 || process.exit(1)"]
+      test: [CMD, node, --import, tsx, src/worker-health.ts]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -168,6 +178,14 @@ services:
       BOOTSTRAP_ADMIN_NAME_FILE: ""
       BOOTSTRAP_ADMIN_PASSWORD: ""
       BOOTSTRAP_ADMIN_PASSWORD_FILE: ""
+      WORKER_READY_FILE: ""
+      WORKER_READY_FILE_FILE: ""
+      WORKER_CONCURRENCY: ""
+      WORKER_CONCURRENCY_FILE: ""
+      WORKER_HEARTBEAT_INTERVAL_MS: ""
+      WORKER_HEARTBEAT_INTERVAL_MS_FILE: ""
+      WORKER_HEARTBEAT_MAX_AGE_MS: ""
+      WORKER_HEARTBEAT_MAX_AGE_MS_FILE: ""
     volumes:
       - .:/app
       - ./deploy/container.env:/app/.env:ro
@@ -206,6 +224,14 @@ services:
       BOOTSTRAP_ADMIN_NAME_FILE: ""
       BOOTSTRAP_ADMIN_PASSWORD: ""
       BOOTSTRAP_ADMIN_PASSWORD_FILE: ""
+      WORKER_READY_FILE: ""
+      WORKER_READY_FILE_FILE: ""
+      WORKER_CONCURRENCY: ""
+      WORKER_CONCURRENCY_FILE: ""
+      WORKER_HEARTBEAT_INTERVAL_MS: ""
+      WORKER_HEARTBEAT_INTERVAL_MS_FILE: ""
+      WORKER_HEARTBEAT_MAX_AGE_MS: ""
+      WORKER_HEARTBEAT_MAX_AGE_MS_FILE: ""
     volumes:
       - .:/app
       - ./deploy/container.env:/app/.env:ro
@@ -250,6 +276,14 @@ services:
       STRIPE_SECRET_KEY_FILE: ""
       STRIPE_WEBHOOK_SECRET: ""
       STRIPE_WEBHOOK_SECRET_FILE: ""
+      WORKER_READY_FILE: ""
+      WORKER_READY_FILE_FILE: ""
+      WORKER_CONCURRENCY: ""
+      WORKER_CONCURRENCY_FILE: ""
+      WORKER_HEARTBEAT_INTERVAL_MS: ""
+      WORKER_HEARTBEAT_INTERVAL_MS_FILE: ""
+      WORKER_HEARTBEAT_MAX_AGE_MS: ""
+      WORKER_HEARTBEAT_MAX_AGE_MS_FILE: ""
     volumes:
       - .:/app
       - ./deploy/container.env:/app/.env:ro
@@ -304,6 +338,14 @@ services:
       STORAGE_PUBLICATION_ROOT: /var/lib/pale-orbit/publication
       STORAGE_COVERS_ROOT: /var/lib/pale-orbit/covers
       STORAGE_SCRATCH_ROOT: /tmp/pale-orbit-verified
+      WORKER_READY_FILE: ""
+      WORKER_READY_FILE_FILE: ""
+      WORKER_CONCURRENCY: ""
+      WORKER_CONCURRENCY_FILE: ""
+      WORKER_HEARTBEAT_INTERVAL_MS: ""
+      WORKER_HEARTBEAT_INTERVAL_MS_FILE: ""
+      WORKER_HEARTBEAT_MAX_AGE_MS: ""
+      WORKER_HEARTBEAT_MAX_AGE_MS_FILE: ""
     volumes:
       - .:/app
       - ./deploy/container.env:/app/.env:ro

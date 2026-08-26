@@ -1,5 +1,4 @@
 x-publication-settings: &publication-settings
-  WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-1}
   UPLOAD_MAX_BYTES: ${UPLOAD_MAX_BYTES:-536870912}
   INGEST_MAX_EXPANDED_BYTES: ${INGEST_MAX_EXPANDED_BYTES:-2147483648}
   INGEST_MAX_ENTRIES: ${INGEST_MAX_ENTRIES:-10000}
@@ -65,7 +64,6 @@ services:
       JOB_LEASE_MS: "30000"
       JOB_RETRY_BASE_MS: "1000"
       JOB_RETRY_MAX_MS: "300000"
-      WORKER_READY_FILE: /tmp/worker-ready
       HOST: 0.0.0.0
       PORT: "3000"
       ADDRESS_HEADER: X-Forwarded-For
@@ -154,6 +152,9 @@ services:
       JOB_RETRY_BASE_MS: "1000"
       JOB_RETRY_MAX_MS: "300000"
       WORKER_READY_FILE: /tmp/worker-ready
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-1}
+      WORKER_HEARTBEAT_INTERVAL_MS: ${WORKER_HEARTBEAT_INTERVAL_MS:-5000}
+      WORKER_HEARTBEAT_MAX_AGE_MS: ${WORKER_HEARTBEAT_MAX_AGE_MS:-20000}
     secrets:
       - database_worker_password
       - auth_secret
@@ -171,7 +172,7 @@ services:
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: [CMD, node, -e, "require('node:fs').statSync('/tmp/worker-ready').size > 0 || process.exit(1)"]
+      test: [CMD, node, build/services/worker-health.js]
       interval: 10s
       timeout: 3s
       retries: 10

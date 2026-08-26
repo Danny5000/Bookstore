@@ -23,13 +23,20 @@ describe('routine database test harness role separation', () => {
     expect(postTeardown).toBeGreaterThan(teardown);
   });
 
-  it('puts the worker readiness marker under the unique owned temp root and rejects stale state', async () => {
+  it('waits for a valid worker freshness record under the exact owned temp root', async () => {
     const source = await readFile(new URL('./with-test-database.ts', import.meta.url), 'utf8');
 
     expect(source).toContain("const workerReadyFile = join(testStorageRoot, 'worker.ready');");
-    expect(source).toContain('if (existsSync(readyFile))');
-    expect(source).toContain("throw new Error('Worker readiness file already exists')");
     expect(source).toContain('WORKER_READY_FILE: workerReadyFile');
+    expect(source).toContain("WORKER_HEARTBEAT_INTERVAL_MS: '1000'");
+    expect(source).toContain("WORKER_HEARTBEAT_MAX_AGE_MS: '4000'");
+    expect(source).toContain("import { runWorkerHealthCheck } from '../src/lib/server/worker/health-check';");
+    expect(source).toMatch(
+      /await runWorkerHealthCheck\(\{\s*heartbeatFile: readyFile,\s*configuredSlots: 1,\s*maxAgeMs: 4_000,\s*stderr: \(\) => undefined\s*\}\)/u
+    );
+    expect(source).not.toContain('existsSync(readyFile)');
+    expect(source).not.toMatch(/readFile[^\n]*readyFile|statSync[^\n]*readyFile/u);
+    expect(source.match(/Timed out waiting for worker readiness/gu)).toHaveLength(1);
     expect(source).not.toContain('`pale-orbit-worker-${process.pid}.ready`');
   });
 
