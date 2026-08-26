@@ -1,8 +1,8 @@
 # Database and workers
 
-**Status:** Plan 6B implementation complete
+**Status:** Plan 6B complete; Plan 7A Checkpoints A and B implemented
 
-The completed unified Plan 6B implementation is migrated through `0014`. Migration `0012` retains its historical eight callable public boundary routines; `0013` adds only the correction-resolution routine, for a final surface of nine; and `0014` changes no callable surface while replacing the nullable issue-transition trigger guard with a fail-closed definition. The protected global Sales link and direct routes are live for authorized administrators, but production must remain `APPLICATION_MODE=maintenance` with Stripe-disabled defaults. See [financial reconciliation and reporting](financial-reconciliation-and-reporting.md) for the operator boundary; Plan 7 owns production activation and operability, including general retry administration, monitoring, off-host backup scheduling, and deployment hardening.
+The completed unified Plan 6B implementation is migrated through `0014`. Migration `0012` retains its historical eight callable public boundary routines; `0013` adds only the correction-resolution routine, for a final surface of nine; and `0014` changes no callable surface while replacing the nullable issue-transition trigger guard with a fail-closed definition. The protected global Sales link and direct routes are live for authorized administrators, but production must remain `APPLICATION_MODE=maintenance` with Stripe-disabled defaults. Plan 7A Checkpoints A and B are implemented, but Plan 7A is not complete. See [financial reconciliation and reporting](financial-reconciliation-and-reporting.md) for the existing operator boundary.
 
 ## Ownership
 
@@ -69,9 +69,29 @@ docker compose --env-file .env --file compose.dev.yaml --profile tools run --rm 
 docker compose --env-file .env --file compose.dev.yaml up --build --wait
 ```
 
-The web service is at `http://localhost:5173`; Mailpit is at `http://localhost:8025`. The worker has no published port. Its Compose health check requires a non-empty `/tmp/worker-ready` file written only after the initial database probe succeeds.
+The web service is at `http://localhost:5173`; Mailpit is at `http://localhost:8025`. The worker has no published port. Its Compose health check runs the stateless source validator against `/tmp/worker-ready`; the file is the version-1 freshness record described below, not an opaque startup marker.
 
 The long-running app and worker receive only their own database credentials. Compose also mounts the deliberately empty [`deploy/container.env`](../deploy/container.env) over `/app/.env`, so the source-tree bind mount cannot expose the host `.env` to either process. Migration, role provisioning, bootstrap, and cleanup remain bounded one-shot services with only the credentials each command requires.
+
+## Structured diagnostics and worker freshness
+
+Checkpoint B application logs use schema version `1` and newline-delimited JSON (NDJSON) written only to local standard output or standard error. The web producer emits `http.request.completed`, `http.request.rejected`, and `http.request.failed`. The worker producer emits `worker.started`, `worker.ready`, `worker.stopping`, `worker.stopped`, `worker.failed`, and `worker.heartbeat_failed`; claimed attempts emit `job.claimed`, `job.succeeded`, `job.failed`, and `job.lease_lost`. Those web, worker, and job events are the fixed Checkpoint B adoption boundary. The shared smoke schemas are defined and tested, but smoke emission and generalized release evidence remain deferred to Checkpoint D. No remote log transport, monitor store, metrics endpoint, dashboard, alert rule, or alert delivery is implemented.
+
+At web ingress, only the `x-request-id` header is considered. A value matching `^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$` remains the diagnostic correlation identifier; a missing or invalid value is replaced with a generated lowercase UUID and is not echoed in a response header. Correlation is never an authorization or idempotency input. The HTTP lifecycle record uses a static or normalized SvelteKit route identifier and never logs a URL, query string, request or response body, raw header, or raw error or stack.
+
+`WORKER_READY_FILE` retains its configuration name and path ownership, but its contents are no longer an opaque nonempty marker. The canonical version-1 JSON record contains only `version`, `workerId`, `processStartedAt`, `publishedAt`, `sequence`, `configuredSlots`, and `slots`. Each slot contains only `slotId`, `state`, `lastSuccessfulPollAt`, and `lastProgressAt`. Slots are zero-based, and every configured slot appears exactly once. `polling` means a queue claim is in progress, `idle` means the latest successful poll found no job or terminal work has settled, and `handling` means the slot owns a claimed job.
+
+A successful poll, including an empty poll, advances both timestamps. While a job is in `handling`, a successful lease renewal advances `lastProgressAt` without changing `lastSuccessfulPollAt`; successful terminal settlement advances `lastProgressAt` and returns the slot to `idle`. Lease loss returns the slot to `idle` without advancing progress. Merely awaiting a handler is not progress; a long-running handler remains fresh only while successful lease renewals continue.
+
+Before resource assembly, the supervisor removes only the configured target and its `.tmp` sibling. No heartbeat exists and `worker.ready` is not emitted until dependency probes succeed, every configured slot completes its first successful poll, and the first atomic publication succeeds. Each serialized publication writes and syncs a mode-`0600` sibling, closes it, and renames it over the target. It uses a same-directory temporary sibling formed as `${WORKER_READY_FILE}.tmp`, so failed partial writes never replace the accepted record.
+
+Encoding, opening, writing, syncing, closing, renaming, or continued-publication failure emits one `worker.heartbeat_failed`, aborts worker activity, and exits nonzero. Fatal shutdown waits for the runner and publisher, seals further progress, removes the target and temporary evidence, and then closes email and database clients in reverse registration order. The whole fatal settlement and cleanup attempt lasts at most 10 seconds; if it wedges, the process force-exits with status `1`. That deadline is fatal-path-only; normal `SIGINT` or `SIGTERM` retains the Compose 30-second stop grace and performs the same ordered evidence removal before clients close.
+
+The validator treats missing, malformed, stale, too-far-future, wrong-slot-count, missing-slot, or stale-slot evidence as unhealthy. It rejects nonregular, empty, size-changed-during-read, or oversized files, with a 65,536-byte maximum and a fixed 5,000-millisecond future tolerance. The stateless health executable does not read or require database credentials and has no network endpoint or public response; application `/health/ready` remains web-only and does not disclose worker state.
+
+For a host-run or development environment, run `npm run worker:health`. Development Compose invokes `node --import tsx src/worker-health.ts`; the production image invokes `node build/services/worker-health.js`. Compose does not restart a container merely because it is unhealthy. In production, fatal publisher failure exits nonzero under `restart: unless-stopped`, allowing Docker to replace the failed worker.
+
+Checkpoint B deliberately adds no monitoring or alert transport, generalized smoke evidence, operations catalog or UI, activation input, production-live mode, or Stripe enablement. Those remain later-checkpoint work.
 
 ## Tests
 
@@ -142,7 +162,7 @@ docker compose --file compose.prod.yaml ps
 docker compose --file compose.prod.yaml logs --tail 100 app worker postgres caddy
 ```
 
-`/health/live` proves only the web process responds. `/health/ready` performs bounded PostgreSQL and storage probes. Worker health proves the worker completed its initial dependency probes and entered the polling loop. The unified financial and reporting implementation is complete, and the protected global Sales link is live for authorized administrators. Production storefront and API paths must remain in `APPLICATION_MODE=maintenance`, and Plan 7 owns production activation and operability. The base production stack keeps Stripe disabled and requires no Stripe credential.
+`/health/live` proves only the web process responds. `/health/ready` performs bounded PostgreSQL and storage probes. `node build/services/worker-health.js` validates the worker's private heartbeat record: the first healthy record implies the initial dependency probes and every slot's first successful poll completed, while subsequent checks require publication and every slot's progress to remain fresh. The unified financial and reporting implementation is complete, and the protected global Sales link is live for authorized administrators. Production storefront and API paths must remain in `APPLICATION_MODE=maintenance`; the base production stack keeps Stripe disabled and requires no Stripe credential.
 
 ## Job behavior
 
@@ -171,4 +191,4 @@ Safe operations may inspect IDs, types/topics, status, attempts, reconciliation 
 - Plan 5 added the six entitlement/reader-state tables and semantic fingerprint columns. Reader migration is synchronous under ordered transaction locks; it is not a worker job.
 - Plan 6A added Stripe reconciliation, commerce email/claim jobs, purchase grants, and refund/dispute access reduction.
 - Plan 6B combines completed financial ingestion/reconciliation with administrator resolution and reporting, and its protected global Sales link is live.
-- Plan 7 adds production activation and operability, including general failed-job retry administration, structured logging, queue-age monitoring, scheduled off-host backups, deployment hardening, and final pool/capacity tuning.
+- Plan 7A Checkpoints A and B added dependency/test boundaries plus structured logging, diagnostic correlation, and worker freshness. General failed-job operations, queue-age monitoring and alert delivery, generalized release evidence, scheduled off-host backups, deployment hardening, final pool/capacity tuning, activation, and Stripe enablement remain deferred.

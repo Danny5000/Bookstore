@@ -60,9 +60,11 @@ npm run verify
 
 Development uses the PostgreSQL catalog, private EPUB/CBZ storage, background ingestion, revision review/publication, public previews, server-owned commerce and entitlement grants, customer libraries and reader state, authenticated original downloads, and an audited admin dashboard. Stripe is disabled by default and production Compose remains fixed to maintenance mode.
 
-**Status:** Plan 6B implementation complete
+**Status:** Plan 6B complete; Plan 7A Checkpoints A and B implemented
 
-The completed Plan 6B implementation includes financial ingestion and reconciliation plus direct administrator review, refund finalization, reporting correction, recovery, payout, Sales reporting, and CSV routes. The protected global Sales link is live for authorized administrators. The migration chain ends at `0014`: `0012` retains its historical eight callable public boundary routines, `0013` adds the ninth, and `0014` changes no callable surface while replacing the nullable issue-transition trigger guard with a fail-closed definition. The four pairwise-distinct login principals are `DATABASE_OWNER_USER`, `DATABASE_USER`, `DATABASE_WORKER_USER`, and `DATABASE_STORAGE_CLEANUP_USER`; the web principal submits commands, reads owner-scoped status, and completes route-authorized detail/export audits while only the financial-worker principal executes protected financial mutations. The required release-evidence order remains migrate, role provision, checkpoint capture, distinct-engine rehearsal, then production-image smoke. Production must remain in maintenance mode with Stripe-disabled defaults; Plan 7 owns production activation and operability, including general retry administration, monitoring, off-host backup scheduling, and deployment hardening.
+The completed Plan 6B implementation includes financial ingestion and reconciliation plus direct administrator review, refund finalization, reporting correction, recovery, payout, Sales reporting, and CSV routes. The protected global Sales link is live for authorized administrators. The migration chain ends at `0014`: `0012` retains its historical eight callable public boundary routines, `0013` adds the ninth, and `0014` changes no callable surface while replacing the nullable issue-transition trigger guard with a fail-closed definition. The four pairwise-distinct login principals are `DATABASE_OWNER_USER`, `DATABASE_USER`, `DATABASE_WORKER_USER`, and `DATABASE_STORAGE_CLEANUP_USER`; the web principal submits commands, reads owner-scoped status, and completes route-authorized detail/export audits while only the financial-worker principal executes protected financial mutations. The required release-evidence order remains migrate, role provision, checkpoint capture, distinct-engine rehearsal, then production-image smoke. Production must remain in maintenance mode with Stripe-disabled defaults.
+
+Plan 7A Checkpoint A dependency and test boundaries are implemented. Plan 7A Checkpoint B structured logging, correlation, and worker freshness are implemented. Plan 7A is not complete.
 
 ## Routes
 
@@ -107,7 +109,7 @@ Plan 6A provides a bounded quantity-one multi-title cart, server-owned quotes, i
 
 Plan 6B adds local canonical balance-transaction and payout ingestion, signed fee/net allocation, reconciliation issues, bounded recovery scans, versioned classification replay, and the direct administrator resolution/reporting surfaces described in the [financial reconciliation and reporting operator guide](docs/financial-reconciliation-and-reporting.md). Exact automatic-standard payout association requires complete membership plus current paid status; manual and instant payouts remain fee-reconciled without invented membership. See also the [commerce operations runbook](docs/commerce-and-guest-claims.md) and the detailed [Stripe financial reconciliation guide](docs/stripe-financial-reconciliation.md).
 
-The protected global Sales link is live, but production must remain `APPLICATION_MODE=maintenance` and the base stack must retain its Stripe-disabled defaults. Plan 7—not the Stripe overlay—owns production activation and operability.
+The protected global Sales link is live, but production must remain `APPLICATION_MODE=maintenance` and the base stack must retain its Stripe-disabled defaults. Remaining Plan 7 work—not the Stripe overlay—owns production activation.
 
 ## Authentication and delivery
 
@@ -117,5 +119,5 @@ Versioned authentication and commerce messages use the PostgreSQL outbox and pro
 
 ## Deferred work
 
-- Plan 7 production activation and operability, including deployment automation and hardening, monitoring, general retry administration, and off-host backup scheduling.
+- General job operations and retry administration, monitoring and alert transport, generalized release and smoke evidence, scheduled off-host backups, deployment automation and hardening, final pool and capacity tuning, production activation, and Stripe enablement remain deferred.
 - Search, series grouping, pre-orders, and reviews.

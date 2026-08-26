@@ -122,6 +122,149 @@ describe('worker heartbeat deployment consumers', () => {
     );
   });
 
+  it('documents the implemented observability and worker-freshness operator contract', async () => {
+    const readme = await source('README.md');
+    const workers = await source('docs/database-and-workers.md');
+    const environments = await source('docs/runtime-environments.md');
+    const exampleEnvironment = await source('.env.example');
+    const operatorDocumentation = [readme, workers, environments].join('\n');
+
+    expect.soft(operatorDocumentation).toContain('schema version `1`');
+    expect.soft(operatorDocumentation).toContain('newline-delimited JSON (NDJSON)');
+    expect.soft(operatorDocumentation).toContain(
+      'written only to local standard output or standard error'
+    );
+    expect.soft(operatorDocumentation).toContain(
+      '`^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$`'
+    );
+    expect.soft(operatorDocumentation).toContain(
+      'a missing or invalid value is replaced with a generated lowercase UUID'
+    );
+    expect.soft(operatorDocumentation).toContain('is not echoed in a response header');
+    expect.soft(operatorDocumentation).toContain(
+      'never logs a URL, query string, request or response body, raw header, or raw error or stack'
+    );
+    for (const event of [
+      'http.request.completed',
+      'http.request.rejected',
+      'http.request.failed',
+      'worker.started',
+      'worker.ready',
+      'worker.stopping',
+      'worker.stopped',
+      'worker.failed',
+      'worker.heartbeat_failed',
+      'job.claimed',
+      'job.succeeded',
+      'job.failed',
+      'job.lease_lost'
+    ]) {
+      expect.soft(operatorDocumentation, event).toContain(`\`${event}\``);
+    }
+    expect.soft(operatorDocumentation).toContain(
+      'smoke emission and generalized release evidence remain deferred to Checkpoint D'
+    );
+
+    expect.soft(workers).toContain(
+      '`version`, `workerId`, `processStartedAt`, `publishedAt`, `sequence`, `configuredSlots`, and `slots`'
+    );
+    expect.soft(workers).toContain(
+      '`slotId`, `state`, `lastSuccessfulPollAt`, and `lastProgressAt`'
+    );
+    expect.soft(workers).toContain(
+      '`polling` means a queue claim is in progress, `idle` means the latest successful poll found no job or terminal work has settled, and `handling` means the slot owns a claimed job'
+    );
+    expect.soft(workers).toContain('Slots are zero-based, and every configured slot appears exactly once');
+    expect.soft(workers).toContain('A successful poll, including an empty poll, advances both timestamps');
+    expect.soft(workers).toContain(
+      'successful lease renewal advances `lastProgressAt` without changing `lastSuccessfulPollAt`'
+    );
+    expect.soft(workers).toContain('terminal settlement advances `lastProgressAt` and returns the slot to `idle`');
+    expect.soft(workers).toContain('Merely awaiting a handler is not progress');
+    expect.soft(workers).toContain(
+      'a long-running handler remains fresh only while successful lease renewals continue'
+    );
+
+    expect.soft(environments).toContain('default `5,000` milliseconds');
+    expect.soft(environments).toContain('between `1,000` and `30,000` milliseconds');
+    expect.soft(environments).toContain('default `20,000` milliseconds');
+    expect.soft(environments).toContain(
+      '`WORKER_HEARTBEAT_MAX_AGE_MS >= 3 * WORKER_HEARTBEAT_INTERVAL_MS`'
+    );
+    expect.soft(environments).toContain(
+      '`WORKER_HEARTBEAT_MAX_AGE_MS >= JOB_POLL_INTERVAL_MS + 2 * WORKER_HEARTBEAT_INTERVAL_MS`'
+    );
+    expect.soft(environments).toContain(
+      '`WORKER_HEARTBEAT_MAX_AGE_MS < JOB_LEASE_MS`'
+    );
+    expect.soft(environments).toContain('`WORKER_HEARTBEAT_MAX_AGE_MS <= 300000`');
+    expect.soft(environments).toContain(
+      '`WORKER_READY_FILE`, `WORKER_CONCURRENCY`, `WORKER_HEARTBEAT_INTERVAL_MS`, `WORKER_HEARTBEAT_MAX_AGE_MS`, `JOB_POLL_INTERVAL_MS`, and `JOB_LEASE_MS`'
+    );
+    expect.soft(environments).toContain(
+      'Web, migration, role provisioning, bootstrap, and storage cleanup do not read or retain the worker heartbeat settings'
+    );
+
+    expect.soft(workers).toContain(
+      'dependency probes succeed, every configured slot completes its first successful poll, and the first atomic publication succeeds'
+    );
+    expect.soft(workers).toContain('The worker has no published port');
+    expect.soft(workers).toContain(
+      'a same-directory temporary sibling formed as `${WORKER_READY_FILE}.tmp`'
+    );
+    expect.soft(workers).toContain(
+      'failure emits one `worker.heartbeat_failed`, aborts worker activity, and exits nonzero'
+    );
+    expect.soft(workers).toContain('at most 10 seconds');
+    expect.soft(workers).toContain('force-exits with status `1`');
+    expect.soft(workers).toContain('normal `SIGINT` or `SIGTERM` retains the Compose 30-second stop grace');
+    expect.soft(workers).toContain(
+      'removes the target and temporary evidence, and then closes email and database clients'
+    );
+
+    expect.soft(operatorDocumentation).toContain('`npm run worker:health`');
+    expect.soft(operatorDocumentation).toContain('`node --import tsx src/worker-health.ts`');
+    expect.soft(operatorDocumentation).toContain('`node build/services/worker-health.js`');
+    expect.soft(operatorDocumentation).toContain('5,000-millisecond future tolerance');
+    expect.soft(operatorDocumentation).toContain('65,536-byte maximum');
+    expect.soft(workers).toContain(
+      'missing, malformed, stale, too-far-future, wrong-slot-count, missing-slot, or stale-slot evidence as unhealthy'
+    );
+    expect.soft(operatorDocumentation).toContain('does not read or require database credentials');
+    expect.soft(operatorDocumentation).toContain('has no network endpoint or public response');
+    expect.soft(operatorDocumentation).toContain(
+      'Compose does not restart a container merely because it is unhealthy'
+    );
+    expect.soft(operatorDocumentation).toContain(
+      'fatal publisher failure exits nonzero under `restart: unless-stopped`'
+    );
+
+    expect.soft(readme).toContain('Plan 7A Checkpoint A dependency and test boundaries are implemented');
+    expect.soft(readme).toContain(
+      'Plan 7A Checkpoint B structured logging, correlation, and worker freshness are implemented'
+    );
+    expect.soft(readme).toContain('Plan 7A is not complete');
+    expect.soft(readme).toContain(
+      'General job operations and retry administration, monitoring and alert transport, generalized release and smoke evidence, scheduled off-host backups, deployment automation and hardening, final pool and capacity tuning, production activation, and Stripe enablement remain deferred'
+    );
+    expect.soft(workers).toContain(
+      'Checkpoint B deliberately adds no monitoring or alert transport, generalized smoke evidence, operations catalog or UI, activation input, production-live mode, or Stripe enablement'
+    );
+
+    expect.soft(exampleEnvironment).toMatch(
+      /WORKER_READY_FILE=.worker-ready\nWORKER_CONCURRENCY=1\nWORKER_HEARTBEAT_INTERVAL_MS=5000\nWORKER_HEARTBEAT_MAX_AGE_MS=20000/u
+    );
+    expect.soft(exampleEnvironment).not.toMatch(
+      /^(?:LOGGING_ENDPOINT|LOGGING_TOKEN|ALERT_DESTINATION)=/mu
+    );
+    expect.soft(workers).not.toContain(
+      'Its Compose health check requires a non-empty `/tmp/worker-ready` file written only after the initial database probe succeeds.'
+    );
+    expect.soft(environments).not.toContain(
+      'Worker health proves the worker completed its initial database probe, atomically provisioned and verified that sentinel, used canonical disposable keys to round-trip all three roots, and entered the polling loop'
+    );
+  });
+
   it('routes both smoke harnesses through the built validator and rehearses fixed failures', async () => {
     const productionSmoke = await source('scripts/plan6b-production-smoke.ts');
     const fixtureProbe = await source('scripts/plan6b-fixture-runtime-probe.ts');
