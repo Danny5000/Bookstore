@@ -521,7 +521,7 @@ async function runSingleClaim(
   repository: JobRepository,
   handler: ReturnType<typeof createFinancialAdminCommandHandler>,
   workerId: string,
-  heartbeatIntervalMs = 20,
+  leaseRenewalIntervalMs = 20,
   controller = new AbortController(),
 ): Promise<void> {
   let polls = 0;
@@ -531,7 +531,7 @@ async function runSingleClaim(
     workerId,
     concurrency: 1,
     pollIntervalMs: 1,
-    heartbeatIntervalMs,
+    leaseRenewalIntervalMs,
     signal: controller.signal,
     beforePoll: async () => {
       polls += 1;
@@ -1668,7 +1668,7 @@ describe("financial administrator command PostgreSQL lifecycle", () => {
       workerId: "financial-admin-transient-worker",
       concurrency: 1,
       pollIntervalMs: 1,
-      heartbeatIntervalMs: 1_000,
+      leaseRenewalIntervalMs: 1_000,
       signal: controller.signal,
     });
 

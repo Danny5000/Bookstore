@@ -533,7 +533,7 @@ async function runCorrectionCommandWorkerToTerminal(
     workerId: `financial-correction-worker-${label}`,
     concurrency: 1,
     pollIntervalMs: 1,
-    heartbeatIntervalMs: 20_000,
+    leaseRenewalIntervalMs: 20_000,
     signal: controller.signal,
     beforePoll: async () => {
       polls += 1;
@@ -565,7 +565,7 @@ async function runCorrectionCommandWorkerToTerminal(
       }
     },
     sleep: async () => {},
-    heartbeatSleep: async (_milliseconds, signal) => {
+    leaseRenewalSleep: async (_milliseconds, signal) => {
       if (signal.aborted) return;
       await new Promise<void>((resolve) => {
         signal.addEventListener('abort', () => resolve(), { once: true });

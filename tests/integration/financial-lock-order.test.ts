@@ -1815,7 +1815,7 @@ async function runRecoveryWorkerProbe(
     workerId: `recovery-lock-${submitted.commandId}`,
     concurrency: 1,
     pollIntervalMs: 1,
-    heartbeatIntervalMs: 250,
+    leaseRenewalIntervalMs: 250,
     signal: controller.signal,
     beforePoll: async () => {
       polls += 1;

@@ -134,7 +134,7 @@ it('converges two real worker polling loops without retaining a database lease',
       repository: createPostgresJobRepository(databaseClient.db, applicationConfig.jobs),
       handlers: new Map(), workerId, concurrency: 1,
       pollIntervalMs: applicationConfig.jobs.pollIntervalMs,
-      heartbeatIntervalMs: Math.max(1, Math.floor(applicationConfig.jobs.leaseMs / 3)),
+      leaseRenewalIntervalMs: Math.max(1, Math.floor(applicationConfig.jobs.leaseMs / 3)),
       signal: controller.signal,
       beforePoll: async ({ signal }) => {
         await ensure({ now, signal });

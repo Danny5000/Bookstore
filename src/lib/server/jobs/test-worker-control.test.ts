@@ -1252,7 +1252,7 @@ describe('test worker control integration with the real runner', () => {
       workerId: 'test-controlled-worker',
       concurrency: 1,
       pollIntervalMs: 1,
-      heartbeatIntervalMs: 1,
+      leaseRenewalIntervalMs: 1,
       signal: workerAbort.signal,
       beforePoll: ({ signal }) => prepareTestWorkerPoll({
         control,
@@ -1310,7 +1310,7 @@ describe('test worker control integration with the real runner', () => {
       workerId: 'test-durable-pause-worker',
       concurrency: 1,
       pollIntervalMs: 1,
-      heartbeatIntervalMs: 1,
+      leaseRenewalIntervalMs: 1,
       signal: workerAbort.signal,
       beforePoll: ({ signal }) => prepareTestWorkerPoll({
         control,
@@ -1385,7 +1385,7 @@ describe('test worker control integration with the real runner', () => {
       workerId: 'test-pre-boundary-pause-worker',
       concurrency: 1,
       pollIntervalMs: 1,
-      heartbeatIntervalMs: 1,
+      leaseRenewalIntervalMs: 1,
       signal: workerAbort.signal,
       beforePoll: ({ signal }) => prepareTestWorkerPoll({
         control,
@@ -1454,7 +1454,7 @@ describe('test worker control integration with the real runner', () => {
       workerId: 'test-boundary-expiry-worker',
       concurrency: 1,
       pollIntervalMs: 1,
-      heartbeatIntervalMs: 1,
+      leaseRenewalIntervalMs: 1,
       signal: workerAbort.signal,
       beforePoll: ({ signal }) => prepareTestWorkerPoll({
         control,
@@ -1530,7 +1530,7 @@ describe('test worker control integration with the real runner', () => {
       workerId: 'test-capped-transition-worker',
       concurrency: 1,
       pollIntervalMs: 1,
-      heartbeatIntervalMs: 1,
+      leaseRenewalIntervalMs: 1,
       signal: workerAbort.signal,
       beforePoll: ({ signal }) => prepareTestWorkerPoll({
         control,
@@ -1579,7 +1579,7 @@ describe('test worker control integration with the real runner', () => {
       workerId: 'test-abortable-pause-worker',
       concurrency: 1,
       pollIntervalMs: 1,
-      heartbeatIntervalMs: 1,
+      leaseRenewalIntervalMs: 1,
       signal: workerAbort.signal,
       beforePoll: ({ signal }) => prepareTestWorkerPoll({
         control,
@@ -1630,7 +1630,7 @@ describe('test worker control integration with the real runner', () => {
       workerId: 'test-maintenance-worker',
       concurrency: 1,
       pollIntervalMs: 1,
-      heartbeatIntervalMs: 1,
+      leaseRenewalIntervalMs: 1,
       signal: workerAbort.signal,
       beforePoll: ({ signal }) => prepareTestWorkerPoll({
         control,

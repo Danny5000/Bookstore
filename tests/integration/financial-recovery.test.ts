@@ -181,7 +181,7 @@ async function runWorkerUntilHandlerReturns(input: {
     workerId: input.workerId,
     concurrency: 1,
     pollIntervalMs: 1,
-    heartbeatIntervalMs: Math.max(1, Math.floor(applicationConfig.jobs.leaseMs / 3)),
+    leaseRenewalIntervalMs: Math.max(1, Math.floor(applicationConfig.jobs.leaseMs / 3)),
     signal: controller.signal,
     sleep: async () => controller.abort()
   });
@@ -241,7 +241,7 @@ async function runWorkerUntilIdle(input: {
     workerId: input.workerId,
     concurrency: 1,
     pollIntervalMs: 1,
-    heartbeatIntervalMs: Math.max(1, Math.floor(applicationConfig.jobs.leaseMs / 3)),
+    leaseRenewalIntervalMs: Math.max(1, Math.floor(applicationConfig.jobs.leaseMs / 3)),
     signal: controller.signal,
     sleep: async () => controller.abort()
   });
@@ -300,7 +300,7 @@ it('restarts a real source job after crashing immediately after provider staging
     workerId: 'financial-recovery-source-crash',
     concurrency: 1,
     pollIntervalMs: 1,
-    heartbeatIntervalMs: Math.max(1, Math.floor(applicationConfig.jobs.leaseMs / 3)),
+    leaseRenewalIntervalMs: Math.max(1, Math.floor(applicationConfig.jobs.leaseMs / 3)),
     signal: crashController.signal
   })).rejects.toThrow(WORKER_DISCONNECT);
 

@@ -283,7 +283,7 @@ try {
     workerId,
     concurrency: config.jobs.concurrency,
     pollIntervalMs: config.jobs.pollIntervalMs,
-    heartbeatIntervalMs: Math.max(1, Math.floor(config.jobs.leaseMs / 3)),
+    leaseRenewalIntervalMs: Math.max(1, Math.floor(config.jobs.leaseMs / 3)),
     beforePoll: prepareWorkerPoll,
     signal: controller.signal
   });

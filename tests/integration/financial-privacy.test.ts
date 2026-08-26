@@ -430,12 +430,12 @@ async function runSanitizedFailure(fixture: PrivacyFixture): Promise<{
     workerId: 'financial-privacy-runner',
     concurrency: 1,
     pollIntervalMs: 1,
-    heartbeatIntervalMs: 1,
+    leaseRenewalIntervalMs: 1,
     signal: controller.signal,
     sleep: async () => {
       controller.abort();
     },
-    heartbeatSleep: async (_milliseconds, signal) => {
+    leaseRenewalSleep: async (_milliseconds, signal) => {
       if (signal.aborted) return;
       await new Promise<void>((resolve) => {
         signal.addEventListener('abort', () => resolve(), { once: true });
