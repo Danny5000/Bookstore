@@ -33,6 +33,7 @@ class MemoryFilesystem implements WorkerHeartbeatFilesystem {
 	readonly #publicationWaiters = new Map<number, Deferred<void>>();
 	readonly #operationWaiters = new Map<number, Deferred<void>>();
 	readonly failures = new Map<'open' | 'write' | 'sync' | 'close' | 'rename' | 'rm', Error>();
+	readonly rmFailures = new Map<string, Error[]>();
 	renameGate: Deferred<void> | undefined;
 	openHandles = 0;
 	maximumOpenHandles = 0;
@@ -91,6 +92,9 @@ class MemoryFilesystem implements WorkerHeartbeatFilesystem {
 
 	async rm(path: string, options: { readonly force: true }): Promise<void> {
 		this.#recordOperation(`rm:${path}:${String(options.force)}`);
+		const pathFailures = this.rmFailures.get(path);
+		const pathFailure = pathFailures?.shift();
+		if (pathFailure !== undefined) throw pathFailure;
 		this.#fail('rm');
 		this.files.delete(path);
 	}
@@ -521,6 +525,118 @@ const failureOperations: Readonly<Record<PublicationFailurePoint, readonly strin
 };
 
 describe('worker heartbeat supervisor atomic filesystem and lifecycle', () => {
+	it('does not publish when readiness predates a pre-aborted run signal', async () => {
+		const harness = createHarness();
+		harness.supervisor.reportSlotProgress({
+			type: 'poll_succeeded',
+			slotId: 0,
+			claimed: false
+		});
+		await harness.supervisor.prepare();
+		const controller = new AbortController();
+		controller.abort();
+
+		await expect(harness.supervisor.run(controller.signal)).resolves.toBeUndefined();
+
+		expect(harness.filesystem.publications).toEqual([]);
+		expect(await promiseState(harness.supervisor.firstHealthyPublication)).toBe('pending');
+	});
+
+	it('rechecks abort after final readiness resolves but before the run continuation', async () => {
+		const harness = createHarness();
+		await harness.supervisor.prepare();
+		const controller = new AbortController();
+		const run = harness.supervisor.run(controller.signal);
+
+		harness.supervisor.reportSlotProgress({
+			type: 'poll_succeeded',
+			slotId: 0,
+			claimed: false
+		});
+		queueMicrotask(() => controller.abort());
+		await expect(run).resolves.toBeUndefined();
+
+		expect(harness.filesystem.publications).toEqual([]);
+		expect(await promiseState(harness.supervisor.firstHealthyPublication)).toBe('pending');
+	});
+
+	it('does not publish another interval after progress is sealed while sleeping', async () => {
+		const harness = createHarness();
+		await harness.supervisor.prepare();
+		const controller = new AbortController();
+		const run = harness.supervisor.run(controller.signal);
+		harness.supervisor.reportSlotProgress({
+			type: 'poll_succeeded',
+			slotId: 0,
+			claimed: false
+		});
+		await harness.supervisor.firstHealthyPublication;
+		await harness.sleeper.waitForCall(1);
+
+		harness.supervisor.sealProgress();
+		harness.sleeper.release(0);
+		await flushMicrotasks();
+		await flushMicrotasks();
+
+		expect(harness.filesystem.publications).toHaveLength(1);
+		controller.abort();
+		await run;
+	});
+
+	it('prepare attempts both owned paths, preserves primary failure, and retries after rejection', async () => {
+		const harness = createHarness();
+		const targetFailure = new Error('target-remove-primary');
+		const tempFailure = new Error('temp-remove-secondary');
+		harness.filesystem.files.set('heartbeat.json', 'stale-target');
+		harness.filesystem.files.set('heartbeat.json.tmp', 'stale-temp');
+		harness.filesystem.files.set('neighbor', 'preserved');
+		harness.filesystem.rmFailures.set('heartbeat.json', [targetFailure]);
+		harness.filesystem.rmFailures.set('heartbeat.json.tmp', [tempFailure]);
+
+		await expect(harness.supervisor.prepare()).rejects.toBe(targetFailure);
+		expect(harness.filesystem.operations).toEqual([
+			'rm:heartbeat.json:true',
+			'rm:heartbeat.json.tmp:true'
+		]);
+
+		await expect(harness.supervisor.prepare()).resolves.toBeUndefined();
+		expect(harness.filesystem.operations).toEqual([
+			'rm:heartbeat.json:true',
+			'rm:heartbeat.json.tmp:true',
+			'rm:heartbeat.json:true',
+			'rm:heartbeat.json.tmp:true'
+		]);
+		expect([...harness.filesystem.files]).toEqual([['neighbor', 'preserved']]);
+	});
+
+	it('removeEvidence attempts both owned paths, preserves primary failure, and retries rejection', async () => {
+		const harness = createHarness();
+		await harness.supervisor.prepare();
+		const targetFailure = new Error('target-remove-primary');
+		const tempFailure = new Error('temp-remove-secondary');
+		harness.filesystem.files.set('heartbeat.json', 'current-target');
+		harness.filesystem.files.set('heartbeat.json.tmp', 'current-temp');
+		harness.filesystem.files.set('neighbor', 'preserved');
+		harness.filesystem.rmFailures.set('heartbeat.json', [targetFailure]);
+		harness.filesystem.rmFailures.set('heartbeat.json.tmp', [tempFailure]);
+		const beforeRemoval = harness.filesystem.operations.length;
+
+		await expect(harness.supervisor.removeEvidence()).rejects.toBe(targetFailure);
+		expect(harness.filesystem.operations.slice(beforeRemoval)).toEqual([
+			'rm:heartbeat.json:true',
+			'rm:heartbeat.json.tmp:true'
+		]);
+
+		await expect(harness.supervisor.removeEvidence()).resolves.toBeUndefined();
+		expect(harness.filesystem.operations.slice(beforeRemoval)).toEqual([
+			'rm:heartbeat.json:true',
+			'rm:heartbeat.json.tmp:true',
+			'rm:heartbeat.json:true',
+			'rm:heartbeat.json.tmp:true'
+		]);
+		expect([...harness.filesystem.files]).toEqual([['neighbor', 'preserved']]);
+	});
+
 	it('snapshots constructor identity, timing, and owned paths before asynchronous use', async () => {
 		let nowMs = PROCESS_STARTED_MS;
 		const filesystem = new MemoryFilesystem();

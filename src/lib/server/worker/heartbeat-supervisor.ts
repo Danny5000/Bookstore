@@ -342,8 +342,8 @@ export function createWorkerHeartbeatSupervisor(options: {
 	}
 
 	function waitForReadiness(signal: AbortSignal): Promise<boolean> {
+		if (signal.aborted || sealed) return Promise.resolve(false);
 		if (ready) return Promise.resolve(true);
-		if (signal.aborted) return Promise.resolve(false);
 		return new Promise((resolve) => {
 			function aborted(): void {
 				resolve(false);
@@ -351,7 +351,7 @@ export function createWorkerHeartbeatSupervisor(options: {
 			signal.addEventListener('abort', aborted, { once: true });
 			void readiness.promise.then(() => {
 				signal.removeEventListener('abort', aborted);
-				resolve(!signal.aborted);
+				resolve(!signal.aborted && !sealed);
 			});
 		});
 	}
@@ -360,19 +360,19 @@ export function createWorkerHeartbeatSupervisor(options: {
 		if (!prepared || sealed || runStarted) throw new TypeError(INVALID_LIFECYCLE);
 		runStarted = true;
 		try {
-			if (!(await waitForReadiness(signal))) return;
+			if (!(await waitForReadiness(signal)) || signal.aborted || sealed) return;
 			await publish();
 			firstPublicationSettled = true;
 			firstPublication.resolve();
 
-			while (!signal.aborted) {
+			while (!signal.aborted && !sealed) {
 				try {
 					await sleep(intervalMs, signal);
 				} catch (error) {
 					if (signal.aborted) return;
 					throw error;
 				}
-				if (signal.aborted) return;
+				if (signal.aborted || sealed) return;
 				await publish();
 			}
 		} catch (error) {
@@ -386,14 +386,38 @@ export function createWorkerHeartbeatSupervisor(options: {
 		}
 	}
 
+	async function removeOwnedPaths(): Promise<void> {
+		let failed = false;
+		let primaryFailure: unknown;
+		try {
+			await filesystem.rm(heartbeatFile, { force: true });
+		} catch (error) {
+			failed = true;
+			primaryFailure = error;
+		}
+		try {
+			await filesystem.rm(temporaryFile, { force: true });
+		} catch (error) {
+			if (!failed) {
+				failed = true;
+				primaryFailure = error;
+			}
+		}
+		if (failed) throw primaryFailure;
+	}
+
 	async function prepare(): Promise<void> {
 		if (runStarted || sealed) throw new TypeError(INVALID_LIFECYCLE);
 		if (prepared) return;
-		preparation ??= (async () => {
-			await filesystem.rm(heartbeatFile, { force: true });
-			await filesystem.rm(temporaryFile, { force: true });
-			prepared = true;
-		})();
+		if (preparation === undefined) {
+			const attempt = removeOwnedPaths().then(() => {
+				prepared = true;
+			});
+			preparation = attempt;
+			void attempt.catch(() => {
+				if (preparation === attempt) preparation = undefined;
+			});
+		}
 		return preparation;
 	}
 
@@ -405,10 +429,13 @@ export function createWorkerHeartbeatSupervisor(options: {
 		if (!prepared) throw new TypeError(INVALID_LIFECYCLE);
 		if (runStarted && !runSettled) throw new TypeError(INVALID_LIFECYCLE);
 		sealed = true;
-		removal ??= (async () => {
-			await filesystem.rm(heartbeatFile, { force: true });
-			await filesystem.rm(temporaryFile, { force: true });
-		})();
+		if (removal === undefined) {
+			const attempt = removeOwnedPaths();
+			removal = attempt;
+			void attempt.catch(() => {
+				if (removal === attempt) removal = undefined;
+			});
+		}
 		return removal;
 	}
 
