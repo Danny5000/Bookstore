@@ -111,6 +111,7 @@ describe('runWorker', () => {
   it('runs the poll hook before each claim cycle and stops before claiming after abort', async () => {
     const controller = new AbortController();
     const trace: string[] = [];
+    const hookSignals: AbortSignal[] = [];
     let hookCount = 0;
     const repository = repositoryReturning(job);
     vi.mocked(repository.claimNext).mockReset().mockImplementation(async () => {
@@ -129,7 +130,8 @@ describe('runWorker', () => {
       beforePoll: async ({ now, signal }) => {
         trace.push('hook');
         expect(now).toBeInstanceOf(Date);
-        expect(signal).toBe(controller.signal);
+        expect(signal).not.toBe(controller.signal);
+        hookSignals.push(signal);
         hookCount += 1;
         if (hookCount === 2) controller.abort();
       },
@@ -137,6 +139,7 @@ describe('runWorker', () => {
     });
 
     expect(trace).toEqual(['hook', 'claim', 'hook']);
+    expect(hookSignals.every((signal) => signal.aborted)).toBe(true);
   });
 
   it('logs a bounded poll-hook failure and continues to a later poll', async () => {
@@ -338,6 +341,160 @@ describe('runWorker', () => {
     release();
     await running;
     expect(complete).toHaveBeenCalledTimes(2);
+  });
+
+  it('aborts sibling slots, waits for their settlement, and preserves the first slot failure', async () => {
+    const controller = new AbortController();
+    const primaryFailure = new Error('primary claim failure');
+    const siblingClaimStarted = deferred<void>();
+    const siblingClaimGate = deferred<null>();
+    const siblingSleep = vi.fn().mockResolvedValue(undefined);
+    const onFirstFailure = vi.fn(() => {
+      throw new Error('secondary notification failure');
+    });
+    const repository: JobRepository = {
+      claimNext: vi.fn(async (leaseOwner: string) => {
+        if (leaseOwner.endsWith(':0')) {
+          await siblingClaimStarted.promise;
+          throw primaryFailure;
+        }
+        siblingClaimStarted.resolve();
+        return siblingClaimGate.promise;
+      }),
+      renewLease: vi.fn().mockResolvedValue(true),
+      complete: vi.fn().mockResolvedValue(true),
+      fail: vi.fn().mockResolvedValue(true),
+      failWithDisposition: vi.fn().mockResolvedValue({
+        applied: true,
+        retryScheduled: false
+      })
+    };
+
+    const running = runWorker({
+      repository,
+      handlers: new Map(),
+      workerId: 'worker-sibling-settlement',
+      concurrency: 2,
+      pollIntervalMs: 1,
+      leaseRenewalIntervalMs: 1,
+      signal: controller.signal,
+      onFirstFailure,
+      sleep: siblingSleep
+    });
+    let settled = false;
+    void running.then(
+      () => { settled = true; },
+      () => { settled = true; }
+    );
+
+    await siblingClaimStarted.promise;
+    await vi.waitFor(() => expect(repository.claimNext).toHaveBeenCalledTimes(2));
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+    const settledBeforeSibling = settled;
+    if (settledBeforeSibling) controller.abort();
+    siblingClaimGate.resolve(null);
+    await expect(running).rejects.toBe(primaryFailure);
+    expect(settledBeforeSibling).toBe(false);
+    expect(onFirstFailure).toHaveBeenCalledTimes(1);
+    expect(siblingSleep).not.toHaveBeenCalled();
+  });
+
+  it('does not start a job returned by a sibling claim after internal abort', async () => {
+    const controller = new AbortController();
+    const primaryFailure = new Error('primary claim failure');
+    const siblingClaimStarted = deferred<void>();
+    const siblingClaimGate = deferred<JobRecord | null>();
+    const handler = vi.fn().mockResolvedValue(undefined);
+    const { events, observer } = captureObservations();
+    const repository: JobRepository = {
+      claimNext: vi.fn(async (leaseOwner: string) => {
+        if (leaseOwner.endsWith(':0')) {
+          await siblingClaimStarted.promise;
+          throw primaryFailure;
+        }
+        siblingClaimStarted.resolve();
+        return siblingClaimGate.promise;
+      }),
+      renewLease: vi.fn().mockResolvedValue(true),
+      complete: vi.fn().mockResolvedValue(true),
+      fail: vi.fn().mockResolvedValue(true),
+      failWithDisposition: vi.fn().mockResolvedValue({
+        applied: true,
+        retryScheduled: false
+      })
+    };
+
+    const running = runWorker({
+      repository,
+      handlers: new Map([[job.type, handler]]),
+      workerId: 'worker-post-abort-claim',
+      concurrency: 2,
+      pollIntervalMs: 1,
+      leaseRenewalIntervalMs: 1,
+      signal: controller.signal,
+      observer
+    });
+
+    await siblingClaimStarted.promise;
+    await vi.waitFor(() => expect(repository.claimNext).toHaveBeenCalledTimes(2));
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+    siblingClaimGate.resolve(job);
+    await expect(running).rejects.toBe(primaryFailure);
+
+    expect(handler).not.toHaveBeenCalled();
+    expect(repository.complete).not.toHaveBeenCalled();
+    expect(repository.fail).not.toHaveBeenCalled();
+    expect(repository.failWithDisposition).not.toHaveBeenCalled();
+    expect(events).not.toContainEqual(expect.objectContaining({
+      type: 'poll_succeeded',
+      slotId: 1
+    }));
+    expect(events).not.toContainEqual(expect.objectContaining({
+      type: 'terminal_settled',
+      slotId: 1
+    }));
+  });
+
+  it('forwards an internal sibling failure into a gated serialized poll hook', async () => {
+    const controller = new AbortController();
+    const primaryFailure = new Error('primary poll failure');
+    const secondHookStarted = deferred<void>();
+    let hookCalls = 0;
+    let gatedHookSignal: AbortSignal | undefined;
+    const repository = repositoryReturning(job);
+    vi.mocked(repository.claimNext).mockReset().mockImplementation(async () => {
+      await secondHookStarted.promise;
+      throw primaryFailure;
+    });
+
+    const running = runWorker({
+      repository,
+      handlers: new Map(),
+      workerId: 'worker-hook-sibling-failure',
+      concurrency: 2,
+      pollIntervalMs: 1,
+      leaseRenewalIntervalMs: 1,
+      signal: controller.signal,
+      beforePoll: async ({ signal }) => {
+        hookCalls += 1;
+        if (hookCalls === 1) return;
+        gatedHookSignal = signal;
+        secondHookStarted.resolve();
+        if (signal.aborted) return;
+        await new Promise<void>((resolve) => {
+          signal.addEventListener('abort', () => resolve(), { once: true });
+        });
+      }
+    });
+
+    await secondHookStarted.promise;
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+    const internallyAborted = gatedHookSignal?.aborted === true;
+    if (!internallyAborted) controller.abort();
+    await expect(running).rejects.toBe(primaryFailure);
+
+    expect(internallyAborted).toBe(true);
+    expect(gatedHookSignal).not.toBe(controller.signal);
   });
 
   it('renews an owned lease while a handler is running and stops after completion', async () => {

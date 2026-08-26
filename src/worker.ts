@@ -1,6 +1,3 @@
-import { randomUUID } from 'node:crypto';
-import { rm, writeFile } from 'node:fs/promises';
-import { hostname } from 'node:os';
 import { loadWorkerApplicationConfig } from '$lib/server/config/load';
 import { createAuthServer } from '$lib/server/auth/options';
 import {
@@ -85,6 +82,7 @@ import { INGEST_REVISION_JOB } from '$lib/server/ingestion/job';
 import { ingestionLimitsFromConfig } from '$lib/server/ingestion/limits';
 import { createPostgresJobRepository } from '$lib/server/jobs/repository';
 import { runWorker } from '$lib/server/jobs/runner';
+import { createRunnerObserver } from '$lib/server/jobs/runner-observer';
 import {
   createTestWorkerControl,
   prepareTestWorkerPoll
@@ -97,204 +95,230 @@ import {
 import { OUTBOX_DISPATCH_JOB } from '$lib/server/outbox/repository';
 import { createObjectStorage } from '$lib/server/storage/factory';
 import { probeStorage } from '$lib/server/storage/health';
+import { createWorkerHeartbeatSupervisor } from '$lib/server/worker/heartbeat-supervisor';
+import { runWorkerProcess } from '$lib/server/worker/process-runtime';
 
 const rawWorkerEnvironment = process.env;
-const config = loadWorkerApplicationConfig(
-  databaseEnvironmentForRole(rawWorkerEnvironment, 'worker')
-);
-const controller = new AbortController();
-const testWorkerControl = createTestWorkerControl({
+process.exitCode = await runWorkerProcess({
   environment: rawWorkerEnvironment,
-  concurrency: config.worker.concurrency,
-  abortWorker: (reason) => controller.abort(reason)
-});
-const databaseClient = createDatabaseClient(config.database);
-const workerId = `${hostname()}:${process.pid}:${randomUUID()}`;
-const emailTransport = createNodemailerEmailTransport(config.smtp);
-const storage = createObjectStorage(config.storage);
-const commerceMessages = createCommerceMessageEnqueuer(config.origin);
-const workerAuth = createAuthServer({
-  database: databaseClient.db,
-  config,
-  queueVerificationEmail: (input) => queueAuthEmail(databaseClient.db, input),
-  queueResetEmail: (input) => queueAuthEmail(databaseClient.db, input),
-  queueMagicEmail: (input) => queueAuthEmail(databaseClient.db, input),
-  queueCommerceClaimEmail: (input) =>
-    queueCommerceClaimEmail(databaseClient.db, commerceMessages, input),
-  canSendMagicLink: (email) => canSendMagicLink(databaseClient.db, email),
-  canSendCommerceMagicLink: (email) => canSendCommerceMagicLink(databaseClient.db, email),
-  onUserCreated: (userId) => ensureCustomerRole(databaseClient.db, userId),
-  registerCommerceClaimIssuance: (input) =>
-    registerCommerceClaimIssuance(databaseClient.db, input)
-});
-const stripeRuntime = createStripeWorkerRuntime(config);
-const topicHandlers = new Map<string, OutboxTopicHandler>([
-  [
-    AUTH_EMAIL_TOPIC,
-    createAuthEmailHandler(emailTransport, config.smtp.from, new URL(config.origin).hostname)
-  ],
-  [
-    COMMERCE_EMAIL_TOPIC,
-    createCommerceEmailHandler(
-      emailTransport,
-      config.smtp.from,
-      new URL(config.origin).hostname,
-      config.origin
-    )
-  ]
-]);
-const stripeEventHandler: JobHandler = createStripeEventHandler(
-  databaseClient.db,
-  stripeRuntime.gateway,
-  {
-    loadStripeEvent: defaultLoadStripeEvent,
-    fulfillCheckout: (database, input) => fulfillCheckoutEvent(database, input, {
-      purchaseMessages: commerceMessages
+  loadConfig: (environment) => loadWorkerApplicationConfig(
+    databaseEnvironmentForRole(environment, 'worker')
+  ),
+  createHeartbeat: ({ config, workerId, processStartedAt }) =>
+    createWorkerHeartbeatSupervisor({
+      workerId,
+      configuredSlots: config.worker.concurrency,
+      heartbeatFile: config.worker.heartbeatFile,
+      intervalMs: config.worker.heartbeatIntervalMs,
+      processStartedAt
     }),
-    fulfillRefund: (database, input) => fulfillRefundEvent(database, input, {
-      messages: commerceMessages
-    }),
-    fulfillDispute: (database, input) => fulfillDisputeEvent(database, input, {
-      messages: commerceMessages
-    }),
-    fulfillPayout: fulfillPayoutEvent,
-    recordException: (database, input) => recordFulfillmentException(database, input)
-  }
-);
-const financialSourceHandler = createFinancialSourceHandler({
-  database: databaseClient.db,
-  gateway: stripeRuntime.gateway
-});
-const financialPayoutHandler = createFinancialPayoutHandler({
-  database: databaseClient.db,
-  gateway: stripeRuntime.gateway
-});
-const financialScanHandler = createFinancialScanHandler({
-  database: databaseClient.db,
-  gateway: stripeRuntime.gateway,
-  runtimeMode: stripeRuntime.mode
-});
-const financialClassificationHandler = createFinancialClassificationHandler({
-  database: databaseClient.db,
-  targetClassifierVersion: FINANCIAL_CLASSIFIER_VERSION,
-  targetAllocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
-});
-const financialAdminCommandExecutors =
-  testWorkerControl.decorateFinancialAdminExecutors(
-    createFinancialAdminCommandExecutors({
-      refundDraftSave: executeRefundDraftSave as FinancialAdminCommandExecutor,
-      refundDraftDiscard: executeRefundDraftDiscard as FinancialAdminCommandExecutor,
-      refundAllocationFinalize:
-        executeRefundAllocationFinalize as FinancialAdminCommandExecutor,
-      refundReportingCorrectionCreate:
-        executeReportingCorrectionCreate as FinancialAdminCommandExecutor,
-      administrativeRecoveryActivate:
-        executeAdministrativeRecoveryActivate as FinancialAdminCommandExecutor,
-      administrativeRecoveryDeactivate:
-        executeAdministrativeRecoveryDeactivate as FinancialAdminCommandExecutor
-    })
-  );
-const financialAdminCommandHandler = createFinancialAdminCommandHandler({
-  database: databaseClient.db,
-  executors: financialAdminCommandExecutors,
-  accessMessages: commerceMessages
-});
-const handlers = new Map<string, JobHandler>([
-  [OUTBOX_DISPATCH_JOB, createOutboxDispatchHandler(databaseClient.db, topicHandlers)],
-  [
-    COMMERCE_CLAIM_EMAIL_JOB,
-    createClaimEmailHandler(createClaimEmailOperations(
-      databaseClient.db,
-      workerAuth,
-      commerceMessages,
-      config.origin
-    ))
-  ],
-  [
-    COMMERCE_CLAIM_REQUEST_JOB,
-    createClaimEmailHandler(createClaimEmailOperations(
-      databaseClient.db,
-      workerAuth,
-      commerceMessages,
-      config.origin
-    ), { allowExistingReceipt: true })
-  ],
-  [STRIPE_EVENT_JOB, stripeEventHandler],
-  [FINANCIAL_SOURCE_JOB, financialSourceHandler],
-  [FINANCIAL_PAYOUT_JOB, financialPayoutHandler],
-  [FINANCIAL_SCAN_JOB, financialScanHandler],
-  [FINANCIAL_CLASSIFICATION_JOB, financialClassificationHandler],
-  [FINANCIAL_ADMIN_COMMAND_JOB, financialAdminCommandHandler],
-  [
-    INGEST_REVISION_JOB,
-    createRevisionIngestionHandler(
-      databaseClient.db,
-      storage,
-      ingestionLimitsFromConfig(config.ingestion)
-    )
-  ]
-]);
-const repository = createPostgresJobRepository(
-  databaseClient.db,
-  config.jobs,
-  undefined,
-  stripeRuntime.mode === 'disabled' ? 'local-only' : 'all'
-);
-const ensureFinancialSchedule = createFinancialScheduleEnsurer({
-  database: databaseClient.db,
-  runtimeMode: stripeRuntime.mode,
-  classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
-  allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
-});
-let nextClaimIssuancePurgeAt = 0;
-
-async function prepareWorkerPoll(
-  context: Parameters<typeof ensureFinancialSchedule>[0]
-): Promise<void> {
-  await prepareTestWorkerPoll({
-    control: testWorkerControl,
-    signal: context.signal,
-    maintenance: async () => {
-      const observedAt = context.now.getTime();
-      if (observedAt >= nextClaimIssuancePurgeAt) {
-        await purgeCommerceClaimIssuances(databaseClient.db);
-        nextClaimIssuancePurgeAt = observedAt + 60_000;
-      }
-      await ensureFinancialSchedule(context);
-    }
-  });
-}
-
-function requestShutdown(): void {
-  controller.abort();
-}
-
-process.once('SIGINT', requestShutdown);
-process.once('SIGTERM', requestShutdown);
-
-try {
-  await probeDatabase(databaseClient.pool, config.database.readinessTimeoutMs);
-  await probeStorage(storage, 'writer');
-  await writeFile(config.worker.heartbeatFile, workerId, { encoding: 'utf8' });
-  console.info('[worker] ready', { workerId });
-  await runWorker({
-    repository,
-    handlers,
+  createAssembly: async ({
+    config,
     workerId,
-    concurrency: config.worker.concurrency,
-    pollIntervalMs: config.jobs.pollIntervalMs,
-    leaseRenewalIntervalMs: Math.max(1, Math.floor(config.jobs.leaseMs / 3)),
-    beforePoll: prepareWorkerPoll,
-    signal: controller.signal
-  });
-  testWorkerControl.throwIfFailed();
-} catch (error: unknown) {
-  console.error('[worker] stopped unexpectedly', {
-    name: error instanceof Error ? error.name : 'UnknownError'
-  });
-  process.exitCode = 1;
-} finally {
-  emailTransport.close();
-  await rm(config.worker.heartbeatFile, { force: true });
-  await databaseClient.close();
-}
+    heartbeat,
+    logger,
+    requestAbort,
+    reportRunnerFailure,
+    cleanup
+  }) => {
+    const testWorkerControl = createTestWorkerControl({
+      environment: rawWorkerEnvironment,
+      concurrency: config.worker.concurrency,
+      abortWorker: requestAbort
+    });
+    const databaseClient = createDatabaseClient(config.database);
+    cleanup.register('database', () => databaseClient.close());
+    const emailTransport = createNodemailerEmailTransport(config.smtp);
+    cleanup.register('email', () => emailTransport.close());
+    const storage = createObjectStorage(config.storage);
+    const commerceMessages = createCommerceMessageEnqueuer(config.origin);
+    const workerAuth = createAuthServer({
+      database: databaseClient.db,
+      config,
+      queueVerificationEmail: (input) => queueAuthEmail(databaseClient.db, input),
+      queueResetEmail: (input) => queueAuthEmail(databaseClient.db, input),
+      queueMagicEmail: (input) => queueAuthEmail(databaseClient.db, input),
+      queueCommerceClaimEmail: (input) =>
+        queueCommerceClaimEmail(databaseClient.db, commerceMessages, input),
+      canSendMagicLink: (email) => canSendMagicLink(databaseClient.db, email),
+      canSendCommerceMagicLink: (email) =>
+        canSendCommerceMagicLink(databaseClient.db, email),
+      onUserCreated: (userId) => ensureCustomerRole(databaseClient.db, userId),
+      registerCommerceClaimIssuance: (input) =>
+        registerCommerceClaimIssuance(databaseClient.db, input)
+    });
+    const stripeRuntime = createStripeWorkerRuntime(config);
+    const topicHandlers = new Map<string, OutboxTopicHandler>([
+      [
+        AUTH_EMAIL_TOPIC,
+        createAuthEmailHandler(
+          emailTransport,
+          config.smtp.from,
+          new URL(config.origin).hostname
+        )
+      ],
+      [
+        COMMERCE_EMAIL_TOPIC,
+        createCommerceEmailHandler(
+          emailTransport,
+          config.smtp.from,
+          new URL(config.origin).hostname,
+          config.origin
+        )
+      ]
+    ]);
+    const stripeEventHandler: JobHandler = createStripeEventHandler(
+      databaseClient.db,
+      stripeRuntime.gateway,
+      {
+        loadStripeEvent: defaultLoadStripeEvent,
+        fulfillCheckout: (database, input) => fulfillCheckoutEvent(database, input, {
+          purchaseMessages: commerceMessages
+        }),
+        fulfillRefund: (database, input) => fulfillRefundEvent(database, input, {
+          messages: commerceMessages
+        }),
+        fulfillDispute: (database, input) => fulfillDisputeEvent(database, input, {
+          messages: commerceMessages
+        }),
+        fulfillPayout: fulfillPayoutEvent,
+        recordException: (database, input) => recordFulfillmentException(database, input)
+      }
+    );
+    const financialSourceHandler = createFinancialSourceHandler({
+      database: databaseClient.db,
+      gateway: stripeRuntime.gateway
+    });
+    const financialPayoutHandler = createFinancialPayoutHandler({
+      database: databaseClient.db,
+      gateway: stripeRuntime.gateway
+    });
+    const financialScanHandler = createFinancialScanHandler({
+      database: databaseClient.db,
+      gateway: stripeRuntime.gateway,
+      runtimeMode: stripeRuntime.mode
+    });
+    const financialClassificationHandler = createFinancialClassificationHandler({
+      database: databaseClient.db,
+      targetClassifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      targetAllocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
+    });
+    const financialAdminCommandExecutors =
+      testWorkerControl.decorateFinancialAdminExecutors(
+        createFinancialAdminCommandExecutors({
+          refundDraftSave: executeRefundDraftSave as FinancialAdminCommandExecutor,
+          refundDraftDiscard: executeRefundDraftDiscard as FinancialAdminCommandExecutor,
+          refundAllocationFinalize:
+            executeRefundAllocationFinalize as FinancialAdminCommandExecutor,
+          refundReportingCorrectionCreate:
+            executeReportingCorrectionCreate as FinancialAdminCommandExecutor,
+          administrativeRecoveryActivate:
+            executeAdministrativeRecoveryActivate as FinancialAdminCommandExecutor,
+          administrativeRecoveryDeactivate:
+            executeAdministrativeRecoveryDeactivate as FinancialAdminCommandExecutor
+        })
+      );
+    const financialAdminCommandHandler = createFinancialAdminCommandHandler({
+      database: databaseClient.db,
+      executors: financialAdminCommandExecutors,
+      accessMessages: commerceMessages
+    });
+    const handlers = new Map<string, JobHandler>([
+      [OUTBOX_DISPATCH_JOB, createOutboxDispatchHandler(databaseClient.db, topicHandlers)],
+      [
+        COMMERCE_CLAIM_EMAIL_JOB,
+        createClaimEmailHandler(createClaimEmailOperations(
+          databaseClient.db,
+          workerAuth,
+          commerceMessages,
+          config.origin
+        ))
+      ],
+      [
+        COMMERCE_CLAIM_REQUEST_JOB,
+        createClaimEmailHandler(createClaimEmailOperations(
+          databaseClient.db,
+          workerAuth,
+          commerceMessages,
+          config.origin
+        ), { allowExistingReceipt: true })
+      ],
+      [STRIPE_EVENT_JOB, stripeEventHandler],
+      [FINANCIAL_SOURCE_JOB, financialSourceHandler],
+      [FINANCIAL_PAYOUT_JOB, financialPayoutHandler],
+      [FINANCIAL_SCAN_JOB, financialScanHandler],
+      [FINANCIAL_CLASSIFICATION_JOB, financialClassificationHandler],
+      [FINANCIAL_ADMIN_COMMAND_JOB, financialAdminCommandHandler],
+      [
+        INGEST_REVISION_JOB,
+        createRevisionIngestionHandler(
+          databaseClient.db,
+          storage,
+          ingestionLimitsFromConfig(config.ingestion)
+        )
+      ]
+    ]);
+    const repository = createPostgresJobRepository(
+      databaseClient.db,
+      config.jobs,
+      undefined,
+      stripeRuntime.mode === 'disabled' ? 'local-only' : 'all'
+    );
+    const ensureFinancialSchedule = createFinancialScheduleEnsurer({
+      database: databaseClient.db,
+      runtimeMode: stripeRuntime.mode,
+      classifierVersion: FINANCIAL_CLASSIFIER_VERSION,
+      allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
+    });
+    let nextClaimIssuancePurgeAt = 0;
+
+    async function prepareWorkerPoll(
+      context: Parameters<typeof ensureFinancialSchedule>[0]
+    ): Promise<void> {
+      await prepareTestWorkerPoll({
+        control: testWorkerControl,
+        signal: context.signal,
+        maintenance: async () => {
+          const observedAt = context.now.getTime();
+          if (observedAt >= nextClaimIssuancePurgeAt) {
+            await purgeCommerceClaimIssuances(databaseClient.db);
+            nextClaimIssuancePurgeAt = observedAt + 60_000;
+          }
+          await ensureFinancialSchedule(context);
+        }
+      });
+    }
+
+    const observer = createRunnerObserver({
+      logger,
+      reportSlotProgress: heartbeat.reportSlotProgress
+    });
+    const leaseRenewalIntervalMs = Math.max(
+      1,
+      Math.min(
+        Math.floor(config.jobs.leaseMs / 3),
+        Math.floor(config.worker.heartbeatMaxAgeMs / 2)
+      )
+    );
+
+    return {
+      async probeDependencies() {
+        await probeDatabase(databaseClient.pool, config.database.readinessTimeoutMs);
+        await probeStorage(storage, 'writer');
+      },
+      run: (signal) => runWorker({
+        repository,
+        handlers,
+        workerId,
+        concurrency: config.worker.concurrency,
+        pollIntervalMs: config.jobs.pollIntervalMs,
+        leaseRenewalIntervalMs,
+        beforePoll: prepareWorkerPoll,
+        signal,
+        observer,
+        onFirstFailure: reportRunnerFailure
+      }),
+      assertControlHealthy: () => testWorkerControl.throwIfFailed()
+    };
+  }
+});

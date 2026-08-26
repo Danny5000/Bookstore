@@ -13,6 +13,13 @@ import type {
 	WorkerSlotState
 } from './heartbeat-contract';
 
+export class WorkerHeartbeatPublicationError extends Error {
+	constructor(cause: unknown) {
+		super('Worker heartbeat publication failed', { cause });
+		this.name = 'WorkerHeartbeatPublicationError';
+	}
+}
+
 export interface WorkerHeartbeatSupervisor {
 	readonly firstHealthyPublication: Promise<void>;
 	prepare(): Promise<void>;
@@ -376,11 +383,12 @@ export function createWorkerHeartbeatSupervisor(options: {
 				await publish();
 			}
 		} catch (error) {
+			const failure = new WorkerHeartbeatPublicationError(error);
 			if (!firstPublicationSettled) {
 				firstPublicationSettled = true;
-				firstPublication.reject(error);
+				firstPublication.reject(failure);
 			}
-			throw error;
+			throw failure;
 		} finally {
 			runSettled = true;
 		}
@@ -410,9 +418,14 @@ export function createWorkerHeartbeatSupervisor(options: {
 		if (runStarted || sealed) throw new TypeError(INVALID_LIFECYCLE);
 		if (prepared) return;
 		if (preparation === undefined) {
-			const attempt = removeOwnedPaths().then(() => {
-				prepared = true;
-			});
+			const attempt = removeOwnedPaths().then(
+				() => {
+					prepared = true;
+				},
+				(error: unknown) => {
+					throw new WorkerHeartbeatPublicationError(error);
+				}
+			);
 			preparation = attempt;
 			void attempt.catch(() => {
 				if (preparation === attempt) preparation = undefined;

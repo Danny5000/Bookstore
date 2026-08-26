@@ -4,6 +4,7 @@ import * as ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
 const source = (path: string) => readFileSync(resolve(path), 'utf8');
+const normalizedSource = (contents: string) => contents.replace(/\s+/gu, ' ').trim();
 
 function runtimeSourceFiles(root: string): readonly string[] {
   const files: string[] = [];
@@ -327,11 +328,27 @@ describe('storage process isolation deployment', () => {
     );
     expect(workerSource.match(/\bcreateTestWorkerControl\s*\(/gu)).toHaveLength(1);
     expect(workerSource).toContain('const rawWorkerEnvironment = process.env;');
-    expect(workerSource).toContain(
-      "databaseEnvironmentForRole(rawWorkerEnvironment, 'worker')"
+    expect(workerSource).toMatch(
+      /runWorkerProcess\(\{\s*environment:\s*rawWorkerEnvironment,/u
     );
     expect(workerSource).toMatch(
-      /createTestWorkerControl\(\{\s*environment:\s*rawWorkerEnvironment,\s*concurrency:\s*config\.worker\.concurrency,\s*abortWorker:/u
+      /loadConfig:\s*\(environment\)\s*=>\s*loadWorkerApplicationConfig\(\s*databaseEnvironmentForRole\(environment,\s*['"]worker['"]\)\s*\)/u
+    );
+    expect(workerSource).toMatch(
+      /createTestWorkerControl\(\{\s*environment:\s*rawWorkerEnvironment,\s*concurrency:\s*config\.worker\.concurrency,\s*abortWorker:\s*requestAbort/u
+    );
+
+    const heartbeatFactoryStart = workerSource.indexOf('createHeartbeat:');
+    const assemblyFactoryStart = workerSource.indexOf('createAssembly:');
+    expect(heartbeatFactoryStart).toBeGreaterThan(-1);
+    expect(assemblyFactoryStart).toBeGreaterThan(heartbeatFactoryStart);
+    expect(normalizedSource(
+      workerSource.slice(heartbeatFactoryStart, assemblyFactoryStart)
+    )).toBe(
+      'createHeartbeat: ({ config, workerId, processStartedAt }) => ' +
+      'createWorkerHeartbeatSupervisor({ workerId, configuredSlots: ' +
+      'config.worker.concurrency, heartbeatFile: config.worker.heartbeatFile, ' +
+      'intervalMs: config.worker.heartbeatIntervalMs, processStartedAt }),'
     );
 
     const productionRuntimeSources = runtimeSourceFiles('src');
@@ -386,9 +403,64 @@ describe('storage process isolation deployment', () => {
     expect(executorDecoration).toBeGreaterThan(controllerCreation);
     expect(handlerCreation).toBeGreaterThan(executorDecoration);
 
+    const databaseCreation = workerSource.indexOf('createDatabaseClient(config.database)');
+    const databaseRegistration = workerSource.indexOf("cleanup.register('database'");
+    const emailCreation = workerSource.indexOf('createNodemailerEmailTransport(config.smtp)');
+    const emailRegistration = workerSource.indexOf("cleanup.register('email'");
+    const storageCreation = workerSource.indexOf('createObjectStorage(config.storage)');
+    expect(databaseCreation).toBeGreaterThan(controllerCreation);
+    expect(databaseRegistration).toBeGreaterThan(databaseCreation);
+    expect(databaseRegistration).toBeLessThan(emailCreation);
+    expect(emailRegistration).toBeGreaterThan(emailCreation);
+    expect(emailRegistration).toBeLessThan(storageCreation);
+
+    const topicMapStart = workerSource.indexOf('const topicHandlers =');
+    const stripeHandlerStart = workerSource.indexOf('const stripeEventHandler');
+    expect(topicMapStart).toBeGreaterThan(storageCreation);
+    expect(stripeHandlerStart).toBeGreaterThan(topicMapStart);
+    expect(normalizedSource(workerSource.slice(topicMapStart, stripeHandlerStart))).toBe(
+      'const topicHandlers = new Map<string, OutboxTopicHandler>([ ' +
+      '[ AUTH_EMAIL_TOPIC, createAuthEmailHandler( emailTransport, config.smtp.from, ' +
+      'new URL(config.origin).hostname ) ], [ COMMERCE_EMAIL_TOPIC, ' +
+      'createCommerceEmailHandler( emailTransport, config.smtp.from, ' +
+      'new URL(config.origin).hostname, config.origin ) ] ]);'
+    );
+
+    const handlerMapStart = workerSource.indexOf('const handlers =');
+    const repositoryStart = workerSource.indexOf('const repository =', handlerMapStart);
+    expect(handlerMapStart).toBeGreaterThan(handlerCreation);
+    expect(repositoryStart).toBeGreaterThan(handlerMapStart);
+    expect(normalizedSource(workerSource.slice(handlerMapStart, repositoryStart))).toBe(
+      'const handlers = new Map<string, JobHandler>([ ' +
+      '[OUTBOX_DISPATCH_JOB, createOutboxDispatchHandler(databaseClient.db, topicHandlers)], ' +
+      '[ COMMERCE_CLAIM_EMAIL_JOB, createClaimEmailHandler(createClaimEmailOperations( ' +
+      'databaseClient.db, workerAuth, commerceMessages, config.origin )) ], ' +
+      '[ COMMERCE_CLAIM_REQUEST_JOB, createClaimEmailHandler(createClaimEmailOperations( ' +
+      'databaseClient.db, workerAuth, commerceMessages, config.origin ), ' +
+      '{ allowExistingReceipt: true }) ], [STRIPE_EVENT_JOB, stripeEventHandler], ' +
+      '[FINANCIAL_SOURCE_JOB, financialSourceHandler], ' +
+      '[FINANCIAL_PAYOUT_JOB, financialPayoutHandler], ' +
+      '[FINANCIAL_SCAN_JOB, financialScanHandler], ' +
+      '[FINANCIAL_CLASSIFICATION_JOB, financialClassificationHandler], ' +
+      '[FINANCIAL_ADMIN_COMMAND_JOB, financialAdminCommandHandler], ' +
+      '[ INGEST_REVISION_JOB, createRevisionIngestionHandler( databaseClient.db, storage, ' +
+      'ingestionLimitsFromConfig(config.ingestion) ) ] ]);'
+    );
+
+    const scheduleStart = workerSource.indexOf(
+      'const ensureFinancialSchedule =',
+      repositoryStart
+    );
+    expect(scheduleStart).toBeGreaterThan(repositoryStart);
+    expect(normalizedSource(workerSource.slice(repositoryStart, scheduleStart))).toBe(
+      "const repository = createPostgresJobRepository( databaseClient.db, config.jobs, " +
+      "undefined, stripeRuntime.mode === 'disabled' ? 'local-only' : 'all' );"
+    );
+
     const pollStart = workerSource.indexOf('async function prepareWorkerPoll(');
-    const shutdownStart = workerSource.indexOf('function requestShutdown()');
-    const pollSource = workerSource.slice(pollStart, shutdownStart);
+    const observerStart = workerSource.indexOf('const observer = createRunnerObserver({');
+    const pollSource = workerSource.slice(pollStart, observerStart);
+    expect(observerStart).toBeGreaterThan(pollStart);
     expect(pollSource).toContain('await prepareTestWorkerPoll({');
     expect(pollSource).toContain('control: testWorkerControl');
     expect(pollSource).toContain('signal: context.signal');
@@ -396,15 +468,42 @@ describe('storage process isolation deployment', () => {
     expect(pollSource).toContain('purgeCommerceClaimIssuances(databaseClient.db)');
     expect(pollSource).toContain('await ensureFinancialSchedule(context);');
 
-    const runWorkerCall = workerSource.indexOf('await runWorker({');
-    const throwIfFailed = workerSource.indexOf(
-      'testWorkerControl.throwIfFailed();',
-      runWorkerCall
+    expect(workerSource.match(/\bcreateRunnerObserver\s*\(/gu)).toHaveLength(1);
+    expect(workerSource).toMatch(
+      /createRunnerObserver\(\{\s*logger,\s*reportSlotProgress:\s*heartbeat\.reportSlotProgress\s*\}\)/u
     );
-    const catchStart = workerSource.indexOf('} catch (error: unknown)', runWorkerCall);
-    expect(runWorkerCall).toBeGreaterThan(-1);
-    expect(throwIfFailed).toBeGreaterThan(runWorkerCall);
-    expect(throwIfFailed).toBeLessThan(catchStart);
+    expect(workerSource).not.toContain('parseJobDiagnosticMetadata');
+
+    const probeStart = workerSource.indexOf('async probeDependencies()');
+    const runWorkerCall = workerSource.indexOf('run: (signal) => runWorker({', probeStart);
+    const controlAssertion = workerSource.indexOf('assertControlHealthy:', runWorkerCall);
+    expect(probeStart).toBeGreaterThan(observerStart);
+    expect(runWorkerCall).toBeGreaterThan(probeStart);
+    expect(controlAssertion).toBeGreaterThan(runWorkerCall);
+    expect(normalizedSource(workerSource.slice(probeStart, runWorkerCall))).toBe(
+      "async probeDependencies() { await probeDatabase(databaseClient.pool, " +
+      "config.database.readinessTimeoutMs); await probeStorage(storage, 'writer'); },"
+    );
+    expect(normalizedSource(workerSource.slice(runWorkerCall, controlAssertion))).toBe(
+      'run: (signal) => runWorker({ repository, handlers, workerId, concurrency: ' +
+      'config.worker.concurrency, pollIntervalMs: config.jobs.pollIntervalMs, ' +
+      'leaseRenewalIntervalMs, beforePoll: prepareWorkerPoll, signal, observer, ' +
+      'onFirstFailure: reportRunnerFailure }),'
+    );
+    expect(workerSource).toContain(
+      'assertControlHealthy: () => testWorkerControl.throwIfFailed()'
+    );
+    expect(workerSource).toMatch(
+      /const leaseRenewalIntervalMs = Math\.max\(\s*1,\s*Math\.min\(\s*Math\.floor\(config\.jobs\.leaseMs \/ 3\),\s*Math\.floor\(config\.worker\.heartbeatMaxAgeMs \/ 2\)\s*\)\s*\);/u
+    );
+    const runnerSource = source('src/lib/server/jobs/runner.ts');
+    const processRuntimeSource = source('src/lib/server/worker/process-runtime.ts');
+    expect(runnerSource).toContain('readonly onFirstFailure?: () => void;');
+    expect(processRuntimeSource).toContain('readonly reportRunnerFailure: () => void;');
+    expect(workerSource).not.toMatch(/onFirstFailure:\s*\([^)]/u);
+    expect(runnerSource).toMatch(
+      /const leaseOwner = options\.concurrency === 1\s*\? options\.workerId\s*:\s*`\$\{options\.workerId\}:\$\{slotId\}`/u
+    );
   }, 30_000);
 
   it('launches the controller-capable worker only with the owned isolated test environment', () => {

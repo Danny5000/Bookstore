@@ -143,6 +143,44 @@ describe('observability ownership and privacy boundaries', () => {
     );
   });
 
+  it('centralizes structured worker lifecycle, fatal policy, and freshness cleanup in the process runtime', () => {
+    const worker = source('src/worker.ts');
+    const runtime = source('src/lib/server/worker/process-runtime.ts');
+    const runner = source('src/lib/server/jobs/runner.ts');
+
+    expect(worker).toContain('runWorkerProcess({');
+    expect(worker).toContain('createWorkerHeartbeatSupervisor({');
+    expect(worker).toContain('createRunnerObserver({');
+    expect(worker).not.toMatch(/\b(?:writeFile|rm)\s*\(/u);
+    expect(worker).not.toMatch(/\bconsole\.(?:debug|error|info|log|warn)\s*\(/u);
+    expect(runner.match(/\bconsole\.(?:debug|error|info|log|warn)\s*\([^\n]*/gu))
+      .toEqual(["console.error('[jobs] worker poll hook failed');"]);
+
+    expect(runtime.indexOf('createStructuredLogger({')).toBeLessThan(
+      runtime.indexOf('options.loadConfig(options.environment)')
+    );
+    expect(runtime.indexOf('await heartbeat.prepare()')).toBeLessThan(
+      runtime.indexOf('options.createAssembly(')
+    );
+    expect(runtime.indexOf('options.createAssembly(')).toBeLessThan(
+      runtime.indexOf('assembly!.probeDependencies()')
+    );
+    expect(runtime).toMatch(
+      /firstHealthyPublication[\s\S]*event:\s*['"]worker\.ready['"]/u
+    );
+    expect(runtime.indexOf('heartbeat.sealProgress()')).toBeLessThan(
+      runtime.indexOf('heartbeat.removeEvidence()')
+    );
+    expect(runtime).toContain('const FATAL_SHUTDOWN_DEADLINE_MS = 10_000;');
+    expect(runtime).toContain(
+      'createShutdownDeadline(FATAL_SHUTDOWN_DEADLINE_MS)'
+    );
+    expect(runtime).toContain('forceExit(1)');
+    expect(runtime).toContain('process.once(signal, listener)');
+    expect(runtime).toContain('process.off(signal, listener)');
+    expect(runtime).toContain('process.exit(1)');
+  });
+
   it('keeps diagnostic context out of authorization locals', () => {
     const appTypes = source('src/app.d.ts');
     const locals = between(appTypes, 'interface Locals {', '}\n  }');

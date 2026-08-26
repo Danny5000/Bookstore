@@ -4,6 +4,7 @@ import type { WorkerSlotProgressEvent } from '../jobs/runner-observer';
 import { parseWorkerHeartbeat } from './heartbeat-contract';
 import {
 	createWorkerHeartbeatSupervisor,
+	WorkerHeartbeatPublicationError,
 	type WorkerHeartbeatFileHandle,
 	type WorkerHeartbeatFilesystem
 } from './heartbeat-supervisor';
@@ -186,6 +187,27 @@ function createHarness(configuredSlots = 1) {
 
 async function flushMicrotasks(): Promise<void> {
 	for (let index = 0; index < 8; index += 1) await Promise.resolve();
+}
+
+async function capturePublicationFailure(
+	promise: Promise<unknown>
+): Promise<WorkerHeartbeatPublicationError> {
+	try {
+		await promise;
+		throw new Error('expected a worker heartbeat publication failure');
+	} catch (error: unknown) {
+		expect(error).toBeInstanceOf(WorkerHeartbeatPublicationError);
+		return error as WorkerHeartbeatPublicationError;
+	}
+}
+
+function expectFixedPublicationFailure(
+	failure: WorkerHeartbeatPublicationError,
+	cause: unknown
+): void {
+	expect(failure.message).toBe('Worker heartbeat publication failed');
+	expect(failure.message).not.toContain(String(cause));
+	expect(failure.cause).toBe(cause);
 }
 
 describe('worker heartbeat supervisor state and readiness', () => {
@@ -593,7 +615,10 @@ describe('worker heartbeat supervisor atomic filesystem and lifecycle', () => {
 		harness.filesystem.rmFailures.set('heartbeat.json', [targetFailure]);
 		harness.filesystem.rmFailures.set('heartbeat.json.tmp', [tempFailure]);
 
-		await expect(harness.supervisor.prepare()).rejects.toBe(targetFailure);
+		const preparationFailure = await capturePublicationFailure(
+			harness.supervisor.prepare()
+		);
+		expectFixedPublicationFailure(preparationFailure, targetFailure);
 		expect(harness.filesystem.operations).toEqual([
 			'rm:heartbeat.json:true',
 			'rm:heartbeat.json.tmp:true'
@@ -768,17 +793,22 @@ describe('worker heartbeat supervisor atomic filesystem and lifecycle', () => {
 			harness.filesystem.failures.set(failurePoint, failure);
 			const controller = new AbortController();
 			const run = harness.supervisor.run(controller.signal);
-			const runFailure = expect(run).rejects.toBe(failure);
-			const readinessFailure = expect(
+			const runFailure = capturePublicationFailure(run);
+			const readinessFailure = capturePublicationFailure(
 				harness.supervisor.firstHealthyPublication
-			).rejects.toBe(failure);
+			);
 
 			harness.supervisor.reportSlotProgress({
 				type: 'poll_succeeded',
 				slotId: 0,
 				claimed: false
 			});
-			await Promise.all([runFailure, readinessFailure]);
+			const [observedRunFailure, observedReadinessFailure] = await Promise.all([
+				runFailure,
+				readinessFailure
+			]);
+			expect(observedRunFailure).toBe(observedReadinessFailure);
+			expectFixedPublicationFailure(observedRunFailure, failure);
 
 			expect(harness.filesystem.operations.slice(2)).toEqual(
 				failureOperations[failurePoint]
@@ -810,7 +840,8 @@ describe('worker heartbeat supervisor atomic filesystem and lifecycle', () => {
 			harness.filesystem.failures.set(failurePoint, failure);
 			await harness.sleeper.waitForCall(1);
 			harness.sleeper.release(0);
-			await expect(run).rejects.toBe(failure);
+			const observedFailure = await capturePublicationFailure(run);
+			expectFixedPublicationFailure(observedFailure, failure);
 
 			expect(harness.filesystem.files.get('heartbeat.json')).toBe(priorTarget);
 			expect(harness.filesystem.files.has('heartbeat.json.tmp')).toBe(false);
@@ -827,8 +858,8 @@ describe('worker heartbeat supervisor atomic filesystem and lifecycle', () => {
 		harness.filesystem.failures.set('rm', new Error('cleanup-secondary'));
 		const controller = new AbortController();
 		const run = harness.supervisor.run(controller.signal);
-		const readiness = expect(harness.supervisor.firstHealthyPublication).rejects.toBe(
-			writeFailure
+		const readiness = capturePublicationFailure(
+			harness.supervisor.firstHealthyPublication
 		);
 		harness.supervisor.reportSlotProgress({
 			type: 'poll_succeeded',
@@ -836,7 +867,12 @@ describe('worker heartbeat supervisor atomic filesystem and lifecycle', () => {
 			claimed: false
 		});
 
-		await Promise.all([expect(run).rejects.toBe(writeFailure), readiness]);
+		const [runFailure, readinessFailure] = await Promise.all([
+			capturePublicationFailure(run),
+			readiness
+		]);
+		expect(runFailure).toBe(readinessFailure);
+		expectFixedPublicationFailure(runFailure, writeFailure);
 		expect(harness.filesystem.openHandles).toBe(0);
 		expect(harness.filesystem.operations.slice(-2)).toEqual([
 			'close:heartbeat.json.tmp',
@@ -854,8 +890,8 @@ describe('worker heartbeat supervisor atomic filesystem and lifecycle', () => {
 			harness.filesystem.failures.set('rm', new Error('cleanup-secondary'));
 			const controller = new AbortController();
 			const run = harness.supervisor.run(controller.signal);
-			const readiness = expect(harness.supervisor.firstHealthyPublication).rejects.toBe(
-				primary
+			const readiness = capturePublicationFailure(
+				harness.supervisor.firstHealthyPublication
 			);
 			harness.supervisor.reportSlotProgress({
 				type: 'poll_succeeded',
@@ -863,7 +899,12 @@ describe('worker heartbeat supervisor atomic filesystem and lifecycle', () => {
 				claimed: false
 			});
 
-			await Promise.all([expect(run).rejects.toBe(primary), readiness]);
+			const [runFailure, readinessFailure] = await Promise.all([
+				capturePublicationFailure(run),
+				readiness
+			]);
+			expect(runFailure).toBe(readinessFailure);
+			expectFixedPublicationFailure(runFailure, primary);
 		}
 	);
 
@@ -981,11 +1022,11 @@ describe('worker heartbeat supervisor atomic filesystem and lifecycle', () => {
 			harness.setNow(invalidNow);
 			await harness.supervisor.prepare();
 			const run = harness.supervisor.run(new AbortController().signal);
-			const readiness = expect(
+			const readiness = capturePublicationFailure(
 				harness.supervisor.firstHealthyPublication
-			).rejects.toThrow();
+			);
 
-			await Promise.all([expect(run).rejects.toThrow(), readiness]);
+			await Promise.all([capturePublicationFailure(run), readiness]);
 			expect(harness.filesystem.operations).toEqual([
 				'rm:heartbeat.json:true',
 				'rm:heartbeat.json.tmp:true'
@@ -1023,7 +1064,8 @@ describe('worker heartbeat supervisor atomic filesystem and lifecycle', () => {
 		});
 		await supervisor.firstHealthyPublication;
 
-		await expect(run).rejects.toBe(sleepFailure);
+		const observedFailure = await capturePublicationFailure(run);
+		expectFixedPublicationFailure(observedFailure, sleepFailure);
 		await expect(supervisor.firstHealthyPublication).resolves.toBeUndefined();
 	});
 });

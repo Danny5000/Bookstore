@@ -76,6 +76,7 @@ export interface RunWorkerOptions {
   readonly sleep?: WorkerSleep;
   readonly leaseRenewalSleep?: WorkerSleep;
   readonly observer?: RunnerObserver;
+  readonly onFirstFailure?: () => void;
   readonly parseJobDiagnosticMetadata?: JobDiagnosticMetadataParser;
   readonly correlationIdSource?: () => string;
   readonly monotonicNow?: () => number;
@@ -100,6 +101,7 @@ interface WorkerLoopOptions extends WorkerJobOptions {
   readonly pollIntervalMs: number;
   readonly sleep?: WorkerSleep;
   readonly runBeforePoll?: () => Promise<void>;
+  readonly reportFailure: (error: unknown) => void;
 }
 
 async function abortableSleep(milliseconds: number, signal: AbortSignal): Promise<void> {
@@ -524,23 +526,29 @@ async function runClaimedJob(
 async function runWorkerLoop(options: WorkerLoopOptions): Promise<void> {
   const sleep = options.sleep ?? abortableSleep;
 
-  while (!options.signal.aborted) {
-    options.observer({ type: 'polling', slotId: options.slotId });
-    await options.runBeforePoll?.();
-    if (options.signal.aborted) return;
-    const job = await options.repository.claimNext(options.leaseOwner);
-    const claimedAt = job === null ? undefined : options.monotonicNow();
-    options.observer({
-      type: 'poll_succeeded',
-      slotId: options.slotId,
-      claimed: job !== null
-    });
-    if (!job) {
-      await sleep(options.pollIntervalMs, options.signal);
-      continue;
-    }
+  try {
+    while (!options.signal.aborted) {
+      options.observer({ type: 'polling', slotId: options.slotId });
+      await options.runBeforePoll?.();
+      if (options.signal.aborted) return;
+      const job = await options.repository.claimNext(options.leaseOwner);
+      if (options.signal.aborted) return;
+      const claimedAt = job === null ? undefined : options.monotonicNow();
+      options.observer({
+        type: 'poll_succeeded',
+        slotId: options.slotId,
+        claimed: job !== null
+      });
+      if (!job) {
+        await sleep(options.pollIntervalMs, options.signal);
+        continue;
+      }
 
-    await runClaimedJob(options, job, claimedAt!);
+      await runClaimedJob(options, job, claimedAt!);
+    }
+  } catch (error: unknown) {
+    options.reportFailure(error);
+    throw error;
   }
 }
 
@@ -552,6 +560,10 @@ export async function runWorker(options: RunWorkerOptions): Promise<void> {
     options.leaseRenewalIntervalMs < 1) {
     throw new RangeError('Worker lease renewal interval must be a positive integer');
   }
+  const workerController = new AbortController();
+  const forwardShutdown = () => workerController.abort(options.signal.reason);
+  if (options.signal.aborted) forwardShutdown();
+  else options.signal.addEventListener('abort', forwardShutdown, { once: true });
   let hookTail = Promise.resolve();
   const runBeforePoll = options.beforePoll
     ? async () => {
@@ -560,11 +572,16 @@ export async function runWorker(options: RunWorkerOptions): Promise<void> {
         hookTail = new Promise<void>((resolve) => { release = resolve; });
         await previous;
         try {
-          if (!options.signal.aborted) {
-            await options.beforePoll!({ now: new Date(), signal: options.signal });
+          if (!workerController.signal.aborted) {
+            await options.beforePoll!({
+              now: new Date(),
+              signal: workerController.signal
+            });
           }
         } catch {
-          if (!options.signal.aborted) console.error('[jobs] worker poll hook failed');
+          if (!workerController.signal.aborted) {
+            console.error('[jobs] worker poll hook failed');
+          }
         } finally {
           release();
         }
@@ -572,35 +589,54 @@ export async function runWorker(options: RunWorkerOptions): Promise<void> {
     : undefined;
   const observer = options.observer ?? NOOP_OBSERVER;
   const monotonicNow = options.monotonicNow ?? (() => performance.now());
+  let failed = false;
+  let primaryFailure: unknown;
+  const reportFailure = (error: unknown): void => {
+    if (failed) return;
+    failed = true;
+    primaryFailure = error;
+    try {
+      options.onFirstFailure?.();
+    } catch {
+      // Notification cannot replace the authoritative slot failure.
+    }
+    workerController.abort();
+  };
 
-  await Promise.all(
-    Array.from({ length: options.concurrency }, (_, slotId) => {
-      const leaseOwner = options.concurrency === 1
-        ? options.workerId
-        : `${options.workerId}:${slotId}`;
-      return runWorkerLoop({
-        repository: options.repository,
-        handlers: options.handlers,
-        workerId: options.workerId,
-        leaseOwner,
-        slotId,
-        pollIntervalMs: options.pollIntervalMs,
-        leaseRenewalIntervalMs: options.leaseRenewalIntervalMs,
-        signal: options.signal,
-        observer,
-        monotonicNow,
-        ...(runBeforePoll ? { runBeforePoll } : {}),
-        ...(options.sleep ? { sleep: options.sleep } : {}),
-        ...(options.leaseRenewalSleep
-          ? { leaseRenewalSleep: options.leaseRenewalSleep }
-          : {}),
-        ...(options.parseJobDiagnosticMetadata
-          ? { parseJobDiagnosticMetadata: options.parseJobDiagnosticMetadata }
-          : {}),
-        ...(options.correlationIdSource
-          ? { correlationIdSource: options.correlationIdSource }
-          : {})
-      });
-    })
-  );
+  try {
+    await Promise.all(
+      Array.from({ length: options.concurrency }, (_, slotId) => {
+        const leaseOwner = options.concurrency === 1
+          ? options.workerId
+          : `${options.workerId}:${slotId}`;
+        return runWorkerLoop({
+          repository: options.repository,
+          handlers: options.handlers,
+          workerId: options.workerId,
+          leaseOwner,
+          slotId,
+          pollIntervalMs: options.pollIntervalMs,
+          leaseRenewalIntervalMs: options.leaseRenewalIntervalMs,
+          signal: workerController.signal,
+          observer,
+          monotonicNow,
+          reportFailure,
+          ...(runBeforePoll ? { runBeforePoll } : {}),
+          ...(options.sleep ? { sleep: options.sleep } : {}),
+          ...(options.leaseRenewalSleep
+            ? { leaseRenewalSleep: options.leaseRenewalSleep }
+            : {}),
+          ...(options.parseJobDiagnosticMetadata
+            ? { parseJobDiagnosticMetadata: options.parseJobDiagnosticMetadata }
+            : {}),
+          ...(options.correlationIdSource
+            ? { correlationIdSource: options.correlationIdSource }
+            : {})
+        }).catch(reportFailure);
+      })
+    );
+    if (failed) throw primaryFailure;
+  } finally {
+    options.signal.removeEventListener('abort', forwardShutdown);
+  }
 }

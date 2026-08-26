@@ -37,7 +37,10 @@ describe('process secret scope', () => {
     const workerEntrypoint = source('src/worker.ts');
     expect(workerEntrypoint).toContain('const rawWorkerEnvironment = process.env;');
     expect(workerEntrypoint).toMatch(
-      /loadWorkerApplicationConfig\(\s*databaseEnvironmentForRole\(rawWorkerEnvironment,\s*['"]worker['"]\)\s*\)/u
+      /runWorkerProcess\(\{\s*environment:\s*rawWorkerEnvironment,/u
+    );
+    expect(workerEntrypoint).toMatch(
+      /loadConfig:\s*\(environment\)\s*=>\s*loadWorkerApplicationConfig\(\s*databaseEnvironmentForRole\(environment,\s*['"]worker['"]\)\s*\)/u
     );
     const migrationEntrypoint = source('src/migrate.ts');
     expect(migrationEntrypoint).toContain(
@@ -85,6 +88,10 @@ describe('process secret scope', () => {
     expect(loader).not.toMatch(
       /DATABASE_(?:PASSWORD|OWNER)|SMTP_|STRIPE_|(?:BETTER_)?AUTH_|BOOTSTRAP_|STORAGE_(?:ACCESS|SECRET|CREDENTIAL)/iu
     );
+    expect(entrypoint).not.toMatch(
+      /DATABASE_(?:PASSWORD|OWNER)|SMTP_|STRIPE_|(?:BETTER_)?AUTH_|BOOTSTRAP_|STORAGE_(?:ACCESS|SECRET|CREDENTIAL)/iu
+    );
+    expect(loader).not.toMatch(/\.\.\.\s*source|Object\.(?:assign|entries)\(\s*source/u);
     expect(loadedSettings.some((name) => /(?:PASSWORD|SECRET|CREDENTIAL|OWNER)/u.test(name)))
       .toBe(false);
   });
@@ -182,15 +189,17 @@ describe('process secret scope', () => {
       );
     }
 
-    const diagnosticCalls = [
-      ...source('src/worker.ts').matchAll(
-        /console\.(?:log|info|warn|error)\s*\([\s\S]*?\);/gu
-      ),
-      ...source('src/lib/server/jobs/runner.ts').matchAll(
-        /console\.(?:log|info|warn|error)\s*\([\s\S]*?\);/gu
-      )
-    ].map((match) => match[0]);
-    expect(diagnosticCalls.length).toBeGreaterThan(0);
+    const workerDiagnostics = [...source('src/worker.ts').matchAll(
+      /console\.(?:log|info|warn|error)\s*\([\s\S]*?\);/gu
+    )].map((match) => match[0]);
+    const runnerDiagnostics = [...source('src/lib/server/jobs/runner.ts').matchAll(
+      /console\.(?:log|info|warn|error)\s*\([\s\S]*?\);/gu
+    )].map((match) => match[0]);
+    expect(workerDiagnostics).toEqual([]);
+    expect(runnerDiagnostics).toEqual([
+      "console.error('[jobs] worker poll hook failed');"
+    ]);
+    const diagnosticCalls = [...workerDiagnostics, ...runnerDiagnostics];
     for (const diagnostic of diagnosticCalls) {
       expect(diagnostic).not.toMatch(
         /financialAdminLeaseCapability|capabilityDigest|last_error|lastError|\.message|\.stack|workerReadyFile|process\.env/iu
