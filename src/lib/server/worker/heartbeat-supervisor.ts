@@ -3,6 +3,7 @@ import {
 	rename as renameFile,
 	rm as removeFile
 } from 'node:fs/promises';
+import { performance } from 'node:perf_hooks';
 
 import { isPositiveSignedInt32, isWorkerId } from '../observability/contracts';
 import type { WorkerSlotProgressEvent } from '../jobs/runner-observer';
@@ -52,6 +53,8 @@ const INVALID_SUPERVISOR = 'invalid worker heartbeat supervisor';
 const INVALID_PROGRESS = 'invalid worker slot progress';
 const INVALID_LIFECYCLE = 'invalid worker heartbeat lifecycle';
 const MAX_SEQUENCE = 2_147_483_647;
+const MAX_RENAME_RETRY_WINDOW_MS = 1_000;
+const RENAME_RETRY_WAIT_MS = 10;
 
 const defaultFilesystem: WorkerHeartbeatFilesystem = {
 	async open(path, flags, mode) {
@@ -75,6 +78,40 @@ function defaultSleep(milliseconds: number, signal: AbortSignal): Promise<void> 
 		}
 		signal.addEventListener('abort', finish, { once: true });
 	});
+}
+
+function defaultRetryWait(milliseconds: number, signal: AbortSignal): Promise<void> {
+	return new Promise((resolve) => {
+		if (signal.aborted) {
+			resolve();
+			return;
+		}
+		const timeout = setTimeout(finish, milliseconds);
+		function finish(): void {
+			clearTimeout(timeout);
+			signal.removeEventListener('abort', finish);
+			resolve();
+		}
+		signal.addEventListener('abort', finish, { once: true });
+	});
+}
+
+function defaultMonotonicNow(): number {
+	return performance.now();
+}
+
+function isTransientRenameContention(error: unknown): boolean {
+	if (error === null || typeof error !== 'object') return false;
+	let descriptor: PropertyDescriptor | undefined;
+	try {
+		descriptor = Object.getOwnPropertyDescriptor(error, 'code');
+	} catch {
+		return false;
+	}
+	if (descriptor === undefined || !Object.hasOwn(descriptor, 'value')) return false;
+	return descriptor.value === 'EPERM' ||
+		descriptor.value === 'EACCES' ||
+		descriptor.value === 'EBUSY';
 }
 
 function dateMilliseconds(value: unknown, message: string): number {
@@ -164,6 +201,8 @@ export function createWorkerHeartbeatSupervisor(options: {
 	readonly processStartedAt: Date;
 	readonly now?: () => Date;
 	readonly sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+	readonly monotonicNow?: () => number;
+	readonly retryWait?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
 	readonly filesystem?: WorkerHeartbeatFilesystem;
 }): WorkerHeartbeatSupervisor {
 	const workerId = options.workerId;
@@ -173,6 +212,8 @@ export function createWorkerHeartbeatSupervisor(options: {
 	const processStartedAtInput = options.processStartedAt;
 	const now = options.now ?? (() => new Date());
 	const sleep = options.sleep ?? defaultSleep;
+	const monotonicNow = options.monotonicNow ?? defaultMonotonicNow;
+	const retryWait = options.retryWait ?? defaultRetryWait;
 	const filesystem = options.filesystem ?? defaultFilesystem;
 	if (
 		!isWorkerId(workerId) ||
@@ -286,7 +327,60 @@ export function createWorkerHeartbeatSupervisor(options: {
 		});
 	}
 
-	async function publish(): Promise<void> {
+	function readMonotonicMilliseconds(previous?: number): number {
+		let milliseconds: number;
+		try {
+			milliseconds = monotonicNow();
+		} catch {
+			throw new TypeError(INVALID_LIFECYCLE);
+		}
+		if (
+			!Number.isFinite(milliseconds) ||
+			milliseconds < 0 ||
+			(previous !== undefined && milliseconds < previous)
+		) {
+			throw new TypeError(INVALID_LIFECYCLE);
+		}
+		return milliseconds;
+	}
+
+	async function renamePreparedPublication(signal: AbortSignal): Promise<boolean> {
+		let observedAt = readMonotonicMilliseconds();
+		const retryWindow = Math.min(intervalMs, MAX_RENAME_RETRY_WINDOW_MS);
+		const deadline = observedAt + retryWindow;
+		if (!Number.isFinite(deadline) || deadline < observedAt) {
+			throw new TypeError(INVALID_LIFECYCLE);
+		}
+		let retrying = false;
+
+		while (true) {
+			if (retrying && (signal.aborted || sealed)) return false;
+			try {
+				await filesystem.rename(temporaryFile, heartbeatFile);
+				if (retrying && (signal.aborted || sealed)) return false;
+				return true;
+			} catch (error) {
+				if (retrying && (signal.aborted || sealed)) return false;
+				if (!isTransientRenameContention(error)) throw error;
+				if (signal.aborted || sealed) return false;
+				observedAt = readMonotonicMilliseconds(observedAt);
+				const remaining = deadline - observedAt;
+				if (remaining <= 0) throw error;
+				try {
+					await retryWait(Math.min(RENAME_RETRY_WAIT_MS, remaining), signal);
+				} catch (waitError) {
+					if (signal.aborted || sealed) return false;
+					throw waitError;
+				}
+				if (signal.aborted || sealed) return false;
+				observedAt = readMonotonicMilliseconds(observedAt);
+				if (observedAt >= deadline) throw error;
+				retrying = true;
+			}
+		}
+	}
+
+	async function publish(signal: AbortSignal): Promise<boolean> {
 		const publishedAt = acceptNow(INVALID_LIFECYCLE);
 		if (sequence === MAX_SEQUENCE) throw new RangeError(INVALID_LIFECYCLE);
 		sequence += 1;
@@ -331,7 +425,14 @@ export function createWorkerHeartbeatSupervisor(options: {
 
 		if (!publicationFailed) {
 			try {
-				await filesystem.rename(temporaryFile, heartbeatFile);
+				if (!(await renamePreparedPublication(signal))) {
+					try {
+						await filesystem.rm(temporaryFile, { force: true });
+					} catch {
+						// Final evidence removal remains authoritative during shutdown.
+					}
+					return false;
+				}
 			} catch (error) {
 				publicationFailed = true;
 				publicationFailure = error;
@@ -346,6 +447,7 @@ export function createWorkerHeartbeatSupervisor(options: {
 			}
 			throw publicationFailure;
 		}
+		return true;
 	}
 
 	function waitForReadiness(signal: AbortSignal): Promise<boolean> {
@@ -368,7 +470,7 @@ export function createWorkerHeartbeatSupervisor(options: {
 		runStarted = true;
 		try {
 			if (!(await waitForReadiness(signal)) || signal.aborted || sealed) return;
-			await publish();
+			if (!(await publish(signal))) return;
 			firstPublicationSettled = true;
 			firstPublication.resolve();
 
@@ -380,7 +482,7 @@ export function createWorkerHeartbeatSupervisor(options: {
 					throw error;
 				}
 				if (signal.aborted || sealed) return;
-				await publish();
+				if (!(await publish(signal))) return;
 			}
 		} catch (error) {
 			const failure = new WorkerHeartbeatPublicationError(error);

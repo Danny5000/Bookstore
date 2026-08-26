@@ -1,4 +1,16 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { once } from 'node:events';
+import {
+	open as openFile,
+	mkdtemp,
+	readFile,
+	rename as renameFile,
+	rm as removeFile
+} from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import type { WorkerSlotProgressEvent } from '../jobs/runner-observer';
 import { parseWorkerHeartbeat } from './heartbeat-contract';
@@ -33,7 +45,8 @@ class MemoryFilesystem implements WorkerHeartbeatFilesystem {
 	readonly publications: string[] = [];
 	readonly #publicationWaiters = new Map<number, Deferred<void>>();
 	readonly #operationWaiters = new Map<number, Deferred<void>>();
-	readonly failures = new Map<'open' | 'write' | 'sync' | 'close' | 'rename' | 'rm', Error>();
+	readonly failures = new Map<'open' | 'write' | 'sync' | 'close' | 'rename' | 'rm', unknown>();
+	readonly renameFailures: unknown[] = [];
 	readonly rmFailures = new Map<string, Error[]>();
 	renameGate: Deferred<void> | undefined;
 	openHandles = 0;
@@ -45,8 +58,7 @@ class MemoryFilesystem implements WorkerHeartbeatFilesystem {
 	}
 
 	#fail(operation: 'open' | 'write' | 'sync' | 'close' | 'rename' | 'rm'): void {
-		const error = this.failures.get(operation);
-		if (error !== undefined) throw error;
+		if (this.failures.has(operation)) throw this.failures.get(operation);
 	}
 
 	async open(path: string, flags: 'wx', mode: number): Promise<WorkerHeartbeatFileHandle> {
@@ -82,6 +94,7 @@ class MemoryFilesystem implements WorkerHeartbeatFilesystem {
 	async rename(from: string, to: string): Promise<void> {
 		this.#recordOperation(`rename:${from}:${to}`);
 		if (this.renameGate !== undefined) await this.renameGate.promise;
+		if (this.renameFailures.length > 0) throw this.renameFailures.shift();
 		this.#fail('rename');
 		const value = this.files.get(from);
 		if (value === undefined) throw new Error('missing rename source');
@@ -161,7 +174,14 @@ function controlledSleep() {
 	};
 }
 
-function createHarness(configuredSlots = 1) {
+function createHarness(
+	configuredSlots = 1,
+	options: {
+		readonly intervalMs?: number;
+		readonly monotonicNow?: () => number;
+		readonly retryWait?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+	} = {}
+) {
 	let nowMs = PROCESS_STARTED_MS;
 	const filesystem = new MemoryFilesystem();
 	const sleeper = controlledSleep();
@@ -169,10 +189,14 @@ function createHarness(configuredSlots = 1) {
 		workerId: 'worker:heartbeat-test',
 		configuredSlots,
 		heartbeatFile: 'heartbeat.json',
-		intervalMs: 5_000,
+		intervalMs: options.intervalMs ?? 5_000,
 		processStartedAt: new Date(PROCESS_STARTED_MS),
 		now: () => new Date(nowMs),
 		sleep: sleeper.sleep,
+		...(options.monotonicNow === undefined
+			? {}
+			: { monotonicNow: options.monotonicNow }),
+		...(options.retryWait === undefined ? {} : { retryWait: options.retryWait }),
 		filesystem
 	});
 	return {
@@ -208,6 +232,27 @@ function expectFixedPublicationFailure(
 	expect(failure.message).toBe('Worker heartbeat publication failed');
 	expect(failure.message).not.toContain(String(cause));
 	expect(failure.cause).toBe(cause);
+}
+
+function errorWithCode(code: string): Error & { readonly code: string } {
+	return Object.assign(new Error(`filesystem ${code}`), { code });
+}
+
+async function reachSecondPublication(input: {
+	readonly harness: ReturnType<typeof createHarness>;
+	readonly controller: AbortController;
+	readonly run: Promise<void>;
+}): Promise<void> {
+	await input.harness.sleeper.waitForCall(1);
+	input.harness.setNow(PROCESS_STARTED_MS + 1_000);
+	input.harness.sleeper.release(0);
+	const published = await Promise.race([
+		input.harness.filesystem.waitForPublication(2).then(() => true),
+		input.run.then(() => false, () => false)
+	]);
+	expect(published).toBe(true);
+	input.controller.abort();
+	await expect(input.run).resolves.toBeUndefined();
 }
 
 describe('worker heartbeat supervisor state and readiness', () => {
@@ -783,6 +828,510 @@ describe('worker heartbeat supervisor atomic filesystem and lifecycle', () => {
 		controller.abort();
 		await run;
 	});
+
+	it.each(['EPERM', 'EACCES', 'EBUSY'])(
+		'retries only the same final rename for transient %s contention',
+		async (code) => {
+			let monotonicMilliseconds = 0;
+			const retryWait = vi.fn(async (milliseconds: number, signal: AbortSignal) => {
+				expect(signal.aborted).toBe(false);
+				monotonicMilliseconds += milliseconds;
+			});
+			const harness = createHarness(1, {
+				monotonicNow: () => monotonicMilliseconds,
+				retryWait
+			});
+			await harness.supervisor.prepare();
+			const controller = new AbortController();
+			const run = harness.supervisor.run(controller.signal);
+			harness.supervisor.reportSlotProgress({
+				type: 'poll_succeeded',
+				slotId: 0,
+				claimed: false
+			});
+			await harness.supervisor.firstHealthyPublication;
+			const priorTarget = harness.filesystem.files.get('heartbeat.json');
+			const beforeSecondPublication = harness.filesystem.operations.length;
+			harness.filesystem.renameFailures.push(errorWithCode(code));
+			await reachSecondPublication({ harness, controller, run });
+
+			expect(retryWait).toHaveBeenCalledOnce();
+			expect(retryWait).toHaveBeenCalledWith(10, controller.signal);
+			expect(harness.filesystem.operations.slice(beforeSecondPublication))
+				.toEqual([
+					'open:heartbeat.json.tmp:wx:600',
+					'write:heartbeat.json.tmp:utf8',
+					'sync:heartbeat.json.tmp',
+					'close:heartbeat.json.tmp',
+					'rename:heartbeat.json.tmp:heartbeat.json',
+					'rename:heartbeat.json.tmp:heartbeat.json'
+				]);
+			expect(harness.filesystem.record().sequence).toBe(2);
+			expect(harness.filesystem.files.get('heartbeat.json')).not.toBe(priorTarget);
+			expect(harness.filesystem.files.has('heartbeat.json.tmp')).toBe(false);
+		}
+	);
+
+	it('keeps the previous target coherent while a transient rename waits', async () => {
+		let monotonicMilliseconds = 0;
+		const retryEntered = deferred<void>();
+		const releaseRetry = deferred<void>();
+		const retryWait = vi.fn(async (milliseconds: number) => {
+			retryEntered.resolve();
+			await releaseRetry.promise;
+			monotonicMilliseconds += milliseconds;
+		});
+		const harness = createHarness(1, {
+			monotonicNow: () => monotonicMilliseconds,
+			retryWait
+		});
+		await harness.supervisor.prepare();
+		const controller = new AbortController();
+		const run = harness.supervisor.run(controller.signal);
+		harness.supervisor.reportSlotProgress({
+			type: 'poll_succeeded',
+			slotId: 0,
+			claimed: false
+		});
+		await harness.supervisor.firstHealthyPublication;
+		const priorTarget = harness.filesystem.files.get('heartbeat.json');
+		harness.filesystem.renameFailures.push(errorWithCode('EPERM'));
+		await harness.sleeper.waitForCall(1);
+		harness.setNow(PROCESS_STARTED_MS + 1_000);
+		harness.sleeper.release(0);
+		const retryObserved = await Promise.race([
+			retryEntered.promise.then(() => true),
+			run.then(() => false, () => false)
+		]);
+		expect(retryObserved).toBe(true);
+
+		expect(harness.filesystem.files.get('heartbeat.json')).toBe(priorTarget);
+		expect(parseWorkerHeartbeat(
+			harness.filesystem.files.get('heartbeat.json.tmp') ?? ''
+		).sequence).toBe(2);
+		releaseRetry.resolve();
+		await harness.filesystem.waitForPublication(2);
+		controller.abort();
+		await expect(run).resolves.toBeUndefined();
+	});
+
+	it('does not retry a nontransient rename failure', async () => {
+		const retryWait = vi.fn().mockResolvedValue(undefined);
+		const harness = createHarness(1, {
+			monotonicNow: () => 0,
+			retryWait
+		});
+		await harness.supervisor.prepare();
+		const controller = new AbortController();
+		const run = harness.supervisor.run(controller.signal);
+		harness.supervisor.reportSlotProgress({
+			type: 'poll_succeeded',
+			slotId: 0,
+			claimed: false
+		});
+		await harness.supervisor.firstHealthyPublication;
+		const priorTarget = harness.filesystem.files.get('heartbeat.json');
+		const failure = errorWithCode('EIO');
+		harness.filesystem.failures.set('rename', failure);
+		await harness.sleeper.waitForCall(1);
+		harness.sleeper.release(0);
+
+		const observed = await capturePublicationFailure(run);
+		expectFixedPublicationFailure(observed, failure);
+		expect(retryWait).not.toHaveBeenCalled();
+		expect(harness.filesystem.files.get('heartbeat.json')).toBe(priorTarget);
+		expect(harness.filesystem.files.has('heartbeat.json.tmp')).toBe(false);
+	});
+
+	it.each(['accessor', 'hostile proxy'])(
+		'does not inspect or retry a %s rename code',
+		async (kind) => {
+			let codeInspection = 0;
+			const failure = kind === 'accessor'
+				? Object.defineProperty(new Error('accessor-code'), 'code', {
+					get() {
+						codeInspection += 1;
+						return 'EPERM';
+					}
+				})
+				: new Proxy(new Error('hostile-code'), {
+					getOwnPropertyDescriptor() {
+						codeInspection += 1;
+						throw new Error('hostile descriptor');
+					}
+				});
+			const retryWait = vi.fn().mockResolvedValue(undefined);
+			const harness = createHarness(1, {
+				monotonicNow: () => 0,
+				retryWait
+			});
+			await harness.supervisor.prepare();
+			const controller = new AbortController();
+			const run = harness.supervisor.run(controller.signal);
+			harness.supervisor.reportSlotProgress({
+				type: 'poll_succeeded',
+				slotId: 0,
+				claimed: false
+			});
+			await harness.supervisor.firstHealthyPublication;
+			harness.filesystem.failures.set('rename', failure);
+			await harness.sleeper.waitForCall(1);
+			harness.sleeper.release(0);
+
+			const observed = await capturePublicationFailure(run);
+			expectFixedPublicationFailure(observed, failure);
+			expect(codeInspection).toBe(kind === 'accessor' ? 0 : 1);
+			expect(retryWait).not.toHaveBeenCalled();
+		}
+	);
+
+	it('expires persistent transient rename contention at the exact monotonic deadline', async () => {
+		let monotonicMilliseconds = 0;
+		const retryWait = vi.fn(async (milliseconds: number) => {
+			monotonicMilliseconds += milliseconds;
+		});
+		const harness = createHarness(1, {
+			intervalMs: 25,
+			monotonicNow: () => monotonicMilliseconds,
+			retryWait
+		});
+		await harness.supervisor.prepare();
+		const controller = new AbortController();
+		const run = harness.supervisor.run(controller.signal);
+		harness.supervisor.reportSlotProgress({
+			type: 'poll_succeeded',
+			slotId: 0,
+			claimed: false
+		});
+		await harness.supervisor.firstHealthyPublication;
+		const priorTarget = harness.filesystem.files.get('heartbeat.json');
+		const beforeSecondPublication = harness.filesystem.operations.length;
+		const failure = errorWithCode('EBUSY');
+		harness.filesystem.failures.set('rename', failure);
+		await harness.sleeper.waitForCall(1);
+		harness.sleeper.release(0);
+
+		const observed = await capturePublicationFailure(run);
+		expectFixedPublicationFailure(observed, failure);
+		expect(retryWait.mock.calls.map(([milliseconds]) => milliseconds))
+			.toEqual([10, 10, 5]);
+		expect(harness.filesystem.operations.slice(beforeSecondPublication))
+			.toEqual([
+				'open:heartbeat.json.tmp:wx:600',
+				'write:heartbeat.json.tmp:utf8',
+				'sync:heartbeat.json.tmp',
+				'close:heartbeat.json.tmp',
+				'rename:heartbeat.json.tmp:heartbeat.json',
+				'rename:heartbeat.json.tmp:heartbeat.json',
+				'rename:heartbeat.json.tmp:heartbeat.json',
+				'rm:heartbeat.json.tmp:true'
+			]);
+		expect(harness.filesystem.files.get('heartbeat.json')).toBe(priorTarget);
+		expect(harness.filesystem.files.has('heartbeat.json.tmp')).toBe(false);
+	});
+
+	it.each(['abort', 'seal'])(
+		'treats %s during a transient rename wait as normal and removes the temp',
+		async (shutdown) => {
+			let monotonicMilliseconds = 0;
+			const retryEntered = deferred<void>();
+			const retryRelease = deferred<void>();
+			const retryWait = vi.fn(async (milliseconds: number, signal: AbortSignal) => {
+				retryEntered.resolve();
+				if (signal.aborted) return;
+				await Promise.race([
+					retryRelease.promise,
+					new Promise<void>((resolve) =>
+						signal.addEventListener('abort', () => resolve(), { once: true })
+					)
+				]);
+				monotonicMilliseconds += milliseconds;
+			});
+			const harness = createHarness(1, {
+				monotonicNow: () => monotonicMilliseconds,
+				retryWait
+			});
+			await harness.supervisor.prepare();
+			const controller = new AbortController();
+			const run = harness.supervisor.run(controller.signal);
+			harness.supervisor.reportSlotProgress({
+				type: 'poll_succeeded',
+				slotId: 0,
+				claimed: false
+			});
+			await harness.supervisor.firstHealthyPublication;
+			const priorTarget = harness.filesystem.files.get('heartbeat.json');
+			harness.filesystem.failures.set('rename', errorWithCode('EPERM'));
+			await harness.sleeper.waitForCall(1);
+			harness.sleeper.release(0);
+			const retryObserved = await Promise.race([
+				retryEntered.promise.then(() => true),
+				run.then(() => false, () => false)
+			]);
+			expect(retryObserved).toBe(true);
+
+			if (shutdown === 'abort') controller.abort();
+			else harness.supervisor.sealProgress();
+			retryRelease.resolve();
+			await expect(run).resolves.toBeUndefined();
+			expect(harness.filesystem.files.get('heartbeat.json')).toBe(priorTarget);
+			expect(harness.filesystem.files.has('heartbeat.json.tmp')).toBe(false);
+			await harness.supervisor.removeEvidence();
+			expect(harness.filesystem.files.has('heartbeat.json')).toBe(false);
+		}
+	);
+
+	it.each([
+		{ shutdown: 'abort', outcome: 'success' },
+		{ shutdown: 'abort', outcome: 'nontransient failure' },
+		{ shutdown: 'seal', outcome: 'success' },
+		{ shutdown: 'seal', outcome: 'nontransient failure' }
+	])(
+		'treats $shutdown during an in-flight retry $outcome as normal',
+		async ({ shutdown, outcome }) => {
+			let monotonicMilliseconds = 0;
+			const retryState: { filesystem?: MemoryFilesystem } = {};
+			const retryRenameGate = deferred<void>();
+			const harness = createHarness(1, {
+				monotonicNow: () => monotonicMilliseconds,
+				retryWait: async (milliseconds) => {
+					monotonicMilliseconds += milliseconds;
+					if (retryState.filesystem === undefined) {
+						throw new Error('missing retry filesystem');
+					}
+					retryState.filesystem.renameGate = retryRenameGate;
+				}
+			});
+			retryState.filesystem = harness.filesystem;
+			await harness.supervisor.prepare();
+			const controller = new AbortController();
+			const run = harness.supervisor.run(controller.signal);
+			harness.supervisor.reportSlotProgress({
+				type: 'poll_succeeded',
+				slotId: 0,
+				claimed: false
+			});
+			await harness.supervisor.firstHealthyPublication;
+			const priorTarget = harness.filesystem.files.get('heartbeat.json');
+			const beforeSecondPublication = harness.filesystem.operations.length;
+			harness.filesystem.renameFailures.push(errorWithCode('EPERM'));
+			if (outcome === 'nontransient failure') {
+				harness.filesystem.renameFailures.push(errorWithCode('EIO'));
+			}
+			await harness.sleeper.waitForCall(1);
+			harness.setNow(PROCESS_STARTED_MS + 1_000);
+			harness.sleeper.release(0);
+			await harness.filesystem.waitForOperation(beforeSecondPublication + 6);
+
+			if (shutdown === 'abort') controller.abort();
+			else harness.supervisor.sealProgress();
+			retryRenameGate.resolve();
+			await expect(run).resolves.toBeUndefined();
+			expect(harness.filesystem.operations.at(-1))
+				.toBe('rm:heartbeat.json.tmp:true');
+			expect(harness.filesystem.files.has('heartbeat.json.tmp')).toBe(false);
+			if (outcome === 'success') {
+				expect(harness.filesystem.record().sequence).toBe(2);
+			} else {
+				expect(harness.filesystem.files.get('heartbeat.json')).toBe(priorTarget);
+			}
+			await harness.supervisor.removeEvidence();
+			expect(harness.filesystem.files.has('heartbeat.json')).toBe(false);
+		}
+	);
+
+	it('keeps an active retry-wait rejection fatal and preserves the prior target', async () => {
+		const retryFailure = new Error('retry-wait-failure');
+		const retryWait = vi.fn(async () => {
+			throw retryFailure;
+		});
+		const harness = createHarness(1, {
+			monotonicNow: () => 0,
+			retryWait
+		});
+		await harness.supervisor.prepare();
+		const controller = new AbortController();
+		const run = harness.supervisor.run(controller.signal);
+		harness.supervisor.reportSlotProgress({
+			type: 'poll_succeeded',
+			slotId: 0,
+			claimed: false
+		});
+		await harness.supervisor.firstHealthyPublication;
+		const priorTarget = harness.filesystem.files.get('heartbeat.json');
+		harness.filesystem.failures.set('rename', errorWithCode('EACCES'));
+		await harness.sleeper.waitForCall(1);
+		harness.sleeper.release(0);
+
+		const observed = await capturePublicationFailure(run);
+		expectFixedPublicationFailure(observed, retryFailure);
+		expect(retryWait).toHaveBeenCalledOnce();
+		expect(harness.filesystem.files.get('heartbeat.json')).toBe(priorTarget);
+		expect(harness.filesystem.files.has('heartbeat.json.tmp')).toBe(false);
+	});
+
+	it.each([Number.NaN, Number.POSITIVE_INFINITY, 99])(
+		'fails closed when the retry monotonic clock becomes %p',
+		async (invalidMilliseconds) => {
+			const clockValues = [0, 100, 100, invalidMilliseconds];
+			const monotonicNow = vi.fn(() => clockValues.shift() ?? invalidMilliseconds);
+			const retryWait = vi.fn().mockResolvedValue(undefined);
+			const harness = createHarness(1, { monotonicNow, retryWait });
+			await harness.supervisor.prepare();
+			const controller = new AbortController();
+			const run = harness.supervisor.run(controller.signal);
+			harness.supervisor.reportSlotProgress({
+				type: 'poll_succeeded',
+				slotId: 0,
+				claimed: false
+			});
+			await harness.supervisor.firstHealthyPublication;
+			const priorTarget = harness.filesystem.files.get('heartbeat.json');
+			harness.filesystem.failures.set('rename', errorWithCode('EPERM'));
+			await harness.sleeper.waitForCall(1);
+			harness.sleeper.release(0);
+
+			const observed = await capturePublicationFailure(run);
+			expect(observed.cause).toBeInstanceOf(TypeError);
+			expect(retryWait).toHaveBeenCalledOnce();
+			expect(harness.filesystem.files.get('heartbeat.json')).toBe(priorTarget);
+			expect(harness.filesystem.files.has('heartbeat.json.tmp')).toBe(false);
+		}
+	);
+
+	it.skipIf(process.platform !== 'win32')(
+		'retries a native Windows replace after a held reader releases without wall sleep',
+		async () => {
+			const root = await mkdtemp(join(tmpdir(), 'worker-heartbeat-native-'));
+			const heartbeatFile = join(root, 'worker.ready');
+			const sleeper = controlledSleep();
+			const retryEntered = deferred<void>();
+			const secondRename = deferred<void>();
+			let successfulRenames = 0;
+			let monotonicMilliseconds = 0;
+			let reader: ChildProcessWithoutNullStreams | undefined;
+			let readerStderr = '';
+			const filesystem: WorkerHeartbeatFilesystem = {
+				async open(path, flags, mode) {
+					return openFile(path, flags, mode);
+				},
+				async rename(from, to) {
+					await renameFile(from, to);
+					successfulRenames += 1;
+					if (successfulRenames === 2) secondRename.resolve();
+				},
+				rm: removeFile
+			};
+			const retryWait = vi.fn(async (milliseconds: number) => {
+				retryEntered.resolve();
+				if (reader === undefined) throw new Error('missing native reader');
+				const exited = once(reader, 'exit');
+				if (!reader.kill()) throw new Error('native reader did not accept termination');
+				await exited;
+				monotonicMilliseconds += milliseconds;
+			});
+			const supervisor = createWorkerHeartbeatSupervisor({
+				workerId: 'worker:native-windows',
+				configuredSlots: 1,
+				heartbeatFile,
+				intervalMs: 1_000,
+				processStartedAt: new Date(PROCESS_STARTED_MS),
+				now: () => new Date(PROCESS_STARTED_MS + successfulRenames * 1_000),
+				sleep: sleeper.sleep,
+				monotonicNow: () => monotonicMilliseconds,
+				retryWait,
+				filesystem
+			});
+			const controller = new AbortController();
+			let run: Promise<void> | undefined;
+			try {
+				await supervisor.prepare();
+				run = supervisor.run(controller.signal);
+				supervisor.reportSlotProgress({
+					type: 'poll_succeeded',
+					slotId: 0,
+					claimed: false
+				});
+				await supervisor.firstHealthyPublication;
+				expect(parseWorkerHeartbeat(await readFile(heartbeatFile, 'utf8')).sequence)
+					.toBe(1);
+
+				const script = [
+					'$handle = [IO.File]::Open($env:WORKER_HEARTBEAT_NATIVE_TARGET, [IO.FileMode]::Open,',
+					'  [IO.FileAccess]::Read, [IO.FileShare]::None)',
+					'try {',
+					"  [Console]::Out.WriteLine('locked')",
+					'  [Console]::Out.Flush()',
+					'  [Threading.Thread]::Sleep([Threading.Timeout]::Infinite)',
+					'} finally {',
+					'  $handle.Dispose()',
+					'}'
+				].join('\n');
+				reader = spawn('powershell.exe', [
+					'-NoLogo',
+					'-NoProfile',
+					'-NonInteractive',
+					'-Command',
+					script
+				], {
+					stdio: 'pipe',
+					env: {
+						...process.env,
+						WORKER_HEARTBEAT_NATIVE_TARGET: heartbeatFile
+					}
+				});
+				reader.stderr.setEncoding('utf8');
+				reader.stderr.on('data', (chunk: string) => {
+					readerStderr += chunk;
+				});
+				const lockResult = await Promise.race([
+					once(reader.stdout, 'data').then(([output]) => ({
+						kind: 'locked' as const,
+						output
+					})),
+					once(reader, 'exit').then(([exitCode]) => ({
+						kind: 'exited' as const,
+						exitCode
+					}))
+				]);
+				if (lockResult.kind === 'exited') {
+					throw new Error(
+						`native reader exited with ${String(lockResult.exitCode)}: ${readerStderr}`
+					);
+				}
+				expect(String(lockResult.output)).toContain('locked');
+
+				await sleeper.waitForCall(1);
+				sleeper.release(0);
+				const retryObserved = await Promise.race([
+					retryEntered.promise.then(() => true),
+					run.then(() => false, () => false)
+				]);
+				expect(retryObserved).toBe(true);
+				await secondRename.promise;
+				expect(retryWait).toHaveBeenCalledOnce();
+				expect(parseWorkerHeartbeat(await readFile(heartbeatFile, 'utf8')).sequence)
+					.toBe(2);
+				controller.abort();
+				await expect(run).resolves.toBeUndefined();
+				await supervisor.removeEvidence();
+			} finally {
+				controller.abort();
+				if (
+					reader !== undefined &&
+					reader.exitCode === null &&
+					reader.signalCode === null
+				) {
+					const exited = once(reader, 'exit');
+					reader.kill();
+					await exited;
+				}
+				if (run !== undefined) await run.catch(() => undefined);
+				await supervisor.removeEvidence().catch(() => undefined);
+				await removeFile(root, { recursive: true, force: true });
+			}
+		}
+	);
 
 	it.each<PublicationFailurePoint>(['open', 'write', 'sync', 'close', 'rename'])(
 		'rejects an unresolved first publication and cleans only the temp on %s failure',
