@@ -105,6 +105,9 @@ const EVENTS: Readonly<Record<EventName, EventMetadata>> = {
 function invalid(): never { throw new TypeError('invalid structured event'); }
 export function isSafeToken(value: unknown): value is string { return typeof value === 'string' && TOKEN.test(value); }
 export function isCorrelationId(value: unknown): value is CorrelationId { return typeof value === 'string' && CORRELATION.test(value); }
+export function isCanonicalLowercaseUuid(value: unknown): value is string { return typeof value === 'string' && UUID.test(value); }
+export function isWorkerId(value: unknown): value is string { return typeof value === 'string' && WORKER_ID.test(value); }
+export function isNonnegativeSignedInt32(value: unknown): value is number { return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= 2_147_483_647; }
 export function isPositiveSignedInt32(value: unknown): value is number { return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 && value <= 2_147_483_647; }
 function isService(value: unknown): value is StructuredLogService { return typeof value === 'string' && EVENTS['logging.failure'].services.includes(value as StructuredLogService); }
 function object(value: unknown): Record<string, unknown> {
@@ -145,12 +148,12 @@ function fieldValue(field: string, value: unknown, metadata: EventMetadata, serv
     case 'method': return string(value, /^[A-Z]{1,16}$/);
     case 'route': return string(value, /^.{1,200}$/);
     case 'httpStatus': return integer(value, 100, 599);
-    case 'workerId': return string(value, WORKER_ID);
+    case 'workerId': return isWorkerId(value) ? value : invalid();
     case 'configuredSlots': case 'attempt': case 'maxAttempts': case 'generation': return positive(value);
     case 'durationMs': return integer(value, 0, 86_400_000);
-    case 'jobId': case 'candidateId': return string(value, UUID);
+    case 'jobId': case 'candidateId': return isCanonicalLowercaseUuid(value) ? value : invalid();
     case 'jobKind': return string(value, TOKEN);
-    case 'slotId': case 'containerCount': case 'networkCount': case 'volumeCount': case 'temporaryRootCount': return integer(value, 0, 2_147_483_647);
+    case 'slotId': case 'containerCount': case 'networkCount': case 'volumeCount': case 'temporaryRootCount': return isNonnegativeSignedInt32(value) ? value : invalid();
     case 'retryScheduled': return typeof value === 'boolean' ? value : invalid();
     case 'code': { const code = string(value, TOKEN); return metadata.codes?.includes(code) ? code : invalid(); }
     case 'profile': return metadata.profiles?.[service as Exclude<StructuredLogService, 'web' | 'worker'>] === value ? value as 'maintenance_fixture' | 'release_candidate' : invalid();

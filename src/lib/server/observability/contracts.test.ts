@@ -1,7 +1,10 @@
 import { describe, expect, test } from 'vitest';
 
 import {
+  isCanonicalLowercaseUuid,
+  isNonnegativeSignedInt32,
   isPositiveSignedInt32,
+  isWorkerId,
   type StructuredEventInputFor,
   validateLoggingFailure,
   validateStructuredEvent
@@ -197,6 +200,37 @@ describe('structured event contracts', () => {
 
   test.each([0, -1, 2_147_483_648, 1.1, Number.NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])('rejects invalid heartbeat sequence %s', (sequence) => {
     expect(isPositiveSignedInt32(sequence)).toBe(false);
+  });
+
+  test.each([
+    ['01234567-89ab-cdef-0123-456789abcdef', true],
+    ['01234567-89AB-CDEF-0123-456789ABCDEF', false],
+    ['0123456789ab-cdef-0123-456789abcdef', false],
+    [new String('01234567-89ab-cdef-0123-456789abcdef'), false]
+  ])('exposes canonical lowercase UUID validation for %#', (value, expected) => {
+    expect(isCanonicalLowercaseUuid(value)).toBe(expected);
+  });
+
+  test.each([
+    ['a', true],
+    [`a${'x'.repeat(199)}`, true],
+    ['worker._:-1', true],
+    [':worker', false],
+    ['a'.repeat(201), false],
+    [new String('worker-1'), false]
+  ])('exposes worker identifier validation for %#', (value, expected) => {
+    expect(isWorkerId(value)).toBe(expected);
+  });
+
+  test.each([
+    [0, true],
+    [2_147_483_647, true],
+    [-1, false],
+    [2_147_483_648, false],
+    [1.1, false],
+    [Number.NaN, false]
+  ])('exposes nonnegative signed-int32 validation for %#', (value, expected) => {
+    expect(isNonnegativeSignedInt32(value)).toBe(expected);
   });
 
   test.each(['slotId', 'containerCount', 'networkCount', 'volumeCount', 'temporaryRootCount'])('accepts nonnegative signed-int32 bounds for %s', (key) => {
