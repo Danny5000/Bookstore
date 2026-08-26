@@ -36,21 +36,22 @@ function hasRuntimeImportBinding(clause: ts.ImportClause | undefined): boolean {
 
 function runtimeCallModuleSpecifier(node: ts.Node): string | undefined {
   if (!ts.isCallExpression(node)) return undefined;
+  const isDynamicImport = node.expression.kind === ts.SyntaxKind.ImportKeyword;
+  const isRequire = ts.isIdentifier(node.expression) && node.expression.text === 'require';
+  if (!isDynamicImport && !isRequire) return undefined;
+
   const firstArgument = node.arguments[0];
-  if (firstArgument === undefined || !ts.isStringLiteralLike(firstArgument)) {
-    return undefined;
-  }
-  if (node.expression.kind === ts.SyntaxKind.ImportKeyword) {
-    return firstArgument.text;
-  }
+  const validArity = isDynamicImport
+    ? node.arguments.length === 1 || node.arguments.length === 2
+    : node.arguments.length === 1;
   if (
-    node.arguments.length === 1 &&
-    ts.isIdentifier(node.expression) &&
-    node.expression.text === 'require'
+    !validArity ||
+    firstArgument === undefined ||
+    !ts.isStringLiteralLike(firstArgument)
   ) {
-    return firstArgument.text;
+    throw new Error('runtime module specifier must be one literal');
   }
-  return undefined;
+  return firstArgument.text;
 }
 
 function runtimeModuleSpecifiersFromSource(
@@ -290,6 +291,26 @@ describe('storage process isolation deployment', () => {
       './side-effect-import',
       './template-require'
     ]);
+  });
+
+  it.each([
+    ['computed dynamic import', "const target = 'stripe'; void import(target);"],
+    ['interpolated dynamic import', "const target = 'stripe'; void import(`plugin-${target}`);"],
+    ['computed require', "const target = 'stripe'; require(target);"],
+    ['require without an argument', 'require();'],
+    ['require with extra arguments', "require('zod', 'stripe');"]
+  ])('rejects non-literal runtime module resolution: %s', (_name, contents) => {
+    expect(() => runtimeModuleSpecifiersFromSource('runtime-edge-fixture.ts', contents))
+      .toThrowError('runtime module specifier must be one literal');
+  });
+
+  it('does not confuse ordinary calls or require-named member methods with module loading', () => {
+    expect(runtimeModuleSpecifiersFromSource('runtime-edge-fixture.ts', `
+      const target = 'stripe';
+      resolve(target);
+      loader.require(target);
+      require.resolve(target);
+    `)).toEqual([]);
   });
 
   it('value-imports the test worker controller only from the worker process root', () => {
