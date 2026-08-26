@@ -70,6 +70,8 @@ interface ActiveFixture {
   readonly readyFile: string;
   readonly requestFile: string;
   readonly acknowledgementFile: string;
+  readonly requestTempFile: string;
+  readonly acknowledgementTempFile: string;
 }
 
 async function activeFixture(): Promise<ActiveFixture> {
@@ -85,6 +87,8 @@ async function activeFixture(): Promise<ActiveFixture> {
       root,
       TEST_WORKER_CONTROL_ACKNOWLEDGEMENT_BASENAME
     ),
+    requestTempFile: join(root, 'worker.control.tmp'),
+    acknowledgementTempFile: join(root, 'worker.control.ack.tmp'),
     environment: {
       APP_ENV: 'test',
       PALE_ORBIT_TEST_PROJECT: 'pale-orbit-test-0123456789abcdef',
@@ -496,6 +500,98 @@ describe('test worker control activation', () => {
 });
 
 describe('test worker control filesystem and acknowledgement failures', () => {
+  it('keeps harness pause strict when readiness is absent and creates no control sibling', async () => {
+    const fixture = await activeFixture();
+    await unlink(fixture.readyFile);
+    const randomBytes = randomBytesFor(NONCE_A);
+    const harness = createTestWorkerControlHarness({
+      environment: fixture.environment,
+      randomBytes
+    });
+
+    await expect(harness.pause(new AbortController().signal))
+      .rejects.toMatchObject({ code: 'ENOENT' });
+
+    expect(randomBytes).not.toHaveBeenCalled();
+    expect(await readdir(fixture.root)).toEqual([]);
+  });
+
+  it('fails worker preflight closed for a non-missing readiness inspection error', async () => {
+    const fixture = await activeFixture();
+    const workerAbort = new AbortController();
+    const abortWorker = vi.fn((reason?: unknown) => workerAbort.abort(reason));
+    const maintenance = vi.fn().mockResolvedValue(undefined);
+    const fileSystem = {
+      ...nodeFileSystem,
+      lstat: vi.fn(async (path: string) => {
+        if (path === fixture.readyFile) throw fileSystemError('EACCES');
+        return lstat(path);
+      })
+    } as unknown as TestWorkerControlFileSystem;
+    const control = createTestWorkerControl({
+      environment: fixture.environment,
+      concurrency: 1,
+      abortWorker,
+      fileSystem
+    });
+
+    await within(prepareTestWorkerPoll({
+      control,
+      signal: workerAbort.signal,
+      maintenance
+    }), 'rejecting a non-missing readiness inspection error');
+
+    expect(abortWorker).toHaveBeenCalledOnce();
+    expect(workerAbort.signal.aborted).toBe(true);
+    expect(maintenance).not.toHaveBeenCalled();
+    expect(() => control.throwIfFailed()).toThrow();
+  });
+
+  it('allows repeated clean bootstrap polls then fails closed if readiness disappears', async () => {
+    const fixture = await activeFixture();
+    await unlink(fixture.readyFile);
+    const workerAbort = new AbortController();
+    const abortWorker = vi.fn((reason?: unknown) => workerAbort.abort(reason));
+    const bootstrapMaintenance = vi.fn().mockResolvedValue(undefined);
+    const readyMaintenance = vi.fn().mockResolvedValue(undefined);
+    const disappearedMaintenance = vi.fn().mockResolvedValue(undefined);
+    const control = createTestWorkerControl({
+      environment: fixture.environment,
+      concurrency: 1,
+      abortWorker
+    });
+
+    await within(prepareTestWorkerPoll({
+      control,
+      signal: workerAbort.signal,
+      maintenance: bootstrapMaintenance
+    }), 'completing a first clean bootstrap poll');
+    await within(prepareTestWorkerPoll({
+      control,
+      signal: workerAbort.signal,
+      maintenance: bootstrapMaintenance
+    }), 'completing a repeated clean bootstrap poll');
+    await writeFile(fixture.readyFile, 'test-worker', 'utf8');
+    await within(prepareTestWorkerPoll({
+      control,
+      signal: workerAbort.signal,
+      maintenance: readyMaintenance
+    }), 'observing valid readiness');
+    await unlink(fixture.readyFile);
+    await within(prepareTestWorkerPoll({
+      control,
+      signal: workerAbort.signal,
+      maintenance: disappearedMaintenance
+    }), 'rejecting disappeared readiness');
+
+    expect(bootstrapMaintenance).toHaveBeenCalledTimes(2);
+    expect(readyMaintenance).toHaveBeenCalledOnce();
+    expect(disappearedMaintenance).not.toHaveBeenCalled();
+    expect(abortWorker).toHaveBeenCalledOnce();
+    expect(workerAbort.signal.aborted).toBe(true);
+    expect(() => control.throwIfFailed()).toThrow();
+  });
+
   it('fails closed when the ready path resolves outside its lexical owned root', async () => {
     const fixture = await activeFixture();
     const workerAbort = new AbortController();
@@ -1234,6 +1330,102 @@ describe('test worker control state machine', () => {
 });
 
 describe('test worker control integration with the real runner', () => {
+  it('allows the first repository poll before heartbeat evidence when control siblings are absent', async () => {
+    const fixture = await activeFixture();
+    await unlink(fixture.readyFile);
+    const workerAbort = new AbortController();
+    const abortWorker = vi.fn((reason?: unknown) => workerAbort.abort(reason));
+    const repository = repositoryWithNoJobs(() => workerAbort.abort());
+    const maintenance = vi.fn().mockResolvedValue(undefined);
+    const control = createTestWorkerControl({
+      environment: fixture.environment,
+      concurrency: 1,
+      abortWorker
+    });
+
+    await within(runWorker({
+      repository,
+      handlers: new Map(),
+      workerId: 'test-pre-readiness-worker',
+      concurrency: 1,
+      pollIntervalMs: 1,
+      leaseRenewalIntervalMs: 1,
+      signal: workerAbort.signal,
+      beforePoll: ({ signal }) => prepareTestWorkerPoll({
+        control,
+        signal,
+        maintenance
+      }),
+      sleep: async () => workerAbort.abort()
+    }), 'completing the first pre-readiness repository poll');
+
+    expect(await readdir(fixture.root)).toEqual([]);
+    expect(maintenance).toHaveBeenCalledOnce();
+    expect(repository.claimNext).toHaveBeenCalledOnce();
+    expect(abortWorker).not.toHaveBeenCalled();
+    expect(() => control.throwIfFailed()).not.toThrow();
+  });
+
+  it.each([
+    {
+      label: 'request',
+      path: (fixture: ActiveFixture) => fixture.requestFile,
+      contents: PAUSE_A
+    },
+    {
+      label: 'acknowledgement',
+      path: (fixture: ActiveFixture) => fixture.acknowledgementFile,
+      contents: PAUSED_A
+    },
+    {
+      label: 'request temp',
+      path: (fixture: ActiveFixture) => fixture.requestTempFile,
+      contents: PAUSE_A
+    },
+    {
+      label: 'acknowledgement temp',
+      path: (fixture: ActiveFixture) => fixture.acknowledgementTempFile,
+      contents: PAUSED_A
+    }
+  ])('fails closed when a $label sibling precedes readiness', async ({
+    path,
+    contents
+  }) => {
+    const fixture = await activeFixture();
+    await unlink(fixture.readyFile);
+    await writeFile(path(fixture), contents, 'utf8');
+    const workerAbort = new AbortController();
+    const abortWorker = vi.fn((reason?: unknown) => workerAbort.abort(reason));
+    const repository = repositoryWithNoJobs();
+    const maintenance = vi.fn().mockResolvedValue(undefined);
+    const control = createTestWorkerControl({
+      environment: fixture.environment,
+      concurrency: 1,
+      abortWorker
+    });
+
+    await within(runWorker({
+      repository,
+      handlers: new Map(),
+      workerId: 'test-invalid-pre-readiness-worker',
+      concurrency: 1,
+      pollIntervalMs: 1,
+      leaseRenewalIntervalMs: 1,
+      signal: workerAbort.signal,
+      beforePoll: ({ signal }) => prepareTestWorkerPoll({
+        control,
+        signal,
+        maintenance
+      }),
+      sleep: async () => undefined
+    }), 'rejecting a control sibling before readiness');
+
+    expect(abortWorker).toHaveBeenCalledOnce();
+    expect(repository.claimNext).not.toHaveBeenCalled();
+    expect(maintenance).not.toHaveBeenCalled();
+    expect(() => control.throwIfFailed()).toThrow();
+  });
+
   it('aborts on malformed control before the fake repository can claim', async () => {
     const fixture = await activeFixture();
     await writeFile(fixture.requestFile, '{"private":"malformed"}', 'utf8');

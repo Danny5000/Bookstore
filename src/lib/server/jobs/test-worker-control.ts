@@ -410,6 +410,14 @@ async function assertRegularPath(
   path: string
 ): Promise<void> {
   const stat = await fileSystem.lstat(path);
+  await assertRegularStat(fileSystem, path, stat);
+}
+
+async function assertRegularStat(
+  fileSystem: TestWorkerControlFileSystem,
+  path: string,
+  stat: TestWorkerControlStat
+): Promise<void> {
   if (!stat.isFile() || stat.isSymbolicLink()) {
     throw new Error('Test worker control path is not a regular file');
   }
@@ -424,6 +432,38 @@ async function assertOwnedRoot(
 ): Promise<void> {
   await assertDirectoryPath(fileSystem, paths.root);
   await assertRegularPath(fileSystem, paths.ready);
+}
+
+async function workerRootHasReadiness(
+  fileSystem: TestWorkerControlFileSystem,
+  paths: ControlPaths
+): Promise<boolean> {
+  await assertDirectoryPath(fileSystem, paths.root);
+  const siblings = [
+    paths.request,
+    paths.acknowledgement,
+    paths.requestTemp,
+    paths.acknowledgementTemp
+  ] as const;
+  for (let observation = 0; observation < 2; observation += 1) {
+    const readyBefore = await optionalStat(fileSystem, paths.ready);
+    if (readyBefore !== null) {
+      await assertRegularStat(fileSystem, paths.ready, readyBefore);
+      return true;
+    }
+    const siblingStats = await Promise.all(
+      siblings.map((path) => optionalStat(fileSystem, path))
+    );
+    const readyAfter = await optionalStat(fileSystem, paths.ready);
+    if (readyAfter !== null) {
+      await assertRegularStat(fileSystem, paths.ready, readyAfter);
+      return true;
+    }
+    if (siblingStats.some((stat) => stat !== null)) {
+      throw new Error('Test worker control sibling preceded readiness');
+    }
+  }
+  return false;
 }
 
 async function readOptionalFile(
@@ -775,6 +815,7 @@ export function createTestWorkerControl(input: {
   let currentCompletedRequestRaw: string | undefined;
   let armedFailureCommandId: string | undefined;
   let failure: Error | undefined;
+  let readinessObserved = false;
 
   const recordFailure = (error: unknown): void => {
     if (failure) return;
@@ -873,7 +914,14 @@ export function createTestWorkerControl(input: {
   ): Promise<WorkerPause | null> => {
     if (!active || paths === null) return null;
     throwIfAborted(signal);
-    await assertOwnedRoot(dependencies.fileSystem, paths);
+    if (!await workerRootHasReadiness(dependencies.fileSystem, paths)) {
+      if (readinessObserved) {
+        throw new Error('Test worker control readiness disappeared');
+      }
+      clearCurrentCompletion();
+      return null;
+    }
+    readinessObserved = true;
     const { requestRaw, acknowledgementRaw } =
       await readStableControlState(paths, signal, dependencies);
 
