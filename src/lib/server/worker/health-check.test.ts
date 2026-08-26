@@ -27,6 +27,7 @@ interface FilesystemHarnessOptions {
 	readonly raw?: string;
 	readonly size?: number;
 	readonly regular?: boolean;
+	readonly stat?: WorkerHealthFileStat;
 	readonly openError?: unknown;
 	readonly statError?: unknown;
 	readonly readError?: unknown;
@@ -58,7 +59,7 @@ function heartbeatRecord(
 function filesystemHarness(options: FilesystemHarnessOptions = {}) {
 	const raw = options.raw ?? encodeWorkerHeartbeat(heartbeatRecord());
 	const operations: string[] = [];
-	const stat: WorkerHealthFileStat = {
+	const stat: WorkerHealthFileStat = options.stat ?? {
 		size: options.size ?? Buffer.byteLength(raw, 'utf8'),
 		isFile: vi.fn(() => options.regular ?? true)
 	};
@@ -181,6 +182,40 @@ describe('runWorkerHealthCheck', () => {
 		]);
 		expect(harness.handle.stat).toHaveBeenCalledTimes(1);
 		expect(harness.handle.readFile).toHaveBeenCalledWith({ encoding: 'utf8' });
+		expect(harness.handle.close).toHaveBeenCalledTimes(1);
+	});
+
+	it('snapshots file size once before validating the bounded metadata', async () => {
+		const raw = encodeWorkerHeartbeat(heartbeatRecord());
+		let sizeReads = 0;
+		const stat = {
+			get size() {
+				sizeReads += 1;
+				return sizeReads === 1 ? 65_537 : Buffer.byteLength(raw, 'utf8');
+			},
+			isFile: vi.fn(() => true)
+		} satisfies WorkerHealthFileStat;
+		const harness = filesystemHarness({ raw, stat });
+
+		await expectUnhealthy(harness);
+		expect(sizeReads).toBe(1);
+		expect(stat.isFile).toHaveBeenCalledTimes(1);
+		expect(harness.handle.readFile).not.toHaveBeenCalled();
+		expect(harness.handle.close).toHaveBeenCalledTimes(1);
+	});
+
+	it('requires isFile to return the boolean true', async () => {
+		const raw = encodeWorkerHeartbeat(heartbeatRecord());
+		const isFile = vi.fn(() => 'yes');
+		const stat = {
+			size: Buffer.byteLength(raw, 'utf8'),
+			isFile
+		} as unknown as WorkerHealthFileStat;
+		const harness = filesystemHarness({ raw, stat });
+
+		await expectUnhealthy(harness);
+		expect(isFile).toHaveBeenCalledTimes(1);
+		expect(harness.handle.readFile).not.toHaveBeenCalled();
 		expect(harness.handle.close).toHaveBeenCalledTimes(1);
 	});
 
@@ -371,6 +406,52 @@ describe('runWorkerHealthCheck', () => {
 				})
 			)
 		).resolves.toBe(1);
+	});
+
+	it('awaits and absorbs an asynchronously rejected stderr sink', async () => {
+		const harness = filesystemHarness({ openError: new Error(ERROR_CANARY) });
+		const lines: string[] = [];
+		const unhandled: unknown[] = [];
+		let rejectSink!: (reason: unknown) => void;
+		let returnedSink: Promise<void> | undefined;
+		let rejected = false;
+		const sinkGate = new Promise<void>((_resolve, reject) => {
+			rejectSink = reject;
+		});
+		const onUnhandled = (reason: unknown): void => {
+			unhandled.push(reason);
+		};
+		process.on('unhandledRejection', onUnhandled);
+
+		try {
+			const run = runWorkerHealthCheck(
+				checkOptions(harness.filesystem, (line) => {
+					lines.push(line);
+					returnedSink = sinkGate.then(() => undefined);
+					return returnedSink;
+				})
+			);
+			let settled = false;
+			void run.then(
+				() => { settled = true; },
+				() => { settled = true; }
+			);
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(settled).toBe(false);
+
+			rejectSink(new Error(ERROR_CANARY));
+			rejected = true;
+			await expect(run).resolves.toBe(1);
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(lines).toEqual([UNHEALTHY_LINE]);
+			expect(lines.join('\n')).not.toContain(ERROR_CANARY);
+			expect(unhandled).toEqual([]);
+		} finally {
+			if (!rejected) rejectSink(new Error(ERROR_CANARY));
+			await returnedSink?.catch(() => undefined);
+			process.off('unhandledRejection', onUnhandled);
+		}
 	});
 
 	it('maps CLI configuration failures to the same fixed private result', () => {

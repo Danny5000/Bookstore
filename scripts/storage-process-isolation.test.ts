@@ -129,11 +129,13 @@ function resolveRuntimeModule(importer: string, rawSpecifier: string): string | 
 
 interface RuntimeImportGraph {
   readonly files: ReadonlySet<string>;
+  readonly externalSpecifiers: ReadonlySet<string>;
   chainTo(path: string): string;
 }
 
 function runtimeValueImportGraph(entryFiles: readonly string[]): RuntimeImportGraph {
   const files = new Set<string>();
+  const externalSpecifiers = new Set<string>();
   const parent = new Map<string, string | null>();
   const pending = entryFiles.map((path) => resolve(path));
   for (const entry of pending) parent.set(entry, null);
@@ -144,7 +146,11 @@ function runtimeValueImportGraph(entryFiles: readonly string[]): RuntimeImportGr
     files.add(current);
     for (const specifier of runtimeModuleSpecifiers(current)) {
       const dependency = resolveRuntimeModule(current, specifier);
-      if (dependency === undefined || parent.has(dependency)) continue;
+      if (dependency === undefined) {
+        externalSpecifiers.add(specifier);
+        continue;
+      }
+      if (parent.has(dependency)) continue;
       parent.set(dependency, current);
       pending.push(dependency);
     }
@@ -152,6 +158,7 @@ function runtimeValueImportGraph(entryFiles: readonly string[]): RuntimeImportGr
 
   return {
     files,
+    externalSpecifiers,
     chainTo(path) {
       const chain: string[] = [];
       let current: string | null | undefined = resolve(path);
@@ -194,12 +201,24 @@ describe('storage process isolation deployment', () => {
   it('keeps the stateless worker-health graph out of storage and application clients', () => {
     const healthLibrary = source('src/lib/server/worker/health-check.ts');
     const healthImports = runtimeModuleSpecifiers('src/lib/server/worker/health-check.ts');
+    const healthEntrypointImports = runtimeModuleSpecifiers('src/worker-health.ts');
     const healthGraph = runtimeValueImportGraph(['src/worker-health.ts']);
+    const healthExternalSpecifiers = healthGraph.externalSpecifiers;
     const relativeGraph = [...healthGraph.files]
       .map((path) => relative(process.cwd(), path).replaceAll('\\', '/'))
       .sort();
 
     expect(healthImports).toEqual(['./heartbeat-contract', 'node:fs/promises']);
+    expect(healthEntrypointImports).toEqual([
+      '$lib/server/config/worker',
+      '$lib/server/worker/health-check'
+    ]);
+    expect([...healthExternalSpecifiers].sort()).toEqual([
+      'node:buffer',
+      'node:fs',
+      'node:fs/promises',
+      'zod'
+    ]);
     for (const forbidden of [
       '/auth/',
       '/commerce/',

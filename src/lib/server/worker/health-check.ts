@@ -36,9 +36,9 @@ const nodeFilesystem: WorkerHealthFilesystem = {
 	open: (path, flags) => openFile(path, flags)
 };
 
-function reportUnhealthy(stderr: (line: string) => void): 1 {
+async function reportUnhealthy(stderr: (line: string) => void): Promise<1> {
 	try {
-		stderr(UNHEALTHY_LINE);
+		await stderr(UNHEALTHY_LINE);
 	} catch {
 		// Health checks must remain fail-closed even when the output sink is unavailable.
 	}
@@ -62,17 +62,19 @@ export async function runWorkerHealthCheck(
 
 		handle = await filesystem.open(heartbeatFile, 'r');
 		const stat = await handle.stat();
+		const size = stat.size;
+		const regular = stat.isFile();
 		if (
-			!stat.isFile() ||
-			!Number.isSafeInteger(stat.size) ||
-			stat.size < 1 ||
-			stat.size > WORKER_HEARTBEAT_MAX_BYTES
+			regular !== true ||
+			!Number.isSafeInteger(size) ||
+			size < 1 ||
+			size > WORKER_HEARTBEAT_MAX_BYTES
 		) {
 			throw new TypeError('invalid worker heartbeat file');
 		}
 
 		const raw = await handle.readFile({ encoding: 'utf8' });
-		if (Buffer.byteLength(raw, 'utf8') !== stat.size) {
+		if (Buffer.byteLength(raw, 'utf8') !== size) {
 			throw new TypeError('changed worker heartbeat file');
 		}
 
