@@ -755,7 +755,7 @@ describe('production database authority split', () => {
       "databaseEnvironmentForRole(process.env, 'owner')"
     );
     expect(workerEntrypoint).toContain(
-      "databaseEnvironmentForRole(rawWorkerEnvironment, 'worker')"
+      "loadConfig: (environment) => loadWorkerApplicationConfig(\n    databaseEnvironmentForRole(environment, 'worker')"
     );
     expect(source('src/cleanup-storage.ts')).toContain(
       "databaseEnvironmentForRole(process.env, 'storage-cleanup')"
