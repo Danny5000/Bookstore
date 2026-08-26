@@ -95,4 +95,8 @@ describe('safe diagnostic errors', () => {
     const reduced = reduceSafeError(new Error(), { operation: 'http.request', matchers: [matcher] });
     expectTypeOf(reduced.code).toEqualTypeOf<SafeCode<'first' | 'second' | 'unexpected_failure'>>();
   });
+
+  test.each(['Uppercase', '1starts_wrong', 'a'.repeat(101)])('defineSafeCode rejects invalid grammar %s', (value) => {
+    expect(() => defineSafeCode(value)).toThrow();
+  });
 });

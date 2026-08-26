@@ -62,24 +62,51 @@ const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const RUN_ID = /^[a-f0-9]{16}$/;
 const FINGERPRINT = /^[a-f0-9]{64}$/;
 const STAGES = new Set(['preflight', 'build', 'compose-config', 'migrate', 'provision', 'checkpoint-capture', 'restore-rehearsal', 'runtime-start', 'runtime-health', 'inspect', 'behavior', 'shutdown', 'cleanup']);
-const CODES: Readonly<Record<string, ReadonlySet<string>>> = {
-  'http.request.rejected': new Set(['invalid_request', 'unauthenticated', 'forbidden', 'not_found', 'method_not_allowed', 'conflict', 'payload_too_large', 'unsupported_media_type', 'invalid_input', 'rate_limited', 'request_rejected', 'maintenance_mode']),
-  'http.request.failed': new Set(['http_server_error', 'unexpected_failure']),
-  'worker.stopping': new Set(['signal_sigint', 'signal_sigterm']),
-  'worker.failed': new Set(['configuration_invalid', 'worker_identity_invalid', 'dependency_startup_failed', 'runner_failed', 'runner_stopped_unexpectedly', 'heartbeat_publication_failed', 'worker_control_failed', 'cleanup_failed', 'unexpected_failure']),
-  'worker.heartbeat_failed': new Set(['heartbeat_publication_failed']),
-  'job.failed': new Set(['permanent_job_failure', 'job_completion_failed', 'unexpected_failure']),
-  'job.lease_lost': new Set(['lease_capability_invalid', 'lease_renewal_rejected', 'lease_renewal_failed', 'completion_rejected', 'failure_transition_rejected', 'failure_transition_failed']),
-  'smoke.stage.failed': new Set(['required_stage_failed', 'timeout', 'interrupted', 'ownership_mismatch', 'configuration_mismatch', 'cleanup_failed', 'unexpected_failure']),
-  'smoke.cleanup.failed': new Set(['required_stage_failed', 'timeout', 'interrupted', 'ownership_mismatch', 'configuration_mismatch', 'cleanup_failed', 'unexpected_failure']),
-  'smoke.run.failed': new Set(['required_stage_failed', 'timeout', 'interrupted', 'ownership_mismatch', 'configuration_mismatch', 'cleanup_failed', 'unexpected_failure'])
+type Severity = 'debug' | 'info' | 'warn' | 'error';
+type Outcome = 'started' | 'succeeded' | 'failed' | 'denied';
+type PublicEvent = WebEventInput['event'] | WorkerEventInput['event'] | SmokeEventInput['event'];
+type EventName = PublicEvent | 'logging.failure';
+type EventMetadata = {
+  readonly services: readonly StructuredLogService[];
+  readonly fields: readonly string[];
+  readonly optional?: 'generation' | 'workerId';
+  readonly severity: Severity | ((values: Readonly<Record<string, string | number | boolean>>) => Severity);
+  readonly outcome: Outcome;
+  readonly sink: 'stdout' | 'stderr';
+  readonly codes?: readonly string[];
+  readonly profiles?: Partial<Record<Exclude<StructuredLogService, 'web' | 'worker'>, 'maintenance_fixture' | 'release_candidate'>>;
+  readonly internal?: true;
+};
+
+const EVENTS: Readonly<Record<EventName, EventMetadata>> = {
+  'http.request.completed': { services: ['web'], fields: ['correlationId', 'method', 'route', 'httpStatus', 'durationMs'], severity: 'info', outcome: 'succeeded', sink: 'stdout' },
+  'http.request.rejected': { services: ['web'], fields: ['correlationId', 'method', 'route', 'httpStatus', 'code', 'durationMs'], severity: 'warn', outcome: 'denied', sink: 'stderr', codes: ['invalid_request', 'unauthenticated', 'forbidden', 'not_found', 'method_not_allowed', 'conflict', 'payload_too_large', 'unsupported_media_type', 'invalid_input', 'rate_limited', 'request_rejected', 'maintenance_mode'] },
+  'http.request.failed': { services: ['web'], fields: ['correlationId', 'method', 'route', 'httpStatus', 'code', 'durationMs'], severity: 'error', outcome: 'failed', sink: 'stderr', codes: ['http_server_error', 'unexpected_failure'] },
+  'worker.started': { services: ['worker'], fields: ['workerId', 'configuredSlots'], severity: 'info', outcome: 'started', sink: 'stdout' },
+  'worker.ready': { services: ['worker'], fields: ['workerId', 'configuredSlots', 'durationMs'], severity: 'info', outcome: 'succeeded', sink: 'stdout' },
+  'worker.stopping': { services: ['worker'], fields: ['workerId', 'code'], severity: 'info', outcome: 'started', sink: 'stdout', codes: ['signal_sigint', 'signal_sigterm'] },
+  'worker.stopped': { services: ['worker'], fields: ['workerId', 'durationMs'], severity: 'info', outcome: 'succeeded', sink: 'stdout' },
+  'worker.failed': { services: ['worker'], fields: ['code'], optional: 'workerId', severity: 'error', outcome: 'failed', sink: 'stderr', codes: ['configuration_invalid', 'worker_identity_invalid', 'dependency_startup_failed', 'runner_failed', 'runner_stopped_unexpectedly', 'heartbeat_publication_failed', 'worker_control_failed', 'cleanup_failed', 'unexpected_failure'] },
+  'job.claimed': { services: ['worker'], fields: ['correlationId', 'jobId', 'jobKind', 'attempt', 'maxAttempts', 'workerId', 'slotId'], optional: 'generation', severity: 'debug', outcome: 'started', sink: 'stdout' },
+  'job.succeeded': { services: ['worker'], fields: ['correlationId', 'jobId', 'jobKind', 'attempt', 'workerId', 'slotId', 'durationMs'], optional: 'generation', severity: 'info', outcome: 'succeeded', sink: 'stdout' },
+  'job.failed': { services: ['worker'], fields: ['correlationId', 'jobId', 'jobKind', 'attempt', 'maxAttempts', 'workerId', 'slotId', 'code', 'durationMs', 'retryScheduled'], optional: 'generation', severity: (values) => values.retryScheduled === true ? 'warn' : 'error', outcome: 'failed', sink: 'stderr', codes: ['permanent_job_failure', 'job_completion_failed', 'unexpected_failure'] },
+  'job.lease_lost': { services: ['worker'], fields: ['correlationId', 'jobId', 'jobKind', 'attempt', 'workerId', 'slotId', 'code'], optional: 'generation', severity: 'warn', outcome: 'failed', sink: 'stderr', codes: ['lease_capability_invalid', 'lease_renewal_rejected', 'lease_renewal_failed', 'completion_rejected', 'failure_transition_rejected', 'failure_transition_failed'] },
+  'worker.heartbeat_failed': { services: ['worker'], fields: ['workerId', 'code'], severity: 'error', outcome: 'failed', sink: 'stderr', codes: ['heartbeat_publication_failed'] },
+  'smoke.stage.started': { services: ['plan6b-production-smoke', 'plan6b-fixture-runtime-probe', 'plan7a-release-candidate'], profiles: { 'plan6b-production-smoke': 'maintenance_fixture', 'plan6b-fixture-runtime-probe': 'maintenance_fixture', 'plan7a-release-candidate': 'release_candidate' }, fields: ['profile', 'runId', 'candidateId', 'stage'], severity: 'debug', outcome: 'started', sink: 'stdout' },
+  'smoke.stage.succeeded': { services: ['plan6b-production-smoke', 'plan6b-fixture-runtime-probe', 'plan7a-release-candidate'], profiles: { 'plan6b-production-smoke': 'maintenance_fixture', 'plan6b-fixture-runtime-probe': 'maintenance_fixture', 'plan7a-release-candidate': 'release_candidate' }, fields: ['profile', 'runId', 'candidateId', 'stage', 'durationMs'], severity: 'info', outcome: 'succeeded', sink: 'stdout' },
+  'smoke.stage.failed': { services: ['plan6b-production-smoke', 'plan6b-fixture-runtime-probe', 'plan7a-release-candidate'], profiles: { 'plan6b-production-smoke': 'maintenance_fixture', 'plan6b-fixture-runtime-probe': 'maintenance_fixture', 'plan7a-release-candidate': 'release_candidate' }, fields: ['profile', 'runId', 'candidateId', 'stage', 'code', 'durationMs'], severity: 'error', outcome: 'failed', sink: 'stderr', codes: ['required_stage_failed', 'timeout', 'interrupted', 'ownership_mismatch', 'configuration_mismatch', 'cleanup_failed', 'unexpected_failure'] },
+  'smoke.cleanup.succeeded': { services: ['plan6b-production-smoke', 'plan6b-fixture-runtime-probe', 'plan7a-release-candidate'], profiles: { 'plan6b-production-smoke': 'maintenance_fixture', 'plan6b-fixture-runtime-probe': 'maintenance_fixture', 'plan7a-release-candidate': 'release_candidate' }, fields: ['profile', 'runId', 'candidateId', 'durationMs', 'containerCount', 'networkCount', 'volumeCount', 'temporaryRootCount'], severity: 'info', outcome: 'succeeded', sink: 'stdout' },
+  'smoke.cleanup.failed': { services: ['plan6b-production-smoke', 'plan6b-fixture-runtime-probe', 'plan7a-release-candidate'], profiles: { 'plan6b-production-smoke': 'maintenance_fixture', 'plan6b-fixture-runtime-probe': 'maintenance_fixture', 'plan7a-release-candidate': 'release_candidate' }, fields: ['profile', 'runId', 'candidateId', 'code', 'durationMs', 'containerCount', 'networkCount', 'volumeCount', 'temporaryRootCount'], severity: 'error', outcome: 'failed', sink: 'stderr', codes: ['required_stage_failed', 'timeout', 'interrupted', 'ownership_mismatch', 'configuration_mismatch', 'cleanup_failed', 'unexpected_failure'] },
+  'smoke.run.succeeded': { services: ['plan6b-production-smoke', 'plan6b-fixture-runtime-probe', 'plan7a-release-candidate'], profiles: { 'plan6b-production-smoke': 'maintenance_fixture', 'plan6b-fixture-runtime-probe': 'maintenance_fixture', 'plan7a-release-candidate': 'release_candidate' }, fields: ['profile', 'runId', 'candidateId', 'durationMs', 'evidenceFingerprint'], severity: 'info', outcome: 'succeeded', sink: 'stdout' },
+  'smoke.run.failed': { services: ['plan6b-production-smoke', 'plan6b-fixture-runtime-probe', 'plan7a-release-candidate'], profiles: { 'plan6b-production-smoke': 'maintenance_fixture', 'plan6b-fixture-runtime-probe': 'maintenance_fixture', 'plan7a-release-candidate': 'release_candidate' }, fields: ['profile', 'runId', 'candidateId', 'stage', 'code', 'durationMs'], severity: 'error', outcome: 'failed', sink: 'stderr', codes: ['required_stage_failed', 'timeout', 'interrupted', 'ownership_mismatch', 'configuration_mismatch', 'cleanup_failed', 'unexpected_failure'] },
+  'logging.failure': { services: ['web', 'worker', 'plan6b-production-smoke', 'plan6b-fixture-runtime-probe', 'plan7a-release-candidate'], fields: [], severity: 'error', outcome: 'failed', sink: 'stderr', internal: true }
 };
 
 function invalid(): never { throw new TypeError('invalid structured event'); }
 export function isSafeToken(value: unknown): value is string { return typeof value === 'string' && TOKEN.test(value); }
 export function isCorrelationId(value: unknown): value is CorrelationId { return typeof value === 'string' && CORRELATION.test(value); }
 export function isPositiveSignedInt32(value: unknown): value is number { return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 && value <= 2_147_483_647; }
-function isService(value: unknown): value is StructuredLogService { return value === 'web' || value === 'worker' || value === 'plan6b-production-smoke' || value === 'plan6b-fixture-runtime-probe' || value === 'plan7a-release-candidate'; }
+function isService(value: unknown): value is StructuredLogService { return typeof value === 'string' && EVENTS['logging.failure'].services.includes(value as StructuredLogService); }
 function object(value: unknown): Record<string, unknown> {
   try {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) invalid();
@@ -95,85 +122,58 @@ function object(value: unknown): Record<string, unknown> {
   } catch { return invalid(); }
 }
 function exact(value: unknown, keys: readonly string[]): Record<string, unknown> {
-  const record = object(value);
-  const actual = Reflect.ownKeys(record);
+  const record = object(value); const actual = Reflect.ownKeys(record);
   if (actual.length !== keys.length || actual.some((key) => typeof key !== 'string' || !keys.includes(key))) invalid();
   return record;
 }
 function string(value: unknown, pattern: RegExp): string { return typeof value === 'string' && pattern.test(value) ? value : invalid(); }
 function integer(value: unknown, min: number, max: number): number { return typeof value === 'number' && Number.isSafeInteger(value) && value >= min && value <= max ? value : invalid(); }
 function positive(value: unknown): number { return isPositiveSignedInt32(value) ? value : invalid(); }
-function bool(value: unknown): boolean { return typeof value === 'boolean' ? value : invalid(); }
-function code(event: string, value: unknown): string { const value_ = string(value, TOKEN); return CODES[event]?.has(value_) ? value_ : invalid(); }
 function timestamp(value: string): string { try { return new Date(value).toISOString() === value ? value : invalid(); } catch { return invalid(); } }
 function put(record: Record<string, string | number | boolean>, key: string, value: string | number | boolean): void { record[key] = value; }
-
-function http(value: unknown, event: string, timestamp_: string, service: 'web'): ValidatedStructuredRecord {
-  const keyed = exact(value, event === 'http.request.completed' ? ['event', 'correlationId', 'method', 'route', 'httpStatus', 'durationMs'] : ['event', 'correlationId', 'method', 'route', 'httpStatus', 'code', 'durationMs']);
-  const record: Record<string, string | number | boolean> = { version: 1, timestamp: timestamp_, severity: event === 'http.request.completed' ? 'info' : event === 'http.request.rejected' ? 'warn' : 'error', service, event, outcome: event === 'http.request.completed' ? 'succeeded' : event === 'http.request.rejected' ? 'denied' : 'failed' };
-  put(record, 'correlationId', string(keyed.correlationId, CORRELATION)); put(record, 'method', string(keyed.method, /^[A-Z]{1,16}$/)); put(record, 'route', string(keyed.route, /^.{1,200}$/)); put(record, 'httpStatus', integer(keyed.httpStatus, 100, 599));
-  if (event !== 'http.request.completed') put(record, 'code', code(event, keyed.code));
-  put(record, 'durationMs', integer(keyed.durationMs, 0, 86_400_000));
-  return { record, sink: event === 'http.request.completed' ? 'stdout' : 'stderr' };
-}
-
-function worker(value: unknown, event: string, timestamp_: string): ValidatedStructuredRecord {
-  const specs: Readonly<Record<string, readonly string[]>> = {
-    'worker.started': ['event', 'workerId', 'configuredSlots'], 'worker.ready': ['event', 'workerId', 'configuredSlots', 'durationMs'], 'worker.stopping': ['event', 'workerId', 'code'], 'worker.stopped': ['event', 'workerId', 'durationMs'], 'worker.failed': ['event', 'code', 'workerId'], 'worker.heartbeat_failed': ['event', 'workerId', 'code'],
-    'job.claimed': ['event', 'correlationId', 'jobId', 'jobKind', 'attempt', 'maxAttempts', 'workerId', 'slotId', 'generation'], 'job.succeeded': ['event', 'correlationId', 'jobId', 'jobKind', 'attempt', 'workerId', 'slotId', 'durationMs'], 'job.failed': ['event', 'correlationId', 'jobId', 'jobKind', 'attempt', 'maxAttempts', 'workerId', 'slotId', 'code', 'durationMs', 'retryScheduled'], 'job.lease_lost': ['event', 'correlationId', 'jobId', 'jobKind', 'attempt', 'workerId', 'slotId', 'code']
-  };
-  let keyed: Record<string, unknown>;
-  if (event === 'worker.failed') {
-    const raw = object(value); const keys = Object.keys(raw); if (!keys.every((key) => ['event', 'code', 'workerId'].includes(key)) || !keys.includes('event') || !keys.includes('code')) invalid(); keyed = raw;
-  } else if (event.startsWith('job.')) {
-    const raw = object(value); const base = specs[event]!; const permitted = [...base, 'generation']; const keys = Object.keys(raw); if (!keys.every((key) => permitted.includes(key)) || base.some((key) => key !== 'generation' && !keys.includes(key))) invalid(); keyed = raw;
-  } else keyed = exact(value, specs[event]!);
-  const retry = event === 'job.failed' ? bool(keyed.retryScheduled) : false;
-  const severity = event === 'worker.started' || event === 'worker.ready' || event === 'worker.stopping' || event === 'worker.stopped' || event === 'job.succeeded' ? 'info' : event === 'job.claimed' ? 'debug' : event === 'job.failed' && retry ? 'warn' : event === 'job.lease_lost' ? 'warn' : 'error';
-  const outcome = event === 'worker.started' || event === 'worker.stopping' || event === 'job.claimed' ? 'started' : event === 'worker.ready' || event === 'worker.stopped' || event === 'job.succeeded' ? 'succeeded' : 'failed';
-  const record: Record<string, string | number | boolean> = { version: 1, timestamp: timestamp_, severity, service: 'worker', event, outcome };
-  if (event.startsWith('job.')) { put(record, 'correlationId', string(keyed.correlationId, CORRELATION)); put(record, 'jobId', string(keyed.jobId, UUID)); put(record, 'jobKind', string(keyed.jobKind, TOKEN)); put(record, 'attempt', positive(keyed.attempt)); if ('maxAttempts' in keyed) put(record, 'maxAttempts', positive(keyed.maxAttempts)); put(record, 'workerId', string(keyed.workerId, WORKER_ID)); put(record, 'slotId', integer(keyed.slotId, 0, 2_147_483_647)); if ('code' in keyed) put(record, 'code', code(event, keyed.code)); if ('durationMs' in keyed) put(record, 'durationMs', integer(keyed.durationMs, 0, 86_400_000)); if ('retryScheduled' in keyed) put(record, 'retryScheduled', retry); if ('generation' in keyed) put(record, 'generation', positive(keyed.generation)); }
-  else {
-    if (event === 'worker.failed') {
-      put(record, 'code', code(event, keyed.code));
-      if ('workerId' in keyed) put(record, 'workerId', string(keyed.workerId, WORKER_ID));
-    } else {
-      if ('workerId' in keyed) put(record, 'workerId', string(keyed.workerId, WORKER_ID));
-      if ('configuredSlots' in keyed) put(record, 'configuredSlots', positive(keyed.configuredSlots));
-      if ('code' in keyed) put(record, 'code', code(event, keyed.code));
-      if ('durationMs' in keyed) put(record, 'durationMs', integer(keyed.durationMs, 0, 86_400_000));
-    }
+function fieldValue(field: string, value: unknown, metadata: EventMetadata, service: StructuredLogService): string | number | boolean {
+  switch (field) {
+    case 'correlationId': return string(value, CORRELATION);
+    case 'method': return string(value, /^[A-Z]{1,16}$/);
+    case 'route': return string(value, /^.{1,200}$/);
+    case 'httpStatus': return integer(value, 100, 599);
+    case 'workerId': return string(value, WORKER_ID);
+    case 'configuredSlots': case 'attempt': case 'maxAttempts': case 'generation': return positive(value);
+    case 'durationMs': return integer(value, 0, 86_400_000);
+    case 'jobId': case 'candidateId': return string(value, UUID);
+    case 'jobKind': return string(value, TOKEN);
+    case 'slotId': case 'containerCount': case 'networkCount': case 'volumeCount': case 'temporaryRootCount': return integer(value, 0, 2_147_483_647);
+    case 'retryScheduled': return typeof value === 'boolean' ? value : invalid();
+    case 'code': { const code = string(value, TOKEN); return metadata.codes?.includes(code) ? code : invalid(); }
+    case 'profile': return metadata.profiles?.[service as Exclude<StructuredLogService, 'web' | 'worker'>] === value ? value as 'maintenance_fixture' | 'release_candidate' : invalid();
+    case 'runId': return string(value, RUN_ID);
+    case 'stage': { const stage = string(value, TOKEN); return STAGES.has(stage) ? stage : invalid(); }
+    case 'evidenceFingerprint': return string(value, FINGERPRINT);
+    default: return invalid();
   }
-  return { record, sink: event === 'job.claimed' || event === 'job.succeeded' || event.startsWith('worker.') && !event.endsWith('failed') ? 'stdout' : 'stderr' };
 }
-
-function smoke(value: unknown, event: string, timestamp_: string, service: Exclude<StructuredLogService, 'web' | 'worker'>): ValidatedStructuredRecord {
-  const keys: Readonly<Record<string, readonly string[]>> = {
-    'smoke.stage.started': ['event', 'profile', 'runId', 'candidateId', 'stage'], 'smoke.stage.succeeded': ['event', 'profile', 'runId', 'candidateId', 'stage', 'durationMs'], 'smoke.stage.failed': ['event', 'profile', 'runId', 'candidateId', 'stage', 'code', 'durationMs'], 'smoke.cleanup.succeeded': ['event', 'profile', 'runId', 'candidateId', 'durationMs', 'containerCount', 'networkCount', 'volumeCount', 'temporaryRootCount'], 'smoke.cleanup.failed': ['event', 'profile', 'runId', 'candidateId', 'code', 'durationMs', 'containerCount', 'networkCount', 'volumeCount', 'temporaryRootCount'], 'smoke.run.succeeded': ['event', 'profile', 'runId', 'candidateId', 'durationMs', 'evidenceFingerprint'], 'smoke.run.failed': ['event', 'profile', 'runId', 'candidateId', 'stage', 'code', 'durationMs']
-  };
-  const keyed = exact(value, keys[event]!); const success = event.endsWith('succeeded'); const started = event.endsWith('started');
-  const record: Record<string, string | number | boolean> = { version: 1, timestamp: timestamp_, severity: started ? 'debug' : success ? 'info' : 'error', service, event, outcome: started ? 'started' : success ? 'succeeded' : 'failed' };
-  put(record, 'profile', keyed.profile === 'maintenance_fixture' || keyed.profile === 'release_candidate' ? keyed.profile : invalid()); put(record, 'runId', string(keyed.runId, RUN_ID)); put(record, 'candidateId', string(keyed.candidateId, UUID));
-  if ('stage' in keyed) { const stage = string(keyed.stage, TOKEN); put(record, 'stage', STAGES.has(stage) ? stage : invalid()); } if ('code' in keyed) put(record, 'code', code(event, keyed.code)); if ('durationMs' in keyed) put(record, 'durationMs', integer(keyed.durationMs, 0, 86_400_000)); for (const key of ['containerCount', 'networkCount', 'volumeCount', 'temporaryRootCount'] as const) if (key in keyed) put(record, key, integer(keyed[key], 0, 2_147_483_647)); if ('evidenceFingerprint' in keyed) put(record, 'evidenceFingerprint', string(keyed.evidenceFingerprint, FINGERPRINT));
-  return { record, sink: started || success ? 'stdout' : 'stderr' };
+function construct(event: EventName, metadata: EventMetadata, service: StructuredLogService, timestamp_: string, values: Readonly<Record<string, string | number | boolean>>): ValidatedStructuredRecord {
+  const severity = typeof metadata.severity === 'function' ? metadata.severity(values) : metadata.severity;
+  const record: Record<string, string | number | boolean> = { version: 1, timestamp: timestamp_, severity, service, event, outcome: metadata.outcome };
+  for (const field of metadata.fields) put(record, field, values[field]!);
+  if (metadata.optional !== undefined && metadata.optional in values) put(record, metadata.optional, values[metadata.optional]!);
+  return { record, sink: metadata.sink };
 }
 
 export function validateStructuredEvent<S extends StructuredLogService>(service: S, valueTimestamp: string, input: StructuredEventInputFor<S>): ValidatedStructuredRecord {
   if (!isService(service)) return invalid();
-  const timestamp_ = timestamp(valueTimestamp); const raw = object(input); const event = string(raw.event, TOKEN);
-  if (service === 'web' && ['http.request.completed', 'http.request.rejected', 'http.request.failed'].includes(event)) return http(input, event, timestamp_, service);
-  if (service === 'worker' && ['worker.started', 'worker.ready', 'worker.stopping', 'worker.stopped', 'worker.failed', 'job.claimed', 'job.succeeded', 'job.failed', 'job.lease_lost', 'worker.heartbeat_failed'].includes(event)) return worker(input, event, timestamp_);
-  if (service !== 'web' && service !== 'worker' && ['smoke.stage.started', 'smoke.stage.succeeded', 'smoke.stage.failed', 'smoke.cleanup.succeeded', 'smoke.cleanup.failed', 'smoke.run.succeeded', 'smoke.run.failed'].includes(event)) {
-    const profile = object(input).profile;
-    if ((service === 'plan7a-release-candidate') !== (profile === 'release_candidate') || (service !== 'plan7a-release-candidate' && profile !== 'maintenance_fixture')) invalid();
-    return smoke(input, event, timestamp_, service);
-  }
-  return invalid();
+  const raw = object(input); const event = string(raw.event, TOKEN); const metadata = EVENTS[event as EventName];
+  if (!metadata || metadata.internal || !metadata.services.includes(service)) return invalid();
+  const keys = ['event', ...metadata.fields, ...(metadata.optional === undefined ? [] : [metadata.optional])];
+  const hasOptional = metadata.optional !== undefined && Object.hasOwn(raw, metadata.optional);
+  const keyed = exact(raw, hasOptional ? keys : keys.filter((key) => key !== metadata.optional));
+  const values: Record<string, string | number | boolean> = {};
+  for (const field of metadata.fields) values[field] = fieldValue(field, keyed[field], metadata, service);
+  if (metadata.optional !== undefined && hasOptional) values[metadata.optional] = fieldValue(metadata.optional, keyed[metadata.optional], metadata, service);
+  return construct(event as PublicEvent, metadata, service, timestamp(valueTimestamp), values);
 }
 
 export function validateLoggingFailure(service: StructuredLogService, valueTimestamp: string): ValidatedStructuredRecord {
-  if (arguments.length !== 2) return invalid();
-  if (!isService(service)) return invalid();
-  const timestamp_ = timestamp(valueTimestamp);
-  return { record: { version: 1, timestamp: timestamp_, severity: 'error', service, event: 'logging.failure', outcome: 'failed' }, sink: 'stderr' };
+  if (arguments.length !== 2 || !isService(service)) return invalid();
+  return construct('logging.failure', EVENTS['logging.failure'], service, timestamp(valueTimestamp), {});
 }

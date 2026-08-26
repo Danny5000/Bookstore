@@ -229,4 +229,18 @@ describe('structured event contracts', () => {
     expect(() => validate(claimed, { ...claimed.input, generation: undefined })).toThrow();
     expect(() => validate(failed, { ...failed.input, workerId: undefined })).toThrow();
   });
+
+  test('accepts literal lower edges for HTTP and diagnostic identifiers', () => {
+    expect(() => validate(webCompleted, { ...webCompleted.input, correlationId: 'a', method: 'A', route: 'x', httpStatus: 100 })).not.toThrow();
+    const started = cases.find((entry) => entry.input.event === 'worker.started')!;
+    expect(() => validate(started, { ...started.input, workerId: 'a' })).not.toThrow();
+  });
+
+  test.each([
+    ['runId', 'a'.repeat(17)], ['evidenceFingerprint', 'a'.repeat(65)], ['candidateId', 'a'.repeat(35)],
+    ['candidateId', 'a'.repeat(37)], ['jobId', 'a'.repeat(35)], ['jobId', 'a'.repeat(37)]
+  ])('rejects documented identifier length neighbor %s', (key, value) => {
+    const case_ = cases.find((entry) => Object.hasOwn(entry.input, key))!;
+    expect(() => validate(case_, { ...case_.input, [key]: value })).toThrow();
+  });
 });
