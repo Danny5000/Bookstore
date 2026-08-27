@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { SQL } from 'drizzle-orm';
+import { DrizzleQueryError, type SQL } from 'drizzle-orm';
 import { describe, expect, it, vi } from 'vitest';
 import type { JobRow } from '$lib/server/db/schema';
 import type { DatabaseTransaction } from '$lib/server/db/transaction';
@@ -14,6 +14,10 @@ import {
   enqueueJob,
   jobInsertQuery
 } from './repository';
+import type {
+  OperationsJobLeaseAuthority,
+  OperationsJobSafeError
+} from './types';
 
 const SOURCE_ID = '00000000-0000-4000-8000-000000001611';
 const NOW = new Date('2026-08-12T12:00:00.000Z');
@@ -21,6 +25,11 @@ const FINANCIAL_ADMIN_JOB = 'commerce.financial-admin-command';
 const FINANCIAL_ADMIN_COMMAND_ID = '00000000-0000-4000-8000-000000001701';
 const FINANCIAL_ADMIN_JOB_ID = '00000000-0000-4000-8000-000000001702';
 const FINANCIAL_ADMIN_LEASE_CAPABILITY = 'B'.repeat(43);
+const OPERATIONS_JOB = 'operations.job-retry-command';
+const OPERATIONS_COMMAND_ID = '00000000-0000-4000-8000-000000001801';
+const OPERATIONS_JOB_ID = '00000000-0000-4000-8000-000000001802';
+const OPERATIONS_LEASE_CAPABILITY = 'O'.repeat(43);
+const OPERATIONS_WORKER = 'operations-worker';
 
 function jobRow(overrides: Partial<JobRow> = {}): JobRow {
   return {
@@ -1305,5 +1314,587 @@ describe('job failure committed retry disposition', () => {
 
     expect(result).toBe(expected);
     expect(typeof result).toBe('boolean');
+  });
+});
+
+function operationsCandidate(overrides: Readonly<Record<string, unknown>> = {}) {
+  return {
+    ...jobRow({
+      id: OPERATIONS_JOB_ID,
+      type: OPERATIONS_JOB,
+      payload: { commandId: OPERATIONS_COMMAND_ID },
+      deduplicationKey: `operations:job-retry-command:${OPERATIONS_COMMAND_ID}:v1`,
+      status: 'pending',
+      attempts: 0,
+      maxAttempts: 8,
+      lockedAt: null,
+      lockedBy: null
+    }),
+    priorStatus: 'pending',
+    hadRerunRequest: false,
+    ...overrides
+  };
+}
+
+function operationsClaimRow(overrides: Readonly<Record<string, unknown>> = {}) {
+  return {
+    id: OPERATIONS_JOB_ID,
+    type: OPERATIONS_JOB,
+    payload: { commandId: OPERATIONS_COMMAND_ID },
+    deduplicationKey: `operations:job-retry-command:${OPERATIONS_COMMAND_ID}:v1`,
+    attempts: 1,
+    maxAttempts: 8,
+    lockedBy: OPERATIONS_WORKER,
+    operationsJobLeaseGeneration: 1,
+    ...overrides
+  };
+}
+
+function operationsAuthority(
+  overrides: Partial<OperationsJobLeaseAuthority> = {}
+): OperationsJobLeaseAuthority {
+  return {
+    jobId: OPERATIONS_JOB_ID,
+    leaseOwner: OPERATIONS_WORKER,
+    attempt: 1,
+    maxAttempts: 8,
+    generation: 1,
+    capability: OPERATIONS_LEASE_CAPABILITY,
+    ...overrides
+  };
+}
+
+const OPERATIONS_ROUTINES = [
+  'plan7a_operations_claim_job',
+  'plan7a_operations_renew_job_claim',
+  'plan7a_operations_relinquish_job',
+  'plan7a_operations_complete_job',
+  'plan7a_operations_fail_job',
+  'plan7a_operations_exhaust_job'
+] as const;
+
+type OperationsRoutine = typeof OPERATIONS_ROUTINES[number];
+
+function operationsHarness(input: {
+  readonly candidateRows?: readonly unknown[];
+  readonly claimRows?: readonly unknown[];
+  readonly appliedRows?: readonly unknown[];
+  readonly routineFailure?: unknown;
+  readonly operationsCapabilitySource?: () => unknown;
+} = {}) {
+  const calls: SQL[] = [];
+  const candidateRows = input.candidateRows ?? [operationsCandidate()];
+  const execute = vi.fn(async (query: SQL) => {
+    calls.push(query);
+    const statement = rendered(query).sql;
+    if (statement.includes('for update skip locked')) return { rows: candidateRows };
+    const routine = OPERATIONS_ROUTINES.find((name) => statement.includes(name));
+    if (routine !== undefined) {
+      if (input.routineFailure !== undefined) throw input.routineFailure;
+      return {
+        rows: routine === 'plan7a_operations_claim_job'
+          ? input.claimRows ?? [operationsClaimRow()]
+          : input.appliedRows ?? [{ applied: true }]
+      };
+    }
+    return { rows: [] };
+  });
+  const transaction = { execute };
+  const database = {
+    transaction: vi.fn(async (work: (tx: unknown) => Promise<unknown>) => work(transaction))
+  };
+  const financialCapabilitySource = vi.fn(() => FINANCIAL_ADMIN_LEASE_CAPABILITY);
+  const operationsCapabilitySource = vi.fn(
+    (input.operationsCapabilitySource ?? (() => OPERATIONS_LEASE_CAPABILITY)) as () => string
+  );
+  const nowSource = vi.fn(() => NOW);
+  const repository = createPostgresJobRepository(
+    database as never,
+    {
+      pollIntervalMs: 1,
+      leaseMs: 30_000,
+      retryBaseMs: 10,
+      retryMaxMs: 1_000
+    },
+    nowSource,
+    'all',
+    { classifierVersion: 2, allocationAlgorithmVersion: 3 },
+    financialCapabilitySource,
+    operationsCapabilitySource
+  );
+  return {
+    calls,
+    database,
+    execute,
+    financialCapabilitySource,
+    nowSource,
+    operationsCapabilitySource,
+    repository
+  };
+}
+
+async function repositoryFailure(operation: Promise<unknown>): Promise<Error> {
+  try {
+    await operation;
+  } catch (error) {
+    expect(error).toBeInstanceOf(Error);
+    return error as Error;
+  }
+  throw new Error('Expected repository operation to reject');
+}
+
+function expectOperationsAuthorityFailure(error: Error): void {
+  expect(error).toEqual(new Error('Operations job lease authority failed'));
+  expect(error.name).toBe('Error');
+  expect(Object.hasOwn(error, 'cause')).toBe(false);
+  expect(Object.hasOwn(error, 'query')).toBe(false);
+  expect(Object.hasOwn(error, 'params')).toBe(false);
+  expect(JSON.stringify(error)).not.toMatch(/private|plan7a_operations|capability/iu);
+}
+
+function operationsRoutineCall(calls: readonly SQL[], routine: OperationsRoutine) {
+  return calls.map(rendered).find((call) => call.sql.includes(routine));
+}
+
+describe('operations job lease authority transport', () => {
+  it('claims an operations candidate with PostgreSQL time and one fresh operations capability', async () => {
+    const harness = operationsHarness();
+
+    await expect(harness.repository.claimNext(OPERATIONS_WORKER)).resolves.toEqual({
+      ...operationsClaimRow(),
+      operationsJobLeaseCapability: OPERATIONS_LEASE_CAPABILITY
+    });
+
+    expect(harness.database.transaction).toHaveBeenCalledOnce();
+    expect(harness.operationsCapabilitySource).toHaveBeenCalledOnce();
+    expect(harness.financialCapabilitySource).not.toHaveBeenCalled();
+    const statements = harness.calls.map(rendered);
+    const candidate = statements.find((call) => call.sql.includes('for update skip locked'))!;
+    expect(candidate.params.filter((value) => value === OPERATIONS_JOB)).toHaveLength(4);
+    expect(candidate.sql.match(
+      /jobs[.]run_at <= pg_catalog[.]clock_timestamp[(][)]/gu
+    )).toHaveLength(2);
+    expect(candidate.sql).toMatch(
+      /jobs[.]type in [(]\$\d+,\s*\$\d+[)]\s+and jobs[.]run_at <= pg_catalog[.]clock_timestamp[(][)]/u
+    );
+    expect(candidate.sql).not.toMatch(
+      /jobs[.]type = \$\d+\s+and jobs[.]locked_at <= \$\d+/u
+    );
+
+    const setting = statements.find((call) =>
+      call.sql.includes('pale_orbit.plan7a_operations_job_capability'))!;
+    expect(setting.params).toEqual([OPERATIONS_LEASE_CAPABILITY]);
+    expect(setting.sql).not.toContain('plan6bii_financial_admin');
+    const claim = operationsRoutineCall(harness.calls, 'plan7a_operations_claim_job')!;
+    expect(claim.params).toEqual([OPERATIONS_JOB_ID, OPERATIONS_WORKER, 30_000]);
+    expect(claim.sql).toMatch(/from public[.]plan7a_operations_claim_job/u);
+    expect(statements.every((call) => !call.sql.includes('plan6bii_financial_admin'))).toBe(true);
+  });
+
+  it('lets the protected claim routine exclusively synchronize an expired ceiling target', async () => {
+    const harness = operationsHarness({
+      candidateRows: [operationsCandidate({
+        status: 'running',
+        priorStatus: 'running',
+        attempts: 8,
+        maxAttempts: 8,
+        lockedAt: new Date('2026-08-12T11:00:00.000Z'),
+        lockedBy: 'expired-operations-worker',
+        runAt: new Date('2026-08-12T11:30:00.000Z')
+      })],
+      claimRows: []
+    });
+
+    await expect(harness.repository.claimNext(OPERATIONS_WORKER)).resolves.toBeNull();
+
+    expect(harness.operationsCapabilitySource).toHaveBeenCalledOnce();
+    expect(operationsRoutineCall(harness.calls, 'plan7a_operations_claim_job')?.params)
+      .toEqual([OPERATIONS_JOB_ID, OPERATIONS_WORKER, 30_000]);
+    expect(harness.calls.map(rendered).filter((call) =>
+      call.sql.includes('plan7a_operations_')).map((call) => call.sql))
+      .toHaveLength(2);
+    expect(operationsRoutineCall(harness.calls, 'plan7a_operations_exhaust_job'))
+      .toBeUndefined();
+    expect(harness.calls.map(rendered).some((call) =>
+      call.sql.trimStart().startsWith('update jobs'))).toBe(false);
+  });
+
+  it.each([
+    { label: 'a throwing source', source: () => { throw new Error('private source detail'); } },
+    { label: 'a non-string source', source: () => 43 },
+    { label: 'a short source', source: () => 'short' },
+    { label: 'an object source', source: () => new String(OPERATIONS_LEASE_CAPABILITY) },
+    {
+      label: 'a hostile callable source',
+      source: new Proxy(() => OPERATIONS_LEASE_CAPABILITY, {
+        apply: () => { throw new Error('private callable source detail'); }
+      })
+    }
+  ])('collapses $label to the fixed capability-generation error', async ({ source }) => {
+    const harness = operationsHarness({ operationsCapabilitySource: source });
+
+    const error = await repositoryFailure(harness.repository.claimNext(OPERATIONS_WORKER));
+
+    expect(error).toEqual(new Error('Operations job lease capability generation failed'));
+    expect(Object.hasOwn(error, 'cause')).toBe(false);
+    expect(JSON.stringify(error)).not.toContain('private source detail');
+    expect(harness.calls).toHaveLength(1);
+    expect(rendered(harness.calls[0]!).sql).toContain('for update skip locked');
+  });
+
+  it.each([
+    { label: 'multiple rows', rows: [operationsClaimRow(), operationsClaimRow()] },
+    {
+      label: 'a missing generation',
+      rows: [{
+        id: OPERATIONS_JOB_ID,
+        type: OPERATIONS_JOB,
+        payload: { commandId: OPERATIONS_COMMAND_ID },
+        deduplicationKey: `operations:job-retry-command:${OPERATIONS_COMMAND_ID}:v1`,
+        attempts: 1,
+        maxAttempts: 8,
+        lockedBy: OPERATIONS_WORKER
+      }]
+    },
+    {
+      label: 'a mismatched job',
+      rows: [operationsClaimRow({
+        id: '00000000-0000-4000-8000-000000001899'
+      })]
+    },
+    {
+      label: 'an invalid lease owner',
+      rows: [operationsClaimRow({ lockedBy: 'invalid owner' })]
+    },
+    {
+      label: 'an extra field',
+      rows: [operationsClaimRow({ clearCapability: OPERATIONS_LEASE_CAPABILITY })]
+    },
+    {
+      label: 'a proxy row',
+      rows: [new Proxy(operationsClaimRow(), {
+        ownKeys: () => { throw new Error('private row proxy detail'); }
+      })]
+    },
+    { label: 'a sparse result', rows: new Array<unknown>(1) }
+  ])('rejects $label from the protected claim routine', async ({ rows }) => {
+    const harness = operationsHarness({ claimRows: rows });
+
+    expectOperationsAuthorityFailure(
+      await repositoryFailure(harness.repository.claimNext(OPERATIONS_WORKER))
+    );
+  });
+
+  it('binds exact validated authority to renew and complete routines', async () => {
+    for (const operation of ['renewOperationsJobLease', 'completeOperationsJob'] as const) {
+      const harness = operationsHarness();
+      const authority = operationsAuthority({ attempt: 3, generation: 7 });
+
+      await expect(harness.repository[operation](authority)).resolves.toBe(true);
+
+      expect(harness.calls).toHaveLength(2);
+      const statements = harness.calls.map(rendered);
+      expect(statements[0]?.sql).toContain('pale_orbit.plan7a_operations_job_capability');
+      expect(statements[0]?.params).toEqual([OPERATIONS_LEASE_CAPABILITY]);
+      expect(statements.every((call) => !call.sql.includes('plan6bii_financial_admin')))
+        .toBe(true);
+      const routine = operation === 'renewOperationsJobLease'
+        ? 'plan7a_operations_renew_job_claim'
+        : 'plan7a_operations_complete_job';
+      expect(operationsRoutineCall(harness.calls, routine)?.params).toEqual([
+        OPERATIONS_JOB_ID,
+        OPERATIONS_WORKER,
+        3,
+        7
+      ]);
+    }
+  });
+
+  it.each([
+    {
+      label: 'a handler retry below the ceiling',
+      authority: operationsAuthority({ attempt: 3, generation: 4 }),
+      safeError: 'Transient job handler failure' as OperationsJobSafeError,
+      retryable: true,
+      routine: 'plan7a_operations_relinquish_job' as const,
+      parameters: [
+        OPERATIONS_JOB_ID, OPERATIONS_WORKER, 3, 4,
+        'Transient job handler failure', 40
+      ],
+      expected: { applied: true, retryScheduled: true }
+    },
+    {
+      label: 'a completion retry below the ceiling',
+      authority: operationsAuthority({ attempt: 2, generation: 5 }),
+      safeError: 'Transient job completion failure' as OperationsJobSafeError,
+      retryable: true,
+      routine: 'plan7a_operations_relinquish_job' as const,
+      parameters: [
+        OPERATIONS_JOB_ID, OPERATIONS_WORKER, 2, 5,
+        'Transient job completion failure', 20
+      ],
+      expected: { applied: true, retryScheduled: true }
+    },
+    {
+      label: 'a retry at the ceiling',
+      authority: operationsAuthority({ attempt: 8, generation: 9 }),
+      safeError: 'Transient job handler failure' as OperationsJobSafeError,
+      retryable: true,
+      routine: 'plan7a_operations_exhaust_job' as const,
+      parameters: [OPERATIONS_JOB_ID, OPERATIONS_WORKER, 8, 9],
+      expected: { applied: true, retryScheduled: false }
+    },
+    ...([
+      'Invalid operations job retry command identity.',
+      'Operations job retry command permanently failed.',
+      'Permanent job handler failure'
+    ] as const).map((safeError, index) => ({
+      label: `permanent failure ${index + 1}`,
+      authority: operationsAuthority({ attempt: 2, generation: 10 + index }),
+      safeError,
+      retryable: false,
+      routine: 'plan7a_operations_fail_job' as const,
+      parameters: [OPERATIONS_JOB_ID, OPERATIONS_WORKER, 2, 10 + index, safeError],
+      expected: { applied: true, retryScheduled: false }
+    }))
+  ])('routes $label to its one protected settlement routine', async ({
+    authority,
+    safeError,
+    retryable,
+    routine,
+    parameters,
+    expected
+  }) => {
+    const harness = operationsHarness();
+
+    await expect(harness.repository.failOperationsJob(
+      authority,
+      safeError,
+      retryable
+    )).resolves.toEqual(expected);
+
+    expect(harness.calls).toHaveLength(2);
+    expect(operationsRoutineCall(harness.calls, routine)?.params).toEqual(parameters);
+    expect(harness.calls.map(rendered).filter((call) =>
+      OPERATIONS_ROUTINES.some((name) => call.sql.includes(name))))
+      .toHaveLength(1);
+  });
+
+  it('rejects every malformed authority without invoking accessors, proxies, or SQL', async () => {
+    let accessorReads = 0;
+    let proxyTraps = 0;
+    const accessor = Object.defineProperty(
+      { ...operationsAuthority() },
+      'capability',
+      {
+        enumerable: true,
+        get: () => {
+          accessorReads += 1;
+          throw new Error('private authority accessor detail');
+        }
+      }
+    );
+    const proxy = new Proxy(operationsAuthority(), {
+      ownKeys: () => {
+        proxyTraps += 1;
+        throw new Error('private authority proxy detail');
+      },
+      getOwnPropertyDescriptor: () => {
+        proxyTraps += 1;
+        throw new Error('private authority proxy detail');
+      }
+    });
+    const malformed: unknown[] = [
+      null,
+      [],
+      { ...operationsAuthority(), extra: true },
+      { ...operationsAuthority(), jobId: '00000000-0000-4000-8000-00000000180A' },
+      { ...operationsAuthority(), leaseOwner: 'invalid owner' },
+      { ...operationsAuthority(), attempt: 0 },
+      { ...operationsAuthority(), attempt: 9 },
+      { ...operationsAuthority(), maxAttempts: 7 },
+      { ...operationsAuthority(), generation: 0 },
+      { ...operationsAuthority(), capability: 'short' },
+      accessor,
+      proxy
+    ];
+
+    for (const value of malformed) {
+      for (const operation of [
+        (harness: ReturnType<typeof operationsHarness>) =>
+          harness.repository.renewOperationsJobLease(value as OperationsJobLeaseAuthority),
+        (harness: ReturnType<typeof operationsHarness>) =>
+          harness.repository.completeOperationsJob(value as OperationsJobLeaseAuthority),
+        (harness: ReturnType<typeof operationsHarness>) =>
+          harness.repository.failOperationsJob(
+            value as OperationsJobLeaseAuthority,
+            'Permanent job handler failure',
+            false
+          )
+      ]) {
+        const harness = operationsHarness();
+        expectOperationsAuthorityFailure(await repositoryFailure(operation(harness)));
+        expect(harness.database.transaction).not.toHaveBeenCalled();
+      }
+    }
+    expect(accessorReads).toBe(0);
+    expect(proxyTraps).toBe(0);
+  });
+
+  it.each([
+    {
+      label: 'a permanent error marked retryable',
+      safeError: 'Permanent job handler failure' as OperationsJobSafeError,
+      retryable: true
+    },
+    {
+      label: 'a transient error marked permanent',
+      safeError: 'Transient job handler failure' as OperationsJobSafeError,
+      retryable: false
+    },
+    {
+      label: 'an unknown safe error',
+      safeError: 'private arbitrary error' as OperationsJobSafeError,
+      retryable: false
+    }
+  ])('rejects $label before SQL', async ({ safeError, retryable }) => {
+    const harness = operationsHarness();
+
+    expectOperationsAuthorityFailure(await repositoryFailure(
+      harness.repository.failOperationsJob(operationsAuthority(), safeError, retryable)
+    ));
+    expect(harness.database.transaction).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { label: 'zero rows', rows: [] },
+    { label: 'multiple rows', rows: [{ applied: true }, { applied: true }] },
+    { label: 'false', rows: [{ applied: false }] },
+    { label: 'an extra field', rows: [{ applied: true, private: true }] },
+    {
+      label: 'an accessor',
+      rows: [Object.defineProperty({}, 'applied', {
+        enumerable: true,
+        get: () => { throw new Error('private applied accessor detail'); }
+      })]
+    },
+    {
+      label: 'a proxy',
+      rows: [new Proxy({ applied: true }, {
+        ownKeys: () => { throw new Error('private applied proxy detail'); }
+      })]
+    },
+    { label: 'a sparse result', rows: new Array<unknown>(1) }
+  ])('fails safely on $label from an applied routine', async ({ rows }) => {
+    for (const operation of [
+      (harness: ReturnType<typeof operationsHarness>) =>
+        harness.repository.renewOperationsJobLease(operationsAuthority()),
+      (harness: ReturnType<typeof operationsHarness>) =>
+        harness.repository.completeOperationsJob(operationsAuthority()),
+      (harness: ReturnType<typeof operationsHarness>) =>
+        harness.repository.failOperationsJob(
+          operationsAuthority(),
+          'Permanent job handler failure',
+          false
+        )
+    ]) {
+      const harness = operationsHarness({ appliedRows: rows });
+      expectOperationsAuthorityFailure(await repositoryFailure(operation(harness)));
+    }
+  });
+
+  it('maps raw and installed-Drizzle 55000 failures for every operations path', async () => {
+    const failures = [
+      Object.assign(new Error('private raw authority detail'), { code: '55000' }),
+      new DrizzleQueryError(
+        'select private_operations_query',
+        ['private-operations-param'],
+        Object.assign(new Error('private wrapped authority detail'), { code: '55000' })
+      )
+    ];
+    for (const failure of failures) {
+      const claimHarness = operationsHarness({ routineFailure: failure });
+      await expect(claimHarness.repository.claimNext(OPERATIONS_WORKER)).resolves.toBeNull();
+      for (const operation of [
+        (harness: ReturnType<typeof operationsHarness>) =>
+          harness.repository.renewOperationsJobLease(operationsAuthority()),
+        (harness: ReturnType<typeof operationsHarness>) =>
+          harness.repository.completeOperationsJob(operationsAuthority()),
+        (harness: ReturnType<typeof operationsHarness>) =>
+          harness.repository.failOperationsJob(
+            operationsAuthority(),
+            'Transient job handler failure',
+            true
+          ),
+        (harness: ReturnType<typeof operationsHarness>) =>
+          harness.repository.failOperationsJob(
+            operationsAuthority({ attempt: 8 }),
+            'Transient job handler failure',
+            true
+          ),
+        (harness: ReturnType<typeof operationsHarness>) =>
+          harness.repository.failOperationsJob(
+            operationsAuthority(),
+            'Permanent job handler failure',
+            false
+          )
+      ]) {
+        const harness = operationsHarness({ routineFailure: failure });
+        const result = await operation(harness);
+        expect(result).toEqual(
+          typeof result === 'boolean' ? false : { applied: false }
+        );
+      }
+    }
+  });
+
+  it('never invokes hostile error reflection while replacing non-55000 failures', async () => {
+    let accessorReads = 0;
+    let proxyTraps = 0;
+    const accessor = Object.defineProperty(new Error('private accessor error'), 'code', {
+      get: () => {
+        accessorReads += 1;
+        throw new Error('private error accessor detail');
+      }
+    });
+    const proxy = new Proxy(new Error('private proxy error'), {
+      get: () => {
+        proxyTraps += 1;
+        throw new Error('private error proxy detail');
+      },
+      getOwnPropertyDescriptor: () => {
+        proxyTraps += 1;
+        throw new Error('private error proxy detail');
+      },
+      getPrototypeOf: () => {
+        proxyTraps += 1;
+        throw new Error('private error proxy detail');
+      }
+    });
+    const cyclic = new Error('private cyclic error') as Error & { cause?: unknown };
+    cyclic.cause = cyclic;
+    const causeShaped = Object.assign(new Error('private cause-shaped error'), {
+      cause: Object.assign(new Error('private nested authority detail'), { code: '55000' })
+    });
+    const wrapperAccessor = new DrizzleQueryError('private wrapper query', [], new Error());
+    Object.defineProperty(wrapperAccessor, 'cause', {
+      get: () => {
+        accessorReads += 1;
+        throw new Error('private wrapper cause detail');
+      }
+    });
+
+    for (const failure of [accessor, proxy, cyclic, causeShaped, wrapperAccessor]) {
+      const claimHarness = operationsHarness({ routineFailure: failure });
+      expectOperationsAuthorityFailure(await repositoryFailure(
+        claimHarness.repository.claimNext(OPERATIONS_WORKER)
+      ));
+      const harness = operationsHarness({ routineFailure: failure });
+      expectOperationsAuthorityFailure(await repositoryFailure(
+        harness.repository.renewOperationsJobLease(operationsAuthority())
+      ));
+    }
+    expect(accessorReads).toBe(0);
+    expect(proxyTraps).toBe(0);
   });
 });

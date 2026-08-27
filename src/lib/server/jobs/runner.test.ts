@@ -58,7 +58,10 @@ function repositoryReturning(record: JobRecord): JobRepository {
           applied: true,
           retryScheduled: failureArguments[3] && record.attempts < record.maxAttempts
         }
-      : { applied: false })
+      : { applied: false }),
+    renewOperationsJobLease: vi.fn().mockResolvedValue(true),
+    completeOperationsJob: vi.fn().mockResolvedValue(true),
+    failOperationsJob: vi.fn().mockResolvedValue({ applied: true, retryScheduled: false })
   };
 }
 
@@ -312,7 +315,10 @@ describe('runWorker', () => {
             applied: true,
             retryScheduled: failureArguments[3] && job.attempts < job.maxAttempts
           }
-        : { applied: false })
+        : { applied: false }),
+      renewOperationsJobLease: vi.fn().mockResolvedValue(true),
+      completeOperationsJob: vi.fn().mockResolvedValue(true),
+      failOperationsJob: vi.fn().mockResolvedValue({ applied: true, retryScheduled: false })
     };
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
@@ -367,7 +373,10 @@ describe('runWorker', () => {
       failWithDisposition: vi.fn().mockResolvedValue({
         applied: true,
         retryScheduled: false
-      })
+      }),
+      renewOperationsJobLease: vi.fn().mockResolvedValue(true),
+      completeOperationsJob: vi.fn().mockResolvedValue(true),
+      failOperationsJob: vi.fn().mockResolvedValue({ applied: true, retryScheduled: false })
     };
 
     const running = runWorker({
@@ -426,7 +435,10 @@ describe('runWorker', () => {
       failWithDisposition: vi.fn().mockResolvedValue({
         applied: true,
         retryScheduled: true
-      })
+      }),
+      renewOperationsJobLease: vi.fn().mockResolvedValue(true),
+      completeOperationsJob: vi.fn().mockResolvedValue(true),
+      failOperationsJob: vi.fn().mockResolvedValue({ applied: true, retryScheduled: false })
     };
 
     const running = runWorker({
@@ -1113,7 +1125,10 @@ describe('runWorker', () => {
       failWithDisposition: vi.fn().mockResolvedValue({
         applied: true,
         retryScheduled: false
-      })
+      }),
+      renewOperationsJobLease: vi.fn().mockResolvedValue(true),
+      completeOperationsJob: vi.fn().mockResolvedValue(true),
+      failOperationsJob: vi.fn().mockResolvedValue({ applied: true, retryScheduled: false })
     };
     let releaseHandlers!: () => void;
     const heldHandlers = new Promise<void>((resolve) => { releaseHandlers = resolve; });

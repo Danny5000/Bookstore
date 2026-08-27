@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
-import { eq, sql, type SQL } from 'drizzle-orm';
+import { isProxy } from 'node:util/types';
+import { DrizzleQueryError, eq, sql, type SQL } from 'drizzle-orm';
 import type { JobConfig } from '$lib/server/config/schema';
 import type { Database } from '$lib/server/db/client';
 import { jobs, type JsonObject, type JsonValue, type JobRow } from '$lib/server/db/schema';
@@ -22,9 +23,17 @@ import { STRIPE_EVENT_JOB } from '$lib/server/commerce/job';
 import { computeRetryDelayMs } from './backoff';
 import {
   FINANCIAL_ADMIN_COMMAND_JOB,
-  definitionForJobKind
+  definitionForJobKind,
+  OPERATIONS_JOB_RETRY_COMMAND_JOB,
+  OPERATIONS_JOB_RETRY_COMMAND_MAX_ATTEMPTS
 } from './catalog';
-import type { JobFailureTransition, JobRecord, JobRepository } from './types';
+import type {
+  JobFailureTransition,
+  JobRecord,
+  JobRepository,
+  OperationsJobLeaseAuthority,
+  OperationsJobSafeError
+} from './types';
 
 export interface EnqueueJobInput {
   type: string;
@@ -555,10 +564,249 @@ interface LockedOwnedJob extends ClaimedJobRow {
 }
 
 type FinancialAdminCapabilitySource = () => string;
+type OperationsCapabilitySource = () => string;
 
 const FINANCIAL_ADMIN_LEASE_CAPABILITY_PATTERN = /^[A-Za-z0-9_-]{43}$/u;
 const FINANCIAL_ADMIN_LEASE_LOCK_PREFIX =
   'pale-orbit:plan6bii-financial-admin-job-lease:';
+const OPERATIONS_JOB_LEASE_CAPABILITY_PATTERN = /^[A-Za-z0-9_-]{43}$/u;
+const OPERATIONS_JOB_LEASE_OWNER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/u;
+const CANONICAL_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const OPERATIONS_AUTHORITY_KEYS = Object.freeze([
+  'jobId',
+  'leaseOwner',
+  'attempt',
+  'maxAttempts',
+  'generation',
+  'capability'
+] as const);
+const OPERATIONS_CLAIM_KEYS = Object.freeze([
+  'id',
+  'type',
+  'payload',
+  'deduplicationKey',
+  'attempts',
+  'maxAttempts',
+  'lockedBy',
+  'operationsJobLeaseGeneration'
+] as const);
+const OPERATIONS_APPLIED_KEYS = Object.freeze(['applied'] as const);
+const OPERATIONS_PAYLOAD_KEYS = Object.freeze(['commandId'] as const);
+const OPERATIONS_TRANSIENT_SAFE_ERRORS = Object.freeze([
+  'Transient job handler failure',
+  'Transient job completion failure'
+] as const satisfies readonly OperationsJobSafeError[]);
+const OPERATIONS_PERMANENT_SAFE_ERRORS = Object.freeze([
+  'Invalid operations job retry command identity.',
+  'Operations job retry command permanently failed.',
+  'Permanent job handler failure'
+] as const satisfies readonly OperationsJobSafeError[]);
+
+function operationsCapabilityGenerationFailure(): Error {
+  return new Error('Operations job lease capability generation failed');
+}
+
+function operationsAuthorityFailure(): Error {
+  return new Error('Operations job lease authority failed');
+}
+
+function operationsExactDataRecord(
+  value: unknown,
+  keys: readonly string[]
+): Readonly<Record<string, unknown>> | undefined {
+  try {
+    if (value === null || typeof value !== 'object' || Array.isArray(value) ||
+      isProxy(value)) return undefined;
+    const prototype = Object.getPrototypeOf(value) as object | null;
+    if (prototype !== Object.prototype && prototype !== null) return undefined;
+    const actualKeys = Reflect.ownKeys(value);
+    if (actualKeys.length !== keys.length ||
+      !actualKeys.every((key) => typeof key === 'string' && keys.includes(key))) {
+      return undefined;
+    }
+    const parsed: Record<string, unknown> = {};
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || descriptor.enumerable !== true ||
+        !Object.hasOwn(descriptor, 'value')) return undefined;
+      parsed[key] = descriptor.value;
+    }
+    return Object.freeze(parsed);
+  } catch {
+    return undefined;
+  }
+}
+
+function operationsOwnDataValue(value: unknown, key: string): unknown {
+  if (value === null || typeof value !== 'object' || isProxy(value)) return undefined;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor !== undefined && Object.hasOwn(descriptor, 'value')
+      ? descriptor.value
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function operationsDrizzleCause(error: unknown): unknown {
+  if (error === null || typeof error !== 'object' || isProxy(error)) return undefined;
+  try {
+    if (Object.getPrototypeOf(error) !== DrizzleQueryError.prototype) return undefined;
+  } catch {
+    return undefined;
+  }
+  return operationsOwnDataValue(error, 'cause');
+}
+
+function operationsDatabaseErrorCode(error: unknown): unknown {
+  const direct = operationsOwnDataValue(error, 'code');
+  return direct === undefined
+    ? operationsOwnDataValue(operationsDrizzleCause(error), 'code')
+    : direct;
+}
+
+function createOperationsJobLeaseCapability(source: OperationsCapabilitySource): string {
+  try {
+    const capability = source();
+    if (typeof capability === 'string' &&
+      OPERATIONS_JOB_LEASE_CAPABILITY_PATTERN.test(capability)) return capability;
+  } catch {
+    // The capability source is deliberately outside the observable error boundary.
+  }
+  throw operationsCapabilityGenerationFailure();
+}
+
+function isPositiveSignedInt32(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) &&
+    value > 0 && value <= 2_147_483_647;
+}
+
+function parseOperationsJobLeaseAuthority(
+  value: unknown
+): Readonly<OperationsJobLeaseAuthority> {
+  const parsed = operationsExactDataRecord(value, OPERATIONS_AUTHORITY_KEYS);
+  if (parsed === undefined || typeof parsed.jobId !== 'string' ||
+    !CANONICAL_UUID_PATTERN.test(parsed.jobId) ||
+    typeof parsed.leaseOwner !== 'string' ||
+    !OPERATIONS_JOB_LEASE_OWNER_PATTERN.test(parsed.leaseOwner) ||
+    !isPositiveSignedInt32(parsed.attempt) ||
+    parsed.attempt > OPERATIONS_JOB_RETRY_COMMAND_MAX_ATTEMPTS ||
+    parsed.maxAttempts !== OPERATIONS_JOB_RETRY_COMMAND_MAX_ATTEMPTS ||
+    !isPositiveSignedInt32(parsed.generation) ||
+    typeof parsed.capability !== 'string' ||
+    !OPERATIONS_JOB_LEASE_CAPABILITY_PATTERN.test(parsed.capability)) {
+    throw operationsAuthorityFailure();
+  }
+  return Object.freeze({
+    jobId: parsed.jobId,
+    leaseOwner: parsed.leaseOwner,
+    attempt: parsed.attempt,
+    maxAttempts: parsed.maxAttempts,
+    generation: parsed.generation,
+    capability: parsed.capability
+  });
+}
+
+function operationsQueryRows(result: unknown, maximumRows: number): readonly unknown[] {
+  if (result === null || typeof result !== 'object' || isProxy(result)) {
+    throw operationsAuthorityFailure();
+  }
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(result, 'rows');
+  } catch {
+    throw operationsAuthorityFailure();
+  }
+  if (descriptor === undefined || !Object.hasOwn(descriptor, 'value') ||
+    !Array.isArray(descriptor.value) || isProxy(descriptor.value)) {
+    throw operationsAuthorityFailure();
+  }
+  const source = descriptor.value as readonly unknown[];
+  if (source.length > maximumRows) throw operationsAuthorityFailure();
+  const rows: unknown[] = [];
+  for (let index = 0; index < source.length; index += 1) {
+    let rowDescriptor: PropertyDescriptor | undefined;
+    try {
+      rowDescriptor = Object.getOwnPropertyDescriptor(source, String(index));
+    } catch {
+      throw operationsAuthorityFailure();
+    }
+    if (rowDescriptor === undefined || !Object.hasOwn(rowDescriptor, 'value')) {
+      throw operationsAuthorityFailure();
+    }
+    rows.push(rowDescriptor.value);
+  }
+  return Object.freeze(rows);
+}
+
+async function queryOperationsRows(
+  transaction: DatabaseTransaction,
+  query: SQL,
+  maximumRows: number
+): Promise<readonly unknown[]> {
+  return operationsQueryRows(await transaction.execute(query), maximumRows);
+}
+
+async function setOperationsJobLeaseContext(
+  transaction: DatabaseTransaction,
+  capability: string
+): Promise<void> {
+  await transaction.execute(sql`
+    select pg_catalog.set_config(
+      'pale_orbit.plan7a_operations_job_capability',
+      ${capability},
+      true
+    )
+  `);
+}
+
+function parseOperationsClaimedJob(
+  row: unknown,
+  expectedJobId: string,
+  expectedLeaseOwner: string,
+  capability: string
+): JobRecord {
+  const parsed = operationsExactDataRecord(row, OPERATIONS_CLAIM_KEYS);
+  const payload = parsed === undefined
+    ? undefined
+    : operationsExactDataRecord(parsed.payload, OPERATIONS_PAYLOAD_KEYS);
+  const commandId = payload?.commandId;
+  if (parsed === undefined || parsed.id !== expectedJobId ||
+    typeof parsed.id !== 'string' || !CANONICAL_UUID_PATTERN.test(parsed.id) ||
+    parsed.type !== OPERATIONS_JOB_RETRY_COMMAND_JOB ||
+    typeof commandId !== 'string' || !CANONICAL_UUID_PATTERN.test(commandId) ||
+    parsed.deduplicationKey !==
+      `operations:job-retry-command:${commandId}:v1` ||
+    !isPositiveSignedInt32(parsed.attempts) ||
+    parsed.attempts > OPERATIONS_JOB_RETRY_COMMAND_MAX_ATTEMPTS ||
+    parsed.maxAttempts !== OPERATIONS_JOB_RETRY_COMMAND_MAX_ATTEMPTS ||
+    typeof parsed.lockedBy !== 'string' ||
+    !OPERATIONS_JOB_LEASE_OWNER_PATTERN.test(parsed.lockedBy) ||
+    parsed.lockedBy !== expectedLeaseOwner ||
+    !isPositiveSignedInt32(parsed.operationsJobLeaseGeneration)) {
+    throw operationsAuthorityFailure();
+  }
+  return Object.freeze({
+    id: parsed.id,
+    type: parsed.type,
+    payload: Object.freeze({ commandId }),
+    deduplicationKey: parsed.deduplicationKey,
+    attempts: parsed.attempts,
+    maxAttempts: parsed.maxAttempts,
+    lockedBy: expectedLeaseOwner,
+    operationsJobLeaseCapability: capability,
+    operationsJobLeaseGeneration: parsed.operationsJobLeaseGeneration
+  });
+}
+
+function parseOperationsApplied(rows: readonly unknown[]): true {
+  if (rows.length !== 1) throw operationsAuthorityFailure();
+  const parsed = operationsExactDataRecord(rows[0], OPERATIONS_APPLIED_KEYS);
+  if (parsed?.applied !== true) throw operationsAuthorityFailure();
+  return true;
+}
 
 async function queryRows<T>(
   transaction: DatabaseTransaction,
@@ -655,6 +903,8 @@ export function createPostgresJobRepository(
     allocationAlgorithmVersion: FINANCIAL_ALLOCATION_ALGORITHM_VERSION
   },
   financialAdminCapabilitySource: FinancialAdminCapabilitySource = () =>
+    randomBytes(32).toString('base64url'),
+  operationsCapabilitySource: OperationsCapabilitySource = () =>
     randomBytes(32).toString('base64url')
 ): JobRepository {
   if (claimPolicy !== 'all' && claimPolicy !== 'local-only') {
@@ -840,6 +1090,22 @@ export function createPostgresJobRepository(
       and (${replayImplementationSupported})
       and (${providerImplementationSupported})
   `;
+  async function applyOperationsRoutine(
+    input: OperationsJobLeaseAuthority,
+    routine: (authority: Readonly<OperationsJobLeaseAuthority>) => SQL
+  ): Promise<boolean> {
+    const authority = parseOperationsJobLeaseAuthority(input);
+    try {
+      return await withTransaction(database, async (transaction) => {
+        await setOperationsJobLeaseContext(transaction, authority.capability);
+        const rows = await queryOperationsRows(transaction, routine(authority), 1);
+        return parseOperationsApplied(rows);
+      });
+    } catch (error: unknown) {
+      if (operationsDatabaseErrorCode(error) === '55000') return false;
+      throw operationsAuthorityFailure();
+    }
+  }
   async function settleFailure(
     jobId: string,
     workerId: string,
@@ -953,6 +1219,8 @@ export function createPostgresJobRepository(
       const claimedAt = now();
       const expiredBefore = new Date(claimedAt.getTime() - config.leaseMs);
       let financialAdminPath = false;
+      let operationsPath = false;
+      let operationsCapabilityGenerationFailed = false;
       try {
         return await withTransaction(database, async (transaction) => {
           const [candidate] = await queryRows<LockedClaimCandidate>(transaction, sql`
@@ -977,10 +1245,12 @@ export function createPostgresJobRepository(
                 jobs.status = 'pending'
                 and (
                   (
-                    jobs.type = ${FINANCIAL_ADMIN_COMMAND_JOB}
+                    jobs.type in (${FINANCIAL_ADMIN_COMMAND_JOB},
+                      ${OPERATIONS_JOB_RETRY_COMMAND_JOB})
                     and jobs.run_at <= pg_catalog.clock_timestamp()
                   ) or (
-                    jobs.type <> ${FINANCIAL_ADMIN_COMMAND_JOB}
+                    jobs.type not in (${FINANCIAL_ADMIN_COMMAND_JOB},
+                      ${OPERATIONS_JOB_RETRY_COMMAND_JOB})
                     and jobs.run_at <= ${claimedAt}
                   )
                 )
@@ -989,10 +1259,12 @@ export function createPostgresJobRepository(
                 jobs.status = 'running'
                 and (
                   (
-                    jobs.type = ${FINANCIAL_ADMIN_COMMAND_JOB}
+                    jobs.type in (${FINANCIAL_ADMIN_COMMAND_JOB},
+                      ${OPERATIONS_JOB_RETRY_COMMAND_JOB})
                     and jobs.run_at <= pg_catalog.clock_timestamp()
                   ) or (
-                    jobs.type <> ${FINANCIAL_ADMIN_COMMAND_JOB}
+                    jobs.type not in (${FINANCIAL_ADMIN_COMMAND_JOB},
+                      ${OPERATIONS_JOB_RETRY_COMMAND_JOB})
                     and jobs.locked_at <= ${expiredBefore}
                   )
                 )
@@ -1005,7 +1277,44 @@ export function createPostgresJobRepository(
           if (!candidate) return null;
 
           const isFinancialAdmin = candidate.type === FINANCIAL_ADMIN_COMMAND_JOB;
+          const isOperations = candidate.type === OPERATIONS_JOB_RETRY_COMMAND_JOB;
           financialAdminPath = isFinancialAdmin;
+          operationsPath = isOperations;
+          if (isOperations) {
+            let capability: string;
+            try {
+              capability = createOperationsJobLeaseCapability(
+                operationsCapabilitySource
+              );
+            } catch {
+              operationsCapabilityGenerationFailed = true;
+              throw operationsCapabilityGenerationFailure();
+            }
+            await setOperationsJobLeaseContext(transaction, capability);
+            const claimed = await queryOperationsRows(transaction, sql`
+              select
+                job_id as "id",
+                job_kind as "type",
+                payload,
+                deduplication_key as "deduplicationKey",
+                attempt as "attempts",
+                max_attempts as "maxAttempts",
+                lease_owner as "lockedBy",
+                lease_generation as "operationsJobLeaseGeneration"
+              from public.plan7a_operations_claim_job(
+                ${candidate.id}::uuid,
+                ${workerId},
+                ${config.leaseMs}
+              )
+            `, 1);
+            if (claimed.length === 0) return null;
+            return parseOperationsClaimedJob(
+              claimed[0],
+              candidate.id,
+              workerId,
+              capability
+            );
+          }
           const isExpiredFinalAttempt = candidate.priorStatus === 'running' &&
             candidate.attempts >= candidate.maxAttempts &&
             !candidate.hadRerunRequest;
@@ -1160,6 +1469,13 @@ export function createPostgresJobRepository(
             : { ...record, financialAdminLeaseCapability: capability };
         });
       } catch (error: unknown) {
+        if (operationsCapabilityGenerationFailed) {
+          throw operationsCapabilityGenerationFailure();
+        }
+        if (operationsPath) {
+          if (operationsDatabaseErrorCode(error) === '55000') return null;
+          throw operationsAuthorityFailure();
+        }
         if (!financialAdminPath) throw error;
         if (errorCode(error) === '55000') return null;
         throw financialAdminAuthorityFailure();
@@ -1304,6 +1620,90 @@ export function createPostgresJobRepository(
       capability
     ): Promise<JobFailureTransition> {
       return settleFailure(jobId, workerId, safeError, retryable, capability);
+    },
+
+    async renewOperationsJobLease(authority): Promise<boolean> {
+      return applyOperationsRoutine(authority, (validated) => sql`
+        select applied
+        from public.plan7a_operations_renew_job_claim(
+          ${validated.jobId}::uuid,
+          ${validated.leaseOwner},
+          ${validated.attempt},
+          ${validated.generation}
+        )
+      `);
+    },
+
+    async completeOperationsJob(authority): Promise<boolean> {
+      return applyOperationsRoutine(authority, (validated) => sql`
+        select applied
+        from public.plan7a_operations_complete_job(
+          ${validated.jobId}::uuid,
+          ${validated.leaseOwner},
+          ${validated.attempt},
+          ${validated.generation}
+        )
+      `);
+    },
+
+    async failOperationsJob(
+      input,
+      safeError,
+      retryable
+    ): Promise<JobFailureTransition> {
+      const authority = parseOperationsJobLeaseAuthority(input);
+      const transient = typeof safeError === 'string' &&
+        (OPERATIONS_TRANSIENT_SAFE_ERRORS as readonly string[]).includes(safeError);
+      const permanent = typeof safeError === 'string' &&
+        (OPERATIONS_PERMANENT_SAFE_ERRORS as readonly string[]).includes(safeError);
+      if (typeof retryable !== 'boolean' ||
+        (retryable ? !transient : !permanent)) throw operationsAuthorityFailure();
+
+      let retryScheduled = false;
+      let applied: boolean;
+      if (retryable && authority.attempt < authority.maxAttempts) {
+        retryScheduled = true;
+        const retryDelay = computeRetryDelayMs(
+          authority.attempt,
+          config.retryBaseMs,
+          config.retryMaxMs
+        );
+        applied = await applyOperationsRoutine(authority, (validated) => sql`
+          select applied
+          from public.plan7a_operations_relinquish_job(
+            ${validated.jobId}::uuid,
+            ${validated.leaseOwner},
+            ${validated.attempt},
+            ${validated.generation},
+            ${safeError},
+            ${retryDelay}
+          )
+        `);
+      } else if (retryable) {
+        applied = await applyOperationsRoutine(authority, (validated) => sql`
+          select applied
+          from public.plan7a_operations_exhaust_job(
+            ${validated.jobId}::uuid,
+            ${validated.leaseOwner},
+            ${validated.attempt},
+            ${validated.generation}
+          )
+        `);
+      } else {
+        applied = await applyOperationsRoutine(authority, (validated) => sql`
+          select applied
+          from public.plan7a_operations_fail_job(
+            ${validated.jobId}::uuid,
+            ${validated.leaseOwner},
+            ${validated.attempt},
+            ${validated.generation},
+            ${safeError}
+          )
+        `);
+      }
+      return applied
+        ? { applied: true, retryScheduled }
+        : { applied: false };
     }
   };
 }

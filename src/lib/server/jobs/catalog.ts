@@ -1,3 +1,89 @@
+import { isProxy } from 'node:util/types';
+
+import type { JobRecord } from './types';
+
+export interface JobDiagnosticMetadata {
+  readonly correlationId?: unknown;
+  readonly generation?: unknown;
+}
+
+const EMPTY_JOB_DIAGNOSTIC_METADATA: JobDiagnosticMetadata = Object.freeze({});
+const CANONICAL_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
+function isPositiveSignedInt32(value: unknown): value is number {
+  return Number.isInteger(value) && Number(value) > 0 && Number(value) <= 2_147_483_647;
+}
+
+function ownDataValue(value: object, key: PropertyKey): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  return descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined;
+}
+
+function parseIngestionGeneration(payload: unknown): number | undefined {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload) || isProxy(payload)) {
+    return undefined;
+  }
+
+  const prototype = Object.getPrototypeOf(payload);
+  if (prototype !== Object.prototype && prototype !== null) {
+    return undefined;
+  }
+
+  const keys = Reflect.ownKeys(payload);
+  if (keys.length !== 2 || !keys.includes('revisionId') || !keys.includes('generation')) {
+    return undefined;
+  }
+
+  const revisionDescriptor = Object.getOwnPropertyDescriptor(payload, 'revisionId');
+  const generationDescriptor = Object.getOwnPropertyDescriptor(payload, 'generation');
+  if (
+    revisionDescriptor === undefined ||
+    generationDescriptor === undefined ||
+    !('value' in revisionDescriptor) ||
+    !('value' in generationDescriptor) ||
+    revisionDescriptor.enumerable !== true ||
+    generationDescriptor.enumerable !== true ||
+    typeof revisionDescriptor.value !== 'string' ||
+    !CANONICAL_UUID_PATTERN.test(revisionDescriptor.value) ||
+    !isPositiveSignedInt32(generationDescriptor.value)
+  ) {
+    return undefined;
+  }
+
+  return generationDescriptor.value;
+}
+
+export function parseRegisteredJobDiagnosticMetadata(
+  job: Readonly<JobRecord>
+): JobDiagnosticMetadata {
+  try {
+    if (
+      typeof job !== 'object' ||
+      job === null ||
+      isProxy(job) ||
+      Object.getPrototypeOf(job) !== Object.prototype
+    ) {
+      return EMPTY_JOB_DIAGNOSTIC_METADATA;
+    }
+
+    const type = ownDataValue(job, 'type');
+    let generation: number | undefined;
+    if (type === 'catalog.ingest_revision') {
+      generation = parseIngestionGeneration(ownDataValue(job, 'payload'));
+    } else if (type === 'operations.job-retry-command') {
+      const candidate = ownDataValue(job, 'operationsJobLeaseGeneration');
+      generation = isPositiveSignedInt32(candidate) ? candidate : undefined;
+    }
+
+    return generation === undefined
+      ? EMPTY_JOB_DIAGNOSTIC_METADATA
+      : Object.freeze({ generation });
+  } catch {
+    return EMPTY_JOB_DIAGNOSTIC_METADATA;
+  }
+}
+
 export const REGISTERED_JOB_KINDS = Object.freeze([
   'outbox.dispatch',
   'commerce.claim-email',

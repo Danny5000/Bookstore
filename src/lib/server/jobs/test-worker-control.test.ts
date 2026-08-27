@@ -148,7 +148,10 @@ function repositoryWithNoJobs(onClaim?: () => void | Promise<void>): JobReposito
       ...failureArguments: Parameters<JobRepository['fail']>
     ): Promise<JobFailureTransition> => await fail(...failureArguments)
       ? { applied: true, retryScheduled: false }
-      : { applied: false })
+      : { applied: false }),
+    renewOperationsJobLease: vi.fn().mockResolvedValue(true),
+    completeOperationsJob: vi.fn().mockResolvedValue(true),
+    failOperationsJob: vi.fn().mockResolvedValue({ applied: true, retryScheduled: false })
   };
 }
 

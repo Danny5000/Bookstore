@@ -263,7 +263,10 @@ function disconnectTerminalWrites(repository: JobRepository): JobRepository {
     renewLease: (jobId, workerId) => repository.renewLease(jobId, workerId),
     complete: disconnected,
     fail: disconnected,
-    failWithDisposition: disconnected
+    failWithDisposition: disconnected,
+    renewOperationsJobLease: (authority) => repository.renewOperationsJobLease(authority),
+    completeOperationsJob: disconnected,
+    failOperationsJob: disconnected
   };
 }
 

@@ -514,6 +514,20 @@ function observeRepository(
       afterFailure?.(current);
       return result;
     },
+    async renewOperationsJobLease(authority) {
+      observations.renewals += 1;
+      return repository.renewOperationsJobLease(authority);
+    },
+    async completeOperationsJob(authority) {
+      observations.completions += 1;
+      return repository.completeOperationsJob(authority);
+    },
+    async failOperationsJob(authority, safeError, retryable) {
+      observations.failures += 1;
+      const result = await repository.failOperationsJob(authority, safeError, retryable);
+      afterFailure?.(current);
+      return result;
+    },
   };
 }
 

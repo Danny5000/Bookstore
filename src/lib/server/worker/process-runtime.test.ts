@@ -367,7 +367,10 @@ function createRealRunnerRaceHarness(): {
     renewLease: async () => true,
     complete: async () => true,
     fail: async () => true,
-    failWithDisposition: async () => ({ applied: true, retryScheduled: false })
+    failWithDisposition: async () => ({ applied: true, retryScheduled: false }),
+    renewOperationsJobLease: async () => true,
+    completeOperationsJob: async () => true,
+    failOperationsJob: async () => ({ applied: true, retryScheduled: false })
   };
   const harness = createHarness({
     createAssembly: async (input) => {
@@ -790,7 +793,10 @@ describe('runWorkerProcess runtime races and shutdown', () => {
       renewLease: async () => true,
       complete: async () => true,
       fail: async () => true,
-      failWithDisposition: async () => ({ applied: true, retryScheduled: false })
+      failWithDisposition: async () => ({ applied: true, retryScheduled: false }),
+      renewOperationsJobLease: async () => true,
+      completeOperationsJob: async () => true,
+      failOperationsJob: async () => ({ applied: true, retryScheduled: false })
     };
     const handler: JobHandler = async (_job, signal) => {
       handlerSignal = signal;

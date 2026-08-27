@@ -35,8 +35,10 @@ import {
   isOperationalFailureCodeAllowedForJobKind,
   isJobRetryPolicyOutcomeAllowed,
   isRegisteredJobKind,
+  parseRegisteredJobDiagnosticMetadata,
   safeOperationalFailureCode
 } from './catalog';
+import type { JobRecord } from './types';
 
 const repositoryRoot = fileURLToPath(new URL('../../../../', import.meta.url));
 const catalogSourcePath = join(repositoryRoot, 'src/lib/server/jobs/catalog.ts');
@@ -742,6 +744,255 @@ const sqlSafeFailureDecoys = [
 ] as const;
 
 describe('production job catalog', () => {
+  describe('registered job diagnostic metadata', () => {
+    const job = (overrides: Partial<JobRecord> = {}): JobRecord => ({
+      id: '11111111-1111-4111-8111-111111111111',
+      type: 'outbox.dispatch',
+      payload: {},
+      deduplicationKey: null,
+      attempts: 1,
+      maxAttempts: 8,
+      lockedBy: 'worker-1',
+      ...overrides
+    });
+    const expectEmpty = (value: unknown): void => {
+      expect(value).toEqual({});
+      expect(Reflect.ownKeys(value as object)).toEqual([]);
+      expect(Object.isFrozen(value)).toBe(true);
+    };
+
+    it.each([1, 2_147_483_647])(
+      'returns only frozen ingestion generation %i from an exact payload',
+      (generation) => {
+        const metadata = parseRegisteredJobDiagnosticMetadata(job({
+          type: 'catalog.ingest_revision',
+          payload: {
+            revisionId: '22222222-2222-4222-8222-222222222222',
+            generation
+          }
+        }));
+
+        expect(metadata).toEqual({ generation });
+        expect(Reflect.ownKeys(metadata)).toEqual(['generation']);
+        expect(Object.isFrozen(metadata)).toBe(true);
+      }
+    );
+
+    it('accepts a canonical lowercase UUIDv7 ingestion revision identifier', () => {
+      expect(parseRegisteredJobDiagnosticMetadata(job({
+        type: 'catalog.ingest_revision',
+        payload: {
+          revisionId: '22222222-2222-7222-8222-222222222222',
+          generation: 7
+        }
+      }))).toEqual({ generation: 7 });
+    });
+
+    it.each([0, -1, 2_147_483_648, 1.5, Number.NaN, '1'])(
+      'rejects malformed ingestion generation %s',
+      (generation) => {
+        expectEmpty(parseRegisteredJobDiagnosticMetadata(job({
+          type: 'catalog.ingest_revision',
+          payload: {
+            revisionId: '22222222-2222-4222-8222-222222222222',
+            generation
+          } as never
+        })));
+      }
+    );
+
+    it('requires an exact own-data ingestion payload and never invokes accessors', () => {
+      let reads = 0;
+      const accessorPayload = Object.create(null) as Record<string, unknown>;
+      Object.defineProperties(accessorPayload, {
+        revisionId: {
+          enumerable: true,
+          get() {
+            reads += 1;
+            throw new Error('revision getter must not run');
+          }
+        },
+        generation: {
+          enumerable: true,
+          get() {
+            reads += 1;
+            throw new Error('generation getter must not run');
+          }
+        }
+      });
+      const malformedPayloads = [
+        { generation: 1 },
+        { revisionId: 'not-a-uuid', generation: 1 },
+        {
+          revisionId: '22222222-2222-4222-8222-222222222222',
+          generation: 1,
+          extra: true
+        },
+        Object.create({
+          revisionId: '22222222-2222-4222-8222-222222222222',
+          generation: 1
+        }),
+        accessorPayload
+      ];
+
+      for (const payload of malformedPayloads) {
+        expectEmpty(parseRegisteredJobDiagnosticMetadata(job({
+          type: 'catalog.ingest_revision',
+          payload: payload as never
+        })));
+      }
+      expect(reads).toBe(0);
+    });
+
+    it.each([1, 2_147_483_647])(
+      'returns only frozen operations lease generation %i without touching capability',
+      (generation) => {
+        let capabilityReads = 0;
+        const operationsJob = job({
+          type: 'operations.job-retry-command',
+          payload: { commandId: '33333333-3333-4333-8333-333333333333' }
+        }) as JobRecord & {
+          operationsJobLeaseCapability?: string;
+          operationsJobLeaseGeneration?: number;
+        };
+        Object.defineProperties(operationsJob, {
+          operationsJobLeaseCapability: {
+            enumerable: true,
+            get() {
+              capabilityReads += 1;
+              throw new Error('capability getter must never run');
+            }
+          },
+          operationsJobLeaseGeneration: { enumerable: true, value: generation }
+        });
+
+        const metadata = parseRegisteredJobDiagnosticMetadata(operationsJob);
+
+        expect(metadata).toEqual({ generation });
+        expect(Reflect.ownKeys(metadata)).toEqual(['generation']);
+        expect(Object.isFrozen(metadata)).toBe(true);
+        expect(capabilityReads).toBe(0);
+      }
+    );
+
+    it.each([undefined, 0, -1, 2_147_483_648, 1.5, Number.NaN, '1'])(
+      'rejects malformed operations lease generation %s',
+      (generation) => {
+        const operationsJob = job({
+          type: 'operations.job-retry-command'
+        }) as JobRecord & { operationsJobLeaseGeneration?: unknown };
+        if (generation !== undefined) {
+          Object.defineProperty(operationsJob, 'operationsJobLeaseGeneration', {
+            enumerable: true,
+            value: generation
+          });
+        }
+        expectEmpty(parseRegisteredJobDiagnosticMetadata(operationsJob));
+      }
+    );
+
+    it('rejects operations generation accessors without reading them or capability', () => {
+      let reads = 0;
+      const operationsJob = job({
+        type: 'operations.job-retry-command'
+      }) as JobRecord & {
+        operationsJobLeaseCapability?: string;
+        operationsJobLeaseGeneration?: number;
+      };
+      Object.defineProperties(operationsJob, {
+        operationsJobLeaseCapability: {
+          enumerable: true,
+          get() {
+            reads += 1;
+            throw new Error('capability getter must never run');
+          }
+        },
+        operationsJobLeaseGeneration: {
+          enumerable: true,
+          get() {
+            reads += 1;
+            throw new Error('generation getter must not run');
+          }
+        }
+      });
+
+      expectEmpty(parseRegisteredJobDiagnosticMetadata(operationsJob));
+      expect(reads).toBe(0);
+    });
+
+    it('returns empty metadata for other registered and unregistered kinds without payload access', () => {
+      for (const type of [...REGISTERED_JOB_KINDS.filter((candidate) =>
+        candidate !== 'catalog.ingest_revision' &&
+        candidate !== 'operations.job-retry-command'
+      ), 'unregistered.job']) {
+        let reads = 0;
+        const candidate = job({ type });
+        Object.defineProperties(candidate, {
+          payload: {
+            enumerable: true,
+            get() {
+              reads += 1;
+              throw new Error('payload getter must not run');
+            }
+          },
+          operationsJobLeaseCapability: {
+            enumerable: true,
+            get() {
+              reads += 1;
+              throw new Error('capability getter must never run');
+            }
+          }
+        });
+        expectEmpty(parseRegisteredJobDiagnosticMetadata(candidate));
+        expect(reads).toBe(0);
+      }
+    });
+
+    it('returns empty metadata for outer proxies and accessors without invoking traps', () => {
+      let traps = 0;
+      const proxy = new Proxy(job({ type: 'operations.job-retry-command' }), {
+        get() {
+          traps += 1;
+          throw new Error('get trap must not run');
+        },
+        getOwnPropertyDescriptor() {
+          traps += 1;
+          throw new Error('descriptor trap must not run');
+        },
+        ownKeys() {
+          traps += 1;
+          throw new Error('ownKeys trap must not run');
+        }
+      });
+      let typeReads = 0;
+      const accessor = job();
+      Object.defineProperty(accessor, 'type', {
+        enumerable: true,
+        get() {
+          typeReads += 1;
+          throw new Error('type getter must not run');
+        }
+      });
+
+      expectEmpty(parseRegisteredJobDiagnosticMetadata(proxy));
+      expectEmpty(parseRegisteredJobDiagnosticMetadata(accessor));
+      expect(traps).toBe(0);
+      expect(typeReads).toBe(0);
+    });
+
+    it('rejects an outer job record with a custom prototype', () => {
+      const inherited = Object.assign(Object.create({ hostile: true }), job({
+        type: 'catalog.ingest_revision',
+        payload: {
+          revisionId: '22222222-2222-4222-8222-222222222222',
+          generation: 7
+        }
+      })) as JobRecord;
+
+      expectEmpty(parseRegisteredJobDiagnosticMetadata(inherited));
+    });
+  });
+
   it('freezes the exact eleven definitions in canonical order', () => {
     expect(JOB_DEFINITIONS).toEqual(expectedDefinitions);
     expect(REGISTERED_JOB_KINDS).toEqual(expectedDefinitions.map(({ kind }) => kind));
