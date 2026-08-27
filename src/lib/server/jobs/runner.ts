@@ -16,7 +16,11 @@ import {
   defineSafeCode,
   reduceSafeError
 } from '../observability/safe-error';
-import { FINANCIAL_ADMIN_COMMAND_JOB } from './catalog';
+import {
+  FINANCIAL_ADMIN_COMMAND_JOB,
+  OPERATIONS_JOB_RETRY_COMMAND_JOB,
+  OPERATIONS_JOB_RETRY_COMMAND_MAX_ATTEMPTS
+} from './catalog';
 import type {
   JobAttemptIdentity,
   JobDiagnosticMetadataParser,
@@ -28,13 +32,22 @@ import type {
   JobFailureTransition,
   JobHandler,
   JobRecord,
-  JobRepository
+  JobRepository,
+  OperationsJobLeaseAuthority,
+  OperationsJobSafeError
 } from './types';
 
 export class PermanentJobError extends Error {
   constructor(readonly safeMessage: string) {
     super(safeMessage);
     this.name = 'PermanentJobError';
+  }
+}
+
+export class DefiniteRetryableJobError extends Error {
+  constructor() {
+    super('Retryable job handler transaction failed');
+    this.name = 'DefiniteRetryableJobError';
   }
 }
 
@@ -47,7 +60,11 @@ export class JobLeaseLostError extends Error {
 
 type WorkerSleep = (milliseconds: number, signal: AbortSignal) => Promise<void>;
 const FINANCIAL_ADMIN_LEASE_CAPABILITY_PATTERN = /^[A-Za-z0-9_-]{43}$/u;
+const OPERATIONS_JOB_LEASE_CAPABILITY_PATTERN = /^[A-Za-z0-9_-]{43}$/u;
 const MAX_DURATION_MS = 86_400_000;
+const OPERATIONS_UNKNOWN_OUTCOME = 'Operations job execution outcome is unknown';
+const OPERATIONS_PERMANENT_FAILURE = 'Operations job retry command permanently failed.';
+const OPERATIONS_INVALID_IDENTITY = 'Invalid operations job retry command identity.';
 
 const PERMANENT_JOB_FAILURE = defineSafeCode('permanent_job_failure');
 const JOB_COMPLETION_FAILED = defineSafeCode('job_completion_failed');
@@ -188,6 +205,82 @@ function createAttemptIdentity(
       });
 }
 
+type OwnDataInspection =
+  | Readonly<{ state: 'absent' }>
+  | Readonly<{ state: 'data'; value: unknown }>
+  | Readonly<{ state: 'invalid' }>;
+
+interface OperationsTransportSnapshot {
+  readonly capability: OwnDataInspection;
+  readonly generation: OwnDataInspection;
+}
+
+function inspectOwnDataProperty(value: object, key: PropertyKey): OwnDataInspection {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined) return Object.freeze({ state: 'absent' });
+    if (!Object.hasOwn(descriptor, 'value')) return Object.freeze({ state: 'invalid' });
+    return Object.freeze({ state: 'data', value: descriptor.value });
+  } catch {
+    return Object.freeze({ state: 'invalid' });
+  }
+}
+
+function inspectOperationsTransport(job: Readonly<JobRecord>): OperationsTransportSnapshot {
+  return Object.freeze({
+    capability: inspectOwnDataProperty(job, 'operationsJobLeaseCapability'),
+    generation: inspectOwnDataProperty(job, 'operationsJobLeaseGeneration')
+  });
+}
+
+function hasOperationsTransport(snapshot: OperationsTransportSnapshot): boolean {
+  return snapshot.capability.state !== 'absent' || snapshot.generation.state !== 'absent';
+}
+
+function reconstructOperationsAuthority(
+  options: WorkerJobOptions,
+  job: Readonly<JobRecord>,
+  identity: JobAttemptIdentity,
+  snapshot: OperationsTransportSnapshot
+): Readonly<OperationsJobLeaseAuthority> | null | undefined {
+  if (identity.jobKind !== OPERATIONS_JOB_RETRY_COMMAND_JOB) {
+    return hasOperationsTransport(snapshot) ? null : undefined;
+  }
+
+  const financialCapability = inspectOwnDataProperty(job, 'financialAdminLeaseCapability');
+  if (snapshot.capability.state !== 'data' ||
+    typeof snapshot.capability.value !== 'string' ||
+    !OPERATIONS_JOB_LEASE_CAPABILITY_PATTERN.test(snapshot.capability.value) ||
+    snapshot.generation.state !== 'data' ||
+    !isPositiveSignedInt32(snapshot.generation.value) ||
+    financialCapability.state !== 'absent' ||
+    identity.maxAttempts !== OPERATIONS_JOB_RETRY_COMMAND_MAX_ATTEMPTS ||
+    identity.attempt > identity.maxAttempts) {
+    return null;
+  }
+
+  return Object.freeze({
+    jobId: identity.jobId,
+    leaseOwner: options.leaseOwner,
+    attempt: identity.attempt,
+    maxAttempts: identity.maxAttempts,
+    generation: snapshot.generation.value,
+    capability: snapshot.capability.value
+  }) satisfies OperationsJobLeaseAuthority;
+}
+
+function operationsOutcomeUnknown(): Error {
+  return new Error(OPERATIONS_UNKNOWN_OUTCOME);
+}
+
+function isDefiniteRetryableJobError(cause: unknown): boolean {
+  try {
+    return cause instanceof DefiniteRetryableJobError;
+  } catch {
+    return false;
+  }
+}
+
 function fixedLeaseLossCode(
   code: JobLeaseLostLogCode,
   operation: 'job.claim' | 'job.completion' | 'job.failure_transition' | 'job.lease_renewal',
@@ -217,6 +310,7 @@ interface LeaseRenewalOptions {
   readonly jobId: string;
   readonly leaseOwner: string;
   readonly financialAdminLeaseCapability?: string;
+  readonly operationsAuthority?: Readonly<OperationsJobLeaseAuthority>;
   readonly intervalMs: number;
   readonly signal: AbortSignal;
   readonly sleep: WorkerSleep;
@@ -237,9 +331,11 @@ async function renewLease(options: LeaseRenewalOptions): Promise<void> {
 
     let renewed: boolean;
     try {
-      renewed = options.financialAdminLeaseCapability === undefined
-        ? await options.repository.renewLease(options.jobId, options.leaseOwner)
-        : await options.repository.renewLease(
+      renewed = options.operationsAuthority !== undefined
+        ? await options.repository.renewOperationsJobLease(options.operationsAuthority)
+        : options.financialAdminLeaseCapability === undefined
+          ? await options.repository.renewLease(options.jobId, options.leaseOwner)
+          : await options.repository.renewLease(
             options.jobId,
             options.leaseOwner,
             options.financialAdminLeaseCapability
@@ -267,6 +363,51 @@ function permanentSafeMessage(cause: unknown): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+interface OperationsFailureDisposition {
+  readonly safeError: OperationsJobSafeError;
+  readonly retryable: boolean;
+  readonly permanent: boolean;
+}
+
+function operationsFailureDisposition(
+  cause: unknown
+): OperationsFailureDisposition | undefined {
+  if (isDefiniteRetryableJobError(cause)) {
+    return Object.freeze({
+      safeError: 'Transient job handler failure',
+      retryable: true,
+      permanent: false
+    });
+  }
+  const trustedPermanentMessage = permanentSafeMessage(cause);
+  if (trustedPermanentMessage === undefined) return undefined;
+  return Object.freeze({
+    safeError: trustedPermanentMessage === OPERATIONS_INVALID_IDENTITY
+      ? OPERATIONS_INVALID_IDENTITY
+      : OPERATIONS_PERMANENT_FAILURE,
+    retryable: false,
+    permanent: true
+  });
+}
+
+function operationsFailureCode(
+  identity: JobAttemptIdentity,
+  permanent: boolean
+): JobFailureLogCode {
+  return permanent
+    ? createSafeDiagnosticError({
+        class: 'job',
+        code: PERMANENT_JOB_FAILURE,
+        operation: 'job.handler',
+        outcome: 'failed',
+        correlationId: identity.correlationId
+      }).code
+    : reduceSafeError(undefined, {
+        operation: 'job.handler',
+        correlationId: identity.correlationId
+      }).code;
 }
 
 async function failClaimedJob(
@@ -306,10 +447,17 @@ function observeUnregisteredSettlement(
 async function runRegisteredJob(
   options: WorkerJobOptions,
   job: JobRecord,
-  handler: JobHandler,
-  claimedAt: number
+  handler: JobHandler | undefined,
+  claimedAt: number,
+  operationsTransport: OperationsTransportSnapshot
 ): Promise<void> {
   const identity = createAttemptIdentity(options, job);
+  const operationsAuthority = reconstructOperationsAuthority(
+    options,
+    job,
+    identity,
+    operationsTransport
+  );
   await runWithDiagnosticContext({
     kind: 'job',
     correlationId: identity.correlationId,
@@ -322,7 +470,17 @@ async function runRegisteredJob(
   }, async () => {
     options.observer({ type: 'job_claimed', identity });
 
-    if (job.type === FINANCIAL_ADMIN_COMMAND_JOB &&
+    if (operationsAuthority === null) {
+      options.observer({
+        type: 'job_lease_lost',
+        identity,
+        code: fixedLeaseLossCode(LEASE_CAPABILITY_INVALID, 'job.claim', identity)
+      });
+      options.observer({ type: 'lease_lost', slotId: options.slotId });
+      return;
+    }
+
+    if (operationsAuthority === undefined && job.type === FINANCIAL_ADMIN_COMMAND_JOB &&
       (job.financialAdminLeaseCapability === undefined ||
         !FINANCIAL_ADMIN_LEASE_CAPABILITY_PATTERN.test(
           job.financialAdminLeaseCapability
@@ -333,6 +491,44 @@ async function runRegisteredJob(
         code: fixedLeaseLossCode(LEASE_CAPABILITY_INVALID, 'job.claim', identity)
       });
       options.observer({ type: 'lease_lost', slotId: options.slotId });
+      return;
+    }
+
+    if (handler === undefined) {
+      if (operationsAuthority === undefined) {
+        throw new TypeError('invalid operations job lease authority');
+      }
+      let transition: JobFailureTransition;
+      try {
+        transition = await options.repository.failOperationsJob(
+          operationsAuthority,
+          OPERATIONS_PERMANENT_FAILURE,
+          false
+        );
+      } catch {
+        throw operationsOutcomeUnknown();
+      }
+      if (!transition.applied) {
+        options.observer({
+          type: 'job_lease_lost',
+          identity,
+          code: fixedLeaseLossCode(
+            FAILURE_TRANSITION_REJECTED,
+            'job.failure_transition',
+            identity
+          )
+        });
+        options.observer({ type: 'lease_lost', slotId: options.slotId });
+        return;
+      }
+      options.observer({
+        type: 'job_failed',
+        identity,
+        code: operationsFailureCode(identity, true),
+        durationMs: normalizeDuration(claimedAt, options.monotonicNow()),
+        retryScheduled: transition.retryScheduled
+      });
+      options.observer({ type: 'terminal_settled', slotId: options.slotId });
       return;
     }
 
@@ -370,11 +566,13 @@ async function runRegisteredJob(
 
     const renewal = renewLease({
       repository: options.repository,
-      jobId: job.id,
+      jobId: identity.jobId,
       leaseOwner: options.leaseOwner,
-      ...(job.financialAdminLeaseCapability === undefined
-        ? {}
-        : { financialAdminLeaseCapability: job.financialAdminLeaseCapability }),
+      ...(operationsAuthority !== undefined
+        ? { operationsAuthority }
+        : job.financialAdminLeaseCapability === undefined
+          ? {}
+          : { financialAdminLeaseCapability: job.financialAdminLeaseCapability }),
       intervalMs: options.leaseRenewalIntervalMs,
       signal: renewalController.signal,
       sleep: options.leaseRenewalSleep ?? abortableSleep,
@@ -400,6 +598,33 @@ async function runRegisteredJob(
 
     if (leaseLost) return;
     if (handlerFailed) {
+      if (operationsAuthority !== undefined) {
+        const disposition = operationsFailureDisposition(handlerError);
+        if (disposition === undefined) throw operationsOutcomeUnknown();
+        let transition: JobFailureTransition;
+        try {
+          transition = await options.repository.failOperationsJob(
+            operationsAuthority,
+            disposition.safeError,
+            disposition.retryable
+          );
+        } catch {
+          throw operationsOutcomeUnknown();
+        }
+        if (!transition.applied) {
+          rejectSettlement(FAILURE_TRANSITION_REJECTED, 'job.failure_transition');
+          return;
+        }
+        options.observer({
+          type: 'job_failed',
+          identity,
+          code: operationsFailureCode(identity, disposition.permanent),
+          durationMs: normalizeDuration(claimedAt, options.monotonicNow()),
+          retryScheduled: transition.retryScheduled
+        });
+        options.observer({ type: 'terminal_settled', slotId: options.slotId });
+        return;
+      }
       const trustedPermanentMessage = permanentSafeMessage(handlerError);
       const reduced = reduceSafeError(handlerError, {
         operation: 'job.handler',
@@ -454,14 +679,17 @@ async function runRegisteredJob(
 
     let completed: boolean;
     try {
-      completed = job.financialAdminLeaseCapability === undefined
-        ? await options.repository.complete(job.id, options.leaseOwner)
-        : await options.repository.complete(
+      completed = operationsAuthority !== undefined
+        ? await options.repository.completeOperationsJob(operationsAuthority)
+        : job.financialAdminLeaseCapability === undefined
+          ? await options.repository.complete(job.id, options.leaseOwner)
+          : await options.repository.complete(
             job.id,
             options.leaseOwner,
             job.financialAdminLeaseCapability
           );
     } catch {
+      if (operationsAuthority !== undefined) throw operationsOutcomeUnknown();
       let transition: JobFailureTransition;
       try {
         transition = await failClaimedJob(
@@ -508,8 +736,10 @@ async function runClaimedJob(
   job: JobRecord,
   claimedAt: number
 ): Promise<void> {
+  const operationsTransport = inspectOperationsTransport(job);
   const handler = options.handlers.get(job.type);
-  if (!handler) {
+  if (!handler && job.type !== OPERATIONS_JOB_RETRY_COMMAND_JOB &&
+    !hasOperationsTransport(operationsTransport)) {
     const transition = await failClaimedJob(
       options.repository,
       job,
@@ -520,7 +750,7 @@ async function runClaimedJob(
     observeUnregisteredSettlement(options, transition);
     return;
   }
-  await runRegisteredJob(options, job, handler, claimedAt);
+  await runRegisteredJob(options, job, handler, claimedAt, operationsTransport);
 }
 
 async function runWorkerLoop(options: WorkerLoopOptions): Promise<void> {

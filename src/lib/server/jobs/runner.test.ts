@@ -7,7 +7,7 @@ import {
   type RunnerObservation,
   type RunnerObserver
 } from './runner-observer';
-import { PermanentJobError, runWorker } from './runner';
+import { DefiniteRetryableJobError, PermanentJobError, runWorker } from './runner';
 import type { JobFailureTransition, JobRecord, JobRepository } from './types';
 
 const job: JobRecord = {
@@ -21,6 +21,7 @@ const job: JobRecord = {
 };
 
 const FINANCIAL_ADMIN_LEASE_CAPABILITY = 'A'.repeat(43);
+const OPERATIONS_JOB_LEASE_CAPABILITY = 'O'.repeat(43);
 const GENERATED_CORRELATION_ID = '11111111-2222-4333-8444-555555555555';
 const financialAdminJob: JobRecord = {
   ...job,
@@ -30,6 +31,17 @@ const financialAdminJob: JobRecord = {
   deduplicationKey:
     'commerce:financial-admin-command:f1f46ee7-3170-40ea-bfad-d55a734bf381:v1',
   financialAdminLeaseCapability: FINANCIAL_ADMIN_LEASE_CAPABILITY
+};
+const operationsJob: JobRecord = {
+  ...job,
+  id: 'f1f46ee7-3170-40ea-bfad-d55a734bf382',
+  type: 'operations.job-retry-command',
+  payload: { commandId: 'f1f46ee7-3170-40ea-bfad-d55a734bf383' },
+  deduplicationKey:
+    'operations:job-retry-command:f1f46ee7-3170-40ea-bfad-d55a734bf383:v1',
+  maxAttempts: 8,
+  operationsJobLeaseCapability: OPERATIONS_JOB_LEASE_CAPABILITY,
+  operationsJobLeaseGeneration: 3
 };
 
 function captureObservations(): {
@@ -1893,5 +1905,304 @@ describe('runWorker', () => {
       const event = JSON.parse(line) as Record<string, unknown>;
       return event.event === 'logging.failure' && !line.includes('privacy-canary');
     })).toBe(true);
+  });
+});
+
+describe('operations job settlement', () => {
+  const expectedAuthority = Object.freeze({
+    jobId: operationsJob.id,
+    leaseOwner: 'worker-operations',
+    attempt: operationsJob.attempts,
+    maxAttempts: operationsJob.maxAttempts,
+    generation: operationsJob.operationsJobLeaseGeneration!,
+    capability: operationsJob.operationsJobLeaseCapability!
+  });
+
+  async function runOperation(input: {
+    readonly record?: JobRecord;
+    readonly handler?: (job: JobRecord, signal: AbortSignal) => Promise<void>;
+    readonly repository?: JobRepository;
+    readonly observer?: RunnerObserver;
+  }): Promise<JobRepository> {
+    const record = input.record ?? { ...operationsJob };
+    const repository = input.repository ?? repositoryReturning(record);
+    const controller = new AbortController();
+    await runWorker({
+      repository,
+      handlers: input.handler === undefined
+        ? new Map()
+        : new Map([[record.type, input.handler]]),
+      workerId: 'worker-operations',
+      concurrency: 1,
+      pollIntervalMs: 1,
+      leaseRenewalIntervalMs: 10_000,
+      signal: controller.signal,
+      ...(input.observer ? { observer: input.observer } : {}),
+      sleep: async () => controller.abort()
+    });
+    return repository;
+  }
+
+  it('exports the exact cause-free definite rollback marker', () => {
+    const error = new DefiniteRetryableJobError();
+
+    expect(error).toMatchObject({
+      name: 'DefiniteRetryableJobError',
+      message: 'Retryable job handler transaction failed'
+    });
+    expect(Object.hasOwn(error, 'cause')).toBe(false);
+  });
+
+  it('completes a successful operations handler through one frozen authority', async () => {
+    const repository = await runOperation({
+      handler: vi.fn().mockResolvedValue(undefined)
+    });
+
+    expect(repository.completeOperationsJob).toHaveBeenCalledExactlyOnceWith(
+      expectedAuthority
+    );
+    const authority = vi.mocked(repository.completeOperationsJob).mock.calls[0]![0];
+    expect(Object.isFrozen(authority)).toBe(true);
+    expect(repository.complete).not.toHaveBeenCalled();
+    expect(repository.failOperationsJob).not.toHaveBeenCalled();
+    expect(repository.failWithDisposition).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      name: 'a definite rolled-back handler transaction',
+      error: new DefiniteRetryableJobError(),
+      safeError: 'Transient job handler failure',
+      retryable: true
+    },
+    {
+      name: 'the exact invalid command identity',
+      error: new PermanentJobError('Invalid operations job retry command identity.'),
+      safeError: 'Invalid operations job retry command identity.',
+      retryable: false
+    },
+    {
+      name: 'another permanent handler failure',
+      error: new PermanentJobError('handler-private-permanent-canary'),
+      safeError: 'Operations job retry command permanently failed.',
+      retryable: false
+    }
+  ] as const)('routes $name only through protected operations failure', async ({
+    error,
+    safeError,
+    retryable
+  }) => {
+    const repository = await runOperation({
+      handler: async () => { throw error; }
+    });
+
+    expect(repository.failOperationsJob).toHaveBeenCalledExactlyOnceWith(
+      expectedAuthority,
+      safeError,
+      retryable
+    );
+    expect(repository.failWithDisposition).not.toHaveBeenCalled();
+    expect(repository.fail).not.toHaveBeenCalled();
+    expect(repository.completeOperationsJob).not.toHaveBeenCalled();
+  });
+
+  it('leaves an unknown handler outcome unsettled and throws a fresh bounded error', async () => {
+    const privateError = new Error(
+      `handler-outcome-private-canary:${OPERATIONS_JOB_LEASE_CAPABILITY}`
+    );
+    Object.defineProperty(privateError, 'cause', {
+      value: { capability: OPERATIONS_JOB_LEASE_CAPABILITY }
+    });
+    const repository = repositoryReturning({ ...operationsJob });
+    const captured = captureObservations();
+    let thrown: unknown;
+
+    try {
+      await runOperation({
+        repository,
+        observer: captured.observer,
+        handler: async () => { throw privateError; }
+      });
+    } catch (error: unknown) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown).not.toBe(privateError);
+    expect(thrown).toMatchObject({ message: 'Operations job execution outcome is unknown' });
+    expect(Object.hasOwn(thrown as object, 'cause')).toBe(false);
+    expect(String(thrown)).not.toContain('private-canary');
+    expect(String(thrown)).not.toContain(OPERATIONS_JOB_LEASE_CAPABILITY);
+    expect(JSON.stringify(captured.events)).not.toContain(OPERATIONS_JOB_LEASE_CAPABILITY);
+    expect(jobEvents(captured.events).map((event) => event.type)).toEqual(['job_claimed']);
+    expect(repository.failOperationsJob).not.toHaveBeenCalled();
+    expect(repository.failWithDisposition).not.toHaveBeenCalled();
+    expect(repository.completeOperationsJob).not.toHaveBeenCalled();
+  });
+
+  it('leaves an ambiguous operations completion unsettled and throws the same bounded class', async () => {
+    const privateError = new Error(
+      `completion-outcome-private-canary:${OPERATIONS_JOB_LEASE_CAPABILITY}`
+    );
+    const repository = repositoryReturning({ ...operationsJob });
+    vi.mocked(repository.completeOperationsJob).mockRejectedValue(privateError);
+    const captured = captureObservations();
+    let thrown: unknown;
+
+    try {
+      await runOperation({
+        repository,
+        observer: captured.observer,
+        handler: vi.fn().mockResolvedValue(undefined)
+      });
+    } catch (error: unknown) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown).not.toBe(privateError);
+    expect(thrown).toMatchObject({ message: 'Operations job execution outcome is unknown' });
+    expect(Object.hasOwn(thrown as object, 'cause')).toBe(false);
+    expect(String(thrown)).not.toContain('private-canary');
+    expect(String(thrown)).not.toContain(OPERATIONS_JOB_LEASE_CAPABILITY);
+    expect(jobEvents(captured.events).map((event) => event.type)).toEqual(['job_claimed']);
+    expect(repository.failOperationsJob).not.toHaveBeenCalled();
+    expect(repository.failWithDisposition).not.toHaveBeenCalled();
+  });
+
+  it('treats complete=false as the existing lease-lost observation without fallback', async () => {
+    const repository = repositoryReturning({ ...operationsJob });
+    vi.mocked(repository.completeOperationsJob).mockResolvedValue(false);
+    const captured = captureObservations();
+
+    await runOperation({
+      repository,
+      observer: captured.observer,
+      handler: vi.fn().mockResolvedValue(undefined)
+    });
+
+    expect(jobEvents(captured.events).map((event) => event.type)).toEqual([
+      'job_claimed',
+      'job_lease_lost'
+    ]);
+    expect(captured.events).toContainEqual({ type: 'lease_lost', slotId: 0 });
+    expect(captured.events).not.toContainEqual({ type: 'terminal_settled', slotId: 0 });
+    expect(repository.failOperationsJob).not.toHaveBeenCalled();
+    expect(repository.failWithDisposition).not.toHaveBeenCalled();
+  });
+
+  it('settles a missing operations handler through the fixed protected permanent path', async () => {
+    const repository = await runOperation({});
+
+    expect(repository.failOperationsJob).toHaveBeenCalledExactlyOnceWith(
+      expectedAuthority,
+      'Operations job retry command permanently failed.',
+      false
+    );
+    expect(repository.failWithDisposition).not.toHaveBeenCalled();
+    expect(repository.fail).not.toHaveBeenCalled();
+  });
+
+  it('freezes authority once before a handler mutates the claimed record', async () => {
+    const record = { ...operationsJob };
+    const repository = repositoryReturning(record);
+    const renewal = controlledSleep();
+    const handlerFinished = deferred<void>();
+    const controller = new AbortController();
+    const handler = vi.fn(async (claimed: JobRecord) => {
+      claimed.attempts = 7;
+      claimed.maxAttempts = 7;
+      claimed.operationsJobLeaseGeneration = 77;
+      claimed.operationsJobLeaseCapability = 'M'.repeat(43);
+      claimed.financialAdminLeaseCapability = 'F'.repeat(43);
+      await handlerFinished.promise;
+    });
+
+    const running = runWorker({
+      repository,
+      handlers: new Map([[record.type, handler]]),
+      workerId: 'worker-operations',
+      concurrency: 1,
+      pollIntervalMs: 1,
+      leaseRenewalIntervalMs: 25,
+      signal: controller.signal,
+      leaseRenewalSleep: renewal.sleep,
+      sleep: async () => controller.abort()
+    });
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledOnce());
+    renewal.releaseNext();
+    await vi.waitFor(() => expect(repository.renewOperationsJobLease).toHaveBeenCalledOnce());
+    handlerFinished.resolve();
+    await running;
+
+    const renewedAuthority = vi.mocked(repository.renewOperationsJobLease).mock.calls[0]![0];
+    const completedAuthority = vi.mocked(repository.completeOperationsJob).mock.calls[0]![0];
+    expect(renewedAuthority).toEqual(expectedAuthority);
+    expect(Object.isFrozen(renewedAuthority)).toBe(true);
+    expect(completedAuthority).toBe(renewedAuthority);
+    expect(repository.renewLease).not.toHaveBeenCalled();
+    expect(repository.complete).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['missing capability', (({ operationsJobLeaseCapability: _, ...record }) => record)({
+      ...operationsJob
+    })],
+    ['missing generation', (({ operationsJobLeaseGeneration: _, ...record }) => record)({
+      ...operationsJob
+    })],
+    ['short capability', { ...operationsJob, operationsJobLeaseCapability: 'short' }],
+    ['zero generation', { ...operationsJob, operationsJobLeaseGeneration: 0 }],
+    ['wrong maximum', { ...operationsJob, maxAttempts: 7 }],
+    ['attempt above maximum', { ...operationsJob, attempts: 9 }],
+    ['financial authority contamination', {
+      ...operationsJob,
+      financialAdminLeaseCapability: FINANCIAL_ADMIN_LEASE_CAPABILITY
+    }],
+    ['ordinary capability contamination', {
+      ...job,
+      operationsJobLeaseCapability: OPERATIONS_JOB_LEASE_CAPABILITY
+    }],
+    ['ordinary generation contamination', {
+      ...job,
+      operationsJobLeaseGeneration: 1
+    }],
+    ['ordinary own-undefined contamination', {
+      ...job,
+      operationsJobLeaseCapability: undefined
+    }]
+  ] as const)('rejects %s before any handler or settlement', async (_name, candidate) => {
+    const record = candidate as JobRecord;
+    const repository = repositoryReturning(record);
+    const handler = vi.fn().mockResolvedValue(undefined);
+
+    await runOperation({ record, repository, handler });
+
+    expect(handler).not.toHaveBeenCalled();
+    expect(repository.renewOperationsJobLease).not.toHaveBeenCalled();
+    expect(repository.completeOperationsJob).not.toHaveBeenCalled();
+    expect(repository.failOperationsJob).not.toHaveBeenCalled();
+    expect(repository.renewLease).not.toHaveBeenCalled();
+    expect(repository.complete).not.toHaveBeenCalled();
+    expect(repository.failWithDisposition).not.toHaveBeenCalled();
+  });
+
+  it('does not invoke an operations capability accessor while rejecting it', async () => {
+    const record = { ...operationsJob };
+    const capabilityGetter = vi.fn(() => OPERATIONS_JOB_LEASE_CAPABILITY);
+    Object.defineProperty(record, 'operationsJobLeaseCapability', {
+      configurable: true,
+      enumerable: true,
+      get: capabilityGetter
+    });
+    const repository = repositoryReturning(record);
+    const handler = vi.fn().mockResolvedValue(undefined);
+
+    await runOperation({ record, repository, handler });
+
+    expect(capabilityGetter).not.toHaveBeenCalled();
+    expect(handler).not.toHaveBeenCalled();
+    expect(repository.failOperationsJob).not.toHaveBeenCalled();
+    expect(repository.failWithDisposition).not.toHaveBeenCalled();
   });
 });

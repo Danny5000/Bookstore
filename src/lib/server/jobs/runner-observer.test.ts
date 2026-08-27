@@ -281,6 +281,7 @@ describe('createRunnerObserver', () => {
       payload: { email: 'person@example.test', storageKey: 'private/storage-key' },
       deduplicationKey: 'deduplication-privacy-canary',
       financialAdminLeaseCapability: 'capability-privacy-canary',
+      operationsJobLeaseCapability: 'operations-capability-privacy-canary',
       providerBody: 'provider-body-privacy-canary',
       error: new Error('exception-message-privacy-canary'),
       stack: 'stack-privacy-canary'
@@ -302,6 +303,7 @@ describe('createRunnerObserver', () => {
       'private/storage-key',
       'deduplication-privacy-canary',
       'capability-privacy-canary',
+      'operations-capability-privacy-canary',
       'provider-body-privacy-canary',
       'exception-message-privacy-canary',
       'stack-privacy-canary',
