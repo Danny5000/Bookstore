@@ -297,6 +297,16 @@ const SAFE_FAILURES: Readonly<
   })
 });
 
+export function isOperationalFailureCodeAllowedForJobKind(
+  kind: unknown,
+  code: unknown
+): code is OperationalJobFailureCode | null {
+  if (!isRegisteredJobKind(kind)) return false;
+  if (code === null || code === 'unexpected_failure') return true;
+  if (typeof code !== 'string') return false;
+  return Object.values(SAFE_FAILURES[kind]).some((candidate) => candidate === code);
+}
+
 export function safeOperationalFailureCode(
   kind: unknown,
   lastError: unknown

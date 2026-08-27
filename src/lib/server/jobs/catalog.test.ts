@@ -30,6 +30,7 @@ import {
   STRIPE_EVENT_JOB,
   STRIPE_EVENT_JOB_MAX_ATTEMPTS,
   definitionForJobKind,
+  isOperationalFailureCodeAllowedForJobKind,
   isJobRetryPolicyOutcomeAllowed,
   isRegisteredJobKind,
   safeOperationalFailureCode
@@ -594,6 +595,45 @@ describe('production job catalog', () => {
     for (const [kind, lastError, expected] of cases) {
       expect(safeOperationalFailureCode(kind, lastError), `${kind}:${lastError}`).toBe(expected);
     }
+  });
+
+  it('selects only safe failure codes reachable for the exact registered kind', () => {
+    const reachable = [
+      ['outbox.dispatch', 'invalid_job_identity'],
+      ['outbox.dispatch', 'source_unavailable'],
+      ['commerce.claim-email', 'domain_state_not_retryable'],
+      ['commerce.claim-email-request', 'domain_state_not_retryable'],
+      ['commerce.stripe-event', 'source_unavailable'],
+      ['commerce.financial-source', 'domain_state_not_retryable'],
+      ['commerce.financial-payout', 'domain_state_not_retryable'],
+      ['commerce.financial-scan', 'domain_state_not_retryable'],
+      ['commerce.financial-classification', 'domain_state_not_retryable'],
+      ['commerce.financial-admin-command', 'domain_state_not_retryable'],
+      ['catalog.ingest_revision', 'source_unavailable'],
+      ['operations.job-retry-command', 'retry_command_exhausted']
+    ] as const;
+    for (const [kind, code] of reachable) {
+      expect(isOperationalFailureCodeAllowedForJobKind(kind, code), `${kind}:${code}`).toBe(true);
+    }
+    for (const kind of REGISTERED_JOB_KINDS) {
+      expect(isOperationalFailureCodeAllowedForJobKind(kind, null)).toBe(true);
+      expect(isOperationalFailureCodeAllowedForJobKind(kind, 'unexpected_failure')).toBe(true);
+    }
+    expect(isOperationalFailureCodeAllowedForJobKind(
+      'commerce.stripe-event', 'retry_command_exhausted'
+    )).toBe(false);
+    expect(isOperationalFailureCodeAllowedForJobKind(
+      'outbox.dispatch', 'domain_state_not_retryable'
+    )).toBe(false);
+    expect(isOperationalFailureCodeAllowedForJobKind(
+      'commerce.financial-admin-command', 'source_unavailable'
+    )).toBe(false);
+    for (const [kind, code] of [
+      ['unregistered', 'unregistered_job_kind'],
+      ['commerce.stripe-event', 'unregistered_job_kind'],
+      ['commerce.stripe-event', 'raw_provider_error'],
+      [null, null]
+    ]) expect(isOperationalFailureCodeAllowedForJobKind(kind, code)).toBe(false);
   });
 
   it('fails closed for null, unknown, malformed, and hostile values', () => {
