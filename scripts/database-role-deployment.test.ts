@@ -183,6 +183,16 @@ function serviceBlock(compose: string, name: string): string {
   return match?.[0] ?? '';
 }
 
+function stringArrayConstant(text: string, name: string): string[] {
+  const startMarker = `const ${name} = [`;
+  const start = text.indexOf(startMarker);
+  expect(start, `${name} start`).toBeGreaterThanOrEqual(0);
+  const end = text.indexOf('] as const;', start);
+  expect(end, `${name} end`).toBeGreaterThan(start);
+  return [...text.slice(start + startMarker.length, end).matchAll(/'([^']+)'/gu)]
+    .map((match) => match[1]!);
+}
+
 describe('production database authority split', () => {
   it('rejects noncanonical preexisting fixed groups before any role mutation', () => {
     const migration = source('drizzle/0009_plan6b_worker_authority_and_commerce_integrity.sql');
@@ -1059,5 +1069,164 @@ describe('production database authority split', () => {
         'u'
       ));
     }
+  });
+
+  it('pins the exact Plan 7A public, private, table, and type authority surface', () => {
+    const migration = source('drizzle/0015_plan7a_operations_authority.sql');
+    const provisioner = source('src/lib/server/db/database-role-provision.ts');
+    const publicRoutines = [
+      'public.list_operational_jobs(uuid,text,text,timestamp with time zone,uuid,integer)',
+      'public.submit_job_retry_command(uuid,uuid,text,integer,integer,timestamp with time zone,text,text,text,text)',
+      'public.get_owned_job_retry_command(uuid,uuid)'
+    ] as const;
+    const privateRoutines = [
+      'public.plan7a_operations_claim_job(uuid,text,integer)',
+      'public.plan7a_operations_renew_job_claim(uuid,text,integer,integer)',
+      'public.plan7a_operations_relinquish_job(uuid,text,integer,integer,text,integer)',
+      'public.plan7a_operations_complete_job(uuid,text,integer,integer)',
+      'public.plan7a_operations_fail_job(uuid,text,integer,integer,text)',
+      'public.plan7a_operations_exhaust_job(uuid,text,integer,integer)',
+      'public.plan7a_operations_lock_job_retry_command(uuid,uuid,text,integer,integer)',
+      'public.plan7a_operations_transition_job_retry_command(uuid,uuid,text,integer,integer,operations_job_retry_result_code)'
+    ] as const;
+    const ownerOnlyRoutines = [
+      'public.plan7a_operations_job_catalog()',
+      'public.plan7a_operations_safe_failure_code(text,text)',
+      'public.plan7a_operations_assert_job_capability(uuid,uuid,text,integer,integer)',
+      'public.plan7a_operations_guard_command_update()',
+      'public.plan7a_operations_guard_command_delete()',
+      'public.plan7a_operations_guard_job_transition()'
+    ] as const;
+    const protectedTables = [
+      'operations_job_retry_commands',
+      'operations_job_retry_claims'
+    ] as const;
+    const protectedTypes = [
+      'operations_job_retry_command_status',
+      'operations_job_retry_result_code',
+      'operations_job_retry_reason_code',
+      'operations_job_retry_claim_state'
+    ] as const;
+
+    const runtimeInventory = stringArrayConstant(provisioner, 'RUNTIME_EXECUTE_FUNCTIONS')
+      .filter((signature) => /(?:plan7a_operations_|operational_jobs|job_retry_command)/u
+        .test(signature));
+    const workerInventory = stringArrayConstant(provisioner, 'WORKER_EXECUTE_FUNCTIONS')
+      .filter((signature) => signature.includes('plan7a_operations_'));
+    expect(runtimeInventory).toEqual(publicRoutines);
+    expect(workerInventory).toEqual(privateRoutines);
+    expect(stringArrayConstant(provisioner, 'WORKER_USAGE_TYPES')).toEqual([
+      'public.operations_job_retry_result_code'
+    ]);
+    expect(stringArrayConstant(provisioner, 'PROTECTED_OPERATIONS_TYPES')).toEqual(
+      protectedTypes.map((type) => `public.${type}`)
+    );
+    expect(stringArrayConstant(provisioner, 'PROTECTED_OPERATIONS_GUCS')).toEqual([
+      'pale_orbit.plan7a_operations_command_insert_id',
+      'pale_orbit.plan7a_operations_command_transition_id',
+      'pale_orbit.plan7a_operations_job_transition_id',
+      'pale_orbit.plan7a_operations_job_capability'
+    ]);
+
+    for (const inventoryName of [
+      'PROTECTED_RUNTIME_WRITE_TABLES',
+      'RUNTIME_TABLE_SELECT_EXCLUSIONS'
+    ]) {
+      expect(stringArrayConstant(provisioner, inventoryName).filter((name) =>
+        name.startsWith('operations_job_retry_')
+      )).toEqual(protectedTables);
+    }
+    expect(stringArrayConstant(provisioner, 'PUBLIC_SENSITIVE_SELECT_COLUMNS').filter((token) =>
+      token.startsWith('operations_job_retry_')
+    )).toEqual(protectedTables.map((table) => `${table}:*`));
+    for (const inventoryName of [
+      'WORKER_INSERT_TABLES', 'WORKER_UPDATE_TABLES', 'WORKER_DELETE_TABLES',
+      'WORKER_SELECT_TABLES', 'RUNTIME_COLUMN_PRIVILEGES', 'WORKER_COLUMN_PRIVILEGES'
+    ]) {
+      expect(stringArrayConstant(provisioner, inventoryName).filter((value) =>
+        value.startsWith('operations_job_retry_')
+      ), `${inventoryName} has no direct operations-table authority`).toEqual([]);
+    }
+
+    const authorityStart = migration.indexOf(
+      'REVOKE ALL ON TABLE "public"."operations_job_retry_commands"'
+    );
+    const authorityEnd = migration.indexOf('DO $plan7a_operations_authority_postflight$');
+    expect(authorityStart).toBeGreaterThanOrEqual(0);
+    expect(authorityEnd).toBeGreaterThan(authorityStart);
+    const statements = migration.slice(authorityStart, authorityEnd)
+      .split('--> statement-breakpoint')
+      .map((statement) => statement.trim().replace(/;$/u, ''))
+      .filter(Boolean);
+    const collapsedStatements = statements.map((statement) => statement.replace(/\s+/gu, ' '));
+    const functionSignature = (statement: string): string => {
+      const match = /ON FUNCTION "public"\."([^"]+)"\(([^)]*)\)/u.exec(statement);
+      expect(match, statement).not.toBeNull();
+      return `public.${match?.[1]}(${match?.[2]})`;
+    };
+    const grantsFor = (role: string) => statements
+      .filter((statement) => statement.startsWith('GRANT EXECUTE ON FUNCTION') &&
+        statement.endsWith(`TO "${role}"`))
+      .map(functionSignature);
+
+    expect(grantsFor('pale_orbit_runtime')).toEqual(publicRoutines);
+    expect(grantsFor('pale_orbit_financial_worker')).toEqual(privateRoutines);
+    expect(statements.filter((statement) => statement.startsWith(
+      'GRANT EXECUTE ON FUNCTION'
+    ))).toHaveLength(publicRoutines.length + privateRoutines.length);
+    expect(statements.filter((statement) => statement.startsWith(
+      'REVOKE ALL ON FUNCTION'
+    )).map(functionSignature)).toEqual([
+      ...ownerOnlyRoutines,
+      ...publicRoutines,
+      ...privateRoutines
+    ]);
+    expect(collapsedStatements.filter((statement) => statement.startsWith(
+      'REVOKE ALL ON FUNCTION'
+    )).every((statement) => statement.endsWith(
+      'FROM PUBLIC, "pale_orbit_runtime", "pale_orbit_financial_worker", "pale_orbit_storage_cleanup"'
+    ))).toBe(true);
+
+    expect(collapsedStatements).toContain(
+      'REVOKE ALL ON TABLE "public"."operations_job_retry_commands", "public"."operations_job_retry_claims" FROM PUBLIC, "pale_orbit_runtime", "pale_orbit_financial_worker", "pale_orbit_storage_cleanup"'
+    );
+    expect(statements.some((statement) =>
+      /^GRANT\s.+\sON TABLE\s/iu.test(statement)
+    )).toBe(false);
+    expect(collapsedStatements).toContain(
+      `REVOKE ALL ON TYPE ${protectedTypes.map((type) => `"public"."${type}"`).join(', ')} FROM PUBLIC, "pale_orbit_runtime", "pale_orbit_financial_worker", "pale_orbit_storage_cleanup"`
+    );
+    expect(collapsedStatements.filter((statement) => statement.startsWith(
+      'GRANT USAGE ON TYPE'
+    ))).toEqual([
+      'GRANT USAGE ON TYPE "public"."operations_job_retry_result_code" TO "pale_orbit_financial_worker"'
+    ]);
+
+    for (const witness of [
+      'unnest($15::text[]) allowed_type(type_name)',
+      'unnest($16::text[]) protected_type(type_name)',
+      'unnest($15::text[]) required_type(type_name)',
+      "privilege_row.object_kind = 'type'",
+      "privilege_row.privilege_type = 'USAGE'",
+      "authority_dependency.classid = 'pg_catalog.pg_type'::pg_catalog.regclass",
+      'pg_catalog.to_regtype(allowed_type.type_name)',
+      'pg_catalog.to_regtype(protected_type.type_name)',
+      'pg_catalog.to_regtype(required_type.type_name)',
+      "coalesce(type_row.typacl, pg_catalog.acldefault('T', type_row.typowner))",
+      'setting_row.setrole in (',
+      'select database_row.datdba',
+      'setting_row.setdatabase in (',
+      "pg_catalog.split_part(configured_setting.value, '=', 1) = any($17::text[])"
+    ]) expect(provisioner).toContain(witness);
+    expect(provisioner.match(/unnest\(\$15::text\[\]\) allowed_type\(type_name\)/gu))
+      .toHaveLength(2);
+    expect(provisioner.match(/unnest\(\$16::text\[\]\) protected_type\(type_name\)/gu))
+      .toHaveLength(1);
+    expect(provisioner.match(/unnest\(\$15::text\[\]\) required_type\(type_name\)/gu))
+      .toHaveLength(1);
+    expect(provisioner).toContain(
+      'PUBLIC_SENSITIVE_SELECT_COLUMNS, WORKER_USAGE_TYPES, PROTECTED_OPERATIONS_TYPES,\n' +
+      '        PROTECTED_OPERATIONS_GUCS]'
+    );
   });
 });

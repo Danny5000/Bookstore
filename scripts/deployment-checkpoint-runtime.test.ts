@@ -101,7 +101,8 @@ const migrationTimestamps = [
   1786823450867,
   1787280731368,
   1787414827000,
-  1787530514483
+  1787530514483,
+  1787812813508
 ] as const;
 const migrationJournal = [
   'id,hash,created_at',
@@ -110,6 +111,8 @@ const migrationJournal = [
   )
 ].join('\n') + '\n';
 const rowCounts = `schema_name,table_name,row_count
+public,operations_job_retry_claims,0
+public,operations_job_retry_commands,0
 public,titles,1
 `;
 const financialDiagnostics = `check_name,violation_count
@@ -497,10 +500,11 @@ describe('deployment checkpoint injected lifecycle runtime', () => {
     expect((await readdir(root)).sort()).toEqual(
       [...DEPLOYMENT_BACKUP_ARTIFACTS, 'backup-bundle.json'].sort()
     );
-    const [sourceVerifier, copiedVerifier, copiedJournal, journalText] = await Promise.all([
+    const [sourceVerifier, copiedVerifier, copiedJournal, copiedRowCounts, journalText] = await Promise.all([
       readFile('scripts/verify-financial-restore.sql', 'utf8'),
       readFile(join(root, 'verify-financial-restore.sql'), 'utf8'),
       readFile(join(root, 'migration-journal.csv'), 'utf8'),
+      readFile(join(root, 'restore-row-counts.csv'), 'utf8'),
       readFile('drizzle/meta/_journal.json', 'utf8')
     ]);
     const journal = JSON.parse(journalText) as {
@@ -508,19 +512,26 @@ describe('deployment checkpoint injected lifecycle runtime', () => {
     };
     const copiedJournalRows = copiedJournal.trimEnd().split('\n');
     expect(copiedVerifier).toBe(sourceVerifier);
-    expect(copiedVerifier.match(/plan6b-financial-catalog-v\d+/gu)).toEqual([
-      'plan6b-financial-catalog-v4'
+    expect(copiedVerifier.match(/plan7a-database-catalog-v\d+/gu)).toEqual([
+      'plan7a-database-catalog-v1'
     ]);
-    expect(copiedVerifier).not.toContain('plan6b-financial-catalog-v1');
+    expect(copiedVerifier).not.toContain('plan6b-financial-catalog-v4');
     expect(/'0{64}'/u.test(copiedVerifier)).toBe(false);
     expect(copiedVerifier.includes('$catalog${}$catalog$')).toBe(false);
-    expect(copiedJournalRows).toHaveLength(16);
+    expect(copiedJournalRows).toHaveLength(17);
     expect(copiedJournalRows.at(-1)).toBe(
-      `15,${'e'.repeat(64)},${String(journal.entries.at(-1)?.when)}`
+      `16,${'f'.repeat(64)},${String(journal.entries.at(-1)?.when)}`
     );
+    expect(copiedRowCounts).toBe(rowCounts);
+    expect(copiedRowCounts.trimEnd().split('\n')).toEqual([
+      'schema_name,table_name,row_count',
+      'public,operations_job_retry_claims,0',
+      'public,operations_job_retry_commands,0',
+      'public,titles,1'
+    ]);
     expect(journal.entries.at(-1)).toMatchObject({
-      idx: 14,
-      tag: '0014_plan6bii_issue_transition_fail_closed'
+      idx: 15,
+      tag: '0015_plan7a_operations_authority'
     });
     expect(events.slice(-2)).toEqual(['seal', 'verify']);
     expect(runtime.calls.some((args) => args.includes('pg_dump'))).toBe(true);

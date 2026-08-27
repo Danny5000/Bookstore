@@ -64,18 +64,23 @@ const reportingCorrectionAuthorityMigrationPath = fileURLToPath(
 const issueTransitionFailClosedMigrationPath = fileURLToPath(
   new URL('../drizzle/0014_plan6bii_issue_transition_fail_closed.sql', import.meta.url)
 );
+const operationsAuthorityMigrationPath = fileURLToPath(
+  new URL('../drizzle/0015_plan7a_operations_authority.sql', import.meta.url)
+);
 const [
   verifier,
   workerAuthorityMigration,
   adminCommandAuthorityMigration,
   reportingCorrectionAuthorityMigration,
-  issueTransitionFailClosedMigration
+  issueTransitionFailClosedMigration,
+  operationsAuthorityMigration
 ] = await Promise.all([
   readFile(verifierPath, 'utf8'),
   readFile(workerAuthorityMigrationPath, 'utf8'),
   readFile(adminCommandAuthorityMigrationPath, 'utf8'),
   readFile(reportingCorrectionAuthorityMigrationPath, 'utf8'),
-  readFile(issueTransitionFailClosedMigrationPath, 'utf8')
+  readFile(issueTransitionFailClosedMigrationPath, 'utf8'),
+  readFile(operationsAuthorityMigrationPath, 'utf8')
 ]);
 const verifierLines = verifier.split(/\r?\n/u);
 const allowedMetaCommands = ['\\set ON_ERROR_STOP on', '\\set QUIET on'];
@@ -226,6 +231,31 @@ function requiredIssueTransitionFailClosedStatement(
   return statement;
 }
 
+function requiredOperationsAuthorityStatement(
+  witnessName: string,
+  prefix: string
+): string {
+  const start = operationsAuthorityMigration.indexOf(prefix);
+  const endMarker = ';--> statement-breakpoint';
+  const end = operationsAuthorityMigration.indexOf(endMarker, start);
+  if (
+    start < 0 ||
+    end < 0 ||
+    operationsAuthorityMigration.indexOf(prefix, start + prefix.length) >= 0
+  ) {
+    throw new Error(`[restore-verifier] expected one canonical ${witnessName} statement`);
+  }
+  const statement = operationsAuthorityMigration.slice(start, end);
+  if (!statement.startsWith(prefix) || statement.includes('\0')) {
+    throw new Error(`[restore-verifier] unsafe canonical ${witnessName} statement`);
+  }
+  const functionDelimiter = statement.match(/\bAS\s+(\$[a-z0-9_]*\$)/iu)?.[1];
+  if (functionDelimiter && statement.split(functionDelimiter).length !== 3) {
+    throw new Error(`[restore-verifier] unsafe canonical ${witnessName} function body`);
+  }
+  return statement;
+}
+
 function canonicalReplaceFunctionStatement(statement: string): string {
   if (statement.startsWith('CREATE OR REPLACE FUNCTION ')) return statement;
   if (!statement.startsWith('CREATE FUNCTION ')) {
@@ -234,7 +264,8 @@ function canonicalReplaceFunctionStatement(statement: string): string {
   return statement.replace(/^CREATE FUNCTION /u, 'CREATE OR REPLACE FUNCTION ');
 }
 
-function requiredInlineCheckConstraintStatement(
+function requiredInlineCheckConstraintStatementFromMigration(
+  migration: string,
   witnessName: string,
   tableName: string,
   constraintName: string
@@ -246,10 +277,10 @@ function requiredInlineCheckConstraintStatement(
     throw new Error('[restore-verifier] unsafe inline constraint identity');
   }
   const prefix = `CONSTRAINT "${constraintName}" CHECK (`;
-  const start = adminCommandAuthorityMigration.indexOf(prefix);
+  const start = migration.indexOf(prefix);
   if (
     start < 0 ||
-    adminCommandAuthorityMigration.indexOf(prefix, start + prefix.length) >= 0
+    migration.indexOf(prefix, start + prefix.length) >= 0
   ) {
     throw new Error(`[restore-verifier] expected one canonical ${witnessName} clause`);
   }
@@ -257,9 +288,9 @@ function requiredInlineCheckConstraintStatement(
   let depth = 0;
   let quoted: 'identifier' | 'literal' | null = null;
   let closingParenthesis = -1;
-  for (let index = openingParenthesis; index < adminCommandAuthorityMigration.length; index += 1) {
-    const character = adminCommandAuthorityMigration[index]!;
-    const next = adminCommandAuthorityMigration[index + 1];
+  for (let index = openingParenthesis; index < migration.length; index += 1) {
+    const character = migration[index]!;
+    const next = migration[index + 1];
     if (quoted === 'literal') {
       if (character === "'" && next === "'") index += 1;
       else if (character === "'") quoted = null;
@@ -290,11 +321,24 @@ function requiredInlineCheckConstraintStatement(
   if (closingParenthesis < 0 || quoted !== null || depth !== 0) {
     throw new Error(`[restore-verifier] unsafe canonical ${witnessName} clause`);
   }
-  const clause = adminCommandAuthorityMigration.slice(start, closingParenthesis + 1);
+  const clause = migration.slice(start, closingParenthesis + 1);
   if (!clause.startsWith(prefix) || clause.includes(';') || clause.includes('-->')) {
     throw new Error(`[restore-verifier] unsafe canonical ${witnessName} clause`);
   }
   return `ALTER TABLE "${tableName}" ADD ${clause}`;
+}
+
+function requiredInlineCheckConstraintStatement(
+  witnessName: string,
+  tableName: string,
+  constraintName: string
+): string {
+  return requiredInlineCheckConstraintStatementFromMigration(
+    adminCommandAuthorityMigration,
+    witnessName,
+    tableName,
+    constraintName
+  );
 }
 
 const financialClaimDigestConstraintStatement = requiredInlineCheckConstraintStatement(
@@ -336,14 +380,26 @@ const financialTerminalTriggerStatement = requiredAdminCommandAuthorityStatement
   'CREATE TRIGGER "jobs_plan6bii_financial_admin_terminal_sync"'
 );
 const financialJobGuardStatement = canonicalReplaceFunctionStatement(
-  requiredAdminCommandAuthorityStatement(
+  requiredOperationsAuthorityStatement(
     'financial job guard',
     'CREATE OR REPLACE FUNCTION "public"."plan6b_guard_job_insert"()'
   )
 );
-const financialAuditGuardStatement = canonicalReplaceFunctionStatement(
+const staleFinancialJobGuardStatement = canonicalReplaceFunctionStatement(
   requiredAdminCommandAuthorityStatement(
+    'stale financial job guard',
+    'CREATE OR REPLACE FUNCTION "public"."plan6b_guard_job_insert"()'
+  )
+);
+const financialAuditGuardStatement = canonicalReplaceFunctionStatement(
+  requiredOperationsAuthorityStatement(
     'financial audit guard',
+    'CREATE OR REPLACE FUNCTION "public"."plan6b_guard_audit_insert"()'
+  )
+);
+const staleFinancialAuditGuardStatement = canonicalReplaceFunctionStatement(
+  requiredAdminCommandAuthorityStatement(
+    'stale financial audit guard',
     'CREATE OR REPLACE FUNCTION "public"."plan6b_guard_audit_insert"()'
   )
 );
@@ -435,6 +491,87 @@ const publicDefaultRoutineRevokeStatement = requiredWorkerAuthorityStatement(
   'ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON ROUTINES FROM PUBLIC'
 );
 
+const operationsReviewedRoutineStatements = new Map(
+  [
+    ['plan7a_operations_job_catalog', 'CREATE FUNCTION public.plan7a_operations_job_catalog()'],
+    ['plan7a_operations_safe_failure_code', 'CREATE FUNCTION "public"."plan7a_operations_safe_failure_code"(text,text)'],
+    ['plan7a_operations_assert_job_capability', 'CREATE FUNCTION "public"."plan7a_operations_assert_job_capability"('],
+    ['plan7a_operations_guard_command_update', 'CREATE FUNCTION "public"."plan7a_operations_guard_command_update"()'],
+    ['plan7a_operations_guard_command_delete', 'CREATE FUNCTION "public"."plan7a_operations_guard_command_delete"()'],
+    ['plan7a_operations_guard_job_transition', 'CREATE FUNCTION "public"."plan7a_operations_guard_job_transition"()'],
+    ['list_operational_jobs', 'CREATE FUNCTION "public"."list_operational_jobs"('],
+    ['submit_job_retry_command', 'CREATE FUNCTION "public"."submit_job_retry_command"('],
+    ['get_owned_job_retry_command', 'CREATE FUNCTION "public"."get_owned_job_retry_command"(uuid,uuid)'],
+    ['plan7a_operations_claim_job', 'CREATE FUNCTION "public"."plan7a_operations_claim_job"(uuid,text,integer)'],
+    ['plan7a_operations_renew_job_claim', 'CREATE FUNCTION "public"."plan7a_operations_renew_job_claim"('],
+    ['plan7a_operations_relinquish_job', 'CREATE FUNCTION "public"."plan7a_operations_relinquish_job"('],
+    ['plan7a_operations_complete_job', 'CREATE FUNCTION "public"."plan7a_operations_complete_job"('],
+    ['plan7a_operations_fail_job', 'CREATE FUNCTION "public"."plan7a_operations_fail_job"('],
+    ['plan7a_operations_exhaust_job', 'CREATE FUNCTION "public"."plan7a_operations_exhaust_job"('],
+    ['plan7a_operations_lock_job_retry_command', 'CREATE FUNCTION "public"."plan7a_operations_lock_job_retry_command"('],
+    ['plan7a_operations_transition_job_retry_command', 'CREATE FUNCTION "public"."plan7a_operations_transition_job_retry_command"(']
+  ].map(([name, prefix]) => [
+    name,
+    canonicalReplaceFunctionStatement(
+      requiredOperationsAuthorityStatement(`operations ${name} routine`, prefix)
+    )
+  ] as const)
+);
+if (operationsReviewedRoutineStatements.size !== 17) {
+  throw new Error('[restore-verifier] reviewed operations routine inventory is incomplete');
+}
+
+function requiredReviewedOperationsRoutine(name: string): string {
+  const statement = operationsReviewedRoutineStatements.get(name);
+  if (!statement) {
+    throw new Error(`[restore-verifier] missing reviewed operations routine ${name}`);
+  }
+  return statement;
+}
+
+const operationsJobCatalogStatement = requiredReviewedOperationsRoutine(
+  'plan7a_operations_job_catalog'
+);
+const operationsJobCatalogRevokeStatement = requiredOperationsAuthorityStatement(
+  'operations job catalog helper revoke',
+  'REVOKE ALL ON FUNCTION "public"."plan7a_operations_job_catalog"()'
+);
+const operationsCommandUpdateTriggerStatement = requiredOperationsAuthorityStatement(
+  'operations command update trigger',
+  'CREATE TRIGGER "plan7a_operations_retry_commands_update_guard"'
+);
+const operationsCommandDeleteTriggerStatement = requiredOperationsAuthorityStatement(
+  'operations command delete trigger',
+  'CREATE TRIGGER "plan7a_operations_retry_commands_delete_guard"'
+);
+const operationsClaimsCommandUniqueIndexStatement = requiredOperationsAuthorityStatement(
+  'operations claim command unique index',
+  'CREATE UNIQUE INDEX "plan7a_operations_retry_claims_command_unique"'
+);
+const operationsClaimDigestConstraintStatement =
+  requiredInlineCheckConstraintStatementFromMigration(
+    operationsAuthorityMigration,
+    'operations claim capability digest constraint',
+    'operations_job_retry_claims',
+    'plan7a_operations_retry_claims_capability_sha256'
+  );
+const operationsClaimCommandForeignKeyStatement = requiredOperationsAuthorityStatement(
+  'operations claim command foreign key',
+  'ALTER TABLE "operations_job_retry_claims" ADD CONSTRAINT "plan7a_operations_retry_claims_command_fk"'
+);
+const operationsResultTypeGrantStatement = requiredOperationsAuthorityStatement(
+  'operations result type grant',
+  'GRANT USAGE ON TYPE "public"."operations_job_retry_result_code"'
+);
+const operationsTypeRevokeStatement = requiredOperationsAuthorityStatement(
+  'operations type revoke',
+  'REVOKE ALL ON TYPE'
+);
+const operationsTablesRevokeStatement = requiredOperationsAuthorityStatement(
+  'operations table revoke',
+  'REVOKE ALL ON TABLE "public"."operations_job_retry_commands"'
+);
+
 const catalogManifestBegin = uniqueBoundary(executableSql, financialCatalogManifestBegin);
 const catalogManifestEnd = uniqueBoundary(executableSql, financialCatalogManifestEnd);
 const failureFormatterStart = uniqueBoundary(executableSql, financialFailureFormatterStart);
@@ -457,12 +594,16 @@ insert into restore_financial_checks (check_name, violation_count) values
   ('failed_running_scan_retry_exhausted', 0),
   ('pending_replay_child_incomplete', 0),
   ('pending_replay_child_permanent', 0),
-  ('pending_replay_child_retry_exhausted', 0);
+  ('pending_replay_child_retry_exhausted', 0),
+  ('plan7a_operations_data', 0),
+  ('plan7a_operations_clear_capability', 0);
 `;
 const zeroCatalogChecksSql = `
 insert into restore_financial_checks (check_name, violation_count) values
   ('financial_schema_object_manifest', 0),
-  ('storage_cleanup_effective_authority', 0);
+  ('storage_cleanup_effective_authority', 0),
+  ('plan7a_operations_authority', 0),
+  ('plan7a_operations_catalog', 0);
 `;
 const catalogOnlyVerifierSql = [
   verifierPrelude,
@@ -496,6 +637,10 @@ for (const [scope, sql] of Object.entries(verifierSqlByScope)) {
 if (
   !catalogOnlyVerifierSql.includes("'financial_schema_object_manifest'") ||
   !catalogOnlyVerifierSql.includes("'storage_cleanup_effective_authority'") ||
+  !catalogOnlyVerifierSql.includes("'plan7a_operations_authority'") ||
+  !catalogOnlyVerifierSql.includes("'plan7a_operations_catalog'") ||
+  !dataOnlyVerifierSql.includes("'plan7a_operations_data'") ||
+  !dataOnlyVerifierSql.includes("'plan7a_operations_clear_capability'") ||
   dataOnlyVerifierSql.includes(financialCatalogManifestBegin)
 ) {
   throw new Error('[restore-verifier] financial catalog verifier split is invalid');
@@ -689,6 +834,11 @@ interface CatalogCalibrationRow {
 
 async function printCatalogContractCalibration(): Promise<void> {
   const result = await pool.query<CatalogCalibrationRow>(financialCatalogCalibrationSql());
+  if (result.rows.length !== 323) {
+    throw new Error(
+      `[restore-verifier] calibrated catalog row count ${result.rows.length} is not 323`
+    );
+  }
   const seenKeys = new Set<string>();
   const contract = result.rows.map((row) => {
     const key = JSON.stringify([
@@ -714,11 +864,17 @@ async function printCatalogContractCalibration(): Promise<void> {
     if (
       actualCatalogDetails === null ||
       typeof actualCatalogDetails !== 'object' ||
-      Array.isArray(actualCatalogDetails)
+      Array.isArray(actualCatalogDetails) ||
+      Object.keys(actualCatalogDetails).length === 0 ||
+      Object.prototype.hasOwnProperty.call(actualCatalogDetails, 'calibration')
     ) {
       throw new Error(`[restore-verifier] invalid calibrated catalog details ${key}`);
     }
-    if (row.actual_catalog_json.includes('$catalog$')) {
+    if (
+      row.actual_catalog_json.includes('$catalog$') ||
+      row.actual_catalog_json.includes('calibration-pending') ||
+      /^\s*\{\s*\}\s*$/u.test(row.actual_catalog_json)
+    ) {
       throw new Error(`[restore-verifier] unsafe catalog delimiter in ${key}`);
     }
     return {
@@ -733,6 +889,9 @@ async function printCatalogContractCalibration(): Promise<void> {
       catalogJson: row.actual_catalog_json
     };
   });
+  if (seenKeys.size !== 323 || contract.length !== 323) {
+    throw new Error('[restore-verifier] calibrated catalog contract was truncated');
+  }
   console.info('[restore-verifier] BEGIN exact financial catalog calibration JSON');
   console.info(JSON.stringify(contract, null, 2));
   console.info('[restore-verifier] END exact financial catalog calibration JSON');
@@ -1506,15 +1665,7 @@ async function exerciseFinancialAdminCatalogWitnesses(
   await pool.query(financialTerminalTriggerStatement);
   await expectPass('financial lease terminal trigger order repair', true);
 
-  await pool.query(`
-    create or replace function public.plan6b_guard_job_insert()
-    returns trigger language plpgsql security definer set search_path = 'pg_catalog'
-    as $plan6bii_job_guard_witness$
-    begin
-      return new;
-    end;
-    $plan6bii_job_guard_witness$
-  `);
+  await pool.query(staleFinancialJobGuardStatement);
   await expectRejection(
     'financial job guard definition drift',
     'financial_schema_object_manifest=1'
@@ -1522,15 +1673,7 @@ async function exerciseFinancialAdminCatalogWitnesses(
   await pool.query(financialJobGuardStatement);
   await expectPass('financial job guard definition repair', true);
 
-  await pool.query(`
-    create or replace function public.plan6b_guard_audit_insert()
-    returns trigger language plpgsql security definer set search_path = 'pg_catalog'
-    as $plan6bii_audit_guard_witness$
-    begin
-      return new;
-    end;
-    $plan6bii_audit_guard_witness$
-  `);
+  await pool.query(staleFinancialAuditGuardStatement);
   await expectRejection(
     'financial audit guard definition drift',
     'financial_schema_object_manifest=1'
@@ -2026,6 +2169,717 @@ async function exerciseFinancialAdminCatalogWitnesses(
   await expectPass('inherited application EXECUTE on private lease helper repair', true);
 }
 
+interface OperationsRestoreWitnessContext {
+  readonly expectPass: (
+    name: string,
+    expectAllZero?: boolean,
+    scope?: VerifierScope
+  ) => Promise<void>;
+  readonly expectRejection: (
+    name: string,
+    checkName: string,
+    scope?: VerifierScope
+  ) => Promise<void>;
+  readonly expectRejectionChecks: (
+    name: string,
+    checkNames: readonly string[],
+    scope?: VerifierScope
+  ) => Promise<void>;
+}
+
+async function exerciseOperationsRestoreWitnesses(
+  context: OperationsRestoreWitnessContext
+): Promise<void> {
+  const { expectPass, expectRejection, expectRejectionChecks } = context;
+  const quoteRole = (role: string): string => {
+    if (!/^[a-z][a-z0-9_]{0,62}$/u.test(role) || role.startsWith('pg_')) {
+      throw new Error('[restore-verifier] unsafe operations witness role');
+    }
+    return `"${role}"`;
+  };
+  const migrationIdentities = loadDatabaseMigrationIdentityConfig(process.env);
+  const databaseOwner = quoteRole(databaseUser);
+  const webLogin = quoteRole(migrationIdentities.webUser);
+  const inheritedWitnessRole = `plan7a_restore_${randomBytes(8).toString('hex')}`;
+  const clearCapabilityCanary = 'A'.repeat(43);
+
+  await pool.query(`
+    alter type operations_job_retry_reason_code
+      rename value 'dependency_recovered' to 'plan7a_enum_order_witness';
+    alter type operations_job_retry_reason_code
+      rename value 'configuration_recovered' to 'dependency_recovered';
+    alter type operations_job_retry_reason_code
+      rename value 'operator_reassessment' to 'configuration_recovered';
+    alter type operations_job_retry_reason_code
+      rename value 'plan7a_enum_order_witness' to 'operator_reassessment'
+  `);
+  await expectRejection(
+    'operations retry reason enum order drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(`
+    alter type operations_job_retry_reason_code
+      rename value 'operator_reassessment' to 'plan7a_enum_order_witness';
+    alter type operations_job_retry_reason_code
+      rename value 'configuration_recovered' to 'operator_reassessment';
+    alter type operations_job_retry_reason_code
+      rename value 'dependency_recovered' to 'configuration_recovered';
+    alter type operations_job_retry_reason_code
+      rename value 'plan7a_enum_order_witness' to 'dependency_recovered'
+  `);
+  await expectPass('operations retry reason enum order repair', true);
+
+  await pool.query('alter table operations_job_retry_commands enable row level security');
+  await expectRejection(
+    'operations command table catalog drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query('alter table operations_job_retry_commands disable row level security');
+  await expectPass('operations command table catalog repair', true);
+
+  await pool.query('create table operations_job_retry_shadow_witness(id uuid primary key)');
+  await expectRejection(
+    'unexpected operations reserved relation',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query('drop table operations_job_retry_shadow_witness');
+  await expectPass('unexpected operations reserved relation repair', true);
+
+  await pool.query('drop index plan7a_operations_retry_claims_command_unique');
+  await expectRejection(
+    'missing operations claim command index',
+    'financial_schema_object_manifest=2'
+  );
+  await pool.query(operationsClaimsCommandUniqueIndexStatement);
+  await expectPass('missing operations claim command index repair', true);
+
+  await pool.query(`
+    alter table operations_job_retry_claims
+      drop constraint plan7a_operations_retry_claims_capability_sha256;
+    alter table operations_job_retry_claims
+      add constraint plan7a_operations_retry_claims_capability_sha256 check (true)
+  `);
+  await expectRejection(
+    'wrong operations claim digest constraint',
+    'financial_schema_object_manifest=2'
+  );
+  await pool.query(`
+    alter table operations_job_retry_claims
+      drop constraint plan7a_operations_retry_claims_capability_sha256
+  `);
+  await pool.query(operationsClaimDigestConstraintStatement);
+  await expectPass('wrong operations claim digest constraint repair', true);
+
+  const operationsCatalogSourceDrift = operationsJobCatalogStatement.replace(
+    "'Outbox dispatch'",
+    "'Outbox dispatch restore witness'"
+  );
+  if (operationsCatalogSourceDrift === operationsJobCatalogStatement) {
+    throw new Error('[restore-verifier] operations catalog source witness was not derived');
+  }
+  await pool.query(operationsCatalogSourceDrift);
+  await expectRejectionChecks(
+    'operations catalog routine source drift',
+    ['financial_schema_object_manifest=1', 'plan7a_operations_catalog=2']
+  );
+  await pool.query(operationsJobCatalogStatement);
+  await pool.query(operationsJobCatalogRevokeStatement);
+  await expectPass('operations catalog routine source repair', true);
+
+  await pool.query(`
+    alter function public.plan7a_operations_job_catalog()
+    owner to pale_orbit_financial_worker
+  `);
+  await expectRejectionChecks(
+    'operations catalog routine owner drift',
+    ['financial_schema_object_manifest=1', 'plan7a_operations_authority=1']
+  );
+  await pool.query(`
+    alter function public.plan7a_operations_job_catalog() owner to ${databaseOwner}
+  `);
+  await pool.query(operationsJobCatalogStatement);
+  await pool.query(operationsJobCatalogRevokeStatement);
+  await expectPass('operations catalog routine owner repair', true);
+
+  await pool.query('alter function public.plan7a_operations_job_catalog() security invoker');
+  await expectRejection(
+    'operations catalog routine security drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(operationsJobCatalogStatement);
+  await pool.query(operationsJobCatalogRevokeStatement);
+  await expectPass('operations catalog routine security repair', true);
+
+  await pool.query(
+    "alter function public.plan7a_operations_job_catalog() set search_path = 'public'"
+  );
+  await expectRejection(
+    'operations catalog routine search path drift',
+    'financial_schema_object_manifest=1'
+  );
+  await pool.query(operationsJobCatalogStatement);
+  await pool.query(operationsJobCatalogRevokeStatement);
+  await expectPass('operations catalog routine search path repair', true);
+
+  await pool.query(`
+    grant execute on function public.plan7a_operations_job_catalog()
+    to pale_orbit_runtime
+  `);
+  await expectRejectionChecks(
+    'operations owner-only routine direct authority',
+    [
+      'financial_schema_object_manifest=1',
+      'plan7a_operations_authority=2'
+    ]
+  );
+  await pool.query(operationsJobCatalogRevokeStatement);
+  await expectPass('operations owner-only routine direct authority repair', true);
+
+  await pool.query(`
+    alter table operations_job_retry_commands
+      disable trigger plan7a_operations_retry_commands_update_guard
+  `);
+  await expectRejection(
+    'disabled operations command update trigger',
+    'financial_schema_object_manifest=2'
+  );
+  await pool.query(`
+    drop trigger plan7a_operations_retry_commands_update_guard
+    on operations_job_retry_commands
+  `);
+  await pool.query(operationsCommandUpdateTriggerStatement);
+  await expectPass('disabled operations command update trigger repair', true);
+
+  await pool.query(`
+    alter trigger plan7a_operations_retry_commands_delete_guard
+    on operations_job_retry_commands
+    rename to plan7a_operations_aa_retry_commands_delete_guard
+  `);
+  await expectRejection(
+    'reordered operations command delete trigger',
+    'financial_schema_object_manifest=3'
+  );
+  await pool.query(`
+    drop trigger plan7a_operations_aa_retry_commands_delete_guard
+    on operations_job_retry_commands
+  `);
+  await pool.query(operationsCommandDeleteTriggerStatement);
+  await expectPass('reordered operations command delete trigger repair', true);
+
+  await pool.query('grant usage on type operations_job_retry_command_status to pale_orbit_runtime');
+  await expectRejectionChecks(
+    'operations command status type authority drift',
+    ['financial_schema_object_manifest=1', 'plan7a_operations_authority=2']
+  );
+  await pool.query(operationsTypeRevokeStatement);
+  await pool.query(operationsResultTypeGrantStatement);
+  await expectPass('operations command status type authority repair', true);
+
+  await pool.query('grant select on table operations_job_retry_commands to pale_orbit_runtime');
+  await expectRejectionChecks(
+    'operations direct table authority drift',
+    ['financial_schema_object_manifest=2', 'plan7a_operations_authority=4']
+  );
+  await pool.query(operationsTablesRevokeStatement);
+  await expectPass('operations direct table authority repair', true);
+
+  await pool.query(`create role "${inheritedWitnessRole}" nologin`);
+  try {
+    await pool.query(`
+      grant select on table operations_job_retry_claims to "${inheritedWitnessRole}";
+      grant "${inheritedWitnessRole}" to pale_orbit_runtime
+    `);
+    await expectRejectionChecks(
+      'operations inherited table authority drift',
+      ['financial_schema_object_manifest=2', 'plan7a_operations_authority=4']
+    );
+  } finally {
+    try {
+      await pool.query(`revoke "${inheritedWitnessRole}" from pale_orbit_runtime`);
+    } finally {
+      try {
+        await pool.query(`
+          revoke select on table operations_job_retry_claims
+          from "${inheritedWitnessRole}"
+        `);
+      } finally {
+        await pool.query(`drop role if exists "${inheritedWitnessRole}"`);
+      }
+    }
+  }
+  await expectPass('operations inherited table authority repair', true);
+
+  await pool.query(`
+    alter role ${databaseOwner}
+      set pale_orbit.plan7a_operations_job_capability = 'forbidden-default'
+  `);
+  await expectRejection(
+    'operations capability role default drift',
+    'plan7a_operations_authority=1'
+  );
+  await pool.query(`
+    alter role ${databaseOwner} reset pale_orbit.plan7a_operations_job_capability
+  `);
+  await expectPass('operations capability role default repair', true);
+
+  await pool.query(`
+    grant set on parameter "pale_orbit.plan7a_operations_command_transition_id"
+      to pale_orbit_runtime
+  `);
+  await expectRejection(
+    'operations command transition parameter ACL drift',
+    'plan7a_operations_authority=1'
+  );
+  await pool.query(`
+    revoke set on parameter "pale_orbit.plan7a_operations_command_transition_id"
+      from pale_orbit_runtime
+  `);
+  await expectPass('operations command transition parameter ACL repair', true);
+
+  const actorId = randomUUID();
+  const targetJobId = randomUUID();
+  const commandId = randomUUID();
+  const commandJobId = randomUUID();
+  const correlationId = `restore-plan7a-${commandId}`;
+  const targetUpdatedAt = '2026-08-26T12:34:56.123456Z';
+  let preRoutineDenialAuditId: string | null = null;
+  const withOwnerReplica = async (
+    action: (client: PoolClient) => Promise<void>
+  ): Promise<void> => {
+    const client = await pool.connect();
+    try {
+      await client.query('begin');
+      await client.query('set local session_replication_role = replica');
+      await action(client);
+      await client.query('commit');
+    } catch (error) {
+      await client.query('rollback');
+      throw error;
+    } finally {
+      client.release();
+    }
+  };
+  const withRuntimeAuthorization = async (
+    action: (client: PoolClient) => Promise<void>
+  ): Promise<void> => {
+    const client = await pool.connect();
+    try {
+      await client.query('begin');
+      await client.query(`set local session authorization ${webLogin}`);
+      const identity = await client.query<{
+        current_user: string;
+        runtime_member: boolean;
+        session_user: string;
+        worker_member: boolean;
+      }>(`
+        select current_user, session_user,
+          pg_catalog.pg_has_role(session_user, 'pale_orbit_runtime', 'MEMBER')
+            as runtime_member,
+          pg_catalog.pg_has_role(session_user, 'pale_orbit_financial_worker', 'MEMBER')
+            as worker_member
+      `);
+      const row = identity.rows[0];
+      if (
+        row?.session_user !== migrationIdentities.webUser ||
+        row.current_user !== migrationIdentities.webUser ||
+        row.runtime_member !== true ||
+        row.worker_member !== false
+      ) {
+        throw new Error('[restore-verifier] runtime authorization witness context is invalid');
+      }
+      await action(client);
+      await client.query('commit');
+    } catch (error) {
+      await client.query('rollback');
+      throw error;
+    } finally {
+      client.release();
+    }
+  };
+
+  try {
+    await withOwnerReplica(async (client) => {
+      await client.query(`
+        insert into "user" (id, name, email, email_verified)
+        values ($1, 'Operations restore witness', $2, true)
+      `, [actorId, `operations-restore-${actorId}@example.invalid`]);
+      await client.query(`
+        insert into jobs (
+          id, type, payload, status, run_at, attempts, max_attempts, last_error,
+          completed_at, created_at, updated_at
+        ) values (
+          $1, 'outbox.dispatch', '{}'::jsonb, 'failed', $2::timestamptz, 1, 8,
+          'Outbox message does not exist', $2::timestamptz,
+          $2::timestamptz - interval '1 second', $2::timestamptz
+        )
+      `, [targetJobId, targetUpdatedAt]);
+      await client.query(`
+        insert into operations_job_retry_commands (
+          id, actor_user_id, target_job_id, target_job_kind, expected_status,
+          expected_attempts, expected_max_attempts, expected_updated_at,
+          reason_code, correlation_id, idempotency_key_sha256,
+          input_fingerprint_sha256
+        ) values (
+          $1, $2, $3, 'outbox.dispatch', 'failed', 1, 8, $4::timestamptz,
+          'dependency_recovered', $5, $6, $7
+        )
+      `, [
+        commandId,
+        actorId,
+        targetJobId,
+        targetUpdatedAt,
+        correlationId,
+        createHash('sha256').update(`idempotency:${commandId}`, 'utf8').digest('hex'),
+        createHash('sha256').update(`input:${commandId}`, 'utf8').digest('hex')
+      ]);
+      await client.query(`
+        insert into jobs (
+          id, type, payload, deduplication_key, status, run_at, attempts,
+          max_attempts, created_at, updated_at
+        ) values (
+          $1, 'operations.job-retry-command',
+          pg_catalog.jsonb_build_object('commandId', $2::uuid),
+          'operations:job-retry-command:' || $2::uuid::text || ':v1',
+          'pending', pg_catalog.clock_timestamp(), 1, 8,
+          pg_catalog.clock_timestamp(), pg_catalog.clock_timestamp()
+        )
+      `, [commandJobId, commandId]);
+      await client.query(`
+        insert into audit_events (
+          actor_type, actor_id, action, outcome, resource_type, resource_id,
+          correlation_id, request_metadata, before, after
+        ) values (
+          'user', $1::uuid::text, 'operations.job_retry.requested', 'succeeded',
+          'operations_job_retry_command', $2::uuid::text, $3, null, null,
+          pg_catalog.jsonb_build_object(
+            'commandId', $2::uuid, 'targetJobId', $4::uuid,
+            'registeredKind', 'outbox.dispatch',
+            'reasonCode', 'dependency_recovered'
+          )
+        )
+      `, [actorId, commandId, correlationId, targetJobId]);
+      await client.query(`
+        insert into operations_job_retry_claims (
+          job_id, command_id, generation, attempt, lease_owner,
+          capability_sha256, lease_duration_ms, state, expires_at, issued_at,
+          invalidated_at
+        ) values (
+          $1, $2, 1, 1, 'restore-plan7a-worker', repeat('f', 64), 30000,
+          'invalidated', pg_catalog.clock_timestamp() - interval '1 hour',
+          pg_catalog.clock_timestamp() - interval '2 hours',
+          pg_catalog.clock_timestamp() - interval '30 minutes'
+        )
+      `, [commandJobId, commandId]);
+    });
+    await expectPass('operations restore data baseline', true, 'full');
+
+    await withOwnerReplica(async (client) => {
+      await client.query(`
+        with witness_clock as materialized (
+          select pg_catalog.clock_timestamp() as observed_at
+        ), updated_claim as (
+          update operations_job_retry_claims claim
+          set state = 'active', issued_at = witness_clock.observed_at,
+            renewed_at = null,
+            expires_at = witness_clock.observed_at + interval '30 seconds',
+            invalidated_at = null
+          from witness_clock
+          where claim.job_id = $1
+          returning claim.attempt, claim.lease_owner, claim.expires_at,
+            coalesce(claim.renewed_at, claim.issued_at) as lease_clock
+        )
+        update jobs command_job
+        set status = 'running', attempts = updated_claim.attempt,
+          locked_at = updated_claim.lease_clock,
+          locked_by = updated_claim.lease_owner,
+          run_at = updated_claim.expires_at,
+          completed_at = null, updated_at = updated_claim.lease_clock
+        from updated_claim
+        where command_job.id = $1
+      `, [commandJobId]);
+    });
+    await expectPass('operations running command claim baseline', true, 'full');
+
+    await withOwnerReplica(async (client) => {
+      await client.query(
+        'delete from operations_job_retry_claims where job_id = $1',
+        [commandJobId]
+      );
+    });
+    await expectRejection(
+      'operations running command missing claim',
+      'plan7a_operations_data=1',
+      'full'
+    );
+    await withOwnerReplica(async (client) => {
+      await client.query(`
+        insert into operations_job_retry_claims (
+          job_id, command_id, generation, attempt, lease_owner,
+          capability_sha256, lease_duration_ms, state, expires_at, issued_at,
+          renewed_at, invalidated_at
+        )
+        select command_job.id, $2, 1, command_job.attempts,
+          command_job.locked_by, repeat('f', 64), 30000, 'active',
+          command_job.run_at, command_job.locked_at, null, null
+        from jobs command_job
+        where command_job.id = $1
+      `, [commandJobId, commandId]);
+    });
+    await expectPass('operations running command missing claim repair', true, 'full');
+
+    await withOwnerReplica(async (client) => {
+      await client.query(`
+        update operations_job_retry_claims
+        set expires_at = expires_at + interval '1 second'
+        where job_id = $1
+      `, [commandJobId]);
+    });
+    await expectRejection(
+      'operations running command expiry drift',
+      'plan7a_operations_data=1',
+      'full'
+    );
+    await withOwnerReplica(async (client) => {
+      await client.query(`
+        update operations_job_retry_claims claim
+        set expires_at = command_job.run_at
+        from jobs command_job
+        where claim.job_id = command_job.id and claim.job_id = $1
+      `, [commandJobId]);
+    });
+    await expectPass('operations running command expiry drift repair', true, 'full');
+
+    await withOwnerReplica(async (client) => {
+      await client.query(`
+        update operations_job_retry_claims
+        set renewed_at = issued_at + interval '1 second'
+        where job_id = $1
+      `, [commandJobId]);
+    });
+    await expectRejection(
+      'operations running command clock drift',
+      'plan7a_operations_data=1',
+      'full'
+    );
+    await withOwnerReplica(async (client) => {
+      await client.query(`
+        update jobs command_job
+        set locked_at = claim.renewed_at, updated_at = claim.renewed_at
+        from operations_job_retry_claims claim
+        where command_job.id = claim.job_id and command_job.id = $1
+      `, [commandJobId]);
+    });
+    await expectPass('operations running command clock drift repair', true, 'full');
+
+    await withOwnerReplica(async (client) => {
+      await client.query(`
+        with witness_clock as materialized (
+          select pg_catalog.clock_timestamp() as observed_at
+        ), updated_claim as (
+          update operations_job_retry_claims claim
+          set state = 'invalidated', invalidated_at = witness_clock.observed_at
+          from witness_clock
+          where claim.job_id = $1
+          returning witness_clock.observed_at
+        )
+        update jobs command_job
+        set status = 'pending', locked_at = null, locked_by = null,
+          run_at = updated_claim.observed_at,
+          completed_at = null, updated_at = updated_claim.observed_at
+        from updated_claim
+        where command_job.id = $1
+      `, [commandJobId]);
+    });
+    await expectPass('operations running command witness cleanup', true, 'full');
+
+    await withRuntimeAuthorization(async (client) => {
+      const insertedAudit = await client.query<{ id: string }>(`
+        insert into audit_events (
+          actor_type, actor_id, action, outcome, resource_type, resource_id,
+          correlation_id, request_metadata, before, after
+        ) values (
+          'user', $1::uuid::text, 'operations.job_retry.requested', 'denied',
+          'operations_job_retry_command', null, $2, null, null, null
+        )
+        returning id::text
+      `, [actorId, `restore-plan7a-denied-${commandId}`]);
+      preRoutineDenialAuditId = insertedAudit.rows[0]?.id ?? null;
+      if (preRoutineDenialAuditId === null) {
+        throw new Error('[restore-verifier] runtime denial audit witness was not persisted');
+      }
+    });
+    await expectPass('operations authorized pre-routine denial audit', true, 'full');
+
+    await withOwnerReplica(async (client) => {
+      await client.query(
+        "update audit_events set after = '{}'::jsonb where id = $1",
+        [preRoutineDenialAuditId]
+      );
+    });
+    await expectRejection(
+      'operations malformed pre-routine denial audit',
+      'plan7a_operations_data=1',
+      'full'
+    );
+    await withOwnerReplica(async (client) => {
+      await client.query(
+        'update audit_events set after = null where id = $1',
+        [preRoutineDenialAuditId]
+      );
+    });
+    await expectPass('operations malformed pre-routine denial audit repair', true, 'full');
+
+    await withOwnerReplica(async (client) => {
+      await client.query(
+        "update jobs set type = 'catalog.ingest_revision' where id = $1",
+        [targetJobId]
+      );
+    });
+    await expectRejection(
+      'operations command target association drift',
+      'plan7a_operations_data=1',
+      'full'
+    );
+    await withOwnerReplica(async (client) => {
+      await client.query(
+        "update jobs set type = 'outbox.dispatch' where id = $1",
+        [targetJobId]
+      );
+    });
+    await expectPass('operations command target association repair', true, 'full');
+
+    await pool.query(`
+      alter table operations_job_retry_claims
+        drop constraint plan7a_operations_retry_claims_command_fk
+    `);
+    await withOwnerReplica(async (client) => {
+      await client.query(
+        'update operations_job_retry_claims set command_id = $2 where job_id = $1',
+        [commandJobId, randomUUID()]
+      );
+    });
+    await expectRejectionChecks(
+      'operations claim association drift',
+      ['financial_schema_object_manifest=3', 'plan7a_operations_data=1'],
+      'full'
+    );
+    await withOwnerReplica(async (client) => {
+      await client.query(
+        'update operations_job_retry_claims set command_id = $2 where job_id = $1',
+        [commandJobId, commandId]
+      );
+    });
+    await pool.query(operationsClaimCommandForeignKeyStatement);
+    await expectPass('operations claim association repair', true, 'full');
+
+    await withOwnerReplica(async (client) => {
+      await client.query(`
+        update operations_job_retry_claims
+        set state = 'active', invalidated_at = null
+        where job_id = $1
+      `, [commandJobId]);
+    });
+    await expectRejection(
+      'operations claim lifecycle drift',
+      'plan7a_operations_data=1',
+      'full'
+    );
+    await withOwnerReplica(async (client) => {
+      await client.query(`
+        update operations_job_retry_claims
+        set state = 'invalidated', invalidated_at = pg_catalog.clock_timestamp()
+        where job_id = $1
+      `, [commandJobId]);
+    });
+    await expectPass('operations claim lifecycle repair', true, 'full');
+
+    await pool.query(`
+      alter table operations_job_retry_claims
+        drop constraint plan7a_operations_retry_claims_capability_sha256
+    `);
+    await withOwnerReplica(async (client) => {
+      await client.query(`
+        update operations_job_retry_claims
+        set capability_sha256 = 'not-a-digest' where job_id = $1
+      `, [commandJobId]);
+    });
+    await expectRejection(
+      'operations claim capability digest drift',
+      'financial_schema_object_manifest=2',
+      'full'
+    );
+    await withOwnerReplica(async (client) => {
+      await client.query(`
+        update operations_job_retry_claims
+        set capability_sha256 = repeat('f', 64) where job_id = $1
+      `, [commandJobId]);
+    });
+    await pool.query(operationsClaimDigestConstraintStatement);
+    await expectPass('operations claim capability digest repair', true, 'full');
+
+    await withOwnerReplica(async (client) => {
+      await client.query(`
+        update audit_events set actor_id = $2
+        where action = 'operations.job_retry.requested' and resource_id = $1
+      `, [commandId, randomUUID()]);
+    });
+    await expectRejection(
+      'operations audit provenance drift',
+      'plan7a_operations_data=2',
+      'full'
+    );
+    await withOwnerReplica(async (client) => {
+      await client.query(`
+        update audit_events set actor_id = $2
+        where action = 'operations.job_retry.requested' and resource_id = $1
+      `, [commandId, actorId]);
+    });
+    await expectPass('operations audit provenance repair', true, 'full');
+
+    await pool.query(
+      'alter table operations_job_retry_claims add column capability_token text'
+    );
+    await pool.query(`
+      update operations_job_retry_claims set capability_token = $2 where job_id = $1
+    `, [commandJobId, clearCapabilityCanary]);
+    await expectRejectionChecks(
+      'operations clear capability column and value',
+      ['financial_schema_object_manifest=1', 'plan7a_operations_clear_capability=1'],
+      'full'
+    );
+    await pool.query(
+      'alter table operations_job_retry_claims drop column capability_token'
+    );
+    await expectPass('operations clear capability column and value repair', true, 'full');
+  } finally {
+    await withOwnerReplica(async (client) => {
+      if (preRoutineDenialAuditId !== null) {
+        await client.query('delete from audit_events where id = $1', [preRoutineDenialAuditId]);
+      }
+      await client.query(`
+        delete from audit_events
+        where resource_type = 'operations_job_retry_command' and resource_id = $1
+      `, [commandId]);
+      await client.query(
+        'delete from operations_job_retry_claims where job_id = $1',
+        [commandJobId]
+      );
+      await client.query(
+        'delete from operations_job_retry_commands where id = $1',
+        [commandId]
+      );
+      await client.query('delete from jobs where id = any($1::uuid[])', [
+        [commandJobId, targetJobId]
+      ]);
+      await client.query('delete from "user" where id = $1', [actorId]);
+    });
+  }
+  await expectPass('operations restore witness cleanup', true, 'full');
+  console.info(
+    '[restore-verifier] plan7a operations schema, catalog, authority, claim, audit, and clear-capability witnesses passed'
+  );
+}
+
 async function exerciseInvariantWitnesses(): Promise<void> {
   let verifierScope: VerifierScope = 'catalog';
   const failWitness = (message: string): never => {
@@ -2296,6 +3150,12 @@ async function exerciseInvariantWitnesses(): Promise<void> {
   };
 
   await expectPass('fresh financial schema-object manifest', true, 'full');
+
+  await exerciseOperationsRestoreWitnesses({
+    expectPass,
+    expectRejection,
+    expectRejectionChecks
+  });
 
   const financialAdminMatrix = await exerciseFinancialAdminClaimMatrix();
   await expectPass(

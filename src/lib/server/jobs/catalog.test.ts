@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import * as ts from 'typescript';
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
   COMMERCE_CLAIM_EMAIL_JOB,
@@ -20,6 +21,7 @@ import {
   INGEST_REVISION_JOB,
   INGEST_REVISION_JOB_MAX_ATTEMPTS,
   JOB_DEFINITIONS,
+  JOB_RETRY_COMMAND_RESULT_CODES,
   JOB_RETRY_POLICY_IDS,
   JOB_RETRY_POLICY_OUTCOMES,
   OPERATIONS_JOB_RETRY_COMMAND_JOB,
@@ -37,6 +39,397 @@ import {
 } from './catalog';
 
 const repositoryRoot = fileURLToPath(new URL('../../../../', import.meta.url));
+const catalogSourcePath = join(repositoryRoot, 'src/lib/server/jobs/catalog.ts');
+const operationsMigrationPath = join(
+  repositoryRoot, 'drizzle/0015_plan7a_operations_authority.sql'
+);
+
+type SafeFailureTuple = readonly [kind: string, message: string, code: string];
+
+const unwrapExpression = (expression: ts.Expression): ts.Expression => {
+  if (ts.isAsExpression(expression) || ts.isSatisfiesExpression(expression) ||
+    ts.isParenthesizedExpression(expression)) return unwrapExpression(expression.expression);
+  return expression;
+};
+
+const frozenObjectLiteral = (
+  expression: ts.Expression | undefined,
+  authorityName: string
+): ts.ObjectLiteralExpression => {
+  if (!expression) throw new Error(`${authorityName} must have an initializer`);
+  const candidate = unwrapExpression(expression);
+  const argument = ts.isCallExpression(candidate) &&
+    ts.isPropertyAccessExpression(candidate.expression) &&
+    ts.isIdentifier(candidate.expression.expression) &&
+    candidate.expression.expression.text === 'Object' &&
+    candidate.expression.name.text === 'freeze' && candidate.arguments.length === 1
+    ? unwrapExpression(candidate.arguments[0]!)
+    : undefined;
+  if (!argument || !ts.isObjectLiteralExpression(argument)) {
+    throw new Error(`${authorityName} must be an Object.freeze object literal`);
+  }
+  return argument;
+};
+
+const stringPropertyName = (property: ts.PropertyAssignment, owner: string): string => {
+  if (!ts.isStringLiteral(property.name)) {
+    throw new Error(`${owner} must contain only string-literal property assignments`);
+  }
+  return property.name.text;
+};
+
+const stringInitializer = (property: ts.PropertyAssignment, owner: string): string => {
+  const initializer = unwrapExpression(property.initializer);
+  if (!ts.isStringLiteral(initializer)) {
+    throw new Error(`${owner}.${property.name.getText()} must have a string-literal value`);
+  }
+  return initializer.text;
+};
+
+const safeFailuresFromCatalogSource = (source: string): readonly SafeFailureTuple[] => {
+  const syntax = ts.createSourceFile(
+    'src/lib/server/jobs/catalog.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS
+  );
+  const owners = syntax.statements.flatMap((statement) => {
+    if (!ts.isVariableStatement(statement)) return [];
+    return statement.declarationList.declarations
+      .filter((declaration) => ts.isIdentifier(declaration.name) &&
+        declaration.name.text === 'SAFE_FAILURES')
+      .map((declaration) => ({ statement, declaration }));
+  });
+  if (owners.length !== 1) {
+    throw new Error('catalog.ts must have exactly one top-level SAFE_FAILURES declaration');
+  }
+  const owner = owners[0];
+  if (!owner) throw new Error('catalog.ts SAFE_FAILURES declaration is unavailable');
+  const { statement, declaration } = owner;
+  const directlyExported = statement.modifiers?.some(
+    ({ kind }) => kind === ts.SyntaxKind.ExportKeyword
+  ) ?? false;
+  const separatelyExported = syntax.statements.some((candidate) => {
+    if (ts.isExportAssignment(candidate)) {
+      const expression = unwrapExpression(candidate.expression);
+      return ts.isIdentifier(expression) && expression.text === 'SAFE_FAILURES';
+    }
+    return ts.isExportDeclaration(candidate) && !candidate.moduleSpecifier &&
+      candidate.exportClause !== undefined && ts.isNamedExports(candidate.exportClause) &&
+      candidate.exportClause.elements.some((element) =>
+        (element.propertyName ?? element.name).text === 'SAFE_FAILURES'
+      );
+  });
+  if (directlyExported || separatelyExported) {
+    throw new Error('SAFE_FAILURES must remain private to catalog.ts');
+  }
+  if ((statement.declarationList.flags & ts.NodeFlags.Const) === 0) {
+    throw new Error('SAFE_FAILURES must remain a const declaration');
+  }
+
+  const authority = frozenObjectLiteral(declaration.initializer, 'SAFE_FAILURES');
+  const tuples: SafeFailureTuple[] = [];
+  const identities = new Set<string>();
+  for (const kindProperty of authority.properties) {
+    if (!ts.isPropertyAssignment(kindProperty)) {
+      throw new Error('SAFE_FAILURES must contain only property assignments');
+    }
+    const kind = stringPropertyName(kindProperty, 'SAFE_FAILURES');
+    const failures = frozenObjectLiteral(kindProperty.initializer, `SAFE_FAILURES[${kind}]`);
+    for (const messageProperty of failures.properties) {
+      if (!ts.isPropertyAssignment(messageProperty)) {
+        throw new Error(`SAFE_FAILURES[${kind}] must contain only property assignments`);
+      }
+      const message = stringPropertyName(messageProperty, `SAFE_FAILURES[${kind}]`);
+      const identity = `${kind}\u0000${message}`;
+      if (identities.has(identity)) throw new Error(`duplicate SAFE_FAILURES entry: ${identity}`);
+      identities.add(identity);
+      tuples.push([
+        kind,
+        message,
+        stringInitializer(messageProperty, `SAFE_FAILURES[${kind}]`)
+      ]);
+    }
+  }
+  return tuples;
+};
+
+type SqlTokenKind = 'dollar' | 'identifier' | 'number' | 'string' | 'symbol' | 'word';
+
+interface SqlToken {
+  readonly kind: SqlTokenKind;
+  readonly text: string;
+}
+
+const quotedSqlToken = (
+  sql: string,
+  offset: number,
+  quote: "'" | '"',
+  kind: 'identifier' | 'string'
+): readonly [token: SqlToken, end: number] => {
+  const backslashEscapes = quote === "'" && isEscapeString(sql, offset);
+  let cursor = offset + 1;
+  let value = '';
+  while (cursor < sql.length) {
+    if (backslashEscapes && sql[cursor] === '\\' && cursor + 1 < sql.length) {
+      value += sql[cursor + 1];
+      cursor += 2;
+      continue;
+    }
+    if (sql[cursor] !== quote) {
+      value += sql[cursor];
+      cursor += 1;
+      continue;
+    }
+    if (sql[cursor + 1] === quote) {
+      value += quote;
+      cursor += 2;
+      continue;
+    }
+    return [{ kind, text: value }, cursor + 1];
+  }
+  throw new Error(`unterminated SQL ${kind}`);
+};
+
+const sqlTokens = (sql: string): readonly SqlToken[] => {
+  const tokens: SqlToken[] = [];
+  let cursor = 0;
+  while (cursor < sql.length) {
+    if (/\s/u.test(sql[cursor]!)) {
+      cursor += 1;
+      continue;
+    }
+    if (sql.startsWith('--', cursor)) {
+      const end = sql.indexOf('\n', cursor + 2);
+      cursor = end < 0 ? sql.length : end + 1;
+      continue;
+    }
+    if (sql.startsWith('/*', cursor)) {
+      let depth = 1;
+      cursor += 2;
+      while (cursor < sql.length && depth > 0) {
+        if (sql.startsWith('/*', cursor)) {
+          depth += 1;
+          cursor += 2;
+        } else if (sql.startsWith('*/', cursor)) {
+          depth -= 1;
+          cursor += 2;
+        } else {
+          cursor += 1;
+        }
+      }
+      if (depth > 0) throw new Error('unterminated SQL block comment');
+      continue;
+    }
+    if (sql[cursor] === "'") {
+      const [token, end] = quotedSqlToken(sql, cursor, "'", 'string');
+      tokens.push(token);
+      cursor = end;
+      continue;
+    }
+    if (sql[cursor] === '"') {
+      const [token, end] = quotedSqlToken(sql, cursor, '"', 'identifier');
+      tokens.push(token);
+      cursor = end;
+      continue;
+    }
+    const dollarTag = sql[cursor] === '$' ? dollarTagAt(sql, cursor) : undefined;
+    if (dollarTag) {
+      const bodyStart = cursor + dollarTag.length;
+      const close = sql.indexOf(dollarTag, bodyStart);
+      if (close < 0) throw new Error(`unterminated SQL dollar quote ${dollarTag}`);
+      tokens.push({ kind: 'dollar', text: sql.slice(bodyStart, close) });
+      cursor = close + dollarTag.length;
+      continue;
+    }
+    if (/[A-Za-z_]/u.test(sql[cursor]!)) {
+      const start = cursor;
+      cursor += 1;
+      while (cursor < sql.length && /[A-Za-z0-9_$]/u.test(sql[cursor]!)) cursor += 1;
+      tokens.push({ kind: 'word', text: sql.slice(start, cursor) });
+      continue;
+    }
+    if (/[0-9]/u.test(sql[cursor]!)) {
+      const start = cursor;
+      cursor += 1;
+      while (cursor < sql.length && /[0-9]/u.test(sql[cursor]!)) cursor += 1;
+      tokens.push({ kind: 'number', text: sql.slice(start, cursor) });
+      continue;
+    }
+    tokens.push({ kind: 'symbol', text: sql[cursor]! });
+    cursor += 1;
+  }
+  return tokens;
+};
+
+const isSqlWord = (token: SqlToken | undefined, expected: string): boolean =>
+  token?.kind === 'word' && token.text.toLowerCase() === expected;
+
+const isSqlIdentifier = (token: SqlToken | undefined, expected: string): boolean =>
+  token !== undefined && (token.kind === 'word'
+    ? token.text.toLowerCase() === expected
+    : token.kind === 'identifier' && token.text === expected);
+
+const safeFailureFunctionBody = (sql: string): string => {
+  const tokens = sqlTokens(sql);
+  const bodies: string[] = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    if (!isSqlWord(tokens[index], 'create') ||
+      (index > 0 && (tokens[index - 1]?.kind !== 'symbol' ||
+        tokens[index - 1]?.text !== ';'))) continue;
+    let cursor = index + 1;
+    if (isSqlWord(tokens[cursor], 'or') && isSqlWord(tokens[cursor + 1], 'replace')) cursor += 2;
+    if (!isSqlWord(tokens[cursor], 'function')) continue;
+    cursor += 1;
+    if (!isSqlIdentifier(tokens[cursor], 'public') || tokens[cursor + 1]?.text !== '.' ||
+      !isSqlIdentifier(tokens[cursor + 2], 'plan7a_operations_safe_failure_code') ||
+      tokens[cursor + 3]?.text !== '(' || !isSqlIdentifier(tokens[cursor + 4], 'text') ||
+      tokens[cursor + 5]?.text !== ',' || !isSqlIdentifier(tokens[cursor + 6], 'text') ||
+      tokens[cursor + 7]?.text !== ')') continue;
+    cursor += 8;
+    const headerStart = cursor;
+    while (cursor < tokens.length && tokens[cursor]?.text !== ';') {
+      if (isSqlWord(tokens[cursor], 'as') && tokens[cursor + 1]?.kind === 'dollar' &&
+        tokens[cursor + 2]?.text === ';') {
+        const header = tokens.slice(headerStart, cursor);
+        const shortCircuitsNulls = header.some((token, headerIndex) =>
+          isSqlWord(token, 'strict') ||
+          (isSqlWord(token, 'returns') && isSqlWord(header[headerIndex + 1], 'null') &&
+            isSqlWord(header[headerIndex + 2], 'on') &&
+            isSqlWord(header[headerIndex + 3], 'null') &&
+            isSqlWord(header[headerIndex + 4], 'input'))
+        );
+        if (shortCircuitsNulls) {
+          throw new Error('safe-failure SQL must remain CALLED ON NULL INPUT');
+        }
+        bodies.push(tokens[cursor + 1]!.text);
+        break;
+      }
+      cursor += 1;
+    }
+  }
+  if (bodies.length !== 1) {
+    throw new Error('0015 must contain exactly one executable safe-failure function(text,text)');
+  }
+  return bodies[0]!;
+};
+
+const safeFailuresFromOperationsMigration = (sql: string): readonly SafeFailureTuple[] => {
+  const tokens = sqlTokens(safeFailureFunctionBody(sql));
+  let cursor = 0;
+  const consume = (kind: SqlTokenKind, text: string): SqlToken => {
+    const token = tokens[cursor];
+    const matches = token?.kind === kind && (kind === 'word'
+      ? token.text.toLowerCase() === text
+      : token.text === text);
+    if (!matches) throw new Error(`safe-failure SQL expected ${kind} ${text} at token ${cursor}`);
+    cursor += 1;
+    return token;
+  };
+  const consumeIdentifier = (text: string): void => {
+    if (!isSqlIdentifier(tokens[cursor], text)) {
+      throw new Error(`safe-failure SQL expected identifier ${text} at token ${cursor}`);
+    }
+    cursor += 1;
+  };
+  const consumeParameter = (ordinal: string): void => {
+    consume('symbol', '$');
+    consume('number', ordinal);
+  };
+  const consumeString = (): string => {
+    const token = tokens[cursor];
+    if (token?.kind !== 'string') {
+      throw new Error(`safe-failure SQL expected string at token ${cursor}`);
+    }
+    cursor += 1;
+    return token.text;
+  };
+
+  consume('word', 'select');
+  consume('word', 'case');
+  consume('word', 'when');
+  consumeParameter('1');
+  consume('word', 'not');
+  consume('word', 'in');
+  consume('symbol', '(');
+  const registeredKinds: string[] = [];
+  while (tokens[cursor]?.kind === 'string') {
+    registeredKinds.push(consumeString());
+    if (tokens[cursor]?.text !== ',') break;
+    consume('symbol', ',');
+  }
+  consume('symbol', ')');
+  consume('word', 'then');
+  if (consumeString() !== 'unregistered_job_kind') {
+    throw new Error('safe-failure SQL must classify unknown kinds as unregistered_job_kind');
+  }
+  if (JSON.stringify(registeredKinds) !== JSON.stringify(REGISTERED_JOB_KINDS)) {
+    throw new Error('safe-failure SQL registered-kind branch must match REGISTERED_JOB_KINDS');
+  }
+  consume('word', 'when');
+  consumeParameter('2');
+  consume('word', 'is');
+  consume('word', 'null');
+  consume('word', 'then');
+  consume('word', 'null');
+  consume('word', 'else');
+  consumeIdentifier('coalesce');
+  consume('symbol', '(');
+  consume('symbol', '(');
+  consume('word', 'select');
+  consumeIdentifier('failure');
+  consume('symbol', '.');
+  consumeIdentifier('code');
+  consume('word', 'from');
+  consume('symbol', '(');
+  consume('word', 'values');
+
+  const tuples: SafeFailureTuple[] = [];
+  do {
+    consume('symbol', '(');
+    const kind = consumeString();
+    consume('symbol', ',');
+    const message = consumeString();
+    consume('symbol', ',');
+    const code = consumeString();
+    consume('symbol', ')');
+    tuples.push([kind, message, code]);
+    if (tokens[cursor]?.text !== ',') break;
+    consume('symbol', ',');
+  } while (tokens[cursor]?.text === '(');
+
+  consume('symbol', ')');
+  consume('word', 'as');
+  consumeIdentifier('failure');
+  consume('symbol', '(');
+  consumeIdentifier('kind');
+  consume('symbol', ',');
+  consumeIdentifier('message');
+  consume('symbol', ',');
+  consumeIdentifier('code');
+  consume('symbol', ')');
+  consume('word', 'where');
+  consumeIdentifier('failure');
+  consume('symbol', '.');
+  consumeIdentifier('kind');
+  consume('symbol', '=');
+  consumeParameter('1');
+  consume('word', 'and');
+  consumeIdentifier('failure');
+  consume('symbol', '.');
+  consumeIdentifier('message');
+  consume('symbol', '=');
+  consumeParameter('2');
+  consume('symbol', ')');
+  consume('symbol', ',');
+  if (consumeString() !== 'unexpected_failure') {
+    throw new Error('safe-failure SQL must classify unmapped failures as unexpected_failure');
+  }
+  consume('symbol', ')');
+  consume('word', 'end');
+  if (tokens[cursor]?.text === ';') consume('symbol', ';');
+  if (cursor !== tokens.length) {
+    throw new Error(`safe-failure SQL has unexpected executable tokens after token ${cursor}`);
+  }
+  return tuples;
+};
 
 const catalogFunctionName = 'public.plan7a_operations_job_catalog';
 const catalogFunctionTag = '$plan7a_operations_job_catalog$';
@@ -209,7 +602,12 @@ const expectedCatalogFunctionBody = (): string => `
   ${policyOutcomeValuesRelation} (
     policy_ordinal, policy_adapter, outcome_ordinal, status, result_code
   ) as (values ${expectedPolicyOutcomeValueRows()})
-  select catalog.*, array(
+  select catalog.kind, catalog.label, catalog.max_attempts,
+    catalog.automatic_retry_owner, catalog.retry_disposition,
+    catalog.policy_adapter, catalog.policy_availability,
+    catalog.provider_verification_required, catalog.provider_calls_in_plan7a,
+    catalog.administrator_retry_excluded, catalog.safe_statuses,
+    catalog.diagnostic_generation, array(
     select outcome.status || '/' || outcome.result_code
     from ${policyOutcomeValuesRelation} outcome
     where outcome.policy_adapter = catalog.policy_adapter
@@ -311,6 +709,38 @@ const expectedDefinitions = [
     ...common }
 ] as const;
 
+const catalogSafeFailureAuthority = safeFailuresFromCatalogSource(
+  readFileSync(catalogSourcePath, 'utf8')
+);
+
+const typescriptSafeFailureDecoys = [
+  { label: 'line comment', source: '// const SAFE_FAILURES = Object.freeze({});' },
+  { label: 'block comment', source: '/* const SAFE_FAILURES = Object.freeze({}); */' },
+  { label: 'quoted string', source: "const quoted = 'const SAFE_FAILURES = Object.freeze({})';" },
+  { label: 'template string', source: 'const quoted = `const SAFE_FAILURES = Object.freeze({})`;' }
+] as const;
+
+const safeFailureFunctionDecoy = [
+  'CREATE FUNCTION "public"."plan7a_operations_safe_failure_code"(text,text)',
+  'RETURNS text LANGUAGE sql AS $body$ SELECT NULL $body$;'
+].join('\n');
+const sqlSafeFailureDecoys = [
+  {
+    label: 'line comments',
+    source: safeFailureFunctionDecoy.split('\n').map((line) => `-- ${line}`).join('\n')
+  },
+  { label: 'block comment', source: `/* ${safeFailureFunctionDecoy} */` },
+  {
+    label: 'quoted string',
+    source: `SELECT '${safeFailureFunctionDecoy.replaceAll("'", "''")}';`
+  },
+  { label: 'dollar-quoted string', source: `SELECT $decoy$${safeFailureFunctionDecoy}$decoy$;` },
+  {
+    label: 'quoted identifier',
+    source: `SELECT 1 AS "${safeFailureFunctionDecoy.replaceAll('"', '""')}";`
+  }
+] as const;
+
 describe('production job catalog', () => {
   it('freezes the exact eleven definitions in canonical order', () => {
     expect(JOB_DEFINITIONS).toEqual(expectedDefinitions);
@@ -392,6 +822,14 @@ describe('production job catalog', () => {
   });
 
   it('owns the exact policy outcome matrix that SQL must mirror', () => {
+    expect(JOB_RETRY_COMMAND_RESULT_CODES).toEqual([
+      'rearmed_existing', 'successor_enqueued', 'already_current',
+      'retry_not_supported', 'retry_policy_not_enabled',
+      'provider_recovery_not_enabled', 'target_not_failed', 'target_state_changed',
+      'domain_state_not_retryable', 'source_unavailable', 'actor_not_authorized',
+      'retry_command_invalid', 'retry_command_exhausted', 'unexpected_failure'
+    ]);
+    expect(Object.isFrozen(JOB_RETRY_COMMAND_RESULT_CODES)).toBe(true);
     const expectedPolicyOutcomeRows = [
       ['deny_retry_not_supported', 'denied', 'retry_not_supported'],
       ['deny_retry_policy_not_enabled', 'denied', 'retry_policy_not_enabled'],
@@ -545,73 +983,70 @@ describe('production job catalog', () => {
       'the operations list/helper routine must consume the executable catalog function').toBe(true);
   });
 
-  it('classifies only exact persisted safe failures', () => {
-    const cases = [
-      ['outbox.dispatch', 'Outbox job is missing outboxId', 'invalid_job_identity'],
-      ['outbox.dispatch', 'Invalid auth email payload', 'invalid_job_identity'],
-      ['outbox.dispatch', 'Invalid commerce email payload', 'invalid_job_identity'],
-      ['commerce.claim-email', 'Invalid commerce claim-email payload', 'invalid_job_identity'],
-      ['commerce.claim-email-request', 'Invalid commerce claim-email payload', 'invalid_job_identity'],
-      ['commerce.stripe-event', 'Invalid Stripe event job payload.', 'invalid_job_identity'],
-      ['commerce.financial-source', 'Invalid financial source job identity.', 'invalid_job_identity'],
-      ['commerce.financial-payout', 'Invalid financial payout job identity.', 'invalid_job_identity'],
-      ['commerce.financial-scan', 'Invalid financial scan job identity.', 'invalid_job_identity'],
-      ['commerce.financial-classification', 'Invalid financial classification job payload.',
-        'invalid_job_identity'],
-      ['commerce.financial-admin-command',
-        'Invalid financial administrator command job identity.', 'invalid_job_identity'],
-      ['commerce.financial-admin-command',
-        'Financial administrator command identity is invalid.', 'invalid_job_identity'],
-      ['catalog.ingest_revision', 'Invalid revision ingestion payload', 'invalid_job_identity'],
-      ['operations.job-retry-command',
-        'Invalid operations job retry command identity.', 'invalid_job_identity'],
-      ['outbox.dispatch', 'Outbox message does not exist', 'source_unavailable'],
-      ['commerce.stripe-event', 'Stripe event no longer exists.', 'source_unavailable'],
-      ['catalog.ingest_revision', 'Revision ingestion target does not exist', 'source_unavailable'],
-      ['catalog.ingest_revision', 'Revision staging metadata is incomplete', 'source_unavailable'],
-      ['commerce.claim-email', 'Commerce claim-email order is not eligible',
-        'domain_state_not_retryable'],
-      ['commerce.claim-email-request', 'Commerce claim-email order is not eligible',
-        'domain_state_not_retryable'],
-      ['commerce.financial-source', 'Financial source evidence is invalid.',
-        'domain_state_not_retryable'],
-      ['commerce.financial-payout', 'Financial payout evidence is invalid.',
-        'domain_state_not_retryable'],
-      ['commerce.financial-scan', 'Financial scan evidence is invalid.',
-        'domain_state_not_retryable'],
-      ['commerce.financial-classification', 'Financial classification evidence is invalid.',
-        'domain_state_not_retryable'],
-      ['commerce.financial-admin-command',
-        'Financial administrator command is already terminal.', 'domain_state_not_retryable'],
-      ['commerce.financial-admin-command', 'Financial administrator command was denied.',
-        'domain_state_not_retryable'],
-      ['commerce.financial-admin-command',
-        'Financial administrator command conflicted with current state.',
-        'domain_state_not_retryable'],
-      ['operations.job-retry-command', 'Operations job retry command exhausted.',
-        'retry_command_exhausted']
-    ] as const;
+  it('keeps executable SQL safe failures byte-identical to the private TypeScript authority', () => {
+    const sqlSafeFailures = safeFailuresFromOperationsMigration(
+      readFileSync(operationsMigrationPath, 'utf8')
+    );
 
-    for (const [kind, lastError, expected] of cases) {
+    expect(catalogSafeFailureAuthority.length).toBeGreaterThan(0);
+    expect(JSON.stringify(sqlSafeFailures)).toBe(JSON.stringify(catalogSafeFailureAuthority));
+  });
+
+  it('rejects a parenthesized default export of the private TypeScript authority', () => {
+    const exportedSource = `
+      const SAFE_FAILURES = Object.freeze({
+        'registered.kind': Object.freeze({ 'message': 'unexpected_failure' })
+      });
+      export default (SAFE_FAILURES);
+    `;
+    expect(() => safeFailuresFromCatalogSource(exportedSource))
+      .toThrow('SAFE_FAILURES must remain private to catalog.ts');
+  });
+
+  it.each(['STRICT', 'RETURNS NULL ON NULL INPUT'] as const)(
+    'rejects SQL $nullBehavior that bypasses unknown-kind classification for null errors',
+    (nullBehavior) => {
+      const migration = readFileSync(operationsMigrationPath, 'utf8').replace(/\r\n?/gu, '\n');
+      const header = [
+        'CREATE FUNCTION "public"."plan7a_operations_safe_failure_code"(text,text)',
+        'RETURNS text',
+        'LANGUAGE sql STABLE'
+      ].join('\n');
+      const nullShortCircuitMigration = migration.replace(header, `${header} ${nullBehavior}`);
+      expect(nullShortCircuitMigration).not.toBe(migration);
+      expect(() => safeFailuresFromOperationsMigration(nullShortCircuitMigration))
+        .toThrow('safe-failure SQL must remain CALLED ON NULL INPUT');
+    }
+  );
+
+  it.each(typescriptSafeFailureDecoys)(
+    'rejects a TypeScript $label as a safe-failure authority',
+    ({ source }) => {
+      expect(() => safeFailuresFromCatalogSource(source))
+        .toThrow('exactly one top-level SAFE_FAILURES declaration');
+    }
+  );
+
+  it.each(sqlSafeFailureDecoys)(
+    'rejects a SQL $label as an executable safe-failure function',
+    ({ source }) => {
+      expect(() => safeFailuresFromOperationsMigration(source))
+        .toThrow('exactly one executable safe-failure function(text,text)');
+    }
+  );
+
+  it('classifies every persisted safe failure from the private source authority', () => {
+    for (const [kind, lastError, expected] of catalogSafeFailureAuthority) {
       expect(safeOperationalFailureCode(kind, lastError), `${kind}:${lastError}`).toBe(expected);
     }
   });
 
   it('selects only safe failure codes reachable for the exact registered kind', () => {
-    const reachable = [
-      ['outbox.dispatch', 'invalid_job_identity'],
-      ['outbox.dispatch', 'source_unavailable'],
-      ['commerce.claim-email', 'domain_state_not_retryable'],
-      ['commerce.claim-email-request', 'domain_state_not_retryable'],
-      ['commerce.stripe-event', 'source_unavailable'],
-      ['commerce.financial-source', 'domain_state_not_retryable'],
-      ['commerce.financial-payout', 'domain_state_not_retryable'],
-      ['commerce.financial-scan', 'domain_state_not_retryable'],
-      ['commerce.financial-classification', 'domain_state_not_retryable'],
-      ['commerce.financial-admin-command', 'domain_state_not_retryable'],
-      ['catalog.ingest_revision', 'source_unavailable'],
-      ['operations.job-retry-command', 'retry_command_exhausted']
-    ] as const;
+    const reachable = catalogSafeFailureAuthority
+      .filter(([kind, , code], index, tuples) => tuples.findIndex(
+        ([candidateKind, , candidateCode]) => candidateKind === kind && candidateCode === code
+      ) === index)
+      .map(([kind, , code]) => [kind, code] as const);
     for (const [kind, code] of reachable) {
       expect(isOperationalFailureCodeAllowedForJobKind(kind, code), `${kind}:${code}`).toBe(true);
     }
@@ -656,6 +1091,9 @@ describe('production job catalog', () => {
         []
       ]) expect(safeOperationalFailureCode(kind, lastError)).toBe('unexpected_failure');
     }
+
+    expect(safeOperationalFailureCode('unregistered.kind', null))
+      .toBe('unregistered_job_kind');
 
     const hostile = Object.defineProperty({}, 'toString', {
       get: () => { throw new Error('must not inspect hostile lastError'); }

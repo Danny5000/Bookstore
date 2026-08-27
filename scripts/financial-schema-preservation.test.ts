@@ -1,4 +1,5 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { getViewConfig } from 'drizzle-orm/pg-core';
 import { describe, expect, it } from 'vitest';
@@ -12,6 +13,14 @@ function source(relativePath: string): string {
   return existsSync(path)
     ? readFileSync(path, 'utf8').replace(/\r\n?/gu, '\n')
     : '';
+}
+
+function bytes(relativePath: string): Buffer {
+  return readFileSync(fileURLToPath(new URL(relativePath, import.meta.url)));
+}
+
+function sha256(relativePath: string): string {
+  return createHash('sha256').update(bytes(relativePath)).digest('hex');
 }
 
 const PROVIDER_TABLES = [
@@ -91,6 +100,7 @@ const REPORTING_CORRECTION_AUTHORITY_MIGRATION =
   '../drizzle/0013_plan6bii_reporting_correction_authority.sql';
 const ISSUE_TRANSITION_FAIL_CLOSED_MIGRATION =
   '../drizzle/0014_plan6bii_issue_transition_fail_closed.sql';
+const OPERATIONS_AUTHORITY_MIGRATION = '../drizzle/0015_plan7a_operations_authority.sql';
 
 const PLAN6BII_0012_CALLABLE_ROUTINES = [
   ['submit_financial_admin_command(uuid,text,text,text,text,jsonb)', 'pale_orbit_runtime'],
@@ -135,11 +145,12 @@ const PLAN6BII_0013_ROUTINE =
 
 function createdRoutineSignatures(migration: string, includeReplacements = false): string[] {
   const expression = includeReplacements
-    ? /^CREATE(?: OR REPLACE)? FUNCTION "public"\."([a-z0-9_]+)"\(([^)]*)\)/gmu
-    : /^CREATE FUNCTION "public"\."([a-z0-9_]+)"\(([^)]*)\)/gmu;
+    ? /^CREATE(?: OR REPLACE)? FUNCTION (?:(?:"public"\."([a-z0-9_]+)")|(?:public\.([a-z0-9_]+)))\(([^)]*)\)/gmu
+    : /^CREATE FUNCTION (?:(?:"public"\."([a-z0-9_]+)")|(?:public\.([a-z0-9_]+)))\(([^)]*)\)/gmu;
   return Array.from(
     migration.matchAll(expression),
-    (match) => `${match[1]}(${match[2]})`
+    (match) => `${match[1] ?? match[2]}(${match[3]!
+      .replace(/\s+/gu, ' ').replace(/\s*,\s*/gu, ',').trim()})`
   );
 }
 
@@ -178,6 +189,41 @@ function triggerAttachment(tableName: string): RegExp {
 }
 
 describe('Plan 6B financial schema preservation', () => {
+  it('preserves historical migration bytes while appending only the exact 0015 head', () => {
+    const historicalHashes = new Map([
+      ['../drizzle/0012_plan6bii_admin_command_authority.sql',
+        '8bb618005b1c3f42aebaf3e2d8c18aa1028b8c0c68ebc325e5c748be09b43065'],
+      ['../drizzle/0013_plan6bii_reporting_correction_authority.sql',
+        'daf2263c57d6916cfd1866f668ba5af090d614455ad5885291501ad75bfd4925'],
+      ['../drizzle/0014_plan6bii_issue_transition_fail_closed.sql',
+        'ad1a3c421bd1c16a15b8334b4b4664157988b1c7119a92259f89874527d90b51'],
+      ['../drizzle/meta/0012_snapshot.json',
+        '0f9d40c2ccc4333f90914bef6d787f0a5ab835f3d203d19bbbac71123f5c4001'],
+      ['../drizzle/meta/0013_snapshot.json',
+        '88395adb4c8a7c3f6337892add36da93f95eebdcb99380d31e623011d0c4cfe6'],
+      ['../drizzle/meta/0014_snapshot.json',
+        '65b1746fb89547bee312133720e12504225e0d1f3b87b2d69b313b2462990c74']
+    ]);
+    for (const [path, expected] of historicalHashes) expect(sha256(path), path).toBe(expected);
+
+    const drizzleDirectory = fileURLToPath(new URL('../drizzle', import.meta.url));
+    expect(readdirSync(drizzleDirectory).filter((name) => name.startsWith('0015_')))
+      .toEqual(['0015_plan7a_operations_authority.sql']);
+    expect(source('../drizzle/0015_plan7a_operations_authority.sql')).not.toBe('');
+    expect(source('../drizzle/meta/0015_snapshot.json')).not.toBe('');
+
+    const journal = JSON.parse(source('../drizzle/meta/_journal.json')) as {
+      entries: Array<{ idx: number; tag: string }>;
+    };
+    expect(journal.entries.map(({ idx }) => idx)).toEqual(
+      Array.from({ length: 16 }, (_value, idx) => idx)
+    );
+    expect(journal.entries.at(-1)).toEqual(expect.objectContaining({
+      idx: 15,
+      tag: '0015_plan7a_operations_authority'
+    }));
+  });
+
   it('adds one append-only correction resolver after an absolute authority preflight', () => {
     const migration = source(REPORTING_CORRECTION_AUTHORITY_MIGRATION);
     const routineSignature =
@@ -214,7 +260,7 @@ describe('Plan 6B financial schema preservation', () => {
     );
   });
 
-  it('freezes the historical eight-routine 0012 boundary and current nine-routine 0014 head', () => {
+  it('freezes the historical eight-routine 0012 boundary through the appended 0015 head', () => {
     const integration = source('../tests/integration/financial-migration.test.ts');
     const adminCommandMigration = source(ADMIN_COMMAND_MIGRATION);
     const reportingCorrectionMigration = source(REPORTING_CORRECTION_AUTHORITY_MIGRATION);
@@ -271,11 +317,11 @@ describe('Plan 6B financial schema preservation', () => {
       /^GRANT EXECUTE ON FUNCTION .* TO (?:PUBLIC|"pale_orbit_runtime"|"pale_orbit_storage_cleanup");/mu
     );
     expect(journal.entries.map(({ idx }) => idx)).toEqual(
-      Array.from({ length: 15 }, (_value, idx) => idx)
+      Array.from({ length: 16 }, (_value, idx) => idx)
     );
     expect(journal.entries.at(-1)).toEqual(expect.objectContaining({
-      idx: 14,
-      tag: '0014_plan6bii_issue_transition_fail_closed'
+      idx: 15,
+      tag: '0015_plan7a_operations_authority'
     }));
   });
 
@@ -1843,6 +1889,575 @@ describe('Plan 6B financial schema preservation', () => {
     expect(setup).toMatch(/truncate table[\s\S]+?financial_projection_versions/iu);
     expect(setup).toMatch(
       /insert\s+into\s+financial_projection_versions[\s\S]+?values\s*\(true,\s*1,\s*2,/iu
+    );
+  });
+});
+
+describe('Plan 7A operations authority migration', () => {
+  const applicationRoutines = [
+    'list_operational_jobs(uuid,text,text,timestamp with time zone,uuid,integer)',
+    'submit_job_retry_command(uuid,uuid,text,integer,integer,timestamp with time zone,text,text,text,text)',
+    'get_owned_job_retry_command(uuid,uuid)'
+  ] as const;
+  const workerRoutines = [
+    'plan7a_operations_claim_job(uuid,text,integer)',
+    'plan7a_operations_renew_job_claim(uuid,text,integer,integer)',
+    'plan7a_operations_relinquish_job(uuid,text,integer,integer,text,integer)',
+    'plan7a_operations_complete_job(uuid,text,integer,integer)',
+    'plan7a_operations_fail_job(uuid,text,integer,integer,text)',
+    'plan7a_operations_exhaust_job(uuid,text,integer,integer)',
+    'plan7a_operations_lock_job_retry_command(uuid,uuid,text,integer,integer)',
+    'plan7a_operations_transition_job_retry_command(uuid,uuid,text,integer,integer,operations_job_retry_result_code)'
+  ] as const;
+
+  it('places the absolute 0014 preflight and fixed namespace locks before mutation', () => {
+    const migration = source(OPERATIONS_AUTHORITY_MIGRATION);
+    const preflightEnd = migration.indexOf(
+      '$plan7a_operations_authority_preflight$;--> statement-breakpoint'
+    );
+    const firstPersistentStatement = migration.search(
+      /CREATE TYPE "public"\."operations_job_retry_claim_state"/u
+    );
+    const firstLock = migration.indexOf(
+      'LOCK TABLE "public"."jobs" IN SHARE ROW EXCLUSIVE MODE;'
+    );
+    const secondLock = migration.indexOf(
+      'LOCK TABLE "public"."audit_events" IN SHARE ROW EXCLUSIVE MODE;'
+    );
+    const emptinessQuery = migration.indexOf("operations.job-retry-command");
+
+    expect(migration.startsWith('DO $plan7a_operations_authority_preflight$')).toBe(true);
+    expect(preflightEnd).toBeGreaterThan(0);
+    expect(preflightEnd).toBeLessThan(firstPersistentStatement);
+    expect(firstLock).toBeGreaterThan(0);
+    expect(migration.indexOf('LOCK TABLE')).toBe(firstLock);
+    expect(secondLock).toBeGreaterThan(firstLock);
+    expect(secondLock).toBeLessThan(emptinessQuery);
+    expect(migration).toContain("deduplication_key LIKE 'operations:job-retry-command:%'");
+    expect(migration).toContain(
+      "pg_catalog.left(audit.action, 21) = 'operations.job_retry.'"
+    );
+    expect(migration).toContain("resource_type = 'operations_job_retry_command'");
+    expect(migration).toContain("ERRCODE = '55000'");
+    expect(migration).toContain("MESSAGE = 'Plan 7A operations namespace is not empty'");
+    for (const authorityFact of [
+      'session_replication_role', 'unsafe_session_replication_default',
+      'migration_expected_web_login', 'migration_expected_worker_login',
+      'migration_expected_storage_cleanup_login', 'pg_parameter_acl',
+      'pg_db_role_setting', 'pg_auth_members', 'pg_default_acl',
+      'pg_rewrite', 'pg_inherits', 'tgenabled', 'pg_get_functiondef',
+      'plan6b_guard_job_insert()', 'plan6b_guard_audit_insert()'
+    ]) expect(migration.slice(0, preflightEnd)).toContain(authorityFact);
+  });
+
+  it('pins the canonical migration context and exact predecessor authority descriptors', () => {
+    const migration = source(OPERATIONS_AUTHORITY_MIGRATION);
+    const preflightEnd = migration.indexOf(
+      '$plan7a_operations_authority_preflight$;--> statement-breakpoint'
+    );
+    const preflight = migration.slice(0, preflightEnd);
+
+    expect(preflight).toContain(
+      `IF pg_catalog.current_schema() IS DISTINCT FROM 'public' OR
+    pg_catalog.current_schemas(false) IS DISTINCT FROM ARRAY['public']::name[] THEN
+    RAISE EXCEPTION USING ERRCODE = '42501',
+      MESSAGE = 'Plan 7A operations authority search path is not canonical';`
+    );
+
+    const predecessorAclDigest =
+      '9d22545961747a6434b6eee47093c6c82c512483a6e36a5a49af0c0f41684e7a';
+    const predecessorAclMessage = 'Plan 7A predecessor ACL inventory is not canonical';
+    const predecessorAclAttestation = new RegExp(
+      `IF actual_predecessor_acl_sha256 IS DISTINCT FROM\\s+` +
+        `'${predecessorAclDigest}' THEN\\s+` +
+        `RAISE EXCEPTION USING ERRCODE = '42501',\\s+` +
+        `MESSAGE = '${predecessorAclMessage}';`,
+      'u'
+    );
+    expect(migration.match(new RegExp(predecessorAclDigest, 'gu'))).toHaveLength(2);
+    expect(migration.match(new RegExp(predecessorAclMessage, 'gu'))).toHaveLength(2);
+    expect(preflight).toMatch(predecessorAclAttestation);
+    expect(migration.slice(preflightEnd)).toMatch(predecessorAclAttestation);
+
+    const predecessorStorageMessage =
+      'Plan 7A predecessor storage inventory is not canonical';
+    const predecessorStorageDigest =
+      '5dfb4b04a8259b1f11cbe91aacb668c62993fd1e32e319c9f8287f78b60e43c8';
+    expect(migration.match(/actual_predecessor_storage_sha256/gu)).toHaveLength(6);
+    expect(migration.match(new RegExp(predecessorStorageDigest, 'gu'))).toHaveLength(2);
+    expect(migration.match(new RegExp(predecessorStorageMessage, 'gu'))).toHaveLength(2);
+    const storageAssignments = [
+      ...migration.matchAll(/\) INTO actual_predecessor_storage_sha256/gu)
+    ];
+    expect(storageAssignments).toHaveLength(2);
+    for (const assignment of storageAssignments) {
+      const assignmentIndex = assignment.index ?? -1;
+      const storageStart = migration.lastIndexOf('  SELECT pg_catalog.encode', assignmentIndex);
+      const storageEnd = migration.indexOf('  ) storage_descriptor;', assignmentIndex);
+      expect(storageStart).toBeGreaterThanOrEqual(0);
+      expect(storageEnd).toBeGreaterThan(assignmentIndex);
+      const storageAttestation = migration.slice(storageStart, storageEnd);
+      for (const descriptorFact of [
+        "'relation:' || relation_row.relname",
+        "'column:' || relation_row.relname",
+        "'constraint:' || relation_row.relname",
+        "'index:' || table_relation.relname",
+        'index_row.indisvalid::text',
+        'index_row.indisready::text',
+        'index_row.indislive::text',
+        "relation_row.relname IN ('jobs', 'audit_events')"
+      ]) expect(storageAttestation).toContain(descriptorFact);
+    }
+
+    const triggerInventoryStart = preflight.indexOf('WITH expected_jobs_trigger(');
+    const triggerInventoryEnd = preflight.indexOf(
+      '), actual_jobs_trigger AS (',
+      triggerInventoryStart
+    );
+    expect(triggerInventoryStart).toBeGreaterThan(0);
+    expect(triggerInventoryEnd).toBeGreaterThan(triggerInventoryStart);
+    const predecessorTriggerNames = [
+      ...preflight
+        .slice(triggerInventoryStart, triggerInventoryEnd)
+        .matchAll(/\('([^']+)'::name,/gu)
+    ].map((match) => match[1]);
+    expect(predecessorTriggerNames).toEqual([
+      'jobs_plan6b_web_insert_guard',
+      'jobs_plan6bii_financial_admin_lease_guard',
+      'jobs_plan6bii_financial_admin_terminal_sync'
+    ]);
+    for (const triggerName of predecessorTriggerNames) {
+      expect(migration.match(new RegExp(triggerName, 'gu'))).toHaveLength(2);
+    }
+
+    const postflightTriggerStart = migration.indexOf(
+      'WITH expected_trigger(',
+      preflightEnd
+    );
+    const postflightTriggerEnd = migration.indexOf(
+      '), actual_trigger AS (',
+      postflightTriggerStart
+    );
+    expect(postflightTriggerStart).toBeGreaterThan(preflightEnd);
+    expect(postflightTriggerEnd).toBeGreaterThan(postflightTriggerStart);
+    const postflightTriggerNames = [
+      ...migration
+        .slice(postflightTriggerStart, postflightTriggerEnd)
+        .matchAll(/\('([^']+)'::name,/gu)
+    ].map((match) => match[1]);
+    expect(postflightTriggerNames).toEqual([
+      ...predecessorTriggerNames,
+      'audit_events_plan6b_web_insert_guard',
+      'audit_events_reject_update',
+      'audit_events_reject_delete',
+      'plan7a_operations_retry_commands_update_guard',
+      'plan7a_operations_retry_commands_delete_guard',
+      'plan7a_operations_jobs_transition_guard'
+    ]);
+    const postflightActualTriggerEnd = migration.indexOf(
+      '), trigger_delta AS (',
+      postflightTriggerEnd
+    );
+    expect(postflightActualTriggerEnd).toBeGreaterThan(postflightTriggerEnd);
+    expect(migration.slice(postflightTriggerEnd, postflightActualTriggerEnd)).toContain(
+      "trigger_row.tgrelid = 'public.operations_job_retry_claims'::pg_catalog.regclass"
+    );
+  });
+
+  it('reattests the exact 0014 role, setting, default-ACL, and inheritance authority', () => {
+    const migration = source(OPERATIONS_AUTHORITY_MIGRATION);
+    const preflightEnd = migration.indexOf(
+      '$plan7a_operations_authority_preflight$;--> statement-breakpoint'
+    );
+    const postflightStart = migration.indexOf(
+      'DO $plan7a_operations_authority_postflight$',
+      preflightEnd
+    );
+    expect(preflightEnd).toBeGreaterThan(0);
+    expect(postflightStart).toBeGreaterThan(preflightEnd);
+    const sections = [
+      migration.slice(0, preflightEnd),
+      migration.slice(postflightStart)
+    ];
+
+    for (const authority of sections) {
+      for (const catalogFact of [
+        'attested_login_expectations',
+        'relevant_membership_delta',
+        'unsafe_attestation_setting_default',
+        'unsafe_session_replication_default',
+        'unsafe_operations_setting_default',
+        'unsafe_parameter_acl',
+        'actual_default_acl_identity',
+        'expected_default_acl_identity',
+        'default_acl_identity_delta',
+        'actual_default_acl_privilege',
+        'expected_default_acl_privilege',
+        'default_acl_privilege_delta'
+      ]) expect(authority, catalogFact).toContain(catalogFact);
+      for (const exactDefaultAclFact of [
+        "(database_owner, 0::oid, 'f'::\"char\")",
+        "(database_owner, 'public'::pg_catalog.regnamespace::oid, 'S'::\"char\")",
+        "(database_owner, 'public'::pg_catalog.regnamespace::oid, 'r'::\"char\")",
+        "'pale_orbit_runtime'::pg_catalog.regrole::oid",
+        "'EXECUTE'::text",
+        "'SELECT'::text",
+        "'UPDATE'::text",
+        "'USAGE'::text"
+      ]) expect(authority, exactDefaultAclFact).toContain(exactDefaultAclFact);
+    }
+
+    const inheritanceStart = migration.indexOf(
+      'SELECT 1 FROM pg_catalog.pg_inherits inheritance_row',
+      postflightStart
+    );
+    const inheritanceEnd = migration.indexOf(') THEN', inheritanceStart);
+    expect(inheritanceStart).toBeGreaterThan(postflightStart);
+    expect(inheritanceEnd).toBeGreaterThan(inheritanceStart);
+    const inheritance = migration.slice(inheritanceStart, inheritanceEnd);
+    for (const relation of [
+      'public.jobs',
+      'public.audit_events',
+      'public.operations_job_retry_commands',
+      'public.operations_job_retry_claims'
+    ]) expect(inheritance, relation).toContain(`'${relation}'::pg_catalog.regclass`);
+  });
+
+  it('attests Plan 7A enum identity by OID and exact ordered labels', () => {
+    const migration = source(OPERATIONS_AUTHORITY_MIGRATION);
+    const enumStart = migration.indexOf('WITH expected_enum(type_name, labels) AS (');
+    const enumEnd = migration.indexOf(
+      ') OR EXISTS (\n    WITH expected_table_type(',
+      enumStart
+    );
+    expect(enumStart).toBeGreaterThan(0);
+    expect(enumEnd).toBeGreaterThan(enumStart);
+    const enumAttestation = migration.slice(enumStart, enumEnd);
+
+    for (const exactEnum of [
+      `('operations_job_retry_claim_state'::text,
+          ARRAY['active','invalidated']::text[])`,
+      `('operations_job_retry_command_status',
+          ARRAY['pending','succeeded','denied','failed']::text[])`,
+      `('operations_job_retry_reason_code',
+          ARRAY['dependency_recovered','configuration_recovered',
+            'operator_reassessment']::text[])`,
+      `('operations_job_retry_result_code',
+          ARRAY['rearmed_existing','successor_enqueued','already_current',
+            'retry_not_supported','retry_policy_not_enabled',
+            'provider_recovery_not_enabled','target_not_failed',
+            'target_state_changed','domain_state_not_retryable','source_unavailable',
+            'actor_not_authorized','retry_command_invalid',
+            'retry_command_exhausted','unexpected_failure']::text[])`
+    ]) expect(enumAttestation).toContain(exactEnum);
+    expect(enumAttestation).toContain('SELECT expected.*, type_row.oid');
+    expect(enumAttestation).toMatch(
+      /WHERE enum_row\.enumtypid = type_row\.oid\s+ORDER BY enum_row\.enumsortorder/u
+    );
+    expect(enumAttestation).toContain('WHERE resolved.oid IS NULL');
+    expect(enumAttestation).toContain(
+      'resolved.actual_labels IS DISTINCT FROM resolved.labels'
+    );
+    for (const arrayIdentityFact of [
+      'type_row.typarray',
+      'array_type.typelem IS DISTINCT FROM resolved.oid',
+      'array_namespace.nspname IS DISTINCT FROM \'public\'',
+      "array_type.typname IS DISTINCT FROM '_' || resolved.type_name"
+    ]) expect(enumAttestation).toContain(arrayIdentityFact);
+
+    const tableTypeStart = migration.indexOf('WITH expected_table_type(relation_name) AS (');
+    const tableTypeEnd = migration.indexOf(') OR EXISTS (', tableTypeStart);
+    expect(tableTypeStart).toBeGreaterThan(enumEnd);
+    expect(tableTypeEnd).toBeGreaterThan(tableTypeStart);
+    const tableTypeAttestation = migration.slice(tableTypeStart, tableTypeEnd);
+    for (const bindingFact of [
+      "('operations_job_retry_commands'::text)",
+      "('operations_job_retry_claims'::text)",
+      'relation_row.reltype',
+      'row_type.typrelid IS DISTINCT FROM relation_row.oid',
+      'row_type.typarray',
+      'array_type.typelem IS DISTINCT FROM row_type.oid'
+    ]) expect(tableTypeAttestation).toContain(bindingFact);
+  });
+
+  it('reserves every generated type and schema-global operations index name', () => {
+    const migration = source(OPERATIONS_AUTHORITY_MIGRATION);
+    const namespaceStart = migration.indexOf('IF EXISTS (\n    SELECT 1\n    FROM pg_catalog.pg_proc routine');
+    const namespaceEnd = migration.indexOf(
+      "MESSAGE = 'Plan 7A operations authority object namespace is not canonical';",
+      namespaceStart
+    );
+    expect(namespaceStart).toBeGreaterThan(0);
+    expect(namespaceEnd).toBeGreaterThan(namespaceStart);
+    const namespacePreflight = migration.slice(namespaceStart, namespaceEnd);
+    for (const reservedName of [
+      '_operations_job_retry_claim_state',
+      '_operations_job_retry_command_status',
+      '_operations_job_retry_reason_code',
+      '_operations_job_retry_result_code',
+      'operations_job_retry_commands',
+      '_operations_job_retry_commands',
+      'operations_job_retry_claims',
+      '_operations_job_retry_claims',
+      'plan7a_operations_retry_claims_pkey',
+      'plan7a_operations_retry_commands_pkey',
+      'plan7a_operations_retry_claims_command_unique',
+      'plan7a_operations_retry_commands_actor_idempotency_unique',
+      'plan7a_operations_retry_commands_status_created_idx',
+      'plan7a_operations_retry_commands_target_created_idx'
+    ]) expect(namespacePreflight, reservedName).toContain(`'${reservedName}'`);
+    expect(migration).toContain('WITH expected_index(index_name, table_name) AS (');
+    expect(migration).toContain('global_name_count <> 1');
+  });
+
+  it('hashes every operations-table index with validity, readiness, and live state', () => {
+    const migration = source(OPERATIONS_AUTHORITY_MIGRATION);
+    const generatedStorageDigest =
+      '6001a821a734f08c22041747299bdb27e6191d380318813a425fbd87eae46d20';
+    const digestIndex = migration.indexOf(generatedStorageDigest);
+    const storageStart = migration.lastIndexOf(
+      "SELECT 'constraint:' || relation_row.relname || ':' || constraint_row.conname",
+      digestIndex
+    );
+    const storageEnd = migration.indexOf(') storage_descriptor', storageStart);
+    expect(storageStart).toBeGreaterThan(0);
+    expect(storageEnd).toBeGreaterThan(storageStart);
+    const storageAttestation = migration.slice(storageStart, storageEnd);
+    const indexStart = storageAttestation.indexOf(
+      "SELECT 'index:' || table_relation.relname"
+    );
+    expect(indexStart).toBeGreaterThan(0);
+    const indexAttestation = storageAttestation.slice(indexStart);
+
+    expect(indexAttestation).toContain('pg_catalog.pg_get_indexdef(index_relation.oid)');
+    expect(indexAttestation).toContain('index_row.indisvalid::text');
+    expect(indexAttestation).toContain('index_row.indisready::text');
+    expect(indexAttestation).toContain('index_row.indislive::text');
+    expect(indexAttestation).toContain(
+      'JOIN pg_catalog.pg_class table_relation ON table_relation.oid = index_row.indrelid'
+    );
+    expect(indexAttestation).toContain(
+      "AND table_relation.relname IN (\n          'operations_job_retry_commands', " +
+        "'operations_job_retry_claims'\n        )"
+    );
+  });
+
+  it('freezes complete generated-table relation, column, constraint, and index descriptors', () => {
+    const migration = source(OPERATIONS_AUTHORITY_MIGRATION);
+    const generatedStart = migration.indexOf(
+      "'public.operations_job_retry_commands',\n      'public.operations_job_retry_claims'"
+    );
+    const generatedEnd = migration.indexOf(
+      'WITH expected_enum(type_name, labels) AS (',
+      generatedStart
+    );
+    expect(generatedStart).toBeGreaterThan(0);
+    expect(generatedEnd).toBeGreaterThan(generatedStart);
+    const generatedAttestation = migration.slice(generatedStart, generatedEnd);
+
+    for (const relationFact of [
+      'relation_row.relreplident',
+      'relation_row.relhasrules',
+      'relation_row.relhastriggers',
+      'relation_row.relchecks'
+    ]) expect(generatedAttestation, relationFact).toContain(relationFact);
+    for (const columnFact of [
+      "type_namespace.nspname || '.' || type_row.typname",
+      'JOIN pg_catalog.pg_type type_row ON type_row.oid = attribute_row.atttypid',
+      'JOIN pg_catalog.pg_namespace type_namespace ON type_namespace.oid = type_row.typnamespace',
+      'LEFT JOIN pg_catalog.pg_collation collation_row',
+      'LEFT JOIN pg_catalog.pg_namespace collation_namespace'
+    ]) expect(generatedAttestation, columnFact).toContain(columnFact);
+    for (const constraintFact of [
+      'constraint_row.convalidated::text',
+      'constraint_row.condeferrable::text',
+      'constraint_row.condeferred::text',
+      'constraint_row.connoinherit::text'
+    ]) expect(generatedAttestation, constraintFact).toContain(constraintFact);
+    for (const indexFact of [
+      'index_namespace.nspname',
+      'table_relation.relname',
+      'index_relation.relowner',
+      'index_row.indisunique::text',
+      'index_row.indisprimary::text',
+      'index_row.indisexclusion::text',
+      'index_row.indimmediate::text',
+      'index_row.indisclustered::text',
+      'index_row.indisreplident::text'
+    ]) expect(generatedAttestation, indexFact).toContain(indexFact);
+  });
+
+  it('freezes the reviewed application, worker, helper, and trigger routine inventory', () => {
+    const migration = source(OPERATIONS_AUTHORITY_MIGRATION);
+    const created = createdRoutineSignatures(migration, true);
+    for (const signature of [...applicationRoutines, ...workerRoutines]) {
+      expect(created, signature).toContain(signature);
+      const name = routineName(signature);
+      const bodyStart = migration.search(new RegExp(
+        `CREATE FUNCTION "public"\\."${name}"\\(`, 'u'
+      ));
+      const revokeStart = migration.indexOf(
+        `REVOKE ALL ON FUNCTION "public".${quotedRoutineSignature(signature)}`
+      );
+      const body = migration.slice(bodyStart, revokeStart);
+      expect(body, signature).toContain('SECURITY DEFINER');
+      expect(body, signature).toContain("SET search_path = 'pg_catalog'");
+    }
+    for (const signature of [
+      'plan7a_operations_job_catalog()',
+      'plan7a_operations_safe_failure_code(text,text)',
+      'plan7a_operations_assert_job_capability(uuid,uuid,text,integer,integer)',
+      'plan7a_operations_guard_command_update()',
+      'plan7a_operations_guard_command_delete()',
+      'plan7a_operations_guard_job_transition()'
+    ]) expect(created, signature).toContain(signature);
+    expect(created.filter((signature) => signature.startsWith('list_operational_jobs(')))
+      .toEqual([applicationRoutines[0]]);
+    expect(created.filter((signature) => signature.startsWith('submit_job_retry_command(')))
+      .toEqual([applicationRoutines[1]]);
+    expect(created.filter((signature) => signature.startsWith('get_owned_job_retry_command(')))
+      .toEqual([applicationRoutines[2]]);
+  });
+
+  it('keeps provenance digest-only and grants only the reviewed callable surfaces', () => {
+    const migration = source(OPERATIONS_AUTHORITY_MIGRATION);
+    for (const setting of [
+      'pale_orbit.plan7a_operations_command_insert_id',
+      'pale_orbit.plan7a_operations_command_transition_id',
+      'pale_orbit.plan7a_operations_job_transition_id',
+      'pale_orbit.plan7a_operations_job_capability'
+    ]) expect(migration).toContain(setting);
+    const auditGuardStart = migration.indexOf(
+      'CREATE OR REPLACE FUNCTION "public"."plan6b_guard_audit_insert"()'
+    );
+    const auditGuardEnd = migration.indexOf(
+      '$plan6bii_audit_insert_guard$;-->', auditGuardStart
+    );
+    const auditGuard = migration.slice(auditGuardStart, auditGuardEnd);
+    expect(auditGuard.match(/NULLIF\(pg_catalog[.]current_setting\(/gu)).toHaveLength(4);
+    expect(auditGuard).not.toMatch(
+      /pg_catalog[.]current_setting\([^)]*\)\s+IS NULL/gu
+    );
+    expect(migration).not.toContain('plan7a-clear-capability-canary');
+    expect(migration).toContain('pg_catalog.sha256');
+    for (const signature of applicationRoutines) {
+      expect(migration).toContain(
+        `GRANT EXECUTE ON FUNCTION "public".${quotedRoutineSignature(signature)} TO "pale_orbit_runtime";`
+      );
+    }
+    for (const signature of workerRoutines) {
+      expect(migration).toContain(
+        `GRANT EXECUTE ON FUNCTION "public".${quotedRoutineSignature(signature)} TO "pale_orbit_financial_worker";`
+      );
+    }
+    expect(migration).not.toMatch(/^GRANT EXECUTE ON FUNCTION .* TO PUBLIC;/mu);
+    expect(migration).toContain(
+      'REVOKE ALL ON TABLE "public"."operations_job_retry_commands", "public"."operations_job_retry_claims" FROM PUBLIC, "pale_orbit_runtime", "pale_orbit_financial_worker", "pale_orbit_storage_cleanup";'
+    );
+    const aclPostflightStart = migration.indexOf(
+      'WITH protected_routine(signature, allowed_group) AS ('
+    );
+    const aclPostflightEnd = migration.indexOf(
+      "MESSAGE = 'Plan 7A operations authority ACL postflight failed';",
+      aclPostflightStart
+    );
+    const aclPostflight = migration.slice(aclPostflightStart, aclPostflightEnd);
+    expect(aclPostflightStart).toBeGreaterThan(0);
+    expect(aclPostflightEnd).toBeGreaterThan(aclPostflightStart);
+    expect(aclPostflight).toContain('privilege.grantor');
+    expect(aclPostflight).toContain('database_owner, database_owner, \'EXECUTE\'::text');
+    expect(aclPostflight).toContain('WITH protected_table(relation_name) AS (');
+    expect(aclPostflight).toContain("pg_catalog.acldefault('r', database_owner)");
+    expect(aclPostflight).not.toContain('privilege.grantee <> database_owner');
+    expect(aclPostflight).toContain('WITH protected_column_acl AS (');
+    expect(aclPostflight).toContain('protected_column_acl.attacl IS NOT NULL');
+    expect(aclPostflight).toContain(
+      'column_privilege.grantee, column_privilege.grantor'
+    );
+  });
+
+  it('serializes replay, reauthorizes terminal results, and observes lease time after locks', () => {
+    const migration = source(OPERATIONS_AUTHORITY_MIGRATION);
+    const submitStart = migration.indexOf(
+      'CREATE FUNCTION "public"."submit_job_retry_command"('
+    );
+    const submitEnd = migration.indexOf('$submit_job_retry_command$;-->', submitStart);
+    const submitBody = migration.slice(submitStart, submitEnd);
+    const replayLock = submitBody.indexOf(
+      "pale-orbit:plan7a-operations-idempotency:"
+    );
+    const existingRead = submitBody.indexOf(
+      'FROM "public"."operations_job_retry_commands" command'
+    );
+    expect(replayLock).toBeGreaterThan(0);
+    expect(replayLock).toBeLessThan(existingRead);
+
+    const transitionStart = migration.indexOf(
+      'CREATE FUNCTION "public"."plan7a_operations_transition_job_retry_command"('
+    );
+    const transitionEnd = migration.indexOf(
+      '$plan7a_operations_transition_job_retry_command$;-->', transitionStart
+    );
+    const transitionBody = migration.slice(transitionStart, transitionEnd);
+    expect(transitionBody).toContain("role_row.role = 'admin'");
+    expect(transitionBody).toContain("$6 = 'actor_not_authorized'");
+    expect(transitionBody).toMatch(/actor_is_authorized[\s\S]+IS DISTINCT FROM/iu);
+    expect(transitionBody).toContain(
+      "$6 IN ('retry_command_invalid', 'retry_command_exhausted', 'unexpected_failure')"
+    );
+
+    const relinquishStart = migration.indexOf(
+      'CREATE FUNCTION "public"."plan7a_operations_relinquish_job"('
+    );
+    const relinquishEnd = migration.indexOf(
+      '$plan7a_operations_relinquish_job$;-->', relinquishStart
+    );
+    const relinquishBody = migration.slice(relinquishStart, relinquishEnd);
+    expect(relinquishBody).toContain(
+      'job_row.attempts >= job_row.max_attempts'
+    );
+
+    const claimStart = migration.indexOf(
+      'CREATE FUNCTION "public"."plan7a_operations_claim_job"('
+    );
+    const claimEnd = migration.indexOf('$plan7a_operations_claim_job$;-->', claimStart);
+    const claimBody = migration.slice(claimStart, claimEnd);
+    const commandLock = claimBody.indexOf(
+      'FROM "public"."operations_job_retry_commands" command'
+    );
+    const leaseObservation = claimBody.indexOf(
+      'lease_now := pg_catalog.clock_timestamp();'
+    );
+    expect(commandLock).toBeGreaterThan(0);
+    expect(leaseObservation).toBeGreaterThan(commandLock);
+    expect(claimBody).toContain(
+      "job_row.status = 'pending' AND job_row.attempts >= job_row.max_attempts"
+    );
+    expect(claimBody).toContain('requested_duration IS NULL');
+    expect(submitBody).toContain('requested_reason IS NULL');
+    expect(relinquishBody).toContain('$5 IS NULL');
+    expect(relinquishBody).toContain('$6 IS NULL');
+    const failStart = migration.indexOf(
+      'CREATE FUNCTION "public"."plan7a_operations_fail_job"('
+    );
+    const failEnd = migration.indexOf('$plan7a_operations_fail_job$;-->', failStart);
+    expect(migration.slice(failStart, failEnd)).toContain('$5 IS NULL');
+    const jobGuardStart = migration.indexOf(
+      'CREATE FUNCTION "public"."plan7a_operations_guard_job_transition"()'
+    );
+    const jobGuardEnd = migration.indexOf(
+      '$plan7a_operations_guard_job_transition$;-->', jobGuardStart
+    );
+    const jobGuard = migration.slice(jobGuardStart, jobGuardEnd);
+    expect(jobGuard).toContain('NEW.last_error IS NULL OR NEW.last_error NOT IN');
+    const terminalTransitionStart = jobGuard.indexOf(
+      "IF OLD.status = 'running' AND NEW.status IN ('succeeded', 'failed') THEN"
+    );
+    const terminalTransitionEnd = jobGuard.indexOf('RETURN NEW;', terminalTransitionStart);
+    expect(terminalTransitionStart).toBeGreaterThan(0);
+    expect(terminalTransitionEnd).toBeGreaterThan(terminalTransitionStart);
+    expect(jobGuard.slice(terminalTransitionStart, terminalTransitionEnd)).toContain(
+      'NEW.run_at IS DISTINCT FROM OLD.run_at'
     );
   });
 });

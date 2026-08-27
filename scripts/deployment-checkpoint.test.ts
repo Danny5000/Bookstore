@@ -149,7 +149,7 @@ describe('deployment checkpoint authenticated inputs', () => {
     expect(source).toContain("'rm', '-f', '/tmp/database.dump'");
   });
 
-  it('copies the calibrated catalog-v4 verifier and exhaustive 0014 database evidence', async () => {
+  it('copies the calibrated Plan 7A catalog-v1 verifier and exhaustive 0015 database evidence', async () => {
     const [source, verifier, rowCountSql, journalText] = await Promise.all([
       readFile('scripts/deployment-checkpoint.ts', 'utf8'),
       readFile('scripts/verify-financial-restore.sql', 'utf8'),
@@ -161,12 +161,12 @@ describe('deployment checkpoint authenticated inputs', () => {
     };
 
     expect(journal.entries.map(({ idx }) => idx)).toEqual(
-      Array.from({ length: 15 }, (_value, idx) => idx)
+      Array.from({ length: 16 }, (_value, idx) => idx)
     );
     expect(journal.entries.at(-1)).toMatchObject({
-      idx: 14,
-      tag: '0014_plan6bii_issue_transition_fail_closed',
-      when: 1787530514483
+      idx: 15,
+      tag: '0015_plan7a_operations_authority',
+      when: 1787812813508
     });
 
     const journalCapture = source.match(
@@ -177,10 +177,10 @@ describe('deployment checkpoint authenticated inputs', () => {
     expect(source).toContain("readFile('scripts/verify-financial-restore.sql', 'utf8')");
     expect(source).toContain("writeExclusive(join(root, 'verify-financial-restore.sql'), verifier)");
 
-    expect(verifier.match(/plan6b-financial-catalog-v\d+/gu)).toEqual([
-      'plan6b-financial-catalog-v4'
+    expect(verifier.match(/plan7a-database-catalog-v\d+/gu)).toEqual([
+      'plan7a-database-catalog-v1'
     ]);
-    expect(verifier).not.toContain('plan6b-financial-catalog-v1');
+    expect(verifier).not.toContain('plan6b-financial-catalog-v4');
     expect(/'0{64}'/u.test(verifier)).toBe(false);
     expect(verifier.includes('$catalog${}$catalog$')).toBe(false);
 
@@ -189,6 +189,8 @@ describe('deployment checkpoint authenticated inputs', () => {
     expect(rowCountSql).toMatch(/c\.relkind\s+in\s*\(\s*'r'\s*,\s*'p'\s*\)/iu);
     expect(rowCountSql).not.toContain('financial_admin_commands');
     expect(rowCountSql).not.toContain('financial_admin_job_claims');
+    expect(rowCountSql).not.toContain('operations_job_retry_commands');
+    expect(rowCountSql).not.toContain('operations_job_retry_claims');
   });
 
   it('publishes one canonical current-v4 CLI and runbook flow', async () => {

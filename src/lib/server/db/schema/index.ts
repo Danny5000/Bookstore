@@ -7,5 +7,6 @@ export * from './financial-admin';
 export * from './financial-provider';
 export * from './identity';
 export * from './json';
+export * from './job-operations';
 export * from './library';
 export * from './operations';

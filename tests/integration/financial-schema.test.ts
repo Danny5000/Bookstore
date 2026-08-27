@@ -568,6 +568,106 @@ describe('Plan 6B financial schema', () => {
     ]));
   });
 
+  it('keeps Plan 7A operations storage structurally outside financial history', async () => {
+    const boundaryViolations = await databaseClient.pool.query<{
+      kind: string;
+      identity: string;
+    }>(`
+      with expected_financial(name) as (
+        select pg_catalog.unnest($1::text[])
+      ), expected_operations(name) as (
+        values ('operations_job_retry_claims'::text),
+          ('operations_job_retry_commands'::text)
+      ), financial_relation as (
+        select relation_row.oid, relation_row.relname, relation_row.reltype
+        from pg_catalog.pg_class relation_row
+        join pg_catalog.pg_namespace namespace_row
+          on namespace_row.oid = relation_row.relnamespace
+        where namespace_row.nspname = 'public'
+          and relation_row.relname in (select name from expected_financial)
+      ), operations_relation as (
+        select relation_row.oid, relation_row.relname, relation_row.reltype
+        from pg_catalog.pg_class relation_row
+        join pg_catalog.pg_namespace namespace_row
+          on namespace_row.oid = relation_row.relnamespace
+        where namespace_row.nspname = 'public'
+          and relation_row.relname in (select name from expected_operations)
+      )
+      select 'missing-financial-relation'::text as kind,
+        expected.name::text as identity
+      from expected_financial expected
+      left join financial_relation actual on actual.relname = expected.name
+      where actual.oid is null
+      union all
+      select 'missing-operations-relation', expected.name
+      from expected_operations expected
+      left join operations_relation actual on actual.relname = expected.name
+      where actual.oid is null
+      union all
+      select 'cross-boundary-foreign-key', constraint_row.conname::text
+      from pg_catalog.pg_constraint constraint_row
+      where constraint_row.contype = 'f' and (
+        constraint_row.conrelid in (select oid from financial_relation)
+        and constraint_row.confrelid in (select oid from operations_relation)
+        or constraint_row.conrelid in (select oid from operations_relation)
+        and constraint_row.confrelid in (select oid from financial_relation)
+      )
+      union all
+      select 'operations-type-financial-column',
+        relation_row.relname || '.' || attribute_row.attname
+      from pg_catalog.pg_attribute attribute_row
+      join financial_relation relation_row on relation_row.oid = attribute_row.attrelid
+      join pg_catalog.pg_type type_row on type_row.oid = attribute_row.atttypid
+      where attribute_row.attnum > 0 and not attribute_row.attisdropped and (
+        pg_catalog.starts_with(type_row.typname::text, 'operations_job_retry_') or
+        pg_catalog.starts_with(type_row.typname::text, '_operations_job_retry_')
+      )
+      union all
+      select 'plan7a-financial-constraint', constraint_row.conname::text
+      from pg_catalog.pg_constraint constraint_row
+      where constraint_row.conrelid in (select oid from financial_relation)
+        and pg_catalog.starts_with(constraint_row.conname::text, 'plan7a_operations_')
+      union all
+      select 'plan7a-financial-index', index_relation.relname::text
+      from pg_catalog.pg_index index_row
+      join pg_catalog.pg_class index_relation on index_relation.oid = index_row.indexrelid
+      where index_row.indrelid in (select oid from financial_relation)
+        and pg_catalog.starts_with(index_relation.relname::text, 'plan7a_operations_')
+      union all
+      select 'plan7a-financial-trigger', trigger_row.tgname::text
+      from pg_catalog.pg_trigger trigger_row
+      join pg_catalog.pg_proc routine_row on routine_row.oid = trigger_row.tgfoid
+      where not trigger_row.tgisinternal
+        and trigger_row.tgrelid in (select oid from financial_relation)
+        and (
+          pg_catalog.starts_with(trigger_row.tgname::text, 'plan7a_operations_') or
+          pg_catalog.starts_with(routine_row.proname::text, 'plan7a_operations_')
+        )
+      union all
+      select 'financial-composite-routine-boundary', routine_row.oid::regprocedure::text
+      from pg_catalog.pg_proc routine_row
+      join pg_catalog.pg_namespace namespace_row
+        on namespace_row.oid = routine_row.pronamespace
+      where namespace_row.nspname = 'public' and (
+        pg_catalog.starts_with(routine_row.proname::text, 'plan7a_operations_') or
+        routine_row.proname in (
+          'list_operational_jobs', 'submit_job_retry_command',
+          'get_owned_job_retry_command'
+        )
+      ) and (
+        routine_row.prorettype in (select reltype from financial_relation) or
+        exists (
+          select 1
+          from pg_catalog.unnest(routine_row.proargtypes) argument_type(type_oid)
+          where argument_type.type_oid in (select reltype from financial_relation)
+        )
+      )
+      order by kind, identity
+    `, [[...FINANCIAL_TABLES]]);
+
+    expect(boundaryViolations.rows).toEqual([]);
+  });
+
   it('rejects partial, null, and mistyped administrator-command terminal results', async () => {
     const actorId = randomUUID();
     await databaseClient.pool.query(`

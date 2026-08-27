@@ -390,10 +390,20 @@ describe('database-enforced guest-claim authority', () => {
     );
   });
 
-  it('carries the valid 0006 upgrade through 0014 while isolating claim preflights at 0010', () => {
+  it('carries the valid 0006 upgrade through 0015 while isolating claim preflights at 0010', () => {
     const upgrade = source('../tests/integration/financial-migration.test.ts');
+    const journal = JSON.parse(source('../drizzle/meta/_journal.json')) as {
+      entries: Array<{ idx: number; tag: string }>;
+    };
 
-    expect(upgrade).toContain('maxMigrationIndex: 8 | 9 | 10 | 11 | 12 | 13 | 14');
+    expect(journal.entries).toHaveLength(16);
+    expect(journal.entries.at(-1)).toMatchObject({
+      idx: 15,
+      tag: '0015_plan7a_operations_authority'
+    });
+    expect(upgrade).toContain(
+      'maxMigrationIndex: 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15'
+    );
     const validFixture = upgrade.slice(
       upgrade.indexOf('async function runValidFixture'),
       upgrade.indexOf('async function runInvalidFixture')
@@ -403,10 +413,31 @@ describe('database-enforced guest-claim authority', () => {
     );
     expect(validFixture).toContain('assertStorageCleanupAuthorityUpgrade(pool)');
     expect(validFixture).toContain('await runRepairedFixtureThroughPlan6biiHead(pool');
-    expect(upgrade).toContain('createMigrationFolderThrough(14)');
-    expect(upgrade).toMatch(
-      /createMigrationFolderThrough\(10\)[\s\S]+migrationCount\(pool\), 11/u
+    const repairedHead = upgrade.slice(
+      upgrade.indexOf('async function runRepairedFixtureThroughPlan6biiHead'),
+      upgrade.indexOf('async function plan6biiIssueTransitionCatalogState')
     );
+    expect(repairedHead).toContain('createMigrationFolderThrough(15)');
+    expect(repairedHead).toContain("equal(await migrationCount(pool), 16");
+    expect(repairedHead).toContain('second 0015 migration pass is a no-op');
+
+    for (const [startMarker, endMarker] of [
+      ['async function runClaimAuthorityInvalidFixture',
+        'async function runClaimIdentityAuthorityInvalidFixture'],
+      ['async function runClaimIdentityAuthorityInvalidFixture',
+        'async function runEntitlementProjectionInvalidFixture'],
+      ['async function runEntitlementProjectionInvalidFixture',
+        'async function main']
+    ] as const) {
+      const fixture = upgrade.slice(upgrade.indexOf(startMarker), upgrade.indexOf(endMarker));
+      const repairedHeadIndex = fixture.indexOf('runRepairedFixtureThroughPlan6biiHead');
+      expect(repairedHeadIndex, startMarker).toBeGreaterThanOrEqual(0);
+      const isolated0010Proof = fixture.slice(0, repairedHeadIndex);
+      expect(isolated0010Proof).toMatch(
+        /createMigrationFolderThrough\(10\)[\s\S]+migrationCount\(pool\), 11/u
+      );
+      expect(isolated0010Proof).not.toMatch(/createMigrationFolderThrough\(1[1-5]\)/u);
+    }
     expect(upgrade).toContain('legacy-claimed-guest-null-grant');
     expect(upgrade).toContain('legacy-paid-guest-missing-grant');
     expect(upgrade).toContain('legacy-claimed-identity-authority');

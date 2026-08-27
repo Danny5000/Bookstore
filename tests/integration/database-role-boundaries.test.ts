@@ -911,6 +911,16 @@ describe('database runtime role boundaries', () => {
         argument_bytes: '',
         updated_columns: '',
         has_no_qualifier: true
+      },
+      {
+        trigger_name: 'plan7a_operations_jobs_transition_guard',
+        enabled_mode: 'O',
+        trigger_type: 19,
+        routine_name: 'plan7a_operations_guard_job_transition',
+        argument_count: 0,
+        argument_bytes: '',
+        updated_columns: '',
+        has_no_qualifier: true
       }
     ]);
     expect((await columnPrivileges(

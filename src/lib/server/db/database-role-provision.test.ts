@@ -67,6 +67,39 @@ const environment = (overrides: Record<string, string | undefined> = {}) => ({
   ...overrides
 });
 
+async function laterStateSafetyStatement(): Promise<{
+  text: string;
+  values?: readonly unknown[];
+}> {
+  const statements: Array<{ text: string; values?: readonly unknown[] }> = [];
+  const client: DatabaseRoleProvisionClient = {
+    query: vi.fn(async (text: string, values?: readonly unknown[]) => {
+      statements.push(values === undefined ? { text } : { text, values });
+      if (text.includes('where rolname = any($1::text[])') && text.includes('rolcanlogin')) {
+        return { rows: safeGroups() };
+      }
+      if (text.includes('select rolname from pg_catalog.pg_roles')) return { rows: [] };
+      if (text.includes('"unsafeUnexpectedNamedAuthority"')) {
+        return { rows: [safeUnexpectedNamedAuthority()] };
+      }
+      if (text.includes('"unsafeMembership"')) return { rows: [safeAuthority()] };
+      if (text.includes('"unsafeCleanupMembership"')) {
+        return { rows: [safeCleanupAuthority()] };
+      }
+      if (text.includes('pg_catalog.format')) {
+        return { rows: [{ statement: `FORMATTED ${String(values?.[1])}` }] };
+      }
+      return { rows: [] };
+    })
+  };
+
+  await provisionDatabaseRoles(client, loadDatabaseRoleProvisionConfig(environment()));
+
+  const safety = statements.find(({ text }) => text.includes('"unsafeMembership"'));
+  expect(safety).toBeDefined();
+  return safety!;
+}
+
 function captureSynchronousError(callback: () => unknown): Error {
   try {
     callback();
@@ -200,6 +233,8 @@ const publicSensitiveSelectColumns = [
   'commerce_claim_issuances:*',
   'financial_admin_commands:*',
   'financial_admin_job_claims:*',
+  'operations_job_retry_commands:*',
+  'operations_job_retry_claims:*',
   'jobs:*'
 ] as const;
 
@@ -647,6 +682,8 @@ describe('database role provisioning', () => {
       'commerce_claim_issuances',
       'financial_admin_commands',
       'financial_admin_job_claims',
+      'operations_job_retry_commands',
+      'operations_job_retry_claims',
       ...derivedCatalogTables
     ]);
     expect(safety?.values?.[4]).toEqual([
@@ -709,7 +746,10 @@ describe('database role provisioning', () => {
       'public.append_financial_issue_view_audit(uuid,uuid,text,text,text)',
       'public.append_financial_refund_review_view_audit(uuid,uuid,text,text,text)',
       'public.append_financial_payout_view_audit(uuid,uuid,text,text,text)',
-      'public.append_financial_sales_export_audit(uuid,text,text,integer,integer,integer,text,text)'
+      'public.append_financial_sales_export_audit(uuid,text,text,integer,integer,integer,text,text)',
+      'public.list_operational_jobs(uuid,text,text,timestamp with time zone,uuid,integer)',
+      'public.submit_job_retry_command(uuid,uuid,text,integer,integer,timestamp with time zone,text,text,text,text)',
+      'public.get_owned_job_retry_command(uuid,uuid)'
     ]);
     expect(safety?.values?.[10]).toEqual([
       'public.resolve_financial_issue_after_worker_recompute(uuid,text)',
@@ -717,20 +757,46 @@ describe('database role provisioning', () => {
       'public.purge_commerce_claim_issuances()',
       'public.resolve_financial_issue_after_admin_command(uuid,uuid)',
       'public.resolve_financial_issue_after_reporting_correction_command(uuid,uuid)',
-      'public.transition_administrative_recovery_grant_after_admin_command(uuid)'
+      'public.transition_administrative_recovery_grant_after_admin_command(uuid)',
+      'public.plan7a_operations_claim_job(uuid,text,integer)',
+      'public.plan7a_operations_renew_job_claim(uuid,text,integer,integer)',
+      'public.plan7a_operations_relinquish_job(uuid,text,integer,integer,text,integer)',
+      'public.plan7a_operations_complete_job(uuid,text,integer,integer)',
+      'public.plan7a_operations_fail_job(uuid,text,integer,integer,text)',
+      'public.plan7a_operations_exhaust_job(uuid,text,integer,integer)',
+      'public.plan7a_operations_lock_job_retry_command(uuid,uuid,text,integer,integer)',
+      'public.plan7a_operations_transition_job_retry_command(uuid,uuid,text,integer,integer,operations_job_retry_result_code)'
     ]);
     expect(safety?.values?.[11]).toEqual([
       'outbox_messages', 'financial_admin_commands', 'jobs'
     ]);
     expect(safety?.values?.[12]).toEqual([
       'commerce_claim_issuances', 'outbox_messages', 'financial_admin_commands',
-      'financial_admin_job_claims', 'jobs'
+      'financial_admin_job_claims', 'operations_job_retry_commands',
+      'operations_job_retry_claims', 'jobs'
     ]);
     expect(safety?.values?.[13]).toEqual(publicSensitiveSelectColumns);
+    expect(safety?.values?.[14]).toEqual([
+      'public.operations_job_retry_result_code'
+    ]);
+    expect(safety?.values?.[15]).toEqual([
+      'public.operations_job_retry_command_status',
+      'public.operations_job_retry_result_code',
+      'public.operations_job_retry_reason_code',
+      'public.operations_job_retry_claim_state'
+    ]);
     expect(grants).toContain("privilege_row.privilege_type = 'SELECT'");
     expect(grants).toContain('allowed_relation.relname = any($12::text[])');
     expect(grants).toContain('required_relation.relname <> all($13::text[])');
     expect(grants).toContain('sensitive_column.token');
+    expect(grants).toContain("privilege_row.object_kind = 'type'");
+    expect(grants).toContain("privilege_row.privilege_type = 'USAGE'");
+    expect(grants).toContain('pg_catalog.to_regtype(allowed_type.type_name)');
+    expect(grants).toContain('unnest($15::text[]) required_type(type_name)');
+    expect(grants).toMatch(
+      /where privilege_row\.grantee = 0[\s\S]+?or privilege_row\.object_kind = 'type'\s+and privilege_row\.privilege_type = 'USAGE'/u
+    );
+    expect(grants).toContain('unnest($16::text[]) protected_type(type_name)');
     expect(grants).toContain(
       "pg_catalog.split_part(sensitive_column.token, ':', 2) = '*'"
     );
@@ -777,6 +843,50 @@ describe('database role provisioning', () => {
       'pg_catalog.has_function_privilege',
       'pg_catalog.has_schema_privilege'
     ]) expect(cleanupSafety?.text).toContain(contract);
+  });
+
+  it('expands protected type defaults while keeping worker USAGE and inventory closed', async () => {
+    const safety = await laterStateSafetyStatement();
+
+    expect(safety.text).toContain(
+      "coalesce(type_row.typacl, pg_catalog.acldefault('T', type_row.typowner))"
+    );
+    expect(safety.values?.[14]).toEqual([
+      'public.operations_job_retry_result_code'
+    ]);
+    expect(safety.values?.[15]).toEqual([
+      'public.operations_job_retry_command_status',
+      'public.operations_job_retry_result_code',
+      'public.operations_job_retry_reason_code',
+      'public.operations_job_retry_claim_state'
+    ]);
+  });
+
+  it('rejects exact Plan 7A operations GUC defaults at all-role and owner scopes', async () => {
+    const safety = await laterStateSafetyStatement();
+    const roleSettingStart = safety.text.indexOf(
+      'from pg_catalog.pg_db_role_setting setting_row'
+    );
+    const roleSettingEnd = safety.text.indexOf(') as "unsafeRoleSetting"', roleSettingStart);
+    const roleSettingAudit = safety.text.slice(roleSettingStart, roleSettingEnd);
+
+    expect(roleSettingStart).toBeGreaterThanOrEqual(0);
+    expect(roleSettingEnd).toBeGreaterThan(roleSettingStart);
+    expect(safety.values?.[16]).toEqual([
+      'pale_orbit.plan7a_operations_command_insert_id',
+      'pale_orbit.plan7a_operations_command_transition_id',
+      'pale_orbit.plan7a_operations_job_transition_id',
+      'pale_orbit.plan7a_operations_job_capability'
+    ]);
+    expect(roleSettingAudit).toMatch(
+      /setting_row\.setrole in \(\s*0::oid,\s*\(\s*select database_row\.datdba[\s\S]+?pg_catalog\.current_database\(\)[\s\S]+?\)\s*\)/u
+    );
+    expect(roleSettingAudit).toMatch(
+      /setting_row\.setdatabase in \(\s*0::oid,\s*\(\s*select database_row\.oid[\s\S]+?pg_catalog\.current_database\(\)[\s\S]+?\)\s*\)/u
+    );
+    expect(roleSettingAudit).toContain(
+      'pg_catalog.split_part(configured_setting.value, \'=\', 1) = any($17::text[])'
+    );
   });
 
   it('rejects unexpected named authority before formatting or mutating any login', async () => {

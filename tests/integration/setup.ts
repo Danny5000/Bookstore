@@ -29,6 +29,7 @@ beforeEach(async () => {
       comic_panel_regions, revision_presentations, prose_blocks, prose_images,
       prose_sections, comic_pages, revision_cover_suggestions,
       revision_ingestion_warnings,
+      operations_job_retry_claims, operations_job_retry_commands,
       audit_events, commerce_claim_issuances, outbox_messages, jobs, title_revisions, titles,
       guest_identities, user_roles, verification, account, session, rate_limit, "user"
     restart identity cascade

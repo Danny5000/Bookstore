@@ -20,6 +20,10 @@ describe('financial restore verifier service witness', () => {
       expect(output).toContain(
         '[restore-verifier] schema-object, issue-identity, source-parity, deterministic-allocation, audit, classification, payout, replay-child, allocation-graph, refund-component, dispute-presentment, and combined-chronology witnesses passed'
       );
+      expect(output).toContain(
+        '[restore-verifier] plan7a operations schema, catalog, authority, claim, audit, and clear-capability witnesses passed'
+      );
+      expect(output).not.toContain('A'.repeat(43));
       expect(result.status).toBe(0);
     },
     financialWitnessTestTimeoutMs

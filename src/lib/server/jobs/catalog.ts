@@ -42,21 +42,23 @@ export const JOB_RETRY_POLICY_IDS = Object.freeze([
 
 export type JobRetryPolicyId = typeof JOB_RETRY_POLICY_IDS[number];
 export type JobRetryCommandStatus = 'succeeded' | 'denied' | 'failed';
-export type JobRetryCommandResultCode =
-  | 'rearmed_existing'
-  | 'successor_enqueued'
-  | 'already_current'
-  | 'retry_not_supported'
-  | 'retry_policy_not_enabled'
-  | 'provider_recovery_not_enabled'
-  | 'target_not_failed'
-  | 'target_state_changed'
-  | 'domain_state_not_retryable'
-  | 'source_unavailable'
-  | 'actor_not_authorized'
-  | 'retry_command_invalid'
-  | 'retry_command_exhausted'
-  | 'unexpected_failure';
+export const JOB_RETRY_COMMAND_RESULT_CODES = Object.freeze([
+  'rearmed_existing',
+  'successor_enqueued',
+  'already_current',
+  'retry_not_supported',
+  'retry_policy_not_enabled',
+  'provider_recovery_not_enabled',
+  'target_not_failed',
+  'target_state_changed',
+  'domain_state_not_retryable',
+  'source_unavailable',
+  'actor_not_authorized',
+  'retry_command_invalid',
+  'retry_command_exhausted',
+  'unexpected_failure'
+] as const);
+export type JobRetryCommandResultCode = typeof JOB_RETRY_COMMAND_RESULT_CODES[number];
 
 const SAFE_STATUSES = Object.freeze([
   'pending',

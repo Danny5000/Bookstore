@@ -168,7 +168,7 @@ function partialStartupDocker(owned: OwnedRunManifest, state: FakeDockerState): 
 }
 
 describe('Plan 6B disposable upgrade database ownership', () => {
-  it('keeps historical rollback proofs while repaired and valid flows reach 0014 once', async () => {
+  it('keeps historical rollback proofs while repaired and valid flows reach 0015 once', async () => {
     const [journalText, fixture, packageText] = await Promise.all([
       readFile('drizzle/meta/_journal.json', 'utf8'),
       readFile('tests/integration/financial-migration.test.ts', 'utf8'),
@@ -186,11 +186,11 @@ describe('Plan 6B disposable upgrade database ownership', () => {
     };
 
     expect(journal.entries.map(({ idx }) => idx)).toEqual(
-      Array.from({ length: 15 }, (_value, idx) => idx)
+      Array.from({ length: 16 }, (_value, idx) => idx)
     );
     expect(journal.entries.at(-1)).toEqual(expect.objectContaining({
-      idx: 14,
-      tag: '0014_plan6bii_issue_transition_fail_closed'
+      idx: 15,
+      tag: '0015_plan7a_operations_authority'
     }));
     const packageManifest = JSON.parse(packageText) as { scripts: Record<string, string> };
     expect(packageManifest.scripts['test:plan6b-upgrade']).toBe(
@@ -200,7 +200,14 @@ describe('Plan 6B disposable upgrade database ownership', () => {
       .toBe('node --import tsx scripts/plan6b-production-smoke.ts');
     expect(Object.hasOwn(packageManifest.scripts, 'smoke:plan6b-i')).toBe(false);
     expect(fixture).toContain(
-      'maxMigrationIndex: 8 | 9 | 10 | 11 | 12 | 13 | 14'
+      'maxMigrationIndex: 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15'
+    );
+    const plan7aFixturePreparation = block(
+      'async function prepareCommitted0014Fixture(',
+      'async function seedPlan7aAtomicityHistory('
+    );
+    expect(plan7aFixturePreparation).toMatch(
+      /try \{\s+await createPlan6biiAttestedRoles\(pool, 0b111\);/u
     );
 
     const repairedHeadCall = 'await runRepairedFixtureThroughPlan6biiHead(pool';
@@ -238,11 +245,13 @@ describe('Plan 6B disposable upgrade database ownership', () => {
       'const REPORTING_CORRECTION_RESOLVER ='
     );
     expect(headHelper).toContain('createMigrationFolderThrough(14)');
-    expect(headHelper).toContain("equal(await migrationCount(pool), 15");
-    expect(headHelper.match(/runCommittedPlan6biiAttestedMigration\(/gu)).toHaveLength(6);
+    expect(headHelper).toContain('createMigrationFolderThrough(15)');
+    expect(headHelper).toContain("equal(await migrationCount(pool), 16");
+    expect(headHelper.match(/runCommittedPlan6biiAttestedMigration\(/gu)).toHaveLength(8);
     expect(headHelper).toContain('second 0012 migration pass is a no-op');
     expect(headHelper).toContain('second 0013 migration pass is a no-op');
     expect(headHelper).toContain('second 0014 migration pass is a no-op');
+    expect(headHelper).toContain('second 0015 migration pass is a no-op');
 
     const correctionAuthorityHelper = block(
       'const REPORTING_CORRECTION_RESOLVER =',
@@ -261,6 +270,157 @@ describe('Plan 6B disposable upgrade database ownership', () => {
     );
     expect(correctionAuthorityHelper).toContain(
       'a second 0013 migrator pass is a no-op'
+    );
+
+    const plan7aUpgradeHarness = block(
+      'type Plan7aNamespaceCollisionFixture =',
+      'async function runValidFixture('
+    );
+    for (const witness of [
+      'Plan 7A test-only late migration fault',
+      'test-only late fault is inserted before commit',
+      'late 0015 rollback leaves the journal at exact 0014',
+      'late 0015 rollback leaves every exact 0014 journal row unchanged',
+      'late 0015 rollback removes every 0015 object',
+      'late 0015 rollback restores both historical guards exactly',
+      'late 0015 rollback preserves historical data exactly',
+      'late 0015 rollback preserves the complete 0014 catalog',
+      'clean 0015 applies exactly once',
+      'a second 0015 migrator pass is a no-op',
+      'Plan 7A operations namespace is not empty',
+      'namespace collision rollback leaves the journal at exact 0014',
+      'namespace collision rollback leaves every exact 0014 journal row unchanged',
+      'namespace collision rollback removes every 0015 object',
+      'namespace collision rollback preserves the complete 0014 catalog',
+      'namespace collision rollback preserves the seeded historical row exactly',
+      'jobs is the first protected-table lock acquisition',
+      'audit lock is attempted only after the jobs lock is granted',
+      'migration did not hold both protected locks at the barrier',
+      'writer did not visibly wait behind the migration',
+      'resumes against the closed 0015 guard',
+      'Plan 7A operations authority relation baseline is not canonical',
+      'Plan 7A predecessor ACL inventory is not canonical',
+      'leaves the committed predecessor drift unchanged',
+      'exposes the exact noncanonical migration namespace',
+      'Plan 7A operations authority search path is not canonical',
+      'restores the canonical migration search path without residue',
+      'leaves the complete 0014 catalog unchanged',
+      'Plan 7A operations authority object namespace is not canonical',
+      'create type drizzle."_operations_job_retry_claim_state"',
+      'create type drizzle."operations_job_retry_commands"',
+      'create type drizzle."_operations_job_retry_commands"',
+      'create index "plan7a_operations_retry_claims_command_unique"',
+      'generated object collision rollback preserves the seeded catalog exactly',
+      'generated object collision rollback leaves every exact 0014 journal row unchanged',
+      'generated object collision rollback removes every 0015 object',
+      'Plan 7A operations authority ACL postflight failed',
+      'FROM CURRENT_USER;',
+      'test-only owner ACL drift is inserted immediately before postflight',
+      'owner ACL postflight rollback preserves the complete 0014 catalog',
+      'owner ACL postflight rollback leaves every exact 0014 journal row unchanged',
+      'owner ACL postflight rollback removes every 0015 object',
+      'Plan 7A operations authority trigger postflight failed',
+      'DROP TRIGGER "audit_events_plan6b_web_insert_guard"',
+      'test-only audit trigger drift is inserted immediately before postflight',
+      'audit trigger postflight rollback preserves the complete 0014 catalog',
+      'audit trigger postflight rollback leaves every exact 0014 journal row unchanged',
+      'audit trigger postflight rollback restores both historical guards exactly',
+      'audit trigger postflight rollback removes every 0015 object'
+    ]) expect(plan7aUpgradeHarness).toContain(witness);
+    expect(plan7aUpgradeHarness).toContain(
+      "equal(postgresError.code, '55000', 'namespace collision uses the fixed SQLSTATE')"
+    );
+    const namespaceRaceHarness = block(
+      'async function runPlan7aNamespaceRaceFixture(',
+      'async function runPlan7aPredecessorDriftFixture('
+    );
+    expect(namespaceRaceHarness).toContain('let workerPool: Pool | undefined;');
+    expect(namespaceRaceHarness).toContain('let migrationOperation: Promise<void> | undefined;');
+    expect(namespaceRaceHarness).toContain('let mutationOperation: Promise<unknown> | undefined;');
+    expect(namespaceRaceHarness.match(
+      /migrationOperation = runCommittedPlan6biiAttestedMigration\(/gu
+    )).toHaveLength(2);
+    expect(namespaceRaceHarness).toContain(
+      'await migrationOperation.catch(() => undefined);'
+    );
+    expect(namespaceRaceHarness).toContain(
+      'await mutationOperation.catch(() => undefined);'
+    );
+    expect(namespaceRaceHarness.indexOf('workerPool = await createPlan7aWorkerPool(pool);'))
+      .toBeGreaterThan(namespaceRaceHarness.indexOf('try {'));
+    for (const fixtureName of [
+      'plan7a-upgrade-atomicity',
+      'plan7a-operations-job-type-collision',
+      'plan7a-operations-deduplication-prefix-collision',
+      'plan7a-operations-audit-action-prefix-collision',
+      'plan7a-operations-resource-type-collision',
+      'plan7a-operations-prelock-job-type',
+      'plan7a-operations-prelock-deduplication-prefix',
+      'plan7a-operations-prelock-audit-action-prefix',
+      'plan7a-operations-prelock-resource-type',
+      'plan7a-operations-postlock-job-type',
+      'plan7a-operations-postlock-deduplication-prefix',
+      'plan7a-operations-postlock-audit-action-prefix',
+      'plan7a-operations-postlock-resource-type',
+      'plan7a-predecessor-jobs-trigger-drift',
+      'plan7a-predecessor-direct-acl-drift',
+      'plan7a-predecessor-jobs-index-drift',
+      'plan7a-predecessor-default-acl-drift',
+      'plan7a-generated-enum-array-type-collision',
+      'plan7a-generated-table-row-type-collision',
+      'plan7a-generated-table-array-type-collision',
+      'plan7a-generated-index-name-collision',
+      'plan7a-postflight-owner-acl-drift',
+      'plan7a-postflight-audit-trigger-drift',
+      'plan7a-postflight-column-acl-drift',
+      'plan7a-postflight-claims-trigger-drift',
+      'plan7a-postflight-generated-storage-drift',
+      'plan7a-postflight-default-acl-drift',
+      'plan7a-postflight-historical-inheritance-drift',
+      'plan7a-noncanonical-migration-search-path'
+    ]) expect(fixture).toContain(`'${fixtureName}'`);
+
+    const mainHarness = block('async function main(): Promise<void> {', 'const entryPoint =');
+    expect(mainHarness).toContain('...PLAN7A_MIGRATION_CONTEXT_DRIFT_FIXTURES');
+    expect(mainHarness).toContain('...PLAN7A_GENERATED_OBJECT_COLLISION_FIXTURES');
+    expect(
+      mainHarness.match(/isPlan7aMigrationContextDriftFixture\(rawFixture\)/gu)
+    ).toHaveLength(2);
+    expect(mainHarness).toContain(
+      `else if (isPlan7aMigrationContextDriftFixture(rawFixture)) {
+      await runPlan7aMigrationContextDriftFixture(pool, rawFixture);`
+    );
+    expect(mainHarness).toContain(
+      `else if (isPlan7aGeneratedObjectCollisionFixture(rawFixture)) {
+      await runPlan7aGeneratedObjectCollisionFixture(pool, rawFixture);`
+    );
+    expect(mainHarness).toContain(
+      `else if (rawFixture === 'plan7a-postflight-owner-acl-drift') {
+      await runPlan7aPostflightOwnerAclDriftFixture(pool);`
+    );
+    expect(mainHarness).toContain(
+      `else if (rawFixture === 'plan7a-postflight-audit-trigger-drift') {
+      await runPlan7aPostflightAuditTriggerDriftFixture(pool);`
+    );
+    expect(mainHarness).toContain(
+      `else if (rawFixture === 'plan7a-postflight-column-acl-drift') {
+      await runPlan7aPostflightColumnAclDriftFixture(pool);`
+    );
+    expect(mainHarness).toContain(
+      `else if (rawFixture === 'plan7a-postflight-claims-trigger-drift') {
+      await runPlan7aPostflightClaimsTriggerDriftFixture(pool);`
+    );
+    expect(mainHarness).toContain(
+      `else if (rawFixture === 'plan7a-postflight-generated-storage-drift') {
+      await runPlan7aPostflightGeneratedStorageDriftFixture(pool);`
+    );
+    expect(mainHarness).toContain(
+      `else if (rawFixture === 'plan7a-postflight-default-acl-drift') {
+      await runPlan7aPostflightDefaultAclDriftFixture(pool);`
+    );
+    expect(mainHarness).toContain(
+      `else if (rawFixture === 'plan7a-postflight-historical-inheritance-drift') {
+      await runPlan7aPostflightHistoricalInheritanceDriftFixture(pool);`
     );
   });
 

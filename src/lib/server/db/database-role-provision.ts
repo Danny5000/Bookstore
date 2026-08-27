@@ -115,6 +115,8 @@ const PROTECTED_RUNTIME_WRITE_TABLES = [
   'commerce_claim_issuances',
   'financial_admin_commands',
   'financial_admin_job_claims',
+  'operations_job_retry_commands',
+  'operations_job_retry_claims',
   ...WORKER_DERIVED_CATALOG_TABLES
 ] as const;
 
@@ -245,7 +247,10 @@ const RUNTIME_EXECUTE_FUNCTIONS = [
   'public.append_financial_issue_view_audit(uuid,uuid,text,text,text)',
   'public.append_financial_refund_review_view_audit(uuid,uuid,text,text,text)',
   'public.append_financial_payout_view_audit(uuid,uuid,text,text,text)',
-  'public.append_financial_sales_export_audit(uuid,text,text,integer,integer,integer,text,text)'
+  'public.append_financial_sales_export_audit(uuid,text,text,integer,integer,integer,text,text)',
+  'public.list_operational_jobs(uuid,text,text,timestamp with time zone,uuid,integer)',
+  'public.submit_job_retry_command(uuid,uuid,text,integer,integer,timestamp with time zone,text,text,text,text)',
+  'public.get_owned_job_retry_command(uuid,uuid)'
 ] as const;
 
 const WORKER_EXECUTE_FUNCTIONS = [
@@ -254,7 +259,33 @@ const WORKER_EXECUTE_FUNCTIONS = [
   'public.purge_commerce_claim_issuances()',
   'public.resolve_financial_issue_after_admin_command(uuid,uuid)',
   'public.resolve_financial_issue_after_reporting_correction_command(uuid,uuid)',
-  'public.transition_administrative_recovery_grant_after_admin_command(uuid)'
+  'public.transition_administrative_recovery_grant_after_admin_command(uuid)',
+  'public.plan7a_operations_claim_job(uuid,text,integer)',
+  'public.plan7a_operations_renew_job_claim(uuid,text,integer,integer)',
+  'public.plan7a_operations_relinquish_job(uuid,text,integer,integer,text,integer)',
+  'public.plan7a_operations_complete_job(uuid,text,integer,integer)',
+  'public.plan7a_operations_fail_job(uuid,text,integer,integer,text)',
+  'public.plan7a_operations_exhaust_job(uuid,text,integer,integer)',
+  'public.plan7a_operations_lock_job_retry_command(uuid,uuid,text,integer,integer)',
+  'public.plan7a_operations_transition_job_retry_command(uuid,uuid,text,integer,integer,operations_job_retry_result_code)'
+] as const;
+
+const WORKER_USAGE_TYPES = [
+  'public.operations_job_retry_result_code'
+] as const;
+
+const PROTECTED_OPERATIONS_TYPES = [
+  'public.operations_job_retry_command_status',
+  'public.operations_job_retry_result_code',
+  'public.operations_job_retry_reason_code',
+  'public.operations_job_retry_claim_state'
+] as const;
+
+const PROTECTED_OPERATIONS_GUCS = [
+  'pale_orbit.plan7a_operations_command_insert_id',
+  'pale_orbit.plan7a_operations_command_transition_id',
+  'pale_orbit.plan7a_operations_job_transition_id',
+  'pale_orbit.plan7a_operations_job_capability'
 ] as const;
 
 const WORKER_SELECT_TABLES = [
@@ -266,6 +297,8 @@ const RUNTIME_TABLE_SELECT_EXCLUSIONS = [
   'outbox_messages',
   'financial_admin_commands',
   'financial_admin_job_claims',
+  'operations_job_retry_commands',
+  'operations_job_retry_claims',
   'jobs'
 ] as const;
 
@@ -274,6 +307,8 @@ const PUBLIC_SENSITIVE_SELECT_COLUMNS = [
   'commerce_claim_issuances:*',
   'financial_admin_commands:*',
   'financial_admin_job_claims:*',
+  'operations_job_retry_commands:*',
+  'operations_job_retry_claims:*',
   'jobs:*'
 ] as const;
 
@@ -620,11 +655,11 @@ export async function provisionDatabaseRoles(
                and extension_object.objsubid = 0
            )
          union all
-         select 'type', namespace_row.nspname, type_row.oid,
-                acl.grantee, acl.privilege_type, acl.is_grantable
-         from pg_catalog.pg_type type_row
-         join pg_catalog.pg_namespace namespace_row on namespace_row.oid = type_row.typnamespace
-         cross join lateral pg_catalog.aclexplode(type_row.typacl) acl
+          select 'type', namespace_row.nspname, type_row.oid,
+                 acl.grantee, acl.privilege_type, acl.is_grantable
+          from pg_catalog.pg_type type_row
+          join pg_catalog.pg_namespace namespace_row on namespace_row.oid = type_row.typnamespace
+          cross join lateral pg_catalog.aclexplode(type_row.typacl) acl
          where namespace_row.nspname = 'public'
            and not exists (
              select 1 from extension_objects extension_object
@@ -869,7 +904,9 @@ export async function provisionDatabaseRoles(
                 acl.grantee, acl.privilege_type, acl.is_grantable
          from pg_catalog.pg_type type_row
          join pg_catalog.pg_namespace namespace_row on namespace_row.oid = type_row.typnamespace
-         cross join lateral pg_catalog.aclexplode(type_row.typacl) acl
+         cross join lateral pg_catalog.aclexplode(
+           coalesce(type_row.typacl, pg_catalog.acldefault('T', type_row.typowner))
+         ) acl
          union all
          select 'language', null, language_row.oid,
                 acl.grantee, acl.privilege_type, acl.is_grantable
@@ -1083,6 +1120,13 @@ export async function provisionDatabaseRoles(
                       where privilege_row.object_oid =
                         pg_catalog.to_regprocedure(allowed_function.signature)
                     )
+                    or privilege_row.object_kind = 'type'
+                    and privilege_row.privilege_type = 'USAGE'
+                    and exists (
+                      select 1 from unnest($15::text[]) allowed_type(type_name)
+                      where privilege_row.object_oid =
+                        pg_catalog.to_regtype(allowed_type.type_name)
+                    )
                   )
                  )
              ) or exists (
@@ -1151,6 +1195,13 @@ export async function provisionDatabaseRoles(
                        from pg_catalog.pg_proc function_row
                        where function_row.oid = privilege_row.object_oid
                          and function_row.prosecdef
+                     )
+                   or privilege_row.object_kind = 'type'
+                     and privilege_row.privilege_type = 'USAGE'
+                     and exists (
+                      select 1 from unnest($16::text[]) protected_type(type_name)
+                       where privilege_row.object_oid =
+                         pg_catalog.to_regtype(protected_type.type_name)
                      )
                    or privilege_row.object_kind = 'large_object'
                      and privilege_row.privilege_type = 'UPDATE'
@@ -1242,6 +1293,12 @@ export async function provisionDatabaseRoles(
                         where authority_dependency.objid =
                           pg_catalog.to_regprocedure(allowed_function.signature)
                       )
+                      or authority_dependency.classid = 'pg_catalog.pg_type'::pg_catalog.regclass
+                      and exists (
+                        select 1 from unnest($15::text[]) allowed_type(type_name)
+                        where authority_dependency.objid =
+                          pg_catalog.to_regtype(allowed_type.type_name)
+                      )
                     )
                   )
                   )
@@ -1279,13 +1336,30 @@ export async function provisionDatabaseRoles(
                        pg_catalog.split_part(configured_setting.value, '=', 2)
                      ) <> 'none'
                    or pg_catalog.split_part(configured_setting.value, '=', 1) = 'search_path'
-                   or pg_catalog.split_part(configured_setting.value, '=', 1) = 'row_security'
-                     and pg_catalog.lower(
-                       pg_catalog.split_part(configured_setting.value, '=', 2)
-                     ) = 'off'
-                 )
-             )
-           ) as "unsafeRoleSetting",
+                    or pg_catalog.split_part(configured_setting.value, '=', 1) = 'row_security'
+                      and pg_catalog.lower(
+                        pg_catalog.split_part(configured_setting.value, '=', 2)
+                      ) = 'off'
+                  )
+                or setting_row.setrole in (
+                    0::oid,
+                    (
+                      select database_row.datdba
+                      from pg_catalog.pg_database database_row
+                      where database_row.datname = pg_catalog.current_database()
+                    )
+                  )
+                  and setting_row.setdatabase in (
+                    0::oid,
+                    (
+                      select database_row.oid
+                      from pg_catalog.pg_database database_row
+                      where database_row.datname = pg_catalog.current_database()
+                    )
+                  )
+                  and pg_catalog.split_part(configured_setting.value, '=', 1) = any($17::text[])
+              )
+            ) as "unsafeRoleSetting",
            (
              not exists (
                select 1
@@ -1515,6 +1589,22 @@ export async function provisionDatabaseRoles(
                   )
               ) or exists (
                 select 1
+                from unnest($15::text[]) required_type(type_name)
+                where pg_catalog.to_regtype(required_type.type_name) is null or
+                  not exists (
+                    select 1
+                    from direct_acl privilege_row
+                    join pg_catalog.pg_roles grantee_role
+                      on grantee_role.oid = privilege_row.grantee
+                    where grantee_role.rolname = 'pale_orbit_financial_worker'
+                      and privilege_row.object_kind = 'type'
+                      and privilege_row.object_oid =
+                        pg_catalog.to_regtype(required_type.type_name)
+                      and privilege_row.privilege_type = 'USAGE'
+                      and not privilege_row.is_grantable
+                  )
+              ) or exists (
+                select 1
                 from unnest(array[
                   'pale_orbit_runtime', 'pale_orbit_financial_worker'
                 ]::text[]) required_group(rolname)
@@ -1546,7 +1636,8 @@ export async function provisionDatabaseRoles(
       RUNTIME_COLUMN_PRIVILEGES, WORKER_COLUMN_PRIVILEGES,
       RUNTIME_EXECUTE_FUNCTIONS, WORKER_EXECUTE_FUNCTIONS,
       WORKER_SELECT_TABLES, RUNTIME_TABLE_SELECT_EXCLUSIONS,
-      PUBLIC_SENSITIVE_SELECT_COLUMNS]
+        PUBLIC_SENSITIVE_SELECT_COLUMNS, WORKER_USAGE_TYPES, PROTECTED_OPERATIONS_TYPES,
+        PROTECTED_OPERATIONS_GUCS]
     );
     const safetyRow = safety.rows[0] as {
       unsafeMembership?: unknown;

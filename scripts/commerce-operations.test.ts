@@ -1313,7 +1313,8 @@ describe('commerce operations contract', () => {
       '0011_plan6b_storage_cleanup_authority.sql',
       '0012_plan6bii_admin_command_authority.sql',
       '0013_plan6bii_reporting_correction_authority.sql',
-      '0014_plan6bii_issue_transition_fail_closed.sql'
+      '0014_plan6bii_issue_transition_fail_closed.sql',
+      '0015_plan7a_operations_authority.sql'
     ]);
     const plan6bSchemaMigrations = (
       await Promise.all(
@@ -1384,13 +1385,15 @@ describe('commerce operations contract', () => {
       financialVerifier,
       financialRunbook,
       verifierWitness,
-      issueTransitionFailClosedMigration
+      issueTransitionFailClosedMigration,
+      operationsAuthorityMigration
     ] =
       await Promise.all([
         source('scripts/verify-financial-restore.sql'),
         source('docs/stripe-financial-reconciliation.md'),
         source('scripts/execute-financial-restore-verifier.ts'),
-        source('drizzle/0014_plan6bii_issue_transition_fail_closed.sql')
+        source('drizzle/0014_plan6bii_issue_transition_fail_closed.sql'),
+        source('drizzle/0015_plan7a_operations_authority.sql')
       ]);
     const financialWitnessHarnessSource = await source(
       'scripts/financial-restore-witness-harness.ts'
@@ -1461,9 +1464,9 @@ describe('commerce operations contract', () => {
     const requiredFunctionNames = new Set(
       Array.from(
         plan6bMigrations.matchAll(
-        /create (?:or replace )?function\s+(?:(?:"public"\.)?)"(?<name>[a-z_][a-z0-9_]*)"\s*\(/giu
+          /create (?:or replace )?function\s+(?:"public"\.|public\.)?(?:"(?<quoted_name>[a-z_][a-z0-9_]*)"|(?<plain_name>[a-z_][a-z0-9_]*))\s*\(/giu
         ),
-        (match) => match.groups?.name ?? ''
+        (match) => match.groups?.quoted_name ?? match.groups?.plain_name ?? ''
       ).filter((name) => name && name !== 'resolve_financial_reconciliation_issue')
     );
     requiredFunctionNames.add('reject_audit_event_mutation');
@@ -1483,8 +1486,9 @@ describe('commerce operations contract', () => {
 
     expect(documentedManifest).toBe(financialSchemaManifest);
     expect(financialSchemaManifest).toMatch(
-      /catalog_contract_version\s*\(\s*contract_version\s*\)\s+as\s*\(\s*values\s*\(\s*'plan6b-financial-catalog-v4'\s*\)/iu
+      /catalog_contract_version\s*\(\s*contract_version\s*\)\s+as\s*\(\s*values\s*\(\s*'plan7a-database-catalog-v1'\s*\)/iu
     );
+    expect(financialSchemaManifest).not.toContain('plan6b-financial-catalog-v4');
     expect(financialSchemaManifest).toMatch(
       /required_catalog_objects\s*\(\s*object_kind\s*,\s*schema_name\s*,\s*parent_name\s*,\s*object_name\s*,\s*identity_arguments\s*,\s*expected_fingerprint_sha256\s*,\s*expected_catalog\s*\)/iu
     );
@@ -1572,10 +1576,10 @@ describe('commerce operations contract', () => {
       /'definition',\s*pg_catalog\.replace\(pg_catalog\.replace\(\s*pg_catalog\.pg_get_functiondef\(routine\.oid\),\s*E'\\r\\n',\s*E'\\n'\s*\),\s*E'\\r',\s*E'\\n'\)/u
     );
 
+    const catalogRowPattern = /\(\s*'(?<kind>table|view|function|trigger|index|constraint|column|enum|sensitive_relation_state)'\s*,\s*'public'\s*,\s*(?<parent>null|'[a-z_][a-z0-9_]*')\s*,\s*'(?<name>[a-z_][a-z0-9_]*)'\s*,\s*(?<arguments>null|'[^']*')\s*,\s*'(?<fingerprint>[0-9a-f]{64})'\s*,\s*\$catalog\$(?<catalog>[\s\S]*?)\$catalog\$::jsonb\s*\)/gu;
+    const catalogRowMatches = Array.from(financialSchemaManifest.matchAll(catalogRowPattern));
     const catalogRows = Array.from(
-      financialSchemaManifest.matchAll(
-        /\(\s*'(?<kind>table|view|function|trigger|index|constraint|column|enum|sensitive_relation_state)'\s*,\s*'public'\s*,\s*(?<parent>null|'[a-z_][a-z0-9_]*')\s*,\s*'(?<name>[a-z_][a-z0-9_]*)'\s*,\s*(?<arguments>null|'[^']*')\s*,\s*'(?<fingerprint>[0-9a-f]{64})'\s*,\s*\$catalog\$(?<catalog>[\s\S]*?)\$catalog\$::jsonb\s*\)/gu
-      ),
+      catalogRowMatches,
       (match) => ({
         arguments: match.groups?.arguments ?? '',
         catalog: match.groups?.catalog ?? '',
@@ -1586,7 +1590,7 @@ describe('commerce operations contract', () => {
       })
     );
     expect(catalogRows.length).toBeGreaterThan(100);
-    expect(catalogRows).toHaveLength(275);
+    expect(catalogRows).toHaveLength(323);
     expect(new Set(catalogRows.map((row) =>
       `${row.kind}:${row.parent}:${row.name}:${row.arguments}`
     )).size).toBe(catalogRows.length);
@@ -1596,6 +1600,40 @@ describe('commerce operations contract', () => {
     expect(catalogRows.every((row) =>
       createHash('sha256').update(row.catalog, 'utf8').digest('hex') === row.fingerprint
     )).toBe(true);
+    const exactCatalogTupleLines = financialSchemaManifest.split(/\r?\n/u).filter((line) =>
+      /^ {2}\('(?:table|view|function|trigger|index|constraint|column|enum|sensitive_relation_state)', 'public',/u.test(line) &&
+      /\$catalog\$::jsonb\),?$/u.test(line)
+    );
+    expect(exactCatalogTupleLines).toHaveLength(323);
+    const legacyUnaffectedCatalogRows = exactCatalogTupleLines.filter((line) => {
+      const name = line.match(
+        /^ {2}\('[^']+', 'public', (?:null|'[^']+'), '(?<name>[a-z_][a-z0-9_]*)'/u
+      )?.groups?.name ?? '';
+      return !name.startsWith('operations_') &&
+        !name.startsWith('plan7a_') &&
+        ![
+          'get_owned_job_retry_command',
+          'list_operational_jobs',
+          'plan6b_guard_audit_insert',
+          'plan6b_guard_job_insert',
+          'submit_job_retry_command'
+        ].includes(name);
+    });
+    expect(legacyUnaffectedCatalogRows).toHaveLength(273);
+    expect(createHash('sha256').update(
+      legacyUnaffectedCatalogRows.join('\n'),
+      'utf8'
+    ).digest('hex')).toBe(
+      '76e8f36bf2756527ba776827fbf8c2192e02ab6d80b8c47a550144ce96171e20'
+    );
+    for (const [guardName, obsoleteFingerprint] of [
+      ['plan6b_guard_audit_insert', '9a4573257f064b5ca1e025454f5c5065ca8fbcfd84c5492fbe1e9a488a21cf31'],
+      ['plan6b_guard_job_insert', '975f0e231266a0069fc4ccb5acf07cdf497627a169eb6eca794eed47e2fe4650']
+    ] as const) {
+      const rows = catalogRows.filter((row) => row.kind === 'function' && row.name === guardName);
+      expect(rows, guardName).toHaveLength(1);
+      expect(rows[0]?.fingerprint, guardName).not.toBe(obsoleteFingerprint);
+    }
     const issueTransitionRows = catalogRows.filter((row) =>
       row.kind === 'function' &&
       row.parent === 'null' &&
@@ -1748,17 +1786,185 @@ describe('commerce operations contract', () => {
       view: 2,
       function: requiredFunctionNames.size,
       trigger: requiredTriggerKeys.size,
-      index: 62,
-      constraint: 67,
+      index: 66,
+      constraint: 85,
       column: requiredLegacyColumnKeys.size,
       enum: requiredEnumLabels.size,
       sensitive_relation_state: 4
     });
-    expect(requiredTableNames.size).toBe(23);
-    expect(requiredFunctionNames.size).toBe(46);
-    expect(requiredTriggerKeys.size).toBe(39);
+    expect(requiredTableNames.size).toBe(25);
+    expect(requiredFunctionNames.size).toBe(63);
+    expect(requiredTriggerKeys.size).toBe(42);
     expect(requiredLegacyColumnKeys.size).toBe(7);
-    expect(requiredEnumLabels.size).toBe(25);
+    expect(requiredEnumLabels.size).toBe(29);
+    const requiredPlan7aCatalogObjects = {
+      table: [
+        'operations_job_retry_claims',
+        'operations_job_retry_commands'
+      ],
+      enum: [
+        'operations_job_retry_claim_state',
+        'operations_job_retry_command_status',
+        'operations_job_retry_reason_code',
+        'operations_job_retry_result_code'
+      ],
+      function: [
+        'get_owned_job_retry_command',
+        'list_operational_jobs',
+        'plan7a_operations_assert_job_capability',
+        'plan7a_operations_claim_job',
+        'plan7a_operations_complete_job',
+        'plan7a_operations_exhaust_job',
+        'plan7a_operations_fail_job',
+        'plan7a_operations_guard_command_delete',
+        'plan7a_operations_guard_command_update',
+        'plan7a_operations_guard_job_transition',
+        'plan7a_operations_job_catalog',
+        'plan7a_operations_lock_job_retry_command',
+        'plan7a_operations_relinquish_job',
+        'plan7a_operations_renew_job_claim',
+        'plan7a_operations_safe_failure_code',
+        'plan7a_operations_transition_job_retry_command',
+        'submit_job_retry_command'
+      ],
+      trigger: [
+        'plan7a_operations_jobs_transition_guard',
+        'plan7a_operations_retry_commands_delete_guard',
+        'plan7a_operations_retry_commands_update_guard'
+      ],
+      index: [
+        'plan7a_operations_retry_claims_command_unique',
+        'plan7a_operations_retry_commands_actor_idempotency_unique',
+        'plan7a_operations_retry_commands_status_created_idx',
+        'plan7a_operations_retry_commands_target_created_idx'
+      ],
+      constraint: [
+        'plan7a_operations_retry_claims_attempt_positive',
+        'plan7a_operations_retry_claims_capability_sha256',
+        'plan7a_operations_retry_claims_command_fk',
+        'plan7a_operations_retry_claims_generation_positive',
+        'plan7a_operations_retry_claims_job_fk',
+        'plan7a_operations_retry_claims_lease_duration_bounded',
+        'plan7a_operations_retry_claims_lease_owner_canonical',
+        'plan7a_operations_retry_claims_lifecycle_consistent',
+        'plan7a_operations_retry_claims_pkey',
+        'plan7a_operations_retry_commands_actor_fk',
+        'plan7a_operations_retry_commands_correlation_canonical',
+        'plan7a_operations_retry_commands_expected_state_consistent',
+        'plan7a_operations_retry_commands_hashes_sha256',
+        'plan7a_operations_retry_commands_kind_fixed',
+        'plan7a_operations_retry_commands_lifecycle_consistent',
+        'plan7a_operations_retry_commands_pkey',
+        'plan7a_operations_retry_commands_target_job_fk',
+        'plan7a_operations_retry_commands_target_kind_registered'
+      ]
+    } as const;
+    for (const [kind, names] of Object.entries(requiredPlan7aCatalogObjects)) {
+      for (const name of names) {
+        expect(
+          catalogRows.filter((row) => row.kind === kind && row.name === name),
+          `${kind}:${name}`
+        ).toHaveLength(1);
+      }
+    }
+    const reviewedOperationsFunctionNames = [
+      ...requiredPlan7aCatalogObjects.function,
+      'plan6b_guard_audit_insert',
+      'plan6b_guard_job_insert'
+    ];
+    const operationsMigrationStatements = operationsAuthorityMigration.split(
+      ';--> statement-breakpoint'
+    );
+    const normalizedDollarBody = (statement: string, witnessName: string): string => {
+      const opening = statement.match(/\bAS\s+(?<delimiter>\$[a-z0-9_]*\$)\r?\n/iu);
+      const delimiter = opening?.groups?.delimiter;
+      expect(delimiter, witnessName).toBeDefined();
+      const bodyStart = (opening?.index ?? -1) + (opening?.[0].length ?? 0);
+      const bodyEnd = delimiter
+        ? statement.lastIndexOf(`\n${delimiter}`)
+        : -1;
+      expect(bodyStart, witnessName).toBeGreaterThan(0);
+      expect(bodyEnd, witnessName).toBeGreaterThan(bodyStart);
+      return statement.slice(bodyStart, bodyEnd).replace(/\r\n?/gu, '\n');
+    };
+    for (const functionName of reviewedOperationsFunctionNames) {
+      const migrationCandidates = operationsMigrationStatements.filter((statement) =>
+        new RegExp(
+          `CREATE (?:OR REPLACE )?FUNCTION\\s+(?:"public"\\.|public\\.)?"?${functionName}"?\\s*\\(`,
+          'iu'
+        ).test(statement)
+      );
+      expect(migrationCandidates, `migration:${functionName}`).toHaveLength(1);
+      const catalogCandidates = catalogRows.filter((row) =>
+        row.kind === 'function' && row.name === functionName
+      );
+      expect(catalogCandidates, `catalog:${functionName}`).toHaveLength(1);
+      const descriptor = JSON.parse(catalogCandidates[0]!.catalog) as {
+        definition?: unknown;
+      };
+      expect(typeof descriptor.definition, `definition:${functionName}`).toBe('string');
+      expect(
+        normalizedDollarBody(String(descriptor.definition), `catalog:${functionName}`),
+        functionName
+      ).toBe(
+        normalizedDollarBody(migrationCandidates[0]!, `migration:${functionName}`)
+      );
+    }
+    expect(verifierWitness).toContain('../drizzle/0015_plan7a_operations_authority.sql');
+    expect(verifierWitness).toContain('operationsReviewedRoutineStatements.size !== 17');
+    expect(verifierWitness).toContain('staleFinancialJobGuardStatement');
+    expect(verifierWitness).toContain('staleFinancialAuditGuardStatement');
+    for (const contractPrimitive of [
+      'plan7a_operations_authority_violations',
+      'plan7a_operations_catalog_differences',
+      'pg_db_role_setting',
+      'pg_parameter_acl',
+      'pale_orbit.plan7a_operations_command_insert_id',
+      'pale_orbit.plan7a_operations_command_transition_id',
+      'pale_orbit.plan7a_operations_job_capability',
+      'pale_orbit.plan7a_operations_job_transition_id'
+    ]) {
+      expect(financialSchemaManifest, contractPrimitive).toContain(contractPrimitive);
+    }
+    const plan7aReservedNamespaceSql = financialSchemaManifest.match(
+      /unexpected_plan7a_reserved_objects[\s\S]*?\), forbidden_retired_types/u
+    )?.[0] ?? '';
+    expect(plan7aReservedNamespaceSql).toMatch(
+      /select 'index'[\s\S]*?not exists \(\s*select 1\s*from pg_catalog\.pg_constraint constraint_row\s*where constraint_row\.conindid = index_row\.oid\s*\)/u
+    );
+    const expectedOperationsEffectiveAuthoritySql = financialSchemaManifest.match(
+      /expected_operations_routine_authority[\s\S]*?\), operations_routine_authority_delta/u
+    )?.[0] ?? '';
+    expect(expectedOperationsEffectiveAuthoritySql).toMatch(
+      /select 'pale_orbit_financial_worker'::text, signature\s*from protected_operations_routines\s*where allowed_role = 'pale_orbit_runtime'/u
+    );
+    for (const dataContractPrimitive of [
+      'plan7a_operations_clear_capability_violations',
+      'plan7a_operations_data_violations'
+    ]) {
+      expect(financialVerifier, dataContractPrimitive).toContain(dataContractPrimitive);
+      expect(financialSchemaManifest, dataContractPrimitive).not.toContain(dataContractPrimitive);
+    }
+    const operationsDataContractSql = financialVerifier.match(
+      /with plan7a_operations_data_violations[\s\S]*?from plan7a_operations_data_violations;/u
+    )?.[0] ?? '';
+    expect(operationsDataContractSql).toContain("'running-command-job-claim-authority'");
+    expect(operationsDataContractSql).toMatch(
+      /command_job\.status = 'running'[\s\S]*?claim\.state is distinct from 'active'[\s\S]*?command\.status is distinct from 'pending'/u
+    );
+    expect(operationsDataContractSql).toMatch(
+      /claim\.expires_at is distinct from command_job\.run_at/u
+    );
+    expect(operationsDataContractSql).toMatch(
+      /coalesce\(claim\.renewed_at, claim\.issued_at\)\s+is distinct from command_job\.locked_at[\s\S]*?command_job\.locked_at is distinct from command_job\.updated_at/u
+    );
+    expect(operationsDataContractSql).not.toContain('pg_catalog.coalesce');
+    expect(verifierWitness).toMatch(
+      /set renewed_at = issued_at \+ interval '1 second'[\s\S]*?operations running command clock drift[\s\S]*?set locked_at = claim\.renewed_at, updated_at = claim\.renewed_at[\s\S]*?operations running command clock drift repair/u
+    );
+    expect(operationsDataContractSql).toMatch(
+      /audit\.action = 'operations\.job_retry\.requested'[\s\S]*?audit\.outcome = 'denied'[\s\S]*?audit\.resource_id is null[\s\S]*?audit\.request_metadata is null[\s\S]*?audit\.before is null[\s\S]*?audit\.after is null/u
+    );
     expect(catalogRows.filter((row) =>
       row.kind === 'index' && row.parent === "'financial_admin_commands'"
     )).toHaveLength(3);
@@ -1942,9 +2148,20 @@ describe('commerce operations contract', () => {
       'append_financial_issue_view_audit',
       'append_financial_refund_review_view_audit',
       'append_financial_payout_view_audit',
-      'append_financial_sales_export_audit'
+      'append_financial_sales_export_audit',
+      'get_owned_job_retry_command',
+      'list_operational_jobs',
+      'submit_job_retry_command'
     ]);
     const newWorkerRoutines = new Set([
+      'plan7a_operations_claim_job',
+      'plan7a_operations_complete_job',
+      'plan7a_operations_exhaust_job',
+      'plan7a_operations_fail_job',
+      'plan7a_operations_lock_job_retry_command',
+      'plan7a_operations_relinquish_job',
+      'plan7a_operations_renew_job_claim',
+      'plan7a_operations_transition_job_retry_command',
       'resolve_financial_issue_after_admin_command',
       'resolve_financial_issue_after_reporting_correction_command',
       'transition_administrative_recovery_grant_after_admin_command'
@@ -1973,14 +2190,25 @@ describe('commerce operations contract', () => {
       'authorize_commerce_claim_issuance(text,text)',
       'claim_guest_purchases_after_authorization(text,text)',
       'financial_admin_command_status(uuid,uuid)',
+      'get_owned_job_retry_command(uuid,uuid)',
+      'list_operational_jobs(uuid,text,text,timestamp with time zone,uuid,integer)',
       'outbox_message_deduplication_metadata(text,text,jsonb)',
       'outbox_message_exists_by_deduplication_key(text)',
       'rearm_pending_stripe_event_job(uuid)',
-      'submit_financial_admin_command(uuid,text,text,text,text,jsonb)'
+      'submit_financial_admin_command(uuid,text,text,text,text,jsonb)',
+      'submit_job_retry_command(uuid,uuid,text,integer,integer,timestamp with time zone,text,text,text,text)'
     ]);
     expect(expectedApplicationExecuteRows.filter((row) =>
       row.grantee === 'pale_orbit_financial_worker'
     ).map((row) => row.signature).sort()).toEqual([
+      'plan7a_operations_claim_job(uuid,text,integer)',
+      'plan7a_operations_complete_job(uuid,text,integer,integer)',
+      'plan7a_operations_exhaust_job(uuid,text,integer,integer)',
+      'plan7a_operations_fail_job(uuid,text,integer,integer,text)',
+      'plan7a_operations_lock_job_retry_command(uuid,uuid,text,integer,integer)',
+      'plan7a_operations_relinquish_job(uuid,text,integer,integer,text,integer)',
+      'plan7a_operations_renew_job_claim(uuid,text,integer,integer)',
+      'plan7a_operations_transition_job_retry_command(uuid,uuid,text,integer,integer,operations_job_retry_result_code)',
       'purge_commerce_claim_issuances()',
       'register_commerce_claim_issuance(text,text,text,uuid,text,timestamp with time zone)',
       'resolve_financial_issue_after_admin_command(uuid,uuid)',
@@ -2044,7 +2272,17 @@ describe('commerce operations contract', () => {
       ['plan6bii_guard_financial_admin_command_update', true],
       ['plan6bii_guard_financial_admin_command_delete', true],
       ['plan6bii_guard_administrative_grant_transition', false],
-      ['plan6bii_sync_failed_financial_admin_command', true]
+      ['plan6bii_sync_failed_financial_admin_command', true],
+      ['plan7a_operations_job_catalog', true],
+      ['plan7a_operations_safe_failure_code', true],
+      ['plan7a_operations_assert_job_capability', true],
+      ['plan7a_operations_guard_command_update', false],
+      ['plan7a_operations_guard_command_delete', false],
+      ['plan7a_operations_guard_job_transition', false]
+    ]);
+    const stablePrivateHelpers = new Set([
+      'plan7a_operations_job_catalog',
+      'plan7a_operations_safe_failure_code'
     ]);
     for (const [privateRoutine, securityDefiner] of newPrivateHelperSecurity) {
       const descriptor = descriptorFor('function', privateRoutine);
@@ -2054,7 +2292,7 @@ describe('commerce operations contract', () => {
         kind: 'f',
         owner: 'DATABASE_OWNER',
         security_definer: securityDefiner,
-        volatility: 'v'
+        volatility: stablePrivateHelpers.has(privateRoutine) ? 's' : 'v'
       }));
     }
     for (const [changedGuard, securityDefiner, config] of [
@@ -2085,7 +2323,10 @@ describe('commerce operations contract', () => {
     ]) {
       expect(financialSchemaManifest, defaultAclPrimitive).toContain(defaultAclPrimitive);
     }
-    expect(financialSchemaManifest.match(/except all/giu)).toHaveLength(4);
+    const defaultAclComparisonSql = financialSchemaManifest.match(
+      /default_acl_identity_delta as \((?<sql>[\s\S]*?)\), expected_base_direct_acl\(/u
+    )?.groups?.sql ?? '';
+    expect(defaultAclComparisonSql.match(/except all/giu)).toHaveLength(4);
     const expectedDefaultAclTuples = financialSchemaManifest.match(
       /expected_default_acl\([\s\S]*?\)\s+as\s*\(values(?<tuples>[\s\S]*?)\)\s*,\s*default_acl_delta/u
     )?.groups?.tuples ?? '';
@@ -2217,6 +2458,13 @@ describe('commerce operations contract', () => {
       /replace\([^\n]+,\s*'null::jsonb'\)/u
     );
     expect(verifierWitness).toContain('JSON.parse(row.actual_catalog_json)');
+    expect(verifierWitness).toContain('result.rows.length !== 323');
+    expect(verifierWitness).toContain('seenKeys.size !== 323');
+    expect(verifierWitness).toContain('contract.length !== 323');
+    expect(verifierWitness).toContain("Object.keys(actualCatalogDetails).length === 0");
+    expect(verifierWitness).toContain("Object.prototype.hasOwnProperty.call(actualCatalogDetails, 'calibration')");
+    expect(verifierWitness).toContain("row.actual_catalog_json.includes('$catalog$')");
+    expect(verifierWitness).toContain("row.actual_catalog_json.includes('calibration-pending')");
     expect(verifierWitness).toContain(
       'alter table public.entitlement_grants disable trigger all'
     );
@@ -2227,7 +2475,7 @@ describe('commerce operations contract', () => {
     const boundedHarnessTimeout = ['financial', 'WitnessHarnessTimeoutMs'].join('');
     const boundedHarnessRunner = ['runBounded', 'FinancialWitnessHarness'].join('');
     const timeoutCleanup = ['cleanupTimedOut', 'FinancialWitnessHarness'].join('');
-    const timeoutLiteral = ['1', '_200_000'].join('');
+    const timeoutLiteral = ['2', '_400_000'].join('');
     expect(financialWitnessHarnessSource).toContain(
       `const ${boundedHarnessTimeout} = ${timeoutLiteral}`
     );
@@ -2342,6 +2590,65 @@ describe('commerce operations contract', () => {
       'financial administrator current lease renewal',
       'financial administrator terminal lease invalidation',
       'cross-job financial administrator capability rejection',
+      'operations retry reason enum order drift',
+      'operations retry reason enum order repair',
+      'operations command table catalog drift',
+      'operations command table catalog repair',
+      'unexpected operations reserved relation',
+      'unexpected operations reserved relation repair',
+      'missing operations claim command index',
+      'missing operations claim command index repair',
+      'wrong operations claim digest constraint',
+      'wrong operations claim digest constraint repair',
+      'operations catalog routine source drift',
+      'operations catalog routine source repair',
+      'operations catalog routine owner drift',
+      'operations catalog routine owner repair',
+      'operations catalog routine security drift',
+      'operations catalog routine security repair',
+      'operations catalog routine search path drift',
+      'operations catalog routine search path repair',
+      'operations owner-only routine direct authority',
+      'operations owner-only routine direct authority repair',
+      'disabled operations command update trigger',
+      'disabled operations command update trigger repair',
+      'reordered operations command delete trigger',
+      'reordered operations command delete trigger repair',
+      'operations command status type authority drift',
+      'operations command status type authority repair',
+      'operations direct table authority drift',
+      'operations direct table authority repair',
+      'operations inherited table authority drift',
+      'operations inherited table authority repair',
+      'operations capability role default drift',
+      'operations capability role default repair',
+      'operations command transition parameter ACL drift',
+      'operations command transition parameter ACL repair',
+      'operations restore data baseline',
+      'operations running command claim baseline',
+      'operations running command missing claim',
+      'operations running command missing claim repair',
+      'operations running command expiry drift',
+      'operations running command expiry drift repair',
+      'operations running command clock drift',
+      'operations running command clock drift repair',
+      'operations running command witness cleanup',
+      'operations authorized pre-routine denial audit',
+      'operations malformed pre-routine denial audit',
+      'operations malformed pre-routine denial audit repair',
+      'operations command target association drift',
+      'operations command target association repair',
+      'operations claim association drift',
+      'operations claim association repair',
+      'operations claim lifecycle drift',
+      'operations claim lifecycle repair',
+      'operations claim capability digest drift',
+      'operations claim capability digest repair',
+      'operations audit provenance drift',
+      'operations audit provenance repair',
+      'operations clear capability column and value',
+      'operations clear capability column and value repair',
+      'operations restore witness cleanup',
       'financial command enum order drift',
       'financial command enum order repair',
       'financial command table descriptor drift',
@@ -2534,6 +2841,34 @@ describe('commerce operations contract', () => {
     for (const witnessLabel of financialAdminWitnessLabelAllowlist) {
       expect(verifierWitness, witnessLabel).toContain(witnessLabel);
     }
+    const operationsRestoreWitnessRegion = verifierWitness.match(
+      /async function exerciseOperationsRestoreWitnesses[\s\S]*?\r?\n\}\r?\n\r?\nasync function exerciseInvariantWitnesses/u
+    )?.[0] ?? '';
+    const implementedOperationsRestoreWitnessLabels = Array.from(
+      operationsRestoreWitnessRegion.matchAll(
+        /await expect(?:Pass|Rejection|RejectionChecks)\(\s*'(?<label>[^']+)'/gu
+      ),
+      (match) => match.groups?.label ?? ''
+    ).filter(Boolean);
+    const firstOperationsWitness = financialAdminWitnessLabelAllowlist.indexOf(
+      'operations retry reason enum order drift'
+    );
+    const lastOperationsWitness = financialAdminWitnessLabelAllowlist.indexOf(
+      'operations restore witness cleanup'
+    );
+    expect(firstOperationsWitness).toBeGreaterThan(-1);
+    expect(lastOperationsWitness).toBeGreaterThan(firstOperationsWitness);
+    const expectedOperationsRestoreWitnessLabels = financialAdminWitnessLabelAllowlist.slice(
+      firstOperationsWitness,
+      lastOperationsWitness + 1
+    );
+    expect(expectedOperationsRestoreWitnessLabels).toHaveLength(59);
+    expect(new Set(expectedOperationsRestoreWitnessLabels).size).toBe(
+      expectedOperationsRestoreWitnessLabels.length
+    );
+    expect(implementedOperationsRestoreWitnessLabels).toEqual(
+      expectedOperationsRestoreWitnessLabels
+    );
     const financialAdminCatalogWitnessRegion = verifierWitness.match(
       /async function exerciseFinancialAdminCatalogWitnesses[\s\S]*?\r?\n\}\r?\n\r?\nasync function exerciseInvariantWitnesses/u
     )?.[0] ?? '';
@@ -3018,6 +3353,59 @@ describe('commerce operations contract', () => {
       ).filter(Boolean).sort();
     };
     for (const [witnessName, exactFailures] of [
+      ['operations retry reason enum order drift', ['financial_schema_object_manifest=1']],
+      ['operations command table catalog drift', ['financial_schema_object_manifest=1']],
+      ['unexpected operations reserved relation', ['financial_schema_object_manifest=1']],
+      ['missing operations claim command index', ['financial_schema_object_manifest=2']],
+      ['wrong operations claim digest constraint', ['financial_schema_object_manifest=2']],
+      ['operations catalog routine source drift', [
+        'financial_schema_object_manifest=1',
+        'plan7a_operations_catalog=2'
+      ]],
+      ['operations catalog routine owner drift', [
+        'financial_schema_object_manifest=1',
+        'plan7a_operations_authority=1'
+      ]],
+      ['operations catalog routine security drift', ['financial_schema_object_manifest=1']],
+      ['operations catalog routine search path drift', ['financial_schema_object_manifest=1']],
+      ['operations owner-only routine direct authority', [
+        'financial_schema_object_manifest=1',
+        'plan7a_operations_authority=2'
+      ]],
+      ['disabled operations command update trigger', ['financial_schema_object_manifest=2']],
+      ['reordered operations command delete trigger', ['financial_schema_object_manifest=3']],
+      ['operations command status type authority drift', [
+        'financial_schema_object_manifest=1',
+        'plan7a_operations_authority=2'
+      ]],
+      ['operations direct table authority drift', [
+        'financial_schema_object_manifest=2',
+        'plan7a_operations_authority=4'
+      ]],
+      ['operations inherited table authority drift', [
+        'financial_schema_object_manifest=2',
+        'plan7a_operations_authority=4'
+      ]],
+      ['operations capability role default drift', ['plan7a_operations_authority=1']],
+      ['operations command transition parameter ACL drift', [
+        'plan7a_operations_authority=1'
+      ]],
+      ['operations command target association drift', ['plan7a_operations_data=1']],
+      ['operations running command missing claim', ['plan7a_operations_data=1']],
+      ['operations running command expiry drift', ['plan7a_operations_data=1']],
+      ['operations running command clock drift', ['plan7a_operations_data=1']],
+      ['operations claim association drift', [
+        'financial_schema_object_manifest=3',
+        'plan7a_operations_data=1'
+      ]],
+      ['operations claim lifecycle drift', ['plan7a_operations_data=1']],
+      ['operations claim capability digest drift', ['financial_schema_object_manifest=2']],
+      ['operations audit provenance drift', ['plan7a_operations_data=2']],
+      ['operations malformed pre-routine denial audit', ['plan7a_operations_data=1']],
+      ['operations clear capability column and value', [
+        'financial_schema_object_manifest=1',
+        'plan7a_operations_clear_capability=1'
+      ]],
       ['financial claim helper direct EXECUTE drift', ['financial_schema_object_manifest=1']],
       ['financial claim helper PUBLIC EXECUTE drift', [
         'financial_schema_object_manifest=1',
@@ -3241,10 +3629,13 @@ describe('commerce operations contract', () => {
       );
     }
     expect(verifierWitness).toMatch(
-      /fresh financial schema-object manifest[\s\S]{0,200}?exerciseFinancialAdminClaimMatrix/u
+      /fresh financial schema-object manifest[\s\S]{0,400}?exerciseOperationsRestoreWitnesses[\s\S]{0,400}?exerciseFinancialAdminClaimMatrix/u
     );
     expect(verifierWitness).toContain(
       "../drizzle/0014_plan6bii_issue_transition_fail_closed.sql"
+    );
+    expect(verifierWitness).toContain(
+      "../drizzle/0015_plan7a_operations_authority.sql"
     );
     expect(verifierWitness).toMatch(
       /const vulnerableFinancialIssueTransitionStatement\s*=\s*requiredAdminCommandAuthorityStatement\([\s\S]{0,300}?'CREATE OR REPLACE FUNCTION "public"\."plan6b_validate_issue_transition"\(\)'/u

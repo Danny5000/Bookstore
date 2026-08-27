@@ -212,19 +212,20 @@ function databasePool(): Pool {
     database: process.env.DATABASE_NAME,
     user: process.env.DATABASE_USER,
     password: process.env.DATABASE_PASSWORD,
-    max: 2,
+    max: 4,
     connectionTimeoutMillis: 5_000
   });
 }
 
 async function createMigrationFolderThrough(
-  maxMigrationIndex: 8 | 9 | 10 | 11 | 12 | 13 | 14
+  maxMigrationIndex: 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15,
+  variant = 'checked-in'
 ): Promise<string> {
   const runId = process.env.PLAN6B_UPGRADE_RUN_ID;
   assert(runId && /^[a-f0-9]{16}$/u.test(runId), 'owned run ID is missing or invalid');
   const folder = join(
     dirname(process.env.PLAN6B_UPGRADE_MANIFEST!),
-    `migrations-through-${maxMigrationIndex}`
+    `migrations-through-${maxMigrationIndex}${variant === 'checked-in' ? '' : `-${variant}`}`
   );
   await mkdir(join(folder, 'meta'), { recursive: true });
   const journal = JSON.parse(
@@ -241,6 +242,10 @@ async function createMigrationFolderThrough(
     'utf8'
   );
   return folder;
+}
+
+async function runHistoricalMigrationsThrough0011(pool: Pool): Promise<void> {
+  await migrate(drizzle(pool), { migrationsFolder: await createMigrationFolderThrough(11) });
 }
 
 async function insertUserAndTitles(client: PoolClient, count: number): Promise<{
@@ -2948,10 +2953,18 @@ async function assertPlan6biiMigrationSettingsCleared(client: PoolClient): Promi
 
 async function runCommittedPlan6biiAttestedMigration(
   pool: Pool,
-  migrationsFolder: string
+  migrationsFolder: string,
+  applicationName?: string
 ): Promise<void> {
   const client = await pool.connect();
   try {
+    if (applicationName !== undefined) {
+      await client.query(
+        `select pg_catalog.set_config('application_name', $1, false),
+          pg_catalog.set_config('lock_timeout', '5s', false)`,
+        [applicationName]
+      );
+    }
     await migrateDatabase(
       drizzle(client),
       PLAN6BII_ATTESTED_IDENTITIES,
@@ -2959,6 +2972,9 @@ async function runCommittedPlan6biiAttestedMigration(
     );
     await assertPlan6biiMigrationSettingsCleared(client);
   } finally {
+    if (applicationName !== undefined) {
+      await client.query('reset application_name; reset lock_timeout').catch(() => undefined);
+    }
     client.release();
   }
 }
@@ -2972,6 +2988,7 @@ async function runRepairedFixtureThroughPlan6biiHead(
   const migrationsThrough12 = await createMigrationFolderThrough(12);
   const migrationsThrough13 = await createMigrationFolderThrough(13);
   const migrationsThrough14 = await createMigrationFolderThrough(14);
+  const migrationsThrough15 = await createMigrationFolderThrough(15);
   try {
     await createPlan6biiAttestedRoles(pool, 0b111);
     await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough12);
@@ -2997,6 +3014,14 @@ async function runRepairedFixtureThroughPlan6biiHead(
       await migrationCount(pool),
       15,
       `${fixture} second 0014 migration pass is a no-op`
+    );
+    await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough15);
+    equal(await migrationCount(pool), 16, `${fixture} reaches migration 0015 exactly once`);
+    await runCommittedPlan6biiAttestedMigration(pool, migrationsThrough15);
+    equal(
+      await migrationCount(pool),
+      16,
+      `${fixture} second 0015 migration pass is a no-op`
     );
   } finally {
     await dropPlan6biiAttestedRoles(pool);
@@ -5802,6 +5827,2292 @@ async function assertPlan6biiAdminCommandAuthorityFixture(
   await assertReportingCorrectionAuthorityUpgrade(pool);
 }
 
+type Plan7aNamespaceCollisionFixture =
+  | 'plan7a-operations-job-type-collision'
+  | 'plan7a-operations-deduplication-prefix-collision'
+  | 'plan7a-operations-audit-action-prefix-collision'
+  | 'plan7a-operations-resource-type-collision';
+
+type Plan7aGeneratedObjectCollisionFixture =
+  | 'plan7a-generated-enum-array-type-collision'
+  | 'plan7a-generated-table-row-type-collision'
+  | 'plan7a-generated-table-array-type-collision'
+  | 'plan7a-generated-index-name-collision';
+
+type Plan7aNamespaceRaceKind =
+  | 'job-type'
+  | 'deduplication-prefix'
+  | 'audit-action-prefix'
+  | 'resource-type';
+
+type Plan7aNamespaceRaceFixture =
+  | `plan7a-operations-prelock-${Plan7aNamespaceRaceKind}`
+  | `plan7a-operations-postlock-${Plan7aNamespaceRaceKind}`;
+
+type Plan7aPredecessorDriftFixture =
+  | 'plan7a-predecessor-jobs-trigger-drift'
+  | 'plan7a-predecessor-direct-acl-drift'
+  | 'plan7a-predecessor-jobs-index-drift'
+  | 'plan7a-predecessor-default-acl-drift';
+
+type Plan7aMigrationContextDriftFixture =
+  'plan7a-noncanonical-migration-search-path';
+
+const PLAN7A_NAMESPACE_COLLISION_FIXTURES = [
+  'plan7a-operations-job-type-collision',
+  'plan7a-operations-deduplication-prefix-collision',
+  'plan7a-operations-audit-action-prefix-collision',
+  'plan7a-operations-resource-type-collision'
+] as const satisfies readonly Plan7aNamespaceCollisionFixture[];
+
+const PLAN7A_GENERATED_OBJECT_COLLISION_FIXTURES = [
+  'plan7a-generated-enum-array-type-collision',
+  'plan7a-generated-table-row-type-collision',
+  'plan7a-generated-table-array-type-collision',
+  'plan7a-generated-index-name-collision'
+] as const satisfies readonly Plan7aGeneratedObjectCollisionFixture[];
+
+const PLAN7A_NAMESPACE_RACE_FIXTURES = [
+  'plan7a-operations-prelock-job-type',
+  'plan7a-operations-prelock-deduplication-prefix',
+  'plan7a-operations-prelock-audit-action-prefix',
+  'plan7a-operations-prelock-resource-type',
+  'plan7a-operations-postlock-job-type',
+  'plan7a-operations-postlock-deduplication-prefix',
+  'plan7a-operations-postlock-audit-action-prefix',
+  'plan7a-operations-postlock-resource-type'
+] as const satisfies readonly Plan7aNamespaceRaceFixture[];
+
+const PLAN7A_PREDECESSOR_DRIFT_FIXTURES = [
+  'plan7a-predecessor-jobs-trigger-drift',
+  'plan7a-predecessor-direct-acl-drift',
+  'plan7a-predecessor-jobs-index-drift',
+  'plan7a-predecessor-default-acl-drift'
+] as const satisfies readonly Plan7aPredecessorDriftFixture[];
+
+const PLAN7A_MIGRATION_CONTEXT_DRIFT_FIXTURES = [
+  'plan7a-noncanonical-migration-search-path'
+] as const satisfies readonly Plan7aMigrationContextDriftFixture[];
+
+function isPlan7aNamespaceCollisionFixture(
+  value: unknown
+): value is Plan7aNamespaceCollisionFixture {
+  return typeof value === 'string' && (
+    PLAN7A_NAMESPACE_COLLISION_FIXTURES as readonly string[]
+  ).includes(value);
+}
+
+function isPlan7aGeneratedObjectCollisionFixture(
+  value: unknown
+): value is Plan7aGeneratedObjectCollisionFixture {
+  return typeof value === 'string' && (
+    PLAN7A_GENERATED_OBJECT_COLLISION_FIXTURES as readonly string[]
+  ).includes(value);
+}
+
+function isPlan7aNamespaceRaceFixture(
+  value: unknown
+): value is Plan7aNamespaceRaceFixture {
+  return typeof value === 'string' && (
+    PLAN7A_NAMESPACE_RACE_FIXTURES as readonly string[]
+  ).includes(value);
+}
+
+function isPlan7aPredecessorDriftFixture(
+  value: unknown
+): value is Plan7aPredecessorDriftFixture {
+  return typeof value === 'string' && (
+    PLAN7A_PREDECESSOR_DRIFT_FIXTURES as readonly string[]
+  ).includes(value);
+}
+
+function isPlan7aMigrationContextDriftFixture(
+  value: unknown
+): value is Plan7aMigrationContextDriftFixture {
+  return typeof value === 'string' && (
+    PLAN7A_MIGRATION_CONTEXT_DRIFT_FIXTURES as readonly string[]
+  ).includes(value);
+}
+
+const PLAN7A_ROUTINE_NAMES = [
+  'plan7a_operations_job_catalog',
+  'plan7a_operations_safe_failure_code',
+  'plan7a_operations_assert_job_capability',
+  'plan7a_operations_guard_command_update',
+  'plan7a_operations_guard_command_delete',
+  'plan7a_operations_guard_job_transition',
+  'list_operational_jobs',
+  'submit_job_retry_command',
+  'get_owned_job_retry_command',
+  'plan7a_operations_claim_job',
+  'plan7a_operations_renew_job_claim',
+  'plan7a_operations_relinquish_job',
+  'plan7a_operations_complete_job',
+  'plan7a_operations_fail_job',
+  'plan7a_operations_exhaust_job',
+  'plan7a_operations_lock_job_retry_command',
+  'plan7a_operations_transition_job_retry_command'
+] as const;
+
+const PLAN7A_INSTALLED_ROUTINE_SIGNATURES = [
+  'get_owned_job_retry_command(uuid,uuid)',
+  'list_operational_jobs(uuid,text,text,timestamp with time zone,uuid,integer)',
+  'plan6b_guard_audit_insert()',
+  'plan6b_guard_job_insert()',
+  'plan7a_operations_assert_job_capability(uuid,uuid,text,integer,integer)',
+  'plan7a_operations_claim_job(uuid,text,integer)',
+  'plan7a_operations_complete_job(uuid,text,integer,integer)',
+  'plan7a_operations_exhaust_job(uuid,text,integer,integer)',
+  'plan7a_operations_fail_job(uuid,text,integer,integer,text)',
+  'plan7a_operations_guard_command_delete()',
+  'plan7a_operations_guard_command_update()',
+  'plan7a_operations_guard_job_transition()',
+  'plan7a_operations_job_catalog()',
+  'plan7a_operations_lock_job_retry_command(uuid,uuid,text,integer,integer)',
+  'plan7a_operations_relinquish_job(uuid,text,integer,integer,text,integer)',
+  'plan7a_operations_renew_job_claim(uuid,text,integer,integer)',
+  'plan7a_operations_safe_failure_code(text,text)',
+  'plan7a_operations_transition_job_retry_command(uuid,uuid,text,integer,integer,operations_job_retry_result_code)',
+  'submit_job_retry_command(uuid,uuid,text,integer,integer,timestamp with time zone,text,text,text,text)'
+] as const;
+
+const PLAN7A_CONSTRAINT_NAMES = [
+  'plan7a_operations_retry_claims_attempt_positive',
+  'plan7a_operations_retry_claims_capability_sha256',
+  'plan7a_operations_retry_claims_command_fk',
+  'plan7a_operations_retry_claims_generation_positive',
+  'plan7a_operations_retry_claims_job_fk',
+  'plan7a_operations_retry_claims_lease_duration_bounded',
+  'plan7a_operations_retry_claims_lease_owner_canonical',
+  'plan7a_operations_retry_claims_lifecycle_consistent',
+  'plan7a_operations_retry_claims_pkey',
+  'plan7a_operations_retry_commands_actor_fk',
+  'plan7a_operations_retry_commands_correlation_canonical',
+  'plan7a_operations_retry_commands_expected_state_consistent',
+  'plan7a_operations_retry_commands_hashes_sha256',
+  'plan7a_operations_retry_commands_kind_fixed',
+  'plan7a_operations_retry_commands_lifecycle_consistent',
+  'plan7a_operations_retry_commands_pkey',
+  'plan7a_operations_retry_commands_target_job_fk',
+  'plan7a_operations_retry_commands_target_kind_registered'
+] as const;
+
+interface Plan7aDatabaseCatalogState {
+  public_descriptors: string;
+  authority_descriptors: string;
+}
+
+interface Plan7aHistoricalDataState {
+  jobs: string;
+  audit_events: string;
+}
+
+interface Plan7aObjectState {
+  relation_count: number;
+  type_count: number;
+  routine_count: number;
+  trigger_count: number;
+  constraint_count: number;
+}
+
+interface Plan7aInstalledDescriptorState {
+  enum_descriptors: string[];
+  relation_names: string[];
+  column_descriptors: string[];
+  routine_signatures: string[];
+  trigger_descriptors: string[];
+  constraint_names: string[];
+  index_names: string[];
+}
+
+interface Plan7aGeneratedObjectCatalogState {
+  descriptors: string;
+}
+
+async function createPlan7aLateFaultMigrationFolder(): Promise<string> {
+  const folder = await createMigrationFolderThrough(15, 'plan7a-late-fault');
+  const migrationPath = join(folder, '0015_plan7a_operations_authority.sql');
+  const copiedMigration = await readFile(migrationPath, 'utf8');
+  const ddlIndex = copiedMigration.indexOf('CREATE TABLE "operations_job_retry_commands"');
+  const jobGuardIndex = copiedMigration.lastIndexOf(
+    'CREATE OR REPLACE FUNCTION "public"."plan6b_guard_job_insert"'
+  );
+  const auditGuardIndex = copiedMigration.lastIndexOf(
+    'CREATE OR REPLACE FUNCTION "public"."plan6b_guard_audit_insert"'
+  );
+  const postflightIndex = copiedMigration.lastIndexOf(
+    '$plan7a_operations_authority_postflight$;'
+  );
+  assert(ddlIndex >= 0, 'copied 0015 migration is missing its operations DDL');
+  assert(jobGuardIndex > ddlIndex, 'copied 0015 migration replaces the job guard after DDL');
+  assert(
+    auditGuardIndex > jobGuardIndex,
+    'copied 0015 migration replaces the audit guard after the job guard'
+  );
+  assert(
+    postflightIndex > auditGuardIndex,
+    'copied 0015 migration reaches postflight after both historical guard replacements'
+  );
+  const explicitCommitIndex = [...copiedMigration.matchAll(
+    /^[ \t]*COMMIT;[ \t]*(?:--[^\r\n]*)?$/gimu
+  )]
+    .map((match) => match.index)
+    .find((index) => index > postflightIndex);
+  const injectionIndex = explicitCommitIndex ?? copiedMigration.length;
+  assert(postflightIndex < injectionIndex, 'test-only late fault is inserted before commit');
+  const beforeFault = copiedMigration.slice(0, injectionIndex).trimEnd();
+  const afterFault = copiedMigration.slice(injectionIndex).trimStart();
+  const faultInjectedMigration = `${beforeFault}
+--> statement-breakpoint
+DO $plan7a_test_only_late_fault$
+BEGIN
+  RAISE EXCEPTION USING ERRCODE = 'P0001',
+    MESSAGE = 'Plan 7A test-only late migration fault';
+END;
+$plan7a_test_only_late_fault$;
+${afterFault ? `--> statement-breakpoint\n${afterFault}` : ''}`;
+  await writeFile(migrationPath, faultInjectedMigration, 'utf8');
+  return folder;
+}
+
+async function createPlan7aPostflightDriftMigrationFolder(
+  variant: 'plan7a-owner-acl-drift' |
+    'plan7a-audit-trigger-drift' |
+    'plan7a-column-acl-drift' |
+    'plan7a-claims-trigger-drift' |
+    'plan7a-generated-storage-drift' |
+    'plan7a-default-acl-drift' |
+    'plan7a-historical-inheritance-drift',
+  driftSql: string,
+  insertionWitness: string
+): Promise<string> {
+  const folder = await createMigrationFolderThrough(15, variant);
+  const migrationPath = join(folder, '0015_plan7a_operations_authority.sql');
+  const copiedMigration = await readFile(migrationPath, 'utf8');
+  const postflightMarker = 'DO $plan7a_operations_authority_postflight$';
+  const postflightIndex = copiedMigration.indexOf(postflightMarker);
+  assert(
+    postflightIndex >= 0 &&
+      copiedMigration.indexOf(postflightMarker, postflightIndex + postflightMarker.length) < 0,
+    'copied 0015 migration must contain one exact postflight insertion point'
+  );
+  const transformed = copiedMigration.replace(
+    postflightMarker,
+    `${driftSql}--> statement-breakpoint\n\n${postflightMarker}`
+  );
+  assert(
+    transformed.indexOf(driftSql) + driftSql.length === transformed.indexOf(
+      '--> statement-breakpoint',
+      transformed.indexOf(driftSql)
+    ),
+    insertionWitness
+  );
+  await writeFile(migrationPath, transformed, 'utf8');
+  return folder;
+}
+
+function createPlan7aOwnerAclDriftMigrationFolder(): Promise<string> {
+  return createPlan7aPostflightDriftMigrationFolder(
+    'plan7a-owner-acl-drift',
+    'REVOKE EXECUTE ON FUNCTION "public"."list_operational_jobs"' +
+      '(uuid,text,text,timestamp with time zone,uuid,integer) FROM CURRENT_USER;\n',
+    'test-only owner ACL drift is inserted immediately before postflight'
+  );
+}
+
+function createPlan7aAuditTriggerDriftMigrationFolder(): Promise<string> {
+  return createPlan7aPostflightDriftMigrationFolder(
+    'plan7a-audit-trigger-drift',
+    'DROP TRIGGER "audit_events_plan6b_web_insert_guard" ' +
+      'ON "public"."audit_events";\n',
+    'test-only audit trigger drift is inserted immediately before postflight'
+  );
+}
+
+function createPlan7aColumnAclDriftMigrationFolder(): Promise<string> {
+  return createPlan7aPostflightDriftMigrationFolder(
+    'plan7a-column-acl-drift',
+    'GRANT SELECT (id) ON TABLE "public"."operations_job_retry_commands" ' +
+      'TO "pale_orbit_runtime";\n',
+    'test-only column ACL drift is inserted immediately before postflight'
+  );
+}
+
+function createPlan7aClaimsTriggerDriftMigrationFolder(): Promise<string> {
+  return createPlan7aPostflightDriftMigrationFolder(
+    'plan7a-claims-trigger-drift',
+    'CREATE TRIGGER "plan7a_test_only_claims_delete_guard" ' +
+      'BEFORE DELETE ON "public"."operations_job_retry_claims" ' +
+      'FOR EACH ROW EXECUTE FUNCTION ' +
+      '"public"."plan7a_operations_guard_command_delete"();\n',
+    'test-only claims trigger drift is inserted immediately before postflight'
+  );
+}
+
+function createPlan7aGeneratedStorageDriftMigrationFolder(): Promise<string> {
+  return createPlan7aPostflightDriftMigrationFolder(
+    'plan7a-generated-storage-drift',
+    'ALTER TABLE "public"."operations_job_retry_commands" ' +
+      'REPLICA IDENTITY FULL;\n',
+    'test-only generated storage drift is inserted immediately before postflight'
+  );
+}
+
+function createPlan7aDefaultAclDriftMigrationFolder(): Promise<string> {
+  return createPlan7aPostflightDriftMigrationFolder(
+    'plan7a-default-acl-drift',
+    'ALTER DEFAULT PRIVILEGES IN SCHEMA "public" ' +
+      'GRANT INSERT ON TABLES TO "pale_orbit_runtime";\n',
+    'test-only default ACL drift is inserted immediately before postflight'
+  );
+}
+
+function createPlan7aHistoricalInheritanceDriftMigrationFolder(): Promise<string> {
+  return createPlan7aPostflightDriftMigrationFolder(
+    'plan7a-historical-inheritance-drift',
+    'CREATE SCHEMA "plan7a_test_only_inheritance";\n' +
+      'CREATE TABLE "plan7a_test_only_inheritance"."jobs_parent" ' +
+      '("id" uuid, "payload" jsonb);\n' +
+      'GRANT USAGE ON SCHEMA "plan7a_test_only_inheritance" ' +
+      'TO "pale_orbit_runtime";\n' +
+      'GRANT SELECT ON TABLE "plan7a_test_only_inheritance"."jobs_parent" ' +
+      'TO "pale_orbit_runtime";\n' +
+      'ALTER TABLE "public"."jobs" INHERIT ' +
+      '"plan7a_test_only_inheritance"."jobs_parent";\n',
+    'test-only historical inheritance drift is inserted immediately before postflight'
+  );
+}
+
+async function plan7aDatabaseCatalogState(
+  pool: Pool
+): Promise<Plan7aDatabaseCatalogState> {
+  return one<Plan7aDatabaseCatalogState>(
+    pool,
+    `with public_descriptor(kind, identity, descriptor) as (
+       select 'schema', namespace_row.nspname::text,
+         pg_catalog.jsonb_build_object(
+           'owner', pg_catalog.pg_get_userbyid(namespace_row.nspowner),
+           'acl', namespace_row.nspacl::text
+         )
+       from pg_catalog.pg_namespace namespace_row
+       where namespace_row.nspname = 'public'
+       union all
+       select 'relation', namespace_row.nspname || '.' || relation_row.relname,
+         pg_catalog.jsonb_build_object(
+           'kind', relation_row.relkind::text,
+           'persistence', relation_row.relpersistence::text,
+           'owner', pg_catalog.pg_get_userbyid(relation_row.relowner),
+           'acl', relation_row.relacl::text,
+           'rowSecurity', relation_row.relrowsecurity,
+           'forceRowSecurity', relation_row.relforcerowsecurity,
+           'replicaIdentity', relation_row.relreplident::text,
+           'partition', relation_row.relispartition
+         )
+       from pg_catalog.pg_class relation_row
+       join pg_catalog.pg_namespace namespace_row
+         on namespace_row.oid = relation_row.relnamespace
+       where namespace_row.nspname = 'public'
+       union all
+       select 'column', namespace_row.nspname || '.' || relation_row.relname ||
+           '.' || attribute_row.attname,
+         pg_catalog.jsonb_build_object(
+           'ordinal', attribute_row.attnum,
+           'type', pg_catalog.format_type(attribute_row.atttypid, attribute_row.atttypmod),
+           'notNull', attribute_row.attnotnull,
+           'identity', attribute_row.attidentity::text,
+           'generated', attribute_row.attgenerated::text,
+           'collation', collation_row.collname,
+           'default', pg_catalog.pg_get_expr(default_row.adbin, default_row.adrelid)
+         )
+       from pg_catalog.pg_attribute attribute_row
+       join pg_catalog.pg_class relation_row on relation_row.oid = attribute_row.attrelid
+       join pg_catalog.pg_namespace namespace_row
+         on namespace_row.oid = relation_row.relnamespace
+       left join pg_catalog.pg_attrdef default_row
+         on default_row.adrelid = attribute_row.attrelid
+        and default_row.adnum = attribute_row.attnum
+       left join pg_catalog.pg_collation collation_row
+         on collation_row.oid = attribute_row.attcollation
+       where namespace_row.nspname = 'public' and attribute_row.attnum > 0
+         and not attribute_row.attisdropped
+       union all
+       select 'type', namespace_row.nspname || '.' || type_row.typname,
+         pg_catalog.jsonb_build_object(
+           'kind', type_row.typtype::text,
+           'category', type_row.typcategory::text,
+           'owner', pg_catalog.pg_get_userbyid(type_row.typowner),
+           'acl', type_row.typacl::text,
+           'baseType', type_row.typbasetype::pg_catalog.regtype::text,
+           'typeModifier', type_row.typtypmod
+         )
+       from pg_catalog.pg_type type_row
+       join pg_catalog.pg_namespace namespace_row
+         on namespace_row.oid = type_row.typnamespace
+       where namespace_row.nspname = 'public'
+       union all
+       select 'enum', namespace_row.nspname || '.' || type_row.typname ||
+           ':' || enum_row.enumsortorder::text,
+         pg_catalog.to_jsonb(enum_row.enumlabel::text)
+       from pg_catalog.pg_enum enum_row
+       join pg_catalog.pg_type type_row on type_row.oid = enum_row.enumtypid
+       join pg_catalog.pg_namespace namespace_row
+         on namespace_row.oid = type_row.typnamespace
+       where namespace_row.nspname = 'public'
+       union all
+       select 'constraint',
+         (case when constraint_row.conrelid <> 0
+           then constraint_row.conrelid::pg_catalog.regclass::text
+           else constraint_row.contypid::pg_catalog.regtype::text end) ||
+           ':' || constraint_row.conname,
+         pg_catalog.jsonb_build_object(
+           'kind', constraint_row.contype::text,
+           'validated', constraint_row.convalidated,
+           'deferrable', constraint_row.condeferrable,
+           'deferred', constraint_row.condeferred,
+           'definition', pg_catalog.pg_get_constraintdef(constraint_row.oid, true)
+         )
+       from pg_catalog.pg_constraint constraint_row
+       join pg_catalog.pg_namespace namespace_row
+         on namespace_row.oid = constraint_row.connamespace
+       where namespace_row.nspname = 'public'
+       union all
+       select 'index', namespace_row.nspname || '.' || index_relation.relname,
+         pg_catalog.jsonb_build_object(
+           'table', table_relation.relname,
+           'valid', index_row.indisvalid,
+           'ready', index_row.indisready,
+           'live', index_row.indislive,
+           'definition', pg_catalog.pg_get_indexdef(index_relation.oid)
+         )
+       from pg_catalog.pg_index index_row
+       join pg_catalog.pg_class index_relation on index_relation.oid = index_row.indexrelid
+       join pg_catalog.pg_class table_relation on table_relation.oid = index_row.indrelid
+       join pg_catalog.pg_namespace namespace_row
+         on namespace_row.oid = index_relation.relnamespace
+       where namespace_row.nspname = 'public'
+       union all
+       select 'routine', namespace_row.nspname || '.' || routine.proname ||
+           '(' || pg_catalog.oidvectortypes(routine.proargtypes) || ')',
+         pg_catalog.jsonb_build_object(
+           'kind', routine.prokind::text,
+           'owner', pg_catalog.pg_get_userbyid(routine.proowner),
+           'language', language_row.lanname::text,
+           'result', pg_catalog.pg_get_function_result(routine.oid),
+           'securityDefiner', routine.prosecdef,
+           'volatility', routine.provolatile::text,
+           'strict', routine.proisstrict,
+           'setReturning', routine.proretset,
+           'parallel', routine.proparallel::text,
+           'leakproof', routine.proleakproof,
+           'configSha256', pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
+             coalesce(routine.proconfig::text, '<NULL>'), 'UTF8'
+           )), 'hex'),
+           'acl', routine.proacl::text,
+           'definitionSha256', case when routine.prokind = 'a' then null else
+             pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
+               pg_catalog.replace(pg_catalog.replace(
+                 pg_catalog.pg_get_functiondef(routine.oid), E'\\r\\n', E'\\n'
+               ), E'\\r', E'\\n'), 'UTF8'
+             )), 'hex') end
+         )
+       from pg_catalog.pg_proc routine
+       join pg_catalog.pg_namespace namespace_row
+         on namespace_row.oid = routine.pronamespace
+       join pg_catalog.pg_language language_row on language_row.oid = routine.prolang
+       where namespace_row.nspname = 'public'
+       union all
+       select 'trigger', relation_row.relname || ':' || trigger_row.tgname,
+         pg_catalog.jsonb_build_object(
+           'function', trigger_row.tgfoid::pg_catalog.regprocedure::text,
+           'type', trigger_row.tgtype,
+           'enabled', trigger_row.tgenabled::text,
+           'internal', trigger_row.tgisinternal,
+           'arguments', pg_catalog.encode(trigger_row.tgargs, 'hex'),
+           'definition', pg_catalog.pg_get_triggerdef(trigger_row.oid, true)
+         )
+       from pg_catalog.pg_trigger trigger_row
+       join pg_catalog.pg_class relation_row on relation_row.oid = trigger_row.tgrelid
+       join pg_catalog.pg_namespace namespace_row
+         on namespace_row.oid = relation_row.relnamespace
+       where namespace_row.nspname = 'public'
+       union all
+       select 'rule', relation_row.relname || ':' || rule_row.rulename,
+         pg_catalog.jsonb_build_object(
+           'enabled', rule_row.ev_enabled::text,
+           'definition', pg_catalog.pg_get_ruledef(rule_row.oid, true)
+         )
+       from pg_catalog.pg_rewrite rule_row
+       join pg_catalog.pg_class relation_row on relation_row.oid = rule_row.ev_class
+       join pg_catalog.pg_namespace namespace_row
+         on namespace_row.oid = relation_row.relnamespace
+       where namespace_row.nspname = 'public'
+       union all
+       select 'inheritance', child_row.relname || ':' || parent_row.relname ||
+           ':' || inheritance_row.inhseqno::text,
+         pg_catalog.jsonb_build_object('detachPending', inheritance_row.inhdetachpending)
+       from pg_catalog.pg_inherits inheritance_row
+       join pg_catalog.pg_class child_row on child_row.oid = inheritance_row.inhrelid
+       join pg_catalog.pg_class parent_row on parent_row.oid = inheritance_row.inhparent
+       join pg_catalog.pg_namespace child_namespace
+         on child_namespace.oid = child_row.relnamespace
+       join pg_catalog.pg_namespace parent_namespace
+         on parent_namespace.oid = parent_row.relnamespace
+       where child_namespace.nspname = 'public' or parent_namespace.nspname = 'public'
+       union all
+       select 'policy', relation_row.relname || ':' || policy_row.polname,
+         pg_catalog.jsonb_build_object(
+           'permissive', policy_row.polpermissive,
+           'command', policy_row.polcmd::text,
+           'roles', policy_row.polroles::text,
+           'using', pg_catalog.pg_get_expr(policy_row.polqual, policy_row.polrelid),
+           'check', pg_catalog.pg_get_expr(policy_row.polwithcheck, policy_row.polrelid)
+         )
+       from pg_catalog.pg_policy policy_row
+       join pg_catalog.pg_class relation_row on relation_row.oid = policy_row.polrelid
+       join pg_catalog.pg_namespace namespace_row
+         on namespace_row.oid = relation_row.relnamespace
+       where namespace_row.nspname = 'public'
+     ), authority_descriptor(kind, identity, descriptor) as (
+       select 'database', database_row.datname,
+         pg_catalog.jsonb_build_object(
+           'owner', pg_catalog.pg_get_userbyid(database_row.datdba),
+           'acl', database_row.datacl::text,
+           'connectionLimit', database_row.datconnlimit
+         )
+       from pg_catalog.pg_database database_row
+       where database_row.datname = pg_catalog.current_database()
+       union all
+       select 'role', role_row.rolname,
+         pg_catalog.jsonb_build_object(
+           'superuser', role_row.rolsuper,
+           'inherit', role_row.rolinherit,
+           'createRole', role_row.rolcreaterole,
+           'createDatabase', role_row.rolcreatedb,
+           'canLogin', role_row.rolcanlogin,
+           'replication', role_row.rolreplication,
+           'bypassRls', role_row.rolbypassrls,
+           'connectionLimit', role_row.rolconnlimit,
+           'configSha256', pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
+             coalesce(role_row.rolconfig::text, '<NULL>'), 'UTF8'
+           )), 'hex')
+         )
+       from pg_catalog.pg_roles role_row
+       where pg_catalog.starts_with(role_row.rolname::text, 'pale_orbit_')
+          or role_row.rolname = any($1::text[])
+       union all
+       select 'membership', member_role.rolname || ':' || granted_role.rolname,
+         pg_catalog.jsonb_build_object(
+           'grantor', grantor_role.rolname,
+           'adminOption', membership.admin_option
+         )
+       from pg_catalog.pg_auth_members membership
+       join pg_catalog.pg_roles member_role on member_role.oid = membership.member
+       join pg_catalog.pg_roles granted_role on granted_role.oid = membership.roleid
+       join pg_catalog.pg_roles grantor_role on grantor_role.oid = membership.grantor
+       where pg_catalog.starts_with(member_role.rolname::text, 'pale_orbit_')
+          or pg_catalog.starts_with(granted_role.rolname::text, 'pale_orbit_')
+          or member_role.rolname = any($1::text[])
+          or granted_role.rolname = any($1::text[])
+       union all
+       select 'defaultAcl', coalesce(namespace_row.nspname, '<global>') ||
+           ':' || owner_role.rolname || ':' || default_acl.defaclobjtype::text,
+         pg_catalog.to_jsonb(default_acl.defaclacl::text)
+       from pg_catalog.pg_default_acl default_acl
+       join pg_catalog.pg_roles owner_role on owner_role.oid = default_acl.defaclrole
+       left join pg_catalog.pg_namespace namespace_row
+         on namespace_row.oid = default_acl.defaclnamespace
+       union all
+       select 'setting',
+         (case when setting_row.setdatabase = 0 then '<all-databases>'
+           else database_row.datname end) || ':' ||
+         (case when setting_row.setrole = 0 then '<all-roles>'
+           else role_row.rolname end),
+         pg_catalog.to_jsonb(pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
+           coalesce(setting_row.setconfig::text, '<NULL>'), 'UTF8'
+         )), 'hex'))
+       from pg_catalog.pg_db_role_setting setting_row
+       left join pg_catalog.pg_database database_row
+         on database_row.oid = setting_row.setdatabase
+       left join pg_catalog.pg_roles role_row on role_row.oid = setting_row.setrole
+       where setting_row.setdatabase in (0, (
+           select current_database_row.oid from pg_catalog.pg_database current_database_row
+           where current_database_row.datname = pg_catalog.current_database()
+         ))
+          or pg_catalog.starts_with(role_row.rolname::text, 'pale_orbit_')
+          or role_row.rolname = any($1::text[])
+       union all
+       select 'parameterAcl', parameter_acl.parname,
+         pg_catalog.to_jsonb(parameter_acl.paracl::text)
+       from pg_catalog.pg_parameter_acl parameter_acl
+     )
+     select
+       coalesce((
+         select pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+           'kind', descriptor.kind,
+           'identity', descriptor.identity,
+           'descriptor', descriptor.descriptor
+         ) order by descriptor.kind collate "C", descriptor.identity collate "C")::text
+         from public_descriptor descriptor
+       ), '[]') as public_descriptors,
+       coalesce((
+         select pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+           'kind', descriptor.kind,
+           'identity', descriptor.identity,
+           'descriptor', descriptor.descriptor
+         ) order by descriptor.kind collate "C", descriptor.identity collate "C")::text
+         from authority_descriptor descriptor
+       ), '[]') as authority_descriptors`,
+    [[...PLAN6BII_ATTESTED_ROLE_EDGES.map(([roleName]) => roleName)]]
+  );
+}
+
+async function plan7aGeneratedObjectCatalogState(
+  pool: Pool
+): Promise<Plan7aGeneratedObjectCatalogState> {
+  return one<Plan7aGeneratedObjectCatalogState>(
+    pool,
+    `with descriptor(kind, identity, value) as (
+       select 'schema', namespace_row.nspname::text,
+         pg_catalog.jsonb_build_object(
+           'owner', pg_catalog.pg_get_userbyid(namespace_row.nspowner),
+           'acl', namespace_row.nspacl::text
+         )
+       from pg_catalog.pg_namespace namespace_row
+       where namespace_row.nspname = 'drizzle'
+       union all
+       select 'relation', namespace_row.nspname || '.' || relation_row.relname,
+         pg_catalog.jsonb_build_object(
+           'kind', relation_row.relkind::text,
+           'persistence', relation_row.relpersistence::text,
+           'owner', pg_catalog.pg_get_userbyid(relation_row.relowner),
+           'acl', relation_row.relacl::text,
+           'rowSecurity', relation_row.relrowsecurity,
+           'forceRowSecurity', relation_row.relforcerowsecurity,
+           'replicaIdentity', relation_row.relreplident::text,
+           'partition', relation_row.relispartition
+         )
+       from pg_catalog.pg_class relation_row
+       join pg_catalog.pg_namespace namespace_row
+         on namespace_row.oid = relation_row.relnamespace
+       where namespace_row.nspname = 'drizzle'
+       union all
+       select 'column', namespace_row.nspname || '.' || relation_row.relname ||
+           '.' || attribute_row.attname,
+         pg_catalog.jsonb_build_object(
+           'ordinal', attribute_row.attnum,
+           'type', pg_catalog.format_type(attribute_row.atttypid, attribute_row.atttypmod),
+           'notNull', attribute_row.attnotnull,
+           'identity', attribute_row.attidentity::text,
+           'generated', attribute_row.attgenerated::text,
+           'default', pg_catalog.pg_get_expr(default_row.adbin, default_row.adrelid)
+         )
+       from pg_catalog.pg_attribute attribute_row
+       join pg_catalog.pg_class relation_row on relation_row.oid = attribute_row.attrelid
+       join pg_catalog.pg_namespace namespace_row
+         on namespace_row.oid = relation_row.relnamespace
+       left join pg_catalog.pg_attrdef default_row
+         on default_row.adrelid = attribute_row.attrelid
+        and default_row.adnum = attribute_row.attnum
+       where namespace_row.nspname = 'drizzle'
+         and attribute_row.attnum > 0 and not attribute_row.attisdropped
+       union all
+       select 'type', namespace_row.nspname || '.' || type_row.typname,
+         pg_catalog.jsonb_build_object(
+           'kind', type_row.typtype::text,
+           'category', type_row.typcategory::text,
+           'defined', type_row.typisdefined,
+           'owner', pg_catalog.pg_get_userbyid(type_row.typowner),
+           'acl', type_row.typacl::text,
+           'element', coalesce(
+             element_namespace.nspname || '.' || element_type.typname,
+             ''
+           ),
+           'array', coalesce(array_namespace.nspname || '.' || array_type.typname, ''),
+           'relation', coalesce(
+             relation_namespace.nspname || '.' || relation_row.relname,
+             ''
+           )
+         )
+       from pg_catalog.pg_type type_row
+       join pg_catalog.pg_namespace namespace_row
+         on namespace_row.oid = type_row.typnamespace
+       left join pg_catalog.pg_type element_type on element_type.oid = type_row.typelem
+       left join pg_catalog.pg_namespace element_namespace
+         on element_namespace.oid = element_type.typnamespace
+       left join pg_catalog.pg_type array_type on array_type.oid = type_row.typarray
+       left join pg_catalog.pg_namespace array_namespace
+         on array_namespace.oid = array_type.typnamespace
+       left join pg_catalog.pg_class relation_row on relation_row.oid = type_row.typrelid
+       left join pg_catalog.pg_namespace relation_namespace
+         on relation_namespace.oid = relation_row.relnamespace
+       where namespace_row.nspname = 'drizzle'
+       union all
+       select 'enum', namespace_row.nspname || '.' || type_row.typname || ':' ||
+           enum_row.enumsortorder::text,
+         pg_catalog.to_jsonb(enum_row.enumlabel::text)
+       from pg_catalog.pg_enum enum_row
+       join pg_catalog.pg_type type_row on type_row.oid = enum_row.enumtypid
+       join pg_catalog.pg_namespace namespace_row
+         on namespace_row.oid = type_row.typnamespace
+       where namespace_row.nspname = 'drizzle'
+       union all
+       select 'constraint', namespace_row.nspname || '.' || constraint_row.conname,
+         pg_catalog.jsonb_build_object(
+           'kind', constraint_row.contype::text,
+           'validated', constraint_row.convalidated,
+           'deferrable', constraint_row.condeferrable,
+           'deferred', constraint_row.condeferred,
+           'definition', pg_catalog.pg_get_constraintdef(constraint_row.oid, true)
+         )
+       from pg_catalog.pg_constraint constraint_row
+       join pg_catalog.pg_namespace namespace_row
+         on namespace_row.oid = constraint_row.connamespace
+       where namespace_row.nspname = 'drizzle'
+       union all
+       select 'index', namespace_row.nspname || '.' || index_relation.relname,
+         pg_catalog.jsonb_build_object(
+           'table', table_namespace.nspname || '.' || table_relation.relname,
+           'valid', index_row.indisvalid,
+           'ready', index_row.indisready,
+           'live', index_row.indislive,
+           'definition', pg_catalog.pg_get_indexdef(index_relation.oid)
+         )
+       from pg_catalog.pg_index index_row
+       join pg_catalog.pg_class index_relation on index_relation.oid = index_row.indexrelid
+       join pg_catalog.pg_namespace namespace_row
+         on namespace_row.oid = index_relation.relnamespace
+       join pg_catalog.pg_class table_relation on table_relation.oid = index_row.indrelid
+       join pg_catalog.pg_namespace table_namespace
+         on table_namespace.oid = table_relation.relnamespace
+       where namespace_row.nspname = 'drizzle'
+     )
+     select coalesce(
+       pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+         'kind', descriptor.kind,
+         'identity', descriptor.identity,
+         'descriptor', descriptor.value
+       ) order by descriptor.kind collate "C", descriptor.identity collate "C"),
+       '[]'::jsonb
+     )::text as descriptors
+     from descriptor`
+  );
+}
+
+async function plan7aHistoricalDataState(pool: Pool): Promise<Plan7aHistoricalDataState> {
+  return one<Plan7aHistoricalDataState>(
+    pool,
+    `select
+       (select coalesce(
+          pg_catalog.jsonb_agg(pg_catalog.to_jsonb(job_row) order by job_row.id),
+          '[]'::jsonb
+        )::text from public.jobs job_row) as jobs,
+       (select coalesce(
+          pg_catalog.jsonb_agg(pg_catalog.to_jsonb(audit_row) order by audit_row.id),
+          '[]'::jsonb
+        )::text from public.audit_events audit_row) as audit_events`
+  );
+}
+
+async function plan7aMigrationJournalState(pool: Pool): Promise<string> {
+  const state = await one<{ journal: string }>(
+    pool,
+    `select coalesce(
+       pg_catalog.jsonb_agg(pg_catalog.to_jsonb(journal_row) order by journal_row.id),
+       '[]'::jsonb
+     )::text as journal
+     from drizzle.__drizzle_migrations journal_row`
+  );
+  return state.journal;
+}
+
+async function plan7aObjectState(pool: Pool): Promise<Plan7aObjectState> {
+  return one<Plan7aObjectState>(
+    pool,
+    `select
+       (select pg_catalog.count(*)::integer
+        from pg_catalog.pg_class relation_row
+        join pg_catalog.pg_namespace namespace_row
+          on namespace_row.oid = relation_row.relnamespace
+        where namespace_row.nspname = 'public' and (
+          pg_catalog.starts_with(relation_row.relname::text, 'operations_job_retry_') or
+          pg_catalog.starts_with(relation_row.relname::text, 'plan7a_operations_')
+        )) as relation_count,
+       (select pg_catalog.count(*)::integer
+        from pg_catalog.pg_type type_row
+        join pg_catalog.pg_namespace namespace_row
+          on namespace_row.oid = type_row.typnamespace
+        where namespace_row.nspname = 'public' and (
+          pg_catalog.starts_with(type_row.typname::text, 'operations_job_retry_') or
+          pg_catalog.starts_with(type_row.typname::text, '_operations_job_retry_')
+        )) as type_count,
+       (select pg_catalog.count(*)::integer
+        from pg_catalog.pg_proc routine
+        join pg_catalog.pg_namespace namespace_row
+          on namespace_row.oid = routine.pronamespace
+        where namespace_row.nspname = 'public'
+          and routine.proname = any($1::text[])) as routine_count,
+       (select pg_catalog.count(*)::integer
+        from pg_catalog.pg_trigger trigger_row
+        where not trigger_row.tgisinternal
+          and pg_catalog.starts_with(trigger_row.tgname::text, 'plan7a_operations_'))
+          as trigger_count,
+       (select pg_catalog.count(*)::integer
+        from pg_catalog.pg_constraint constraint_row
+        join pg_catalog.pg_namespace namespace_row
+          on namespace_row.oid = constraint_row.connamespace
+        where namespace_row.nspname = 'public'
+          and pg_catalog.starts_with(constraint_row.conname::text, 'plan7a_operations_'))
+          as constraint_count`,
+    [[...PLAN7A_ROUTINE_NAMES]]
+  );
+}
+
+async function assertPlan7aObjectsAbsent(pool: Pool, message: string): Promise<void> {
+  equal(
+    await plan7aObjectState(pool),
+    {
+      relation_count: 0,
+      type_count: 0,
+      routine_count: 0,
+      trigger_count: 0,
+      constraint_count: 0
+    },
+    message
+  );
+}
+
+async function plan7aHistoricalGuardState(pool: Pool): Promise<{
+  job_definition: RoutineDefinitionState;
+  job_metadata: RoutineMetadataState;
+  audit_definition: RoutineDefinitionState;
+  audit_metadata: RoutineMetadataState;
+}> {
+  const [jobDefinition, jobMetadata, auditDefinition, auditMetadata] = await Promise.all([
+    routineDefinitionState(pool, 'public.plan6b_guard_job_insert()'),
+    routineMetadataState(pool, 'public.plan6b_guard_job_insert()'),
+    routineDefinitionState(pool, 'public.plan6b_guard_audit_insert()'),
+    routineMetadataState(pool, 'public.plan6b_guard_audit_insert()')
+  ]);
+  return {
+    job_definition: jobDefinition,
+    job_metadata: jobMetadata,
+    audit_definition: auditDefinition,
+    audit_metadata: auditMetadata
+  };
+}
+
+async function assertPlan7aTransactionSettingsCleared(
+  pool: Pool | PoolClient
+): Promise<void> {
+  const state = await one<{ setting_values: Array<string | null> }>(
+    pool,
+    `select array[
+       pg_catalog.current_setting('pale_orbit.migration_expected_web_login', true),
+       pg_catalog.current_setting('pale_orbit.migration_expected_worker_login', true),
+       pg_catalog.current_setting('pale_orbit.migration_expected_storage_cleanup_login', true),
+       pg_catalog.current_setting('pale_orbit.plan7a_operations_command_insert_id', true),
+       pg_catalog.current_setting('pale_orbit.plan7a_operations_command_transition_id', true),
+       pg_catalog.current_setting('pale_orbit.plan7a_operations_job_transition_id', true),
+       pg_catalog.current_setting('pale_orbit.plan7a_operations_job_capability', true)
+     ]::text[] as setting_values`
+  );
+  assert(
+    state.setting_values.every((value) => value === null || value === ''),
+    'Plan 7A migration or provenance setting survived transaction end'
+  );
+}
+
+async function plan7aInstalledDescriptorState(
+  pool: Pool
+): Promise<Plan7aInstalledDescriptorState> {
+  return one<Plan7aInstalledDescriptorState>(
+    pool,
+    `select
+       array(
+         select enum_descriptor.descriptor
+         from (
+           select type_row.typname || ':' ||
+             pg_catalog.string_agg(enum_row.enumlabel, ',' order by enum_row.enumsortorder)
+               as descriptor
+           from pg_catalog.pg_type type_row
+           join pg_catalog.pg_namespace namespace_row
+             on namespace_row.oid = type_row.typnamespace
+           join pg_catalog.pg_enum enum_row on enum_row.enumtypid = type_row.oid
+           where namespace_row.nspname = 'public'
+             and pg_catalog.starts_with(type_row.typname::text, 'operations_job_retry_')
+           group by type_row.typname
+         ) enum_descriptor
+         order by enum_descriptor.descriptor collate "C"
+       ) as enum_descriptors,
+       array(
+         select relation_row.relname::text
+         from pg_catalog.pg_class relation_row
+         join pg_catalog.pg_namespace namespace_row
+           on namespace_row.oid = relation_row.relnamespace
+         where namespace_row.nspname = 'public' and relation_row.relkind = 'r'
+           and relation_row.relname in (
+             'operations_job_retry_claims', 'operations_job_retry_commands'
+           )
+         order by relation_row.relname collate "C"
+       ) as relation_names,
+       array(
+         select relation_row.relname || ':' ||
+           pg_catalog.string_agg(attribute_row.attname::text, ',' order by attribute_row.attnum)
+         from pg_catalog.pg_class relation_row
+         join pg_catalog.pg_namespace namespace_row
+           on namespace_row.oid = relation_row.relnamespace
+         join pg_catalog.pg_attribute attribute_row
+           on attribute_row.attrelid = relation_row.oid
+         where namespace_row.nspname = 'public'
+           and relation_row.relname in (
+             'operations_job_retry_claims', 'operations_job_retry_commands'
+           )
+           and attribute_row.attnum > 0 and not attribute_row.attisdropped
+         group by relation_row.relname
+         order by relation_row.relname collate "C"
+       ) as column_descriptors,
+       array(
+         select routine.proname || '(' ||
+           pg_catalog.replace(pg_catalog.oidvectortypes(routine.proargtypes), ', ', ',') || ')'
+         from pg_catalog.pg_proc routine
+         join pg_catalog.pg_namespace namespace_row
+           on namespace_row.oid = routine.pronamespace
+         where namespace_row.nspname = 'public'
+           and routine.proname = any($1::text[])
+         order by routine.proname collate "C", routine.proargtypes::text collate "C"
+       ) as routine_signatures,
+       array(
+         select trigger_row.tgname || ':' || relation_row.relname || ':' ||
+           routine.proname || ':' || trigger_row.tgenabled::text || ':' ||
+           trigger_row.tgtype::text
+         from pg_catalog.pg_trigger trigger_row
+         join pg_catalog.pg_class relation_row on relation_row.oid = trigger_row.tgrelid
+         join pg_catalog.pg_proc routine on routine.oid = trigger_row.tgfoid
+         where not trigger_row.tgisinternal
+           and pg_catalog.starts_with(trigger_row.tgname::text, 'plan7a_operations_')
+         order by trigger_row.tgname collate "C"
+       ) as trigger_descriptors,
+       array(
+         select constraint_row.conname::text
+         from pg_catalog.pg_constraint constraint_row
+         join pg_catalog.pg_namespace namespace_row
+           on namespace_row.oid = constraint_row.connamespace
+         where namespace_row.nspname = 'public'
+           and pg_catalog.starts_with(constraint_row.conname::text, 'plan7a_operations_')
+         order by constraint_row.conname collate "C"
+       ) as constraint_names,
+       array(
+         select index_relation.relname::text
+         from pg_catalog.pg_index index_row
+         join pg_catalog.pg_class index_relation on index_relation.oid = index_row.indexrelid
+         join pg_catalog.pg_namespace namespace_row
+           on namespace_row.oid = index_relation.relnamespace
+         where namespace_row.nspname = 'public'
+           and pg_catalog.starts_with(index_relation.relname::text, 'plan7a_operations_')
+         order by index_relation.relname collate "C"
+       ) as index_names`,
+    [[...PLAN7A_ROUTINE_NAMES, 'plan6b_guard_job_insert', 'plan6b_guard_audit_insert']]
+  );
+}
+
+function assertPlan7aInstalledDescriptors(state: Plan7aInstalledDescriptorState): void {
+  equal(state.enum_descriptors, [
+    'operations_job_retry_claim_state:active,invalidated',
+    'operations_job_retry_command_status:pending,succeeded,denied,failed',
+    'operations_job_retry_reason_code:dependency_recovered,configuration_recovered,operator_reassessment',
+    'operations_job_retry_result_code:rearmed_existing,successor_enqueued,already_current,retry_not_supported,retry_policy_not_enabled,provider_recovery_not_enabled,target_not_failed,target_state_changed,domain_state_not_retryable,source_unavailable,actor_not_authorized,retry_command_invalid,retry_command_exhausted,unexpected_failure'
+  ], 'clean 0015 installs every exact operations enum descriptor');
+  equal(
+    state.relation_names,
+    ['operations_job_retry_claims', 'operations_job_retry_commands'],
+    'clean 0015 installs both exact operations relations'
+  );
+  equal(state.column_descriptors, [
+    'operations_job_retry_claims:job_id,command_id,generation,attempt,lease_owner,capability_sha256,lease_duration_ms,state,expires_at,issued_at,renewed_at,invalidated_at',
+    'operations_job_retry_commands:id,kind,actor_user_id,target_job_id,target_job_kind,expected_status,expected_attempts,expected_max_attempts,expected_updated_at,reason_code,correlation_id,idempotency_key_sha256,input_fingerprint_sha256,status,safe_result_code,created_at,updated_at,completed_at'
+  ], 'clean 0015 installs every exact operations column descriptor');
+  equal(
+    state.routine_signatures,
+    [...PLAN7A_INSTALLED_ROUTINE_SIGNATURES],
+    'clean 0015 installs or replaces every exact routine descriptor'
+  );
+  equal(state.trigger_descriptors, [
+    'plan7a_operations_jobs_transition_guard:jobs:plan7a_operations_guard_job_transition:O:19',
+    'plan7a_operations_retry_commands_delete_guard:operations_job_retry_commands:plan7a_operations_guard_command_delete:O:11',
+    'plan7a_operations_retry_commands_update_guard:operations_job_retry_commands:plan7a_operations_guard_command_update:O:19'
+  ], 'clean 0015 installs every exact trigger descriptor');
+  equal(
+    state.constraint_names,
+    [...PLAN7A_CONSTRAINT_NAMES],
+    'clean 0015 installs every exact operations constraint descriptor'
+  );
+  equal(state.index_names, [
+    'plan7a_operations_retry_claims_command_unique',
+    'plan7a_operations_retry_claims_pkey',
+    'plan7a_operations_retry_commands_actor_idempotency_unique',
+    'plan7a_operations_retry_commands_pkey',
+    'plan7a_operations_retry_commands_status_created_idx',
+    'plan7a_operations_retry_commands_target_created_idx'
+  ], 'clean 0015 installs every exact operations index descriptor');
+}
+
+const PLAN7A_PREDECESSOR_STORAGE_SHA256 =
+  '5dfb4b04a8259b1f11cbe91aacb668c62993fd1e32e319c9f8287f78b60e43c8';
+
+async function plan7aPredecessorStorageSha256(pool: Pool): Promise<string> {
+  const result = await one<{ digest: string }>(
+    pool,
+    `select pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
+       pg_catalog.string_agg(storage_descriptor.descriptor, E'\\n'
+         order by storage_descriptor.descriptor), 'UTF8'
+     )), 'hex') as digest
+     from (
+       select 'relation:' || relation_row.relname || ':' ||
+         relation_row.relkind::text || ':' || relation_row.relpersistence::text || ':' ||
+         case relation_row.relowner
+           when (select database_row.datdba from pg_catalog.pg_database database_row
+                 where database_row.datname = pg_catalog.current_database()) then '<owner>'
+           else pg_catalog.pg_get_userbyid(relation_row.relowner) end || ':' ||
+         relation_row.relrowsecurity::text || ':' || relation_row.relforcerowsecurity::text ||
+         ':' || relation_row.relreplident::text || ':' || relation_row.relispartition::text ||
+         ':' || relation_row.relhasrules::text || ':' || relation_row.relhastriggers::text ||
+         ':' || relation_row.relchecks::text as descriptor
+       from pg_catalog.pg_class relation_row
+       join pg_catalog.pg_namespace namespace_row
+         on namespace_row.oid = relation_row.relnamespace
+       where namespace_row.nspname = 'public'
+         and relation_row.relname in ('jobs', 'audit_events')
+       union all
+       select 'column:' || relation_row.relname || ':' || attribute_row.attnum::text || ':' ||
+         attribute_row.attname || ':' || type_namespace.nspname || '.' || type_row.typname ||
+         ':' || pg_catalog.format_type(attribute_row.atttypid, attribute_row.atttypmod) ||
+         ':' || attribute_row.attnotnull::text || ':' || attribute_row.attidentity::text ||
+         ':' || attribute_row.attgenerated::text || ':' || coalesce(
+           collation_namespace.nspname || '.' || collation_row.collname, ''
+         ) || ':' || coalesce(
+           pg_catalog.pg_get_expr(default_row.adbin, default_row.adrelid), ''
+         )
+       from pg_catalog.pg_attribute attribute_row
+       join pg_catalog.pg_class relation_row on relation_row.oid = attribute_row.attrelid
+       join pg_catalog.pg_namespace namespace_row on namespace_row.oid = relation_row.relnamespace
+       join pg_catalog.pg_type type_row on type_row.oid = attribute_row.atttypid
+       join pg_catalog.pg_namespace type_namespace on type_namespace.oid = type_row.typnamespace
+       left join pg_catalog.pg_attrdef default_row
+         on default_row.adrelid = attribute_row.attrelid
+        and default_row.adnum = attribute_row.attnum
+       left join pg_catalog.pg_collation collation_row
+         on collation_row.oid = attribute_row.attcollation
+       left join pg_catalog.pg_namespace collation_namespace
+         on collation_namespace.oid = collation_row.collnamespace
+       where namespace_row.nspname = 'public'
+         and relation_row.relname in ('jobs', 'audit_events')
+         and attribute_row.attnum > 0 and not attribute_row.attisdropped
+       union all
+       select 'constraint:' || relation_row.relname || ':' || constraint_row.conname || ':' ||
+         constraint_row.contype::text || ':' || constraint_row.convalidated::text || ':' ||
+         constraint_row.condeferrable::text || ':' || constraint_row.condeferred::text || ':' ||
+         constraint_row.connoinherit::text || ':' ||
+         pg_catalog.pg_get_constraintdef(constraint_row.oid, true)
+       from pg_catalog.pg_constraint constraint_row
+       join pg_catalog.pg_class relation_row on relation_row.oid = constraint_row.conrelid
+       join pg_catalog.pg_namespace namespace_row on namespace_row.oid = relation_row.relnamespace
+       where namespace_row.nspname = 'public'
+         and relation_row.relname in ('jobs', 'audit_events')
+       union all
+       select 'index:' || table_relation.relname || ':' || index_namespace.nspname || '.' ||
+         index_relation.relname || ':' ||
+         case index_relation.relowner
+           when (select database_row.datdba from pg_catalog.pg_database database_row
+                 where database_row.datname = pg_catalog.current_database()) then '<owner>'
+           else pg_catalog.pg_get_userbyid(index_relation.relowner) end || ':' ||
+         index_row.indisunique::text || ':' || index_row.indisprimary::text || ':' ||
+         index_row.indisexclusion::text || ':' || index_row.indimmediate::text || ':' ||
+         index_row.indisclustered::text || ':' || index_row.indisvalid::text || ':' ||
+         index_row.indisready::text || ':' || index_row.indislive::text || ':' ||
+         index_row.indisreplident::text || ':' ||
+         pg_catalog.pg_get_indexdef(index_relation.oid)
+       from pg_catalog.pg_index index_row
+       join pg_catalog.pg_class index_relation on index_relation.oid = index_row.indexrelid
+       join pg_catalog.pg_namespace index_namespace
+         on index_namespace.oid = index_relation.relnamespace
+       join pg_catalog.pg_class table_relation on table_relation.oid = index_row.indrelid
+       join pg_catalog.pg_namespace table_namespace
+         on table_namespace.oid = table_relation.relnamespace
+       where table_namespace.nspname = 'public'
+         and table_relation.relname in ('jobs', 'audit_events')
+     ) storage_descriptor`
+  );
+  return result.digest;
+}
+
+async function prepareCommitted0014Fixture(pool: Pool): Promise<void> {
+  equal(await migrationCount(pool), 7, 'Plan 7A upgrade fixture begins at migration 0006');
+  await runHistoricalMigrationsThrough0011(pool);
+  equal(await migrationCount(pool), 12, 'Plan 7A upgrade fixture applies through 0011');
+  try {
+    await createPlan6biiAttestedRoles(pool, 0b111);
+    await runCommittedPlan6biiAttestedMigration(
+      pool,
+      await createMigrationFolderThrough(12)
+    );
+    await runCommittedPlan6biiAttestedMigration(
+      pool,
+      await createMigrationFolderThrough(13)
+    );
+    await runCommittedPlan6biiAttestedMigration(
+      pool,
+      await createMigrationFolderThrough(14)
+    );
+    equal(await migrationCount(pool), 15, 'Plan 7A upgrade fixture commits exact 0014 head');
+    await assertPlan7aObjectsAbsent(
+      pool,
+      'committed 0014 fixture contains no 0015 object'
+    );
+  } catch (error) {
+    await dropPlan6biiAttestedRoles(pool);
+    throw error;
+  }
+}
+
+async function seedPlan7aAtomicityHistory(pool: Pool): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    await client.query(
+      `insert into public.jobs (id, type, payload, deduplication_key)
+       values ($1, 'email.send', '{"plan7aAtomicity":true}'::jsonb, $2)`,
+      [randomUUID(), `plan7a-atomicity-job-${randomUUID()}`]
+    );
+    await client.query(
+      `insert into public.audit_events
+         (id, actor_type, actor_id, action, outcome, resource_type, resource_id,
+          correlation_id)
+       values ($1, 'system', 'plan7a-upgrade-fixture', 'commerce.fixture',
+         'succeeded', 'order', $2, $3)`,
+      [randomUUID(), randomUUID(), randomUUID()]
+    );
+    await client.query('commit');
+  } catch (error) {
+    await client.query('rollback');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function runPlan7aUpgradeAtomicityFixture(pool: Pool): Promise<void> {
+  await prepareCommitted0014Fixture(pool);
+  try {
+    await seedPlan7aAtomicityHistory(pool);
+    const catalogAt0014 = await plan7aDatabaseCatalogState(pool);
+    const guardsAt0014 = await plan7aHistoricalGuardState(pool);
+    const dataAt0014 = await plan7aHistoricalDataState(pool);
+    const journalAt0014 = await plan7aMigrationJournalState(pool);
+    const faultFolder = await createPlan7aLateFaultMigrationFolder();
+    let rejected = false;
+    try {
+      await runCommittedPlan6biiAttestedMigration(pool, faultFolder);
+    } catch (error) {
+      rejected = true;
+      const postgresError = unwrapPostgresError(error);
+      assert(postgresError !== null, 'late 0015 fault exposes the underlying PostgreSQL error');
+      equal(
+        postgresError.message,
+        'Plan 7A test-only late migration fault',
+        'late 0015 fault reaches the injected post-DDL statement'
+      );
+      equal(postgresError.code, 'P0001', 'late 0015 fault uses the test-only SQLSTATE');
+    }
+    assert(rejected, 'late 0015 fault-injected migration unexpectedly committed');
+    equal(
+      await migrationCount(pool),
+      15,
+      'late 0015 rollback leaves the journal at exact 0014'
+    );
+    equal(
+      await plan7aMigrationJournalState(pool),
+      journalAt0014,
+      'late 0015 rollback leaves every exact 0014 journal row unchanged'
+    );
+    await assertPlan7aObjectsAbsent(
+      pool,
+      'late 0015 rollback removes every 0015 object'
+    );
+    equal(
+      await plan7aHistoricalGuardState(pool),
+      guardsAt0014,
+      'late 0015 rollback restores both historical guards exactly'
+    );
+    equal(
+      await plan7aHistoricalDataState(pool),
+      dataAt0014,
+      'late 0015 rollback preserves historical data exactly'
+    );
+    equal(
+      await plan7aDatabaseCatalogState(pool),
+      catalogAt0014,
+      'late 0015 rollback preserves the complete 0014 catalog'
+    );
+    await assertPlan7aTransactionSettingsCleared(pool);
+
+    const cleanFolder = await createMigrationFolderThrough(15);
+    await runCommittedPlan6biiAttestedMigration(pool, cleanFolder);
+    equal(await migrationCount(pool), 16, 'clean 0015 applies exactly once');
+    equal(
+      await plan7aHistoricalDataState(pool),
+      dataAt0014,
+      'clean 0015 preserves collision-free historical data'
+    );
+    const installedGuards = await plan7aHistoricalGuardState(pool);
+    assert(
+      installedGuards.job_definition.definition_sha256 !==
+        guardsAt0014.job_definition.definition_sha256 &&
+      installedGuards.job_definition.routine_definition.includes('operations.job-retry-command'),
+      'clean 0015 replaces the historical job guard with its reserved operations branch'
+    );
+    assert(
+      installedGuards.audit_definition.definition_sha256 !==
+        guardsAt0014.audit_definition.definition_sha256 &&
+      installedGuards.audit_definition.routine_definition.includes('operations.job_retry.') &&
+      installedGuards.audit_definition.routine_definition.includes('operations_job_retry_command'),
+      'clean 0015 replaces the historical audit guard with its reserved operations branch'
+    );
+    equal(
+      installedGuards.job_metadata,
+      guardsAt0014.job_metadata,
+      'clean 0015 preserves the historical job-guard descriptor metadata'
+    );
+    equal(
+      installedGuards.audit_metadata,
+      guardsAt0014.audit_metadata,
+      'clean 0015 preserves the historical audit-guard descriptor metadata'
+    );
+    const installedDescriptors = await plan7aInstalledDescriptorState(pool);
+    assertPlan7aInstalledDescriptors(installedDescriptors);
+    const installedCatalog = await plan7aDatabaseCatalogState(pool);
+    const installedJournal = await plan7aMigrationJournalState(pool);
+    await runCommittedPlan6biiAttestedMigration(pool, cleanFolder);
+    equal(await migrationCount(pool), 16, 'a second 0015 migrator pass is a no-op');
+    equal(
+      await plan7aMigrationJournalState(pool),
+      installedJournal,
+      'a second 0015 migration pass leaves the journal unchanged'
+    );
+    equal(
+      await plan7aInstalledDescriptorState(pool),
+      installedDescriptors,
+      'a second 0015 migration pass preserves every installed descriptor'
+    );
+    equal(
+      await plan7aHistoricalGuardState(pool),
+      installedGuards,
+      'a second 0015 migration pass preserves both replaced guards'
+    );
+    equal(
+      await plan7aHistoricalDataState(pool),
+      dataAt0014,
+      'a second 0015 migration pass preserves historical data'
+    );
+    equal(
+      await plan7aDatabaseCatalogState(pool),
+      installedCatalog,
+      'a second 0015 migration pass preserves the installed catalog'
+    );
+    await assertPlan7aTransactionSettingsCleared(pool);
+  } finally {
+    await dropPlan6biiAttestedRoles(pool);
+  }
+}
+
+async function seedPlan7aNamespaceCollision(
+  pool: Pool,
+  fixture: Plan7aNamespaceCollisionFixture
+): Promise<void> {
+  const id = randomUUID();
+  if (
+    fixture === 'plan7a-operations-job-type-collision' ||
+    fixture === 'plan7a-operations-deduplication-prefix-collision'
+  ) {
+    await pool.query(
+      `insert into public.jobs (id, type, payload, deduplication_key)
+       values ($1, $2, '{"historicalNamespaceCollision":true}'::jsonb, $3)`,
+      [
+        id,
+        fixture === 'plan7a-operations-job-type-collision'
+          ? 'operations.job-retry-command'
+          : 'email.send',
+        fixture === 'plan7a-operations-deduplication-prefix-collision'
+          ? `operations:job-retry-command:${id}:legacy`
+          : `legacy-operations-type-${id}`
+      ]
+    );
+  } else {
+    await pool.query(
+      `insert into public.audit_events
+         (id, actor_type, actor_id, action, outcome, resource_type, resource_id,
+          correlation_id)
+       values ($1, 'system', 'plan7a-upgrade-fixture', $2, 'succeeded', $3, $4, $5)`,
+      [
+        id,
+        fixture === 'plan7a-operations-audit-action-prefix-collision'
+          ? 'operations.job_retry.legacy_collision'
+          : 'commerce.fixture',
+        fixture === 'plan7a-operations-resource-type-collision'
+          ? 'operations_job_retry_command'
+          : 'order',
+        randomUUID(),
+        randomUUID()
+      ]
+    );
+  }
+  const state = await plan7aHistoricalDataState(pool);
+  const jobs = JSON.parse(state.jobs) as unknown[];
+  const auditEvents = JSON.parse(state.audit_events) as unknown[];
+  equal(
+    [jobs.length, auditEvents.length],
+    fixture.includes('job-type') || fixture.includes('deduplication-prefix')
+      ? [1, 0]
+      : [0, 1],
+    `${fixture} seeds exactly one otherwise-valid historical row`
+  );
+}
+
+async function runPlan7aNamespaceCollisionFixture(
+  pool: Pool,
+  fixture: Plan7aNamespaceCollisionFixture
+): Promise<void> {
+  await prepareCommitted0014Fixture(pool);
+  try {
+    await seedPlan7aNamespaceCollision(pool, fixture);
+    const catalogAt0014 = await plan7aDatabaseCatalogState(pool);
+    const guardsAt0014 = await plan7aHistoricalGuardState(pool);
+    const dataAt0014 = await plan7aHistoricalDataState(pool);
+    const journalAt0014 = await plan7aMigrationJournalState(pool);
+    let rejected = false;
+    try {
+      await runCommittedPlan6biiAttestedMigration(
+        pool,
+        await createMigrationFolderThrough(15)
+      );
+    } catch (error) {
+      rejected = true;
+      const postgresError = unwrapPostgresError(error);
+      assert(postgresError !== null, 'namespace collision exposes the PostgreSQL preflight error');
+      equal(postgresError.code, '55000', 'namespace collision uses the fixed SQLSTATE');
+      equal(
+        postgresError.message,
+        'Plan 7A operations namespace is not empty',
+        'namespace collision uses the fixed safe failure message'
+      );
+    }
+    assert(rejected, `${fixture} unexpectedly migrated through reserved namespace data`);
+    equal(
+      await migrationCount(pool),
+      15,
+      'namespace collision rollback leaves the journal at exact 0014'
+    );
+    equal(
+      await plan7aMigrationJournalState(pool),
+      journalAt0014,
+      'namespace collision rollback leaves every exact 0014 journal row unchanged'
+    );
+    await assertPlan7aObjectsAbsent(
+      pool,
+      'namespace collision rollback removes every 0015 object'
+    );
+    equal(
+      await plan7aHistoricalGuardState(pool),
+      guardsAt0014,
+      'namespace collision rollback preserves both historical guards exactly'
+    );
+    equal(
+      await plan7aHistoricalDataState(pool),
+      dataAt0014,
+      'namespace collision rollback preserves the seeded historical row exactly'
+    );
+    equal(
+      await plan7aDatabaseCatalogState(pool),
+      catalogAt0014,
+      'namespace collision rollback preserves the complete 0014 catalog'
+    );
+    await assertPlan7aTransactionSettingsCleared(pool);
+  } finally {
+    await dropPlan6biiAttestedRoles(pool);
+  }
+}
+
+async function seedPlan7aGeneratedObjectCollision(
+  pool: Pool,
+  fixture: Plan7aGeneratedObjectCollisionFixture
+): Promise<void> {
+  if (fixture === 'plan7a-generated-enum-array-type-collision') {
+    await pool.query(
+      `create type drizzle."_operations_job_retry_claim_state" as enum ('shadow')`
+    );
+  } else if (fixture === 'plan7a-generated-table-row-type-collision') {
+    await pool.query(
+      `create type drizzle."operations_job_retry_commands" as enum ('shadow')`
+    );
+  } else if (fixture === 'plan7a-generated-table-array-type-collision') {
+    await pool.query(
+      `create type drizzle."_operations_job_retry_commands" as enum ('shadow')`
+    );
+  } else {
+    await pool.query(
+      `create table drizzle.plan7a_generated_index_collision_target (id integer)`
+    );
+    await pool.query(
+      `create index "plan7a_operations_retry_claims_command_unique"
+       on drizzle.plan7a_generated_index_collision_target (id)`
+    );
+  }
+
+  const collisionName = fixture === 'plan7a-generated-enum-array-type-collision'
+    ? '_operations_job_retry_claim_state'
+    : fixture === 'plan7a-generated-table-row-type-collision'
+      ? 'operations_job_retry_commands'
+      : fixture === 'plan7a-generated-table-array-type-collision'
+        ? '_operations_job_retry_commands'
+        : 'plan7a_operations_retry_claims_command_unique';
+  const seeded = fixture === 'plan7a-generated-index-name-collision'
+    ? await one<{ count: number }>(
+        pool,
+        `select pg_catalog.count(*)::integer as count
+         from pg_catalog.pg_class relation_row
+         join pg_catalog.pg_namespace namespace_row
+           on namespace_row.oid = relation_row.relnamespace
+         where namespace_row.nspname = 'drizzle'
+           and relation_row.relname = $1 and relation_row.relkind = 'i'`,
+        [collisionName]
+      )
+    : await one<{ count: number }>(
+        pool,
+        `select pg_catalog.count(*)::integer as count
+         from pg_catalog.pg_type type_row
+         join pg_catalog.pg_namespace namespace_row
+           on namespace_row.oid = type_row.typnamespace
+         where namespace_row.nspname = 'drizzle' and type_row.typname = $1`,
+        [collisionName]
+      );
+  equal(seeded.count, 1, `${fixture} seeds one exact non-public generated-name collision`);
+}
+
+async function runPlan7aGeneratedObjectCollisionFixture(
+  pool: Pool,
+  fixture: Plan7aGeneratedObjectCollisionFixture
+): Promise<void> {
+  await prepareCommitted0014Fixture(pool);
+  try {
+    await seedPlan7aGeneratedObjectCollision(pool, fixture);
+    const catalogAfterSeed = await plan7aDatabaseCatalogState(pool);
+    const generatedCatalogAfterSeed = await plan7aGeneratedObjectCatalogState(pool);
+    const journalAt0014 = await plan7aMigrationJournalState(pool);
+    let migrationError: unknown;
+    try {
+      await runCommittedPlan6biiAttestedMigration(
+        pool,
+        await createMigrationFolderThrough(15)
+      );
+    } catch (error) {
+      migrationError = error;
+    }
+    const postgresError = unwrapPostgresError(migrationError);
+    assert(postgresError !== null, `${fixture} exposes the object-namespace preflight error`);
+    equal(postgresError.code, '42501', `${fixture} uses the fixed insufficient-authority code`);
+    equal(
+      postgresError.message,
+      'Plan 7A operations authority object namespace is not canonical',
+      `${fixture} uses the fixed safe object-namespace message`
+    );
+    equal(await migrationCount(pool), 15, `${fixture} leaves the journal at exact 0014`);
+    equal(
+      await plan7aMigrationJournalState(pool),
+      journalAt0014,
+      'generated object collision rollback leaves every exact 0014 journal row unchanged'
+    );
+    await assertPlan7aObjectsAbsent(
+      pool,
+      'generated object collision rollback removes every 0015 object'
+    );
+    equal(
+      await plan7aDatabaseCatalogState(pool),
+      catalogAfterSeed,
+      `${fixture} rollback preserves the complete public and authority catalog`
+    );
+    equal(
+      await plan7aGeneratedObjectCatalogState(pool),
+      generatedCatalogAfterSeed,
+      'generated object collision rollback preserves the seeded catalog exactly'
+    );
+    await assertPlan7aTransactionSettingsCleared(pool);
+  } finally {
+    await dropPlan6biiAttestedRoles(pool);
+  }
+}
+
+interface Plan7aLockObservation {
+  readonly pid: number;
+  readonly blockers: number[];
+  readonly wait_event_type: string | null;
+  readonly relation_locks: string[];
+}
+
+function plan7aNamespaceRaceKind(fixture: Plan7aNamespaceRaceFixture): Plan7aNamespaceRaceKind {
+  return fixture.replace(
+    /^plan7a-operations-(?:prelock|postlock)-/u,
+    ''
+  ) as Plan7aNamespaceRaceKind;
+}
+
+function plan7aRaceApplicationName(
+  fixture: Plan7aNamespaceRaceFixture,
+  participant: 'writer' | 'migrator'
+): string {
+  const phase = fixture.includes('-postlock-') ? 'post' : 'pre';
+  const kind = {
+    'job-type': 'jt',
+    'deduplication-prefix': 'dp',
+    'audit-action-prefix': 'aa',
+    'resource-type': 'rt'
+  } as const;
+  const applicationName =
+    `p7a-${phase}-${kind[plan7aNamespaceRaceKind(fixture)]}-${participant}-${randomUUID()}`;
+  assert(
+    Buffer.byteLength(applicationName, 'utf8') <= 63,
+    'Plan 7A race application_name exceeds PostgreSQL NAMEDATALEN'
+  );
+  return applicationName;
+}
+
+function plan7aNamespaceRaceRelation(kind: Plan7aNamespaceRaceKind): 'jobs' | 'audit_events' {
+  return kind === 'job-type' || kind === 'deduplication-prefix'
+    ? 'jobs'
+    : 'audit_events';
+}
+
+async function waitForPlan7aNamedLock(
+  pool: Pool,
+  applicationName: string,
+  operation: Promise<unknown>,
+  predicate: (observation: Plan7aLockObservation) => boolean,
+  description: string
+): Promise<Plan7aLockObservation> {
+  let latestObservation: Plan7aLockObservation | undefined;
+  const observation = (async () => {
+    for (let poll = 0; poll < 500; poll += 1) {
+      const result = await pool.query<Plan7aLockObservation>(`
+        select activity.pid, activity.wait_event_type,
+          pg_catalog.pg_blocking_pids(activity.pid) as blockers,
+          array(
+            select relation_row.relname || ':' || lock_row.mode || ':' ||
+              lock_row.granted::text
+            from pg_catalog.pg_locks lock_row
+            join pg_catalog.pg_class relation_row on relation_row.oid = lock_row.relation
+            where lock_row.pid = activity.pid
+              and relation_row.relname in ('jobs', 'audit_events')
+            order by relation_row.relname, lock_row.mode, lock_row.granted
+          )::text[] as relation_locks
+        from pg_catalog.pg_stat_activity activity
+        where activity.application_name = $1
+      `, [applicationName]);
+      const current = result.rows[0];
+      latestObservation = current;
+      if (current !== undefined && predicate(current)) return current;
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`[financial-migration-test] ${description}`);
+  })();
+  return Promise.race([
+    observation,
+    operation.then(
+      () => { throw new Error(`[financial-migration-test] ${description}: operation completed`); },
+      (error: unknown) => {
+        const postgresError = unwrapPostgresError(error);
+        const failure = postgresError === null
+          ? 'non-PostgreSQL failure'
+          : `${postgresError.code}: ${postgresError.message}`;
+        throw new Error(
+          `[financial-migration-test] ${description}: operation failed before observation ` +
+          `(${failure}; last observation ${JSON.stringify(latestObservation ?? null)})`
+        );
+      }
+    )
+  ]);
+}
+
+async function createPlan7aWorkerPool(pool: Pool): Promise<Pool> {
+  const password = `plan7a-${randomUUID()}-${randomUUID()}`;
+  await pool.query(await formattedRoleStatement(
+    pool,
+    'alter role %I password %L',
+    PLAN6BII_ATTESTED_IDENTITIES.workerUser,
+    password
+  ));
+  return new Pool({
+    host: process.env.DATABASE_HOST,
+    port: Number(process.env.DATABASE_PORT),
+    database: process.env.DATABASE_NAME,
+    user: PLAN6BII_ATTESTED_IDENTITIES.workerUser,
+    password,
+    max: 1,
+    connectionTimeoutMillis: 5_000
+  });
+}
+
+async function beginPlan7aNamespaceMutation(
+  workerPool: Pool,
+  applicationName: string
+): Promise<{ readonly client: PoolClient; readonly pid: number }> {
+  const client = await workerPool.connect();
+  try {
+    await client.query('begin');
+    await client.query(
+      `select pg_catalog.set_config('application_name', $1, true),
+        pg_catalog.set_config('lock_timeout', '5s', true)`,
+      [applicationName]
+    );
+    const provenanceId = randomUUID();
+    await client.query(
+      `select pg_catalog.set_config(setting_name, $1, true)
+       from pg_catalog.unnest(array[
+         'pale_orbit.plan7a_operations_command_insert_id',
+         'pale_orbit.plan7a_operations_command_transition_id',
+         'pale_orbit.plan7a_operations_job_transition_id'
+       ]::text[]) setting_name`,
+      [provenanceId]
+    );
+    await client.query(
+      `select pg_catalog.set_config(
+        'pale_orbit.plan7a_operations_job_capability', $1, true
+      )`,
+      [randomUUID().replaceAll('-', '') + randomUUID().replaceAll('-', '').slice(0, 11)]
+    );
+    const pid = (await one<{ pid: number }>(
+      client,
+      'select pg_catalog.pg_backend_pid() as pid'
+    )).pid;
+    return { client, pid };
+  } catch (error) {
+    await client.query('rollback').catch(() => undefined);
+    client.release(true);
+    throw error;
+  }
+}
+
+async function seedPlan7aRacePrerequisite(
+  pool: Pool,
+  kind: Plan7aNamespaceRaceKind,
+  rowId: string
+): Promise<void> {
+  if (kind !== 'deduplication-prefix') return;
+  await pool.query(
+    `insert into public.jobs (id, type, payload, deduplication_key)
+     values ($1, 'email.send', '{"plan7aRace":true}'::jsonb, $2)`,
+    [rowId, `plan7a-race-ordinary-${rowId}`]
+  );
+}
+
+function plan7aNamespaceMutation(
+  client: PoolClient,
+  kind: Plan7aNamespaceRaceKind,
+  rowId: string
+): Promise<unknown> {
+  if (kind === 'job-type') {
+    return client.query(
+      `insert into public.jobs (
+         type, payload, deduplication_key, max_attempts
+       ) values (
+         'operations.job-retry-command',
+         pg_catalog.jsonb_build_object('commandId', $1::uuid), $2, 8
+       )`,
+      [rowId, `plan7a-race-type-only-${rowId}`]
+    );
+  }
+  if (kind === 'deduplication-prefix') {
+    return client.query(
+      `update public.jobs set deduplication_key = $2 where id = $1`,
+      [rowId, `operations:job-retry-command:${rowId}:race`]
+    );
+  }
+  return client.query(
+    `insert into public.audit_events (
+       id, actor_type, actor_id, action, outcome, resource_type, resource_id,
+       correlation_id
+     ) values (
+       $1, 'system', 'financial-worker', $2, 'succeeded', $3, $4, $5
+     )`,
+    [
+      rowId,
+      kind === 'audit-action-prefix'
+        ? 'operations.job_retry.race'
+        : 'commerce.fixture',
+      kind === 'resource-type' ? 'operations_job_retry_command' : 'order',
+      randomUUID(),
+      randomUUID()
+    ]
+  );
+}
+
+async function createPlan7aPostlockBarrierFolder(barrierName: string): Promise<string> {
+  assert(
+    /^plan7a-lock-barrier-[a-f0-9-]{36}$/u.test(barrierName),
+    'Plan 7A lock barrier name is invalid'
+  );
+  const folder = await createMigrationFolderThrough(15, barrierName);
+  const migrationPath = join(folder, '0015_plan7a_operations_authority.sql');
+  const source = await readFile(migrationPath, 'utf8');
+  const marker = '  LOCK TABLE "public"."audit_events" IN SHARE ROW EXCLUSIVE MODE;';
+  const first = source.indexOf(marker);
+  assert(first >= 0 && source.indexOf(marker, first + marker.length) < 0,
+    '0015 must contain one exact audit lock insertion point');
+  const transformed = source.replace(
+    marker,
+    `${marker}\n  PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(` +
+      `'${barrierName}', 0));`
+  );
+  await writeFile(migrationPath, transformed, 'utf8');
+  return folder;
+}
+
+async function assertPlan7aRaceResidue(
+  pool: Pool,
+  kind: Plan7aNamespaceRaceKind,
+  rowId: string,
+  expectedPresent: boolean
+): Promise<void> {
+  if (kind === 'deduplication-prefix') {
+    const row = await one<{ deduplication_key: string }>(
+      pool,
+      'select deduplication_key from public.jobs where id = $1',
+      [rowId]
+    );
+    equal(
+      row.deduplication_key,
+      expectedPresent
+        ? `operations:job-retry-command:${rowId}:race`
+        : `plan7a-race-ordinary-${rowId}`,
+      'reserved deduplication race leaves the exact expected row state'
+    );
+    return;
+  }
+  if (kind === 'job-type') {
+    const count = await one<{ count: number }>(
+      pool,
+      `select pg_catalog.count(*)::integer as count
+       from public.jobs where deduplication_key = $1`,
+      [`plan7a-race-type-only-${rowId}`]
+    );
+    equal(count.count, expectedPresent ? 1 : 0, 'job-type race leaves no unexpected row');
+    return;
+  }
+  const relation = 'audit_events';
+  const count = await one<{ count: number }>(
+    pool,
+    `select pg_catalog.count(*)::integer as count from public.${relation} where id = $1`,
+    [rowId]
+  );
+  equal(count.count, expectedPresent ? 1 : 0, 'namespace race leaves no unexpected row');
+}
+
+async function runPlan7aNamespaceRaceFixture(
+  pool: Pool,
+  fixture: Plan7aNamespaceRaceFixture
+): Promise<void> {
+  await prepareCommitted0014Fixture(pool);
+  const kind = plan7aNamespaceRaceKind(fixture);
+  const relation = plan7aNamespaceRaceRelation(kind);
+  const postlock = fixture.includes('-postlock-');
+  const rowId = randomUUID();
+  let workerPool: Pool | undefined;
+  let migrationOperation: Promise<void> | undefined;
+  let mutationOperation: Promise<unknown> | undefined;
+  try {
+    workerPool = await createPlan7aWorkerPool(pool);
+    await seedPlan7aRacePrerequisite(pool, kind, rowId);
+    if (!postlock) {
+      const mutationName = plan7aRaceApplicationName(fixture, 'writer');
+      const mutation = await beginPlan7aNamespaceMutation(workerPool, mutationName);
+      try {
+        await plan7aNamespaceMutation(mutation.client, kind, rowId);
+        const migrationName = plan7aRaceApplicationName(fixture, 'migrator');
+        migrationOperation = runCommittedPlan6biiAttestedMigration(
+          pool,
+          await createMigrationFolderThrough(15),
+          migrationName
+        );
+        const blocked = await waitForPlan7aNamedLock(
+          pool,
+          migrationName,
+          migrationOperation,
+          (state) => state.wait_event_type === 'Lock' &&
+            state.blockers.includes(mutation.pid) &&
+            state.relation_locks.includes(`${relation}:ShareRowExclusiveLock:false`),
+          `${fixture} migration did not visibly wait on ${relation}`
+        );
+        if (relation === 'jobs') {
+          assert(
+            !blocked.relation_locks.some((lock) => lock.startsWith('audit_events:')),
+            'jobs is the first protected-table lock acquisition'
+          );
+        } else {
+          assert(
+            blocked.relation_locks.includes('jobs:ShareRowExclusiveLock:true'),
+            'audit lock is attempted only after the jobs lock is granted'
+          );
+        }
+        await mutation.client.query('commit');
+        let migrationError: unknown;
+        try {
+          await migrationOperation;
+        } catch (error) {
+          migrationError = error;
+        }
+        const postgresError = unwrapPostgresError(migrationError);
+        assert(postgresError !== null, `${fixture} exposes the namespace preflight error`);
+        equal(postgresError.code, '55000', `${fixture} uses the fixed namespace SQLSTATE`);
+        equal(
+          postgresError.message,
+          'Plan 7A operations namespace is not empty',
+          `${fixture} uses the fixed namespace message`
+        );
+        equal(await migrationCount(pool), 15, `${fixture} does not advance the journal`);
+        await assertPlan7aObjectsAbsent(pool, `${fixture} creates no 0015 object`);
+        await assertPlan7aRaceResidue(pool, kind, rowId, true);
+      } finally {
+        await mutation.client.query('rollback').catch(() => undefined);
+        mutation.client.release();
+      }
+      return;
+    }
+
+    const barrierName = `plan7a-lock-barrier-${randomUUID()}`;
+    const barrier = await pool.connect();
+    const migrationName = plan7aRaceApplicationName(fixture, 'migrator');
+    let mutation: Awaited<ReturnType<typeof beginPlan7aNamespaceMutation>> | undefined;
+    try {
+      await barrier.query('begin');
+      const barrierPid = (await one<{ pid: number }>(
+        barrier,
+        'select pg_catalog.pg_backend_pid() as pid'
+      )).pid;
+      await barrier.query(
+        'select pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1, 0))',
+        [barrierName]
+      );
+      migrationOperation = runCommittedPlan6biiAttestedMigration(
+        pool,
+        await createPlan7aPostlockBarrierFolder(barrierName),
+        migrationName
+      );
+      const migrationBlocked = await waitForPlan7aNamedLock(
+        pool,
+        migrationName,
+        migrationOperation,
+        (state) => state.wait_event_type === 'Lock' &&
+          state.blockers.includes(barrierPid) &&
+          state.relation_locks.includes('jobs:ShareRowExclusiveLock:true') &&
+          state.relation_locks.includes('audit_events:ShareRowExclusiveLock:true'),
+        `${fixture} migration did not hold both protected locks at the barrier`
+      );
+      const mutationName = plan7aRaceApplicationName(fixture, 'writer');
+      mutation = await beginPlan7aNamespaceMutation(
+        workerPool,
+        mutationName
+      );
+      mutationOperation = plan7aNamespaceMutation(mutation.client, kind, rowId);
+      const mutationBlocked = await waitForPlan7aNamedLock(
+        pool,
+        mutationName,
+        mutationOperation,
+        (state) => state.wait_event_type === 'Lock' &&
+          state.blockers.includes(migrationBlocked.pid) &&
+          state.relation_locks.includes(`${relation}:RowExclusiveLock:false`),
+        `${fixture} writer did not visibly wait behind the migration`
+      );
+      equal(mutationBlocked.pid, mutation.pid, `${fixture} observes the exact writer backend`);
+      await barrier.query('rollback');
+      await migrationOperation;
+      let mutationError: unknown;
+      try {
+        await mutationOperation;
+      } catch (error) {
+        mutationError = error;
+      }
+      const postgresError = unwrapPostgresError(mutationError);
+      assert(postgresError !== null, `${fixture} resumes against the closed 0015 guard`);
+      equal(postgresError.code, '55000', `${fixture} guard rejection is fail-closed`);
+      await mutation.client.query('rollback');
+      equal(await migrationCount(pool), 16, `${fixture} commits 0015 exactly once`);
+      await assertPlan7aRaceResidue(pool, kind, rowId, false);
+    } finally {
+      await barrier.query('rollback').catch(() => undefined);
+      barrier.release();
+      if (mutation !== undefined) {
+        await mutation.client.query('rollback').catch(() => undefined);
+        mutation.client.release();
+      }
+    }
+  } finally {
+    if (migrationOperation !== undefined) {
+      await migrationOperation.catch(() => undefined);
+    }
+    if (mutationOperation !== undefined) {
+      await mutationOperation.catch(() => undefined);
+    }
+    if (workerPool !== undefined) await workerPool.end();
+    await dropPlan6biiAttestedRoles(pool);
+  }
+}
+
+async function runPlan7aPredecessorDriftFixture(
+  pool: Pool,
+  fixture: Plan7aPredecessorDriftFixture
+): Promise<void> {
+  await prepareCommitted0014Fixture(pool);
+  try {
+    equal(
+      await plan7aPredecessorStorageSha256(pool),
+      PLAN7A_PREDECESSOR_STORAGE_SHA256,
+      'committed 0014 jobs and audit storage has the reviewed Plan 7A fingerprint'
+    );
+    if (fixture === 'plan7a-predecessor-jobs-trigger-drift') {
+      await pool.query(
+        'drop trigger jobs_plan6b_web_insert_guard on public.jobs'
+      );
+    } else if (fixture === 'plan7a-predecessor-direct-acl-drift') {
+      await pool.query('grant select on public.jobs to public');
+    } else if (fixture === 'plan7a-predecessor-jobs-index-drift') {
+      await pool.query('drop index public.jobs_deduplication_key_unique');
+    } else {
+      await pool.query(
+        'alter default privileges in schema public ' +
+          'grant insert on tables to pale_orbit_runtime'
+      );
+    }
+    const catalogAfterDrift = await plan7aDatabaseCatalogState(pool);
+    const journalAt0014 = await plan7aMigrationJournalState(pool);
+    let migrationError: unknown;
+    try {
+      await runCommittedPlan6biiAttestedMigration(
+        pool,
+        await createMigrationFolderThrough(15)
+      );
+    } catch (error) {
+      migrationError = error;
+    }
+    const postgresError = unwrapPostgresError(migrationError);
+    assert(postgresError !== null, `${fixture} exposes the predecessor attestation error`);
+    equal(postgresError.code, '42501', `${fixture} fails with insufficient authority`);
+    equal(
+      postgresError.message,
+      fixture === 'plan7a-predecessor-jobs-trigger-drift'
+        ? 'Plan 7A operations authority relation baseline is not canonical'
+        : fixture === 'plan7a-predecessor-direct-acl-drift'
+          ? 'Plan 7A predecessor ACL inventory is not canonical'
+          : fixture === 'plan7a-predecessor-jobs-index-drift'
+            ? 'Plan 7A predecessor storage inventory is not canonical'
+            : 'Plan 7A operations authority settings are not canonical',
+      `${fixture} uses its fixed safe predecessor message`
+    );
+    equal(await migrationCount(pool), 15, `${fixture} leaves the journal at 0014`);
+    equal(
+      await plan7aMigrationJournalState(pool),
+      journalAt0014,
+      `${fixture} leaves every 0014 journal row unchanged`
+    );
+    await assertPlan7aObjectsAbsent(pool, `${fixture} creates no 0015 object`);
+    equal(
+      await plan7aDatabaseCatalogState(pool),
+      catalogAfterDrift,
+      `${fixture} leaves the committed predecessor drift unchanged`
+    );
+  } finally {
+    await dropPlan6biiAttestedRoles(pool);
+  }
+}
+
+interface Plan7aPostflightDriftOptions {
+  readonly fixture: 'plan7a-postflight-owner-acl-drift' |
+    'plan7a-postflight-audit-trigger-drift' |
+    'plan7a-postflight-column-acl-drift' |
+    'plan7a-postflight-claims-trigger-drift' |
+    'plan7a-postflight-generated-storage-drift' |
+    'plan7a-postflight-default-acl-drift' |
+    'plan7a-postflight-historical-inheritance-drift';
+  readonly migrationFolder: () => Promise<string>;
+  readonly expectedMessage: string;
+  readonly journalRollbackMessage: string;
+  readonly objectRollbackMessage: string;
+  readonly guardRollbackMessage: string;
+  readonly catalogRollbackMessage: string;
+}
+
+async function runPlan7aPostflightDriftFixture(
+  pool: Pool,
+  options: Plan7aPostflightDriftOptions
+): Promise<void> {
+  await prepareCommitted0014Fixture(pool);
+  try {
+    const catalogAt0014 = await plan7aDatabaseCatalogState(pool);
+    const guardsAt0014 = await plan7aHistoricalGuardState(pool);
+    const dataAt0014 = await plan7aHistoricalDataState(pool);
+    const journalAt0014 = await plan7aMigrationJournalState(pool);
+    let migrationError: unknown;
+    try {
+      await runCommittedPlan6biiAttestedMigration(
+        pool,
+        await options.migrationFolder()
+      );
+    } catch (error) {
+      migrationError = error;
+    }
+    const postgresError = unwrapPostgresError(migrationError);
+    assert(postgresError !== null, `${options.fixture} exposes its postflight error`);
+    equal(postgresError.code, '42501', `${options.fixture} uses insufficient authority`);
+    equal(
+      postgresError.message,
+      options.expectedMessage,
+      `${options.fixture} uses its exact fixed postflight message`
+    );
+    equal(await migrationCount(pool), 15, `${options.fixture} leaves the journal at exact 0014`);
+    equal(
+      await plan7aMigrationJournalState(pool),
+      journalAt0014,
+      options.journalRollbackMessage
+    );
+    await assertPlan7aObjectsAbsent(pool, options.objectRollbackMessage);
+    equal(
+      await plan7aHistoricalGuardState(pool),
+      guardsAt0014,
+      options.guardRollbackMessage
+    );
+    equal(
+      await plan7aHistoricalDataState(pool),
+      dataAt0014,
+      `${options.fixture} rollback preserves historical data exactly`
+    );
+    equal(
+      await plan7aDatabaseCatalogState(pool),
+      catalogAt0014,
+      options.catalogRollbackMessage
+    );
+    await assertPlan7aTransactionSettingsCleared(pool);
+  } finally {
+    await dropPlan6biiAttestedRoles(pool);
+  }
+}
+
+function runPlan7aPostflightOwnerAclDriftFixture(pool: Pool): Promise<void> {
+  return runPlan7aPostflightDriftFixture(pool, {
+    fixture: 'plan7a-postflight-owner-acl-drift',
+    migrationFolder: createPlan7aOwnerAclDriftMigrationFolder,
+    expectedMessage: 'Plan 7A operations authority ACL postflight failed',
+    journalRollbackMessage:
+      'owner ACL postflight rollback leaves every exact 0014 journal row unchanged',
+    objectRollbackMessage: 'owner ACL postflight rollback removes every 0015 object',
+    guardRollbackMessage: 'owner ACL postflight rollback restores both historical guards exactly',
+    catalogRollbackMessage: 'owner ACL postflight rollback preserves the complete 0014 catalog'
+  });
+}
+
+function runPlan7aPostflightAuditTriggerDriftFixture(pool: Pool): Promise<void> {
+  return runPlan7aPostflightDriftFixture(pool, {
+    fixture: 'plan7a-postflight-audit-trigger-drift',
+    migrationFolder: createPlan7aAuditTriggerDriftMigrationFolder,
+    expectedMessage: 'Plan 7A operations authority trigger postflight failed',
+    journalRollbackMessage:
+      'audit trigger postflight rollback leaves every exact 0014 journal row unchanged',
+    objectRollbackMessage: 'audit trigger postflight rollback removes every 0015 object',
+    guardRollbackMessage:
+      'audit trigger postflight rollback restores both historical guards exactly',
+    catalogRollbackMessage:
+      'audit trigger postflight rollback preserves the complete 0014 catalog'
+  });
+}
+
+function runPlan7aPostflightColumnAclDriftFixture(pool: Pool): Promise<void> {
+  return runPlan7aPostflightDriftFixture(pool, {
+    fixture: 'plan7a-postflight-column-acl-drift',
+    migrationFolder: createPlan7aColumnAclDriftMigrationFolder,
+    expectedMessage: 'Plan 7A operations authority ACL postflight failed',
+    journalRollbackMessage:
+      'column ACL postflight rollback leaves every exact 0014 journal row unchanged',
+    objectRollbackMessage: 'column ACL postflight rollback removes every 0015 object',
+    guardRollbackMessage:
+      'column ACL postflight rollback restores both historical guards exactly',
+    catalogRollbackMessage:
+      'column ACL postflight rollback preserves the complete 0014 catalog'
+  });
+}
+
+function runPlan7aPostflightClaimsTriggerDriftFixture(pool: Pool): Promise<void> {
+  return runPlan7aPostflightDriftFixture(pool, {
+    fixture: 'plan7a-postflight-claims-trigger-drift',
+    migrationFolder: createPlan7aClaimsTriggerDriftMigrationFolder,
+    expectedMessage: 'Plan 7A operations authority trigger postflight failed',
+    journalRollbackMessage:
+      'claims trigger postflight rollback leaves every exact 0014 journal row unchanged',
+    objectRollbackMessage: 'claims trigger postflight rollback removes every 0015 object',
+    guardRollbackMessage:
+      'claims trigger postflight rollback restores both historical guards exactly',
+    catalogRollbackMessage:
+      'claims trigger postflight rollback preserves the complete 0014 catalog'
+  });
+}
+
+function runPlan7aPostflightGeneratedStorageDriftFixture(pool: Pool): Promise<void> {
+  return runPlan7aPostflightDriftFixture(pool, {
+    fixture: 'plan7a-postflight-generated-storage-drift',
+    migrationFolder: createPlan7aGeneratedStorageDriftMigrationFolder,
+    expectedMessage: 'Plan 7A operations authority descriptor postflight failed',
+    journalRollbackMessage:
+      'generated storage postflight rollback leaves every exact 0014 journal row unchanged',
+    objectRollbackMessage:
+      'generated storage postflight rollback removes every 0015 object',
+    guardRollbackMessage:
+      'generated storage postflight rollback restores both historical guards exactly',
+    catalogRollbackMessage:
+      'generated storage postflight rollback preserves the complete 0014 catalog'
+  });
+}
+
+function runPlan7aPostflightDefaultAclDriftFixture(pool: Pool): Promise<void> {
+  return runPlan7aPostflightDriftFixture(pool, {
+    fixture: 'plan7a-postflight-default-acl-drift',
+    migrationFolder: createPlan7aDefaultAclDriftMigrationFolder,
+    expectedMessage: 'Plan 7A operations authority settings are not canonical',
+    journalRollbackMessage:
+      'default ACL postflight rollback leaves every exact 0014 journal row unchanged',
+    objectRollbackMessage: 'default ACL postflight rollback removes every 0015 object',
+    guardRollbackMessage:
+      'default ACL postflight rollback restores both historical guards exactly',
+    catalogRollbackMessage:
+      'default ACL postflight rollback preserves the complete 0014 catalog'
+  });
+}
+
+function runPlan7aPostflightHistoricalInheritanceDriftFixture(pool: Pool): Promise<void> {
+  return runPlan7aPostflightDriftFixture(pool, {
+    fixture: 'plan7a-postflight-historical-inheritance-drift',
+    migrationFolder: createPlan7aHistoricalInheritanceDriftMigrationFolder,
+    expectedMessage: 'Plan 7A operations authority trigger postflight failed',
+    journalRollbackMessage:
+      'historical inheritance postflight rollback leaves every exact 0014 journal row unchanged',
+    objectRollbackMessage:
+      'historical inheritance postflight rollback removes every 0015 object',
+    guardRollbackMessage:
+      'historical inheritance postflight rollback restores both historical guards exactly',
+    catalogRollbackMessage:
+      'historical inheritance postflight rollback preserves the complete 0014 catalog'
+  });
+}
+
+async function runPlan7aMigrationContextDriftFixture(
+  pool: Pool,
+  fixture: Plan7aMigrationContextDriftFixture
+): Promise<void> {
+  await prepareCommitted0014Fixture(pool);
+  try {
+    const catalogAt0014 = await plan7aDatabaseCatalogState(pool);
+    const journalAt0014 = await plan7aMigrationJournalState(pool);
+    const migrationsThrough15 = await createMigrationFolderThrough(15);
+    const client = await pool.connect();
+    type SearchPathState = {
+      current_schema: string;
+      current_schemas: string;
+      search_path: string;
+    };
+    let canonicalContext: SearchPathState | undefined;
+    let restoredContext: SearchPathState | undefined;
+    try {
+      canonicalContext = await one<SearchPathState>(
+        client,
+        `select pg_catalog.current_schema()::text as current_schema,
+           pg_catalog.current_schemas(false)::text as current_schemas,
+           pg_catalog.current_setting('search_path') as search_path`
+      );
+      equal(
+        {
+          current_schema: canonicalContext.current_schema,
+          current_schemas: canonicalContext.current_schemas
+        },
+        { current_schema: 'public', current_schemas: '{public}' },
+        `${fixture} begins with the canonical migration namespace`
+      );
+      await client.query(
+        `select pg_catalog.set_config('search_path', 'public, drizzle', false)`
+      );
+      equal(
+        await one<{ current_schema: string; current_schemas: string }>(
+          client,
+          `select pg_catalog.current_schema()::text as current_schema,
+             pg_catalog.current_schemas(false)::text as current_schemas`
+        ),
+        { current_schema: 'public', current_schemas: '{public,drizzle}' },
+        `${fixture} exposes the exact noncanonical migration namespace`
+      );
+
+      let migrationError: unknown;
+      try {
+        await migrateDatabase(
+          drizzle(client),
+          PLAN6BII_ATTESTED_IDENTITIES,
+          migrationsThrough15
+        );
+      } catch (error) {
+        migrationError = error;
+      }
+      const postgresError = unwrapPostgresError(migrationError);
+      assert(postgresError !== null, `${fixture} exposes the search-path attestation error`);
+      equal(postgresError.code, '42501', `${fixture} fails with insufficient authority`);
+      equal(
+        postgresError.message,
+        'Plan 7A operations authority search path is not canonical',
+        `${fixture} uses the fixed safe search-path message`
+      );
+      await assertPlan6biiMigrationSettingsCleared(client);
+      await assertPlan7aTransactionSettingsCleared(client);
+    } finally {
+      try {
+        if (canonicalContext !== undefined) {
+          await client.query(
+            `select pg_catalog.set_config('search_path', $1, false)`,
+            [canonicalContext.search_path]
+          );
+          restoredContext = await one<SearchPathState>(
+            client,
+            `select pg_catalog.current_schema()::text as current_schema,
+               pg_catalog.current_schemas(false)::text as current_schemas,
+               pg_catalog.current_setting('search_path') as search_path`
+          );
+        }
+      } finally {
+        client.release();
+      }
+    }
+    assert(canonicalContext !== undefined, `${fixture} captured the canonical namespace`);
+    equal(
+      restoredContext,
+      canonicalContext,
+      `${fixture} restores the canonical migration search path without residue`
+    );
+    equal(await migrationCount(pool), 15, `${fixture} leaves the journal at 0014`);
+    equal(
+      await plan7aMigrationJournalState(pool),
+      journalAt0014,
+      `${fixture} leaves every 0014 journal row unchanged`
+    );
+    await assertPlan7aObjectsAbsent(pool, `${fixture} creates no 0015 object`);
+    equal(
+      await plan7aDatabaseCatalogState(pool),
+      catalogAt0014,
+      `${fixture} leaves the complete 0014 catalog unchanged`
+    );
+  } finally {
+    await dropPlan6biiAttestedRoles(pool);
+  }
+}
+
 async function runValidFixture(pool: Pool): Promise<void> {
   const client = await pool.connect();
   let fixture: LegacyFixture;
@@ -6262,7 +8573,23 @@ async function main(): Promise<void> {
       'legacy-entitlement-projection',
       'storage-cleanup-authority-preflight',
       'plan6bii-admin-command-authority',
-      'plan6bii-issue-transition-fail-closed'
+      'plan6bii-issue-transition-fail-closed',
+      'plan7a-upgrade-atomicity',
+      'plan7a-operations-job-type-collision',
+      'plan7a-operations-deduplication-prefix-collision',
+      'plan7a-operations-audit-action-prefix-collision',
+      'plan7a-operations-resource-type-collision',
+      ...PLAN7A_GENERATED_OBJECT_COLLISION_FIXTURES,
+      ...PLAN7A_NAMESPACE_RACE_FIXTURES,
+      ...PLAN7A_PREDECESSOR_DRIFT_FIXTURES,
+      'plan7a-postflight-owner-acl-drift',
+      'plan7a-postflight-audit-trigger-drift',
+      'plan7a-postflight-column-acl-drift',
+      'plan7a-postflight-claims-trigger-drift',
+      'plan7a-postflight-generated-storage-drift',
+      'plan7a-postflight-default-acl-drift',
+      'plan7a-postflight-historical-inheritance-drift',
+      ...PLAN7A_MIGRATION_CONTEXT_DRIFT_FIXTURES
     ] as const) {
       const result = spawnSync(
         process.execPath,
@@ -6311,7 +8638,20 @@ async function main(): Promise<void> {
       rawFixture === 'legacy-entitlement-projection' ||
       rawFixture === 'storage-cleanup-authority-preflight' ||
       rawFixture === 'plan6bii-admin-command-authority' ||
-      rawFixture === 'plan6bii-issue-transition-fail-closed',
+      rawFixture === 'plan6bii-issue-transition-fail-closed' ||
+      rawFixture === 'plan7a-upgrade-atomicity' ||
+      isPlan7aNamespaceCollisionFixture(rawFixture) ||
+      isPlan7aGeneratedObjectCollisionFixture(rawFixture) ||
+      isPlan7aNamespaceRaceFixture(rawFixture) ||
+      isPlan7aPredecessorDriftFixture(rawFixture) ||
+      rawFixture === 'plan7a-postflight-owner-acl-drift' ||
+      rawFixture === 'plan7a-postflight-audit-trigger-drift' ||
+      rawFixture === 'plan7a-postflight-column-acl-drift' ||
+      rawFixture === 'plan7a-postflight-claims-trigger-drift' ||
+      rawFixture === 'plan7a-postflight-generated-storage-drift' ||
+      rawFixture === 'plan7a-postflight-default-acl-drift' ||
+      rawFixture === 'plan7a-postflight-historical-inheritance-drift' ||
+      isPlan7aMigrationContextDriftFixture(rawFixture),
     `unknown fixture ${rawFixture ?? '<missing>'}`
   );
   if (rawFixture === 'plan6bii-admin-command-authority') {
@@ -6344,6 +8684,32 @@ async function main(): Promise<void> {
       await runStorageCleanupAuthorityPreflightFixture(pool);
     } else if (rawFixture === 'plan6bii-issue-transition-fail-closed') {
       await runPlan6biiIssueTransitionFailClosedFixture(pool);
+    } else if (rawFixture === 'plan7a-upgrade-atomicity') {
+      await runPlan7aUpgradeAtomicityFixture(pool);
+    } else if (isPlan7aNamespaceCollisionFixture(rawFixture)) {
+      await runPlan7aNamespaceCollisionFixture(pool, rawFixture);
+    } else if (isPlan7aGeneratedObjectCollisionFixture(rawFixture)) {
+      await runPlan7aGeneratedObjectCollisionFixture(pool, rawFixture);
+    } else if (isPlan7aNamespaceRaceFixture(rawFixture)) {
+      await runPlan7aNamespaceRaceFixture(pool, rawFixture);
+    } else if (isPlan7aPredecessorDriftFixture(rawFixture)) {
+      await runPlan7aPredecessorDriftFixture(pool, rawFixture);
+    } else if (rawFixture === 'plan7a-postflight-owner-acl-drift') {
+      await runPlan7aPostflightOwnerAclDriftFixture(pool);
+    } else if (rawFixture === 'plan7a-postflight-audit-trigger-drift') {
+      await runPlan7aPostflightAuditTriggerDriftFixture(pool);
+    } else if (rawFixture === 'plan7a-postflight-column-acl-drift') {
+      await runPlan7aPostflightColumnAclDriftFixture(pool);
+    } else if (rawFixture === 'plan7a-postflight-claims-trigger-drift') {
+      await runPlan7aPostflightClaimsTriggerDriftFixture(pool);
+    } else if (rawFixture === 'plan7a-postflight-generated-storage-drift') {
+      await runPlan7aPostflightGeneratedStorageDriftFixture(pool);
+    } else if (rawFixture === 'plan7a-postflight-default-acl-drift') {
+      await runPlan7aPostflightDefaultAclDriftFixture(pool);
+    } else if (rawFixture === 'plan7a-postflight-historical-inheritance-drift') {
+      await runPlan7aPostflightHistoricalInheritanceDriftFixture(pool);
+    } else if (isPlan7aMigrationContextDriftFixture(rawFixture)) {
+      await runPlan7aMigrationContextDriftFixture(pool, rawFixture);
     } else await runInvalidFixture(pool, rawFixture);
     console.info(`[financial-migration-test] ${rawFixture} fixture passed`);
   } finally {

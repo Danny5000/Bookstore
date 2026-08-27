@@ -51,7 +51,7 @@ describe('atomic deployment backup bundle', () => {
     expect(JSON.parse(await readFile(join(root, 'backup-bundle.json'), 'utf8'))).toEqual(manifest);
   });
 
-  it('authenticates the current calibrated catalog-v4 verifier exactly once', async () => {
+  it('authenticates the current calibrated Plan 7A catalog-v1 verifier exactly once', async () => {
     const verifier = await readFile('scripts/verify-financial-restore.sql', 'utf8');
     await writeFile(join(root, 'verify-financial-restore.sql'), verifier);
     const expectedEvidence = await hashDeploymentBackupArtifact(
@@ -66,10 +66,10 @@ describe('atomic deployment backup bundle', () => {
     )).toHaveLength(1);
     expect(manifest.artifacts['verify-financial-restore.sql']).toEqual(expectedEvidence);
     expect(await readFile(join(root, 'verify-financial-restore.sql'), 'utf8')).toBe(verifier);
-    expect(verifier.match(/plan6b-financial-catalog-v\d+/gu)).toEqual([
-      'plan6b-financial-catalog-v4'
+    expect(verifier.match(/plan7a-database-catalog-v\d+/gu)).toEqual([
+      'plan7a-database-catalog-v1'
     ]);
-    expect(verifier).not.toContain('plan6b-financial-catalog-v1');
+    expect(verifier).not.toContain('plan6b-financial-catalog-v4');
     expect(/'0{64}'/u.test(verifier)).toBe(false);
     expect(verifier.includes('$catalog${}$catalog$')).toBe(false);
   });

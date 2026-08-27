@@ -44,9 +44,9 @@ function directNodeHarnessEnvironment(): NodeJS.ProcessEnv {
   return process.env;
 }
 
-export const financialWitnessHarnessTimeoutMs = 1_200_000;
+export const financialWitnessHarnessTimeoutMs = 2_400_000;
 const financialWitnessCloseGraceMs = 15_000;
-export const financialWitnessTestTimeoutMs = 1_500_000;
+export const financialWitnessTestTimeoutMs = 2_700_000;
 const testDatabaseProjectPattern = /^pale-orbit-test-[0-9a-f]{16}$/u;
 const testStorageDirectoryPattern = /^pale-orbit-test-storage-[A-Za-z0-9_-]+$/u;
 const composeTestFilePath = resolve(
