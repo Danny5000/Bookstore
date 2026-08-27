@@ -16,6 +16,7 @@ import {
   defineSafeCode,
   reduceSafeError
 } from '../observability/safe-error';
+import { FINANCIAL_ADMIN_COMMAND_JOB } from './catalog';
 import type {
   JobAttemptIdentity,
   JobDiagnosticMetadataParser,
@@ -45,7 +46,6 @@ export class JobLeaseLostError extends Error {
 }
 
 type WorkerSleep = (milliseconds: number, signal: AbortSignal) => Promise<void>;
-const FINANCIAL_ADMIN_COMMAND_JOB = 'commerce.financial-admin-command';
 const FINANCIAL_ADMIN_LEASE_CAPABILITY_PATTERN = /^[A-Za-z0-9_-]{43}$/u;
 const MAX_DURATION_MS = 86_400_000;
 

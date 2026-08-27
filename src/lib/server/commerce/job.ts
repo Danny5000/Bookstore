@@ -1,9 +1,10 @@
 import { z } from 'zod';
 import { permanentStripeFailure } from './stripe/errors';
 
-export const STRIPE_EVENT_JOB = 'commerce.stripe-event' as const;
-// With the production 1s base and 5m cap, 12 attempts cover about 18.5 minutes.
-export const STRIPE_EVENT_JOB_MAX_ATTEMPTS = 12;
+export {
+  STRIPE_EVENT_JOB,
+  STRIPE_EVENT_JOB_MAX_ATTEMPTS
+} from '$lib/server/jobs/catalog';
 
 const stripeEventJobPayloadSchema = z.strictObject({
   stripeEventId: z.uuid()

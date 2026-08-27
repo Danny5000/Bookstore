@@ -274,6 +274,10 @@ describe('financial allocation schema declarations', () => {
     expect(query).toMatch(
       /active_classification_job_markers[\s\S]+?classification_job\.deduplication_key\s*=\s*'financial:classification:'[\s\S]+?classification_job\.status <> 'succeeded'/u
     );
+    expect(query).toContain(
+      "classification_job.type = 'commerce.financial-classification'"
+    );
+    expect(query).not.toContain('classification_job.type = $');
     expect(query).toMatch(
       /selected_set_issue_count = 0 and active_job_marker_count = 0[\s\S]+?as is_complete/u
     );

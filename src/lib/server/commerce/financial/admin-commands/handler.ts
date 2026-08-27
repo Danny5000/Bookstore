@@ -18,6 +18,10 @@ import {
   withTransaction,
   type DatabaseTransaction,
 } from "$lib/server/db/transaction";
+import {
+  FINANCIAL_ADMIN_COMMAND_JOB,
+  FINANCIAL_ADMIN_COMMAND_MAX_ATTEMPTS,
+} from "$lib/server/jobs/catalog";
 import { PermanentJobError } from "$lib/server/jobs/runner";
 import type { JobHandler, JobRecord } from "$lib/server/jobs/types";
 import {
@@ -45,10 +49,7 @@ export {
   FinancialAdminPermanentError,
 } from "./errors";
 
-export const FINANCIAL_ADMIN_COMMAND_JOB =
-  "commerce.financial-admin-command" as const;
-
-const FINANCIAL_ADMIN_COMMAND_MAX_ATTEMPTS = 8;
+export { FINANCIAL_ADMIN_COMMAND_JOB } from "$lib/server/jobs/catalog";
 const CANONICAL_UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const LEASE_CAPABILITY = /^[A-Za-z0-9_-]{43}$/u;

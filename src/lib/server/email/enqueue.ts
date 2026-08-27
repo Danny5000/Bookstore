@@ -38,8 +38,7 @@ export async function queueAuthEmail(database: Database, input: QueueAuthEmailIn
   await withTransaction(database, async (transaction) => {
     await enqueueOutboxMessage(transaction, {
       topic: AUTH_EMAIL_TOPIC,
-      payload,
-      maxAttempts: 8
+      payload
     });
   });
 }

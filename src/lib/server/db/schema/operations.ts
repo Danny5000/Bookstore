@@ -11,7 +11,10 @@ import {
   uniqueIndex,
   uuid
 } from 'drizzle-orm/pg-core';
+import { INGEST_REVISION_JOB } from '$lib/server/jobs/catalog';
 import type { JsonObject, JsonValue } from './json';
+
+const INGEST_REVISION_JOB_SQL = sql.raw(`'${INGEST_REVISION_JOB}'`);
 
 export const jobStatus = pgEnum('job_status', ['pending', 'running', 'succeeded', 'failed']);
 export const outboxStatus = pgEnum('outbox_status', ['pending', 'delivered', 'failed']);
@@ -48,7 +51,7 @@ export const jobs = pgTable(
     index('jobs_failed_updated_idx').on(table.status, table.updatedAt),
     index('jobs_active_ingest_revision_identity_idx')
       .on(sql`(${table.payload} ->> 'revisionId')`, sql`(${table.payload} ->> 'generation')`)
-      .where(sql`${table.type} = 'catalog.ingest_revision' and ${table.status} in ('pending', 'running')`),
+      .where(sql`${table.type} = ${INGEST_REVISION_JOB_SQL} and ${table.status} in ('pending', 'running')`),
     check('jobs_attempts_nonnegative', sql`${table.attempts} >= 0`),
     check('jobs_max_attempts_positive', sql`${table.maxAttempts} > 0`),
     check(

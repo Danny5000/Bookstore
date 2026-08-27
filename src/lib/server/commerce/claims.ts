@@ -18,6 +18,7 @@ import {
 } from '$lib/server/jobs/repository';
 import {
   COMMERCE_CLAIM_REQUEST_JOB,
+  COMMERCE_CLAIM_REQUEST_JOB_MAX_ATTEMPTS,
   createClaimEmailJobPayload
 } from './claim-email';
 import { PermanentCommerceError } from './errors';
@@ -192,7 +193,7 @@ export async function requestGuestClaimEmails(
         payload: createClaimEmailJobPayload(order.id),
         deduplicationKey:
           `commerce:claim-request:order:${order.id}:window:${windowNumber}:v1`,
-        maxAttempts: 8
+        maxAttempts: COMMERCE_CLAIM_REQUEST_JOB_MAX_ATTEMPTS
       });
     }
   });

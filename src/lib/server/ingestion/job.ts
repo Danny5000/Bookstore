@@ -1,8 +1,12 @@
 import { z } from 'zod';
 import type { DatabaseExecutor } from '$lib/server/db/transaction';
+import {
+  INGEST_REVISION_JOB,
+  INGEST_REVISION_JOB_MAX_ATTEMPTS
+} from '$lib/server/jobs/catalog';
 import { enqueueJobReference } from '$lib/server/jobs/repository';
 
-export const INGEST_REVISION_JOB = 'catalog.ingest_revision';
+export { INGEST_REVISION_JOB } from '$lib/server/jobs/catalog';
 
 const revisionIngestionPayloadSchema = z.strictObject({
   revisionId: z.uuid(),
@@ -25,6 +29,6 @@ export function enqueueRevisionIngestion(
     type: INGEST_REVISION_JOB,
     payload,
     deduplicationKey: `catalog.ingest:${revisionId}:${generation}`,
-    maxAttempts: 5
+    maxAttempts: INGEST_REVISION_JOB_MAX_ATTEMPTS
   });
 }

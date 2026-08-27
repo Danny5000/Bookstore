@@ -89,7 +89,6 @@ describe('transactional commerce email enqueue', () => {
     expect(test.enqueueOutboxMessage).toHaveBeenLastCalledWith(transaction, {
       topic: 'email.commerce.v1',
       deduplicationKey: `commerce:receipt:order:${orderId}:v1`,
-      maxAttempts: 8,
       payload: expect.objectContaining({
         version: 1,
         template: 'commerce.account-receipt',
@@ -185,7 +184,6 @@ describe('transactional commerce email enqueue', () => {
     expect(test.enqueueOutboxMessage).toHaveBeenLastCalledWith(transaction, {
       topic: 'email.commerce.v1',
       deduplicationKey: `commerce:access-change:event:${eventId}:v1`,
-      maxAttempts: 8,
       payload: expect.objectContaining({
         messageId: eventId,
         libraryUrl: `${origin}/library`,
@@ -223,7 +221,6 @@ describe('transactional commerce email enqueue', () => {
     expect(test.enqueueOutboxMessage).toHaveBeenLastCalledWith(transaction, {
       topic: 'email.commerce.v1',
       deduplicationKey: expectedKey,
-      maxAttempts: 8,
       payload: {
         version: 1,
         template: 'commerce.administrative-recovery-access-changed',

@@ -15,6 +15,7 @@ import {
   varchar,
   type AnyPgColumn
 } from 'drizzle-orm/pg-core';
+import { FINANCIAL_CLASSIFICATION_JOB } from '$lib/server/jobs/catalog';
 import { user } from './auth';
 import {
   disputes,
@@ -32,6 +33,8 @@ import {
   stripeBalanceTransactions
 } from './financial-provider';
 import { jobs } from './operations';
+
+const FINANCIAL_CLASSIFICATION_JOB_SQL = sql.raw(`'${FINANCIAL_CLASSIFICATION_JOB}'`);
 
 export const allocationBasisValues = ['gross_amount', 'fee'] as const;
 export const allocationScopeValues = ['title', 'account', 'unresolved'] as const;
@@ -736,7 +739,7 @@ export const currentFinancialProjectionHeads = pgView('current_financial_project
     from ${stripeBalanceTransactions} bt
     cross join active_projection_version
     left join ${jobs} classification_job
-      on classification_job.type = 'commerce.financial-classification'
+      on classification_job.type = ${FINANCIAL_CLASSIFICATION_JOB_SQL}
       and classification_job.deduplication_key =
         'financial:classification:' || active_projection_version.classifier_version::text ||
         ':' || active_projection_version.allocation_algorithm_version::text ||

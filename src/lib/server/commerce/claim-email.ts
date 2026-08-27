@@ -17,8 +17,12 @@ import {
 } from '$lib/server/outbox/repository';
 import type { CommerceMessageEnqueuer } from './email/enqueue';
 
-export const COMMERCE_CLAIM_EMAIL_JOB = 'commerce.claim-email' as const;
-export const COMMERCE_CLAIM_REQUEST_JOB = 'commerce.claim-email-request' as const;
+export {
+  COMMERCE_CLAIM_EMAIL_JOB,
+  COMMERCE_CLAIM_EMAIL_JOB_MAX_ATTEMPTS,
+  COMMERCE_CLAIM_REQUEST_JOB,
+  COMMERCE_CLAIM_REQUEST_JOB_MAX_ATTEMPTS
+} from '$lib/server/jobs/catalog';
 
 export const claimEmailJobPayloadSchema = z.strictObject({
   orderId: z.uuid()

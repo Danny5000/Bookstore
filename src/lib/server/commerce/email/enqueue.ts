@@ -17,6 +17,7 @@ import { PermanentCommerceError } from '../errors';
 import type { PurchaseMessageEnqueuer } from '../fulfillment';
 import {
   COMMERCE_CLAIM_EMAIL_JOB,
+  COMMERCE_CLAIM_EMAIL_JOB_MAX_ATTEMPTS,
   createClaimEmailJobPayload
 } from '../claim-email';
 import {
@@ -217,8 +218,7 @@ export function createCommerceMessageEnqueuer(
       topic: COMMERCE_EMAIL_TOPIC,
       payload: asJson(payload),
       deduplicationKey:
-        deduplicationKey ?? `commerce:receipt:order:${canonicalOrderId}:v1`,
-      maxAttempts: 8
+        deduplicationKey ?? `commerce:receipt:order:${canonicalOrderId}:v1`
     });
   }
 
@@ -232,7 +232,7 @@ export function createCommerceMessageEnqueuer(
         type: COMMERCE_CLAIM_EMAIL_JOB,
         payload: createClaimEmailJobPayload(canonicalOrderId),
         deduplicationKey: `commerce:claim-email:order:${canonicalOrderId}:v1`,
-        maxAttempts: 8
+        maxAttempts: COMMERCE_CLAIM_EMAIL_JOB_MAX_ATTEMPTS
       });
     },
 
@@ -277,8 +277,7 @@ export function createCommerceMessageEnqueuer(
           payload: asJson(payload),
           deduplicationKey:
             `commerce:recovery-access:${recovery.recoveryGrantId}:` +
-            `${recovery.accessState}:${Date.parse(recovery.stateChangedAt)}`,
-          maxAttempts: 8
+            `${recovery.accessState}:${Date.parse(recovery.stateChangedAt)}`
         });
         return;
       }
@@ -296,8 +295,7 @@ export function createCommerceMessageEnqueuer(
       await dependencies.enqueueOutboxMessage(transaction, {
         topic: COMMERCE_EMAIL_TOPIC,
         payload: asJson(payload),
-        deduplicationKey: `commerce:access-change:event:${eventId}:v1`,
-        maxAttempts: 8
+        deduplicationKey: `commerce:access-change:event:${eventId}:v1`
       });
     }
   };

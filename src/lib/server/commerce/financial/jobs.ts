@@ -1,5 +1,11 @@
 import { z } from 'zod';
 import {
+  FINANCIAL_CLASSIFICATION_JOB,
+  FINANCIAL_PAYOUT_JOB,
+  FINANCIAL_SCAN_JOB,
+  FINANCIAL_SOURCE_JOB
+} from '$lib/server/jobs/catalog';
+import {
   FINANCIAL_CLASSIFICATION_JOB_MAX_ATTEMPTS,
   FINANCIAL_GENERATION_MAX,
   FINANCIAL_PAYOUT_JOB_MAX_ATTEMPTS,
@@ -8,10 +14,12 @@ import {
 } from './constants';
 import { PermanentFinancialError } from './errors';
 
-export const FINANCIAL_SOURCE_JOB = 'commerce.financial-source' as const;
-export const FINANCIAL_PAYOUT_JOB = 'commerce.financial-payout' as const;
-export const FINANCIAL_SCAN_JOB = 'commerce.financial-scan' as const;
-export const FINANCIAL_CLASSIFICATION_JOB = 'commerce.financial-classification' as const;
+export {
+  FINANCIAL_CLASSIFICATION_JOB,
+  FINANCIAL_PAYOUT_JOB,
+  FINANCIAL_SCAN_JOB,
+  FINANCIAL_SOURCE_JOB
+} from '$lib/server/jobs/catalog';
 
 const sourceKindSchema = z.enum(['payment', 'refund', 'dispute']);
 const uuidSchema = z.uuid().transform((value) => value.toLowerCase());

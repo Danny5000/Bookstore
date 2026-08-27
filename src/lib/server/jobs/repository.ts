@@ -20,6 +20,10 @@ import {
 } from '$lib/server/commerce/financial/constants';
 import { STRIPE_EVENT_JOB } from '$lib/server/commerce/job';
 import { computeRetryDelayMs } from './backoff';
+import {
+  FINANCIAL_ADMIN_COMMAND_JOB,
+  definitionForJobKind
+} from './catalog';
 import type { JobFailureTransition, JobRecord, JobRepository } from './types';
 
 export interface EnqueueJobInput {
@@ -36,7 +40,7 @@ export interface EnqueuedJobReference {
 
 export type EnqueueActiveEntityJobInput =
   | (EnqueueJobInput & {
-      readonly type: 'commerce.financial-source';
+      readonly type: typeof FINANCIAL_SOURCE_JOB;
       readonly deduplicationKey: string;
       readonly maxAttempts: number;
       readonly activeEntity: {
@@ -45,7 +49,7 @@ export type EnqueueActiveEntityJobInput =
       };
     })
   | (EnqueueJobInput & {
-      readonly type: 'commerce.financial-payout';
+      readonly type: typeof FINANCIAL_PAYOUT_JOB;
       readonly deduplicationKey: string;
       readonly maxAttempts: number;
       readonly activeEntity: { readonly providerPayoutId: string };
@@ -352,7 +356,7 @@ export function jobInsertQuery(input: EnqueueJobInput): SQL {
       ${canonicalPayload}::jsonb,
       ${input.deduplicationKey ?? null}::text,
       coalesce(${input.runAt ?? null}::timestamptz, pg_catalog.now()),
-      ${input.maxAttempts ?? 5}::integer
+      ${input.maxAttempts ?? definitionForJobKind(input.type)?.maxAttempts ?? 5}::integer
     )
     on conflict ("deduplication_key") do nothing
     returning "id"
@@ -370,7 +374,7 @@ export function jobReferenceInsertQuery(input: EnqueueJobInput): SQL {
         ${canonicalPayload}::jsonb,
         ${input.deduplicationKey ?? null}::text,
         coalesce(${input.runAt ?? null}::timestamptz, pg_catalog.now()),
-        ${input.maxAttempts ?? 5}::integer
+        ${input.maxAttempts ?? definitionForJobKind(input.type)?.maxAttempts ?? 5}::integer
       )
       on conflict ("deduplication_key") do nothing
       returning "id"
@@ -552,7 +556,6 @@ interface LockedOwnedJob extends ClaimedJobRow {
 
 type FinancialAdminCapabilitySource = () => string;
 
-const FINANCIAL_ADMIN_COMMAND_JOB = 'commerce.financial-admin-command';
 const FINANCIAL_ADMIN_LEASE_CAPABILITY_PATTERN = /^[A-Za-z0-9_-]{43}$/u;
 const FINANCIAL_ADMIN_LEASE_LOCK_PREFIX =
   'pale-orbit:plan6bii-financial-admin-job-lease:';

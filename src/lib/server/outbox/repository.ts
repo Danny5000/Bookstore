@@ -2,15 +2,18 @@ import { createHash, randomUUID } from 'node:crypto';
 import { eq, sql, type SQL } from 'drizzle-orm';
 import { outboxMessages, type JsonObject, type OutboxMessageRow } from '$lib/server/db/schema';
 import type { DatabaseExecutor, DatabaseTransaction } from '$lib/server/db/transaction';
+import {
+  OUTBOX_DISPATCH_JOB,
+  OUTBOX_DISPATCH_JOB_MAX_ATTEMPTS
+} from '$lib/server/jobs/catalog';
 import { enqueueJobReference } from '$lib/server/jobs/repository';
 
-export const OUTBOX_DISPATCH_JOB = 'outbox.dispatch';
+export { OUTBOX_DISPATCH_JOB } from '$lib/server/jobs/catalog';
 
 export interface EnqueueOutboxMessageInput {
   topic: string;
   payload: JsonObject;
   deduplicationKey?: string | null;
-  maxAttempts?: number;
 }
 
 export class OutboxDeduplicationInvariantError extends Error {
@@ -148,7 +151,7 @@ export async function enqueueOutboxMessage(
     type: OUTBOX_DISPATCH_JOB,
     payload: { outboxId },
     deduplicationKey: dispatchDeduplicationKey,
-    maxAttempts: input.maxAttempts ?? 8
+    maxAttempts: OUTBOX_DISPATCH_JOB_MAX_ATTEMPTS
   });
 
   const values: OutboxMessageInsertValues = {
