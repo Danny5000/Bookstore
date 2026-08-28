@@ -452,6 +452,114 @@ describe('job operations application boundaries', () => {
     expect(service.match(/await auditDenied\(/gu)).toHaveLength(1);
   });
 
+  it('keeps every current operator guide aligned with Checkpoint C head', async () => {
+    const currentGuidePaths = [
+      'README.md',
+      'docs/authentication-and-email.md',
+      'docs/commerce-and-guest-claims.md',
+      'docs/customer-library-and-reader.md',
+      'docs/database-and-workers.md',
+      'docs/dependency-decisions.md',
+      'docs/financial-reconciliation-and-reporting.md',
+      'docs/runtime-environments.md',
+      'docs/storage-ingestion-and-publication.md',
+      'docs/stripe-financial-reconciliation.md'
+    ] as const;
+    const guides = await Promise.all(currentGuidePaths.map(async (path) => ({
+      path,
+      value: await source(path)
+    })));
+    for (const guide of guides) {
+      expect(guide.value, guide.path).toContain('Plan 7A Checkpoint C');
+      expect(guide.value, guide.path).toContain(
+        'migration chain ends at `0015_plan7a_operations_authority`'
+      );
+      expect(guide.value, guide.path).toContain(
+        'executable verifier is `plan7a-database-catalog-v1`'
+      );
+
+      const prose = guide.value.replace(/```[\s\S]*?```/gu, '');
+      for (const [index, paragraph] of prose.split(/\r?\n\s*\r?\n/u).entries()) {
+        if (!/`0014(?:_[^`]*)?`|plan6b-financial-catalog-v4/u.test(paragraph)) continue;
+        expect(
+          /(?:historical|legacy|bundle-authenticated)/iu.test(paragraph),
+          `${guide.path} prose paragraph ${index + 1} presents Plan 6B head/verifier history as current`
+        ).toBe(true);
+      }
+    }
+
+    const currentOperatorCorpus = guides.map((guide) => guide.value).join('\n');
+    const canonicalGuide = guides.find(
+      (guide) => guide.path === 'docs/commerce-and-guest-claims.md'
+    )?.value;
+    expect(canonicalGuide).toBeDefined();
+    const canonicalCheckpointCSection = canonicalGuide?.match(
+      /^## Release state and authority\r?\n([\s\S]*?)(?=^## )/mu
+    )?.[1];
+    expect(canonicalCheckpointCSection).toBeDefined();
+    for (const [label, pattern] of [
+      ['migration head', /migration chain ends at `0015_plan7a_operations_authority`/u],
+      ['catalog verifier', /executable verifier is `plan7a-database-catalog-v1`/u],
+      ['backend authority', /backend-only list\/submit\/status/iu],
+      ['application authorization', /`jobs\.retry`/u],
+      ['database reauthorization', /current-role reauthorization/iu],
+      ['closed catalog', /exactly eleven production job kinds/iu],
+      ['enabled policies', /only pending Stripe-event rearm and exact financial-classification rearm are enabled/iu],
+      ['fixed disabled policies', /all other initial policies return disabled\/excluded fixed results/iu],
+      ['no generic reset', /no generic job reset/iu],
+      ['no delivered redelivery', /no delivered-outbox redelivery/iu],
+      ['no recursive retry', /no recursive command retry/iu],
+      ['no ingestion retry', /no general ingestion retry/iu],
+      ['provider isolation', /no provider call occurs/iu],
+      ['per-claim capability', /per-claim/iu],
+      ['transaction-local capability', /memory\/transaction-local only/iu],
+      ['digest-only persistence', /digest-persisted/iu],
+      ['non-environment capability', /not environment secrets/iu],
+      ['separate authorities', /financial-admin and revision-ingestion authorities remain separate/iu],
+      ['durable authority', /command, audit, and restore authority is exact/iu],
+      ['retained history', /command history is retained/iu],
+      ['no operations UI', /no operations route, page, navigation, polling, or button exists/iu],
+      ['production posture', /production (?:stays|remains) maintenance-only and Stripe-disabled/iu]
+    ] as const) {
+      expect(
+        pattern.test(canonicalCheckpointCSection ?? ''),
+        `missing canonical current ${label} guidance`
+      )
+        .toBe(true);
+    }
+
+    const deferredParagraph = canonicalCheckpointCSection
+      ?.split(/\r?\n\s*\r?\n/u)
+      .find((paragraph) => /Checkpoint D remain deferred/iu.test(paragraph));
+    expect(deferredParagraph).toBeDefined();
+    for (const [label, phrase] of [
+      ['monitoring', 'Monitoring/alerts'],
+      ['stage evidence', 'generalized stage evidence'],
+      ['activation', 'production-live activation'],
+      ['Stripe', 'Stripe enablement'],
+      ['candidate capture', 'fresh release-candidate capture'],
+      ['Checkpoint D', 'Checkpoint D remain deferred']
+    ] as const) {
+      expect(
+        deferredParagraph?.toLocaleLowerCase('en-US')
+          .includes(phrase.toLocaleLowerCase('en-US')),
+        `missing canonical deferred ${label} guidance`
+      ).toBe(true);
+    }
+
+    const storageGuide = guides.find(
+      (guide) => guide.path === 'docs/storage-ingestion-and-publication.md'
+    )?.value;
+    const legacyRestoreParagraph = storageGuide?.match(
+      /This legacy rollback procedure[^\r\n]*/u
+    )?.[0];
+    expect(legacyRestoreParagraph).toContain('`0014_plan6bii_issue_transition_fail_closed`');
+    expect(legacyRestoreParagraph).toContain('`plan6b-financial-catalog-v4`');
+    expect(currentOperatorCorpus).not.toMatch(
+      /Checkpoint D (?:is |has been )?(?:implemented|complete)/iu
+    );
+  });
+
   it('adds no route, UI, navigation, polling, public API, or provider boundary', async () => {
     for (const path of [
       'src/routes/admin/jobs',

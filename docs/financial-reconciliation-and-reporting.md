@@ -1,10 +1,12 @@
 # Financial Reconciliation and Reporting
 
-**Status:** Plan 6B implementation complete — protected Sales navigation live
+**Status:** Plan 6B implementation complete — protected Sales navigation live; Plan 7A Checkpoint C backend authority implemented
 
 This is the operator guide for the completed Plan 6B financial-ingestion, reconciliation, administrator-review, reporting, payout, and CSV implementation. The global administrator navigation now exposes the protected live `Sales` link to `/admin/sales`; the route and service capability checks described below still govern access. Production remains closed in `APPLICATION_MODE=maintenance`, and the base production defaults remain Stripe-disabled.
 
 Plan 6B reads the durable commerce facts established by Plan 6A. It does not replace checkout, refund, dispute, claim, or entitlement authority, and its reporting corrections never rewrite those facts.
+
+Plan 7A Checkpoint C adds a backend-only retry-command boundary over exactly eleven production job kinds; it adds no operations route, page, navigation, polling, or button. Only pending Stripe-event rearm and exact financial-classification rearm are enabled, and no provider call occurs in either retry adapter. The operations capability is per-claim, memory/transaction-local only, and digest-persisted rather than an environment secret. It cannot authorize financial-administrator or revision-ingestion work, whose authorities remain separate.
 
 ## Money, copies, and currency domains
 
@@ -49,6 +51,8 @@ The read surfaces require `sales.read`; CSV additionally requires `sales.export`
 
 Use the Sales overview to filter the stable title/currency rows. Summary groups never collapse unlike currency pairs. Use **Needs Review** for ambiguous refunds, immutable conflicts, unsupported classifications, and incomplete payout imports. A read-only issue is evidence to wait for canonical ingestion or a newer supported classifier, not permission to edit protected rows. There is no generic resolve or provider-retry control.
 
+Within the closed retry policy, `commerce.financial-classification` can rearm only the exact failed target whose active versions, identity, enrollment, and expected state still match. Financial source, payout, and scan retries remain disabled fixed results, while financial-administrator command retry remains an excluded fixed result. This boundary is not a generic reset or permission to edit a protected job.
+
 ## Refund draft and finalization
 
 An ambiguous succeeded refund may have one shared administrative allocation draft. Saving or discarding the draft changes no report, grant, entitlement, or customer email. Before finalization, verify:
@@ -89,6 +93,8 @@ Signed numeric columns remain canonical base-10 integers. Text-origin cells are 
 
 Financial mutations are submitted by the web process and executed by the financial worker. Poll only the returned owner-scoped command-status route; do not inspect or retry jobs directly.
 
+That financial command/status authority is distinct from the operations retry authority. A financial-administrator command job is excluded from retry, and neither authority's capability can authorize the other.
+
 | Status | Operator meaning |
 | --- | --- |
 | `pending` | The command is durably accepted or in progress; continue bounded polling. |
@@ -113,23 +119,23 @@ Apply the same boundary to diagnostics. Use internal IDs, state, counts, timesta
 2. Record the route, safe state label, internal resource ID, and correlation ID without copying private fields.
 3. Check readiness and the documented worker/service state. Do not start an extra worker against production data.
 4. Determine whether the row is `pending`, `exception`, `fee_reconciled`, or `payout_reconciled`, and compare the displayed freshness timestamp with the last successful bounded scan.
-5. For a pending command, use its owner-scoped status endpoint. For a conflict, refresh and review current canonical facts. For a terminal failure, preserve the row for Plan 7 operations; do not alter attempts or status.
+5. For a pending command, use its owner-scoped status endpoint. For a conflict, refresh and review current canonical facts. For a terminal failure, preserve the row and escalate with the bounded evidence above; the Checkpoint C backend policy has no operator caller, so do not alter attempts or status.
 6. For an issue, use only its named workflow. Never update protected ledger, allocation, membership, command, grant, job, or audit rows directly; never delete immutable evidence; never call Stripe from a report route; and never use ad hoc SQL to “resolve” state.
 
 If safe inspection cannot explain the state, stop. Keep maintenance mode enabled and escalate with only the bounded evidence above.
 
 ## Migration, principals, and deployment order
 
-The Plan 6B migration chain ends at `0014`. Migration `0012` retains its historical eight callable public boundary routines; `0013` adds only `resolve_financial_issue_after_reporting_correction_command(uuid, uuid)`, producing the final nine-routine callable surface; and `0014` changes no callable surface while replacing the nullable issue-transition trigger guard with a fail-closed definition. Missing or partial transaction-local resolution context therefore rejects the protected transition instead of being accepted through SQL `NULL` semantics.
+The current migration chain ends at `0015_plan7a_operations_authority`, and the executable verifier is `plan7a-database-catalog-v1`. Historically, Plan 6B ended at `0014`: migration `0012` retained its eight callable public boundary routines; `0013` added only `resolve_financial_issue_after_reporting_correction_command(uuid, uuid)`, producing nine; and `0014` changed no callable surface while replacing the nullable issue-transition trigger guard with a fail-closed definition. Missing or partial transaction-local resolution context therefore rejects the protected transition instead of being accepted through SQL `NULL` semantics. Migration `0015` adds the separate operations command/claim authority without weakening that financial boundary; command, audit, and restore authority remains exact and command history is retained.
 
 The four pairwise-distinct login principals are exactly `DATABASE_OWNER_USER`, `DATABASE_USER` (web), `DATABASE_WORKER_USER` (financial worker), and `DATABASE_STORAGE_CLEANUP_USER` (storage cleanup). The web principal may submit commands, read its owner-scoped status, and append the route-authorized audit boundary; it cannot mutate protected financial state. Only the worker principal executes the allowlisted mutation routines. Storage cleanup retains only its narrow storage capability, and the owner is used only for ownership and migrations.
 
 For a Plan 6B release rehearsal, preserve this order:
 
-1. migrate through `0014` as the owner;
+1. migrate through `0015_plan7a_operations_authority` as the owner;
 2. provision and attest the four-role boundary;
 3. capture the versioned checkpoint artifacts;
 4. rehearse restore on a distinct database engine with app and general worker stopped; and
 5. run the production-image smoke gate.
 
-Do not reorder these steps or treat a same-engine check as the restore rehearsal. Production remains closed in `APPLICATION_MODE=maintenance`, and the base production defaults remain Stripe-disabled after Plan 6B implementation completion. The live protected Sales navigation does not activate production. Plan 7 owns launch activation, monitoring and alerts, general retry administration, automated off-host backup scheduling, deployment hardening, capacity/pool tuning, and the final production launch.
+Do not reorder these steps or treat a same-engine check as the restore rehearsal. Production remains closed in `APPLICATION_MODE=maintenance`, and the base production defaults remain Stripe-disabled after Plan 6B implementation completion. The live protected Sales navigation and the Checkpoint C backend do not activate production. Monitoring/alerts, generalized stage evidence, production-live activation, Stripe enablement, fresh release-candidate capture, Checkpoint D, automated off-host backup scheduling, deployment hardening, capacity/pool tuning, and the final production launch remain deferred.

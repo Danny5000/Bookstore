@@ -60,11 +60,13 @@ npm run verify
 
 Development uses the PostgreSQL catalog, private EPUB/CBZ storage, background ingestion, revision review/publication, public previews, server-owned commerce and entitlement grants, customer libraries and reader state, authenticated original downloads, and an audited admin dashboard. Stripe is disabled by default and production Compose remains fixed to maintenance mode.
 
-**Status:** Plan 6B complete; Plan 7A Checkpoints A and B implemented
+**Status:** Plan 6B complete; Plan 7A Checkpoint C implemented; Plan 7A remains incomplete
 
-The completed Plan 6B implementation includes financial ingestion and reconciliation plus direct administrator review, refund finalization, reporting correction, recovery, payout, Sales reporting, and CSV routes. The protected global Sales link is live for authorized administrators. The migration chain ends at `0014`: `0012` retains its historical eight callable public boundary routines, `0013` adds the ninth, and `0014` changes no callable surface while replacing the nullable issue-transition trigger guard with a fail-closed definition. The four pairwise-distinct login principals are `DATABASE_OWNER_USER`, `DATABASE_USER`, `DATABASE_WORKER_USER`, and `DATABASE_STORAGE_CLEANUP_USER`; the web principal submits commands, reads owner-scoped status, and completes route-authorized detail/export audits while only the financial-worker principal executes protected financial mutations. The required release-evidence order remains migrate, role provision, checkpoint capture, distinct-engine rehearsal, then production-image smoke. Production must remain in maintenance mode with Stripe-disabled defaults.
+The completed Plan 6B implementation includes financial ingestion and reconciliation plus direct administrator review, refund finalization, reporting correction, recovery, payout, Sales reporting, and CSV routes. The protected global Sales link is live for authorized administrators. At current head, the migration chain ends at `0015_plan7a_operations_authority`, and the executable verifier is `plan7a-database-catalog-v1`. Historically, `0012` retained eight callable public boundary routines, `0013` added the ninth, and `0014` changed no callable surface while replacing the nullable issue-transition trigger guard with a fail-closed definition; `0015` adds the separate operations-command authority. The four pairwise-distinct login principals remain `DATABASE_OWNER_USER`, `DATABASE_USER`, `DATABASE_WORKER_USER`, and `DATABASE_STORAGE_CLEANUP_USER`. The required evidence order remains migrate, role provision, checkpoint capture, distinct-engine rehearsal, then production-image smoke. Production remains maintenance-only and Stripe-disabled.
 
-Plan 7A Checkpoint A dependency and test boundaries are implemented. Plan 7A Checkpoint B structured logging, correlation, and worker freshness are implemented. Plan 7A is not complete.
+Plan 7A Checkpoints A and B provide dependency/test boundaries, structured logging, correlation, and worker freshness. Plan 7A Checkpoint C adds a backend-only list/submit/status surface protected first by `jobs.retry` and then by database current-role reauthorization. The closed catalog contains exactly eleven production job kinds. Only pending Stripe-event rearm and exact financial-classification rearm are enabled; all other initial policies return disabled/excluded fixed results. No provider call occurs on this operations path. There is no generic job reset, no delivered-outbox redelivery, no recursive command retry, and no general ingestion retry.
+
+Operations capabilities are per-claim, memory/transaction-local only, digest-persisted, and not environment secrets. Financial-admin and revision-ingestion authorities remain separate. Command, audit, and restore authority is exact, and command history is retained. No operations route, page, navigation, polling, or button exists.
 
 ## Routes
 
@@ -119,5 +121,5 @@ Versioned authentication and commerce messages use the PostgreSQL outbox and pro
 
 ## Deferred work
 
-- General job operations and retry administration, monitoring and alert transport, generalized release and smoke evidence, scheduled off-host backups, deployment automation and hardening, final pool and capacity tuning, production activation, and Stripe enablement remain deferred.
+- Operations UI, monitoring/alerts, generalized stage evidence, production-live activation, Stripe enablement, fresh release-candidate capture, and Checkpoint D remain deferred, together with scheduled off-host backups, deployment automation and hardening, and final pool and capacity tuning.
 - Search, series grouping, pre-orders, and reviews.

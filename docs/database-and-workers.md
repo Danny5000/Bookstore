@@ -1,8 +1,8 @@
 # Database and workers
 
-**Status:** Plan 6B complete; Plan 7A Checkpoints A and B implemented
+**Status:** Plan 6B complete; Plan 7A Checkpoints A-C implemented
 
-The completed unified Plan 6B implementation is migrated through `0014`. Migration `0012` retains its historical eight callable public boundary routines; `0013` adds only the correction-resolution routine, for a final surface of nine; and `0014` changes no callable surface while replacing the nullable issue-transition trigger guard with a fail-closed definition. The protected global Sales link and direct routes are live for authorized administrators, but production must remain `APPLICATION_MODE=maintenance` with Stripe-disabled defaults. Plan 7A Checkpoints A and B are implemented, but Plan 7A is not complete. See [financial reconciliation and reporting](financial-reconciliation-and-reporting.md) for the existing operator boundary.
+The current migration chain ends at `0015_plan7a_operations_authority`, and the executable verifier is `plan7a-database-catalog-v1`. Historically, the completed unified Plan 6B implementation ended at `0014`: migration `0012` retained its eight callable public boundary routines, `0013` added only the correction-resolution routine, and `0014` changed no callable surface while replacing the nullable issue-transition trigger guard with a fail-closed definition. Plan 7A Checkpoint C is now implemented, but Checkpoint D is not. The protected global Sales link and direct routes are live for authorized administrators, while production remains maintenance-only and Stripe-disabled. See [financial reconciliation and reporting](financial-reconciliation-and-reporting.md) for the financial operator boundary.
 
 ## Ownership
 
@@ -11,6 +11,8 @@ Drizzle schema files under `src/lib/server/db/schema/` are the database model so
 The web process, migration command, worker, and storage-cleanup command each own a bounded node-postgres pool. The web process uses PostgreSQL for readiness. The worker claims durable jobs from PostgreSQL, dispatches transactional outbox messages, ingests revision sources from private object storage, reduces accepted `stripe_events`, prepares guest-claim email, and runs bounded financial source, payout, scan, and classification work. PostgreSQL owns the queue, durable cursors, version checkpoint, locks, financial issues, and immutable ledger history; Redis is not part of the current topology.
 
 Plan 6B financial relations are read-only to the web. The web principal can submit allowlisted administrator commands, read only its owner-scoped status, and append the route-authorized audit boundary through the exact public routines; it cannot execute their protected mutations. The financial worker alone receives the exact routine and `INSERT`/`UPDATE` authority used by source, payout, scan, classification, allocation, correction, and issue publication; neither runtime role receives `DELETE`. The same boundary covers canonical `payments`, `refunds`, `refund_allocations`, and `disputes`. Webhook intake can append only the immutable provider-identity columns of `stripe_events`; database defaults create pending/unprocessed state and only the worker can update completion. New public tables receive SELECT-only default privileges for the web role, so adding a financial table requires an explicit reviewed worker grant rather than silently inheriting web writes.
+
+Plan 7A Checkpoint C adds a backend-only list/submit/status surface protected by `jobs.retry` and current-role reauthorization. Operations capabilities are per-claim, memory/transaction-local only, and digest-persisted; they are not environment secrets. Financial-admin and revision-ingestion authorities remain separate from that operations authority. Command, audit, and restore authority is exact, and command history is retained rather than deleted or rewritten.
 
 ## Local schema changes
 
@@ -91,7 +93,7 @@ The validator treats missing, malformed, stale, too-far-future, wrong-slot-count
 
 For a host-run or development environment, run `npm run worker:health`. Development Compose invokes `node --import tsx src/worker-health.ts`; the production image invokes `node build/services/worker-health.js`. Compose does not restart a container merely because it is unhealthy. In production, fatal publisher failure exits nonzero under `restart: unless-stopped`, allowing Docker to replace the failed worker.
 
-Checkpoint B deliberately adds no monitoring or alert transport, generalized smoke evidence, operations catalog or UI, activation input, production-live mode, or Stripe enablement. Those remain later-checkpoint work.
+Plan 7A Checkpoint C adds the closed operations catalog and backend authority without adding an operations UI or activation input. Monitoring and alert transport, generalized release evidence, production-live mode, and Stripe enablement remain later-checkpoint work.
 
 ## Tests
 
@@ -118,7 +120,7 @@ npm run test:plan6b-upgrade
 
 ## Production deployment order
 
-The Plan 6B release-evidence order is exact: migrate through `0014`, provision and attest the four principals, capture the versioned checkpoint, rehearse it on a distinct database engine, then run the production-image smoke. A later step cannot substitute for or precede an earlier one.
+The current release-evidence order is exact: migrate through `0015_plan7a_operations_authority`, provision and attest the four principals, run the `plan7a-database-catalog-v1` executable verifier as part of checkpoint capture, rehearse on a distinct database engine, then run the production-image smoke. A later step cannot substitute for or precede an earlier one.
 
 Production configuration comes from the invoking process environment; no production `.env` file is used. When upgrading an existing PostgreSQL data volume created by the former single-login topology, set `DATABASE_OWNER_USER` to the existing database owner (and use its existing secret); you must not reuse that owner name for `DATABASE_USER`, `DATABASE_WORKER_USER`, or `DATABASE_STORAGE_CLEANUP_USER`. Choose three new login names and secrets for web, worker, and cleanup. An already-split owner/web/worker deployment preserves those pairs and adds the fourth cleanup pair. Role provisioning deliberately rejects a proposed runtime login that owns the database or public application objects, or that inherits unexpected roles, instead of silently weakening the boundary.
 
@@ -168,6 +170,8 @@ docker compose --file compose.prod.yaml logs --tail 100 app worker postgres cadd
 
 Workers claim one job at a time with `FOR UPDATE SKIP LOCKED`. A lease timestamp makes work recoverable after a process crash. Each claim increments attempts. Transient failures return to `pending` with bounded exponential delay; permanent or exhausted work moves to `failed` for the future admin operations view.
 
+The closed catalog contains exactly eleven production job kinds. Only pending Stripe-event rearm and exact financial-classification rearm are enabled; all other initial policies return disabled/excluded fixed results. No generic job reset, no delivered-outbox redelivery, no recursive command retry, and no general ingestion retry exists. No provider call occurs during operations retry.
+
 Handlers persist only deliberately safe error text. The outbox pairs a message and dispatch job in the caller's transaction and delivers at least once. A message already recorded as delivered is not sent again on ordinary job replay, while topic handlers remain responsible for the crash window between an external side effect and the `deliveredAt` update.
 
 Revision-ingestion jobs copy accepted sources to immutable original keys, produce deterministic derived assets, and commit a generation only while it is still current. Transient storage/database/timeout failures retry automatically; permanent archive/content failures require an administrator retry only when the staged source is still intact, or a new immutable upload. See [storage, ingestion, publication, and recovery](storage-ingestion-and-publication.md) for cleanup, capacity, backup, and restore operations.
@@ -182,7 +186,7 @@ In fixture or Stripe mode, the poll hook converges concurrent workers on an init
 
 Exact payout membership is published only after complete filtered pagination for a currently paid automatic standard payout with reconciliation completed. Manual and instant payouts keep complete fee evidence but no invented membership. Payout publication/failure increments a generation and enqueues bounded source-impact work, so derived state is not a stale cached flag. See [Stripe financial reconciliation](stripe-financial-reconciliation.md) for safe diagnosis, backup/restore order, and invariant checks.
 
-Safe operations may inspect IDs, types/topics, status, attempts, reconciliation state, and timestamps. Do not select job/outbox payloads, purchase emails, action URLs, webhook signatures, raw provider bodies, credential-authority hashes/reset epochs, secrets, or card/address data. Credential-authority integrity diagnostics return aggregate mismatch counts only and never repair state by copying the live account hash. Preserve failed jobs and event exceptions for review; Plan 7 owns an authorized retry control. See [commerce and guest-claim operations](commerce-and-guest-claims.md).
+Safe operations may inspect IDs, types/topics, status, attempts, reconciliation state, and timestamps. Do not select job/outbox payloads, purchase emails, action URLs, webhook signatures, raw provider bodies, credential-authority hashes/reset epochs, secrets, or card/address data. Credential-authority integrity diagnostics return aggregate mismatch counts only and never repair state by copying the live account hash. Preserve failed jobs and event exceptions for review and escalation; the bounded backend retry policy has no operator caller, so never alter job attempts or status directly. See [commerce and guest-claim operations](commerce-and-guest-claims.md).
 
 ## Scope of later plans
 
@@ -191,4 +195,4 @@ Safe operations may inspect IDs, types/topics, status, attempts, reconciliation 
 - Plan 5 added the six entitlement/reader-state tables and semantic fingerprint columns. Reader migration is synchronous under ordered transaction locks; it is not a worker job.
 - Plan 6A added Stripe reconciliation, commerce email/claim jobs, purchase grants, and refund/dispute access reduction.
 - Plan 6B combines completed financial ingestion/reconciliation with administrator resolution and reporting, and its protected global Sales link is live.
-- Plan 7A Checkpoints A and B added dependency/test boundaries plus structured logging, diagnostic correlation, and worker freshness. General failed-job operations, queue-age monitoring and alert delivery, generalized release evidence, scheduled off-host backups, deployment hardening, final pool/capacity tuning, activation, and Stripe enablement remain deferred.
+- Plan 7A Checkpoints A-C added dependency/test boundaries, structured logging, diagnostic correlation, worker freshness, and the bounded backend operations authority. No operations route, page, navigation, polling, or button exists. Monitoring/alerts, generalized stage evidence, production-live activation, Stripe enablement, fresh release-candidate capture, and Checkpoint D remain deferred.
