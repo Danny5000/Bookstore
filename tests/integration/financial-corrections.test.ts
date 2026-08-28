@@ -450,7 +450,7 @@ async function claimCommand(expectedCommandId: string, label: string): Promise<C
   const capability = leaseCapability(label);
   const repository = createPostgresJobRepository(
     workerDatabaseClient.db,
-    { ...applicationConfig.jobs, leaseMs: 5_000 },
+    { ...applicationConfig.jobs, leaseMs: 60_000 },
     undefined,
     'local-only',
     { classifierVersion: 1, allocationAlgorithmVersion: 1 },
