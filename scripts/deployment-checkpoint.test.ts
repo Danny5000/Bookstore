@@ -193,7 +193,7 @@ describe('deployment checkpoint authenticated inputs', () => {
     expect(rowCountSql).not.toContain('operations_job_retry_claims');
   });
 
-  it('publishes one canonical current-v4 CLI and runbook flow', async () => {
+  it('publishes one canonical current Plan 7A CLI and runbook flow', async () => {
     const packageJson = JSON.parse(await readFile('package.json', 'utf8')) as {
       scripts: Record<string, string>;
     };
@@ -208,9 +208,13 @@ describe('deployment checkpoint authenticated inputs', () => {
     expect(current).toContain('npm run deployment:checkpoint -- rehearse');
     expect(current).not.toContain('npm run storage:backup-volumes');
     expect(current).not.toContain('npm run backup:bundle');
-    expect(current).toContain('plan6b-financial-catalog-v4');
-    expect(current).toContain('0014_plan6bii_issue_transition_fail_closed');
+    expect(current).toContain('plan7a-database-catalog-v1');
+    expect(current).toContain('0015_plan7a_operations_authority');
+    expect(current).not.toContain('plan6b-financial-catalog-v4');
+    expect(current).not.toContain('0014_plan6bii_issue_transition_fail_closed');
     expect(current).toContain('financial_admin_job_claims');
+    expect(current).toContain('operations_job_retry_commands');
+    expect(current).toContain('operations_job_retry_claims');
     expect(current).toContain('every ordinary or partitioned base table');
     for (const path of ['docs/database-and-workers.md', 'docs/runtime-environments.md']) {
       const runbook = await readFile(path, 'utf8');
