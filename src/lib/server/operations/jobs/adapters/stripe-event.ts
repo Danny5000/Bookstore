@@ -1,5 +1,9 @@
 import { isProxy } from 'node:util/types';
 import { sql } from 'drizzle-orm';
+import {
+  STRIPE_EVENT_JOB,
+  STRIPE_EVENT_JOB_MAX_ATTEMPTS
+} from '$lib/server/jobs/catalog';
 import { rearmPendingStripeEventJob } from '$lib/server/jobs/repository';
 import {
   InvalidJobRetryPolicyIdentityError,
@@ -12,8 +16,6 @@ const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const TIMESTAMP_PATTERN =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/u;
-const STRIPE_EVENT_JOB = 'commerce.stripe-event';
-const STRIPE_EVENT_MAX_ATTEMPTS = 12;
 
 const REARMED = Object.freeze({
   status: 'succeeded',
@@ -137,7 +139,7 @@ function rearmPostconditionHolds(
   return ownDataValue(job, 'id') === target.targetJobId &&
     ownDataValue(job, 'status') === 'pending' &&
     ownDataValue(job, 'attempts') === 0 &&
-    ownDataValue(job, 'maxAttempts') === STRIPE_EVENT_MAX_ATTEMPTS &&
+    ownDataValue(job, 'maxAttempts') === STRIPE_EVENT_JOB_MAX_ATTEMPTS &&
     typeof timestamp === 'string' && TIMESTAMP_PATTERN.test(timestamp) &&
     ownDataValue(job, 'runAt') === timestamp &&
     ownDataValue(job, 'updatedAt') === timestamp &&
@@ -209,7 +211,7 @@ export function createStripeEventJobRetryPolicyAdapter(): JobRetryPolicyAdapter 
 
     if (
       ownDataValue(job, 'type') !== STRIPE_EVENT_JOB ||
-      ownDataValue(job, 'maxAttempts') !== STRIPE_EVENT_MAX_ATTEMPTS ||
+      ownDataValue(job, 'maxAttempts') !== STRIPE_EVENT_JOB_MAX_ATTEMPTS ||
       !exactStripeEventPayload(ownDataValue(job, 'payload'), stripeEventId) ||
       ownDataValue(job, 'deduplicationKey') !== `stripe:event:${providerEventId}`
     ) return RETRY_COMMAND_INVALID;
@@ -219,7 +221,7 @@ export function createStripeEventJobRetryPolicyAdapter(): JobRetryPolicyAdapter 
       ownDataValue(event, 'processedAt') !== null ||
       ownDataValue(job, 'status') !== 'failed' ||
       typeof ownDataValue(job, 'attempts') !== 'number' ||
-      (ownDataValue(job, 'attempts') as number) < STRIPE_EVENT_MAX_ATTEMPTS
+      (ownDataValue(job, 'attempts') as number) < STRIPE_EVENT_JOB_MAX_ATTEMPTS
     ) return DOMAIN_STATE_NOT_RETRYABLE;
 
     if (!await rearmPendingStripeEventJob(transaction, stripeEventId)) {

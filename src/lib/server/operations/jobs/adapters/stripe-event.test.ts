@@ -291,6 +291,9 @@ describe('Stripe event operations retry adapter', () => {
 
   it('contains no provider dependency or replacement update SQL', () => {
     const source = readFileSync(new URL('./stripe-event.ts', import.meta.url), 'utf8');
+    expect(source).toContain("from '$lib/server/jobs/catalog'");
+    expect(source).toContain('STRIPE_EVENT_JOB_MAX_ATTEMPTS');
+    expect(source).not.toMatch(/const\s+STRIPE_EVENT_(?:JOB|MAX_ATTEMPTS)\s*=/u);
     expect(source).not.toMatch(/StripeGateway|stripeRuntime|\.gateway\b|\bfetch\s*\(|from\s+['"]stripe['"]/u);
     expect(source).not.toMatch(/\bupdate\s+(?:"public"\.)?"?jobs"?/iu);
     expect(source).toContain('rearmPendingStripeEventJob');
