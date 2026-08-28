@@ -26,7 +26,9 @@ import {
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const TIMESTAMP_PATTERN =
-  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/u;
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\.(\d{6})Z$/u;
+const POSTGRES_TIMESTAMP_PATTERN =
+  /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?([+-])(\d{2})(?::(\d{2}))?$/u;
 const REQUIRED_PAYLOAD_KEYS = Object.freeze([
   'subjectType',
   'subjectId',
@@ -91,6 +93,9 @@ interface RearmPostconditionRow extends Record<string, unknown> {
   readonly runAt: unknown;
   readonly updatedAt: unknown;
   readonly transactionTimestamp: unknown;
+  readonly nativeRunAt: unknown;
+  readonly nativeUpdatedAt: unknown;
+  readonly nativeTransactionTimestamp: unknown;
 }
 
 function impossibleIdentity(): never {
@@ -261,9 +266,131 @@ function returnedPayloadMatches(
   return payload !== undefined && exactPayloadMatches(payload, expected);
 }
 
+function validTimestampFields(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number,
+  second: number
+): boolean {
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysByMonth = [
+    31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+  ];
+  return year >= 1 && month >= 1 && month <= 12 && day >= 1 &&
+    day <= daysByMonth[month - 1]! && hour <= 23 && minute <= 59 &&
+    second <= 59;
+}
+
+function utcWholeSecondMilliseconds(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number,
+  second: number
+): number | undefined {
+  if (!validTimestampFields(year, month, day, hour, minute, second)) {
+    return undefined;
+  }
+  const date = new Date(0);
+  date.setUTCFullYear(year, month - 1, day);
+  date.setUTCHours(hour, minute, second, 0);
+  const milliseconds = date.getTime();
+  return Number.isFinite(milliseconds) ? milliseconds : undefined;
+}
+
+function postgresTimestampAsCanonical(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const match = POSTGRES_TIMESTAMP_PATTERN.exec(value);
+  if (match === null) return undefined;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const fraction = (match[7] ?? '').padEnd(6, '0');
+  const offsetHour = Number(match[9]);
+  const offsetMinute = Number(match[10] ?? '0');
+  if (offsetHour > 15 || offsetMinute > 59) return undefined;
+  const localMilliseconds = utcWholeSecondMilliseconds(
+    year,
+    month,
+    day,
+    hour,
+    minute,
+    second
+  );
+  if (localMilliseconds === undefined) return undefined;
+  const offsetDirection = match[8] === '+' ? 1 : -1;
+  const utcMilliseconds = localMilliseconds - offsetDirection *
+    (offsetHour * 60 + offsetMinute) * 60_000;
+  try {
+    const utcPrefix = new Date(utcMilliseconds).toISOString().slice(0, 19);
+    return `${utcPrefix}.${fraction}Z`;
+  } catch {
+    return undefined;
+  }
+}
+
+function canonicalTimestampMilliseconds(value: string): number | undefined {
+  const match = TIMESTAMP_PATTERN.exec(value);
+  if (match === null) return undefined;
+  const wholeSecond = utcWholeSecondMilliseconds(
+    Number(match[1]),
+    Number(match[2]),
+    Number(match[3]),
+    Number(match[4]),
+    Number(match[5]),
+    Number(match[6])
+  );
+  return wholeSecond === undefined
+    ? undefined
+    : wholeSecond + Number(match[7]!.slice(0, 3));
+}
+
+function finiteDateMilliseconds(value: unknown): number | undefined {
+  try {
+    if (!(value instanceof Date) || isProxy(value)) return undefined;
+    const milliseconds = value.getTime();
+    return Number.isFinite(milliseconds) ? milliseconds : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function sameDate(left: unknown, right: unknown): boolean {
-  return left instanceof Date && right instanceof Date &&
-    Number.isFinite(left.getTime()) && left.getTime() === right.getTime();
+  const leftMilliseconds = finiteDateMilliseconds(left);
+  return leftMilliseconds !== undefined &&
+    leftMilliseconds === finiteDateMilliseconds(right);
+}
+
+function isPostgresTimestampText(value: unknown): value is string {
+  return postgresTimestampAsCanonical(value) !== undefined;
+}
+
+function sameReturnedTimestamp(left: unknown, right: unknown): boolean {
+  if (typeof left === 'string' || typeof right === 'string') {
+    return isPostgresTimestampText(left) && isPostgresTimestampText(right) &&
+      left === right;
+  }
+  return sameDate(left, right);
+}
+
+function returnedTimestampMatchesPostcondition(
+  returned: unknown,
+  native: unknown,
+  canonical: string
+): boolean {
+  if (typeof returned === 'string') {
+    return isPostgresTimestampText(returned) &&
+      isPostgresTimestampText(native) && returned === native;
+  }
+  const returnedMilliseconds = finiteDateMilliseconds(returned);
+  return returnedMilliseconds !== undefined &&
+    returnedMilliseconds === canonicalTimestampMilliseconds(canonical);
 }
 
 function returnedJobMatches(
@@ -280,7 +407,7 @@ function returnedJobMatches(
     ownDataValue(row, 'status') === 'pending' &&
     ownDataValue(row, 'attempts') === 0 &&
     ownDataValue(row, 'maxAttempts') === FINANCIAL_CLASSIFICATION_JOB_MAX_ATTEMPTS &&
-    sameDate(runAt, updatedAt) &&
+    sameReturnedTimestamp(runAt, updatedAt) &&
     ownDataValue(row, 'lockedAt') === null &&
     ownDataValue(row, 'lockedBy') === null &&
     ownDataValue(row, 'lastError') === null &&
@@ -295,12 +422,21 @@ function postconditionMatches(
 ): boolean {
   const timestamp = ownDataValue(row, 'transactionTimestamp');
   const returnedRunAt = ownDataValue(rearmed, 'runAt');
+  const nativeRunAt = ownDataValue(row, 'nativeRunAt');
+  const nativeUpdatedAt = ownDataValue(row, 'nativeUpdatedAt');
+  const nativeTransactionTimestamp = ownDataValue(
+    row,
+    'nativeTransactionTimestamp'
+  );
   return ownDataValue(row, 'id') === target.targetJobId &&
     typeof timestamp === 'string' && TIMESTAMP_PATTERN.test(timestamp) &&
-    returnedRunAt instanceof Date &&
-    returnedRunAt.getTime() === new Date(timestamp).getTime() &&
     ownDataValue(row, 'runAt') === timestamp &&
-    ownDataValue(row, 'updatedAt') === timestamp;
+    ownDataValue(row, 'updatedAt') === timestamp &&
+    isPostgresTimestampText(nativeRunAt) &&
+    nativeUpdatedAt === nativeRunAt &&
+    nativeTransactionTimestamp === nativeRunAt &&
+    postgresTimestampAsCanonical(nativeRunAt) === timestamp &&
+    returnedTimestampMatchesPostcondition(returnedRunAt, nativeRunAt, timestamp);
 }
 
 export function createFinancialClassificationJobRetryPolicyAdapter(): JobRetryPolicyAdapter {
@@ -401,14 +537,17 @@ export function createFinancialClassificationJobRetryPolicyAdapter(): JobRetryPo
           queued_job.run_at at time zone 'UTC',
           'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
         ) as "runAt",
+        queued_job.run_at::text as "nativeRunAt",
         pg_catalog.to_char(
           queued_job.updated_at at time zone 'UTC',
           'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
         ) as "updatedAt",
+        queued_job.updated_at::text as "nativeUpdatedAt",
         pg_catalog.to_char(
           pg_catalog.transaction_timestamp() at time zone 'UTC',
           'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
-        ) as "transactionTimestamp"
+        ) as "transactionTimestamp",
+        pg_catalog.transaction_timestamp()::text as "nativeTransactionTimestamp"
       from "public"."jobs" queued_job
       where queued_job.id = ${target.targetJobId}::uuid
       limit 1

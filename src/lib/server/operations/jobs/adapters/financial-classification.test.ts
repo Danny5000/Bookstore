@@ -29,6 +29,10 @@ const PARENT_ID = '44444444-4444-4444-8444-444444444444';
 const SCAN_RUN_ID = '55555555-5555-4555-8555-555555555555';
 const UPDATED_AT = '2026-08-26T12:34:56.123456Z';
 const REARMED_AT = '2026-08-26T12:35:00.654321Z';
+const REARMED_NATIVE_AT = '2026-08-26 12:35:00.654321+00';
+const DRIFTED_NATIVE_AT = '2026-08-26 12:35:00.654320+00';
+const OFFSET_REARMED_AT = '2026-08-26T12:35:00.654320Z';
+const OFFSET_REARMED_NATIVE_AT = '2026-08-26 08:35:00.65432-04';
 const CREATED_AT = new Date('2026-08-20T09:00:00.000Z');
 const REARMED_DATE = new Date('2026-08-26T12:35:00.654Z');
 const FINGERPRINT = 'a'.repeat(64);
@@ -167,6 +171,9 @@ function postcondition(overrides: Record<string, unknown> = {}) {
     runAt: REARMED_AT,
     updatedAt: REARMED_AT,
     transactionTimestamp: REARMED_AT,
+    nativeRunAt: REARMED_NATIVE_AT,
+    nativeUpdatedAt: REARMED_NATIVE_AT,
+    nativeTransactionTimestamp: REARMED_NATIVE_AT,
     ...overrides
   };
 }
@@ -284,6 +291,77 @@ describe('financial-classification operations retry adapter', () => {
     expect(source.sql).toContain('stripe_balance_transactions');
     expect(source.sql).not.toContain('for update');
     expect(source.params).toEqual([SUBJECT_ID]);
+  });
+
+  it('accepts the raw PostgreSQL timestamps returned by the production primitive', async () => {
+    const job = lockedJob();
+    const database = fakeDatabase([[job], [sourceRow()], [postcondition({
+      nativeRunAt: REARMED_NATIVE_AT,
+      nativeUpdatedAt: REARMED_NATIVE_AT,
+      nativeTransactionTimestamp: REARMED_NATIVE_AT
+    })]]);
+    bindLocks(database);
+    bindPrimitive(database, rearmedJob(job, {
+      runAt: REARMED_NATIVE_AT,
+      updatedAt: REARMED_NATIVE_AT,
+      createdAt: '2026-08-20 09:00:00+00'
+    }));
+
+    await expect(createFinancialClassificationJobRetryPolicyAdapter()(
+      context(database.transaction)
+    )).resolves.toEqual({ status: 'succeeded', resultCode: 'rearmed_existing' });
+
+    const postconditionQuery = rendered(database.calls[2]!);
+    expect(postconditionQuery.sql).toContain(
+      'queued_job.run_at::text as "nativeRunAt"'
+    );
+    expect(postconditionQuery.sql).toContain(
+      'queued_job.updated_at::text as "nativeUpdatedAt"'
+    );
+    expect(postconditionQuery.sql).toContain(
+      'transaction_timestamp()::text as "nativeTransactionTimestamp"'
+    );
+  });
+
+  it('preserves a trimmed fractional timestamp in the current PostgreSQL offset', async () => {
+    const job = lockedJob();
+    const database = fakeDatabase([[job], [sourceRow()], [postcondition({
+      runAt: OFFSET_REARMED_AT,
+      updatedAt: OFFSET_REARMED_AT,
+      transactionTimestamp: OFFSET_REARMED_AT,
+      nativeRunAt: OFFSET_REARMED_NATIVE_AT,
+      nativeUpdatedAt: OFFSET_REARMED_NATIVE_AT,
+      nativeTransactionTimestamp: OFFSET_REARMED_NATIVE_AT
+    })]]);
+    bindLocks(database);
+    bindPrimitive(database, rearmedJob(job, {
+      runAt: OFFSET_REARMED_NATIVE_AT,
+      updatedAt: OFFSET_REARMED_NATIVE_AT
+    }));
+
+    await expect(createFinancialClassificationJobRetryPolicyAdapter()(
+      context(database.transaction)
+    )).resolves.toEqual({ status: 'succeeded', resultCode: 'rearmed_existing' });
+  });
+
+  it('correlates a fractionless PostgreSQL timestamp with a minute offset', async () => {
+    const canonical = '2026-08-26T12:35:00.000000Z';
+    const native = '2026-08-26 18:05:00+05:30';
+    const job = lockedJob();
+    const database = fakeDatabase([[job], [sourceRow()], [postcondition({
+      runAt: canonical,
+      updatedAt: canonical,
+      transactionTimestamp: canonical,
+      nativeRunAt: native,
+      nativeUpdatedAt: native,
+      nativeTransactionTimestamp: native
+    })]]);
+    bindLocks(database);
+    bindPrimitive(database, rearmedJob(job, { runAt: native, updatedAt: native }));
+
+    await expect(createFinancialClassificationJobRetryPolicyAdapter()(
+      context(database.transaction)
+    )).resolves.toEqual({ status: 'succeeded', resultCode: 'rearmed_existing' });
   });
 
   it.each(['classification_replay_page', 'classification_replay_finalize'])(
@@ -481,6 +559,69 @@ describe('financial-classification operations retry adapter', () => {
     const database = fakeDatabase([[job], [sourceRow()], [postcondition()]]);
     bindLocks(database);
     bindPrimitive(database, rearmedJob(job, { runAt: shifted, updatedAt: shifted }));
+    await identityFailure(createFinancialClassificationJobRetryPolicyAdapter()(
+      context(database.transaction)
+    ));
+  });
+
+  it.each([
+    ['a non-PostgreSQL timestamp', '2026-08-26T12:35:00.654321Z'],
+    ['more than six fractional digits', '2026-08-26 12:35:00.6543210+00'],
+    ['an impossible calendar value', '2026-02-30 12:35:00.654321+00']
+  ])('rejects a primitive that returned %s', async (_label, rawTimestamp) => {
+    const job = lockedJob();
+    const database = fakeDatabase([[job], [sourceRow()]]);
+    bindLocks(database);
+    bindPrimitive(database, rearmedJob(job, {
+      runAt: rawTimestamp,
+      updatedAt: rawTimestamp
+    }));
+    await identityFailure(createFinancialClassificationJobRetryPolicyAdapter()(
+      context(database.transaction)
+    ));
+  });
+
+  it('rejects a raw primitive timestamp that differs by one microsecond', async () => {
+    const job = lockedJob();
+    const database = fakeDatabase([[job], [sourceRow()], [postcondition()]]);
+    bindLocks(database);
+    bindPrimitive(database, rearmedJob(job, {
+      runAt: '2026-08-26 12:35:00.654320+00',
+      updatedAt: '2026-08-26 12:35:00.654320+00'
+    }));
+    await identityFailure(createFinancialClassificationJobRetryPolicyAdapter()(
+      context(database.transaction)
+    ));
+  });
+
+  it.each([
+    ['Date', {}],
+    ['raw string', { runAt: DRIFTED_NATIVE_AT, updatedAt: DRIFTED_NATIVE_AT }]
+  ])('rejects a different all-native timestamp group for a %s primitive', async (
+    _label,
+    primitiveOverrides
+  ) => {
+    const job = lockedJob();
+    const database = fakeDatabase([[job], [sourceRow()], [postcondition({
+      nativeRunAt: DRIFTED_NATIVE_AT,
+      nativeUpdatedAt: DRIFTED_NATIVE_AT,
+      nativeTransactionTimestamp: DRIFTED_NATIVE_AT
+    })]]);
+    bindLocks(database);
+    bindPrimitive(database, rearmedJob(job, primitiveOverrides));
+    await identityFailure(createFinancialClassificationJobRetryPolicyAdapter()(
+      context(database.transaction)
+    ));
+  });
+
+  it('rejects unequal raw run and update timestamps', async () => {
+    const job = lockedJob();
+    const database = fakeDatabase([[job], [sourceRow()]]);
+    bindLocks(database);
+    bindPrimitive(database, rearmedJob(job, {
+      runAt: REARMED_NATIVE_AT,
+      updatedAt: '2026-08-26 12:35:00.654320+00'
+    }));
     await identityFailure(createFinancialClassificationJobRetryPolicyAdapter()(
       context(database.transaction)
     ));
