@@ -10,8 +10,6 @@ import {
   ensureCustomerRole
 } from '$lib/server/auth/identity';
 import {
-  COMMERCE_CLAIM_EMAIL_JOB,
-  COMMERCE_CLAIM_REQUEST_JOB,
   createClaimEmailHandler,
   createClaimEmailOperations,
   queueCommerceClaimEmail
@@ -28,26 +26,18 @@ import {
   defaultLoadStripeEvent,
   fulfillPayoutEvent
 } from '$lib/server/commerce/handler';
-import { STRIPE_EVENT_JOB } from '$lib/server/commerce/job';
 import { fulfillDisputeEvent } from '$lib/server/commerce/disputes';
 import { fulfillRefundEvent } from '$lib/server/commerce/refunds';
 import { createStripeWorkerRuntime } from '$lib/server/commerce/stripe/runtime-core';
 import { createFinancialAdminCommandExecutors } from '$lib/server/commerce/financial/admin-commands/executors';
 import {
   createFinancialAdminCommandHandler,
-  FINANCIAL_ADMIN_COMMAND_JOB,
   type FinancialAdminCommandExecutor
 } from '$lib/server/commerce/financial/admin-commands/handler';
 import {
   FINANCIAL_ALLOCATION_ALGORITHM_VERSION,
   FINANCIAL_CLASSIFIER_VERSION
 } from '$lib/server/commerce/financial/constants';
-import {
-  FINANCIAL_CLASSIFICATION_JOB,
-  FINANCIAL_PAYOUT_JOB,
-  FINANCIAL_SCAN_JOB,
-  FINANCIAL_SOURCE_JOB
-} from '$lib/server/commerce/financial/jobs';
 import { createFinancialSourceHandler } from '$lib/server/commerce/financial/handlers/source';
 import { createFinancialPayoutHandler } from '$lib/server/commerce/financial/handlers/payout';
 import { createFinancialScanHandler } from '$lib/server/commerce/financial/handlers/scan';
@@ -78,8 +68,22 @@ import { AUTH_EMAIL_TOPIC, queueAuthEmail } from '$lib/server/email/enqueue';
 import { createAuthEmailHandler } from '$lib/server/email/handler';
 import { createNodemailerEmailTransport } from '$lib/server/email/nodemailer';
 import { createRevisionIngestionHandler } from '$lib/server/ingestion/handler';
-import { INGEST_REVISION_JOB } from '$lib/server/ingestion/job';
 import { ingestionLimitsFromConfig } from '$lib/server/ingestion/limits';
+import {
+  COMMERCE_CLAIM_EMAIL_JOB,
+  COMMERCE_CLAIM_REQUEST_JOB,
+  FINANCIAL_ADMIN_COMMAND_JOB,
+  FINANCIAL_CLASSIFICATION_JOB,
+  FINANCIAL_PAYOUT_JOB,
+  FINANCIAL_SCAN_JOB,
+  FINANCIAL_SOURCE_JOB,
+  INGEST_REVISION_JOB,
+  OPERATIONS_JOB_RETRY_COMMAND_JOB,
+  OUTBOX_DISPATCH_JOB,
+  parseRegisteredJobDiagnosticMetadata,
+  STRIPE_EVENT_JOB
+} from '$lib/server/jobs/catalog';
+import { createRegisteredJobHandlerMap } from '$lib/server/jobs/handler-bindings';
 import { createPostgresJobRepository } from '$lib/server/jobs/repository';
 import { runWorker } from '$lib/server/jobs/runner';
 import { createRunnerObserver } from '$lib/server/jobs/runner-observer';
@@ -92,7 +96,10 @@ import {
   createOutboxDispatchHandler,
   type OutboxTopicHandler
 } from '$lib/server/outbox/dispatcher';
-import { OUTBOX_DISPATCH_JOB } from '$lib/server/outbox/repository';
+import { createFinancialClassificationJobRetryPolicyAdapter } from '$lib/server/operations/jobs/adapters/financial-classification';
+import { createStripeEventJobRetryPolicyAdapter } from '$lib/server/operations/jobs/adapters/stripe-event';
+import { createOperationsJobRetryHandler } from '$lib/server/operations/jobs/handler';
+import { createJobRetryPolicyAdapters } from '$lib/server/operations/jobs/policies';
 import { createObjectStorage } from '$lib/server/storage/factory';
 import { probeStorage } from '$lib/server/storage/health';
 import { createWorkerHeartbeatSupervisor } from '$lib/server/worker/heartbeat-supervisor';
@@ -223,40 +230,56 @@ process.exitCode = await runWorkerProcess({
       executors: financialAdminCommandExecutors,
       accessMessages: commerceMessages
     });
-    const handlers = new Map<string, JobHandler>([
-      [OUTBOX_DISPATCH_JOB, createOutboxDispatchHandler(databaseClient.db, topicHandlers)],
-      [
-        COMMERCE_CLAIM_EMAIL_JOB,
-        createClaimEmailHandler(createClaimEmailOperations(
+    const retryPolicies = createJobRetryPolicyAdapters({
+      rearmPendingStripeEvent: createStripeEventJobRetryPolicyAdapter(),
+      rearmFinancialClassification:
+        createFinancialClassificationJobRetryPolicyAdapter()
+    });
+    const operationsRetryCommandHandler = createOperationsJobRetryHandler({
+      database: databaseClient.db,
+      policies: retryPolicies
+    });
+    const handlers = createRegisteredJobHandlerMap([
+      {
+        kind: OUTBOX_DISPATCH_JOB,
+        handler: createOutboxDispatchHandler(databaseClient.db, topicHandlers)
+      },
+      {
+        kind: COMMERCE_CLAIM_EMAIL_JOB,
+        handler: createClaimEmailHandler(createClaimEmailOperations(
           databaseClient.db,
           workerAuth,
           commerceMessages,
           config.origin
         ))
-      ],
-      [
-        COMMERCE_CLAIM_REQUEST_JOB,
-        createClaimEmailHandler(createClaimEmailOperations(
+      },
+      {
+        kind: COMMERCE_CLAIM_REQUEST_JOB,
+        handler: createClaimEmailHandler(createClaimEmailOperations(
           databaseClient.db,
           workerAuth,
           commerceMessages,
           config.origin
         ), { allowExistingReceipt: true })
-      ],
-      [STRIPE_EVENT_JOB, stripeEventHandler],
-      [FINANCIAL_SOURCE_JOB, financialSourceHandler],
-      [FINANCIAL_PAYOUT_JOB, financialPayoutHandler],
-      [FINANCIAL_SCAN_JOB, financialScanHandler],
-      [FINANCIAL_CLASSIFICATION_JOB, financialClassificationHandler],
-      [FINANCIAL_ADMIN_COMMAND_JOB, financialAdminCommandHandler],
-      [
-        INGEST_REVISION_JOB,
-        createRevisionIngestionHandler(
+      },
+      { kind: STRIPE_EVENT_JOB, handler: stripeEventHandler },
+      { kind: FINANCIAL_SOURCE_JOB, handler: financialSourceHandler },
+      { kind: FINANCIAL_PAYOUT_JOB, handler: financialPayoutHandler },
+      { kind: FINANCIAL_SCAN_JOB, handler: financialScanHandler },
+      { kind: FINANCIAL_CLASSIFICATION_JOB, handler: financialClassificationHandler },
+      { kind: FINANCIAL_ADMIN_COMMAND_JOB, handler: financialAdminCommandHandler },
+      {
+        kind: INGEST_REVISION_JOB,
+        handler: createRevisionIngestionHandler(
           databaseClient.db,
           storage,
           ingestionLimitsFromConfig(config.ingestion)
         )
-      ]
+      },
+      {
+        kind: OPERATIONS_JOB_RETRY_COMMAND_JOB,
+        handler: operationsRetryCommandHandler
+      }
     ]);
     const repository = createPostgresJobRepository(
       databaseClient.db,
@@ -316,6 +339,7 @@ process.exitCode = await runWorkerProcess({
         beforePoll: prepareWorkerPoll,
         signal,
         observer,
+        parseJobDiagnosticMetadata: parseRegisteredJobDiagnosticMetadata,
         onFirstFailure: reportRunnerFailure
       }),
       assertControlHealthy: () => testWorkerControl.throwIfFailed()

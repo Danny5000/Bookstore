@@ -446,6 +446,70 @@ function numericMaxOwners(): string[] {
 }
 
 describe('production job catalog ownership boundary', () => {
+  it('keeps the Plan 7A catalog closed to eleven no-provider rows and two enabled policies', () => {
+    expect(jobCatalog.JOB_DEFINITIONS).toHaveLength(11);
+    expect(jobCatalog.JOB_DEFINITIONS.every((definition) =>
+      definition.providerVerificationRequired === false &&
+      definition.providerCallsInPlan7A === false
+    )).toBe(true);
+    expect(jobCatalog.JOB_DEFINITIONS.filter((definition) =>
+      definition.retryPolicyAvailability === 'enabled'
+    ).map((definition) => definition.retryPolicyId)).toEqual([
+      'rearm_pending_stripe_event',
+      'rearm_financial_classification'
+    ]);
+  });
+
+  it('requires the worker root to consume catalog authority and exhaustive validators directly', () => {
+    const worker = readFileSync(join(repositoryRoot, 'src/worker.ts'), 'utf8');
+    const workerSyntax = ts.createSourceFile(
+      'src/worker.ts',
+      worker,
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.TS
+    );
+    const catalogImports = workerSyntax.statements.filter((statement) =>
+      ts.isImportDeclaration(statement) &&
+      ts.isStringLiteral(statement.moduleSpecifier) &&
+      statement.moduleSpecifier.text === '$lib/server/jobs/catalog'
+    );
+
+    expect(worker).toContain("from '$lib/server/jobs/catalog'");
+    expect(worker).toContain("from '$lib/server/jobs/handler-bindings'");
+    expect(worker).toContain('createRegisteredJobHandlerMap');
+    expect(worker).toContain('parseRegisteredJobDiagnosticMetadata');
+    const catalogNames = [
+      'OUTBOX_DISPATCH_JOB',
+      'COMMERCE_CLAIM_EMAIL_JOB',
+      'COMMERCE_CLAIM_REQUEST_JOB',
+      'STRIPE_EVENT_JOB',
+      'FINANCIAL_SOURCE_JOB',
+      'FINANCIAL_PAYOUT_JOB',
+      'FINANCIAL_SCAN_JOB',
+      'FINANCIAL_CLASSIFICATION_JOB',
+      'FINANCIAL_ADMIN_COMMAND_JOB',
+      'INGEST_REVISION_JOB',
+      'OPERATIONS_JOB_RETRY_COMMAND_JOB',
+      'parseRegisteredJobDiagnosticMetadata'
+    ];
+    expect(catalogImports).toHaveLength(1);
+    const namedBindings = catalogImports[0]?.importClause?.namedBindings;
+    expect(namedBindings && ts.isNamedImports(namedBindings)).toBe(true);
+    expect(namedBindings && ts.isNamedImports(namedBindings)
+      ? namedBindings.elements.map((element) => ({
+        imported: element.propertyName?.text ?? element.name.text,
+        local: element.name.text
+      })).sort((left, right) => left.local.localeCompare(right.local))
+      : []).toEqual(catalogNames.map((name) => ({ imported: name, local: name }))
+        .sort((left, right) => left.local.localeCompare(right.local)));
+    for (const kindName of catalogNames) {
+      expect(worker, kindName).toMatch(
+        new RegExp(`\\b${kindName}\\b`, 'u')
+      );
+    }
+  });
+
   it('detects exact no-substitution templates without rejecting prefixed dedupe templates', () => {
     const kind = jobCatalog.REGISTERED_JOB_KINDS[0];
     expect(exactKindLiteralOwnersInSource(

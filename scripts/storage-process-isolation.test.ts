@@ -431,20 +431,25 @@ describe('storage process isolation deployment', () => {
     expect(handlerMapStart).toBeGreaterThan(handlerCreation);
     expect(repositoryStart).toBeGreaterThan(handlerMapStart);
     expect(normalizedSource(workerSource.slice(handlerMapStart, repositoryStart))).toBe(
-      'const handlers = new Map<string, JobHandler>([ ' +
-      '[OUTBOX_DISPATCH_JOB, createOutboxDispatchHandler(databaseClient.db, topicHandlers)], ' +
-      '[ COMMERCE_CLAIM_EMAIL_JOB, createClaimEmailHandler(createClaimEmailOperations( ' +
-      'databaseClient.db, workerAuth, commerceMessages, config.origin )) ], ' +
-      '[ COMMERCE_CLAIM_REQUEST_JOB, createClaimEmailHandler(createClaimEmailOperations( ' +
-      'databaseClient.db, workerAuth, commerceMessages, config.origin ), ' +
-      '{ allowExistingReceipt: true }) ], [STRIPE_EVENT_JOB, stripeEventHandler], ' +
-      '[FINANCIAL_SOURCE_JOB, financialSourceHandler], ' +
-      '[FINANCIAL_PAYOUT_JOB, financialPayoutHandler], ' +
-      '[FINANCIAL_SCAN_JOB, financialScanHandler], ' +
-      '[FINANCIAL_CLASSIFICATION_JOB, financialClassificationHandler], ' +
-      '[FINANCIAL_ADMIN_COMMAND_JOB, financialAdminCommandHandler], ' +
-      '[ INGEST_REVISION_JOB, createRevisionIngestionHandler( databaseClient.db, storage, ' +
-      'ingestionLimitsFromConfig(config.ingestion) ) ] ]);'
+      'const handlers = createRegisteredJobHandlerMap([ ' +
+      '{ kind: OUTBOX_DISPATCH_JOB, handler: ' +
+      'createOutboxDispatchHandler(databaseClient.db, topicHandlers) }, ' +
+      '{ kind: COMMERCE_CLAIM_EMAIL_JOB, handler: ' +
+      'createClaimEmailHandler(createClaimEmailOperations( databaseClient.db, workerAuth, ' +
+      'commerceMessages, config.origin )) }, ' +
+      '{ kind: COMMERCE_CLAIM_REQUEST_JOB, handler: ' +
+      'createClaimEmailHandler(createClaimEmailOperations( databaseClient.db, workerAuth, ' +
+      'commerceMessages, config.origin ), { allowExistingReceipt: true }) }, ' +
+      '{ kind: STRIPE_EVENT_JOB, handler: stripeEventHandler }, ' +
+      '{ kind: FINANCIAL_SOURCE_JOB, handler: financialSourceHandler }, ' +
+      '{ kind: FINANCIAL_PAYOUT_JOB, handler: financialPayoutHandler }, ' +
+      '{ kind: FINANCIAL_SCAN_JOB, handler: financialScanHandler }, ' +
+      '{ kind: FINANCIAL_CLASSIFICATION_JOB, handler: financialClassificationHandler }, ' +
+      '{ kind: FINANCIAL_ADMIN_COMMAND_JOB, handler: financialAdminCommandHandler }, ' +
+      '{ kind: INGEST_REVISION_JOB, handler: createRevisionIngestionHandler( ' +
+      'databaseClient.db, storage, ingestionLimitsFromConfig(config.ingestion) ) }, ' +
+      '{ kind: OPERATIONS_JOB_RETRY_COMMAND_JOB, ' +
+      'handler: operationsRetryCommandHandler } ]);'
     );
 
     const scheduleStart = workerSource.indexOf(
@@ -472,7 +477,9 @@ describe('storage process isolation deployment', () => {
     expect(workerSource).toMatch(
       /createRunnerObserver\(\{\s*logger,\s*reportSlotProgress:\s*heartbeat\.reportSlotProgress\s*\}\)/u
     );
-    expect(workerSource).not.toContain('parseJobDiagnosticMetadata');
+    expect(workerSource).toContain(
+      'parseJobDiagnosticMetadata: parseRegisteredJobDiagnosticMetadata'
+    );
 
     const probeStart = workerSource.indexOf('async probeDependencies()');
     const runWorkerCall = workerSource.indexOf('run: (signal) => runWorker({', probeStart);
@@ -488,6 +495,7 @@ describe('storage process isolation deployment', () => {
       'run: (signal) => runWorker({ repository, handlers, workerId, concurrency: ' +
       'config.worker.concurrency, pollIntervalMs: config.jobs.pollIntervalMs, ' +
       'leaseRenewalIntervalMs, beforePoll: prepareWorkerPoll, signal, observer, ' +
+      'parseJobDiagnosticMetadata: parseRegisteredJobDiagnosticMetadata, ' +
       'onFirstFailure: reportRunnerFailure }),'
     );
     expect(workerSource).toContain(
@@ -886,7 +894,7 @@ describe('storage process isolation deployment', () => {
       );
     }
     expect(worker).toMatch(
-      /\[FINANCIAL_ADMIN_COMMAND_JOB,\s*financialAdminCommandHandler\]/u
+      /\{\s*kind:\s*FINANCIAL_ADMIN_COMMAND_JOB,\s*handler:\s*financialAdminCommandHandler\s*\}/u
     );
     expect(web).not.toMatch(/financial-admin-command|DATABASE_WORKER|financial_worker/iu);
 
