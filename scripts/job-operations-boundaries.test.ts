@@ -1,4 +1,6 @@
+import { createHash } from 'node:crypto';
 import { access, readFile, readdir } from 'node:fs/promises';
+import { posix } from 'node:path';
 import * as ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
@@ -14,7 +16,8 @@ async function sourceFiles(directory: URL, prefix: string): Promise<readonly str
     const path = `${prefix}/${entry.name}`;
     if (entry.isDirectory()) {
       files.push(...await sourceFiles(new URL(`${entry.name}/`, directory), path));
-    } else if (/\.(?:[cm]?js|ps1|ts|svelte|md|sql|ya?ml)$/u.test(entry.name)) {
+    } else if (/\.(?:[cm]?js|ps1|ts|svelte|md|sql|ya?ml|json|toml|txt|csv)$/u
+      .test(entry.name) || entry.name.endsWith('.env')) {
       files.push(path);
     }
   }
@@ -57,10 +60,39 @@ function imports(value: string): readonly string[] {
 }
 
 function isForbiddenRetryDependency(specifier: string): boolean {
-  if (/(?:gateway|provider|runtime-core|stripe-sdk|(?:^|\/)stripe\/runtime(?:\/|$))/iu
-    .test(specifier)) return true;
+  if (isProviderOrNetworkDependency(specifier)) return true;
   if (specifier.startsWith('.') || specifier.startsWith('$lib/')) return false;
   return specifier !== 'node:util/types' && specifier !== 'drizzle-orm';
+}
+
+function isProviderOrNetworkDependency(specifier: string): boolean {
+  return /(?:gateway|provider|runtime-core|stripe-sdk|(?:^|\/)stripe\/runtime(?:\/|$))/iu
+    .test(specifier) ||
+    /^(?:@stripe\/stripe-js|stripe|node:https?|axios|got|ky|superagent|undici)(?:\/|$)/u
+      .test(specifier);
+}
+
+async function resolveLocalTypeScriptModule(
+  importer: string,
+  specifier: string
+): Promise<string | undefined> {
+  const unresolved = specifier.startsWith('$lib/')
+    ? `src/lib/${specifier.slice('$lib/'.length)}`
+    : specifier.startsWith('.')
+      ? posix.normalize(posix.join(posix.dirname(importer), specifier))
+      : undefined;
+  if (unresolved === undefined) return undefined;
+  const withoutJavaScriptExtension = unresolved.replace(/\.[cm]?js$/u, '');
+  const candidates = unresolved.endsWith('.ts')
+    ? [unresolved]
+    : [`${withoutJavaScriptExtension}.ts`, `${withoutJavaScriptExtension}/index.ts`];
+  for (const candidate of candidates) {
+    try {
+      await access(new URL(candidate, root));
+      return candidate;
+    } catch { /* try the next TypeScript module shape */ }
+  }
+  return undefined;
 }
 
 function hasOperationsCapabilitySecretIdentifier(value: string): boolean {
@@ -70,6 +102,10 @@ function hasOperationsCapabilitySecretIdentifier(value: string): boolean {
   );
   return /(?:PLAN7A[_-])?OPERATIONS(?:[_-]JOB|Job)(?:[_-]LEASE|Lease)?(?:[_-]CAPABILITY|Capability)/iu
     .test(withoutTransactionLocalSetting);
+}
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
 describe('job operations application boundaries', () => {
@@ -208,6 +244,49 @@ describe('job operations application boundaries', () => {
     expect(retryAssembly).not.toMatch(/stripeRuntime|gateway|provider/iu);
   });
 
+  it('keeps the complete local retry-adapter graph off provider and network edges', async () => {
+    const pending = [
+      'src/lib/server/operations/jobs/adapters/stripe-event.ts',
+      'src/lib/server/operations/jobs/adapters/financial-classification.ts'
+    ];
+    const visited = new Set<string>();
+
+    while (pending.length > 0) {
+      const path = pending.shift()!;
+      if (visited.has(path)) continue;
+      visited.add(path);
+      const value = await source(path);
+      const dependencies = imports(value);
+      const forbiddenDependencies: string[] = [];
+      const resolvedDependencies: string[] = [];
+      for (const dependency of dependencies) {
+        const resolved = await resolveLocalTypeScriptModule(path, dependency);
+        const localSchemaModel = resolved?.startsWith('src/lib/server/db/schema/') === true;
+        if (isProviderOrNetworkDependency(dependency) && !localSchemaModel) {
+          forbiddenDependencies.push(dependency);
+        }
+        if (resolved !== undefined) resolvedDependencies.push(resolved);
+      }
+      expect(
+        forbiddenDependencies,
+        `${path} reached a provider or network dependency`
+      ).toEqual([]);
+      expect(
+        /\b(?:fetch\s*\(|XMLHttpRequest|WebSocket|EventSource|sendBeacon)/u
+          .test(value),
+        `${path} reached a provider or network primitive`
+      ).toBe(false);
+      for (const resolved of resolvedDependencies) {
+        if (!visited.has(resolved)) pending.push(resolved);
+      }
+    }
+
+    expect(visited.has('src/lib/server/jobs/repository.ts')).toBe(true);
+    expect(visited.has(
+      'src/lib/server/commerce/financial/projection-authority.ts'
+    )).toBe(true);
+  });
+
   it('keeps the clear operations capability on its four in-memory transport modules', async () => {
     const applicationFiles = await sourceFiles(new URL('src/', root), 'src');
     const consumers: string[] = [];
@@ -242,6 +321,71 @@ describe('job operations application boundaries', () => {
 
     for (const path of sinks) {
       expect(hasOperationsCapabilitySecretIdentifier(await source(path)), path).toBe(false);
+    }
+  });
+
+  it('keeps both fixed Task 18 canaries and their digests out of committed safe surfaces', async () => {
+    const clearCanaries = ['O'.repeat(43), 'F'.repeat(43)] as const;
+    const privateValues = [
+      ...clearCanaries,
+      ...clearCanaries.map(sha256)
+    ];
+    const documentation = await sourceFiles(new URL('docs/', root), 'docs');
+    const databaseArtifacts = await sourceFiles(new URL('drizzle/', root), 'drizzle');
+    const productionSources = (await sourceFiles(new URL('src/', root), 'src'))
+      .filter((path) => !/\.(?:test|spec)\.[cm]?ts$/u.test(path));
+    const operationalScripts = (await sourceFiles(new URL('scripts/', root), 'scripts'))
+      .filter((path) => !/\.(?:test|spec)\.[cm]?ts$/u.test(path));
+    const rootConfiguration = [
+      '.dockerignore',
+      '.env.example',
+      '.gitignore',
+      '.nvmrc',
+      'README.md',
+      'compose.dev.yaml',
+      'compose.prod.yaml',
+      'compose.stripe.yaml',
+      'compose.test.yaml',
+      'deploy/Caddyfile',
+      'deploy/container.env',
+      'Dockerfile',
+      'drizzle.config.ts',
+      'eslint.config.js',
+      'package-lock.json',
+      'package.json',
+      'playwright.config.ts',
+      'svelte.config.js',
+      'tsconfig.json',
+      'vite.config.ts',
+      'vite.services.config.ts',
+      'vitest.config.ts',
+      'vitest.integration.config.ts',
+      'vitest.service.config.ts'
+    ];
+    const fixedArtifactSurfaces = [
+      'scripts/capture-restore-row-counts.sql',
+      'scripts/deployment-checkpoint.ts',
+      'scripts/execute-financial-restore-verifier.ts',
+      'scripts/financial-restore-witness-harness.ts',
+      'scripts/verify-financial-restore.sql'
+    ];
+    const surfaces = [...new Set([
+      ...documentation,
+      ...databaseArtifacts,
+      ...productionSources,
+      ...operationalScripts,
+      ...rootConfiguration,
+      ...fixedArtifactSurfaces
+    ])];
+
+    for (const path of surfaces) {
+      const value = await source(path);
+      for (const privateValue of privateValues) {
+        expect(
+          value.includes(privateValue),
+          `${path} persisted a fixed Task 18 capability value`
+        ).toBe(false);
+      }
     }
   });
 
