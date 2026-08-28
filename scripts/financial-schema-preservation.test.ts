@@ -2460,4 +2460,35 @@ describe('Plan 7A operations authority migration', () => {
       'NEW.run_at IS DISTINCT FROM OLD.run_at'
     );
   });
+
+  it('classifies only invalid retry command identity failures as retry_command_invalid', () => {
+    const migration = source(OPERATIONS_AUTHORITY_MIGRATION);
+    const restoreVerifier = source('./verify-financial-restore.sql');
+    const failStart = migration.indexOf(
+      'CREATE FUNCTION "public"."plan7a_operations_fail_job"('
+    );
+    const failEnd = migration.indexOf('$plan7a_operations_fail_job$;-->', failStart);
+    const failBody = migration.slice(failStart, failEnd);
+
+    expect(failBody).toMatch(
+      /result_code := CASE WHEN \$5 =\s*'Invalid operations job retry command identity[.]'\s+THEN 'retry_command_invalid'::"public"[.]"operations_job_retry_result_code"\s+ELSE 'unexpected_failure'::"public"[.]"operations_job_retry_result_code" END;/u
+    );
+
+    const descriptorMatch = restoreVerifier.match(
+      /^ {2}\('function', 'public', null, 'plan7a_operations_fail_job', 'uuid, text, integer, integer, text', '[0-9a-f]{64}', \$catalog\$(?<catalog>[^\r\n]+)\$catalog\$::jsonb\),$/mu
+    );
+    expect(descriptorMatch?.groups?.catalog).toBeDefined();
+    const descriptor = JSON.parse(descriptorMatch!.groups!.catalog!) as {
+      readonly definition?: unknown;
+    };
+    expect(typeof descriptor.definition).toBe('string');
+    const definitionSha256 = createHash('sha256')
+      .update(String(descriptor.definition).replace(/\r\n?/gu, '\n'), 'utf8')
+      .digest('hex');
+    const postflightBody = migration.slice(failEnd);
+    const postflightHash = postflightBody.match(
+      /\('plan7a_operations_fail_job',\s*'public[.]plan7a_operations_fail_job\(uuid,text,integer,integer,text\)',\s*'TABLE\(applied boolean\)', true, 'v'::"char", '(?<hash>[0-9a-f]{64})'\)/u
+    )?.groups?.hash;
+    expect(postflightHash).toBe(definitionSha256);
+  });
 });

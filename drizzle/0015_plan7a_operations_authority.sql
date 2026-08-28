@@ -3104,10 +3104,9 @@ BEGIN
   transition_now := pg_catalog.clock_timestamp();
   command_was_pending := command_row.status = 'pending';
   IF command_was_pending THEN
-    result_code := CASE WHEN $5 IN (
-      'Invalid operations job retry command identity.',
-      'Operations job retry command permanently failed.'
-    ) THEN 'retry_command_invalid'::"public"."operations_job_retry_result_code"
+    result_code := CASE WHEN $5 =
+      'Invalid operations job retry command identity.'
+    THEN 'retry_command_invalid'::"public"."operations_job_retry_result_code"
       ELSE 'unexpected_failure'::"public"."operations_job_retry_result_code" END;
     PERFORM pg_catalog.set_config(
       'pale_orbit.plan7a_operations_command_transition_id', command_row.id::text, true
@@ -4031,7 +4030,7 @@ BEGIN
           'TABLE(applied boolean)', true, 'v'::"char", '38aa875da3b0c67d44394e7c8b7781b57707d117b8f1aaddb03e3a25bb0371bf'),
         ('plan7a_operations_fail_job',
           'public.plan7a_operations_fail_job(uuid,text,integer,integer,text)',
-          'TABLE(applied boolean)', true, 'v'::"char", '8b9e7801266a8a6f94084d5f7fe171dd0ebb32f9a3ab30cda92bdadf8c14ea27'),
+          'TABLE(applied boolean)', true, 'v'::"char", 'ec94c84bb0f560cfce890fc940daa9741b1fe2f87f1cbc17d0d3c667fc8d8138'),
         ('plan7a_operations_guard_command_delete',
           'public.plan7a_operations_guard_command_delete()', 'trigger', false, 'v'::"char",
           '51c644c3f62cba64bfc4b46f09cac247336edd86e4335c0b8289437fa5b97754'),

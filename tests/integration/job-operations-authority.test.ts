@@ -710,7 +710,7 @@ describe('Plan 7A operations authority catalogs', () => {
       {
         signature: 'plan7a_operations_fail_job(uuid,text,integer,integer,text)',
         result: 'TABLE(applied boolean)', security_definer: true,
-        definition_sha256: '8b9e7801266a8a6f94084d5f7fe171dd0ebb32f9a3ab30cda92bdadf8c14ea27'
+        definition_sha256: 'ec94c84bb0f560cfce890fc940daa9741b1fe2f87f1cbc17d0d3c667fc8d8138'
       },
       {
         signature: 'plan7a_operations_guard_command_delete()',
