@@ -452,6 +452,20 @@ describe('job operations application boundaries', () => {
     expect(service.match(/await auditDenied\(/gu)).toHaveLength(1);
   });
 
+  it('records Checkpoint C complete without changing the production launch posture', async () => {
+    const design = await source(
+      'docs/superpowers/specs/2026-08-24-production-operability-foundations-design.md'
+    );
+    const lines = design.split(/\r?\n/u);
+
+    expect(lines.filter((line) => line.startsWith('**Implementation status:**'))).toEqual([
+      '**Implementation status:** Checkpoints A-C complete; Checkpoint D not started'
+    ]);
+    expect(lines.filter((line) => line.startsWith('**Launch status:**'))).toEqual([
+      '**Launch status:** Production remains maintenance-only with Stripe disabled'
+    ]);
+  });
+
   it('keeps every current operator guide aligned with Checkpoint C head', async () => {
     const currentGuidePaths = [
       'README.md',

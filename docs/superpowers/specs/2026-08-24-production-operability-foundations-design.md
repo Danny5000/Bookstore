@@ -4,7 +4,7 @@
 
 **Design status:** Approved
 
-**Implementation status:** Checkpoints A-B complete; Checkpoints C-D not started
+**Implementation status:** Checkpoints A-C complete; Checkpoint D not started
 
 **Depends on:** [Bookstore Full-Stack Design](2026-08-08-bookstore-full-stack-design.md), [Plan 6B Financial Reconciliation and Reporting](2026-08-11-stripe-financial-reconciliation-reporting-design.md), and [Plan 6B-II Implementation Refresh](2026-08-20-plan-6b-ii-implementation-refresh-design.md)
 
