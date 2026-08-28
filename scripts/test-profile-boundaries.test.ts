@@ -51,6 +51,7 @@ const packageManifest = JSON.parse(source('package.json')) as {
 };
 const unitConfigSource = source('vitest.config.ts');
 const serviceConfigSource = source('vitest.service.config.ts');
+const testComposeSource = source('compose.test.yaml');
 const commerceOperationsTestSource = source('scripts/commerce-operations.test.ts');
 const serviceTestSource = source('tests/service/financial-restore-witness.test.ts');
 const financialWitnessHarnessSource = source('scripts/financial-restore-witness-harness.ts');
@@ -123,6 +124,13 @@ describe('test profile boundaries', () => {
     expect(serviceConfigSource).not.toContain('upgrade');
     expect(serviceConfigSource).not.toContain('smoke');
     expect(serviceConfigSource).not.toContain("include: ['tests/service/**/*.test.ts']");
+  });
+
+  it('keeps PostgreSQL test data on a bounded tmpfs with WAL headroom', () => {
+    expect(testComposeSource).toContain(
+      '- /var/lib/postgresql:rw,noexec,nosuid,size=512m'
+    );
+    expect(occurrences(testComposeSource, 'size=512m')).toBe(1);
   });
 
   it('keeps production smoke tests from directly importing live socket runtimes', () => {

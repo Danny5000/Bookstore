@@ -11,7 +11,7 @@ services:
         host_ip: 127.0.0.1
         protocol: tcp
     tmpfs:
-      - /var/lib/postgresql:rw,noexec,nosuid,size=256m
+      - /var/lib/postgresql:rw,noexec,nosuid,size=512m
     healthcheck:
       test: [CMD-SHELL, 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
       interval: 2s
