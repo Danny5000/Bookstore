@@ -142,7 +142,7 @@ describe('test profile boundaries', () => {
 
   it('retains the bounded supervisor and exact cleanup safeguards', () => {
     for (const safeguard of [
-      'const financialWitnessHarnessTimeoutMs = 1_200_000',
+      'const financialWitnessHarnessTimeoutMs = 2_400_000',
       'npm_execpath is required for the direct Node test-database harness',
       'terminateFinancialWitnessHarnessProcessTree',
       "'down', '--volumes', '--remove-orphans'",

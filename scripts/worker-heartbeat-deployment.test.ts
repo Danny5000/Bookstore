@@ -239,16 +239,21 @@ describe('worker heartbeat deployment consumers', () => {
       'fatal publisher failure exits nonzero under `restart: unless-stopped`'
     );
 
-    expect.soft(readme).toContain('Plan 7A Checkpoint A dependency and test boundaries are implemented');
     expect.soft(readme).toContain(
-      'Plan 7A Checkpoint B structured logging, correlation, and worker freshness are implemented'
+      'Plan 7A Checkpoints A and B provide dependency/test boundaries, structured logging, correlation, and worker freshness'
     );
-    expect.soft(readme).toContain('Plan 7A is not complete');
     expect.soft(readme).toContain(
-      'General job operations and retry administration, monitoring and alert transport, generalized release and smoke evidence, scheduled off-host backups, deployment automation and hardening, final pool and capacity tuning, production activation, and Stripe enablement remain deferred'
+      'Plan 7A Checkpoint C adds a backend-only list/submit/status surface protected first by `jobs.retry` and then by database current-role reauthorization'
+    );
+    expect.soft(readme).toContain('Plan 7A remains incomplete');
+    expect.soft(readme).toContain(
+      'Operations UI, monitoring/alerts, generalized stage evidence, production-live activation, Stripe enablement, fresh release-candidate capture, and Checkpoint D remain deferred'
     );
     expect.soft(workers).toContain(
-      'Checkpoint B deliberately adds no monitoring or alert transport, generalized smoke evidence, operations catalog or UI, activation input, production-live mode, or Stripe enablement'
+      'Plan 7A Checkpoint C adds the closed operations catalog and backend authority without adding an operations UI or activation input'
+    );
+    expect.soft(workers).toContain(
+      'Monitoring and alert transport, generalized release evidence, production-live mode, and Stripe enablement remain later-checkpoint work'
     );
 
     expect.soft(exampleEnvironment).toMatch(
